@@ -6038,6 +6038,69 @@ fn an_interrupt_withdraws_the_prompts_waiting_behind_the_run() {
     assert_eq!(prompts(root), 1, "a withdrawn prompt is never sent");
 }
 
+/// Retrying a follow-up whose run has ended reports how it ended, and says
+/// whether the agent received the prompt, rather than claiming it was sent.
+#[test]
+fn a_retried_follow_up_says_whether_the_agent_received_it() {
+    use crate::agent_execution::{ENDED, NOT_SENT, Start};
+    if isolated("a_retried_follow_up_says_whether_the_agent_received_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let follow_up = |prompt: &str, key: &str| Submit {
+        destination: Destination::Existing(first.agent.id),
+        prompt: prompt.into(),
+        idempotency_key: key.into(),
+        ..request.clone()
+    };
+    let prompt = |request: Submit| super::prompt(&host, &Authority::default(), request, false);
+
+    let (held, start) = prompt(follow_up("HOLD_CLEANUP_BUSY", "held")).unwrap();
+    assert_eq!(start, Start::Sent { resumed: false });
+    eventually(
+        || root.join("cleanup-busy").exists(),
+        "the provider never began its held turn",
+    );
+    let (queued, start) = prompt(follow_up("Withdrawn", "queued")).unwrap();
+    assert!(matches!(start, Start::Queued { .. }), "{start:?}");
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let _ = process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent: first.agent.id,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    );
+    let held = settled(&host, held.run.id);
+    assert!(held.provider_key.is_some(), "{held:?}");
+    let queued = settled(&host, queued.run.id);
+    assert_eq!(queued.state, State::Cancelled, "{queued:?}");
+
+    let error = prompt(follow_up("Withdrawn", "queued")).unwrap_err();
+    assert!(
+        error.starts_with(&format!("{NOT_SENT}run {}", &queued.id.to_string()[..8])),
+        "{error}"
+    );
+    // The interrupt stopped a turn the agent had begun, so it ended after
+    // the agent received the prompt.
+    assert_eq!(held.state, State::Cancelled, "{held:?}");
+    let error = prompt(follow_up("HOLD_CLEANUP_BUSY", "held")).unwrap_err();
+    assert!(
+        error.starts_with(&format!(
+            "{ENDED}run {} ended cancelled after the agent received it.",
+            &held.id.to_string()[..8]
+        )),
+        "{error}"
+    );
+}
+
 /// A message for an agent whose process stopped and whose conversation cannot
 /// reopen by itself is held, not lost, and says why; it becomes a run once.
 #[test]

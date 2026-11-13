@@ -300,14 +300,14 @@ fn provider(
 /// Why `accepted` did not start, beginning with what its run's end proves
 /// about its prompt, so the CLI knows whether retrying its key can help.
 fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
-    use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
-    let id = accepted.run.id;
-    let state = registry(host).and_then(|registry| {
+    use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
+    let full = accepted.run.id.to_string();
+    let id = &full[..8];
+    let run = registry(host).and_then(|registry| {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .agent_run(id)
-            .map(|run| run.state)
+            .agent_run(accepted.run.id)
     });
     let reason = error.strip_prefix(NOT_SENT).unwrap_or(&error);
     let mut chars = reason.chars();
@@ -315,11 +315,16 @@ fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect::<String>())
         .unwrap_or_default();
-    match state {
-        Ok(State::Failed | State::Cancelled) => {
+    match run.map(|run| (run.state, run.provider_key.is_some())) {
+        // The provider acknowledged the turn, so the agent had the prompt.
+        Ok((state @ (State::Succeeded | State::Failed | State::Cancelled), true)) => format!(
+            "{ENDED}run {id} ended {} after the agent received it. {reason}",
+            format!("{state:?}").to_lowercase()
+        ),
+        Ok((State::Failed | State::Cancelled, false)) => {
             format!("{NOT_SENT}run {id} ended before the agent received it. {reason}")
         }
-        Ok(State::Interrupted) => format!(
+        Ok((State::Interrupted, _)) => format!(
             "{OUTCOME_UNKNOWN}run {id} was interrupted without proof of whether the agent received it. {reason}"
         ),
         // Still waiting, so a retry with its key can still start it.

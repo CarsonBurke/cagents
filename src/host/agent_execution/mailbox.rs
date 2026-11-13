@@ -269,18 +269,26 @@ fn started(host: &SharedHost, registry: &SharedRegistry, accepted: &Accepted) ->
         Ok(start) => return Handoff::Run { agent, run, start },
         Err(reason) => reason,
     };
-    let interrupted = registry
+    let ended = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent_run(run)
-        .is_ok_and(|run| run.state == crate::agent_execution::State::Interrupted);
-    if interrupted {
+        .map(|run| (run.state, run.provider_key.is_some()));
+    match ended {
         // The provider may have the message, so it stays given.
-        Handoff::Unknown { agent, run, reason }
-    } else {
+        Ok((crate::agent_execution::State::Interrupted, _)) => {
+            Handoff::Unknown { agent, run, reason }
+        }
+        // The provider acknowledged the turn: the agent took the message
+        // as this run, which has since ended.
+        Ok((_, true)) => Handoff::Run {
+            agent,
+            run,
+            start: crate::agent_execution::Start::Sent { resumed: false },
+        },
         // Its run ended unsent and gave the message back, which reaches the
         // conversation as a message.
-        Handoff::Held { agent, reason }
+        _ => Handoff::Held { agent, reason },
     }
 }
 

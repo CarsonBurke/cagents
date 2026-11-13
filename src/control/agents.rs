@@ -1294,8 +1294,10 @@ fn with_retry_key(mut error: AppError, key: &str) -> AppError {
 /// Whether the daemon reports the run a follow-up was accepted as having
 /// ended, sent or not, so its key can no longer start it.
 fn ended_run(error: &AppError) -> bool {
-    use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
-    error.message.starts_with(NOT_SENT) || error.message.starts_with(OUTCOME_UNKNOWN)
+    use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
+    [NOT_SENT, OUTCOME_UNKNOWN, ENDED]
+        .iter()
+        .any(|prefix| error.message.starts_with(prefix))
 }
 
 /// How a follow-up's acceptance line ends: whether the prompt went to the
@@ -3274,7 +3276,7 @@ mod tests {
 
     #[test]
     fn only_a_retry_that_can_still_start_the_work_names_its_key() {
-        use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
+        use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
         let lost = with_retry_key(AppError::new("daemon", "The connection closed"), "k1");
         assert!(
             lost.message
@@ -3288,6 +3290,7 @@ mod tests {
             format!(
                 "{OUTCOME_UNKNOWN}run 1 was interrupted without proof of whether the agent received it."
             ),
+            format!("{ENDED}run 1 ended cancelled after the agent received it. Interrupted."),
         ] {
             let error = with_retry_key(AppError::new("daemon", ended.clone()), "k1");
             assert_eq!(

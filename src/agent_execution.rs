@@ -43,6 +43,9 @@ pub const NOT_SENT: &str = "Not sent: ";
 /// with no proof of whether the agent received its prompt. Retrying its key
 /// reports the same run.
 pub const OUTCOME_UNKNOWN: &str = "Outcome unknown: ";
+/// How the daemon begins reporting a follow-up whose run the agent took and
+/// that has since ended. Retrying its key reports the same run.
+pub const ENDED: &str = "Ended: ";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 /// Ephemeral launcher proof for a console waiting for daemon startup. It is
 /// never a capability, durable launch recipe, or permission to send a prompt.

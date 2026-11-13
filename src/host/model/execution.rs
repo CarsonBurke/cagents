@@ -2441,7 +2441,7 @@ const STOPPED_BEHIND: &str = "Not sent: the agent's process stopped during the r
 
 /// Why a prompt waiting behind a run interrupted without proof of its outcome
 /// was not sent.
-pub(crate) const UNVERIFIED_BEHIND: &str = "Not sent: the run ahead of it was interrupted without proof of its outcome. Inspect the agent's conversation; the agent takes no more runs until it is closed";
+pub(crate) const UNVERIFIED_BEHIND: &str = "Not sent: the run ahead of it was interrupted without proof of its outcome, so this agent takes no more runs. Inspect its conversation, then close it and start a new agent to continue";
 
 pub(crate) const UNVERIFIED_REFUSAL: &str = "The agent has unverified work: a run was interrupted without proof of its outcome. Inspect its conversation, then close the agent before giving it more work";
 
