@@ -4722,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn large_image_alt_and_literal_title_use_flow_and_keep_exact_child_selection_sources() {
+    fn large_image_title_is_a_flowed_caption_with_its_exact_selection_source() {
         use iced::advanced::{
             layout,
             widget::{Tree, tree},
@@ -4794,30 +4794,33 @@ mod tests {
         }
         let mut leaves = Vec::new();
         collect(&tree, &mut leaves);
-        assert_eq!(leaves.len(), 2);
+        // The alternative text names the image's link and is not drawn as
+        // text of its own; the title is the caption beneath it.
         let alt_id = selection::logical_identity(&source.id, &[0, 0, 0]);
         let title_id = selection::logical_identity(&source.id, &[0, 0, 1]);
         assert_eq!(
             leaves,
-            vec![(alt_id, Some(false)), (title_id, Some(false))],
-            "both actual native image leaves await the worker, with original child0/1 identities"
+            vec![(title_id, Some(false))],
+            "the caption awaits the worker, with its original child 1 identity"
         );
         let mut catalog = selection::Catalog::builder();
         catalog.markdown(&source.id, &[0], cached.markdown.items());
         let catalog = catalog.finish();
-        for (identity, expected) in [(alt_id, expected_alt.as_str()), (title_id, title.as_str())] {
-            let plain = catalog.text(identity).unwrap();
-            assert_eq!(plain.as_ref(), expected);
-            let mut leaf = selection::Catalog::builder();
-            leaf.logical(identity, plain);
-            let leaf = leaf.finish();
-            let (first, last) = leaf.endpoints().unwrap();
-            assert_eq!(
-                catalog.copy(first, last).as_deref(),
-                Some(expected),
-                "full original image selection source survives virtual worker preparation"
-            );
-        }
+        assert!(
+            catalog.text(alt_id).is_none(),
+            "alt text is not selectable text"
+        );
+        let plain = catalog.text(title_id).unwrap();
+        assert_eq!(plain.as_ref(), title.as_str());
+        let mut leaf = selection::Catalog::builder();
+        leaf.logical(title_id, plain);
+        let leaf = leaf.finish();
+        let (first, last) = leaf.endpoints().unwrap();
+        assert_eq!(
+            catalog.copy(first, last).as_deref(),
+            Some(title.as_str()),
+            "the full original title survives virtual worker preparation"
+        );
         drop(element);
         drop(tree);
         drop(cached);
