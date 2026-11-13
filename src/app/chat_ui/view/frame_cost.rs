@@ -236,7 +236,10 @@ fn a_streaming_frame_of_a_full_window() {
 /// documentation, with its headings, tables, lists and code fences, 24 bytes
 /// a publication. Preparing a publication lays out the new text once, so it
 /// counts the paragraphs that publication shapes; the frame after it shows
-/// the same text again and should shape none.
+/// the same text again and should shape none. The counts cover prose shaped
+/// on the interface thread; flow layouts shaped on a worker and monospace
+/// text are not counted. The documentation changes over time, so compare
+/// runs made on the same revision of it.
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_streaming_frame_of_documentation() {

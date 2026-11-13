@@ -1044,7 +1044,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         {
             // Each publication of a growing message parses into new span
             // allocations, settled blocks included. Spans that shape alike
-            // (text, size, line height, font, colour) keep their paragraph.
+            // keep their paragraph: `Span`'s equality compares exactly what
+            // `Paragraph::with_spans` shapes (text, size, line height, font,
+            // colour), and the rest (links, highlights, decorations) is read
+            // from `state.spans` when drawing and hit-testing.
             if state
                 .spans
                 .as_deref()
@@ -1968,6 +1971,36 @@ mod tests {
                 .as_ref()
                 .is_some_and(|spans| Arc::ptr_eq(spans, &republished)),
             "links and highlights are read from the spans now drawn"
+        );
+        let wide = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits)
+            .size();
+
+        // A kept paragraph still follows the width it is laid out at.
+        let mut element = text(
+            spans(None),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            target,
+            None,
+        );
+        let narrow = element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(200.0, f32::INFINITY)),
+            )
+            .size();
+        assert_eq!(
+            tree.state.downcast_ref::<State>().paragraph_builds.get(),
+            1,
+            "a narrower width rewraps the kept paragraph without shaping it again"
+        );
+        assert!(
+            narrow.height > wide.height && narrow.width <= 200.0,
+            "the kept paragraph wraps to the narrower width: {wide:?} then {narrow:?}"
         );
 
         let mut element = text(
