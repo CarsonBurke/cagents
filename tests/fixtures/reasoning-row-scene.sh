@@ -61,6 +61,9 @@ expanded_shot() {
     evidence drive click "$row" >/dev/null
     evidence drive wait 'new setting' --timeout 15 >/dev/null
     shot "$1"
+    # Expanding in a narrow pane can move the header as its scroll anchor
+    # settles. Locate it again rather than clicking the old body position.
+    row=$(first_reasoning_row)
     evidence drive click "$row" >/dev/null
     evidence drive wait 'new setting' --gone --timeout 15 >/dev/null
 }
