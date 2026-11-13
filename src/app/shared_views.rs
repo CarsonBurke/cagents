@@ -4768,9 +4768,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
-        use super::super::workspace_model_sync::ModelUpdate;
+    /// A desktop-scale inventory: 30 channels holding 122 open panes, 433
+    /// closed historical cards and 1,218 historical worktree scopes.
+    fn desktop_inventory_fixture() -> (Cagents, crate::workspace_model::WorkspaceModel) {
         let (mut app, _, _, template) = fixture();
         let repository = PathBuf::from("/repo/.git");
         let project = app.durable.channels[0].project_id;
@@ -4866,6 +4866,88 @@ mod tests {
                 .sum::<usize>(),
             122
         );
+        (app, model)
+    }
+
+    /// Paired measurement for #2641: the UI thread's CPU for a burst of 20
+    /// channel renames observed from the registry, at desktop inventory scale.
+    /// Run with `--ignored --nocapture` on the same host for both revisions.
+    #[test]
+    #[ignore = "manual paired measurement of observed metadata edits"]
+    fn measure_observed_channel_renames_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        fn thread_cpu() -> Duration {
+            let mut value = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `value` is a valid, writable timespec.
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) },
+                0
+            );
+            Duration::new(value.tv_sec as u64, value.tv_nsec as u32)
+        }
+        let (mut app, model) = desktop_inventory_fixture();
+        // Every historical scope is a worktree the sidebar still lists.
+        for view in &model.views {
+            if let Scope::Worktree { path, .. } = &view.scope {
+                app.known_worktree_roots.insert(path.clone());
+                app.sidebar_model.projects[0]
+                    .worktrees
+                    .push(crate::sidebar::SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        path.clone(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ));
+            }
+        }
+        let (tx, _rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            model.clone(),
+        ))));
+        let channel = app.durable.channels[0].id;
+        let mut cpu = Vec::new();
+        let mut wall = Vec::new();
+        for index in 0..20 {
+            let title = format!("Measured rename {index:02}");
+            let sequence = app.workspace_model.sequence + 1;
+            let (started, started_cpu) = (Instant::now(), thread_cpu());
+            drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::RetitleChannel {
+                    id: channel,
+                    title: title.clone(),
+                },
+            })));
+            cpu.push(thread_cpu() - started_cpu);
+            wall.push(started.elapsed());
+            assert_eq!(app.durable.channels[0].title, title);
+        }
+        let report = |name: &str, samples: &mut Vec<Duration>| {
+            let total: Duration = samples.iter().sum();
+            samples.sort();
+            println!(
+                "observed_renames {name}: total {:.3} ms, median {:.3} ms, max {:.3} ms",
+                total.as_secs_f64() * 1e3,
+                samples[samples.len() / 2].as_secs_f64() * 1e3,
+                samples[samples.len() - 1].as_secs_f64() * 1e3,
+            );
+        };
+        report("thread cpu", &mut cpu);
+        report("wall", &mut wall);
+    }
+
+    #[test]
+    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, mut model) = desktop_inventory_fixture();
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let before = app.durable.clone();
