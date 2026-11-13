@@ -30,8 +30,9 @@
 //!   or last built row, not the first or last row.
 //! - Rows are laid out at the column's width with unbounded height, so a row
 //!   must not fill its height.
-//! - A repeated key shares its row state with the first row that has it, so
-//!   the second loses hover, focus and tooltip state on every layout.
+//! - Keys must be unique. Rows that repeat a key share one retained state
+//!   between them, so each loses hover, focus and tooltip state on every
+//!   layout.
 //!
 //! Rows outside the window have no widgets, so they are absent from the
 //! accessibility tree and from pointer and keyboard operations until they come
@@ -115,12 +116,19 @@ struct State {
     /// The height assumed for rows not yet measured.
     assumed: Option<f32>,
     width: f32,
+    /// The gap between rows, as the last layout placed them.
+    spacing: f32,
     /// The keys whose trees are `tree.children`, in order.
     mounted: Vec<u64>,
     /// Where the last layout put each mounted row: its top and bottom.
     placed: Vec<(f32, f32)>,
+    /// The row the user is reading, by key, and how far the viewport's top
+    /// is below that row's top. It changes only when the viewport moves for
+    /// another reason than following it, such as the wheel or the thumb, so
+    /// a filter that hides the row and is then cleared returns to it.
+    reading: std::cell::Cell<Option<(u64, f32)>>,
     /// Where, from the column's top, the viewport's top must be for the row
-    /// at its top to stay where it was drawn, when a layout since
+    /// being read to stay where it was drawn, when a layout since
     /// [`keep_in_place`] last scrolled has moved that row.
     follow: Option<f32>,
     /// The span of content, from the column's top, that the mounted rows
@@ -135,6 +143,34 @@ struct State {
 }
 
 impl State {
+    /// Notes the visible span, from the column's top, of a column `height`
+    /// tall, and what the user is now reading if they moved the viewport.
+    fn observe(&self, span: (f32, f32), height: f32) {
+        let (top, shown) = span;
+        let last = self.viewport.replace(Some(span));
+        let moved = last.is_none_or(|(was, _)| (was - top).abs() > 0.5);
+        // Content that shrank under the viewport, as a filter makes it, pulls
+        // the viewport up to its end; the user did not move.
+        let clamped = last.is_some_and(|(was, _)| was > top) && top + shown >= height - 0.5;
+        if moved && !clamped {
+            // At the very top, rows added above should show.
+            self.reading
+                .set((top > 0.0).then(|| self.row_at(top)).flatten());
+        }
+    }
+
+    /// The row `top` is in, or the one after the gap it is in, and how far
+    /// `top` is below that row's top. None where the last layout built no
+    /// row, as when the viewport has jumped; the next layout finds it.
+    fn row_at(&self, top: f32) -> Option<(u64, f32)> {
+        self.mounted
+            .iter()
+            .zip(&self.placed)
+            .find(|(_, (_, bottom))| *bottom > top)
+            .filter(|(_, (placed, _))| *placed <= top + self.spacing)
+            .map(|(key, (placed, _))| (*key, top - placed))
+    }
+
     fn height(&self, key: u64, estimate: f32) -> f32 {
         self.heights.get(&key).copied().unwrap_or(estimate)
     }
@@ -313,26 +349,14 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
     ) -> layout::Node {
         let width = limits.max().width;
         let state = tree.state.downcast_mut::<State>();
-        // The row at the top of the viewport, as the last layout placed it,
-        // or the first below it that is still listed, as after a filter.
-        // Away from the top of the list, it is what the user is looking at,
-        // and it stays put however the rows above it change.
-        let anchor = state
-            .viewport
-            .get()
-            .filter(|(top, _)| *top > 0.0)
-            .and_then(|(top, _)| {
-                state
-                    .mounted
-                    .iter()
-                    .zip(&state.placed)
-                    .filter(|(_, (_, bottom))| *bottom > top)
-                    .find_map(|(key, (placed, _))| {
-                        let index = self.keys.iter().position(|row| row == key)?;
-                        Some((index, *placed))
-                    })
-            });
-        let moved = |tops: &[f32]| anchor.map_or(0.0, |(index, placed)| tops[index] - placed);
+        // The row the user is reading stays put however the rows above it
+        // change. While a filter hides it, nothing is followed and the
+        // scrollable keeps its offset, as it would without culling.
+        let anchor = state.reading.get().and_then(|(key, offset)| {
+            let index = self.keys.iter().position(|row| *row == key)?;
+            Some((index, offset))
+        });
+        let target = |tops: &[f32]| anchor.map(|(index, offset)| tops[index] + offset);
         if (state.width - width).abs() > 0.5 {
             state.forget_heights();
             state.width = width;
@@ -340,12 +364,12 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         state.prune(&self.keys);
         let tops = self.tops(state);
         // Choose the window around where the viewport will be once it has
-        // followed the anchor.
-        let ahead = moved(&tops);
+        // followed the row being read.
+        let ahead = target(&tops);
         let viewport = state
             .viewport
             .get()
-            .map(|(top, height)| (top + ahead, height));
+            .map(|(top, height)| (ahead.unwrap_or(top), height));
         let (run, rows) = self.window(state, &tops, viewport);
 
         // Match each row's retained tree by key, as a keyed list does.
@@ -389,24 +413,28 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         // Place rows by the measured heights, which may differ from the
         // estimates the window was chosen by.
         let tops = self.tops(state);
-        let shift = moved(&tops);
-        if shift != 0.0 {
-            let viewport = state
-                .viewport
-                .get()
-                .map(|(top, height)| (top + shift, height));
-            state.viewport.set(viewport);
-            // A target rather than a distance: the content may have shrunk
-            // under a viewport the scrollable has since clamped, as when a
-            // filter leaves fewer rows, and a distance from the clamped
-            // offset would land elsewhere.
-            state.follow = viewport.map(|(top, _)| top);
+        // A target rather than a distance: the scrollable may have clamped
+        // its offset to content that shrank, as under a filter, and a
+        // distance from there would land elsewhere.
+        if let (Some(top), Some((was, height))) = (target(&tops), state.viewport.get())
+            && top != was
+        {
+            state.viewport.set(Some((top, height)));
+            state.follow = Some(top);
         }
         state.placed = rows
             .iter()
             .zip(&nodes)
             .map(|(index, node)| (tops[*index], tops[*index] + node.size().height))
             .collect();
+        state.spacing = self.spacing;
+        // A viewport that moved past the rows built could not say which row
+        // it shows until now.
+        if state.reading.get().is_none()
+            && let Some((top, _)) = state.viewport.get().filter(|(top, _)| *top > 0.0)
+        {
+            state.reading.set(state.row_at(top));
+        }
         let children = rows
             .iter()
             .zip(nodes)
@@ -463,7 +491,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         // half the overscan is still in hand.
         let state = tree.state.downcast_ref::<State>();
         if let Some(span) = visible_span(layout.bounds(), viewport) {
-            state.viewport.set(Some(span));
+            state.observe(span, layout.bounds().height);
             let needs = wanted(span, OVERSCAN / 2.0);
             // Focus that moved to another row needs its neighbours built.
             if needs.start < state.covered.start
@@ -486,8 +514,13 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if let Some(span) = visible_span(layout.bounds(), viewport) {
-            tree.state.downcast_ref::<State>().viewport.set(Some(span));
+        let state = tree.state.downcast_ref::<State>();
+        // A frame drawn before keep_in_place has followed the row being read
+        // shows where the scrollable still is; what is read is unchanged.
+        if let Some(span) = visible_span(layout.bounds(), viewport)
+            && state.follow.is_none()
+        {
+            state.observe(span, layout.bounds().height);
         }
         for (row, child, child_layout) in self.children(tree, layout) {
             if child_layout.bounds().intersects(viewport) {
@@ -629,7 +662,8 @@ impl<'a, Message: 'a> From<CulledColumn<'a, Message>> for Element<'a, Message, T
 /// rows measured or added above it never move what is on screen.
 ///
 /// While the scrollbar's thumb is dragged, the pointer decides the position,
-/// so the scrollable is left where it is and the row is not followed.
+/// so the scrollable is left where it is and the row is not followed. It
+/// follows the first culled column inside the scrollable only.
 pub fn keep_in_place<'a, Message: 'a>(
     scrollable: impl Into<Element<'a, Message, Theme, Renderer>>,
 ) -> Element<'a, Message, Theme, Renderer> {
@@ -1347,9 +1381,13 @@ mod tests {
             positions
         }
 
-        /// Where `row` is on screen, if it is built.
+        /// Where `row` is on screen, if it is built. Names are matched by
+        /// the row's key, as each build of a row makes a new `Id`.
         fn on_screen(&self, row: &str) -> Option<f32> {
-            self.1.get(row).map(|top| top - self.0)
+            self.1
+                .iter()
+                .find(|(name, _)| name.contains(&format!("\"{row}\"")))
+                .map(|(_, top)| top - self.0)
         }
 
         /// The key of the row named `name`.
@@ -1361,16 +1399,6 @@ mod tests {
                 .take_while(char::is_ascii_digit)
                 .collect::<String>()
                 .parse()
-                .unwrap()
-        }
-
-        /// The first row wholly on screen, and where it is.
-        fn first_on_screen(&self) -> (String, f32) {
-            self.1
-                .iter()
-                .map(|(name, top)| (name.clone(), top - self.0))
-                .filter(|(_, top)| *top >= 0.0)
-                .min_by(|a, b| a.1.total_cmp(&b.1))
                 .unwrap()
         }
     }
@@ -1465,8 +1493,11 @@ mod tests {
         assert!(followed > 0, "no layout moved the rows on screen");
     }
 
-    #[test]
-    fn a_filter_typed_and_cleared_far_down_leaves_the_row_on_screen_in_place() {
+    /// Scrolls a lane of 3,000 uneven rows far down, then lists each of
+    /// `filters` in turn, the last of them every row, as typing and clearing
+    /// a filter does. Asserts that the row being read before the first is
+    /// where it was whenever it is listed.
+    fn filter_far_down(filters: &[&dyn Fn(u64, u64) -> bool]) {
         let mut renderer = super::super::accessibility_probe::headless_renderer();
         let all: Vec<u64> = (0..3000).collect();
         let mut ui = UserInterface::build(lane(all.clone()), SCREEN, Cache::new(), &mut renderer);
@@ -1482,35 +1513,55 @@ mod tests {
             ),
         );
         settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
-        let (row, _) = Positions::of(&mut ui, &renderer).first_on_screen();
-        let key = Positions::key(&row);
-        // A filter that keeps one row in ten, the first row wholly on screen
-        // among them, leaves far less to scroll through than the old offset.
-        // Clearing it brings the other nine back around what is on screen.
-        let matching: Vec<u64> = all.iter().copied().filter(|k| k % 10 == key % 10).collect();
-        for keys in [matching, all] {
-            // The row at the top of the view, or the first below it that the
-            // change keeps, is what the user is looking at.
-            let before = Positions::of(&mut ui, &renderer);
-            let (row, was) = before
-                .1
-                .keys()
-                .filter(|name| keys.contains(&Positions::key(name)))
-                .filter_map(|name| {
-                    let top = before.on_screen(name)?;
-                    (top + uneven(Positions::key(name) as usize) > 0.0).then(|| (name.clone(), top))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap();
+        // The row the viewport's top is in.
+        let before = Positions::of(&mut ui, &renderer);
+        let (key, was) = before
+            .1
+            .iter()
+            .map(|(name, top)| (Positions::key(name), top - before.0))
+            .filter(|(key, top)| top + uneven(*key as usize) > 0.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let row = format!("row-{key}");
+        let everything: &dyn Fn(u64, u64) -> bool = &|_, _| true;
+        for filter in filters.iter().chain([&everything]) {
+            let keys: Vec<u64> = all.iter().copied().filter(|k| filter(*k, key)).collect();
+            let listed = keys.contains(&key);
             let cache = ui.into_cache();
             ui = UserInterface::build(lane(keys), SCREEN, cache, &mut renderer);
             settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
-            let is = Positions::of(&mut ui, &renderer).on_screen(&row);
-            // The scrollable draws at a whole-pixel offset.
-            assert!(
-                is.is_some_and(|is| (is - was).abs() <= 0.5),
-                "{row} was at {was}, is at {is:?}"
-            );
+            if listed {
+                let is = Positions::of(&mut ui, &renderer).on_screen(&row);
+                // The scrollable draws at a whole-pixel offset.
+                assert!(
+                    is.is_some_and(|is| (is - was).abs() <= 0.5),
+                    "{row} was at {was}, is at {is:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_filter_that_keeps_the_row_being_read_leaves_it_in_place() {
+        // One row in ten, the row being read among them.
+        filter_far_down(&[&|k, key| k % 10 == key % 10]);
+    }
+
+    #[test]
+    fn clearing_a_filter_that_hid_the_row_being_read_returns_to_it() {
+        // Twenty rows from the top of the list, none of them built, though
+        // together taller than the lane, so the lane shows their end.
+        filter_far_down(&[&|k, _| k < 20]);
+    }
+
+    #[test]
+    fn typing_a_filter_a_letter_at_a_time_and_clearing_it_returns_to_the_row_being_read() {
+        // The first letters keep the row being read; later ones hide it.
+        filter_far_down(&[
+            &|k, key| k % 2 == key % 2,
+            &|k, key| k % 10 == key % 10,
+            &|k, _| k < 20,
+            &|k, _| k < 5,
+        ]);
     }
 }

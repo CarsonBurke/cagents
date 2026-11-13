@@ -40,8 +40,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    project repository, and `bin/` with the synthetic `claude`, a `gh` that
    fails until [switched on](#an-offline-github), a `curl` that always
    fails, an `xdg-open` that records each link the app opens in
-   `state/opened-urls` rather than starting a browser and, for a session started with `--codex`, an
-   [offline `codex`](#an-offline-codex), or an explicitly selected
+   `state/opened-urls` rather than starting a browser and, for a session
+   started with `--codex`, an [offline `codex`](#an-offline-codex), or an
+   explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
