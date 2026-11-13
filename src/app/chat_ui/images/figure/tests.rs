@@ -123,6 +123,14 @@ fn images_that_cannot_be_shown_say_why() {
         reason("missing.png", self::origin(directory.path())),
         Reason::Missing
     );
+    match read("missing.png".into(), self::origin(directory.path()), None) {
+        Outcome::Failed { detail, .. } => assert_eq!(
+            detail,
+            directory.path().join("missing.png").display().to_string(),
+            "a missing file's tip names the file it looked for"
+        ),
+        _ => panic!("missing.png should not decode"),
+    }
     assert_eq!(
         reason("notes.png", self::origin(directory.path())),
         Reason::NotImage

@@ -460,13 +460,18 @@ fn read(path: PathBuf, origin: Origin, known: Option<Stamp>) -> Outcome {
                     detail: format!("{} is not a regular file.", shown.display()),
                 };
             }
+            // The reason already says what went wrong; the detail names the
+            // file, and why it can't be read without the OS error number.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Outcome::Failed {
+                    reason: Reason::Missing,
+                    detail: shown.display().to_string(),
+                };
+            }
             Err(error) => {
                 return Outcome::Failed {
-                    reason: match error.kind() {
-                        std::io::ErrorKind::NotFound => Reason::Missing,
-                        _ => Reason::Unreadable,
-                    },
-                    detail: format!("{}: {error}", shown.display()),
+                    reason: Reason::Unreadable,
+                    detail: format!("{}: {}", shown.display(), error.kind()),
                 };
             }
         }
