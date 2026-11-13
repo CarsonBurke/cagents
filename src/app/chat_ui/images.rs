@@ -4,6 +4,7 @@ use super::*;
 mod canvas;
 pub(super) mod clipboard;
 pub(super) mod figure;
+pub(super) mod preview;
 pub(in crate::app) use clipboard::{ImageCommand, ImageRef};
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
@@ -1095,10 +1096,7 @@ impl Runtime {
                 .into()
             };
         };
-        let preview = iced::widget::image(handle.clone())
-            .width(Length::Fill)
-            .height(280)
-            .content_fit(iced::ContentFit::Contain);
+        let preview = preview::image(handle.clone());
         let image = ImageRef::Transcript(self.target, handle.id());
         let path = clipboard::has_copyable_path(self, &item.content);
         widget::column::with_children(vec![
@@ -1106,8 +1104,7 @@ impl Runtime {
                 widget::button::custom(preview)
                     .class(crate::ui_controls::control_style(false, None))
                     .padding(0)
-                    .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                    .width(Length::Fill),
+                    .on_press(action(Action::OpenImage(self.target, item.id.clone()))),
                 move || clipboard::menu(image, path, false),
             ),
             design::caption(format!("{label} · Click to enlarge")).into(),
