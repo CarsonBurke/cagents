@@ -1987,18 +1987,6 @@ impl Claude {
                                 if ended.is_none() {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                                if !history
-                                    && let Some(agent) =
-                                        frame["tool_use_result"]["agentId"].as_str()
-                                    && let Some(previous) = self.agent_call(agent, &tool_id)
-                                {
-                                    step.events.push(subagent_status(
-                                        previous,
-                                        ToolStatus::Ended,
-                                        Some("Superseded by a later run of this agent"),
-                                        false,
-                                    ));
-                                }
                             }
                             let background = self.background_agents.contains(&tool_id);
                             let status = if let Some(ended) =
@@ -2032,12 +2020,24 @@ impl Claude {
                             });
                             if let ItemContent::Tool { output, .. } = &item.content
                                 && let Some(address) = agent_address(structured, output)
-                                && self.addressed_agents.insert(tool_id.clone())
                             {
-                                step.events.push(Event::AgentAddress(AgentAddress {
-                                    address,
-                                    subagent: tool_id.clone(),
-                                }));
+                                if !history
+                                    && child.is_none()
+                                    && let Some(previous) = self.agent_call(&address, &tool_id)
+                                {
+                                    step.events.push(subagent_status(
+                                        previous,
+                                        ToolStatus::Ended,
+                                        Some("Superseded by a later run of this agent"),
+                                        false,
+                                    ));
+                                }
+                                if self.addressed_agents.insert(tool_id.clone()) {
+                                    step.events.push(Event::AgentAddress(AgentAddress {
+                                        address,
+                                        subagent: tool_id.clone(),
+                                    }));
+                                }
                             }
                         }
                         if let Some(content) = block["content"].as_array() {
@@ -2943,7 +2943,7 @@ impl Adapter for Claude {
             for frame in frames {
                 self.history_message(&frame, &mut history_step)?;
             }
-            let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
+            let mut calls = history.agent_addresses.iter().collect::<Vec<_>>();
             calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
             for (tool, agent) in calls {
                 self.agent_call(agent, tool);
@@ -3019,6 +3019,11 @@ impl Adapter for Claude {
             let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
             statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
             for (id, status) in statuses {
+                let status = if self.is_superseded(id) {
+                    &ToolStatus::Ended
+                } else {
+                    status
+                };
                 if *status == ToolStatus::Stopped {
                     self.ended_agents.push_back((id.clone(), *status));
                 } else if *status == ToolStatus::Ended {
@@ -13924,6 +13929,65 @@ mod tests {
                 .unwrap();
             assert_eq!(old.status, ToolStatus::Ended);
             assert!(old.detail.contains("before the current prompt"));
+        }
+    }
+
+    #[test]
+    fn foreground_same_address_replacement_retires_failures_live_and_on_restore() {
+        for restored in [false, true] {
+            let mut frames = Vec::new();
+            for (tool, failed) in [("old-foreground", true), ("new-foreground", false)] {
+                frames.push(scoped_call(
+                    None,
+                    &format!("{tool}-call"),
+                    tool,
+                    "Agent",
+                    json!({"description":tool}),
+                ));
+                frames.push(json!({"type":"user","uuid":format!("{tool}-result"),"tool_use_result":{"agentId":"shared-foreground"},"toolUseResult":{"agentId":"shared-foreground"},"message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":failed,"content":format!("agentId: shared-foreground\n{tool} report")}]}}));
+            }
+            let mut state = chat::Snapshot::default();
+            if restored {
+                let mut adapter = Claude {
+                    history: Some(correlation_history(frames)),
+                    ..Default::default()
+                };
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.initialize().unwrap().events,
+                );
+                assert_eq!(adapter.agent_calls.back().unwrap().1, "new-foreground");
+            } else {
+                let mut adapter = Claude::default();
+                for frame in frames {
+                    crate::chat::runtime::project_events_for_test(
+                        &mut state,
+                        adapter.receive(frame).unwrap().events,
+                    );
+                }
+            }
+            assert!(state.subagent_activity().failed.is_empty());
+            assert_eq!(state.subagent_activity().working, 0);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "old-foreground")
+                    .unwrap()
+                    .status,
+                ToolStatus::Ended
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "new-foreground")
+                    .unwrap()
+                    .status,
+                ToolStatus::Succeeded
+            );
+            assert!(state.items.iter().any(|item| item.id == "old-foreground"
+                && item.content.status() == Some(ToolStatus::Failed)));
         }
     }
 
