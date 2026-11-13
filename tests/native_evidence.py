@@ -1746,13 +1746,20 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.assertEqual(opened["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"],
                          [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                            "conclusion": "SUCCESS", "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}}])
-        # Its probe: the viewer's newest issue, free to ask again while unchanged.
+        # Its probe: the viewer's latest changes, free to ask again while unchanged,
+        # dated by the forge's clock as GitHub dates its answers.
         probe = "gh api --include --hostname github.com --method GET " \
-            "'repos/Octo-Org/app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=1'"
+            "'repos/Octo-Org/app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=20'"
         first = self.fixture_shell(probe)
         head, body = first.stdout.split("\n\n", 1)
-        self.assertEqual([(row["number"], row["updated_at"]) for row in json.loads(body)],
-                         [(7, "2026-11-01T00:00:00Z")])
+        self.assertEqual([(row["number"], row["updated_at"], "pull_request" in row) for row in json.loads(body)],
+                         [(7, "2026-11-01T00:00:00Z", True)])
+        self.assertRegex(head, r"(?m)^Date: \w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT$")
+        # The sidebar's and review scan's: everyone's, as many as asked for.
+        everyone = self.fixture_shell(
+            "gh api --hostname github.com --method GET "
+            "'repos/Octo-Org/app/issues?state=all&sort=updated&direction=desc&per_page=1'")
+        self.assertEqual(len(json.loads(everyone.stdout)), 1)
         (etag,) = re.findall(r"^Etag: (.+)$", head, re.MULTILINE)
         again = self.fixture_shell(f"{probe} -H 'If-None-Match: {etag}'", check=False)
         self.assertEqual((again.returncode, again.stderr), (1, "gh: HTTP 304\n"))

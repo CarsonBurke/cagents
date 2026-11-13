@@ -195,9 +195,11 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
     assert_eq!(authored.all[0].status_check_rollup, None);
 
     // The board's probe is unchanged until a seed it covers changes.
-    let probe = "repos/Fixture-Owner/fixture-app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=1";
+    let probe = "repos/Fixture-Owner/fixture-app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=20";
     let Revalidation::Modified {
-        etag: Some(etag), ..
+        etag: Some(etag),
+        date: Some(_),
+        ..
     } = service
         .revalidate(&key, probe, None, &cancellation)
         .unwrap()

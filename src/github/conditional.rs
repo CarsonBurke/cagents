@@ -10,8 +10,13 @@ pub enum Revalidation {
     /// Unchanged since the validator the caller sent.
     NotModified,
     /// Changed, or there was nothing to compare with: the validator to send
-    /// next time, when GitHub returned one, and what the resource now holds.
-    Modified { etag: Option<String>, body: Vec<u8> },
+    /// next time, when GitHub returned one, what the resource now holds, and
+    /// GitHub's time when it answered, to compare its dates with.
+    Modified {
+        etag: Option<String>,
+        body: Vec<u8>,
+        date: Option<jiff::Timestamp>,
+    },
     /// GitHub refuses the resource itself, such as the issues of a repository
     /// that disabled them, so asking again soon would be refused again.
     Refused,
@@ -51,6 +56,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
                     Ok(Revalidation::Modified {
                         etag: response_header(head, "etag"),
                         body: body.to_vec(),
+                        date: response_header(head, "date").and_then(|date| {
+                            jiff::fmt::rfc2822::DateTimeParser::new()
+                                .parse_timestamp(date)
+                                .ok()
+                        }),
                     })
                 }
                 Err(error) if error.rate_limit().is_some() => {
@@ -190,7 +200,7 @@ mod tests {
             "gh",
             answer(
                 true,
-                "HTTP/2.0 200 OK\r\nEtag: W/\"next\"\r\nX-Ratelimit-Remaining: 4000\r\n\r\n[{\"number\":1}]",
+                "HTTP/2.0 200 OK\r\nDate: Thu, 12 Nov 2026 23:59:35 GMT\r\nEtag: W/\"next\"\r\nX-Ratelimit-Remaining: 4000\r\n\r\n[{\"number\":1}]",
                 "",
             ),
         );
@@ -206,6 +216,7 @@ mod tests {
             Revalidation::Modified {
                 etag: Some("W/\"next\"".into()),
                 body: b"[{\"number\":1}]".to_vec(),
+                date: Some("2026-11-12T23:59:35Z".parse().unwrap()),
             }
         );
     }

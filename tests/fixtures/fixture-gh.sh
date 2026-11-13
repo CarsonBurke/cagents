@@ -56,6 +56,7 @@ headers() {
     status=$1 resource=$2
     printf 'HTTP/2.0 %s\n' "$status"
     printf '%s\r\n' \
+        "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
         'Content-Type: application/json; charset=utf-8' \
         'X-Github-Media-Type: github.v3; format=json' \
         'X-Ratelimit-Limit: 5000' \

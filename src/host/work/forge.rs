@@ -150,41 +150,49 @@ impl Listing {
     /// this listing was read that search has had time to show it, and an
     /// answer of only such recent changes may have more beyond it.
     fn reflects(&self, recent: &Recent) -> bool {
+        // When this listing was read, by GitHub's clock, less the lag.
         let Some(settled) = jiff::SignedDuration::try_from(SEARCH_LAG)
             .ok()
-            .and_then(|lag| self.read_at.checked_sub(lag).ok())
+            .and_then(|lag| {
+                self.read_at
+                    .checked_add(recent.skew)
+                    .ok()?
+                    .checked_sub(lag)
+                    .ok()
+            })
         else {
             return false;
         };
-        if recent.0.is_empty() {
+        if recent.rows.is_empty() {
             return self.pull_requests.is_empty();
         }
-        let full = recent.0.len() >= PROBE_PAGE;
-        if full && recent.0.iter().all(|row| row.updated >= settled) {
+        let full = recent.rows.len() >= PROBE_PAGE;
+        if full && recent.rows.iter().all(|row| row.updated >= settled) {
             return false;
         }
-        recent.0.iter().all(|row| {
+        recent.rows.iter().all(|row| {
             let Some(number) = row.pull_request else {
                 return true;
             };
-            match self
-                .pull_requests
-                .iter()
-                .find(|pull_request| pull_request.number == number)
-            {
-                Some(listed) => {
-                    listed.updated_at.parse::<jiff::Timestamp>().ok() == Some(row.updated)
-                }
-                None => row.updated < settled,
-            }
+            // Search has had time to show an older change, however it dates
+            // it.
+            row.updated < settled
+                || self.pull_requests.iter().any(|listed| {
+                    listed.number == number
+                        && listed.updated_at.parse::<jiff::Timestamp>().ok() == Some(row.updated)
+                })
         })
     }
 }
 
 /// The viewer's most recently updated issues and pull requests in the
-/// repository, newest first, as the probe's answer names them.
+/// repository, newest first, as the probe's answer names them, and how far
+/// GitHub's clock is ahead of this one's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Recent(Vec<Row>);
+struct Recent {
+    rows: Vec<Row>,
+    skew: jiff::SignedDuration,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -194,7 +202,7 @@ struct Row {
 }
 
 impl Recent {
-    fn of(body: &[u8]) -> Option<Self> {
+    fn of(body: &[u8], skew: jiff::SignedDuration) -> Option<Self> {
         let rows: Vec<serde_json::Value> = serde_json::from_slice(body).ok()?;
         rows.iter()
             .map(|row| {
@@ -207,7 +215,7 @@ impl Recent {
                 })
             })
             .collect::<Option<_>>()
-            .map(Self)
+            .map(|rows| Self { rows, skew })
     }
 }
 
@@ -450,6 +458,7 @@ fn ask<E: crate::repository::ProcessExecutor>(
         Probe::Validator(etag) => Some(etag.as_str()),
         Probe::Unknown | Probe::Unavailable(_) => None,
     };
+    let asked = jiff::Timestamp::now();
     match gh.revalidate(
         repository,
         &probe_path(repository, &listing.viewer),
@@ -457,7 +466,12 @@ fn ask<E: crate::repository::ProcessExecutor>(
         cancellation,
     ) {
         Ok(Revalidation::NotModified) => Answer::Current(listing.probe.clone()),
-        Ok(Revalidation::Modified { etag, body }) => match Recent::of(&body) {
+        Ok(Revalidation::Modified { etag, body, date }) => match Recent::of(
+            &body,
+            date.map_or(jiff::SignedDuration::ZERO, |date| {
+                date.duration_since(asked)
+            }),
+        ) {
             // Unchanged in effect, such as the first validator after a read.
             Some(recent) if listing.reflects(&recent) => {
                 Answer::Current(etag.map_or(Probe::Unknown, Probe::Validator))
@@ -788,7 +802,10 @@ mod tests {
             }]);
             output(
                 true,
-                format!("HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n{newest}"),
+                // GitHub's clock, just after the second change.
+                format!(
+                    "HTTP/2.0 200 OK\r\nDate: Fri, 02 Jan 2026 00:00:30 GMT\r\nEtag: {etag}\r\n\r\n{newest}"
+                ),
             )
         }
     }
@@ -935,24 +952,44 @@ mod tests {
             viewer: "me".into(),
             probe: Probe::Unknown,
         };
-        let recent = |body: serde_json::Value| Recent::of(body.to_string().as_bytes()).unwrap();
+        let ahead = |body: serde_json::Value, seconds: i64| {
+            Recent::of(
+                body.to_string().as_bytes(),
+                jiff::SignedDuration::from_secs(seconds),
+            )
+            .unwrap()
+        };
+        let recent = |body: serde_json::Value| ahead(body, 0);
         let pull = |number: u64, updated: &str| serde_json::json!({"number": number, "updated_at": updated, "pull_request": {}});
         let issue = |updated: &str| serde_json::json!({"number": 99, "updated_at": updated});
         let late = "2026-01-02T00:00:30Z";
+        let soon = "2026-01-02T00:01:00Z";
 
-        // The newest change, listed as it is now or not.
+        // A change made just before the read, listed as it is now or not.
         let changed = recent(serde_json::json!([pull(1, SECOND)]));
-        assert!(listing(&[(1, SECOND)], THIRD).reflects(&changed));
-        assert!(!listing(&[(1, FIRST)], THIRD).reflects(&changed));
+        assert!(listing(&[(1, SECOND)], late).reflects(&changed));
+        assert!(!listing(&[(1, FIRST)], late).reflects(&changed));
+        assert!(!listing(&[], late).reflects(&changed));
+        // Search has had time to show one long before, however it dates it.
+        assert!(listing(&[(1, FIRST)], THIRD).reflects(&changed));
+        // A change after the read isn't in it.
+        assert!(!listing(&[(1, FIRST)], FIRST).reflects(&changed));
+        // GitHub's clock, not this one, says how long search has had.
+        assert!(listing(&[], late).reflects(&ahead(serde_json::json!([pull(1, SECOND)]), 60)));
+        assert!(
+            !listing(&[], THIRD)
+                .reflects(&ahead(serde_json::json!([pull(1, SECOND)]), -24 * 60 * 60))
+        );
         // An older new pull request search hadn't returned yet, though it
         // returned a newer one.
         let both = recent(serde_json::json!([pull(2, late), pull(1, SECOND)]));
-        assert!(!listing(&[(2, late)], "2026-01-02T00:01:00Z").reflects(&both));
+        assert!(!listing(&[(2, late)], soon).reflects(&both));
+        assert!(listing(&[(2, late), (1, SECOND)], soon).reflects(&both));
         // One search has had a while to return and never did isn't waited for.
         assert!(listing(&[(2, late)], THIRD).reflects(&both));
         // Issues aren't listed.
-        let issues = recent(serde_json::json!([issue(THIRD), pull(1, SECOND)]));
-        assert!(listing(&[(1, SECOND)], FIRST).reflects(&issues));
+        let issues = recent(serde_json::json!([issue(late), pull(1, SECOND)]));
+        assert!(listing(&[(1, SECOND)], soon).reflects(&issues));
         // A whole answer of recent changes may hide more beyond it.
         let busy = recent(serde_json::Value::Array(
             (0..PROBE_PAGE).map(|_| issue(THIRD)).collect(),
@@ -960,7 +997,10 @@ mod tests {
         assert!(!listing(&[], THIRD).reflects(&busy));
         assert!(!listing(&[(1, SECOND)], THIRD).reflects(&recent(serde_json::json!([]))));
         assert!(listing(&[], THIRD).reflects(&recent(serde_json::json!([]))));
-        assert_eq!(Recent::of(b"{\"message\":\"no\"}"), None);
+        assert_eq!(
+            Recent::of(b"{\"message\":\"no\"}", jiff::SignedDuration::ZERO),
+            None
+        );
     }
 
     #[test]
