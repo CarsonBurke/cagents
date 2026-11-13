@@ -219,19 +219,27 @@ fn canonical_empty_retirement_accepts_an_agent_whose_pane_was_closed_there() {
             params![agent.id.to_string(), serde_json::to_string(&agent).unwrap()],
         )
         .unwrap();
-    let inserted = registry
-        .db
-        .execute(
-            "INSERT INTO retired_panes(scope, pane, ordinal, retired_at_unix_ms)
-             SELECT id, ?1, 1, 0 FROM view_scopes WHERE channel = ?2",
-            params![agent.id.to_string(), home.channel.to_string()],
-        )
+    // The person closed its pane there, which the view retires.
+    let card = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    let scope = crate::workspace_model::views::Scope::Channel(home.channel);
+    let seeded = registry
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: Vec::new(),
+            closed: vec![card],
+        })
         .unwrap();
-    assert_eq!(inserted, 1);
+    let view = seeded
+        .model
+        .views
+        .iter()
+        .find(|view| view.scope == scope)
+        .unwrap();
+    assert_eq!(view.retired, [card]);
     let applied = registry
         .apply(&ModelEdit::RetireEmptyChannel {
             home,
-            expected_view_revision: 0,
+            expected_view_revision: view.revision,
         })
         .unwrap();
     assert!(applied.changed);
