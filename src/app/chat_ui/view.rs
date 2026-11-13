@@ -4152,8 +4152,8 @@ impl Runtime {
                     .enumerate()
                     .map(|(index, choice)| {
                         let mut row: Vec<Element<'a, Message>> = Vec::new();
-                        match choice.used {
-                            Some(used) => row.push(crate::ui_controls::budget_radial(used)),
+                        match choice.left {
+                            Some(left) => row.push(crate::ui_controls::budget_radial(left)),
                             None => row.push(
                                 iced::widget::Space::new()
                                     .width(design::RADIAL_GAUGE_SIZE)
