@@ -2610,7 +2610,7 @@ mod tests {
         drop(app.sync_chrome());
         let state = app.card_state(card).unwrap();
         assert_eq!(app.card_display_title(state), "Parser rewrite");
-        assert_eq!(app.repository_chrome(state).0, "Parser rewrite");
+        assert_eq!(app.repository_chrome(state), "Parser rewrite");
         assert_eq!(app.card_chrome[&card].title, "Parser rewrite");
 
         Arc::make_mut(&mut app.durable).channels[1].title = "Renamed".into();

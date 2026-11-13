@@ -626,6 +626,18 @@ pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message
         },
     )
 }
+/// Whether any of `target`'s layouts waits for a free slot, which is all a
+/// [`Action::FlowAvailable`] resumes.
+pub(super) fn has_deferred(target: Target) -> bool {
+    REQUESTS.with(|requests| {
+        requests.borrow().values().any(|entry| {
+            entry.upgrade().is_some_and(|entry| {
+                let entry = entry.borrow();
+                entry.target == Some(target) && entry.deferred.is_some()
+            })
+        })
+    })
+}
 pub(super) fn deferred_requests(target: Target) -> Vec<Request> {
     REQUESTS.with(|requests| {
         requests
@@ -2417,6 +2429,33 @@ fn queued_none_flow_results_hold_admission_through_cancellation_error_and_worker
         drop(permit);
     }
     executor.shutdown_background();
+}
+
+/// Slot availability is subscribed only while a chat's layout waits for one.
+#[test]
+fn only_a_deferred_layout_waits_for_slot_availability() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let cache = Cache::default();
+    let entry = cache.entry(92, vec![Span::new("waiting reader")].into());
+    entry.borrow_mut().bind_target(target);
+    entry
+        .borrow_mut()
+        .configure(400.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+    let request = entry.borrow_mut().request().unwrap();
+    assert!(!has_deferred(target));
+    entry.borrow_mut().defer(&request, 1);
+    assert!(has_deferred(target));
+    assert!(!has_deferred(Target {
+        card: CardId::new(),
+        generation: 0,
+    }));
+    drop(request);
+    drop(entry);
+    drop(cache);
+    assert!(!has_deferred(target));
 }
 
 #[test]
