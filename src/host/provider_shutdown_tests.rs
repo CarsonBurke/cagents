@@ -1451,3 +1451,52 @@ fn startup_lets_an_agent_follow_its_pane_reopened_in_an_earlier_boot() {
         0
     );
 }
+
+/// A daemon that stops cleanly records that the agent's process ended, so a
+/// later daemon in the same boot may reopen the chat in place and keep the
+/// agent. Without that record the earlier process may still be running.
+#[test]
+fn a_chat_reopened_in_place_after_a_recorded_stop_keeps_its_agent() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (registry, agent, session, _) = reopenable_codex_agent(directory.path());
+    let first = session.proof.clone().unwrap();
+    let mut state = HostState::new(first.clone());
+    state.install_model(registry);
+    let handle = quiet_chat(&directory.path().canonicalize().unwrap());
+    state
+        .chats
+        .insert(session.id, record(session.clone(), handle.clone()));
+    let host = Arc::new(state::HostLock::new(state));
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        ..first
+    };
+    let reopened = chat::Session {
+        proof: Some(restarted.clone()),
+        ..session.clone()
+    };
+    assert!(
+        agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .adopt_successor(&session, &reopened)
+            .is_err(),
+        "nothing yet proves the running process ended"
+    );
+
+    finish_chat_shutdown(&host).unwrap();
+    assert!(handle.is_completed());
+    drop(host);
+    let registry = model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+    let mut state = HostState::new(restarted);
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    assert!(agent_execution::adopt_resumed(&host, &reopened).unwrap());
+    let registry = agent_execution::registry(&host).unwrap();
+    assert_eq!(
+        registry.lock().unwrap().agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(reopened))
+    );
+}

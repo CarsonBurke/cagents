@@ -1871,17 +1871,21 @@ impl Registry {
     ///
     /// A conversation can also reopen in place after an unclean restart,
     /// keeping its chat ID under a new process proof, as a Codex conversation
-    /// does through its retained listener allocation. That successor is the
-    /// same chat under a later boot; only an earlier boot proves its
-    /// predecessor ended, and any authority that predecessor held is dropped.
+    /// does through its retained listener allocation. The same proof of an
+    /// ended predecessor applies; authority issued to the successor's own
+    /// process is kept, and any other under that ID is dropped. A reopen that
+    /// is the very process the agent already holds proves nothing ended.
     pub(crate) fn adopt_successor(
         &mut self,
         predecessor: &crate::chat::Session,
         successor: &crate::chat::Session,
     ) -> Result<bool, String> {
         let in_place = successor.id == predecessor.id;
-        if in_place && successor == predecessor {
-            return Ok(false);
+        if in_place
+            && HostedSession::Chat(successor.clone())
+                .same_process(&HostedSession::Chat(predecessor.clone()))
+        {
+            return Err("The successor is the process the agent already holds".into());
         }
         if successor.launch.provider != predecessor.launch.provider
             || successor.launch.recipe.working_directory
@@ -1930,10 +1934,7 @@ impl Registry {
             .proof
             .as_ref()
             .is_some_and(|proof| proof.boot_id != boot);
-        // A chat reopened in place shares its ID with the process it
-        // replaces, so only a boot that process did not survive tells them
-        // apart.
-        if !earlier_boot && (in_place || !stopped) {
+        if !earlier_boot && !stopped {
             return Err("The predecessor may still be running; stop it first".into());
         }
         // Any authority left from an earlier boot is stale. Rewriting the
@@ -1941,12 +1942,24 @@ impl Registry {
         if in_place {
             // The reopened process shares the ID; keep only what was issued
             // to it.
-            let successor_source = encode(&HostedSession::Chat(successor.clone()))?;
-            tx.execute(
-                "DELETE FROM agent_authorities WHERE session_id = ?1 AND source != ?2",
-                params![predecessor.id.to_string(), successor_source],
-            )
-            .map_err(|error| error.to_string())?;
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                    [predecessor.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let next = HostedSession::Chat(successor.clone());
+            if let Some(stored) = stored
+                && !next.same_process(&decode::<HostedSession>(&stored)?)
+            {
+                tx.execute(
+                    "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
+                    params![predecessor.id.to_string(), stored],
+                )
+                .map_err(|error| error.to_string())?;
+            }
         } else {
             tx.execute(
                 "DELETE FROM agent_authorities WHERE session_id = ?1",
@@ -2009,10 +2022,16 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut adopted = 0;
         for record in records {
-            let mut agent: Agent = decode(&record)?;
+            // One unreadable record must not hold back the others.
+            let Ok(mut agent) = decode::<Agent>(&record) else {
+                continue;
+            };
             let Some(HostedSession::Chat(bound)) = &agent.session else {
                 continue;
             };
+            if !earlier(bound) {
+                continue;
+            }
             let Some(shown) = super::views::agent_pane_chat(&tx, agent.id)? else {
                 continue;
             };
@@ -2020,7 +2039,6 @@ impl Registry {
             let next = HostedSession::Chat(shown.clone());
             if shown.id != bound.id
                 || next.same_process(&previous)
-                || !earlier(bound)
                 || !earlier(&shown)
                 || shown.launch.provider != bound.launch.provider
                 || shown.launch.recipe.working_directory != bound.launch.recipe.working_directory

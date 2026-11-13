@@ -1368,8 +1368,11 @@ pub(in crate::host) fn adopt_resumed(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .agent_for_session(successor.id)?;
+        let next = HostedSession::Chat(successor.clone());
         return match bound.and_then(|agent| agent.session) {
-            Some(HostedSession::Chat(previous)) if previous != *successor => {
+            Some(HostedSession::Chat(previous))
+                if !HostedSession::Chat(previous.clone()).same_process(&next) =>
+            {
                 adopt_successor(host, &previous, successor)
             }
             _ => Ok(false),
