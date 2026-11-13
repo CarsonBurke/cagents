@@ -29,6 +29,30 @@ def private_directory(path):
     return path.resolve(strict=True)
 
 
+def configure_peer(root):
+    """Restore fixture settings after native launches filter CAGENTS_* values."""
+    path = root / "codex-fixture.json"
+    if not path.exists() and not path.is_symlink():
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as stream:
+        settings = json.load(stream)
+    names = {"pause": "CAGENTS_TOOL_ROWS_PAUSE",
+             "never_confirm_interrupt": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT",
+             "never_confirm_close": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE"}
+    if not isinstance(settings, dict) or settings.keys() - names.keys():
+        raise ValueError("unknown Codex fixture setting")
+    for key, value in settings.items():
+        if key == "pause":
+            if type(value) not in (int, float) or not 0 < value <= 300:
+                raise ValueError("Codex fixture pause must be between 0 and 300 seconds")
+            os.environ[names[key]] = str(value)
+        else:
+            if type(value) is not bool:
+                raise ValueError("Codex fixture confirmation settings must be boolean")
+            os.environ[names[key]] = "1" if value else "0"
+
+
 def listener_path(args, runtime):
     address = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--listen=")), None)
     if "--listen" in args:
@@ -154,6 +178,7 @@ def main():
         print("codex-cli 0.162.0 (offline update rehearsal fixture)")
         return
     root = private_directory(Path(os.environ["CAGENTS_TOOL_ROWS_FIXTURE_ROOT"]))
+    configure_peer(root)
     logs = root / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     # The harness may create logs with its ordinary umask; ROOT itself is 0700.
@@ -191,9 +216,21 @@ def main():
         path = listener_path(args, runtime)
 
         class LoggedScenario(scenario_class(peer, home / "rehearsal-app-server", path)):
+            def observe(self, notification, generations=None):
+                accepted = super().observe(notification, generations)
+                if accepted and notification.get("method") in ("turn/started", "turn/completed"):
+                    params = notification["params"]
+                    record("notification", method=notification["method"], socket=str(path),
+                           thread_id=params["threadId"], turn_id=params["turn"]["id"],
+                           status=params["turn"]["status"], parent=params["threadId"] == self.thread)
+                return accepted
+
             def request(self, frame, codex_home):
                 responses = super().request(frame, codex_home)
+                params = frame.get("params") or {}
                 record("request", method=frame.get("method"), request_id=frame.get("id"),
+                       socket=str(path), parent=params.get("threadId") == self.thread,
+                       thread_id=params.get("threadId"), turn_id=params.get("turnId"),
                        errors=[response["error"] for response in responses if "error" in response])
                 return responses
 
