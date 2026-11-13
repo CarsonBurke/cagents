@@ -535,16 +535,25 @@ fn accepted_wait_output(
                     }
                     Operation::List => Reply::Listed(vec![]),
                     Operation::Inbox(_) | Operation::PeekInbox(_) => Reply::Inbox(vec![]),
-                    Operation::Submit(submit) => {
+                    // A spawn submits; a follow-up asks for a prompt, which
+                    // this agent takes now.
+                    Operation::Submit(submit)
+                    | Operation::Prompt {
+                        request: submit, ..
+                    } => {
                         submits += 1;
                         assert_eq!(submits, 1, "no duplicate submission after Accepted");
-                        match submit.destination {
-                            agent_execution::Destination::New(_) => assert!(spawn),
+                        let prompted = match submit.destination {
+                            agent_execution::Destination::New(_) => {
+                                assert!(spawn);
+                                false
+                            }
                             agent_execution::Destination::Existing(id) => {
                                 assert!(!spawn);
                                 assert_eq!(id, accepted.agent.id);
+                                true
                             }
-                        }
+                        };
                         receipt = Some(serde_json::json!({
                             "agent": accepted.agent,
                             "run": accepted.run,
@@ -552,7 +561,14 @@ fn accepted_wait_output(
                             "idempotency_key": submit.idempotency_key,
                             "device": "local",
                         }));
-                        Reply::Accepted(accepted.clone())
+                        if prompted {
+                            Reply::Prompted {
+                                accepted: accepted.clone(),
+                                start: agent_execution::Start::Sent { resumed: false },
+                            }
+                        } else {
+                            Reply::Accepted(accepted.clone())
+                        }
                     }
                     Operation::Run(id) => {
                         assert_eq!(id, accepted.run.id);

@@ -7,7 +7,7 @@ use crate::{
     agent_execution::{Agent, HostedSession, Lineage, Origin},
     model::TerminalId,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 /// Keeps an idempotency key that a rewritten origin would make collide out of
@@ -207,6 +207,18 @@ impl Registry {
         Ok(agents)
     }
 
+    /// The open agent bound to a session of `lineage`, if exactly one is: the
+    /// agent a message to that lineage is for.
+    pub(crate) fn lineage_agent(&self, lineage: Lineage) -> Result<Option<Agent>, String> {
+        lineage_agent_in(&self.db, lineage)
+    }
+
+    /// Whether a message to `agent`'s conversation becomes one of its runs;
+    /// see `takes_messages_as_runs_in`.
+    pub(crate) fn takes_messages_as_runs(&self, agent: &Agent) -> Result<bool, String> {
+        takes_messages_as_runs_in(&self.db, agent)
+    }
+
     /// Whether `id` was registered as a session or names a lineage.
     pub(crate) fn lineage_recorded(&self, id: TerminalId) -> Result<bool, String> {
         self.db
@@ -289,20 +301,71 @@ impl Registry {
     }
 
     fn lineage_members(&self, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
-        let mut statement = self
-            .db
-            .prepare_cached("SELECT session_id FROM session_lineages WHERE lineage = ?1")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([lineage.to_string()], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?;
-        rows.map(|row| {
-            row.map_err(|error| error.to_string())?
-                .parse()
-                .map_err(|_| "Stored session lineage is invalid".to_owned())
-        })
-        .collect()
+        lineage_members_in(&self.db, lineage)
     }
+}
+
+fn lineage_members_in(db: &Connection, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
+    let mut statement = db
+        .prepare_cached("SELECT session_id FROM session_lineages WHERE lineage = ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([lineage.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        row.map_err(|error| error.to_string())?
+            .parse()
+            .map_err(|_| "Stored session lineage is invalid".to_owned())
+    })
+    .collect()
+}
+
+fn lineage_agent_in(db: &Connection, lineage: Lineage) -> Result<Option<Agent>, String> {
+    let mut members = lineage_members_in(db, lineage)?;
+    if !members.contains(&lineage.0) {
+        members.push(lineage.0);
+    }
+    let mut agents = Vec::new();
+    for member in members {
+        agents.extend(super::execution::agent_for_session_in(db, member)?);
+    }
+    Ok(match <[Agent; 1]>::try_from(agents) {
+        Ok([agent]) => Some(agent),
+        Err(_) => None,
+    })
+}
+
+/// Whether a message to `agent`'s conversation becomes one of its runs: the
+/// agent is open, the only open agent of its lineage, which messages name,
+/// hosted in a chat, and no automation's or person's. Every other recipient
+/// takes messages as messages, outside the order of its runs.
+pub(super) fn takes_messages_as_runs_in(db: &Connection, agent: &Agent) -> Result<bool, String> {
+    let Some(HostedSession::Chat(session)) = &agent.session else {
+        return Ok(false);
+    };
+    if agent.closed
+        || matches!(agent.origin, Origin::Automation { .. })
+        || super::execution::agent_is_interactive_in(db, agent.id)?
+    {
+        return Ok(false);
+    }
+    let lineage: Option<String> = db
+        .query_row(
+            "SELECT lineage FROM session_lineages WHERE session_id = ?1",
+            [session.id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let lineage = match lineage {
+        Some(lineage) => Lineage(
+            lineage
+                .parse()
+                .map_err(|_| "Stored session lineage is invalid".to_owned())?,
+        ),
+        None => Lineage(session.id),
+    };
+    Ok(lineage_agent_in(db, lineage)?.is_some_and(|only| only.id == agent.id))
 }
 
 #[cfg(test)]

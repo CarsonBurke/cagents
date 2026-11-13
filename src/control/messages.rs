@@ -2,7 +2,8 @@ use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
     mailbox::{
-        Delivery, Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short,
+        Delivery, Handed, Handoff, Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State,
+        To, short,
     },
 };
 #[cfg(feature = "ui")]
@@ -105,15 +106,15 @@ fn recipient(to: String) -> To {
 
 pub(super) fn send(arguments: SendArgs) -> Result<CommandOutput, AppError> {
     let mut client = Mailbox::connect()?;
-    let delivery = client.send(Outgoing {
+    let handed = client.send(Outgoing {
         to: recipient(arguments.to),
         body: arguments.message.read()?,
         wait_ms: None,
     })?;
     Ok(CommandOutput {
         command: "send",
-        human: delivery_lines(&delivery),
-        data: delivery_json(&delivery),
+        human: delivery_lines(&handed),
+        data: delivery_json(&handed),
     })
 }
 
@@ -135,11 +136,11 @@ pub(super) fn reply(arguments: ReplyArgs) -> Result<CommandOutput, AppError> {
     if arguments.wait {
         return converse("reply", outgoing, arguments.timeout);
     }
-    let delivery = Mailbox::connect()?.send(outgoing)?;
+    let handed = Mailbox::connect()?.send(outgoing)?;
     Ok(CommandOutput {
         command: "reply",
-        human: delivery_lines(&delivery),
-        data: delivery_json(&delivery),
+        human: delivery_lines(&handed),
+        data: delivery_json(&handed),
     })
 }
 
@@ -180,9 +181,9 @@ fn converse(
 ) -> Result<CommandOutput, AppError> {
     let mut client = Mailbox::connect()?;
     outgoing.wait_ms = Some((timeout * 1000.0).ceil() as u64);
-    let delivery = client.send(outgoing)?;
-    let sent = &delivery.sent;
-    let mut data = delivery_json(&delivery);
+    let handed = client.send(outgoing)?;
+    let sent = &handed.delivery.sent;
+    let mut data = delivery_json(&handed);
     // The daemon holds no reply for an asker no one can answer yet.
     if sent.message.wait_until_ms.is_none() {
         data["replies"] = json!([]);
@@ -190,7 +191,7 @@ fn converse(
             command,
             human: format!(
                 "{}\nNot waiting, since no one can answer before then; a later reply arrives as a message.",
-                delivery_lines(&delivery)
+                delivery_lines(&handed)
             ),
             data,
         });
@@ -216,33 +217,78 @@ fn converse(
             "timeout",
             format!(
                 "{}\nNo reply within {timeout} s. A later reply arrives as a message; read it with `cagents inbox`.",
-                delivery_lines(&delivery)
+                delivery_lines(&handed)
             ),
         )),
     }
 }
 
 /// A delivery as `--json` reports it: the message, how it reaches its
-/// recipient, the recipient's session as `sessions --json` lists it, and
-/// what keeps the recipient from acting on it, in words.
-fn delivery_json(delivery: &Delivery) -> Value {
+/// recipient, the recipient's session as `sessions --json` lists it, what
+/// keeps the recipient from acting on it, in words, and how an agent
+/// recipient takes it.
+fn delivery_json(handed: &Handed) -> Value {
+    let delivery = &handed.delivery;
     json!({
         "message": delivery.sent.message,
         "reach": delivery.sent.reach,
         "recipient": delivery.recipient.as_ref().map(super::sessions::session_json),
-        "notice": recipient_notice(delivery),
+        "notice": notice(handed),
+        "agent": handed.agent,
     })
 }
 
-/// The sent line, then what keeps the recipient from acting on the message.
-/// The sent line says a live conversation takes a message once idle; a
-/// limited one is idle yet takes nothing, so the notice reads as a correction.
-fn delivery_lines(delivery: &Delivery) -> String {
-    let line = sent_line(&delivery.sent);
-    match recipient_notice(delivery) {
-        Some(notice) => format!("{line}\nBut {notice}"),
-        None => line,
+/// The sent line; for an agent recipient, the run it took the message as;
+/// then what keeps the recipient from acting on the message. The sent line
+/// says a live conversation takes a message once idle; a limited one is idle
+/// yet takes nothing, so the notice reads as a correction.
+fn delivery_lines(handed: &Handed) -> String {
+    let mut lines = vec![sent_line(&handed.delivery.sent, handed.agent.as_ref())];
+    if let Some(Handoff::Run { agent, run, start }) = &handed.agent {
+        if matches!(start, crate::agent_execution::Start::Sent { resumed: true }) {
+            lines.push(
+                "Its conversation had stopped, so cagents reopened it to take the message.".into(),
+            );
+        }
+        lines.push(format!(
+            "It runs as run {} of agent {}.",
+            short(*run),
+            short(*agent)
+        ));
     }
+    if let Some(Handoff::Ended { agent, run, reason }) = &handed.agent {
+        lines.push(format!(
+            "It ran as run {} of agent {}, which ended without finishing: {}.",
+            short(*run),
+            short(*agent),
+            reason.trim_end_matches('.')
+        ));
+    }
+    if let Some(Handoff::Unknown { agent, run, reason }) = &handed.agent {
+        lines.push(format!(
+            "It went to agent {} as run {}, which ended without proof of whether the agent received it: {}. Inspect that conversation before sending it again.",
+            short(*agent),
+            short(*run),
+            reason.trim_end_matches('.')
+        ));
+    }
+    if let Some(notice) = notice(handed) {
+        lines.push(format!("But {notice}"));
+    }
+    lines.join("\n")
+}
+
+/// Why the recipient cannot act on a message now, when it cannot: its usage
+/// limit; or why the agent cagents hosts for it did not take it as a run, so
+/// it arrives as the sent line says a message to any session does.
+fn notice(handed: &Handed) -> Option<String> {
+    recipient_notice(&handed.delivery).or_else(|| match &handed.agent {
+        Some(Handoff::Held { reason, .. }) => Some(format!(
+            "cagents did not start a run of that agent with it: {}.",
+            reason.trim_end_matches('.')
+        )),
+        _ => None,
+    })
 }
 
 /// Why the recipient cannot act on a message now, when it cannot: its usage
@@ -285,37 +331,85 @@ pub enum Arrival {
     NextSession,
     /// The user, outside every session, reads it with `cagents inbox`.
     User,
+    /// The agent cagents hosts for it took it as a run, which started now.
+    Started,
+    /// That agent takes it as its next run once its current work ends.
+    Queued,
+    /// That agent takes it as a run once the messages sent to it earlier have
+    /// become runs.
+    Behind,
+    /// Every agent slot is taken; that agent takes it as a run once one frees.
+    NoSlot,
+    /// That agent received it as a run, which ended without finishing.
+    Ended,
+    /// That agent took it as a run, which ended with no proof of whether the
+    /// agent received it.
+    Unknown,
 }
 
-fn sent_line(sent: &Sent) -> String {
+impl Arrival {
+    /// How `sent`, which `agent` took as its recipient agent, arrives.
+    pub(crate) fn of(sent: &Sent, agent: Option<&Handoff>) -> Self {
+        use crate::agent_execution::Start;
+        match (agent, sent.reach, sent.message.to.lineage) {
+            (
+                Some(Handoff::Run {
+                    start: Start::Sent { .. },
+                    ..
+                }),
+                ..,
+            ) => Arrival::Started,
+            (
+                Some(
+                    Handoff::Run {
+                        start: Start::Queued { .. },
+                        ..
+                    }
+                    | Handoff::Waiting { .. },
+                ),
+                ..,
+            ) => Arrival::Queued,
+            (Some(Handoff::Behind { .. }), ..) => Arrival::Behind,
+            (Some(Handoff::NoSlot { .. }), ..) => Arrival::NoSlot,
+            (Some(Handoff::Ended { .. }), ..) => Arrival::Ended,
+            (Some(Handoff::Unknown { .. }), ..) => Arrival::Unknown,
+            (_, _, None) => Arrival::User,
+            (_, Reach::Conversation, _) => Arrival::WhenIdle,
+            (_, Reach::Inbox, _) => Arrival::Inbox,
+            (_, Reach::Offline, _) => Arrival::NextSession,
+        }
+    }
+}
+
+fn sent_line(sent: &Sent, agent: Option<&Handoff>) -> String {
     let message = &sent.message;
     let what = if message.reply_to.is_some() {
         "Replied"
     } else {
         "Sent"
     };
-    let arrival = match (sent.reach, message.to.lineage) {
-        (_, None) => Arrival::User,
-        (Reach::Conversation, _) => Arrival::WhenIdle,
-        (Reach::Inbox, _) => Arrival::Inbox,
-        (Reach::Offline, _) => Arrival::NextSession,
-    };
     format!(
         "{what} {} to {}; {}",
         short(message.id),
         message.to.label(),
-        arrival_phrase(arrival)
+        arrival_phrase(Arrival::of(sent, agent))
     )
 }
 
 /// How a sent line says a message will arrive, which is also how a
-/// transcript reading the line back tells the four apart.
+/// transcript reading the line back tells them apart.
 fn arrival_phrase(arrival: Arrival) -> &'static str {
     match arrival {
         Arrival::User => "the user reads it with `cagents inbox`",
         Arrival::WhenIdle => "it arrives as soon as that conversation is idle",
         Arrival::Inbox => "that session runs in a terminal and reads it with `cagents inbox`",
         Arrival::NextSession => "no session of it runs now; the next one to start receives it",
+        Arrival::Started => "that agent started a run with it now",
+        Arrival::Queued => "that agent takes it as its next run once its current work ends",
+        Arrival::Behind => "that agent takes it as a run after the messages sent to it earlier",
+        Arrival::NoSlot => "every agent slot is taken; that agent takes it as a run once one frees",
+        Arrival::Ended => "that agent received it as a run, which has ended",
+        Arrival::Unknown => "whether that agent received it is unknown",
     }
 }
 
@@ -333,6 +427,12 @@ pub(super) fn read_sent_line(line: &str) -> Option<Receipt> {
         Arrival::Inbox,
         Arrival::NextSession,
         Arrival::User,
+        Arrival::Started,
+        Arrival::Queued,
+        Arrival::Behind,
+        Arrival::NoSlot,
+        Arrival::Ended,
+        Arrival::Unknown,
     ]
     .into_iter()
     .find_map(|arrival| {
@@ -441,16 +541,16 @@ impl Mailbox {
         })
     }
 
-    fn send(&mut self, outgoing: Outgoing) -> Result<Delivery, AppError> {
+    fn send(&mut self, outgoing: Outgoing) -> Result<Handed, AppError> {
         outgoing
             .validate()
             .map_err(|e| AppError::new("message", e))?;
         match self
             .client
-            .agent(self.authority.clone(), Operation::Send(outgoing))
+            .agent(self.authority.clone(), Operation::Deliver(outgoing))
             .map_err(protocol_error)?
         {
-            Reply::Delivered(delivery) => Ok(delivery),
+            Reply::Handed(handed) => Ok(handed),
             _ => Err(AppError::new("message", "Unexpected send response")),
         }
     }
@@ -623,10 +723,13 @@ mod tests {
             state: crate::agent_execution::mailbox::State::Pending,
             created_ms: 0,
         };
-        let line = sent_line(&Sent {
-            message: message.clone(),
-            reach: Reach::Conversation,
-        });
+        let line = sent_line(
+            &Sent {
+                message: message.clone(),
+                reach: Reach::Conversation,
+            },
+            None,
+        );
         assert!(line.starts_with(&format!("Sent {} to session ", short(message.id))));
         assert!(
             line.contains("\"Fix login\"; it arrives as soon as"),
@@ -635,10 +738,13 @@ mod tests {
         let mut to_user = message;
         to_user.to = crate::agent_execution::mailbox::Party::user();
         assert!(
-            sent_line(&Sent {
-                message: to_user,
-                reach: Reach::Inbox,
-            })
+            sent_line(
+                &Sent {
+                    message: to_user,
+                    reach: Reach::Inbox,
+                },
+                None,
+            )
             .ends_with("to the user; the user reads it with `cagents inbox`")
         );
     }
@@ -680,27 +786,30 @@ mod tests {
             relation: Relation::Peer,
             lineage: crate::agent_execution::Lineage(id),
         };
-        let mut delivery = Delivery {
-            sent: Sent {
-                message,
-                reach: Reach::Conversation,
-            },
-            recipient: Some(Member {
-                session,
-                exited: false,
-                failure: Some("Claude weekly limit reached · resets 3pm".into()),
-                active_at: None,
-                limit: Some(UsageLimit {
-                    summary: "Claude weekly limit reached".into(),
-                    reset: Some("3pm".into()),
-                    resets_at: None,
+        let mut handed = Handed {
+            delivery: Delivery {
+                sent: Sent {
+                    message,
+                    reach: Reach::Conversation,
+                },
+                recipient: Some(Member {
+                    session,
+                    exited: false,
+                    failure: Some("Claude weekly limit reached · resets 3pm".into()),
+                    active_at: None,
+                    limit: Some(UsageLimit {
+                        summary: "Claude weekly limit reached".into(),
+                        reset: Some("3pm".into()),
+                        resets_at: None,
+                    }),
+                    account: None,
                 }),
-                account: None,
-            }),
+            },
+            agent: None,
         };
-        let lines = delivery_lines(&delivery);
+        let lines = delivery_lines(&handed);
         let (first, notice) = lines.split_once('\n').unwrap();
-        assert_eq!(first, sent_line(&delivery.sent));
+        assert_eq!(first, sent_line(&handed.delivery.sent, None));
         assert_eq!(
             notice,
             format!(
@@ -708,14 +817,17 @@ mod tests {
                 short(id)
             )
         );
-        let value = delivery_json(&delivery);
+        let value = delivery_json(&handed);
         assert_eq!(value["recipient"]["state"], "Limited");
         assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
-        assert_eq!(value["message"]["id"], json!(delivery.sent.message.id));
+        assert_eq!(
+            value["message"]["id"],
+            json!(handed.delivery.sent.message.id)
+        );
 
         // A reading that shows the account spent only warns, since it can be
         // out of date.
-        let recipient = delivery.recipient.as_mut().unwrap();
+        let recipient = handed.delivery.recipient.as_mut().unwrap();
         recipient.limit = None;
         recipient.account = Some(SessionAccount {
             id: "claude/system".parse().unwrap(),
@@ -726,7 +838,7 @@ mod tests {
             observed_at: None,
             ordinary_usage_allowed: None,
         });
-        let notice = recipient_notice(&delivery).unwrap();
+        let notice = recipient_notice(&handed.delivery).unwrap();
         assert!(
             notice.starts_with(&format!(
                 "session {}'s account is out of allowance as last read",
@@ -734,9 +846,242 @@ mod tests {
             )),
             "{notice}"
         );
-        delivery.recipient.as_mut().unwrap().account = None;
-        assert_eq!(delivery_lines(&delivery), sent_line(&delivery.sent));
-        assert!(delivery_json(&delivery)["notice"].is_null());
+        handed.delivery.recipient.as_mut().unwrap().account = None;
+        assert_eq!(
+            delivery_lines(&handed),
+            sent_line(&handed.delivery.sent, None)
+        );
+        assert!(delivery_json(&handed)["notice"].is_null());
+    }
+
+    #[test]
+    fn a_message_an_agent_takes_as_a_run_says_how_it_started() {
+        use crate::agent_execution::Start;
+        let agent = crate::model::AgentId::new();
+        let run = crate::model::RunId::new();
+        let lineage = crate::agent_execution::Lineage(TerminalId::new());
+        let handed = |handoff: Option<Handoff>| Handed {
+            delivery: Delivery {
+                sent: Sent {
+                    message: Message {
+                        id: crate::model::MessageId::new(),
+                        from: crate::agent_execution::mailbox::Party::user(),
+                        to: crate::agent_execution::mailbox::Party {
+                            lineage: Some(lineage),
+                            session: None,
+                            title: Some("Fix login".into()),
+                        },
+                        reply_to: None,
+                        body: "hi".into(),
+                        wait_until_ms: None,
+                        state: crate::agent_execution::mailbox::State::Pending,
+                        created_ms: 0,
+                    },
+                    reach: Reach::Conversation,
+                },
+                recipient: None,
+            },
+            agent: handoff,
+        };
+
+        let started = delivery_lines(&handed(Some(Handoff::Run {
+            agent,
+            run,
+            start: Start::Sent { resumed: false },
+        })));
+        let lines: Vec<_> = started.lines().collect();
+        assert!(
+            lines[0].ends_with("\"Fix login\"; that agent started a run with it now"),
+            "{started}"
+        );
+        assert_eq!(
+            lines[1],
+            format!("It runs as run {} of agent {}.", short(run), short(agent))
+        );
+        assert_eq!(lines.len(), 2);
+
+        let reopened = delivery_lines(&handed(Some(Handoff::Run {
+            agent,
+            run,
+            start: Start::Sent { resumed: true },
+        })));
+        assert_eq!(
+            reopened.lines().nth(1),
+            Some("Its conversation had stopped, so cagents reopened it to take the message.")
+        );
+
+        for queued in [
+            Handoff::Run {
+                agent,
+                run,
+                start: Start::Queued { behind: None },
+            },
+            Handoff::Waiting {
+                agent,
+                behind: Some(crate::model::RunId::new()),
+            },
+        ] {
+            let lines = delivery_lines(&handed(Some(queued)));
+            assert!(
+                lines
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .ends_with("that agent takes it as its next run once its current work ends"),
+                "{lines}"
+            );
+        }
+
+        // An agent that cannot take the message now says why, and the
+        // message waits where the session-level line says it does.
+        let held = handed(Some(Handoff::Held {
+            agent,
+            reason: "This agent's provider stopped. Resume it from its pane.".into(),
+        }));
+        let lines = delivery_lines(&held);
+        let (first, notice) = lines.split_once('\n').unwrap();
+        assert!(
+            first.ends_with("it arrives as soon as that conversation is idle"),
+            "{first}"
+        );
+        assert_eq!(
+            notice,
+            "But cagents did not start a run of that agent with it: This agent's provider stopped. Resume it from its pane."
+        );
+        let value = delivery_json(&held);
+        assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
+        assert!(value["agent"]["Held"]["reason"].is_string(), "{value}");
+
+        // A run interrupted with no proof of whether the agent received the
+        // message neither claims it arrives nor that nothing was sent.
+        let lines = delivery_lines(&handed(Some(Handoff::Unknown {
+            agent,
+            run,
+            reason: "The provider restarted during the turn.".into(),
+        })));
+        let lines: Vec<_> = lines.lines().collect();
+        assert!(
+            lines[0].ends_with("\"Fix login\"; whether that agent received it is unknown"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "It went to agent {} as run {}, which ended without proof of whether the agent received it: The provider restarted during the turn. Inspect that conversation before sending it again.",
+                short(agent),
+                short(run)
+            )
+        );
+        assert_eq!(lines.len(), 2);
+
+        // A run the agent received that has already ended says so, rather
+        // than that it started.
+        let lines = delivery_lines(&handed(Some(Handoff::Ended {
+            agent,
+            run,
+            reason: "The run ended Cancelled".into(),
+        })));
+        let lines: Vec<_> = lines.lines().collect();
+        assert!(
+            lines[0].ends_with("\"Fix login\"; that agent received it as a run, which has ended"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "It ran as run {} of agent {}, which ended without finishing: The run ended Cancelled.",
+                short(run),
+                short(agent)
+            )
+        );
+        assert_eq!(lines.len(), 2);
+
+        // A message that waits its turn to become a run says what for.
+        for (handoff, phrase) in [
+            (
+                Handoff::Behind { agent },
+                "that agent takes it as a run after the messages sent to it earlier",
+            ),
+            (
+                Handoff::NoSlot { agent },
+                "every agent slot is taken; that agent takes it as a run once one frees",
+            ),
+        ] {
+            let lines = delivery_lines(&handed(Some(handoff)));
+            assert!(lines.ends_with(phrase), "{lines}");
+            assert_eq!(lines.lines().count(), 1, "{lines}");
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_transcript_reads_back_an_agent_run_handoff() {
+        for (handoff, arrival) in [
+            (
+                Handoff::Run {
+                    agent: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    start: crate::agent_execution::Start::Sent { resumed: true },
+                },
+                Arrival::Started,
+            ),
+            (
+                Handoff::Waiting {
+                    agent: crate::model::AgentId::new(),
+                    behind: None,
+                },
+                Arrival::Queued,
+            ),
+            (
+                Handoff::Unknown {
+                    agent: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    reason: "The provider restarted".into(),
+                },
+                Arrival::Unknown,
+            ),
+            (
+                Handoff::Ended {
+                    agent: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    reason: "The run ended Failed".into(),
+                },
+                Arrival::Ended,
+            ),
+            (
+                Handoff::Behind {
+                    agent: crate::model::AgentId::new(),
+                },
+                Arrival::Behind,
+            ),
+            (
+                Handoff::NoSlot {
+                    agent: crate::model::AgentId::new(),
+                },
+                Arrival::NoSlot,
+            ),
+        ] {
+            let sent = Sent {
+                message: Message {
+                    id: crate::model::MessageId::new(),
+                    from: crate::agent_execution::mailbox::Party::user(),
+                    to: crate::agent_execution::mailbox::Party {
+                        lineage: Some(crate::agent_execution::Lineage(TerminalId::new())),
+                        session: None,
+                        title: Some("Fix login".into()),
+                    },
+                    reply_to: None,
+                    body: "hi".into(),
+                    wait_until_ms: None,
+                    state: crate::agent_execution::mailbox::State::Pending,
+                    created_ms: 0,
+                },
+                reach: Reach::Conversation,
+            };
+            let receipt = read_sent_line(&sent_line(&sent, Some(&handoff))).unwrap();
+            assert_eq!(receipt.arrival, arrival);
+            assert_eq!(receipt.message, short(sent.message.id));
+        }
     }
 
     #[cfg(feature = "ui")]
@@ -762,10 +1107,13 @@ mod tests {
             (Reach::Inbox, Arrival::Inbox),
             (Reach::Offline, Arrival::NextSession),
         ] {
-            let line = sent_line(&Sent {
-                message: message.clone(),
-                reach,
-            });
+            let line = sent_line(
+                &Sent {
+                    message: message.clone(),
+                    reach,
+                },
+                None,
+            );
             let receipt = read_sent_line(&line).expect("reads its own line");
             assert_eq!(receipt.message, short(message.id));
             assert_eq!(receipt.recipient, message.to.label());
