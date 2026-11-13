@@ -4621,6 +4621,18 @@
         ]
       ]
     },
+    "cagents::chat::AgentAddress": {
+      "Struct": [
+        [
+          "address",
+          "Str"
+        ],
+        [
+          "subagent",
+          "Str"
+        ]
+      ]
+    },
     "cagents::chat::Answer": {
       "Struct": [
         [
@@ -9859,6 +9871,25 @@
                 {
                   "Option": {
                     "Container": "cagents::agent_execution::directory::UsageLimit"
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "chat_agent_addresses",
+          {
+            "Struct": [
+              [
+                "chat_id",
+                "Bytes"
+              ],
+              [
+                "addresses",
+                {
+                  "Seq": {
+                    "Container": "cagents::chat::AgentAddress"
                   }
                 }
               ]
