@@ -2,8 +2,9 @@
 //! progress, newest activity first.
 use super::*;
 use crate::work::{
-    ActivitySource, Board, CheckOutcome, Column, Forge, Item, Keep, PullRequestState, Removal,
-    RemovalPlan, Removed, Request, Response, Review, SavedSnapshot, Scope,
+    ActivitySource, Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, Keep,
+    PullRequestState, Removal, RemovalPlan, Removed, Request, Response, Review, SavedSnapshot,
+    Scope,
 };
 
 /// How long a board may wait on its first scan or a fresh rescan, on top of
@@ -193,6 +194,66 @@ impl ControlClient {
     }
 }
 
+impl ControlClient {
+    /// Subscribes this connection to the pull requests `conversation`
+    /// worked on or mentioned, and returns them with the revision later
+    /// lists from [`Self::next_conversation_pull_requests`] supersede.
+    pub fn watch_conversation_pull_requests(
+        &mut self,
+        conversation: TerminalId,
+    ) -> Result<(u64, ConversationPullRequests), ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::WatchConversationPullRequests { conversation },
+            Instant::now() + BOARD_TIMEOUT,
+        )? {
+            ServerResponse::Work(Response::WatchingConversation {
+                revision,
+                pull_requests,
+            }) => Ok((revision, *pull_requests)),
+            response => Err(unexpected_response(
+                "a conversation's pull requests",
+                &response,
+            )),
+        }
+    }
+
+    /// Blocks until the daemon sends a list newer than `revision`, as
+    /// [`Self::next_work_board`] does for boards.
+    pub fn next_conversation_pull_requests(
+        &mut self,
+        revision: u64,
+    ) -> Result<(u64, ConversationPullRequests), ControlError> {
+        if let Some((observed, pull_requests)) = self.observed_conversation.take()
+            && observed > revision
+        {
+            return Ok((observed, *pull_requests));
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::ConversationPullRequests {
+                    revision: observed,
+                    pull_requests,
+                    ..
+                } if observed > revision => return Ok((observed, *pull_requests)),
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn scope(project: Option<PathBuf>) -> Result<Scope, AppError> {
     Ok(match project {
         Some(project) => Scope::Project(super::project_argument(project)?),
@@ -212,42 +273,57 @@ fn item_argument(item: String) -> String {
     item
 }
 
-fn send(request: Request, timeout: Duration) -> Result<Response, AppError> {
-    send_with(request, timeout, protocol_error)
+fn send(
+    context: &ServiceRequestContext,
+    request: Request,
+    timeout: Duration,
+) -> Result<Response, AppError> {
+    send_with(context, request, timeout, protocol_error)
 }
 
 fn send_with(
+    context: &ServiceRequestContext,
     request: Request,
     timeout: Duration,
     failed: impl FnOnce(ControlError) -> AppError,
 ) -> Result<Response, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = context.connect()?;
     // Inside a hosted session the daemon lets this read the board but never
     // change it, as it can tell once the connection names its authority.
-    let authority = Authority::from_environment();
-    if authority.token().is_some() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
-        client.authenticate(authority).map_err(protocol_error)?;
+    if context.scoped() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
+        client
+            .authenticate(context.authority.clone())
+            .map_err(protocol_error)?;
     }
     client.work(request, timeout).map_err(failed)
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: WorkCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
     match command {
-        WorkCommand::List(arguments) => list(arguments),
+        WorkCommand::List(arguments) => list(arguments, context),
         WorkCommand::Pin {
             item,
             column,
             project,
-        } => pin(item, Some(column), project),
-        WorkCommand::Unpin { item, project } => pin(item, None, project),
-        WorkCommand::Rm(arguments) => remove(arguments),
-        WorkCommand::Snapshots { project } => snapshots(project),
+        } => pin(item, Some(column), project, context),
+        WorkCommand::Unpin { item, project } => pin(item, None, project, context),
+        WorkCommand::Rm(arguments) => remove(arguments, context),
+        WorkCommand::Snapshots { project } => snapshots(project, context),
     }
 }
 
-fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
+fn remove(
+    arguments: RemoveArgs,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
     let scope = scope(arguments.project)?;
     let item = item_argument(arguments.item);
     let request = Request::RemovalPlan {
@@ -260,7 +336,7 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
     } else {
         PLAN_TIMEOUT
     };
-    let Response::RemovalPlan(plan) = send(request, timeout)? else {
+    let Response::RemovalPlan(plan) = send(context, request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let described = plan_human(&plan);
@@ -326,7 +402,8 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
         ),
         error => protocol_error(error),
     };
-    let Response::Removed(removed) = send_with(request, REMOVE_TIMEOUT, unanswered)? else {
+    let Response::Removed(removed) = send_with(context, request, REMOVE_TIMEOUT, unanswered)?
+    else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     Ok(CommandOutput {
@@ -336,11 +413,14 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
     })
 }
 
-fn snapshots(project: Option<PathBuf>) -> Result<CommandOutput, AppError> {
+fn snapshots(
+    project: Option<PathBuf>,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
     let request = Request::Snapshots {
         scope: scope(project)?,
     };
-    let Response::Snapshots(snapshots) = send(request, BOARD_TIMEOUT)? else {
+    let Response::Snapshots(snapshots) = send(context, request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = snapshots_human(&snapshots, crate::chat::now_ms().unwrap_or_default());
@@ -470,7 +550,7 @@ fn snapshots_human(snapshots: &[SavedSnapshot], now_ms: u64) -> String {
     )
 }
 
-fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
+fn list(arguments: ListArgs, context: &ServiceRequestContext) -> Result<CommandOutput, AppError> {
     let request = Request::Board {
         scope: scope(arguments.project)?,
         fresh: arguments.fresh,
@@ -480,7 +560,7 @@ fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
     } else {
         BOARD_TIMEOUT
     };
-    let Response::Board(mut board) = send(request, timeout)? else {
+    let Response::Board(mut board) = send(context, request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     if let Some(column) = arguments.column {
@@ -502,13 +582,14 @@ fn pin(
     item: String,
     column: Option<Column>,
     project: Option<PathBuf>,
+    context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
     let request = Request::Pin {
         scope: scope(project)?,
         item: item_argument(item),
         column,
     };
-    let Response::Pinned(item) = send(request, BOARD_TIMEOUT)? else {
+    let Response::Pinned(item) = send(context, request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = match column {

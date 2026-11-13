@@ -63,6 +63,7 @@ impl Registered {
             email: self.email.clone(),
             organization: self.organization.clone(),
             plan: None,
+            disputed_by: None,
         }
     }
 
@@ -108,6 +109,10 @@ pub struct Registry {
     /// order; an older snapshot must never replace a newer account choice.
     #[serde(default)]
     revision: u64,
+    /// When the file this copy was read from or written to was last
+    /// written, which no file records of itself.
+    #[serde(skip)]
+    written: Written,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -131,6 +136,55 @@ pub struct Registry {
     archived: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<Pending>,
+    /// Managed homes whose sign-in was given up - it duplicated an account
+    /// already listed, or was cancelled - and whose files are kept. They are
+    /// not accounts, so restoring the rows a lost list no longer names
+    /// leaves them alone even when they hold a working login.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    released: Vec<Uuid>,
+}
+
+/// When an accounts file was last written, as its modification time says.
+/// Two copies of the registry are the same registry whenever they were read,
+/// so it is not compared.
+#[derive(Debug, Clone, Copy, Default)]
+struct Written(Option<std::time::SystemTime>);
+
+impl PartialEq for Written {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Written {}
+
+impl Written {
+    fn of(file: &std::fs::File) -> Self {
+        Self(
+            file.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    }
+}
+
+/// Whether a window holding `current` takes `incoming`, a copy of the
+/// accounts file whose answer may have arrived out of order.
+///
+/// A copy with a lower revision is older, and never replaces a newer
+/// choice - unless the file it was read from was written after the one the
+/// window holds. Then the file was replaced: deleted and written from
+/// scratch, or restored by hand, at revisions that say nothing about the
+/// file before it, and what is on disk now is what every other window and
+/// command sees. A clock set back can make a later write look earlier, but
+/// not lower its revision, so either one being later is enough.
+pub fn supersedes(incoming: &Registry, current: &Registry) -> bool {
+    incoming.revision >= current.revision
+        || incoming
+            .written
+            .0
+            .zip(current.written.0)
+            .is_some_and(|(incoming, current)| incoming > current)
 }
 
 const SYSTEM: &str = "system";
@@ -499,20 +553,8 @@ impl Registry {
         managed: Registered,
         system: &[(Provider, Identity)],
     ) -> Result<(), AccountId> {
-        let identity = managed.identity();
-        if let Some((provider, _)) = system
-            .iter()
-            .find(|(provider, known)| *provider == managed.provider && known.same_login(&identity))
-        {
-            return Err(Account::system(*provider).id());
-        }
-        if let Some(existing) = self.accounts.iter().find(|existing| {
-            existing.key != managed.key
-                && !self.archived.contains(&existing.key)
-                && existing.provider == managed.provider
-                && existing.identity().same_login(&identity)
-        }) {
-            return Err(Account::managed(existing.provider, existing.key, PathBuf::new()).id());
+        if let Some(retained) = self.duplicated(&managed, system, None) {
+            return Err(retained.id());
         }
         self.abandon(managed.key);
         match self
@@ -526,10 +568,73 @@ impl Registry {
         Ok(())
     }
 
+    /// The account already in use for the login `managed` reports: the
+    /// system account of its provider, or another active registered one.
+    fn duplicated(
+        &self,
+        managed: &Registered,
+        system: &[(Provider, Identity)],
+        homes: Option<&Homes>,
+    ) -> Option<Account> {
+        let identity = managed.identity();
+        if system
+            .iter()
+            .any(|(provider, known)| *provider == managed.provider && known.same_login(&identity))
+        {
+            return Some(Account::system(managed.provider));
+        }
+        let existing = self.accounts.iter().find(|existing| {
+            existing.key != managed.key
+                && !self.archived.contains(&existing.key)
+                && existing.provider == managed.provider
+                && existing.identity().same_login(&identity)
+        })?;
+        Some(match &existing.linked_home {
+            Some(path) => Account::linked(existing.provider, existing.key, path.clone()),
+            None => Account::managed(
+                existing.provider,
+                existing.key,
+                homes
+                    .map(|homes| homes.path(existing.provider, existing.key))
+                    .unwrap_or_default(),
+            ),
+        })
+    }
+
+    /// Records a managed home that was signed in but lost its registry row -
+    /// a reset or deleted configuration directory - under its original key.
+    /// A home whose login another active account already uses is recorded
+    /// archived instead, so it is not offered twice but its saved
+    /// conversations still resume. Returns that retained account, if any.
+    ///
+    /// Callers verify the login with the provider first; this records only
+    /// what it reported, and never replaces or edits an existing row.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn restore(
+        &mut self,
+        managed: Registered,
+        system: &[(Provider, Identity)],
+        homes: &Homes,
+    ) -> Option<Account> {
+        if self.find(managed.key).is_some() || managed.linked_home.is_some() {
+            return None;
+        }
+        let retained = self.duplicated(&managed, system, Some(homes));
+        let key = managed.key;
+        self.abandon(key);
+        self.accounts.push(managed);
+        if let Some(retained) = &retained {
+            self.archive_duplicate(key, retained);
+        }
+        retained
+    }
+
     /// Records an existing provider home without taking ownership of it.
     /// Its canonical path, not its reported email, determines whether it is
     /// already registered: separate homes can hold the same login but have
-    /// different histories. Linking an archived home restores its row.
+    /// different histories. Repeating an unambiguous active linked home returns
+    /// its original key without changing metadata. Linking an archived home
+    /// restores its row.
     pub fn link(
         &mut self,
         provider: Provider,
@@ -545,14 +650,38 @@ impl Registry {
         if system_home
             .and_then(|home| fs::canonicalize(home).ok())
             .is_some_and(|home| home == path)
-            || self.accounts(homes).iter().any(|account| {
+        {
+            return Err("That account home is already listed".into());
+        }
+        let matching = self
+            .all_accounts(homes)
+            .into_iter()
+            .filter(|account| {
                 account.provider == provider
                     && account
                         .resolved_home()
                         .and_then(|home| fs::canonicalize(home).ok())
                         .is_some_and(|home| home == path)
             })
-        {
+            .collect::<Vec<_>>();
+        // An archive retains its registration and conversation identity too.
+        // Refuse ambiguous homes before restoring any one archived row.
+        if matching.len() > 1 {
+            return Err("That account home is already listed".into());
+        }
+        if matching.iter().any(|account| {
+            !account
+                .registry_key()
+                .is_some_and(|key| self.is_archived(key))
+        }) {
+            // A reply may have been lost after the registration committed.
+            // Recover only one exact linked home, never a System/managed home
+            // or an ambiguous active/archived registration sharing its path.
+            if let [account] = matching.as_slice()
+                && let AccountHome::Linked { key, .. } = &account.home
+            {
+                return Ok(*key);
+            }
             return Err("That account home is already listed".into());
         }
         if let Some(existing) = self.accounts.iter().find(|account| {
@@ -602,6 +731,26 @@ impl Registry {
     /// Forgets a sign-in whose home is gone.
     pub fn abandon(&mut self, key: Uuid) {
         self.pending.retain(|pending| pending.key != key);
+    }
+
+    /// Forgets a sign-in that was given up while its home is kept, and
+    /// records that its home is not an account the list lost. Released homes
+    /// that have since gone are forgotten too.
+    pub fn release(&mut self, key: Uuid, homes: &Homes) {
+        self.abandon(key);
+        if self.find(key).is_none() && !self.released.contains(&key) {
+            self.released.push(key);
+        }
+        self.released.retain(|released| {
+            super::Account::PROVIDERS
+                .iter()
+                .any(|provider| homes.is_kept(*provider, *released))
+        });
+    }
+
+    /// Whether this managed home's sign-in was given up rather than lost.
+    pub fn is_released(&self, key: Uuid) -> bool {
+        self.released.contains(&key)
     }
 
     /// Records what the provider reported about a managed account that the
@@ -717,13 +866,30 @@ pub struct Store {
 
 #[derive(Debug)]
 pub enum LaunchAccountError {
-    Removed { provider: Provider, key: Uuid },
+    /// The registry does not name the selected managed home. `home_kept`
+    /// says its directory is still on this device: the registry lost the
+    /// row, not the account, and restoring it keeps the conversation on the
+    /// home that holds its history.
+    Removed {
+        provider: Provider,
+        key: Uuid,
+        home_kept: bool,
+    },
     Unreadable(io::Error),
 }
 
 impl std::fmt::Display for LaunchAccountError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Removed {
+                provider,
+                home_kept: true,
+                ..
+            } => write!(
+                formatter,
+                "This {} account isn't in the account list, but its files and history are still on this device. It can be restored while its provider still reports a sign-in to it.",
+                provider.label()
+            ),
             Self::Removed { provider, .. } => write!(
                 formatter,
                 "This {} account was removed. Choose another account before continuing.",
@@ -737,6 +903,66 @@ impl std::fmt::Display for LaunchAccountError {
 }
 
 impl std::error::Error for LaunchAccountError {}
+
+/// Unregistered managed homes this process is asking their provider about
+/// before restoring them to the registry. While one is listed, a spawn in
+/// that home is authorized as if it were registered, so the provider's own
+/// status probe can confirm the login. The daemon holds its account
+/// reservation on the home meanwhile, which refuses every other launch there.
+static RESTORE_PROBES: std::sync::Mutex<Vec<(Provider, Uuid)>> = std::sync::Mutex::new(Vec::new());
+
+fn restore_probe_active(provider: Provider, key: Uuid) -> bool {
+    RESTORE_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&(provider, key))
+}
+
+/// Authorizes the identity probe of one unregistered home until dropped.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct RestoreProbe {
+    provider: Provider,
+    key: Uuid,
+}
+
+#[cfg(any(feature = "host", test))]
+impl RestoreProbe {
+    /// `None` while another restoration in this process is probing the
+    /// same home.
+    pub(crate) fn begin(provider: Provider, key: Uuid) -> Option<Self> {
+        let mut probes = RESTORE_PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if probes.contains(&(provider, key)) {
+            return None;
+        }
+        probes.push((provider, key));
+        Some(Self { provider, key })
+    }
+}
+
+#[cfg(any(feature = "host", test))]
+impl Drop for RestoreProbe {
+    fn drop(&mut self) {
+        RESTORE_PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|probe| *probe != (self.provider, self.key));
+    }
+}
+
+/// What restoring an unregistered home recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Restored {
+    /// The home is listed again under its original key.
+    Listed,
+    /// Its login is the one this account already uses, so the home was
+    /// recorded archived: hidden from new work, but its saved conversations
+    /// still resume.
+    Archived { duplicate_of: AccountId },
+    /// Another window or command restored or registered it first.
+    AlreadyRegistered,
+}
 
 /// Keep this lease only across the child-spawn step, never a provider turn or
 /// handshake. Removal uses the same lifecycle lock before forgetting a home.
@@ -848,8 +1074,14 @@ impl Store {
             )));
         }
         for (provider, key) in selected {
-            if !registry.contains_managed_home(homes, provider, key) {
-                return Err(LaunchAccountError::Removed { provider, key });
+            if !registry.contains_managed_home(homes, provider, key)
+                && !restore_probe_active(provider, key)
+            {
+                return Err(LaunchAccountError::Removed {
+                    provider,
+                    key,
+                    home_kept: homes.is_unregistered(&registry, provider, key),
+                });
             }
         }
         Ok(Some(LaunchAccountLease { _lock: lock }))
@@ -950,9 +1182,10 @@ impl Store {
         Ok((key, home))
     }
 
-    /// Forget and park under the same lifecycle lock as spawning. A failed
-    /// deletion cannot make an unregistered home launchable again; the sweep
-    /// finishes parked trees later. Linked aliases still protect their home.
+    // Legacy destructive fixture support only. Product lifecycle operations
+    // require daemon admission and preserve managed/abandoned home files.
+    // Registry absence or an old parked name grants no deletion authority.
+    #[cfg(test)]
     pub fn remove_home(
         &self,
         homes: &Homes,
@@ -1047,6 +1280,86 @@ impl Store {
                     ));
                 }
                 Ok(registry.register(account, system))
+            },
+            nonblocking,
+        )
+    }
+
+    /// Records an unregistered managed home whose login the provider has
+    /// just confirmed, under the lifecycle and registry locks: nothing the
+    /// probe could not see - a removal, a sign-in, a newer cagents writing
+    /// the registry - can have changed in between unnoticed.
+    #[cfg(feature = "host")]
+    pub(crate) fn try_restore_reserved(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Restored)> {
+        self.restore_with_mode(homes, account, system, true, |registry| {
+            reservation
+                .verify_registry(registry)
+                .map_err(io::Error::other)
+        })
+    }
+
+    #[cfg(test)]
+    fn restore_home(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Restored)> {
+        self.restore_with_mode(homes, account, system, false, |_| Ok(()))
+    }
+
+    #[cfg(any(feature = "host", test))]
+    fn restore_with_mode(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+    ) -> io::Result<(Registry, Restored)> {
+        let _lifecycle = if nonblocking {
+            homes.try_lifecycle_lock()?
+        } else {
+            homes.lifecycle_lock()?
+        };
+        self.update_checked_with_mode(
+            |registry| {
+                validate(registry)?;
+                let (provider, key) = (account.provider, account.key);
+                if registry.contains_managed_home(homes, provider, key) {
+                    return Ok(Restored::AlreadyRegistered);
+                }
+                if registry.find(key).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "Another account in the list already uses this account's key",
+                    ));
+                }
+                if registry.is_released(key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "This home is from a sign-in that was not kept, so it is not restored",
+                    ));
+                }
+                if account.linked_home.is_some() || !homes.is_unregistered(registry, provider, key)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "This account's files are no longer on this device",
+                    ));
+                }
+                Ok(match registry.restore(account, system, homes) {
+                    None => Restored::Listed,
+                    Some(retained) => Restored::Archived {
+                        duplicate_of: retained.id(),
+                    },
+                })
             },
             nonblocking,
         )
@@ -1155,7 +1468,7 @@ impl Store {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
-            write(&self.directory, &path, &registry)?;
+            registry.written = write(&self.directory, &path, &registry)?;
         }
         Ok((registry, result))
     }
@@ -1183,10 +1496,14 @@ fn read(path: &Path) -> io::Result<Registry> {
     Read::by_ref(&mut file)
         .take(MAX_BYTES)
         .read_to_string(&mut text)?;
-    toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let mut registry: Registry =
+        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    registry.written = Written::of(&file);
+    Ok(registry)
 }
 
-fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
+/// Replaces the file at `path` with `registry`, and says when it was written.
+fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<Written> {
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
     if !document.ends_with('\n') {
         document.push('\n');
@@ -1205,8 +1522,8 @@ fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
     temporary.as_file().sync_all()?;
     // The rename replaces whatever is at `path` - a link included - rather
     // than writing through it.
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    let file = temporary.persist(path).map_err(|error| error.error)?;
+    Ok(Written::of(&file))
 }
 
 /// A provider written as its executable name, which is what a reader
@@ -1234,6 +1551,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_copy_supersedes_by_revision_or_by_a_later_file() {
+        let copy = |revision: u64, written: Option<u64>| {
+            let mut registry: Registry = toml::from_str(&format!("revision = {revision}")).unwrap();
+            registry.written =
+                Written(written.map(|seconds| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+                }));
+            registry
+        };
+        // One file's copies are ordered by its revisions.
+        assert!(supersedes(&copy(5, Some(20)), &copy(4, Some(10))));
+        assert!(supersedes(&copy(5, Some(10)), &copy(5, Some(10))));
+        assert!(!supersedes(&copy(4, Some(10)), &copy(5, Some(20))));
+        // A file written from scratch after the one held replaces it.
+        assert!(supersedes(&copy(1, Some(30)), &copy(5, Some(20))));
+        // A clock set back cannot hold back a later revision.
+        assert!(supersedes(&copy(6, Some(5)), &copy(5, Some(20))));
+        // Without both write times, only revisions can say.
+        assert!(!supersedes(&copy(1, None), &copy(5, Some(20))));
+        assert!(!supersedes(&copy(1, Some(30)), &copy(5, None)));
+        // The write time is no part of what the registry holds.
+        assert_eq!(copy(5, Some(10)), copy(5, None));
+    }
+
+    #[test]
+    fn a_read_or_written_registry_knows_when_its_file_was_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        assert_eq!(store.load().unwrap().written.0, None);
+        let (written, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("A".into()))
+            })
+            .unwrap();
+        let modified = fs::metadata(store.path()).unwrap().modified().unwrap();
+        assert_eq!(written.written.0, Some(modified));
+        assert_eq!(store.load().unwrap().written.0, Some(modified));
+    }
 
     fn account_recipe(home: &Path) -> crate::model::LaunchRecipe {
         let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
@@ -1495,10 +1852,207 @@ mod tests {
                 Some(&homes),
                 2
             ),
-            Err("That account home is already listed".into())
+            Ok(key)
         );
         registry.unregister(key).unwrap();
         assert!(history.is_file());
+    }
+
+    #[test]
+    fn repeating_a_link_recovers_its_key_without_rewriting_registry_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        let other = directory.path().join("other");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&other).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let other = fs::canonicalize(other).unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("managed"));
+        let key = Uuid::new_v4();
+        let account = Account::linked(Provider::Codex, key, home.clone());
+        let (before, ()) = store
+            .update(|registry| {
+                assert_eq!(
+                    registry.link(Provider::Codex, key, home.clone(), None, Some(&homes), 7),
+                    Ok(key)
+                );
+                registry.set_label(&account, Some("Selected home".into()));
+                registry.observe_identity(
+                    key,
+                    &Identity {
+                        email: Some("selected@example.test".into()),
+                        organization: Some("Fixture organization".into()),
+                        plan: None,
+                        disputed_by: None,
+                    },
+                );
+                registry.set_default(&account);
+                registry.set_project_default(directory.path(), &account);
+                registry.begin(Provider::Claude, Uuid::new_v4(), 8);
+            })
+            .unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        // The first response was lost: repeat explicitly with a fresh request
+        // key, as the real Link callers do. No transport/provider is exercised.
+        let requested = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    requested,
+                    home.clone(),
+                    None,
+                    Some(&homes),
+                    99,
+                )
+            })
+            .unwrap();
+        assert_eq!(result, Ok(key));
+        assert_eq!(after, before);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.registered().len(), 1);
+        assert!(after.find(requested).is_none());
+        assert_eq!(after.find(key).unwrap().added_at, 7);
+        assert_eq!(after.label(&account), Some("Selected home"));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+        assert_eq!(
+            after.project_default_account(directory.path(), Provider::Codex, Some(&homes)),
+            account
+        );
+
+        // Identity alone cannot merge a different home. It remains a separate
+        // registration with the independently requested key.
+        let other_key = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                let result = registry.link(
+                    Provider::Codex,
+                    other_key,
+                    other.clone(),
+                    None,
+                    Some(&homes),
+                    100,
+                );
+                registry.observe_identity(other_key, &before.find(key).unwrap().identity());
+                result
+            })
+            .unwrap();
+        assert_eq!(result, Ok(other_key));
+        assert_eq!(after.registered().len(), 2);
+        assert_eq!(after.find(key), before.find(key));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+    }
+
+    #[test]
+    fn link_recovery_refuses_conflicting_home_kinds_and_ambiguous_registrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        fs::create_dir(&home).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let key = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .link(Provider::Codex, key, home.clone(), None, None, 1)
+            .unwrap();
+        let original = registry.clone();
+        let listed: Result<Uuid, String> = Err("That account home is already listed".into());
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                home.clone(),
+                Some(&home),
+                None,
+                2
+            ),
+            listed
+        );
+        assert_eq!(
+            registry, original,
+            "System conflict wins over linked recovery"
+        );
+
+        // A stored linked path can alias a managed home. Retain the managed
+        // registration's existing refusal even when the linked row is first.
+        let homes = Homes::at(directory.path().join("managed"));
+        let managed_key = Uuid::new_v4();
+        let managed_home = homes.path(Provider::Codex, managed_key);
+        fs::create_dir_all(&managed_home).unwrap();
+        registry.accounts[0].linked_home = Some(managed_home.clone());
+        registry.accounts.push(Registered {
+            key: managed_key,
+            provider: Provider::Codex,
+            linked_home: None,
+            label: None,
+            email: None,
+            organization: None,
+            added_at: 2,
+        });
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                managed_home,
+                None,
+                Some(&homes),
+                3
+            ),
+            listed
+        );
+        assert_eq!(registry, before);
+
+        // Multiple linked registrations must not choose the first row as the
+        // recovered identity, even when both registrations are archived.
+        for (first_archived, duplicate_archived) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            registry = original.clone();
+            let duplicate_key = Uuid::new_v4();
+            let mut duplicate = registry.accounts[0].clone();
+            duplicate.key = duplicate_key;
+            registry.accounts.push(duplicate);
+            if first_archived {
+                registry.archived.push(key);
+            }
+            if duplicate_archived {
+                registry.archived.push(duplicate_key);
+            }
+            let before = registry.clone();
+            assert_eq!(
+                registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 4),
+                listed
+            );
+            assert_eq!(registry, before);
+        }
+
+        registry = original.clone();
+        registry.archived.push(key);
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 5),
+            Ok(key)
+        );
+        let mut restored = before;
+        restored.archived.clear();
+        assert_eq!(
+            registry, restored,
+            "archive restoration keeps all row metadata"
+        );
+        let other_provider_key = Uuid::new_v4();
+        assert_eq!(
+            registry.link(Provider::Claude, other_provider_key, home, None, None, 6),
+            Ok(other_provider_key),
+            "path uniqueness remains scoped to the chosen provider"
+        );
     }
 
     #[test]
@@ -1632,6 +2186,7 @@ mod tests {
             email: Some(email.into()),
             organization: organization.map(str::to_owned),
             plan: None,
+            disputed_by: None,
         };
         let mut registry = Registry::default();
         let added = managed(Provider::Claude, "work@example.com");
@@ -1909,5 +2464,318 @@ mod tests {
         fs::write(&target, "").unwrap();
         std::os::unix::fs::symlink(&target, directory.path().join(FILE_NAME)).unwrap();
         assert!(Store::at(directory.path()).load().is_err());
+    }
+
+    fn identity(email: &str) -> Identity {
+        Identity {
+            email: Some(email.into()),
+            organization: None,
+            plan: None,
+            disputed_by: None,
+        }
+    }
+
+    fn restorable(key: Uuid, email: &str) -> Registered {
+        let mut account = managed(Provider::Claude, email);
+        account.key = key;
+        account
+    }
+
+    #[test]
+    fn a_lost_home_is_restored_under_its_original_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        fs::write(home.join("history.jsonl"), "kept").unwrap();
+        // The configuration directory was wiped: no registry file at all.
+        let before = store.load().unwrap();
+        assert_eq!(
+            homes
+                .unregistered(&before)
+                .into_iter()
+                .map(|(provider, key, _)| (provider, key))
+                .collect::<Vec<_>>(),
+            [(Provider::Claude, key)]
+        );
+        let (registry, restored) = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap();
+        assert_eq!(restored, Restored::Listed);
+        assert!(registry.revision() > before.revision());
+        assert_eq!(
+            registry.find(key).unwrap().email.as_deref(),
+            Some("plan2@example.com")
+        );
+        assert!(registry.accounts(Some(&homes)).iter().any(|account| {
+            account.registry_key() == Some(key) && account.resolved_home() == Some(home.clone())
+        }));
+        assert!(homes.unregistered(&registry).is_empty());
+        assert_eq!(
+            fs::read_to_string(home.join("history.jsonl")).unwrap(),
+            "kept"
+        );
+        // Restoring again changes nothing.
+        let (again, restored) = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap();
+        assert_eq!(restored, Restored::AlreadyRegistered);
+        assert_eq!(again.revision(), registry.revision());
+    }
+
+    #[test]
+    fn a_sign_in_given_up_as_a_duplicate_is_not_restored_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (listed, _) = homes.create(Provider::Claude, None).unwrap();
+        store
+            .restore_home(&homes, restorable(listed, "plan2@example.com"), &[])
+            .unwrap();
+        // A second sign-in reached the same login; it was not kept, but its
+        // home and login stay on disk.
+        let (copy, _) = homes.create(Provider::Claude, None).unwrap();
+        store
+            .update(|registry| registry.begin(Provider::Claude, copy, 1))
+            .unwrap();
+        let (_, duplicate) = store
+            .update(|registry| registry.register(restorable(copy, "plan2@example.com"), &[]))
+            .unwrap();
+        assert!(duplicate.is_err());
+        let (registry, ()) = store
+            .update(|registry| registry.release(copy, &homes))
+            .unwrap();
+        assert!(registry.pending().is_empty() && registry.is_released(copy));
+        assert!(homes.is_unregistered(&registry, Provider::Claude, copy));
+        let error = store
+            .restore_home(&homes, restorable(copy, "plan2@example.com"), &[])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(store.load().unwrap().find(copy).is_none());
+        // Its record goes once its home has, with the next release.
+        fs::remove_dir_all(homes.path(Provider::Claude, copy)).unwrap();
+        let (gone, _) = homes.create(Provider::Claude, None).unwrap();
+        let (registry, ()) = store
+            .update(|registry| registry.release(gone, &homes))
+            .unwrap();
+        assert!(!registry.is_released(copy) && registry.is_released(gone));
+    }
+
+    #[test]
+    fn a_restored_duplicate_login_is_archived_not_listed_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (active, _) = homes.create(Provider::Claude, None).unwrap();
+        let (copy, _) = homes.create(Provider::Claude, None).unwrap();
+        let (of_system, _) = homes.create(Provider::Claude, None).unwrap();
+        let system = [(Provider::Claude, identity("system@example.com"))];
+        let (_, first) = store
+            .restore_home(&homes, restorable(active, "plan2@example.com"), &system)
+            .unwrap();
+        assert_eq!(first, Restored::Listed);
+        let (_, second) = store
+            .restore_home(&homes, restorable(copy, "PLAN2@example.com"), &system)
+            .unwrap();
+        assert_eq!(
+            second,
+            Restored::Archived {
+                duplicate_of: Account::managed(Provider::Claude, active, PathBuf::new()).id()
+            }
+        );
+        let (registry, third) = store
+            .restore_home(&homes, restorable(of_system, "system@example.com"), &system)
+            .unwrap();
+        assert_eq!(
+            third,
+            Restored::Archived {
+                duplicate_of: Account::system(Provider::Claude).id()
+            }
+        );
+        // Archived homes stay registered, so their saved sessions resume and
+        // nothing takes them for unregistered again, but new work skips them.
+        assert!(registry.is_archived(copy) && registry.is_archived(of_system));
+        assert!(!registry.is_archived(active));
+        let listed: Vec<_> = registry
+            .accounts(Some(&homes))
+            .into_iter()
+            .filter_map(|account| account.registry_key())
+            .collect();
+        assert_eq!(listed, [active]);
+        assert!(homes.unregistered(&registry).is_empty());
+        for key in [active, copy, of_system] {
+            assert!(
+                store
+                    .authorize_launch(
+                        &homes,
+                        &account_recipe(&homes.path(Provider::Claude, key)),
+                        None
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn only_real_key_named_homes_are_candidates_for_restoration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (registered, _) = homes.create(Provider::Claude, None).unwrap();
+        let (pending, _) = homes.create(Provider::Codex, None).unwrap();
+        let (linked, linked_path) = homes.create(Provider::Claude, None).unwrap();
+        let (lost, _) = homes.create(Provider::Codex, None).unwrap();
+        let parent = directory.path().join("accounts/claude");
+        // A removal that was interrupted is on its way out, whatever it holds.
+        let parked = parent.join(format!(".removing-{}", Uuid::new_v4()));
+        fs::create_dir(&parked).unwrap();
+        fs::write(parked.join("login"), "still signed in").unwrap();
+        // Other spellings of a UUID are not names cagents gives a home.
+        fs::create_dir(parent.join(Uuid::new_v4().simple().to_string())).unwrap();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let aliased = Uuid::new_v4();
+        std::os::unix::fs::symlink(&outside, parent.join(aliased.to_string())).unwrap();
+        fs::write(parent.join(Uuid::new_v4().to_string()), "not a directory").unwrap();
+        let (registry, ()) = store
+            .update(|registry| {
+                registry
+                    .accounts
+                    .push(restorable(registered, "a@example.com"));
+                registry.begin(Provider::Codex, pending, 1);
+                let mut link = managed(Provider::Claude, "linked@example.com");
+                link.linked_home = Some(linked_path.clone());
+                registry.accounts.push(link);
+            })
+            .unwrap();
+        let _ = linked;
+        assert_eq!(
+            homes
+                .unregistered(&registry)
+                .into_iter()
+                .map(|(provider, key, _)| (provider, key))
+                .collect::<Vec<_>>(),
+            [(Provider::Codex, lost)]
+        );
+        assert!(!homes.is_unregistered(&registry, Provider::Claude, aliased));
+        let mut through_link = restorable(aliased, "x@example.com");
+        through_link.provider = Provider::Claude;
+        assert_eq!(
+            store
+                .restore_home(&homes, through_link, &[])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(parked.join("login").exists());
+    }
+
+    #[test]
+    fn a_newer_registry_is_never_restored_into() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, _) = homes.create(Provider::Claude, None).unwrap();
+        let newer = Registry {
+            version: VERSION + 1,
+            ..Registry::default()
+        };
+        fs::create_dir_all(&store.directory).unwrap();
+        write(&store.directory, &store.path(), &newer).unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        let error = store
+            .restore_home(&homes, restorable(key, "a@example.com"), &[])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn restoration_waits_for_the_lifecycle_lock_and_keeps_a_concurrent_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, _) = homes.create(Provider::Claude, None).unwrap();
+        let lifecycle = homes.lifecycle_lock().unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        let (restore_store, restore_homes) = (store.clone(), homes.clone());
+        let restoring = std::thread::spawn(move || {
+            done.send(restore_store.restore_home(
+                &restore_homes,
+                restorable(key, "probe@example.com"),
+                &[],
+            ))
+            .unwrap();
+        });
+        assert!(
+            result
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "restoration waits for an account lifecycle change in progress"
+        );
+        // Meanwhile another window registers the same home.
+        store
+            .update(|registry| {
+                registry
+                    .accounts
+                    .push(restorable(key, "window@example.com"))
+            })
+            .unwrap();
+        drop(lifecycle);
+        let (registry, restored) = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        restoring.join().unwrap();
+        assert_eq!(restored, Restored::AlreadyRegistered);
+        assert_eq!(
+            registry.find(key).unwrap().email.as_deref(),
+            Some("window@example.com")
+        );
+        assert_eq!(registry.registered().len(), 1);
+    }
+
+    #[test]
+    fn a_launch_on_a_kept_unregistered_home_says_it_can_be_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (kept, kept_home) = homes.create(Provider::Claude, None).unwrap();
+        let gone = Uuid::new_v4();
+        let gone_home = homes.path(Provider::Claude, gone);
+        let refused =
+            |home: &Path| match store.authorize_launch(&homes, &account_recipe(home), None) {
+                Err(error @ LaunchAccountError::Removed { .. }) => error,
+                other => panic!(
+                    "expected a refusal, got {:?}",
+                    other.map(|lease| lease.is_some())
+                ),
+            };
+        let kept_error = refused(&kept_home);
+        assert!(matches!(
+            kept_error,
+            LaunchAccountError::Removed { key, home_kept: true, .. } if key == kept
+        ));
+        let message = kept_error.to_string();
+        assert!(message.contains("isn't in the account list") && !message.contains("removed"));
+        let gone_error = refused(&gone_home);
+        assert!(matches!(
+            gone_error,
+            LaunchAccountError::Removed { key, home_kept: false, .. } if key == gone
+        ));
+        assert!(gone_error.to_string().contains("was removed"));
+        // Only while its restoration asks the provider is the home launchable.
+        {
+            let _probe = RestoreProbe::begin(Provider::Claude, kept).unwrap();
+            assert!(RestoreProbe::begin(Provider::Claude, kept).is_none());
+            assert!(
+                store
+                    .authorize_launch(&homes, &account_recipe(&kept_home), None)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        refused(&kept_home);
     }
 }

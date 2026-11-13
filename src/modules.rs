@@ -2,12 +2,20 @@
 // another worktree's source mtimes predate the shared cached artifact.
 const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
-/// The version this build reports about itself: the product version plus the
-/// build metadata `build.rs` resolved (`0.1.3+local.3d80e6d`), or the bare
+/// The version this executable reports about itself: the product version plus
+/// the build metadata it was compiled with (`0.1.3+local.3d80e6d`), or the bare
 /// product version for a release build. Use this to verify an installed build's
 /// identity; ignore its metadata only when ordering published release versions.
-pub const VERSION: &str = env!("CAGENTS_VERSION");
+///
+/// An executable states it with [`stamp_version!`], which records it before
+/// `main`; in one that never does, such as a unit test, this is
+/// `<product version>+unstamped`.
+pub fn version() -> &'static str {
+    build_version::current()
+}
 
+#[doc(hidden)]
+pub mod build_version;
 mod names;
 pub(crate) mod native_chat_capacity;
 pub mod search_match;
@@ -26,8 +34,6 @@ pub mod browser;
 pub mod capability;
 pub mod channel_work;
 pub mod channel_work_api;
-#[cfg(feature = "ui")]
-pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;
@@ -64,12 +70,15 @@ pub mod file_manager;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod file_url;
 mod filesystem_recovery_context;
+mod flock;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
 pub mod github_identity;
+pub(crate) mod github_rate_limit;
+pub mod github_status;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]
@@ -85,6 +94,8 @@ pub mod latency_fixture;
 pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
@@ -101,6 +112,8 @@ pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod pull_request_signals;
 pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
@@ -128,6 +141,9 @@ pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;
 pub mod terminal;
+#[cfg(all(test, any(feature = "host", feature = "ui")))]
+pub(crate) mod test_tracing;
+pub(crate) mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]

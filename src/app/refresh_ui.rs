@@ -26,7 +26,6 @@ pub(super) struct State {
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     schedule: ProjectSchedule,
-    last_pull_request: Instant,
 }
 
 impl Default for State {
@@ -39,7 +38,6 @@ impl Default for State {
             source_cancel: None,
             projects: HashMap::new(),
             schedule: ProjectSchedule::default(),
-            last_pull_request: Instant::now(),
         }
     }
 }
@@ -171,6 +169,40 @@ pub enum Action {
 }
 
 impl Cagents {
+    fn next_github_project(
+        &self,
+        selected: Option<ProjectId>,
+        regained_focus: bool,
+        now: Instant,
+    ) -> Option<ProjectId> {
+        self.refresh_ui.schedule.next(
+            selected.filter(|id| {
+                self.sidebar_model.project(*id).is_some_and(|project| {
+                    project.kind == ProjectKind::Git && self.github_project_polling_ready(*id)
+                })
+            }),
+            self.sidebar_model
+                .projects
+                .iter()
+                .filter(|project| {
+                    project.kind == ProjectKind::Git
+                        && project.unreachable.is_none()
+                        && self.github_project_polling_ready(project.id)
+                })
+                .map(|project| {
+                    let interval = if project.has_open_pull_request() {
+                        ACTIVE_PROJECT_INTERVAL
+                    } else {
+                        IDLE_PROJECT_INTERVAL
+                    };
+                    (project.id, interval)
+                }),
+            &self.refresh_ui.projects,
+            regained_focus,
+            now,
+        )
+    }
+
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
         if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
             return Subscription::none();
@@ -199,10 +231,13 @@ impl Cagents {
             self.cancel_workspace_preview();
         }
         self.refresh_ui.focused = focused;
+        crate::ui_controls::animate_activity(focused);
         if !regained {
             return self.accounts_focus_changed(focused, false);
         }
         Task::batch([
+            // Coming back to the window is coming back to the pane in use.
+            self.focus_pane_keyboard_on_activation(),
             self.refresh(true),
             self.accounts_focus_changed(focused, true),
             self.installation_focus_regained(),
@@ -254,7 +289,7 @@ impl Cagents {
             }
         }
         if self.context_inspector_open
-            && matches!(self.context_tab, ContextTab::Files | ContextTab::Changes)
+            && self.workspace_view_shown().is_some()
             && self.refresh_ui.source_cancel.is_none()
             && let Some(key) = self
                 .sidebar_model
@@ -266,21 +301,24 @@ impl Cagents {
             tasks.push(self.reload_source_control(&key));
         }
         let now = Instant::now();
-        if let Some(card) = self.workspace.focused()
-            && matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_)))
-        {
-            tasks.push(
-                self.apply_pull_request_review(
-                    card,
-                    pull_request_review::Action::RefreshIfDue(now),
-                ),
-            );
-        }
-        if regained_focus
-            || now.duration_since(self.refresh_ui.last_pull_request) >= Duration::from_secs(30)
-        {
-            self.refresh_ui.last_pull_request = now;
-            tasks.push(self.maybe_refresh_pull_request());
+        let browsers = self
+            .cards
+            .iter()
+            .filter_map(|(&card, runtime)| {
+                (self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+                    && matches!(runtime, CardRuntime::PullRequests(_)))
+                .then_some(card)
+            })
+            .collect::<Vec<_>>();
+        for card in browsers {
+            tasks.push(self.apply_pull_request_review(
+                card,
+                if regained_focus {
+                    pull_request_review::Action::BrowserFocused
+                } else {
+                    pull_request_review::Action::RefreshIfDue(now)
+                },
+            ));
         }
         let projects = &self.sidebar_model.projects;
         self.refresh_ui
@@ -304,33 +342,12 @@ impl Cagents {
         }
         // A project whose checkout could not be read is retried from its row
         // rather than in the background, unless it is selected.
-        if let Some(id) = self
-            .refresh_ui
-            .schedule
-            .next(
-                sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
-                    .filter(|project| project.kind == ProjectKind::Git)
-                    .map(|project| project.id),
-                projects
-                    .iter()
-                    .filter(|project| {
-                        project.kind == ProjectKind::Git && project.unreachable.is_none()
-                    })
-                    .map(|project| {
-                        let interval = if project.has_open_pull_request() {
-                            ACTIVE_PROJECT_INTERVAL
-                        } else {
-                            IDLE_PROJECT_INTERVAL
-                        };
-                        (project.id, interval)
-                    }),
-                &self.refresh_ui.projects,
-                regained_focus,
-                now,
-            )
-            .and_then(|id| self.sidebar_model.project(id))
-            .map(|project| project.id)
-        {
+        if let Some(id) = self.next_github_project(
+            sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
+                .map(|project| project.id),
+            regained_focus,
+            now,
+        ) {
             tasks.push(self.github_read_task(id));
         }
         Task::batch(tasks)
@@ -406,6 +423,27 @@ mod tests {
 
     fn active<const N: usize>(projects: [ProjectId; N]) -> [(ProjectId, Duration); N] {
         projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
+    }
+
+    /// Spinners take their cadence from the main window's focus and nothing
+    /// else: another window's focus changes must neither slow nor restore it.
+    #[test]
+    fn activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let other = window::Id::unique();
+        assert!(!crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, true))));
+        assert!(crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, false))));
+        assert!(crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, false))));
+        assert!(!crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, true))));
+        assert!(!crate::ui_controls::activity_animates());
     }
 
     #[test]
@@ -656,5 +694,106 @@ mod tests {
         assert_eq!(schedule.read.keys().collect::<Vec<_>>(), [&open]);
         assert!(schedule.stale.is_empty());
         assert!(schedule.failures.is_empty());
+    }
+
+    #[test]
+    fn review_project_rate_limits_remain_failures_in_both_completion_routes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let availability = || GitHubAvailability::RateLimited {
+            limit: crate::github::polling::RateLimit::secondary(
+                crate::github::polling::now() + 120,
+            ),
+        };
+        app.repository_generations.insert(project, 1);
+        drop(app.update(Message::GitUi(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok((availability(), Vec::new())),
+        })));
+        assert_eq!(app.refresh_ui.schedule.failures.get(&project), Some(&1));
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 1,
+            result: Ok(Box::new(LoadedRepository {
+                project: ProjectState {
+                    id: project,
+                    generation: 0,
+                    name: "paused".into(),
+                    repository: "/review-paused-project".into(),
+                    existence: Existence::Open,
+                    kind: ProjectKind::Git,
+                },
+                repository: None,
+                worktrees: Vec::new(),
+                github: availability(),
+                review_repository: None,
+                head_repositories: HashMap::new(),
+            })),
+        }));
+        assert_eq!(app.refresh_ui.schedule.failures.get(&project), Some(&2));
+    }
+
+    #[test]
+    fn review_project_polling_skips_shared_backoff_before_repository_discovery() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let key = GitHubRepoKey::new("review-project-backoff.invalid", None, "o", "r").unwrap();
+        app.review_repositories.insert(project, key.clone());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "paused".into(),
+            "/review-paused-project".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        crate::github::polling::failed(
+            &key.authority(),
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+        let sequence = app.repository_load_sequence;
+        drop(app.github_read_task(project));
+        assert_eq!(app.repository_load_sequence, sequence);
+        assert!(app.repository_generations.is_empty());
+        assert!(app.refresh_ui.projects.is_empty());
+    }
+
+    #[test]
+    fn review_project_scheduler_skips_paused_selected_and_oldest_hosts_without_starving_others() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let [paused, ready] = projects();
+        for (project, host) in [
+            (paused, "review-scheduler-paused.invalid"),
+            (ready, "review-scheduler-ready.invalid"),
+        ] {
+            app.review_repositories
+                .insert(project, GitHubRepoKey::new(host, None, "o", "r").unwrap());
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                host.into(),
+                PathBuf::from("/review-scheduler").join(host),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        crate::github::polling::failed(
+            "review-scheduler-paused.invalid",
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
+            },
+        );
+        let now = Instant::now();
+        assert_eq!(
+            app.next_github_project(Some(paused), false, now),
+            Some(ready)
+        );
+        assert_eq!(app.next_github_project(None, false, now), Some(ready));
+        app.refresh_ui.schedule.started(ready, now);
+        assert_eq!(app.next_github_project(Some(paused), false, now), None);
     }
 }

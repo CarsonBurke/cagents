@@ -2,8 +2,6 @@ use super::*;
 
 fn hosted_omp() -> CardState {
     let mut card = super::super::tests::terminal_card_state();
-    card.exposure = Exposure::Offscreen;
-    card.residency = Residency::Hibernated;
     let CardKind::Terminal(session) = &mut card.kind else {
         unreachable!()
     };
@@ -27,10 +25,8 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
     // attachment, so an empty-focus oracle would not test this contract.
     let mut control = super::super::tests::terminal_card_state();
     control.kind = CardKind::Settings;
-    control.exposure = Exposure::Visible;
-    control.residency = Residency::Hot;
     app.durable = Arc::new(WorkspaceState {
-        cards: vec![control.clone(), original.clone()],
+        cards: vec![control.clone(), original.clone()].into(),
         focused: Some(control.id),
         ..Default::default()
     });
@@ -93,8 +89,8 @@ fn newly_adopted_omp_uses_the_hidden_attachment_without_changing_scope_or_focus(
     assert_eq!(cards.len(), 1);
     let card = cards[0].id;
     assert_eq!(cards[0].kind, CardKind::Terminal(session));
-    assert_eq!(cards[0].exposure, Exposure::Offscreen);
-    assert_eq!(cards[0].residency, Residency::Hibernated);
+    assert_eq!(app.exposure(card), Exposure::Offscreen);
+    assert_eq!(*app.residency(card), Residency::Hibernated);
     assert_eq!(app.terminal_starts_in_flight(), 1);
     assert!(app.terminal_start_in_flight(card));
     assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));

@@ -1,35 +1,26 @@
-//! A shell owns one worker slot and one resumable scan per repository.
+//! Each shell consumes the repository scan shared across local windows.
 use super::*;
-use crate::github::GitHubService;
-use std::collections::HashMap;
+use crate::github::review_requests::{scan::Scan, shared};
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-/// How long a repository's requests may go unread between passes, each of
-/// which reads every page and new request's history. Review requests change on
-/// a human timescale, and every read spends the account's GraphQL budget,
-/// which it shares with every other `gh` client on the machine.
-const REFRESH: Duration = Duration::from_secs(60);
-/// A failed read waits this long, then twice as long after each further
-/// failure in a row, up to [`MAX_BACKOFF`]. A rate limit is the failure this
-/// matters for: retrying it sooner only spends the budget it is waiting for.
+/// A failed local cache operation is retried once a minute. Network backoff
+/// and server pacing live in the shared repository state.
 const RETRY: Duration = Duration::from_secs(60);
-const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
-/// Across every repository, one shell starts at most one read per `PACE` once
-/// it has spent its `BURST`: at most 600 of GitHub's 5,000 hourly GraphQL
-/// points, however many repositories are open. Past ten repositories this,
-/// not [`REFRESH`], sets how often each is read. The burst lets a shell that
-/// just opened discover its first repositories without waiting a pace apiece.
+/// Across repositories, a shell starts one shared-cache read per `PACE` after
+/// spending its initial burst. The shared repository state decides whether a
+/// read needs GitHub; several windows cannot each spend a repository's budget.
 const PACE: Duration = Duration::from_secs(6);
 const BURST: u32 = 10;
 
 /// How long a shell's monitor may wait to start a read that has fallen due
-/// while its window is focused. A settled repository falls due once per
-/// [`REFRESH`] however often this ticks, and a tick with nothing due changes
+/// while its window is focused. A settled repository falls due once a minute
+/// however often this ticks, and a tick with nothing due changes
 /// nothing.
 const FOCUSED_TICK: Duration = Duration::from_secs(10);
 /// Out of focus, discovery mostly serves the desktop alerts, which exist for
 /// someone looking elsewhere. Two minutes keeps those on a human timescale,
-/// twice [`REFRESH`], while waking the window a twelfth as often. A shell
+/// while waking the window a twelfth as often. A shell
 /// ticks once more when its window regains focus, so whatever fell due in
 /// the meantime is read at once.
 const BACKGROUND_TICK: Duration = Duration::from_secs(2 * 60);
@@ -46,11 +37,10 @@ pub fn tick_interval(focused: bool) -> Duration {
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
-    Loaded {
+    SharedLoaded {
         repository: GitHubRepoKey,
         generation: u64,
-        work: Work,
-        result: Result<Reply, String>,
+        result: Result<shared::PollResult, String>,
     },
 }
 
@@ -60,7 +50,7 @@ struct Entry {
     generation: u64,
     cancellation: CancellationToken,
     due: Instant,
-    failures: u32,
+    last_shared_observation: Option<(String, u64)>,
 }
 
 impl Drop for Entry {
@@ -76,20 +66,15 @@ pub struct Monitor {
     // Keep the global slot until even a cancelled worker acknowledges completion.
     busy: Option<(GitHubRepoKey, u64)>,
     observed: Vec<crate::notifications::review::ReviewRequest>,
+    // Followers can catch up several pages at once, but each report RPC accepts
+    // one page. Drain the remaining observations through local messages.
+    pending_observed: VecDeque<(u64, crate::notifications::review::ReviewRequest)>,
     /// When the next read would be on schedule were reads started at exactly
     /// one per [`PACE`]; a read may start while this is less than a burst
     /// ahead of now (the generic cell rate algorithm).
     paced: Option<Instant>,
-    /// Reads in a row, across every repository, that failed.
-    failing: usize,
     /// Advances whenever [`Monitor::snapshots`] would yield something else.
     revision: u64,
-}
-
-fn backoff(failures: u32) -> Duration {
-    RETRY
-        .saturating_mul(1 << (failures - 1).min(16))
-        .min(MAX_BACKOFF)
 }
 
 impl Monitor {
@@ -103,8 +88,8 @@ impl Monitor {
         true
     }
 
-    /// Only the bounded page just validated by this coordinator may report
-    /// alerts. Historical snapshot rows are not replayed on every UI tick.
+    /// A bounded batch of newly consumed shared observations. Displayed rows
+    /// alone never grant an alert, and ordinary ticks never replay a page.
     pub fn take_observed(&mut self) -> Vec<crate::notifications::review::ReviewRequest> {
         std::mem::take(&mut self.observed)
     }
@@ -193,7 +178,7 @@ impl Monitor {
                         generation: state.generation,
                         cancellation: CancellationToken::new(),
                         due: Instant::now(),
-                        failures: 0,
+                        last_shared_observation: None,
                     },
                 );
             }
@@ -201,120 +186,144 @@ impl Monitor {
         if revised {
             state.revision = state.revision.wrapping_add(1);
         }
-        let failing = state.failing;
-        if let Action::Loaded {
-            repository,
-            generation,
-            work,
-            result,
-        } = action
-        {
-            if state.busy.as_ref() != Some(&(repository.clone(), generation)) {
-                return iced::Task::none();
-            }
-            state.busy = None;
-            if let Some(entry) = state
-                .entries
-                .get_mut(&repository)
-                .filter(|entry| entry.generation == generation)
-            {
-                let mut observed_numbers = Vec::new();
-                let applied = result.and_then(|reply| {
-                    let viewer = match &reply {
-                        Reply::Page(page) => &page.viewer,
-                        Reply::History(page) => &page.viewer,
-                    };
-                    let observed_viewer = viewer.id.clone();
-                    observed_numbers = match &reply {
-                        Reply::Page(page) => {
-                            page.entries.iter().map(|entry| entry.number).collect()
-                        }
-                        Reply::History(_) => match &work {
-                            Work::History { number, .. } => vec![*number],
-                            _ => Vec::new(),
-                        },
-                    };
-                    let result = match reply {
-                        Reply::Page(page) => entry.scan.page(&work, page),
-                        Reply::History(page) => entry.scan.history(&work, page),
-                    };
-                    if entry
-                        .scan
-                        .viewer
-                        .as_ref()
-                        .is_none_or(|viewer| viewer.id != observed_viewer)
-                    {
-                        observed_numbers.clear();
-                    }
-                    result
-                });
-                if applied.is_ok()
-                    && let Some(viewer) = &entry.scan.viewer
+        match action {
+            Action::SharedLoaded {
+                repository,
+                generation,
+                result,
+            } => {
+                if state.busy.as_ref() != Some(&(repository.clone(), generation)) {
+                    return iced::Task::none();
+                }
+                state.busy = None;
+                if let Some(entry) = state
+                    .entries
+                    .get_mut(&repository)
+                    .filter(|entry| entry.generation == generation)
                 {
-                    state
-                        .observed
-                        .extend(observed_numbers.into_iter().filter_map(|number| {
-                            entry.scan.requested.get(&number).map(|request| {
-                                crate::notifications::review::ReviewRequest {
-                                    host: repository.host.clone(),
-                                    port: repository.port,
-                                    owner: repository.owner.clone(),
-                                    repository: repository.name.clone(),
-                                    number,
-                                    viewer: viewer.id.clone(),
-                                    request: request.current.id.clone(),
+                    let error = match result {
+                        Ok(result) => {
+                            entry.scan = result.scan;
+                            // The shared state carries server pacing. Recheck
+                            // its credential key within one minute, including
+                            // during an old account's transient backoff.
+                            entry.due = Instant::now()
+                                + Duration::from_secs(
+                                    result
+                                        .due
+                                        .saturating_sub(crate::github::polling::now())
+                                        .clamp(1, 60),
+                                );
+                            if entry.last_shared_observation.as_ref() != Some(&result.observation) {
+                                let since = entry
+                                    .last_shared_observation
+                                    .as_ref()
+                                    .filter(|(incarnation, _)| incarnation == &result.observation.0)
+                                    .map_or(0, |(_, revision)| *revision);
+                                entry.last_shared_observation = Some(result.observation);
+                                if let Some(viewer) = &entry.scan.viewer {
+                                    let mut queued = state
+                                        .pending_observed
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, (_, request))| (request.clone(), index))
+                                        .collect::<HashMap<_, _>>();
+                                    for page in result.observed {
+                                        if page.revision <= since || page.viewer != viewer.id {
+                                            continue;
+                                        }
+                                        for (number, request_id) in page.requests {
+                                            if entry.scan.requested.get(&number).is_some_and(
+                                                |request| request.current.id == request_id,
+                                            ) {
+                                                let request =
+                                                    crate::notifications::review::ReviewRequest {
+                                                        host: repository.host.clone(),
+                                                        port: repository.port,
+                                                        owner: repository.owner.clone(),
+                                                        repository: repository.name.clone(),
+                                                        number,
+                                                        viewer: viewer.id.clone(),
+                                                        request: request_id,
+                                                    };
+                                                if let Some(&index) = queued.get(&request) {
+                                                    state.pending_observed[index].0 = state
+                                                        .pending_observed[index]
+                                                        .0
+                                                        .max(page.at);
+                                                } else {
+                                                    queued.insert(
+                                                        request.clone(),
+                                                        state.pending_observed.len(),
+                                                    );
+                                                    state
+                                                        .pending_observed
+                                                        .push_back((page.at, request));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            })
-                        }));
-                }
-                if applied.is_err() {
-                    entry.scan.failed_history(&work);
-                }
-                // Most reads find what the last one did. Keeping its snapshot
-                // lets every shell see that nothing changed.
-                let error = applied.err();
-                if entry.snapshot.viewer != entry.scan.viewer
-                    || entry.snapshot.requested != entry.scan.requested
-                    || entry.snapshot.error != error
-                {
-                    entry.snapshot = Arc::new(Snapshot {
-                        viewer: entry.scan.viewer.clone(),
-                        requested: entry.scan.requested.clone(),
-                        error,
-                    });
-                    state.revision = state.revision.wrapping_add(1);
-                }
-                // A pass that met a failure keeps backing off until it
-                // settles, so one timeline that always fails cannot reset the
-                // backoff through the pages read between its attempts.
-                let failed = entry.snapshot.error.is_some();
-                if failed {
-                    entry.failures = entry.failures.saturating_add(1);
-                } else if entry.scan.settled() {
-                    entry.failures = 0;
-                }
-                entry.due = Instant::now()
-                    + if failed || entry.failures > 0 {
-                        backoff(entry.failures.max(1))
-                    } else if entry.scan.settled() {
-                        REFRESH
-                    } else {
-                        Duration::ZERO
-                    };
-                state.failing = if failed { state.failing + 1 } else { 0 };
-                if !failed && failing >= state.entries.len().max(2) {
-                    // Every repository failed in a row, then one read worked:
-                    // the account or network is back, so none should wait
-                    // out a backoff it earned while everything was down.
-                    let now = Instant::now();
-                    for entry in state.entries.values_mut() {
-                        if entry.failures > 0 {
-                            entry.failures = 0;
-                            entry.due = entry.due.min(now);
+                            }
+                            result.error
                         }
+                        Err(error) => {
+                            entry.due = Instant::now() + RETRY;
+                            Some(error)
+                        }
+                    };
+                    if entry.snapshot.viewer != entry.scan.viewer
+                        || entry.snapshot.requested != entry.scan.requested
+                        || entry.snapshot.error != error
+                    {
+                        entry.snapshot = Arc::new(Snapshot {
+                            viewer: entry.scan.viewer.clone(),
+                            requested: entry.scan.requested.clone(),
+                            error,
+                        });
+                        state.revision = state.revision.wrapping_add(1);
                     }
                 }
             }
+            Action::Tick => {}
+        };
+        // A new viewer, closed request or removed repository revokes queued
+        // authority before delivery. Unchanged cached pages are never replayed.
+        let observed_at = crate::github::polling::now();
+        state.pending_observed.retain(|(at, request)| {
+            observed_at.saturating_sub(*at) < 5 * 60
+                && state.entries.iter().any(|(repository, entry)| {
+                    repository.host == request.host
+                        && repository.port == request.port
+                        && repository.owner == request.owner
+                        && repository.name == request.repository
+                        && entry.snapshot.error.is_none()
+                        && entry
+                            .scan
+                            .viewer
+                            .as_ref()
+                            .is_some_and(|viewer| viewer.id == request.viewer)
+                        && entry
+                            .scan
+                            .requested
+                            .get(&request.number)
+                            .is_some_and(|current| current.current.id == request.request)
+                })
+        });
+        let mut numbers = std::collections::HashSet::new();
+        while state.observed.len() < 50 {
+            let Some((_, request)) = state.pending_observed.pop_front() else {
+                break;
+            };
+            if numbers.insert(request.clone()) {
+                state.observed.push(request);
+            }
+        }
+        if !state.pending_observed.is_empty() {
+            // Notification RPCs accept fifty observations. Drain a follower's
+            // backlog through bounded local messages now, rather than waiting
+            // another background interval or spending another GitHub request.
+            return iced::Task::done(Action::Tick);
         }
         if state.busy.is_some() {
             return iced::Task::none();
@@ -334,28 +343,19 @@ impl Monitor {
         }
         let entry = state.entries.get_mut(&repository).expect("selected entry");
         let generation = entry.generation;
-        let work = entry.scan.next();
         let cancellation = entry.cancellation.clone();
         state.busy = Some((repository.clone(), generation));
         iced::Task::perform(
             async move {
                 let target = repository.clone();
-                let requested = work.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    execute(
-                        &GitHubService::system("gh"),
-                        &target,
-                        &requested,
-                        &cancellation,
-                    )
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                Action::Loaded {
+                let result =
+                    tokio::task::spawn_blocking(move || shared::poll(&target, &cancellation))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                Action::SharedLoaded {
                     repository,
                     generation,
-                    work,
                     result,
                 }
             },
@@ -367,90 +367,159 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::review_requests::{Current, Entry as RequestEntry, Page, Viewer};
+    use crate::github::review_requests::{
+        Current, Entry as RequestEntry, Page, Viewer, scan::Work,
+    };
 
-    fn reply(viewer: &str, request: Option<&str>) -> Reply {
-        Reply::Page(Page {
-            viewer: Viewer {
-                id: viewer.into(),
-                login: viewer.into(),
-            },
-            entries: vec![RequestEntry {
-                number: 51,
-                title: "Late request".into(),
-                url: "https://github.com/o/r/pull/51".parse().unwrap(),
-                viewer_latest_review_request: request.map(|id| Current {
-                    id: id.into(),
-                    as_code_owner: false,
-                    requested_reviewer: None,
-                }),
-            }],
-            next_cursor: None,
-        })
+    fn repository() -> GitHubRepoKey {
+        GitHubRepoKey::new("github.com", None, "o", "r").unwrap()
     }
-    #[test]
-    fn only_a_changed_read_or_repository_set_revises_the_snapshots() {
-        let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        let unwatched = monitor.revision();
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        assert_ne!(
-            monitor.revision(),
-            unwatched,
-            "a new repository is a change"
-        );
-        let read = |monitor: &mut Monitor, result: Result<Reply, String>| {
-            monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
-            monitor.paced = None;
-            drop(monitor.update(Action::Tick, [repository.clone()]));
-            let (_, generation) = monitor.busy.clone().expect("a read started");
-            drop(monitor.update(
-                Action::Loaded {
-                    repository: repository.clone(),
-                    generation,
-                    work: Work::Page { cursor: None },
-                    result,
+
+    fn result(viewer: &str, requested: &[u64], revision: u64) -> shared::PollResult {
+        let mut scan = Scan::default();
+        scan.page(
+            &Work::Page { cursor: None },
+            Page {
+                viewer: Viewer {
+                    id: viewer.into(),
+                    login: viewer.into(),
                 },
-                [repository.clone()],
-            ));
-        };
-        read(&mut monitor, Ok(reply("viewer", Some("request51"))));
-        let revision = monitor.revision();
-        let published = Arc::clone(&monitor.entries[&repository].snapshot);
+                entries: requested
+                    .iter()
+                    .map(|&number| RequestEntry {
+                        number,
+                        title: format!("PR {number}"),
+                        url: format!("https://github.com/o/r/pull/{number}")
+                            .parse()
+                            .unwrap(),
+                        viewer_latest_review_request: Some(Current {
+                            id: format!("request-{number}"),
+                            as_code_owner: false,
+                            requested_reviewer: None,
+                        }),
+                    })
+                    .collect(),
+                next_cursor: None,
+            },
+        )
+        .unwrap();
+        shared::PollResult {
+            scan,
+            error: None,
+            due: crate::github::polling::now() + 60,
+            observation: ("incarnation".into(), revision),
+            observed: vec![shared::Observation {
+                revision,
+                at: crate::github::polling::now(),
+                viewer: viewer.into(),
+                requests: requested
+                    .iter()
+                    .map(|&number| (number, format!("request-{number}")))
+                    .collect(),
+            }],
+        }
+    }
 
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        read(&mut monitor, Ok(reply("viewer", Some("request51"))));
-        assert_eq!(
-            monitor.revision(),
-            revision,
-            "an identical read changes nothing"
-        );
-        assert!(Arc::ptr_eq(
-            &published,
-            &monitor.entries[&repository].snapshot
+    fn load(monitor: &mut Monitor, result: Result<shared::PollResult, String>) {
+        monitor.make_due_for_test();
+        drop(monitor.update(Action::Tick, [repository()]));
+        let (_, generation) = monitor.busy.clone().unwrap();
+        drop(monitor.update(
+            Action::SharedLoaded {
+                repository: repository(),
+                generation,
+                result,
+            },
+            [repository()],
         ));
+    }
 
-        // A re-request keeps the pull request listed under a new request node,
-        // which is what an alert's focus target names.
-        read(&mut monitor, Ok(reply("viewer", Some("request52"))));
-        assert_ne!(monitor.revision(), revision);
-        assert_eq!(
-            monitor.entries[&repository].snapshot.requested[&51]
-                .current
-                .id,
-            "request52"
-        );
-
+    #[test]
+    fn only_a_changed_snapshot_or_repository_set_revises_the_monitor() {
+        let mut monitor = Monitor::default();
+        let empty = monitor.revision();
+        drop(monitor.update(Action::Tick, [repository()]));
+        assert_ne!(monitor.revision(), empty);
+        load(&mut monitor, Ok(result("viewer", &[51], 1)));
         let revision = monitor.revision();
-        read(&mut monitor, Err("rate limited".into()));
-        assert_ne!(monitor.revision(), revision, "a failed read is shown");
+        let shown = monitor.entries[&repository()].snapshot.clone();
+        load(&mut monitor, Ok(result("viewer", &[51], 2)));
+        assert_eq!(monitor.revision(), revision);
+        assert!(Arc::ptr_eq(
+            &shown,
+            &monitor.entries[&repository()].snapshot
+        ));
+        load(&mut monitor, Ok(result("viewer", &[52], 3)));
+        assert_ne!(monitor.revision(), revision);
+        let revision = monitor.revision();
+        load(&mut monitor, Err("cache unavailable".into()));
+        assert_ne!(monitor.revision(), revision);
+        assert!(
+            monitor.entries[&repository()]
+                .snapshot
+                .requested
+                .contains_key(&52)
+        );
         let revision = monitor.revision();
         drop(monitor.update(Action::Tick, []));
-        assert_ne!(
-            monitor.revision(),
-            revision,
-            "a dropped repository is a change"
+        assert_ne!(monitor.revision(), revision);
+    }
+
+    #[test]
+    fn duplicate_panes_share_a_worker_and_viewer_switch_revokes_old_authority() {
+        let mut monitor = Monitor::default();
+        let equivalent = GitHubRepoKey::new("github.com", None, "O", "R").unwrap();
+        drop(monitor.update(Action::Tick, [repository(), equivalent]));
+        assert_eq!(monitor.entries.len(), 1);
+        load(&mut monitor, Ok(result("first", &[51], 1)));
+        assert_eq!(monitor.take_observed()[0].viewer, "first");
+        load(&mut monitor, Ok(result("second", &[], 1)));
+        assert!(monitor.take_observed().is_empty());
+        assert!(monitor.entries[&repository()].snapshot.requested.is_empty());
+        assert_eq!(
+            monitor.entries[&repository()]
+                .snapshot
+                .viewer
+                .as_ref()
+                .unwrap()
+                .id,
+            "second"
         );
+    }
+
+    #[test]
+    fn stale_repository_reply_cannot_grant_requests_to_a_readded_binding() {
+        let mut monitor = Monitor::default();
+        drop(monitor.update(Action::Tick, [repository()]));
+        let old = monitor.entries[&repository()].generation;
+        drop(monitor.update(Action::Tick, []));
+        drop(monitor.update(Action::Tick, [repository()]));
+        let current = monitor.entries[&repository()].generation;
+        assert_ne!(old, current);
+        drop(monitor.update(
+            Action::SharedLoaded {
+                repository: repository(),
+                generation: old,
+                result: Ok(result("old", &[1], 1)),
+            },
+            [repository()],
+        ));
+        assert!(monitor.entries[&repository()].snapshot.requested.is_empty());
+        assert_eq!(monitor.busy, Some((repository(), current)));
+    }
+
+    #[test]
+    fn local_ticks_do_not_replay_a_cached_observation_but_a_new_read_can_offer_it_again() {
+        let mut monitor = Monitor::default();
+        load(&mut monitor, Ok(result("viewer", &[1], 1)));
+        let observed = monitor.take_observed();
+        assert_eq!(observed.len(), 1);
+        drop(monitor.update(Action::Tick, [repository()]));
+        assert!(monitor.take_observed().is_empty());
+        load(&mut monitor, Ok(result("viewer", &[1], 1)));
+        assert!(monitor.take_observed().is_empty());
+        load(&mut monitor, Ok(result("viewer", &[1], 2)));
+        assert_eq!(monitor.take_observed(), observed);
     }
 
     #[test]
@@ -463,8 +532,6 @@ mod tests {
         assert!(!monitor.admit(start));
         assert!(!monitor.admit(start + PACE - Duration::from_millis(1)));
         assert!(monitor.admit(start + PACE));
-        assert!(!monitor.admit(start + PACE));
-        // An idle shell earns its burst back, and no more than it.
         let idle = start + PACE * (2 * BURST);
         for _ in 0..BURST {
             assert!(monitor.admit(idle));
@@ -473,270 +540,97 @@ mod tests {
     }
 
     #[test]
-    fn failures_back_off_to_a_ceiling_and_recovery_continues_the_pass_at_once() {
+    fn background_follower_delivers_two_hundred_requests_before_the_journal_expires() {
+        use cosmic::iced::futures::StreamExt;
         let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        let load = |monitor: &mut Monitor, cursor: Option<&str>, result: Result<Reply, String>| {
-            monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
-            monitor.paced = None;
-            drop(monitor.update(Action::Tick, [repository.clone()]));
-            let (_, generation) = monitor.busy.clone().expect("a read started");
-            let work = Work::Page {
-                cursor: cursor.map(str::to_owned),
+        let repository = GitHubRepoKey::new("github.com", None, "owner", "repository").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let generation = monitor.entries[&repository].generation;
+        let root = tempfile::tempdir().unwrap();
+        let now = crate::github::polling::now();
+        // Separate publisher processes advance every page without an alert
+        // consumer. The background follower arrives four minutes later, so
+        // another 120-second subscription interval would lose the observations.
+        let mut result = shared::tests::published_fixture(root.path(), now - 240, 200);
+        result.due = now + 60;
+        let mut task = monitor.update(
+            Action::SharedLoaded {
+                repository: repository.clone(),
+                generation,
+                result: Ok(result.clone()),
+            },
+            [repository.clone()],
+        );
+        let mut delivered = monitor.take_observed();
+        assert_eq!(delivered.len(), 50);
+        for _ in 0..3 {
+            let mut stream = iced::runtime::task::into_stream(task)
+                .expect("a local continuation must drain the backlog now");
+            // Iced yields once before every task, including Task::done. Drive
+            // that scheduler yield without waiting for a subscription timer.
+            let action = cosmic::iced::futures::executor::block_on(stream.next()).unwrap();
+            let iced::runtime::Action::Output(action @ Action::Tick) = action else {
+                panic!("draining observations must not fetch GitHub");
             };
-            let before = Instant::now();
-            drop(monitor.update(
-                Action::Loaded {
-                    repository: repository.clone(),
-                    generation,
-                    work,
-                    result,
-                },
-                [repository.clone()],
-            ));
-            monitor.entries[&repository]
-                .due
-                .saturating_duration_since(before)
-        };
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        monitor.busy = None;
-        let waits = (0..8)
-            .map(|_| load(&mut monitor, None, Err("rate limited".into())))
-            .collect::<Vec<_>>();
-        for (wait, expected) in waits.iter().zip([1, 2, 4, 8, 16, 30, 30, 30]) {
-            assert!(wait.abs_diff(Duration::from_secs(60 * expected)) < Duration::from_secs(1));
+            task = monitor.update(action, [repository.clone()]);
+            let batch = monitor.take_observed();
+            assert_eq!(batch.len(), 50);
+            delivered.extend(batch);
         }
-        let mut more = reply("viewer", None);
-        if let Reply::Page(page) = &mut more {
-            page.next_cursor = Some("page2".into());
-        }
-        assert!(load(&mut monitor, None, Ok(more)) < Duration::from_secs(1));
-        assert_eq!(monitor.entries[&repository].failures, 0);
-        let refreshed = load(&mut monitor, Some("page2"), Ok(reply("viewer", None)));
-        assert!(refreshed.abs_diff(REFRESH) < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn a_spent_budget_holds_due_repositories_until_it_refills() {
-        let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        monitor.paced = Some(Instant::now() + PACE * BURST);
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        assert!(monitor.busy.is_none());
-        monitor.paced = None;
-        drop(monitor.update(Action::Tick, [repository]));
-        assert!(monitor.busy.is_some());
-    }
-
-    #[test]
-    fn a_timeline_that_always_fails_keeps_backing_off_between_pages() {
-        let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        let current = Current {
-            id: "request".into(),
-            as_code_owner: false,
-            requested_reviewer: Some(crate::github::review_requests::Reviewer {
-                kind: "User".into(),
-                id: Some("reader".into()),
-            }),
-        };
-        let page = Reply::Page(Page {
-            viewer: Viewer {
-                id: "reader".into(),
-                login: "reader".into(),
-            },
-            entries: vec![RequestEntry {
-                number: 7,
-                title: "Needs history".into(),
-                url: "https://github.com/o/r/pull/7".parse().unwrap(),
-                viewer_latest_review_request: Some(current.clone()),
-            }],
-            next_cursor: None,
-        });
-        let history = Work::History {
-            number: 7,
-            request: current,
-            before: None,
-        };
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        monitor.busy = None;
-        let mut load = |work: Work, result: Result<Reply, String>| {
-            monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
-            monitor.paced = None;
-            drop(monitor.update(Action::Tick, [repository.clone()]));
-            let (_, generation) = monitor.busy.clone().expect("a read started");
-            let before = Instant::now();
-            drop(monitor.update(
-                Action::Loaded {
-                    repository: repository.clone(),
-                    generation,
-                    work,
-                    result,
-                },
-                [repository.clone()],
-            ));
-            let wait = monitor.entries[&repository]
-                .due
-                .saturating_duration_since(before);
-            (wait.as_secs_f64() / 60.0).round() as u64
-        };
-        let first = Work::Page { cursor: None };
-        assert_eq!(load(first.clone(), Ok(page.clone())), 0);
-        let waits = [1, 2, 4]
-            .iter()
-            .flat_map(|_| {
-                [
-                    load(history.clone(), Err("timeline unavailable".into())),
-                    load(first.clone(), Ok(page.clone())),
-                ]
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(waits, [1, 1, 2, 2, 4, 4]);
-    }
-
-    #[test]
-    fn a_read_that_ends_an_outage_clears_every_backoff() {
-        let mut monitor = Monitor::default();
-        let repositories =
-            ["a", "b", "c"].map(|name| GitHubRepoKey::new("github.com", None, "o", name).unwrap());
-        drop(monitor.update(Action::Tick, repositories.clone()));
-        monitor.busy = None;
-        let load = |monitor: &mut Monitor, index: usize, result: Result<Reply, String>| {
-            for entry in monitor.entries.values_mut() {
-                entry.due = Instant::now() + Duration::from_secs(3600);
-            }
-            monitor.entries.get_mut(&repositories[index]).unwrap().due = Instant::now();
-            monitor.paced = None;
-            drop(monitor.update(Action::Tick, repositories.clone()));
-            let (repository, generation) = monitor.busy.clone().expect("a read started");
-            drop(monitor.update(
-                Action::Loaded {
-                    repository,
-                    generation,
-                    work: Work::Page { cursor: None },
-                    result,
-                },
-                repositories.clone(),
-            ));
-        };
-        for round in 0..3 {
-            for index in 0..3 {
-                load(&mut monitor, index, Err(format!("offline {round}")));
-            }
-        }
-        assert!(monitor.entries.values().all(|entry| entry.failures == 3));
-        load(&mut monitor, 0, Ok(reply("viewer", None)));
-        let now = Instant::now();
-        assert!(
-            monitor
-                .entries
-                .values()
-                .all(|entry| entry.failures == 0 && entry.due <= now + REFRESH)
-        );
-    }
-
-    #[test]
-    fn duplicate_panes_share_worker_and_viewer_switch_revokes_prior_authority() {
-        let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        let equivalent = GitHubRepoKey::new("github.com", None, "O", "R").unwrap();
-        drop(monitor.update(Action::Tick, [repository.clone(), equivalent]));
-        assert_eq!(monitor.entries.len(), 1);
-        let generation = monitor.entries[&repository].generation;
-        drop(monitor.update(
-            Action::Loaded {
-                repository: repository.clone(),
-                generation,
-                work: Work::Page { cursor: None },
-                result: Ok(reply("first", Some("request51"))),
-            },
-            [repository.clone()],
-        ));
-        assert!(
-            monitor.entries[&repository]
-                .snapshot
-                .requested
-                .contains_key(&51)
-        );
-        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        drop(monitor.update(
-            Action::Loaded {
-                repository: repository.clone(),
-                generation,
-                work: Work::Page { cursor: None },
-                result: Ok(reply("second", None)),
-            },
-            [repository.clone()],
-        ));
-        assert!(monitor.entries[&repository].snapshot.requested.is_empty());
+        assert!(iced::runtime::task::into_stream(task).is_none());
         assert_eq!(
-            monitor.entries[&repository]
-                .snapshot
-                .viewer
-                .as_ref()
-                .unwrap()
-                .id,
-            "second"
+            delivered
+                .iter()
+                .map(|request| request.number)
+                .collect::<std::collections::BTreeSet<_>>(),
+            (1..=200).collect()
         );
-    }
-    #[test]
-    fn a_failed_delivery_is_offered_again_only_after_fresh_validated_observation() {
-        let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        let generation = monitor.entries[&repository].generation;
-        let loaded = || Action::Loaded {
-            repository: repository.clone(),
-            generation,
-            work: Work::Page { cursor: None },
-            result: Ok(reply("viewer", Some("request51"))),
-        };
-        drop(monitor.update(loaded(), [repository.clone()]));
-        let lost = monitor.take_observed();
-        assert_eq!(lost.len(), 1);
-        // The report RPC failed after this page; an ordinary UI tick must not
-        // replay stale account authority, nor permanently mark the ID delivered.
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        assert!(monitor.take_observed().is_empty());
-        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        drop(monitor.update(loaded(), [repository.clone()]));
-        assert_eq!(monitor.take_observed(), lost);
-        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        assert!(monitor.busy.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        monitor.make_due_for_test();
         drop(monitor.update(Action::Tick, [repository.clone()]));
         drop(monitor.update(
-            Action::Loaded {
+            Action::SharedLoaded {
                 repository: repository.clone(),
                 generation,
-                work: Work::Page { cursor: None },
-                result: Ok(reply("changed-viewer", None)),
+                result: Ok(result),
             },
             [repository],
         ));
-        assert!(monitor.take_observed().is_empty());
+        assert!(
+            monitor.take_observed().is_empty(),
+            "the same journal is consumed only once by each window"
+        );
     }
 
     #[test]
-    fn stale_repository_reply_cannot_grant_requests_to_readded_binding() {
+    fn shared_poll_admission_is_not_blocked_by_an_old_unscoped_host_budget() {
         let mut monitor = Monitor::default();
-        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        let old = monitor.entries[&repository].generation;
-        drop(monitor.update(Action::Tick, []));
-        drop(monitor.update(Action::Tick, [repository.clone()]));
-        let current = monitor.entries[&repository].generation;
-        assert_ne!(old, current);
-        drop(monitor.update(
-            Action::Loaded {
-                repository: repository.clone(),
-                generation: old,
-                work: Work::Page { cursor: None },
-                result: Ok(reply("stale", Some("request51"))),
+        let repository =
+            GitHubRepoKey::new("old-review-credential-budget.invalid", None, "o", "r").unwrap();
+        crate::github::polling::failed(
+            &repository.authority(),
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
-            [repository.clone()],
+        );
+        assert!(!crate::github::polling::ready(
+            &repository.authority(),
+            false
         ));
-        assert!(monitor.entries[&repository].snapshot.requested.is_empty());
-        assert_eq!(monitor.busy, Some((repository, current)));
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        assert_eq!(
+            monitor.busy.as_ref().map(|(key, _)| key),
+            Some(&repository),
+            "the shared worker must resolve its own credential-scoped cooldown"
+        );
     }
 }

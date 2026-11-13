@@ -234,9 +234,10 @@ fn diagnostic_details_are_historical_fixed_categories_without_private_records() 
     use crate::diagnostics::{Lifecycle, Observation, Persistence, Product, ProductReport, Report};
     let report = Report {
         schema_version: 1,
-        cli_version: crate::VERSION,
+        cli_version: crate::version(),
         cli_protocol: crate::terminal_ipc::PROTOCOL_VERSION,
         path: "/PRIVATE_DIAGNOSTICS_PATH".into(),
+        transcript_caches: None,
         holders_readable: false,
         holders: Vec::new(),
         products: vec![ProductReport {

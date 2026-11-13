@@ -149,6 +149,8 @@ pub enum HostedTerminalStartError {
     HostReadyTimeout { path: PathBuf, timeout: Duration },
     #[error("could not complete cagents daemon startup: {0}")]
     HostStartup(String),
+    #[error("cagents is updating; try again shortly")]
+    UpdateInProgress(#[source] crate::instance::UpdateInProgress),
     #[error("could not verify the running cagents daemon: {0}")]
     HostProtocol(#[source] crate::control::ControlError),
     #[error(
@@ -168,7 +170,18 @@ pub enum HostedTerminalStartError {
 #[derive(Default)]
 struct AttachmentState {
     confirmed: bool,
+    /// The exact terminal was accepted on the current observed connection.
+    /// Unlike remembered identity, this is retired when that connection ends.
+    current_proof: Option<HostSessionProof>,
     failure: Option<String>,
+}
+
+struct CurrentAttachment<'a>(&'a HostedPublishedState);
+
+impl Drop for CurrentAttachment<'_> {
+    fn drop(&mut self) {
+        self.0.clear_current_attachment();
+    }
 }
 
 #[derive(Default)]
@@ -693,12 +706,37 @@ impl HostedPublishedState {
         }
     }
 
-    fn confirm_attachment(&self) {
-        self.attachment
+    fn confirm_attachment(&self, proof: &HostSessionProof) {
+        {
+            let mut attachment = self
+                .attachment
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attachment.confirmed = true;
+            if attachment.failure.is_none() {
+                attachment.current_proof = Some(proof.clone());
+            }
+        }
+        self.attachment_changed.notify_all();
+        self.request_semantic_wake();
+    }
+
+    fn clear_current_attachment(&self) {
+        let changed = self
+            .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .confirmed = true;
-        self.attachment_changed.notify_all();
+            .current_proof
+            .take()
+            .is_some();
+        if changed {
+            self.attachment_changed.notify_all();
+            // Connection cleanup also runs during worker unwinding. Retire
+            // its state without invoking a callback during another panic.
+            if !thread::panicking() {
+                self.request_semantic_wake();
+            }
+        }
     }
 
     fn fail_attachment(&self, message: String) {
@@ -706,9 +744,11 @@ impl HostedPublishedState {
             .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attachment.current_proof = None;
         if attachment.failure.is_none() {
             attachment.failure = Some(message);
         }
+        drop(attachment);
         self.attachment_changed.notify_all();
     }
 
@@ -1062,6 +1102,38 @@ impl HostedTerminalHandle {
         confirmed.then(|| self.inner.published.proof()).flatten()
     }
 
+    /// Why the daemon refused this terminal's attachment for good, if it did.
+    /// Unlike a detached snapshot, which a hibernated view also holds, this
+    /// is only set by the refusal itself.
+    #[cfg(test)]
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failure
+            .clone()
+    }
+
+    /// The exact terminal accepted on the current observed connection.
+    /// Remembered recovery identity alone does not establish this state.
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        let attachment = self
+            .inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reason) = &attachment.failure {
+            return Err(reason.clone());
+        }
+        if self.inner.stop.is_requested() {
+            return Err("hosted terminal connection stopped".to_owned());
+        }
+        Ok(attachment.current_proof.clone())
+    }
+
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
     /// Semantic events remain queued for the UI; authenticating the daemon alone
     /// does not confirm that it accepted this terminal.
@@ -1332,21 +1404,51 @@ enum PendingRequest {
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
-/// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance. On systemd hosts the daemon runs in its own
+/// Startup has a bounded base allowance, extended per session for upgrade
+/// restoration. The same allowance bounds authentication to a daemon started
+/// by this call or another launcher. On systemd hosts the daemon runs in its own
 /// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
 /// hosted sessions. Other hosts retain the detached process-group fallback.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
+pub(crate) fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+    match crate::device::existing_socket_path()? {
+        Some(socket) => Ok(socket),
+        None => daemon_socket_path(),
+    }
+}
+
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    if crate::instance::window_restore_policy()
+        == crate::instance::WindowRestorePolicy::ExistingOnly
+    {
+        // Background readers and model publishers share this boundary. A
+        // recovery window cannot turn an ordinary reconnect into a new daemon.
+        verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
+        return Ok(socket);
+    }
     if !crate::device::is_remote() {
         ensure_daemon_ready_at(&socket, application)?;
     }
+    Ok(socket)
+}
+
+/// Provider activation requested by a person, after an attach-only recovery.
+/// Its transport is separate from the window's automatic read-only readers.
+pub(crate) fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError>
+{
+    if let Some(socket) = crate::device::socket_path_for_explicit_action()
+        .map_err(HostedTerminalStartError::SocketPath)?
+    {
+        return Ok(socket);
+    }
+    let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
     Ok(socket)
 }
 
@@ -1359,7 +1461,13 @@ fn ensure_daemon_ready_at(
             // A listening socket can belong to an older development build.
             // Verify the wire protocol before opening a window whose actions
             // would otherwise all fail against that daemon.
-            return verify_daemon_protocol(stream);
+            // A concurrent launcher may still be restoring behind this bound
+            // listener. Authenticate with the same startup allowance as our
+            // own launch. Budget estimation is not readiness authority: a
+            // stale damaged checkpoint must not reject a serving daemon.
+            let timeout = crate::upgrade::handoff::startup_timeout()
+                .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
+            return verify_startup_stream(socket, stream, Instant::now() + timeout);
         }
         Err(error)
             if !matches!(
@@ -1375,6 +1483,8 @@ fn ensure_daemon_ready_at(
         Err(_) => {}
     }
 
+    refuse_update_launch(socket)?;
+
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe =
@@ -1386,15 +1496,32 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    start_daemon_at(
-        socket,
-        timeout,
-        &daemon_binary,
-        systemd_user_manager_available()
-            && !crate::instance::has_inherited_daemon_fence()
-                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
-        |scoped| spawn_daemon(&daemon_binary, application, scoped),
-    )?;
+    // User scopes execute the command locally and preserve explicitly
+    // forwarded descriptors, including both update admission and inventory.
+    // Recovery authority belongs to the verified daemon itself. A scope
+    // launcher must never receive or relay its receipt and continuous fences.
+    let recovery = crate::upgrade::recovery::has_inherited_receipt()
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    let scoped = systemd_user_manager_available() && !recovery;
+    start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
+        spawn_daemon(&daemon_binary, application, scoped)
+    })
+}
+
+/// The daemon binds its listener before restoring retained sessions and
+/// accepts clients only once restoration finishes, so a connected socket
+/// proves the reservation, not service. The handshake therefore shares the
+/// startup allowance: an ordinary five-second reply budget turned a restore of
+/// 34 sessions that took 5.5 s into a failed `daemon start` (#2400).
+fn start_and_verify_daemon_at(
+    socket: &Path,
+    timeout: Duration,
+    daemon_binary: &Path,
+    scoped: bool,
+    launch: impl FnMut(bool) -> io::Result<Child>,
+) -> Result<(), HostedTerminalStartError> {
+    let deadline = Instant::now() + timeout;
+    start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
     let stream =
@@ -1402,18 +1529,48 @@ fn ensure_daemon_ready_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_daemon_protocol(stream)
+    verify_startup_stream(socket, stream, deadline)
 }
 
-fn verify_daemon_protocol(stream: UnixStream) -> Result<(), HostedTerminalStartError> {
-    crate::control::ControlClient::from_stream(stream)
-        .map(|_| ())
-        .map_err(|error| match error {
-            crate::control::ControlError::UnsupportedVersion { actual } => {
-                HostedTerminalStartError::HostIncompatible { actual }
-            }
-            error => HostedTerminalStartError::HostProtocol(error),
-        })
+fn launch_is_updating(socket: &Path) -> Result<bool, HostedTerminalStartError> {
+    crate::instance::daemon_launch_is_updating(socket)
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))
+}
+
+fn refuse_update_launch(socket: &Path) -> Result<(), HostedTerminalStartError> {
+    if launch_is_updating(socket)? {
+        return Err(HostedTerminalStartError::UpdateInProgress(
+            crate::instance::UpdateInProgress,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_startup_stream(
+    socket: &Path,
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<(), HostedTerminalStartError> {
+    // A serving daemon remains usable during review. An ordinary reader of
+    // an update's bound-but-unready listener gets the normal handshake budget;
+    // only an admitted/inherited launch may need checkpoint restoration time.
+    let client = if launch_is_updating(socket)? {
+        crate::control::ControlClient::from_stream(stream)
+    } else {
+        crate::control::ControlClient::from_stream_until(stream, deadline)
+    };
+    verify_daemon_protocol(client)
+}
+
+fn verify_daemon_protocol(
+    client: Result<crate::control::ControlClient, crate::control::ControlError>,
+) -> Result<(), HostedTerminalStartError> {
+    client.map(|_| ()).map_err(|error| match error {
+        crate::control::ControlError::UnsupportedVersion { actual } => {
+            HostedTerminalStartError::HostIncompatible { actual }
+        }
+        error => HostedTerminalStartError::HostProtocol(error),
+    })
 }
 
 fn start_daemon_at(
@@ -1531,6 +1688,7 @@ fn spawn_daemon(
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     crate::instance::inherit_daemon_fence(&mut command)?;
+    crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut command)?;
     command.spawn()
 }
 
@@ -1554,11 +1712,14 @@ fn daemon_startup_ready(
             });
         }
     }
+    refuse_update_launch(socket)?;
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
-        // listener is deliberately absent until every session has restored.
-        if !crate::daemon::HostLease::is_held_at(socket)
+        // listener may not be bound yet; the lease proves its ownership.
+        if crate::daemon::lease_handoff::has_inherited_lease()
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+            || !crate::daemon::HostLease::is_held_at(socket)
+                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
         {
             return Err(HostedTerminalStartError::HostExited {
                 path: socket.to_owned(),
@@ -1878,6 +2039,10 @@ fn serve_connection(
         stop,
     } = context;
     let terminal_id = *terminal_id;
+    published.clear_current_attachment();
+    // Retire currentness on every EOF, retry, stop, or unwind before the next
+    // connection can authenticate. The remembered proof remains unchanged.
+    let _attachment = CurrentAttachment(published);
     if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
         published
             .attachment
@@ -2036,7 +2201,7 @@ fn serve_connection(
                     {
                         return ConnectionEnd::Retry;
                     }
-                    published.confirm_attachment();
+                    published.confirm_attachment(&proof);
                     did_attach();
                 }
                 #[cfg(feature = "ui")]
@@ -2186,12 +2351,16 @@ fn serve_connection(
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
+    // This inner guard is dropped before ConnectionIo, whose destructor joins
+    // its reader. EOF/retry must retire currentness before that join can wait.
+    let _connected_attachment = CurrentAttachment(published);
 
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
@@ -2241,6 +2410,7 @@ fn serve_connection(
     }
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
@@ -2258,6 +2428,7 @@ fn serve_connection(
             && matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
             && stop.is_requested()
         {
+            published.clear_current_attachment();
             connection.close();
             return ConnectionEnd::Stop;
         }
@@ -2302,6 +2473,7 @@ fn serve_connection(
         }
         published.expire_retained(Instant::now());
         if stop.is_requested() {
+            published.clear_current_attachment();
             connection.close();
             return ConnectionEnd::Stop;
         }
@@ -2312,6 +2484,7 @@ fn serve_connection(
                 break;
             }
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2327,10 +2500,12 @@ fn serve_connection(
             };
             command = coalesce_client_scroll_command(command, commands, carried);
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
             if matches!(command, ClientCommand::Stop) {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2394,6 +2569,7 @@ fn serve_connection(
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2403,6 +2579,7 @@ fn serve_connection(
             }
             ClientWork::Server(envelope) => envelope,
             ClientWork::CommandsClosed => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2503,7 +2680,7 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
@@ -2540,7 +2717,7 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (
@@ -3040,6 +3217,118 @@ mod tests {
     }
 
     #[test]
+    fn update_fence_interrupts_ordinary_readiness_but_preserves_admission_and_serving_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_READINESS";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::process::ExitStatusExt;
+
+            let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let socket = runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            std::fs::create_dir(socket.parent().unwrap()).unwrap();
+            let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+            let _worker_lease = hold_startup_lease(&socket);
+            let started = Instant::now();
+            let error = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HostedTerminalStartError::UpdateInProgress(_)
+            ));
+            assert!(crate::instance::is_update_in_progress(&error));
+            // This is an already-dispatched launch: a failed child plus the
+            // update worker's lease must not look like a restoring daemon.
+            let result = start_daemon_at(
+                &socket,
+                Duration::from_secs(125),
+                Path::new("fixture-daemon"),
+                false,
+                |_| Command::new("/bin/false").spawn(),
+            );
+            assert!(matches!(
+                result,
+                Err(HostedTerminalStartError::UpdateInProgress(_))
+            ));
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            for compatible in [true, false] {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                    let proof = proof("serving-during-review");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: if compatible {
+                                PROTOCOL_VERSION
+                            } else {
+                                PROTOCOL_VERSION + 1
+                            },
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: vec![],
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                });
+                let result =
+                    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+                if compatible {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(HostedTerminalStartError::HostIncompatible { .. })
+                    ));
+                }
+                server.join().unwrap();
+                std::fs::remove_file(&socket).unwrap();
+            }
+            drop(update);
+            let _admission = crate::instance::AdmissionFence::acquire().unwrap();
+            assert!(
+                !daemon_startup_ready(
+                    &socket,
+                    Duration::from_secs(125),
+                    Duration::from_secs(60),
+                    Some(ExitStatus::from_raw(1 << 8)),
+                )
+                .unwrap(),
+                "a declared concurrent admission still owns its restoration allowance"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn unavailable_scope_launcher_falls_back_once() {
         for spawn_error in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -3154,7 +3443,228 @@ mod tests {
     }
 
     #[test]
+    fn existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint() {
+        use std::io::Write;
+        const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
+        const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
+        let Ok(checkpoint) = std::env::var(CHILD) else {
+            for checkpoint in ["absent", "damaged"] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::create_dir(root.path().join("tmp")).unwrap();
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .env_clear()
+                    .env(CHILD, checkpoint)
+                    .env("HOME", root.path().join("home"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                    .env("TMPDIR", root.path().join("tmp"))
+                    .env("PATH", "/usr/bin:/bin")
+                    .args(["--exact", TEST, "--nocapture"]);
+                if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                    command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+                }
+                assert!(
+                    command.status().unwrap().success(),
+                    "{checkpoint} checkpoint fixture failed"
+                );
+            }
+            return;
+        };
+        let upgrade = crate::instance::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("daemon-upgrade");
+        if checkpoint == "damaged" {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::create_dir_all(&upgrade).unwrap();
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(upgrade.join("daemon-upgrade.json"))
+                .unwrap()
+                .write_all(b"damaged checkpoint")
+                .unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5_600));
+            let mut stream = accept_connection(&listener);
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            let proof = proof("restored-existing");
+            let _ = write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            );
+        });
+        let result = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+        server.join().unwrap();
+        result.unwrap();
+        if checkpoint == "absent" {
+            assert!(
+                !upgrade.exists(),
+                "budget estimation must not create upgrade storage"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(upgrade.join("daemon-upgrade.json")).unwrap(),
+                b"damaged checkpoint"
+            );
+        }
+    }
+
+    /// A fixture daemon whose listener is bound at launch and serves only
+    /// after `restore`, as `listener_before_restore` does.
+    fn restoring_daemon(
+        socket: &Path,
+        restore: Duration,
+    ) -> impl FnMut(bool) -> io::Result<Child> + use<> {
+        let socket = socket.to_owned();
+        move |_scoped| {
+            let listener = UnixListener::bind(&socket).unwrap();
+            thread::spawn(move || {
+                thread::sleep(restore);
+                // Readiness probes connect and close; answer the handshake.
+                loop {
+                    let mut stream = accept_connection(&listener);
+                    let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                        continue;
+                    };
+                    let proof = proof("restored");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                    return;
+                }
+            });
+            Command::new("/bin/true").spawn()
+        }
+    }
+
+    #[test]
+    fn launched_daemon_handshake_waits_out_restoration_beyond_five_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        // The #2400 rehearsal restored 34 sessions in 5.48 s; the CLI's ordinary
+        // handshake gave up at 5 s while the startup allowance was far larger.
+        let started = Instant::now();
+        start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(30),
+            Path::new("fixture-daemon"),
+            false,
+            restoring_daemon(&socket, Duration::from_millis(5_600)),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(5_600));
+    }
+
+    #[test]
+    fn launched_daemon_that_dies_while_restoring_fails_without_its_allowance() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let path = socket.clone();
+        let started = Instant::now();
+        let result = start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(60),
+            Path::new("fixture-daemon"),
+            false,
+            move |_scoped| {
+                let listener = UnixListener::bind(&path).unwrap();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    drop(listener);
+                });
+                Command::new("/bin/true").spawn()
+            },
+        );
+        assert!(
+            matches!(result, Err(HostedTerminalStartError::HostProtocol(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn scope_fixture_lease(root: &Path) -> crate::daemon::lease_handoff::LeaseHandoff {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.to_owned(),
+            socket: root.join("daemon.sock"),
+            lock: root.join("cagentsd.lock"),
+        };
+        let mut lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+        drop(lock);
+        crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap()
+    }
+
+    #[test]
+    fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("systemd-run");
+        // The scope launcher executes locally and preserves inherited fds.
+        // This fake checks the selected mode and reproduces that exec contract.
+        std::fs::write(&launcher, "#!/bin/sh\n[ \"$1\" = --user ] && [ \"$2\" = --scope ] || exit 7\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = scope_fixture_lease(root.path());
+        let mut command = daemon_launch_command(
+            Path::new("/bin/sh"),
+            crate::notifications::Application::Cagents,
+            true,
+        );
+        command.env("PATH", root.path()).args([
+            "-c",
+            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199",
+        ]);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
+        assert!(command.status().unwrap().success());
+    }
+
+    #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::io::{Read, Seek};
 
         if !systemd_user_manager_available() {
@@ -3162,6 +3672,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        let lease = scope_fixture_lease(directory.path());
         // Regular files avoid waiting for the background holder to close a pipe.
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
@@ -3196,12 +3707,14 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args(["-c", "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199 || exit 8; sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
         command
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
         let status = command.status().unwrap();
         assert!(
             status.success(),
@@ -3216,18 +3729,27 @@ mod tests {
         let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
         // SAFETY: this PID belongs to the fixture's own background sleep.
         unsafe { libc::kill(holder_pid, libc::SIGTERM) };
-        let holder_cgroup = holder_cgroup.unwrap();
-        let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        // Hybrid hosts also list v1 controllers (`1:net_cls:/`); membership
+        // is the unified hierarchy's `0::` entry, as in process_scope.
+        let unified = |cgroup: &str| {
+            cgroup
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .unwrap()
+                .to_owned()
+        };
+        let holder_cgroup = unified(&holder_cgroup.unwrap());
+        let caller = unified(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
         let mut lines = evidence.lines();
         let scope = lines.next().unwrap();
-        assert_ne!(scope, caller.trim());
+        assert_ne!(scope, caller);
         assert!(
             scope.contains("cagentsd-") && scope.ends_with(".scope"),
             "{scope}"
         );
         assert_eq!(lines.next(), Some("$HOME"));
         assert_eq!(lines.next(), Some("caller-value"));
-        assert_eq!(holder_cgroup.trim(), scope);
+        assert_eq!(holder_cgroup, scope);
     }
 
     #[test]
@@ -4643,7 +5165,12 @@ mod tests {
                     },
                 },
             );
-            let wake = wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Confirming the resumed attachment also wakes the view once,
+            // before any frame, so its owner sees the attachment is current.
+            let wake =
+                std::iter::repeat_with(|| wake_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+                    .find(|wake| wake.generation != 0)
+                    .unwrap();
             assert_eq!(wake.generation, generation);
             let observed = handle.snapshot();
             assert_eq!(observed.lines[0].cells[0].text, text);

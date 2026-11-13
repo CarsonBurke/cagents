@@ -517,16 +517,7 @@ impl RegisteredHeads {
             script.extend_from_slice(b" ]\n");
         }
         let proof = directory.join("check-registered-heads");
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o700)
-            .open(&proof)
-            .map_err(io)?;
-        output
-            .write_all(&script)
-            .and_then(|()| output.sync_all())
-            .map_err(io)?;
+        super::write_executable(&proof, &script, true)?;
         Ok(proof)
     }
 }

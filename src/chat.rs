@@ -26,6 +26,10 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(any(feature = "ui", feature = "host"))]
+mod work_hold;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use work_hold::{Held, HeldSubagent, WorkHold};
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
@@ -227,6 +231,20 @@ impl Launch {
         }
         Some(recipe)
     }
+
+    /// Whether `recipe` is a terminal this conversation may hand off to: its
+    /// exact resume, either as launched or under one valid permission mode. The
+    /// mode comes from the live session, which storage does not hold, so this
+    /// cannot prove which mode was confirmed; it proves the recipe differs from
+    /// the resume by nothing else.
+    pub(crate) fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
+        let mode = match recipe.arguments.as_slice() {
+            [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
+            _ => None,
+        };
+        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+    }
+
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
@@ -305,6 +323,14 @@ pub enum Intent {
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
+    /// Reattach a recovered pane only to an existing daemon-owned chat or its
+    /// exact retained history. Failure never prepares or starts a provider.
+    RestoreExisting,
+    /// Start a new provider on the conversation of a card whose provider
+    /// exited, in place of the ended actor the daemon still holds. The daemon
+    /// retires that actor and proves it gone before the successor starts, and
+    /// nothing it held is resubmitted.
+    Resume,
 }
 
 /// A conversation that could not be put on screen, and the one thing left that
@@ -421,8 +447,10 @@ impl ImageReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
-    /// Absent on legacy provider files and non-image attachments. Legacy text
-    /// that happens to say `[Image N]` never manufactures an image reference.
+    /// Absent on files the person chose that are not images, which a draft
+    /// keeps by path, and on legacy provider files such as images a provider
+    /// names by a path cagents does not own. Legacy text that happens to say
+    /// `[Image N]` never manufactures an image reference.
     #[serde(default)]
     pub reference: Option<ImageReference>,
 }
@@ -540,6 +568,29 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
+/// Whether `path` names an inline image the host's transcript store decoded
+/// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
+/// Such a file lives only as long as that cache, so it is no path to hand to
+/// anyone else.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+    let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
+        part.and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix(prefix))
+            .map(str::to_owned)
+    };
+    let image = name(path.file_name(), "image-").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(digest, extension)| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && matches!(extension, "png" | "jpg" | "webp" | "gif")
+        })
+    });
+    image
+        && name(path.parent().and_then(|parent| parent.file_name()), "chat-")
+            .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,
@@ -580,6 +631,15 @@ impl NativeContinuity {
     }
 }
 
+impl Session {
+    /// A holder or listener outside the daemon's actors can answer a close of
+    /// this session. Anything else has only a lost actor, which proves nothing.
+    pub fn closes_without_hosted_actor(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || matches!(self.native_continuity, NativeContinuity::Durable { .. })
+    }
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
@@ -616,6 +676,8 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        // The system Claude login binds its home by leaving it unset.
+        recipe.unset_environment.remove(home);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));
@@ -630,6 +692,11 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
 pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
+    if crate::upgrade::floor::load()
+        .is_ok_and(|ledger| ledger.history_replacement(source, replacement))
+    {
+        return true;
+    }
     let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
         return false;
     };
@@ -674,6 +741,66 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `successor` is exactly the daemon's prepared resume of the stranded
+/// retained Claude card `source`: the same conversation, launch and account
+/// under a new allocation with no ownership proof yet. This shape is
+/// no authority by itself; only an authenticated `ChatPrepareResume` answer on
+/// the same daemon stream may produce one.
+pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
+        && source.launch.session_id.is_some()
+    {
+        let mut expected = source.clone();
+        expected.reset_owned_codex_listener();
+        expected.id = successor.id;
+        expected.proof = None;
+        expected.terminal = None;
+        return source.id != successor.id && expected == *successor;
+    }
+    let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
+    // A pane whose actor never reported its conversation resumes the one the
+    // daemon proved that actor confirmed, or, when it confirmed none, starts
+    // one: either way nothing else of its launch changes.
+    let launch = if source.has_unnamed_retained_claude_actor()
+        && successor.launch.session_id.as_ref().is_none_or(valid)
+    {
+        Launch {
+            session_id: None,
+            ..successor.launch.clone()
+        }
+    } else {
+        successor.launch.clone()
+    };
+    matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) && source.has_valid_native_continuity()
+        && source.launch.provider == Provider::Claude
+        && (source.launch.session_id.as_ref().is_some_and(valid)
+            || source.has_unnamed_retained_claude_actor())
+        && successor.id != source.id
+        && launch == source.launch
+        && successor.proof.is_none()
+        && successor.terminal.is_none()
+        && successor.owned_codex_listener.is_none()
+        && successor.native_continuity == NativeContinuity::ReconnectOnly
+}
+
+/// Whether `started` is the daemon's started form of a prepared resume
+/// successor of `source`: started under a complete ownership proof, on the
+/// exact saved conversation, with only the continuity it learned on install.
+pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
+    let mut prepared = started.clone();
+    prepared.proof = None;
+    prepared.native_continuity = NativeContinuity::ReconnectOnly;
+    is_retained_resume_successor(source, &prepared)
+        && started
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete)
+        && started.has_valid_native_continuity()
 }
 
 /// A formerly hosted pane may never have observed its first provider identity.
@@ -780,13 +907,47 @@ impl OwnedCodexListener {
                 .parent()
                 .and_then(std::path::Path::file_name)
                 .is_some_and(|name| name == format!("cagents-codex-{id}").as_str())
-            && recipe
-                .arguments
-                .iter()
-                .position(|arg| arg == "--remote")
-                .and_then(|index| recipe.arguments.get(index + 1))
-                .is_some_and(|remote| remote == &format!("unix://{}", self.socket.display()))
+            && codex_remote_argument(&recipe.arguments)
+                .is_some_and(|(_, remote)| remote == format!("unix://{}", self.socket.display()))
     }
+}
+
+/// Index and value of the first remote argument, in either CLI spelling.
+fn codex_remote_argument(arguments: &[String]) -> Option<(usize, &str)> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        if argument == "--remote" {
+            arguments
+                .get(index + 1)
+                .map(|value| (index, value.as_str()))
+        } else {
+            argument
+                .strip_prefix("--remote=")
+                .map(|value| (index, value))
+        }
+    })
+}
+
+fn set_codex_remote(arguments: &mut [String], index: usize, address: String) {
+    if arguments[index] == "--remote" {
+        arguments[index + 1] = address;
+    } else {
+        arguments[index] = format!("--remote={address}");
+    }
+}
+
+/// The local endpoint recorded by a Codex launch recipe. This is execution
+/// evidence only; ownership and replacement admission are checked separately.
+pub(crate) fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
+    let (_, address) = codex_remote_argument(&recipe.arguments)?;
+    let path = address
+        .strip_prefix("unix://")
+        .filter(|path| !path.is_empty())?;
+    let path = std::path::PathBuf::from(path);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        recipe.working_directory.join(path)
+    })
 }
 
 impl Session {
@@ -812,6 +973,15 @@ impl Session {
                 .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
     }
 
+    /// The endpoint in the saved launch, including panes predating allocator
+    /// records. Reading it grants no authority to replace an external server.
+    pub(crate) fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
+        if self.launch.provider != Provider::Codex {
+            return None;
+        }
+        recorded_codex_socket(&self.launch.recipe)
+    }
+
     /// A typed descriptor shape, never proof of an authenticated live helper.
     /// Adoption and persistence callers must also resolve its exact actor owner.
     pub(crate) fn has_unnamed_retained_claude_actor(&self) -> bool {
@@ -834,7 +1004,8 @@ impl Session {
     /// A saved transcript is eligible for the forced, read-only history API.
     /// This shape is never authority to launch, close or resume a provider.
     pub(crate) fn is_saved_claude_history(&self) -> bool {
-        self.launch.provider == Provider::Claude
+        (self.launch.provider == Provider::Claude
+            || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.source(self.id).is_some()))
             && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
@@ -842,11 +1013,16 @@ impl Session {
                 .proof
                 .as_ref()
                 .is_some_and(crate::model::HostSessionProof::is_complete)
-            && self
+            && (self
                 .launch
                 .session_id
                 .as_ref()
                 .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+                || crate::upgrade::floor::load().is_ok_and(|ledger| {
+                    ledger
+                        .resume_source(self)
+                        .is_some_and(|source| source.launch.session_id == self.launch.session_id)
+                }))
     }
 
     /// Import an installed capability observed on this exact authenticated
@@ -937,28 +1113,34 @@ impl Session {
     /// draft. Its next start receives a fresh identity and asks the daemon for
     /// a new listener rather than reusing the abandoned conversation's socket.
     pub fn reset_owned_codex_listener(&mut self) {
-        if self.owns_codex_listener() {
-            let index = self
-                .launch
-                .recipe
-                .arguments
-                .iter()
-                .position(|argument| argument == "--remote")
-                .expect("owned listener has a remote argument");
-            self.launch.recipe.arguments[index + 1] = "unix://".into();
+        // The picker also reopens legacy panes, whose launch records their
+        // pane-specific endpoint but predates owned listener provenance.
+        let pane_endpoint = self.recorded_codex_socket().is_some_and(|socket| {
+            socket
+                .file_name()
+                .is_some_and(|name| name == "control.sock")
+                && socket
+                    .parent()
+                    .and_then(std::path::Path::file_name)
+                    .is_some_and(|name| name == format!("cagents-codex-{}", self.id).as_str())
+        });
+        if self.owns_codex_listener() || pane_endpoint {
+            let (index, _) = codex_remote_argument(&self.launch.recipe.arguments)
+                .expect("pane listener has a remote argument");
+            set_codex_remote(&mut self.launch.recipe.arguments, index, "unix://".into());
         }
         self.owned_codex_listener = None;
         self.native_continuity = NativeContinuity::ReconnectOnly;
     }
 
-    /// Whether `started` is this new Codex thread as the daemon started it.
+    /// Whether `started` resolved this Codex pane's requested allocation.
     ///
-    /// A new thread asks for a listener of its own with a bare `unix://`
+    /// A new or resumed pane asks for a listener with a bare `unix://`
     /// remote, which the daemon resolves to its reported owned endpoint
     /// before it launches anything; that resolution is the one change the
     /// launch undergoes, and the rest of the recipe is exactly as asked.
     pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
-        if self.launch.session_id.is_some()
+        if self.launch.session_id.is_some() && self.launch.session_id != started.launch.session_id
             || self.terminal.is_some()
             || started.id != self.id
             || !started.owns_codex_listener()
@@ -970,16 +1152,13 @@ impl Session {
             return false;
         }
         let mut recipe = self.launch.recipe.clone();
-        let Some(index) = recipe.arguments.iter().position(|arg| arg == "--remote") else {
-            return false;
-        };
-        let Some(remote) = recipe.arguments.get_mut(index + 1) else {
+        let Some((index, remote)) = codex_remote_argument(&recipe.arguments) else {
             return false;
         };
         if self.launch.provider != Provider::Codex || remote != "unix://" {
             return false;
         }
-        *remote = format!(
+        let address = format!(
             "unix://{}",
             started
                 .owned_codex_listener
@@ -988,10 +1167,13 @@ impl Session {
                 .socket
                 .display()
         );
+        set_codex_remote(&mut recipe.arguments, index, address);
         recipe == started.launch.recipe
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
+    /// A new thread's bare `unix://` requests an allocation. Begun threads
+    /// require the daemon's separate shared-service and writer checks.
     ///
     /// Only the daemon chooses `root`. Existing evidence must have come from
     /// trusted retained/checkpointed state before invoking this method. Legacy
@@ -1000,6 +1182,33 @@ impl Session {
         &mut self,
         root: &std::path::Path,
         allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        let new_thread = self.launch.session_id.is_none();
+        self.claim_codex_listener(root, allocator, new_thread)
+    }
+
+    /// Point this existing Codex thread's bare `unix://` at its own listener.
+    ///
+    /// A begun thread's bare remote names the account's shared daemon, which
+    /// owns the thread whenever it is running. Only the daemon calls this,
+    /// after finding the shared endpoint unserved and checking for another
+    /// process writing the thread. This method only assigns the listener;
+    /// the caller remains responsible for those launch checks.
+    pub fn claim_owned_codex_listener_for_unserved_thread(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        self.launch.session_id.is_some()
+            && self.terminal.is_none()
+            && self.claim_codex_listener(root, allocator, true)
+    }
+
+    fn claim_codex_listener(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+        allocate: bool,
     ) -> bool {
         if self.launch.provider != Provider::Codex {
             return false;
@@ -1014,22 +1223,19 @@ impl Session {
             .join(format!("cagents-codex-{}", self.id))
             .join("control.sock");
         let owned = format!("unix://{}", socket.display());
-        let new_thread = self.launch.session_id.is_none();
         let arguments = &mut self.launch.recipe.arguments;
-        let Some(index) = arguments.iter().position(|argument| argument == "--remote") else {
+        let Some((index, remote)) = codex_remote_argument(arguments) else {
             return false;
         };
-        match arguments.get_mut(index + 1) {
-            Some(remote) if *remote == owned || (new_thread && remote == "unix://") => {
-                *remote = owned;
-                self.owned_codex_listener = Some(OwnedCodexListener {
-                    socket,
-                    allocator: allocator.clone(),
-                });
-                true
-            }
-            _ => false,
+        if remote != owned && !(allocate && remote == "unix://") {
+            return false;
         }
+        set_codex_remote(arguments, index, owned);
+        self.owned_codex_listener = Some(OwnedCodexListener {
+            socket,
+            allocator: allocator.clone(),
+        });
+        true
     }
 }
 
@@ -1278,13 +1484,26 @@ pub struct Subagent {
     pub items: Vec<std::sync::Arc<Item>>,
 }
 
+/// A subagent as its provider's tools address it, where that is not by the ID
+/// its conversation lists it under: Claude Code names an agent to
+/// `SendMessage`, `TaskStop` and `TaskOutput` by its agent ID, not by the tool
+/// call that started it. Not part of a snapshot, whose layout older peers
+/// share; see `ServerMessage::ChatAgentAddresses`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AgentAddress {
+    /// What the provider calls the agent.
+    pub address: String,
+    /// The ID the conversation's snapshot lists the agent under.
+    pub subagent: String,
+}
+
 impl Subagent {
-    /// Running delegated work that cancelling the parent's turn would also
-    /// stop, where the provider's interrupt does not spare it.
+    /// Delegated work, running or waiting on its own background work, that
+    /// cancelling the parent's turn would also stop, where the provider's
+    /// interrupt does not spare it. Claude Code's interrupt kills a waiting
+    /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status == ToolStatus::Running
-            && self.background
-            && capabilities.interrupt_stops_background
+        self.status.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -1358,6 +1577,18 @@ impl Snapshot {
             })
     }
 
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt, and which no usage limit from an earlier turn stops.
+    pub fn turn_accepted(&self) -> bool {
+        self.busy || self.waiting || !self.requests.is_empty()
+    }
+    /// Whether closing the conversation now would end or abandon something:
+    /// its turn, a question to the user, or a subagent working or waiting on
+    /// its own background work.
+    pub fn holds_work(&self) -> bool {
+        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
+    }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
@@ -1408,10 +1639,66 @@ pub struct TextCopySource {
     pub bytes: u64,
 }
 
+/// A transcript item's body is presented in parts of at most this many bytes,
+/// so one enormous message or tool output stays pageable.
+pub const TRANSCRIPT_PART_BYTES: usize = 128 * 1024;
+
+/// A transcript window presents items of at most this many bytes in all; the
+/// reader pages to see more.
+pub const TRANSCRIPT_WINDOW_BYTES: usize = 3 * 1024 * 1024;
+
+/// Where a presented part after the first sits in its transcript item. The
+/// first part keeps the item's own ID; each later part's ID names the item,
+/// the part's position, the item's layout and the byte range it shows of each
+/// paged field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptPart<'a> {
+    pub item: &'a str,
+    pub index: usize,
+    pub layout: &'a str,
+    pub fields: [(usize, usize); 2],
+}
+
+impl<'a> TranscriptPart<'a> {
+    const MARKER: &'static str = ":native-part:";
+
+    pub fn id(&self) -> String {
+        let [(start0, end0), (start1, end1)] = self.fields;
+        format!(
+            "{}{}{}:{}:{start0}-{end0}:{start1}-{end1}",
+            self.item,
+            Self::MARKER,
+            self.index,
+            self.layout
+        )
+    }
+
+    /// Reads a later part's ID. A provider's own ID can contain the marker,
+    /// so a match is only a claim that callers check against the bytes.
+    pub fn parse(id: &'a str) -> Option<Self> {
+        let (item, rest) = id.rsplit_once(Self::MARKER)?;
+        let mut fields = rest.split(':');
+        let index = fields.next()?.parse().ok().filter(|index| *index > 0)?;
+        let layout = fields.next()?;
+        let mut range = || {
+            let (start, end) = fields.next()?.split_once('-')?;
+            let range = (start.parse().ok()?, end.parse().ok()?);
+            (range.0 <= range.1).then_some(range)
+        };
+        let ranges = [range()?, range()?];
+        fields.next().is_none().then_some(Self {
+            item,
+            index,
+            layout,
+            fields: ranges,
+        })
+    }
+}
+
 /// Keep each reply at the existing transcript chunk size, far below the IPC
 /// frame ceiling. A single clipboard operation may collect one 30 MiB Claude
 /// envelope, with headroom; longer accumulated streams fail explicitly.
-pub const TEXT_COPY_PAGE_BYTES: usize = 128 * 1024;
+pub const TEXT_COPY_PAGE_BYTES: usize = TRANSCRIPT_PART_BYTES;
 pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1433,6 +1720,41 @@ pub struct TextCopySources {
     pub conversation_revision: u64,
     pub conversation: Vec<Option<TextCopySource>>,
     pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
+}
+
+impl Command {
+    /// Whether the command gives the provider work: a turn, a reply to its
+    /// question, or a queued or provider command it runs.
+    ///
+    /// Exhaustive on purpose, so that a new command has to be classified.
+    pub fn gives_work(&self) -> bool {
+        match self {
+            Self::ResumeAfterLogin { .. }
+            | Self::Prompt { .. }
+            | Self::Answer { .. }
+            | Self::Compact
+            | Self::Slash { .. }
+            | Self::StartQueued { .. }
+            | Self::Branch { .. } => true,
+            Self::Interrupt
+            | Self::StopSubagent { .. }
+            | Self::SetModel { .. }
+            | Self::SetFastMode { .. }
+            | Self::SetPermissionMode { .. }
+            | Self::RefreshPermissions
+            | Self::UpdatePermissionSettings { .. }
+            | Self::DismissPermissionDenial { .. }
+            | Self::Refresh
+            | Self::LoadEarlier
+            | Self::RemoveQueued { .. }
+            | Self::SetInterruptMode { .. }
+            | Self::ListBranches
+            | Self::LoadLater
+            | Self::LoadFileChanges { .. }
+            | Self::LoadFileChangePatches { .. }
+            | Self::ReadTextCopy { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1603,15 +1925,55 @@ pub enum Phase {
     Commentary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ToolStatus {
     Running,
     Succeeded,
     Failed,
     Denied,
-    /// Ended before it finished because it was asked to stop: cancelled by
-    /// the user, or interrupted with the work that started it.
+    /// Ended before it finished: cancelled by the user, interrupted with the
+    /// work that started it, or cut short because its provider stopped.
     Stopped,
+    /// A delegated agent that stopped with background work of its own still
+    /// running. It's alive and what it has reported may be interim, but it
+    /// isn't doing anything itself and may never report again, so it neither
+    /// counts as working nor as finished. A later notice settles it, any sign
+    /// of life returns it to `Running`, and a Stop or the provider exiting
+    /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
+    Waiting,
+}
+
+/// As derived, except that a client from before `Waiting` was added is sent
+/// `Running`: the agent hasn't finished.
+impl Serialize for ToolStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let status = match self {
+            Self::Waiting
+                if crate::terminal_ipc::encoding_before(
+                    crate::terminal_ipc::WAITING_TOOL_STATUS,
+                ) =>
+            {
+                Self::Running
+            }
+            status => *status,
+        };
+        let name = match status {
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Denied => "Denied",
+            Self::Stopped => "Stopped",
+            Self::Waiting => "Waiting",
+        };
+        serializer.serialize_unit_variant("ToolStatus", status as u32, name)
+    }
+}
+
+impl ToolStatus {
+    /// Whether the agent or tool has yet to end.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Waiting)
+    }
 }
 
 /// What a shell command was actually for.
@@ -1787,12 +2149,13 @@ pub enum ItemContent {
         #[serde(default)]
         reference: Option<ImageReference>,
     },
-    /// Something another agent, or the harness on its behalf, delivered to
-    /// this conversation: a subagent's report, a teammate's or another
-    /// session's message, or word that background work changed state.
+    /// Something another agent or the provider harness delivered to this
+    /// conversation: a report, a message, a background-work notice, or context
+    /// the provider added without attributing it to the user.
     ///
-    /// It arrives in the user's slot and the agent acts on it as on a
-    /// prompt, but the user did not write it. Typesetting it as their own
+    /// It can arrive in the user's slot and the agent acts on it as on a
+    /// prompt; provider context uses the System role. The user did not write
+    /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
     Delivery {
@@ -1807,8 +2170,8 @@ pub enum ItemContent {
         /// `Agent "Review" finished`, or the one a teammate wrote for its
         /// message. Empty when there is none.
         summary: String,
-        /// A report's or message's Markdown, or the output a notice quotes,
-        /// with the harness's framing removed.
+        /// A report/message with harness framing removed, a notice's quoted
+        /// output, or provider context retained verbatim without interpretation.
         body: String,
     },
 }
@@ -1819,8 +2182,8 @@ pub enum DeliveryKind {
     Report,
     /// A message from a teammate or another session.
     Message,
-    /// The harness reporting that background work - a command, a monitor or
-    /// an agent - finished or produced an event.
+    /// A provider/harness notice, including background-work events and
+    /// provider context. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -1958,6 +2321,18 @@ impl ItemContent {
             | Self::Delivery { .. } => None,
         }
     }
+
+    pub fn status_mut(&mut self) -> Option<&mut ToolStatus> {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => Some(status),
+            Self::Text { .. }
+            | Self::WebSearch { .. }
+            | Self::Image { .. }
+            | Self::Delivery { .. } => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
@@ -1973,6 +2348,43 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
+}
+
+/// A paged command's label or tool's name as the provider gave it.
+pub(crate) fn without_page_mark(label: &str) -> &str {
+    label
+        .rsplit_once(" (part ")
+        .filter(|(_, mark)| {
+            mark.strip_suffix(')')
+                .and_then(|mark| mark.split_once('/'))
+                .is_some_and(|(part, parts)| {
+                    part.parse::<usize>().is_ok() && parts.parse::<usize>().is_ok()
+                })
+        })
+        .map_or(label, |(label, _)| label)
+}
+
+impl Item {
+    /// Whether this is a later part of an item too long for one, which is still
+    /// a single thing the provider did or said.
+    pub(crate) fn continues_paged_item(&self) -> bool {
+        TranscriptPart::parse(&self.id).is_some()
+    }
+
+    /// Bodies whose complete canonical bytes can be copied through the owned
+    /// transcript source. Provider context uses the same field as ordinary
+    /// prose; other deliveries retain their existing presentation copy rules.
+    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+        match &self.content {
+            ItemContent::Text { text, .. } => Some(text),
+            ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                body,
+                ..
+            } if self.role == Role::System => Some(body),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
@@ -2369,6 +2781,9 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// How the provider addresses a subagent, which it says only once the
+    /// agent has started.
+    AgentAddress(AgentAddress),
 }
 
 #[cfg(test)]
@@ -2597,6 +3012,31 @@ mod retained_native_pair_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn transcript_part_ids_round_trip_and_reject_partial_claims() {
+        let part = super::TranscriptPart {
+            item: "msg:native-part:opaque",
+            index: 3,
+            layout: "text",
+            fields: [(262_144, 393_216), (0, 0)],
+        };
+        let id = part.id();
+        assert_eq!(
+            id,
+            "msg:native-part:opaque:native-part:3:text:262144-393216:0-0"
+        );
+        assert_eq!(super::TranscriptPart::parse(&id), Some(part));
+        for claim in [
+            "opaque:native-part:1",
+            "msg:native-part:0:text:0-1:0-0",
+            "msg:native-part:1:text:9-1:0-0",
+            "msg:native-part:1:text:0-1:0-0:extra",
+            "msg:native-part:x:text:0-1:0-0",
+        ] {
+            assert_eq!(super::TranscriptPart::parse(claim), None, "{claim}");
+        }
+    }
+
+    #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});
         let mut request: super::Request = serde_json::from_value(legacy).unwrap();
@@ -2618,6 +3058,37 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn an_agent_waiting_on_its_background_work_neither_works_nor_asks_for_the_user() {
+        let mut snapshot = Snapshot::default();
+        snapshot.subagents.push(Subagent {
+            id: "tool".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+        assert!(!snapshot.is_working());
+        // Closing the conversation would end it, so an update or a cleanup
+        // that waits for idle waits for it too.
+        assert!(snapshot.holds_work());
+        // `Waiting` means the person is needed, and nothing here needs them.
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
+        // An interrupt kills it, as recorded from Claude Code, so a person is
+        // warned as for running work.
+        let capabilities = Capabilities {
+            interrupt_stops_background: true,
+            ..Capabilities::default()
+        };
+        assert!(snapshot.subagents[0].stopped_by_interrupt(&capabilities));
+        snapshot.exited = true;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Unknown);
     }
 
     #[test]
@@ -2656,8 +3127,10 @@ mod tests {
         assert!(!snapshot.busy);
         assert!(snapshot.is_working());
         assert_eq!(snapshot.activity(), super::ActivityState::Working);
+        assert!(snapshot.holds_work());
         snapshot.subagents[0].status = super::ToolStatus::Succeeded;
         assert_eq!(snapshot.activity(), super::ActivityState::Idle);
+        assert!(!snapshot.holds_work());
     }
 
     use super::*;
@@ -2772,6 +3245,91 @@ mod tests {
         )
         .unwrap();
         assert!(project_session.launch.recipe.arguments.is_empty());
+    }
+
+    /// Moving a conversation between the system Claude login, whose home
+    /// is left unset, and a linked one is an account recovery both ways.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn moving_between_an_unset_and_a_linked_home_is_an_account_recovery() {
+        let user = |name: &str| (name == "HOME").then(|| "/home/a".to_owned());
+        let system = crate::account::Account::system(Provider::Claude);
+        let linked = crate::account::Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(7),
+            "/home/a/.claude-work".into(),
+        );
+        let mut source = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        system
+            .bind_home_in(&mut source.launch.recipe, &user)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        let moved = |from: &Session, to: &crate::account::Account| {
+            let mut replacement = from.clone();
+            replacement.id = crate::model::TerminalId::new();
+            replacement.proof = None;
+            replacement.terminal = None;
+            to.bind_home_in(&mut replacement.launch.recipe, &user)
+                .unwrap();
+            replacement
+        };
+        let on_linked = moved(&source, &linked);
+        assert!(is_account_recovery(&source, &on_linked));
+        assert!(is_account_recovery(&on_linked, &moved(&on_linked, &system)));
+        // Staying on the same home changes no account.
+        assert!(!is_account_recovery(&source, &moved(&source, &system)));
+    }
+
+    /// A conversation on the system login exports the home its sign-in
+    /// does, and its probe reads: none unless cagents was started with one,
+    /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn a_system_conversation_exports_the_home_its_probe_reads() {
+        let system = crate::account::Account::system(Provider::Claude);
+        let session = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from),
+            system.launch_home()
+        );
+        assert_eq!(system.probe_environment(), None);
+        // Left unset rather than out, so a daemon started with its own
+        // `CLAUDE_CONFIG_DIR` does not hand it on.
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR"),
+            system.launch_home().is_none()
+        );
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            assert_eq!(system.launch_home(), None);
+        }
     }
 
     #[test]
@@ -3013,7 +3571,7 @@ mod tests {
     /// listens on, so the claim looks only at the first `--remote`, as the
     /// launch itself does, and never re-points an endpoint it did not allocate.
     #[test]
-    fn only_a_new_thread_asking_for_its_own_listener_is_claimed() {
+    fn codex_pane_allocation_preserves_external_endpoints_and_resume_identity() {
         let session = |arguments: &[&str], session_id: Option<&str>| Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -3045,6 +3603,12 @@ mod tests {
         asked.proof = Some(allocator.clone());
         assert!(asked.owns_codex_listener());
         assert!(unstarted.resolved_to_owned_codex_listener(&asked));
+        let mut learned = asked.clone();
+        learned.launch.session_id = Some("learned".into());
+        assert!(
+            unstarted.resolved_to_owned_codex_listener(&learned),
+            "a new thread learns its identity as it starts"
+        );
         let claimed = asked.clone();
         assert!(
             asked.claim_owned_codex_listener(
@@ -3060,13 +3624,64 @@ mod tests {
                 &["--remote", "unix:///elsewhere", "--remote", "unix://"][..],
                 None,
             ),
-            (&["--remote", "unix://"][..], Some("begun")),
             (&["--search"][..], None),
         ] {
             let mut other = session(arguments, session_id);
             let before = other.clone();
             assert!(
                 !other.claim_owned_codex_listener(root, &allocator),
+                "{arguments:?}"
+            );
+            assert_eq!(other, before);
+        }
+
+        let mut resumed = session(&["--remote", "unix://"], Some("begun"));
+        let requested = resumed.clone();
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        resumed.proof = Some(allocator.clone());
+        assert!(resumed.owns_codex_listener());
+        assert!(requested.resolved_to_owned_codex_listener(&resumed));
+        let mut changed = resumed.clone();
+        changed.launch.session_id = Some("another-conversation".into());
+        assert!(!requested.resolved_to_owned_codex_listener(&changed));
+        let mut resumed = session(&["--remote=unix://"], Some("begun"));
+        let requested = resumed.clone();
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        resumed.proof = Some(allocator.clone());
+        assert!(resumed.owns_codex_listener());
+        assert!(requested.resolved_to_owned_codex_listener(&resumed));
+
+        // Reopened from history, a thread nothing serves takes a listener of
+        // its own only when the daemon asks on its behalf, and only in place
+        // of the shared daemon its bare remote names.
+        let mut reopened = session(&["resume", "begun", "--remote", "unix://"], Some("begun"));
+        let saved = reopened.clone();
+        assert!(reopened.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        reopened.proof = Some(allocator.clone());
+        assert!(reopened.owns_codex_listener());
+        assert!(saved.resolved_to_owned_codex_listener(&reopened));
+        let mut renamed = reopened.clone();
+        renamed.launch.session_id = Some("other".into());
+        assert!(!saved.resolved_to_owned_codex_listener(&renamed));
+        for (arguments, session_id) in [
+            (&["--remote", "unix://"][..], None),
+            (&["--remote", "unix:///shared/elsewhere"][..], Some("begun")),
+            (&["--search"][..], Some("begun")),
+        ] {
+            let mut other = session(arguments, session_id);
+            let before = other.clone();
+            assert!(
+                !other.claim_owned_codex_listener_for_unserved_thread(root, &allocator),
                 "{arguments:?}"
             );
             assert_eq!(other, before);
@@ -3134,16 +3749,8 @@ pub(crate) fn fresh_session(
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
-        && let (Some(variable), Some(home)) = (
-            crate::account::home_variable(provider),
-            account.resolved_home(),
-        )
     {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
+        account.bind_home(&mut recipe)?;
     }
     recipe
         .environment

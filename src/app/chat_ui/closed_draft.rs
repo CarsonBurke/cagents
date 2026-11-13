@@ -29,6 +29,19 @@ impl Cagents {
         let closed = self.chat_closed_elsewhere(card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.closed_elsewhere = closed;
+            // Nothing will send a first message now, and this card says the
+            // unsent draft is kept: that has to include the message.
+            if closed && runtime.queued.is_some() {
+                if runtime
+                    .handle()
+                    .is_some_and(|handle| handle.has_accepted_user_input())
+                {
+                    runtime.queued = None;
+                    let _ = runtime.present();
+                } else {
+                    runtime.unqueue();
+                }
+            }
         }
         if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
             runtime.closed_elsewhere = closed;
@@ -301,7 +314,9 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
         let text = visible_text(&app, target.card).join("\n");
-        assert!(text.contains("Closed · draft retained"), "{text}");
+        // The footer no longer repeats the state; the closed card says it.
+        assert!(text.contains("Closed in another window"), "{text}");
+        assert!(!text.contains("Closed · draft retained"), "{text}");
         assert!(
             text.contains("Copy draft") && text.contains("Discard draft text"),
             "{text}"
@@ -311,6 +326,36 @@ mod tests {
                 && !text.contains("explicit recovery is required"),
             "{text}"
         );
+    }
+
+    /// A close from another window can land while this window's first message
+    /// waits on a provider still coming up. Nothing will send it now.
+    #[test]
+    fn a_first_message_still_waiting_comes_back_when_closed_elsewhere() {
+        let (mut app, target, channel, _) = fixture("");
+        let CardRuntime::Chat(sending) = app.cards.get_mut(&target.card).unwrap() else {
+            panic!("chat retained");
+        };
+        sending.queued = Some(Queued {
+            source: prompt::LocalSource::new("the first message".into()),
+            presentation: prompt::LocalPresentation::default(),
+            resolved_text: "the first message".into(),
+            attachments: Vec::new(),
+            model: None,
+            draft: sending.session.clone(),
+            since: None,
+            rechecking: false,
+        });
+
+        retire(&mut app, channel, target.card);
+
+        let runtime = runtime(&app, target);
+        assert!(runtime.closed_elsewhere);
+        assert!(runtime.queued.is_none());
+        assert_eq!(runtime.unsent_text(), "the first message");
+        assert!(app.chat_working_session(target.card).is_none());
+        let text = visible_text(&app, target.card).join("\n");
+        assert!(!text.contains("Starting"), "{text}");
     }
 
     #[test]

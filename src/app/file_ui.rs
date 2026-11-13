@@ -212,7 +212,7 @@ impl Cagents {
                 .workspace
                 .focus(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged());
-            return Task::batch([jump, self.apply_viewport(update, true, false)]);
+            return Task::batch([jump, self.apply_viewport(update, true, DurableChange::None)]);
         }
         let view = RepositoryView {
             project,
@@ -266,8 +266,6 @@ impl Cagents {
                 title: title.clone(),
                 width_fraction: width,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Repository(view),
             };
             let durable = Arc::make_mut(&mut self.durable);
@@ -285,6 +283,7 @@ impl Cagents {
                 channel.cards.push(card);
                 channel.focused = Some(card);
             }
+            self.set_presence(card, Exposure::Visible, Residency::Hot);
             self.workspace.add_card(
                 WorkspaceCard::new(card, title, CardWidth::Fraction(width))
                     .expect("file pane is valid"),
@@ -293,7 +292,11 @@ impl Cagents {
             )
         }
         .unwrap_or_else(|_| ViewportUpdate::unchanged());
-        Task::batch([load, jump, self.apply_viewport(update, true, true)])
+        Task::batch([
+            load,
+            jump,
+            self.apply_viewport(update, true, DurableChange::Content),
+        ])
     }
 
     pub(super) fn preview_local_file(&mut self, card: CardId) -> Task<Message> {
@@ -466,6 +469,34 @@ mod tests {
                 "real PNG fixture"
             );
         }
+    }
+
+    /// `src/lib.rs:12` in a chat opens the file with its caret on line 12.
+    #[tokio::test]
+    async fn chat_file_position_links_open_at_their_line() {
+        use super::super::chat_ui::{Action, Target};
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().to_path_buf();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let text: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(worktree.join("src/lib.rs"), text).unwrap();
+        let mut app = app();
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(worktree.clone())));
+        let source = app.workspace.focused().unwrap();
+        let target: Target = match app.cards.get(&source).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.target,
+            _ => panic!("draft chat"),
+        };
+        let click =
+            Action::OpenDocumentFrom(target, Some(worktree.join(".chat")), "src/lib.rs:12".into());
+        let task = app.handle_chat_ui(click);
+        settle(&mut app, task).await;
+        let file = runtime(&app, app.workspace.focused().unwrap());
+        assert_eq!(
+            file.descriptor.worktree.join(file.selected_path().unwrap()),
+            worktree.join("src/lib.rs")
+        );
+        assert_eq!(file.cursor_position().map(|at| at.line), Some(11));
     }
 
     #[tokio::test]
@@ -858,7 +889,7 @@ mod tests {
         assert_eq!(app.durable.card_scopes.get(&file_a), Some(&scope_a));
         // Repository loading does not advance the pane's layout/reveal animation.
         let update = app.workspace.tick(std::time::Duration::from_secs(1));
-        drop(app.apply_viewport(update, true, false));
+        drop(app.apply_viewport(update, true, DurableChange::None));
         assert_eq!(
             app.workspace.visibility(file_a),
             Some(VisibilityClass::Visible)

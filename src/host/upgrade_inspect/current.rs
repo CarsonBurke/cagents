@@ -1,4 +1,4 @@
-//! Read-only inspection of the stable 99/100/101/current inventory subset.
+//! Read-only inspection of the wire-proven source inventory subset.
 //! The frozen protocol-77 reader remains separate from this matched connection.
 use crate::{
     chat::Session,
@@ -108,13 +108,10 @@ impl Client {
                 | ClientRequest::ChatAttach { .. }
                 | ClientRequest::ChatVisibility { .. }
                 | ClientRequest::ChatRead { .. }
-        ) && !matches!(&request, ClientRequest::ChatStart { session, source: None, terminate_source: false, execution_environment }
-            if self.protocol == 119 && session.native_continuity.retains_provider() && execution_environment.0.is_empty())
-        {
+        ) {
             return Err("Request is outside the retained-source inspection contract".into());
         }
         let bootstrap_chat = match &request {
-            ClientRequest::ChatStart { session, .. } if self.protocol == 119 => Some(session.id),
             ClientRequest::ChatAttach { session } => Some(session.id),
             ClientRequest::ChatDetach { chat_id }
             | ClientRequest::ChatVisibility { chat_id, .. }
@@ -161,7 +158,9 @@ impl Client {
                 ServerMessage::ChatActivity { chat_id, .. }
                 | ServerMessage::ChatObserved { chat_id, .. }
                 | ServerMessage::ChatChanged { chat_id }
-                | ServerMessage::ChatAccountUsage { chat_id, .. } => Some(chat_id),
+                | ServerMessage::ChatAccountUsage { chat_id, .. }
+                | ServerMessage::ChatLimit { chat_id, .. }
+                | ServerMessage::ChatAgentAddresses { chat_id, .. } => Some(chat_id),
                 _ => None,
             };
             if envelope.request_id.is_some()
@@ -194,52 +193,6 @@ impl Client {
                 "Source terminal inventory is unsupported or exceeds the inspection limit".into(),
             ),
         }
-    }
-
-    /// Bootstrap an installed119 service using its existing retained-only start
-    /// path. The type fences into authenticated adoption even if its owner
-    /// disappears. ReconnectOnly must never reach generic ChatStart here.
-    pub(super) fn reconcile_retained(&mut self, source: &Session) -> Result<(), String> {
-        if self.protocol != 119 {
-            return Ok(()); // newer Resolve performs no-launch adoption itself
-        }
-        if !source.native_continuity.retains_provider() || !source.has_valid_native_continuity() {
-            return Err(
-                "Legacy source needs an authenticated retained owner; no provider was launched"
-                    .into(),
-            );
-        }
-        let response = self.request(
-            ClientRequest::ChatStart {
-                session: source.clone(),
-                source: None,
-                terminate_source: false,
-                execution_environment: Default::default(),
-            },
-            true,
-        )?;
-        let ServerResponse::ChatAttached { session, snapshot } = response else {
-            return Err("Legacy retained owner did not return its exact attachment".into());
-        };
-        let valid = (session == *source
-            || crate::chat::is_upgrade_recovery(source, &session)
-            || crate::chat::is_upgrade_identity_learning(source, &session))
-            && snapshot.ready
-            && snapshot.session_id == session.launch.session_id
-            && snapshot.native_continuity == session.native_continuity
-            && session.proof.as_ref() == Some(&self.proof);
-        if !matches!(
-            self.request(ClientRequest::ChatDetach { chat_id: source.id }, true)?,
-            ServerResponse::Detached
-        ) {
-            return Err("Cannot detach the retained-owner inspection".into());
-        }
-        if !valid {
-            return Err(
-                "Legacy retained owner changed its exact conversation or is not ready".into(),
-            );
-        }
-        Ok(())
     }
 
     pub(super) fn resolve(&mut self, source: &Session) -> Result<Session, String> {
@@ -287,9 +240,7 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
-            || !source.is_saved_claude_history()
-        {
+        if !supports_protocol(self.protocol) || !source.is_saved_claude_history() {
             return Err("Saved history has no qualified read-only inspection API".into());
         }
         let mut requested = source.clone();
@@ -369,23 +320,17 @@ impl Client {
             return Err("Saved history inspection could not detach its reader".into());
         }
         // Keep the reader through consent and normal source shutdown. Removing
-        // and reconstructing a pager advances legacy119's global inventory
+        // and reconstructing a pager advances the source's global inventory
         // generation and invalidates every unrelated live owner's consent.
         // Other attached history views remain attached; no cache is evicted.
         inspection
     }
 }
 
-// These versions have identical Connect/List/ChatList/ResolveUpgradeChat tags
-// and inventory DTOs. Version 100 appends capacity operations; 101 requires
-// atomic managed-pane adoption without changing these DTOs. This restricted
-// Inventory uses the frozen restricted decoder. The separate retained/history
-// methods admit full snapshots only for the explicitly qualified119/current pair.
-// Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
-// appended Work board request) preserve this subset, including the existing
-// continuity enum discriminants.
+/// Use the same current-wire qualification as lifecycle control, including
+/// the complete read-only history API rather than only inventory messages.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].contains(&protocol)
+    crate::update::source::current_client_supports(protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -556,7 +501,7 @@ mod tests {
     use super::*;
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].into()
+        crate::update::source::current_client_protocols().collect()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
@@ -760,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_inventory_subset_accepts_99_through_104_only() {
+    fn frozen_inventory_subset_accepts_qualified_current_wire_sources() {
         assert!(!supports_protocol(98));
         assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);
@@ -787,8 +732,10 @@ mod tests {
         for protocol in source_protocols() {
             assert!(supports_protocol(protocol));
             // Frozen postcard envelope with request 7, proof s/b/i and an empty
-            // ChatListed response. The only version-specific byte is first.
-            let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
+            // ChatListed response. Only the leading version varint varies; from
+            // 128 it takes two bytes.
+            let mut payload = postcard::to_allocvec(&protocol).unwrap();
+            payload.extend([1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0]);
             let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
             frame.extend(payload);
             let envelope = read_response(&mut frame.as_slice()).unwrap();
@@ -835,123 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retained_reconciliation_drains_exact_events_and_accepts_large_history() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        let mut source = super::super::tests::session();
-        let mut old = proof();
-        old.host_incarnation = crate::model::HostIncarnation::new("previous-owner");
-        source.proof = Some(old);
-        source.native_continuity =
-            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
-        assert!(source.has_valid_native_continuity());
-        let expected = source.clone();
-        let worker = std::thread::spawn(move || {
-            for attach in [true, false] {
-                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
-                assert_eq!(request.version, 119);
-                assert_eq!(request.proof.as_ref(), Some(&proof()));
-                if attach {
-                    assert!(
-                        matches!(request.request, ClientRequest::ChatStart { session, source: None, terminate_source: false, execution_environment } if session == expected && execution_environment.0.is_empty())
-                    );
-                } else {
-                    assert!(
-                        matches!(request.request, ClientRequest::ChatDetach { chat_id } if chat_id == expected.id)
-                    );
-                }
-                for message in [
-                    ServerMessage::ChatActivity {
-                        chat_id: expected.id,
-                        state: crate::agent::ActivityState::Working,
-                        generation: 42,
-                    },
-                    ServerMessage::ChatObserved {
-                        chat_id: expected.id,
-                        epoch: 3,
-                    },
-                ] {
-                    ipc::write_frame(
-                        &mut peer,
-                        &ServerEnvelope {
-                            version: 119,
-                            request_id: None,
-                            proof: proof(),
-                            message,
-                        },
-                    )
-                    .unwrap();
-                }
-                let response = if attach {
-                    let mut resolved = expected.clone();
-                    resolved.proof = Some(proof());
-                    let mut snapshot = crate::chat::Snapshot {
-                        ready: true,
-                        session_id: resolved.launch.session_id.clone(),
-                        native_continuity: resolved.native_continuity.clone(),
-                        ..Default::default()
-                    };
-                    snapshot.items.push(std::sync::Arc::new(crate::chat::Item {
-                        id: "retained-history".into(),
-                        role: crate::chat::Role::Assistant,
-                        content: crate::chat::ItemContent::Text {
-                            text: "x".repeat(5 * 1024 * 1024),
-                            thinking: false,
-                            phase: Default::default(),
-                        },
-                        started_at: None,
-                        at: None,
-                    }));
-                    ServerResponse::ChatAttached {
-                        session: resolved,
-                        snapshot,
-                    }
-                } else {
-                    ServerResponse::Detached
-                };
-                ipc::write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: 119,
-                        request_id: Some(request.request_id),
-                        proof: proof(),
-                        message: ServerMessage::Response { response },
-                    },
-                )
-                .unwrap();
-            }
-        });
-        let mut client = Client {
-            stream,
-            proof: proof(),
-            next: 1,
-            protocol: 119,
-            deadline: Instant::now() + Duration::from_secs(5),
-        };
-        client.reconcile_retained(&source).unwrap();
-        drop(client);
-        worker.join().unwrap();
+    fn history_preview_only_attaches_reads_and_detaches_without_execution_or_eviction() {
+        for protocol in source_protocols() {
+            history_preview_at_protocol(protocol);
+        }
     }
 
-    #[test]
-    fn legacy_reconnect_only_source_never_sends_a_start_request() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.set_nonblocking(true).unwrap();
-        let source = super::super::tests::session();
-        let mut client = Client {
-            stream,
-            proof: proof(),
-            next: 1,
-            protocol: 119,
-            deadline: Instant::now() + Duration::from_secs(1),
-        };
-        assert!(client.reconcile_retained(&source).is_err());
-        assert!(
-            matches!(peer.read(&mut [0]), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-        );
-    }
-
-    #[test]
-    fn legacy_history_preview_only_attaches_reads_and_detaches_without_execution_or_eviction() {
+    fn history_preview_at_protocol(protocol: u16) {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let source = super::super::tests::session();
         let mut requested = source.clone();
@@ -960,7 +797,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             for step in 0..4 {
                 let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
-                assert_eq!(request.version, 119);
+                assert_eq!(request.version, protocol);
                 assert_eq!(request.proof, Some(proof()));
                 let response = match (step, request.request) {
                     (0, ClientRequest::ChatAttach { session }) if session == expected => ServerResponse::ChatAttached {
@@ -987,7 +824,7 @@ mod tests {
                 ipc::write_frame(
                     &mut peer,
                     &ServerEnvelope {
-                        version: 119,
+                        version: protocol,
                         request_id: None,
                         proof: proof(),
                         message: ServerMessage::ChatChanged {
@@ -999,7 +836,7 @@ mod tests {
                 ipc::write_frame(
                     &mut peer,
                     &ServerEnvelope {
-                        version: 119,
+                        version: protocol,
                         request_id: Some(request.request_id),
                         proof: proof(),
                         message: ServerMessage::Response { response },
@@ -1012,7 +849,7 @@ mod tests {
             stream,
             proof: proof(),
             next: 1,
-            protocol: 119,
+            protocol,
             deadline: Instant::now() + Duration::from_secs(5),
         };
         client.inspect_saved_history(&source).unwrap();
@@ -1087,6 +924,73 @@ mod tests {
             } else {
                 assert!(result.unwrap_err().contains("inspection limit"));
             }
+        }
+    }
+
+    #[test]
+    fn qualified_sources_authenticate_and_resolve_at_their_own_protocol() {
+        for protocol in source_protocols() {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = crate::daemon::RuntimePaths {
+                directory: directory.path().into(),
+                socket: directory.path().join("cagentsd.sock"),
+                lock: directory.path().join("cagentsd.lock"),
+            };
+            let mut owner = proof();
+            owner.boot_id = crate::daemon::read_boot_id().unwrap();
+            let _lease = crate::daemon::HostLease::acquire(&paths, &owner).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let expected = owner.clone();
+            let source = super::super::tests::session();
+            let expected_source = source.clone();
+            let worker = std::thread::spawn(move || {
+                let (mut peer, _) = listener.accept().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                for step in 0..2 {
+                    let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                    assert_eq!(request.version, protocol);
+                    let response = if step == 0 {
+                        assert!(request.proof.is_none());
+                        assert!(
+                            matches!(request.request, ClientRequest::Connect { expected_host: Some(proof), resume } if proof == expected && resume.is_empty())
+                        );
+                        ServerResponse::Connected {
+                            proof: expected.clone(),
+                            resumed: Vec::new(),
+                        }
+                    } else {
+                        assert_eq!(request.proof.as_ref(), Some(&expected));
+                        assert!(
+                            matches!(request.request, ClientRequest::ResolveUpgradeChat { source } if source == expected_source)
+                        );
+                        ServerResponse::UpgradeChatResolved {
+                            session: expected_source.clone(),
+                        }
+                    };
+                    ipc::write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: Some(request.request_id),
+                            proof: expected.clone(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client = Client::connect(
+                &paths.socket,
+                &owner,
+                Instant::now() + Duration::from_secs(5),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(client.resolve(&source).unwrap(), source);
+            drop(client);
+            worker.join().unwrap();
         }
     }
 

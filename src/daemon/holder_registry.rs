@@ -30,13 +30,40 @@ pub(crate) struct Process {
 
 impl Process {
     pub fn read(pid: i32) -> io::Result<Self> {
-        let stat = fs::read(format!("/proc/{pid}/stat"))?;
+        let stat = fs::read(format!("/proc/{pid}/stat")).map_err(exited_as_absent)?;
         let (_, start) = crate::model::agent_recovery::process_identity(&stat)
             .ok_or_else(|| io::Error::other("invalid process identity"))?;
         Ok(Self { pid, start })
     }
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
+    }
+
+    /// Whether this exact process is gone within 15 seconds. Exit proofs, such
+    /// as a readable pidfd or a zombie state, come before the parent reaps the
+    /// process, and until then its `/proc` entry still names this identity.
+    /// How soon the reaper runs depends on scheduling, so a test asserting
+    /// absence after such a proof waits for it here.
+    #[cfg(test)]
+    pub fn reaped(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self.is_current() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+}
+
+/// A process reaped between opening and reading its stat file fails the read
+/// with ESRCH. It is as absent as one whose entry is already gone.
+pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
     }
 }
 
@@ -52,8 +79,8 @@ pub(crate) struct BuildIdentity {
 impl BuildIdentity {
     pub(crate) fn current(kind: Kind) -> Self {
         Self {
-            version: crate::VERSION.into(),
-            commit: crate::VERSION
+            version: crate::version().into(),
+            commit: crate::version()
                 .split("+local.")
                 .nth(1)
                 .and_then(|metadata| metadata.split('.').next())
@@ -205,7 +232,7 @@ pub(crate) fn socket_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < capacity
 }
 
-fn with_socket_address<T>(
+pub(crate) fn with_socket_address<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -265,7 +292,7 @@ pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream>
 impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
-            build.version != crate::VERSION
+            build.version != crate::version()
                 || (self.kind == Kind::Native
                     && !build
                         .capabilities
@@ -285,11 +312,12 @@ impl Record {
         let mut children = std::collections::BTreeSet::new();
         for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
             let task = task?;
-            let raw = match fs::read_to_string(task.path().join("children")) {
-                Ok(raw) => raw,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            let raw =
+                match fs::read_to_string(task.path().join("children")).map_err(exited_as_absent) {
+                    Ok(raw) => raw,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
             children.extend(
                 raw.split_whitespace()
                     .filter_map(|pid| pid.parse::<i32>().ok()),
@@ -328,6 +356,10 @@ impl Record {
         directory.join(format!("{}.json", self.terminal))
     }
 
+    /// Writes without fsync: the record carries its boot ID, so no reader
+    /// accepts it after an OS crash, and the page cache serves every reader in
+    /// this boot. An fsync on a disk-backed runtime directory can instead hold
+    /// a holder's launch for seconds under write load (#2180).
     pub fn create(&self, directory: &Path) -> io::Result<()> {
         let path = self.path(directory);
         let mut file = OpenOptions::new()
@@ -339,8 +371,7 @@ impl Record {
         let identity = file.metadata()?;
         let result = (|| {
             serde_json::to_writer(&mut file, self).map_err(io::Error::other)?;
-            file.flush()?;
-            file.sync_all()
+            file.flush()
         })();
         if result.is_err()
             && fs::symlink_metadata(&path).is_ok_and(|actual| {
@@ -377,15 +408,40 @@ impl Record {
 }
 
 fn read(path: &Path) -> io::Result<Record> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    read_file(file, false)
+    read_current(|| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+
+/// A record its holder unlinks between our open and fstat no longer names the
+/// path. Open the path again to read whatever it names now, rather than
+/// rejecting the retired inode as unsafe; repeated churn still is. One fstat
+/// both decides this and authorizes the read: an unlink after it leaves the
+/// held bytes intact.
+fn read_current(mut open: impl FnMut() -> io::Result<std::fs::File>) -> io::Result<Record> {
+    for _ in 1..3 {
+        let file = open()?;
+        let metadata = file.metadata()?;
+        if metadata.nlink() != 0 {
+            return read_checked(file, &metadata, false);
+        }
+    }
+    read_file(open()?, false)
 }
 
 fn read_file(file: std::fs::File, allow_unlinked: bool) -> io::Result<Record> {
     let metadata = file.metadata()?;
+    read_checked(file, &metadata, allow_unlinked)
+}
+
+fn read_checked(
+    file: std::fs::File,
+    metadata: &fs::Metadata,
+    allow_unlinked: bool,
+) -> io::Result<Record> {
     if !metadata.is_file()
         || metadata.uid() != crate::daemon::current_uid()
         || metadata.mode() & 0o077 != 0
@@ -428,6 +484,21 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
 /// discovery stays application-exact; no caller may infer adoption from this.
 pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, true)
+}
+
+/// Read execution evidence without granting discovery or adoption authority.
+/// Old boots and foreign holders still describe execution; callers must check
+/// the boot before interpreting process identities that the kernel can reuse.
+pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
+    let record = match read(&socket.with_extension("json")) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string())) {
+        return Err(io::Error::other("Holder record names another pane"));
+    }
+    Ok(Some(record))
 }
 
 fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
@@ -493,6 +564,45 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
+/// The running process that holds a record for this terminal, for a caller
+/// that holds no authority over the registry. Unlike discovery this creates and
+/// removes nothing. Holders don't carry the terminal's environment markers, so
+/// this record is the only evidence of one. Any live record counts: a holder of
+/// another version, application or kind can't be adopted, but it is still alive.
+/// A record that can't be read is an error, not an absence.
+#[cfg(feature = "ui")]
+pub(crate) fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    crate::secure_file::reject_symlink_components(&directory)?;
+    holding_process_in(&directory, terminal)
+}
+
+#[cfg(feature = "ui")]
+fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Option<i32>> {
+    match read(&socket(directory, terminal).with_extension("json")) {
+        Ok(record) => Ok([record.holder, record.root]
+            .into_iter()
+            .find(Process::is_current)
+            .map(|process| process.pid)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether nothing of a dead holder's execution is left. A native holder's
+/// record is the only evidence of which session and process group its
+/// conversation ran in, and its Close needs that evidence for as long as a
+/// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
+fn ended_with_holder(record: &Record) -> bool {
+    #[cfg(feature = "host")]
+    if record.kind == Kind::Native {
+        return crate::daemon::lost_processes::census(&record.holder, &record.root)
+            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
+    }
+    let _ = record;
+    true
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
@@ -544,7 +654,7 @@ fn discover_inner(
         if !record.holder.is_current() {
             // Candidate intake grants no mutation authority over the other
             // package's evidence, including an unresolved orphan root.
-            if record.application == crate::instance::APPLICATION_ID {
+            if record.application == crate::instance::APPLICATION_ID && ended_with_holder(&record) {
                 record.remove(directory);
             }
             continue;
@@ -561,6 +671,70 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_process_reaped_while_its_stat_is_read_is_absent() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+        child.wait().unwrap();
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(exited_as_absent(error).kind(), io::ErrorKind::NotFound);
+    }
+
+    /// #2339: a holder that removes its record while it is being read made
+    /// the paired console's close confirmation fail as an unsafe record.
+    #[test]
+    fn a_record_unlinked_while_it_is_read_is_read_again_by_path() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = root.path().join("holders");
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let record = record();
+        record.create(&directory).unwrap();
+        let path = record.path(&directory);
+        let open = || fs::File::open(&path);
+        // Removed after the open: the path is absent.
+        let mut unlinked = false;
+        let removed = read_current(|| {
+            let file = open()?;
+            if !std::mem::replace(&mut unlinked, true) {
+                record.remove(&directory);
+            }
+            Ok(file)
+        });
+        assert_eq!(removed.unwrap_err().kind(), io::ErrorKind::NotFound);
+        // Replaced after the open: the path names the successor.
+        let mut successor = self::record();
+        successor.terminal = record.terminal;
+        successor.version = 4;
+        record.create(&directory).unwrap();
+        let mut replaced = false;
+        let current = read_current(|| {
+            let file = open()?;
+            if !std::mem::replace(&mut replaced, true) {
+                fs::remove_file(&path).unwrap();
+                successor.create(&directory).unwrap();
+            }
+            Ok(file)
+        });
+        assert_eq!(current.unwrap(), successor);
+        // A path that never stops churning is still refused as unsafe.
+        let churning = read_current(|| {
+            let file = open()?;
+            fs::remove_file(&path).unwrap();
+            successor.create(&directory).unwrap();
+            Ok(file)
+        });
+        assert_eq!(
+            churning.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Unlinked after the fstat that authorized it: the held bytes read.
+        let file = open().unwrap();
+        let metadata = file.metadata().unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_checked(file, &metadata, false).unwrap(), successor);
+    }
 
     #[test]
     fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
@@ -768,6 +942,92 @@ mod tests {
             holder: process.clone(),
             root: process,
         }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn checking_for_a_holder_changes_nothing_in_the_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("holders");
+        let unknown = TerminalId::new();
+        assert!(holding_process_in(&directory, unknown).unwrap().is_none());
+        assert!(!directory.exists(), "a read must not create the registry");
+
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let live = record();
+        live.create(&directory).unwrap();
+        assert!(
+            holding_process_in(&directory, live.terminal)
+                .unwrap()
+                .is_some()
+        );
+        assert!(holding_process_in(&directory, unknown).unwrap().is_none());
+
+        // Discovery prunes a dead holder's record. This caller has no such authority.
+        let mut dead = record();
+        dead.holder.start += 1;
+        dead.root.start += 1;
+        dead.create(&directory).unwrap();
+        assert!(
+            holding_process_in(&directory, dead.terminal)
+                .unwrap()
+                .is_none()
+        );
+        assert!(dead.path(&directory).exists());
+
+        let unreadable = TerminalId::new();
+        std::fs::write(
+            socket(&directory, unreadable).with_extension("json"),
+            "not a record",
+        )
+        .unwrap();
+        assert!(holding_process_in(&directory, unreadable).is_err());
+    }
+
+    /// Adoption can turn these down; none of them makes the holder less alive.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_live_holder_counts_whatever_its_record_says_about_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("holders");
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let foreign: [fn(&mut Record); 4] = [
+            |record| record.version = u32::MAX,
+            |record| record.application = "another.application".into(),
+            |record| record.kind = Kind::Native,
+            |record| record.boot = BootId::new("another-boot"),
+        ];
+        for change in foreign {
+            let mut record = record();
+            change(&mut record);
+            record.create(&directory).unwrap();
+            assert!(
+                holding_process_in(&directory, record.terminal)
+                    .unwrap()
+                    .is_some()
+            );
+
+            // The same record with its holder gone is no longer evidence of one.
+            let mut gone = record.clone();
+            gone.terminal = TerminalId::new();
+            gone.holder.start += 1;
+            gone.root.start += 1;
+            gone.create(&directory).unwrap();
+            assert!(
+                holding_process_in(&directory, gone.terminal)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // Its terminal's root process outlived the holder.
+        let mut orphaned = record();
+        orphaned.holder.start += 1;
+        orphaned.create(&directory).unwrap();
+        assert_eq!(
+            holding_process_in(&directory, orphaned.terminal).unwrap(),
+            Some(orphaned.root.pid)
+        );
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

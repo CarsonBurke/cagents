@@ -57,17 +57,17 @@ esac
 
 # Build each implementation graph separately; never unify host/UI features.
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
-    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
+    [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
     # The package is native-only. Override config build.target with the validated
     # release target, and consume each exact Cargo executable instead of guessing
     # whether it lives below a target-triple directory.
-    CLI_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
+    CLI_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
-    HOST_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
+    HOST_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --features host --bin cagentsd)
-    EDITOR_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
+    EDITOR_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --package ceditor)
 else
@@ -79,6 +79,21 @@ fi
 for binary in "$EDITOR_BINARY" "$CLI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
+if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
+    require_prebuilt_version() {
+        # Preserve output through command substitution so extra lines cannot
+        # disappear. Accept the exact line with or without its final newline.
+        reported=$("$2" --version && printf '.') \
+            || fail "could not verify prebuilt $1 version: $2"
+        expected="$1 $VERSION"
+        [ "$reported" = "$expected." ] \
+            || [ "$reported" = "$(printf '%s\n.' "$expected")" ] \
+            || fail "prebuilt $1 does not report requested version $VERSION: $2"
+    }
+    require_prebuilt_version ceditor "$EDITOR_BINARY"
+    require_prebuilt_version cagents "$CLI_BINARY"
+    require_prebuilt_version cagentsd "$HOST_BINARY"
+fi
 
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ceditor-package.XXXXXX")
 cleanup() {

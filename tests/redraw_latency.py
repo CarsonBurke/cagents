@@ -41,7 +41,8 @@ product = root / 'configured target/x86_64-unknown-linux-gnu/release' / name
 product.parent.mkdir(parents=True, exist_ok=True)
 product.write_text('#!' + sys.executable + '\\n' +
     'import json,os,pathlib,sys\\n' +
-    'with pathlib.Path(os.environ["MOCK_CALLS"]).open("a") as f: f.write(json.dumps(["product",sys.argv])+"\\\\n")\\n')
+    'with pathlib.Path(os.environ["MOCK_CALLS"]).open("a") as f: f.write(json.dumps(["product",sys.argv])+"\\\\n")\\n' +
+    'with pathlib.Path(os.environ["MOCK_ROOT"], "product-environment").open("a") as f: f.write(json.dumps(dict(os.environ))+"\\\\n")\\n')
 product.chmod(0o755)
 message = {'reason': 'compiler-artifact', 'target': {'name': name, 'kind': ['bin']},
            'executable': str(product)}
@@ -57,6 +58,10 @@ if sys.argv[1] == 'rev-parse': print('fixture-revision')
         self.tool("timeout", """
 assert sys.argv[1:5] == ['--signal=TERM', '--kill-after=5s', '120s',
     str(root / 'configured target/x86_64-unknown-linux-gnu/release/cagents-ui')], sys.argv
+with (root / 'ui-environment').open('a') as output:
+    output.write(json.dumps(dict(os.environ)) + '\\n')
+if os.environ.get('FAIL_UI_RUN') == os.environ['CAGENTS_LATENCY_RUN']:
+    sys.exit(1)
 Path(os.environ['CAGENTS_LATENCY_OUTPUT']).write_text('{}\\n')
 """)
         # jq is outside the artifact-routing contract; no performance acceptance
@@ -65,6 +70,8 @@ Path(os.environ['CAGENTS_LATENCY_OUTPUT']).write_text('{}\\n')
 if sys.argv[1:3] == ['-er', '.target_directory']:
     print(json.load(sys.stdin)['target_directory'])
 elif sys.argv[1] != '-e': print('{}')
+with (root / 'jq-homes').open('a') as output:
+    output.write(os.environ['HOME'] + '\\n')
 """)
         self.environment = os.environ.copy()
         self.environment.pop("CARGO_BUILD_TARGET", None)
@@ -104,6 +111,21 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
     def builds(self):
         return [args for tool, args in self.recorded() if tool == "cargo" and args[0] == "build"]
 
+    def environments(self, name):
+        return [json.loads(line) for line in (self.root / name).read_text().splitlines()]
+
+    def assert_in_sandbox(self, environment, run, shims=None):
+        run_directory = Path(environment["HOME"]).parent
+        self.assertEqual(run_directory.name, str(run))
+        self.assertNotEqual(environment["HOME"], self.environment["HOME"])
+        for key, name in (("XDG_RUNTIME_DIR", "runtime"), ("XDG_CONFIG_HOME", "config"),
+                          ("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"),
+                          ("XDG_STATE_HOME", "state")):
+            self.assertEqual(environment[key], str(run_directory / name))
+        if shims:
+            self.assertNotIn(str(shims), environment["PATH"].split(os.pathsep))
+        return run_directory.parent
+
     def test_config_target_paths_and_matched_isolated_lanes(self):
         result = self.run_runner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -120,6 +142,33 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         cleanups = [args for tool, args in calls if tool == "product"]
         self.assertEqual(cleanups, [[str(self.products / "cagents"), "daemon", "stop-for-rebuild",
                                      "--including-subagents"]] * 5)
+
+    def test_the_sandbox_reaches_the_product_without_mise_shims(self):
+        shims = self.root / "data/mise/shims"
+        shims.mkdir(parents=True)
+        result = self.run_runner(PATH=f"{shims}:{self.environment['PATH']}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        interfaces = self.environments("ui-environment")
+        stops = self.environments("product-environment")
+        self.assertEqual(len(interfaces), 5)
+        self.assertEqual(len(stops), 5)
+        bases = set()
+        for run, (interface, stop) in enumerate(zip(interfaces, stops), 1):
+            bases.add(self.assert_in_sandbox(interface, run, shims))
+            # The stop is of this run's daemon: outside the sandbox it would reach the caller's.
+            self.assert_in_sandbox(stop, run, shims)
+        self.assertEqual(len(bases), 1)
+        # Its own tools keep the caller's HOME, where a shim works.
+        homes = set((self.root / "jq-homes").read_text().splitlines())
+        self.assertEqual(homes, {self.environment["HOME"]})
+
+    def test_a_failed_run_stops_the_daemon_in_its_own_sandbox(self):
+        result = self.run_runner(FAIL_UI_RUN="3")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        stops = self.environments("product-environment")
+        # Two finished runs stopped theirs; the cleanup stops the third's.
+        self.assertEqual(len(stops), 3)
+        self.assert_in_sandbox(stops[-1], 3)
 
     def test_each_build_failure_preserves_status_and_stops_before_launch(self):
         for index, name in enumerate(("cagents", "cagentsd", "cagents-ui"), 1):

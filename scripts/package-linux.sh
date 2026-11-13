@@ -7,19 +7,33 @@ ROOT_DIR=$(dirname -- "$SCRIPT_DIR")
 DIST_DIR=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 VARIANT=full
+# Cargo profile for the packaged executables; `local` keeps release identity.
+PROFILE=${CAGENTS_CARGO_PROFILE:-release}
+ARCHIVE_ONLY=0
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
     exit 1
 }
 
-case $# in
-    0) ;;
-    2)
-        [ "$1" = --variant ] || fail 'usage: package-linux.sh [--variant full|browserless]'
-        VARIANT=$2
-        ;;
-    *) fail 'usage: package-linux.sh [--variant full|browserless]' ;;
+USAGE='usage: package-linux.sh [--variant full|browserless] [--archive-only]'
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --variant)
+            [ "$#" -ge 2 ] || fail "$USAGE"
+            VARIANT=$2
+            shift 2
+            ;;
+        # The portable archive and its checksums are all install.sh needs.
+        --archive-only)
+            ARCHIVE_ONLY=1
+            shift
+            ;;
+        *) fail "$USAGE" ;;
+    esac
+done
+case $PROFILE in
+    ''|*[!0-9A-Za-z_-]*) fail "unsafe Cargo profile: $PROFILE" ;;
 esac
 [ "$(uname -s)" = Linux ] || fail 'packaging is supported only on Linux'
 [ "$(uname -m)" = x86_64 ] || fail 'packaging is supported only on x86_64'
@@ -83,14 +97,20 @@ case $VARIANT in
     *) fail "unknown package variant: $VARIANT" ;;
 esac
 
-for command in awk cargo date dpkg-deb gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
+for command in awk cargo date gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+[ "$ARCHIVE_ONLY" = 1 ] || command -v dpkg-deb >/dev/null 2>&1 || fail 'required command not found: dpkg-deb'
+if [ "$ARCHIVE_ONLY" = 1 ]; then
+    GZIP_LEVEL=-1
+else
+    GZIP_LEVEL=-9
+fi
 
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
-    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
+    [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
     # Native build scripts run outside the repository and cannot rely on a mise
     # shim rediscovering mise.toml. Resolve the real executable up front.
@@ -109,18 +129,21 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # The archive is named after the version's build metadata (the part after
     # `+`, e.g. `local.3d80e6d`), and the binaries inside it report the same
     # string from `--version`. A bare release version carries none, and an
-    # empty value tells build.rs to look at the checkout instead.
+    # empty value has the binaries take the checkout's metadata instead, so
+    # a dirty or untagged tree cannot pass for the release. A build gate's
+    # marker, inherited, would have build.rs skip the checkout.
     CAGENTS_BUILD_METADATA=${VERSION#*+}
     [ "$CAGENTS_BUILD_METADATA" != "$VERSION" ] || CAGENTS_BUILD_METADATA=
     export CAGENTS_BUILD_METADATA
+    unset CAGENTS_BUILD_METADATA_SUPPLIED
 
     build_target() {
         product=$1
         shift
-        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
+        /usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
-            --release \
+            --profile "$PROFILE" \
             --target-dir "$TARGET_DIR" \
             --target "$RELEASE_TARGET" \
             "$@"
@@ -143,37 +166,55 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 else
     # Explicit prebuilt mode retains its native release layout.
-    CLI_BINARY=$TARGET_DIR/release/cagents
-    HOST_BINARY=$TARGET_DIR/release/cagentsd
-    UI_BINARY=$TARGET_DIR/release/cagents-ui
+    CLI_BINARY=$TARGET_DIR/$PROFILE/cagents
+    HOST_BINARY=$TARGET_DIR/$PROFILE/cagentsd
+    UI_BINARY=$TARGET_DIR/$PROFILE/cagents-ui
 fi
 
-# Report the package's whole resolved graph: the union of the lanes built above.
-# `cargo tree` only reads Cargo.lock, so unifying the features here resolves
-# nothing that a build would compile. Never copy these feature sets into a
-# build command.
-if [ "$VARIANT" = browserless ]; then
-    RESOLVED_PACKAGE_IDS=$(
-        cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --no-default-features --features ui,host --edges normal --prefix none |
-            sed 's/ (\*)$//' |
-            LC_ALL=C sort -u |
-            wc -l
-    )
-else
-    RESOLVED_PACKAGE_IDS=$(
-        cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --features host,integrated-browser --edges normal --prefix none |
-            sed 's/ (\*)$//' |
-            LC_ALL=C sort -u |
-            wc -l
-    )
+# Only the release size report reads this.
+if [ "$ARCHIVE_ONLY" = 0 ]; then
+    # Report the package's whole resolved graph: the union of the lanes built above.
+    # `cargo tree` only reads Cargo.lock, so unifying the features here resolves
+    # nothing that a build would compile. Never copy these feature sets into a
+    # build command.
+    if [ "$VARIANT" = browserless ]; then
+        RESOLVED_PACKAGE_IDS=$(
+            cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
+                --no-default-features --features ui,host --edges normal --prefix none |
+                sed 's/ (\*)$//' |
+                LC_ALL=C sort -u |
+                wc -l
+        )
+    else
+        RESOLVED_PACKAGE_IDS=$(
+            cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
+                --features host,integrated-browser --edges normal --prefix none |
+                sed 's/ (\*)$//' |
+                LC_ALL=C sort -u |
+                wc -l
+        )
+    fi
+    RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 fi
-RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
+if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
+    require_prebuilt_version() {
+        # Preserve output through command substitution so extra lines cannot
+        # disappear. Accept the exact line with or without its final newline.
+        reported=$("$2" --version && printf '.') \
+            || fail "could not verify prebuilt $1 version: $2"
+        expected="$1 $VERSION"
+        [ "$reported" = "$expected." ] \
+            || [ "$reported" = "$(printf '%s\n.' "$expected")" ] \
+            || fail "prebuilt $1 does not report requested version $VERSION: $2"
+    }
+    require_prebuilt_version cagents "$CLI_BINARY"
+    require_prebuilt_version cagents-ui "$UI_BINARY"
+    require_prebuilt_version cagentsd "$HOST_BINARY"
+fi
 
 PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
     || fail 'cannot inspect packaged daemon protocol'
@@ -213,6 +254,68 @@ fi
 # alone must retain the normal release stripping behavior.
 if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
     strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+fi
+
+# Inspect the exact bytes about to enter both package formats, including
+# prebuilt/skip-strip mode. A successful link or a newer linker is not proof
+# that bundled HarfBuzz cannot interpose on the system FreeType/HarfBuzz pair.
+if [ "$VARIANT" = full ]; then
+    UI_DYNAMIC_SYMBOLS=$WORK_DIR/ui-dynamic-symbols
+    UI_DYNAMIC_ERRORS=$WORK_DIR/ui-dynamic-errors
+    LC_ALL=C readelf --wide --dyn-syms "$BIN_DIR/cagents-ui" \
+        > "$UI_DYNAMIC_SYMBOLS" 2> "$UI_DYNAMIC_ERRORS" \
+        || fail 'cannot inspect full UI dynamic symbols'
+    [ ! -s "$UI_DYNAMIC_ERRORS" ] || fail 'readelf reported invalid full UI dynamic symbols'
+    # Separate inspection and parsing: POSIX sh has no pipefail. Require a
+    # complete GNU readelf dynamic table so empty/truncated output cannot pass.
+    # UND entries are imports, including the required system FT_* functions.
+    LC_ALL=C awk '
+        BEGIN { rows = 0; tables = 0; headings = 0 }
+        /^[[:space:]]*$/ { next }
+        /^Symbol table / {
+            if (tables++ || NF != 6 || $3 != sprintf("%c.dynsym%c", 39, 39) ||
+                $4 != "contains" || $5 !~ /^[0-9]+$/ || $5 == 0 || $6 != "entries:") {
+                bad = 1; exit
+            }
+            expected = $5; next
+        }
+        /^[[:space:]]*Num:/ {
+            if (tables != 1 || headings++ || NF != 8 || $2 != "Value" ||
+                $3 != "Size" || $4 != "Type" || $5 != "Bind" ||
+                $6 != "Vis" || $7 != "Ndx" || $8 != "Name") {
+                bad = 1; exit
+            }
+            next
+        }
+        /^[[:space:]]*[0-9]+:/ {
+            # readelf names reserved type/binding values, such as C++
+            # GNU_UNIQUE objects, as "<OS specific>: 10". Keep them one field.
+            gsub(/<(OS|processor) specific>: [0-9]+/, "RESERVED")
+            if (tables != 1 || headings != 1 || NF < 7 || NF > 9 ||
+                $1 != rows ":" || $2 !~ /^[0-9a-fA-F]+$/ ||
+                $3 !~ /^(0x[0-9a-fA-F]+|[0-9]+)$/ ||
+                $4 !~ /^[A-Z][A-Z0-9_]*$/ || $5 !~ /^[A-Z][A-Z0-9_]*$/ ||
+                $6 !~ /^(DEFAULT|INTERNAL|HIDDEN|PROTECTED)$/ ||
+                $7 !~ /^(UND|ABS|COM|[0-9]+)$/ ||
+                (NF == 9 && $9 !~ /^\([0-9]+\)$/) ||
+                (rows == 0 && (NF != 7 || $2 !~ /^0+$/)) ||
+                (NF == 7 && (rows != 0 || $3 != 0 || $4 != "NOTYPE" ||
+                    $5 != "LOCAL" || $6 != "DEFAULT" || $7 != "UND"))) {
+                bad = 1; exit
+            }
+            if (NF >= 8 && $7 != "UND" && $8 ~ /^(hb_|FT_)/) {
+                print "forbidden bundled font export: " $8 > "/dev/stderr"
+                forbidden++
+            }
+            rows++; next
+        }
+        { bad = 1; exit }
+        END {
+            if (bad || tables != 1 || headings != 1 || rows != expected || forbidden)
+                exit 1
+        }
+    ' "$UI_DYNAMIC_SYMBOLS" \
+        || fail 'full UI dynamic symbol policy failed (malformed table or bundled hb_/FT_ definitions)'
 fi
 
 # A local/native package can be built on newer glibc than the official release
@@ -293,7 +396,17 @@ PORTABLE_TAR=$WORK_DIR/portable.tar
         -cf "$PORTABLE_TAR" \
         "$TOP_LEVEL"
 )
-gzip -n -9 -c "$PORTABLE_TAR" > "$DIST_DIR/$ARCHIVE_NAME"
+gzip -n "$GZIP_LEVEL" -c "$PORTABLE_TAR" > "$DIST_DIR/$ARCHIVE_NAME"
+
+if [ "$ARCHIVE_ONLY" = 1 ]; then
+    (
+        cd "$DIST_DIR"
+        sha256sum "$ARCHIVE_NAME" > "$CHECKSUM_NAME"
+    )
+    printf 'Created %s archive:\n  %s\n  %s\n' \
+        "$VARIANT" "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$CHECKSUM_NAME"
+    exit 0
+fi
 
 DEB_ROOT=$WORK_DIR/deb
 install -d -m 0755 \

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Linux-only development orchestration; normal runner never requires this tool."""
 import argparse
 import json
@@ -127,9 +127,10 @@ def main():
     native = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
     if "linux" not in native:
         fail("Hot development requires a Linux native Rust toolchain")
-    identity = "development" if args.browserless else "development,full"
-    cli = build_product("cagents", identity, native)
-    daemon = build_product("cagentsd", identity + ",host", native)
+    # Without `full`, which selects the shipped product's identity and nothing
+    # a development build uses, both lanes share one CLI and one daemon build.
+    cli = build_product("cagents", "development", native)
+    daemon = build_product("cagentsd", "development,host", native)
     ui_features = "hot-reload" if args.browserless else "hot-reload,integrated-browser"
     # Resolve and fetch the selected UI graph before cargo-hot builds offline.
     # cargo-hot builds its specialized executable instead of using an ordinary UI artifact.

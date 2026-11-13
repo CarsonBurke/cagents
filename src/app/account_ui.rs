@@ -16,10 +16,9 @@
 //! letting the CLI sign in there, in a terminal the reader can see - the
 //! provider's own login, its own browser hand-off, its own device code.
 //! cagents never sees what the login produces. When the terminal ends, the
-//! home is asked who it is signed in as; a home that is signed in to an
-//! account cagents already has is signed out and deleted again, one that is
-//! signed in to nothing is deleted, and anything else becomes an account in
-//! the registry ([`crate::account::registry`]).
+//! home is asked who it is signed in as. A duplicate or unsigned home has
+//! its pending registration abandoned while its login and files stay.
+//! Other identities join the registry ([`crate::account::registry`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,7 +82,7 @@ const HOST_CHECK: Millis = 3_000;
 /// than a tick, so a focused window reads it on every one: a local read
 /// costs nobody's patience, and Omp records figures as it works.
 const OMP_REREAD: Millis = 20_000;
-const STATUS_BAR_HEIGHT: f32 = 24.0;
+pub(super) const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
 const POPOVER_WIDTH: f32 = 320.0;
@@ -94,7 +93,15 @@ const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 pub(super) struct State {
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
+    /// Local metadata reads are superseded independently of usage probes.
+    discovery_generation: u64,
+    /// Explicit refresh intent survives coalesced discovery; the owner still
+    /// has to match when the current metadata read completes.
+    discovery_manual: BTreeMap<AccountId, u64>,
     registry: Registry,
+    /// A successful authoritative result has admitted the registry's policy.
+    /// The constructor's default is only a placeholder until then.
+    registry_ready: bool,
     store: Option<Store>,
     homes: Option<Homes>,
     remote_system_homes: BTreeMap<Provider, PathBuf>,
@@ -115,7 +122,7 @@ pub(super) struct State {
     /// Not before this is the daemon asked again.
     next_host_check: Millis,
     table: table::Table,
-    /// Accounts being signed out and deleted.
+    /// Accounts awaiting the selected daemon's lifecycle reply.
     removing: BTreeSet<AccountId>,
     /// Accounts whose home was found signed in to another login than the
     /// one it was added with, and the login each was reported signed in to.
@@ -170,8 +177,60 @@ impl OmpRecord {
 }
 
 impl State {
+    /// The managed home at `path`, of an account the daemon just refused
+    /// because its account list does not name it, when that home may still
+    /// be on its device: one a lost or reset account list stranded, which
+    /// the daemon can restore under its original key.
+    ///
+    /// The refusal is the daemon's answer from the list as it stands; the
+    /// copy here can lag a list that was reset under it, so it is not asked
+    /// again. A local home is looked for on disk, so a home that is really
+    /// gone is never offered. A remote device's files are not visible from
+    /// here; its list says whether the home was removed, and the device
+    /// itself answers when it is asked to restore it.
+    pub(super) fn restorable_home(&self, path: &Path) -> Option<(Provider, uuid::Uuid)> {
+        let homes = self.homes.as_ref()?;
+        let (provider, key) = homes.managed_identity(path)?;
+        if crate::device::is_remote() {
+            return (!self.registry.contains_managed_home(homes, provider, key))
+                .then_some((provider, key));
+        }
+        homes.is_kept(provider, key).then_some((provider, key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_homes(&mut self, homes: Homes) {
+        self.homes = Some(homes);
+    }
+
     pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
         self.account(id).map(|state| state.owner)
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin_probe_for_test(
+        &mut self,
+        id: &AccountId,
+        trigger: Trigger,
+        now: Millis,
+    ) -> (u64, ProbeTicket) {
+        let state = self.account_mut(id).expect("fixture account");
+        (state.owner, state.start_probe(trigger, now))
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
+        self.account(id)?.pending_probe.clone()
+    }
+
+    /// A pending explicit sign-in can finish without admitting unknown default
+    /// policy for the other accounts. These watches are in-memory intent only.
+    fn probe_policy_ready(&self, id: &AccountId, trigger: Trigger, now: Millis) -> bool {
+        self.registry_ready
+            || trigger == Trigger::Manual
+            || self.account(id).is_some_and(|state| {
+                state.sign_in_terminal.is_some() || state.schedule.awaiting_login(now)
+            })
     }
 
     fn shown_in_switcher(&self, account: &AccountState) -> bool {
@@ -235,7 +294,10 @@ impl State {
         let mut state = Self {
             accounts: Vec::new(),
             installed: BTreeMap::new(),
+            discovery_generation: 0,
+            discovery_manual: BTreeMap::new(),
             registry,
+            registry_ready: false,
             store,
             homes,
             remote_system_homes: BTreeMap::new(),
@@ -314,12 +376,26 @@ impl State {
         }
         self.table
             .forget_missing(|id| self.accounts.iter().any(|state| &state.id == id));
+        self.discovery_manual.retain(|id, owner| {
+            self.accounts
+                .iter()
+                .any(|state| &state.id == id && state.owner == *owner)
+        });
     }
 
-    fn set_registry(&mut self, registry: Registry) {
-        if registry.revision() < self.registry.revision() {
+    fn discovery_owners(&self) -> Vec<(AccountId, u64)> {
+        self.accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| (state.id.clone(), state.owner))
+            .collect()
+    }
+
+    pub(super) fn set_registry(&mut self, registry: Registry) {
+        if !registry::supersedes(&registry, &self.registry) {
             return;
         }
+        self.registry_ready = true;
         if self.registry != registry {
             self.registry = registry;
             self.sync_accounts();
@@ -331,6 +407,25 @@ impl State {
     /// Omp's accounts is named with the service it signs in to, since one
     /// address can have a login with several.
     fn display_name(&self, account: &AccountState) -> String {
+        self.name(account, true)
+    }
+
+    /// What another row's message calls `account`: [`Self::display_name`],
+    /// but with the address it is listed as alone where its records name
+    /// two logins, which that row's own message explains, and the system
+    /// account named as such, since other rows can carry its address too.
+    fn referred_name(&self, account: &AccountState) -> String {
+        let name = self.name(account, false);
+        if account.account.is_system() && self.registry.label(&account.account).is_none() {
+            format!("System default ({name})")
+        } else {
+            name
+        }
+    }
+
+    /// [`Self::display_name`], naming both logins a disputed login's
+    /// records name when `both`.
+    fn name(&self, account: &AccountState, both: bool) -> String {
         if let Some(service) = account.account.brokered_service() {
             let service = omp::service_label(service);
             return match account.email(&self.registry) {
@@ -358,10 +453,20 @@ impl State {
                 .unwrap_or_else(|| "existing".into())
         });
         if let Some(email) = account.email(&self.registry) {
+            // A login whose records disagree is named by both.
+            let email = match account
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.disputed_by.as_deref())
+                .filter(|_| both)
+            {
+                Some(other) => format!("{email} or {other}"),
+                None => email.to_owned(),
+            };
             if let Some(hint) = linked_hint {
                 return format!("{hint} · {email}");
             }
-            return email.to_owned();
+            return email;
         }
         if let Some(hint) = linked_hint {
             return format!("{} · {hint}", account.name());
@@ -382,6 +487,15 @@ impl State {
             return None;
         }
         let current = account.identity.as_ref();
+        if let Some(identity) = current
+            && let (Some(reported), Some(other)) =
+                (identity.email.as_deref(), identity.disputed_by.as_deref())
+        {
+            return Some(LoginConflict::Disputed {
+                reported: reported.to_owned(),
+                other: other.to_owned(),
+            });
+        }
         if let (Some(registered), Some(current)) = (
             account
                 .account
@@ -417,18 +531,46 @@ impl State {
         for other in others {
             if home.is_some() && other.account.resolved_home() == home {
                 return Some(LoginConflict::SameHome {
-                    with: self.display_name(other),
+                    with: self.referred_name(other),
                 });
             }
-            if let (Some(mine), Some(theirs)) = (current, other.identity.as_ref())
-                && mine.same_login(theirs)
+            let (Some(mine), Some(theirs)) = (current, other.identity.as_ref()) else {
+                continue;
+            };
+            if !mine.claims_same_login(theirs) {
+                continue;
+            }
+            let with = self.referred_name(other);
+            if !mine.same_login(theirs) {
+                return Some(LoginConflict::Contradicted {
+                    with,
+                    because: Contradiction::Disputed,
+                });
+            }
+            if let (Some(mine), Some(theirs)) = (&account.snapshot, &other.snapshot)
+                && mine.separate_allowance(theirs, (self.now_ms / 1000) as i64)
             {
-                return Some(LoginConflict::SameLogin {
-                    with: self.display_name(other),
+                return Some(LoginConflict::Contradicted {
+                    with,
+                    because: Contradiction::SeparateAllowances,
                 });
             }
+            return Some(LoginConflict::SameLogin { with });
         }
         None
+    }
+
+    /// Whether `account`'s login is trusted to be the one it is listed as,
+    /// which archiving a duplicate of it relies on.
+    fn login_trusted(&self, account: &AccountState) -> bool {
+        !matches!(
+            self.login_conflict(account),
+            Some(
+                LoginConflict::Changed { .. }
+                    | LoginConflict::Disputed { .. }
+                    | LoginConflict::Contradicted { .. }
+            )
+        )
     }
 
     fn reported_login_action(&self, account: &AccountState) -> Option<Action> {
@@ -462,10 +604,7 @@ impl State {
     /// System homes are always kept; prefer them over other registered homes.
     fn duplicate_to_keep(&self, account: &AccountState) -> Option<&AccountState> {
         account.account.registry_key()?;
-        if matches!(
-            self.login_conflict(account),
-            Some(LoginConflict::Changed { .. })
-        ) {
+        if !self.login_trusted(account) {
             return None;
         }
         let identity = account.identity.as_ref()?;
@@ -477,10 +616,7 @@ impl State {
                         .identity
                         .as_ref()
                         .is_some_and(|known| identity.same_login(known))
-                    && !matches!(
-                        self.login_conflict(other),
-                        Some(LoginConflict::Changed { .. })
-                    )
+                    && self.login_trusted(other)
             })
             .min_by_key(|other| !other.account.is_system())
     }
@@ -513,6 +649,7 @@ impl State {
             let Some(state) = self.account_mut(&restored.id) else {
                 continue;
             };
+            state.absent_since = (!restored.present).then(now_ms);
             // A probe that answered first knows better than the load.
             if state.snapshot.is_some() {
                 continue;
@@ -583,13 +720,14 @@ impl State {
 
     /// Takes what `provider` listed, unless what is known is newer: another
     /// window's list read from the cache can be older than this window's.
+    /// A known stamp beyond the current clock's slack follows a clock rollback
+    /// and must not prevent a current list, just as with quota and disk cache.
     /// Whether it was taken.
-    fn take_catalog(&mut self, provider: Provider, catalog: Catalog) -> bool {
-        if self
-            .catalogs
-            .get(&provider)
-            .is_some_and(|known| known.observed_at > catalog.observed_at)
-        {
+    fn take_catalog(&mut self, provider: Provider, catalog: Catalog, now: Millis) -> bool {
+        if self.catalogs.get(&provider).is_some_and(|known| {
+            known.observed_at > catalog.observed_at
+                && known.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+        }) {
             return false;
         }
         self.catalogs.insert(provider, catalog);
@@ -664,6 +802,24 @@ enum LoginConflict {
     SameHome { with: String },
     /// Its home is signed in to the same login as another row's.
     SameLogin { with: String },
+    /// Two records of its credentials name different logins: `reported`,
+    /// the one its CLI reads, and `other`.
+    Disputed { reported: String, other: String },
+    /// It reports the same login as another row, `with`, which other
+    /// evidence contradicts.
+    Contradicted {
+        with: String,
+        because: Contradiction,
+    },
+}
+
+/// What contradicts two rows reporting one login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Contradiction {
+    /// One of them is disputed: its records name two logins.
+    Disputed,
+    /// Their weekly allowances reset at different times.
+    SeparateAllowances,
 }
 
 impl LoginConflict {
@@ -672,6 +828,7 @@ impl LoginConflict {
             Self::Changed { .. } => "Login changed",
             Self::SameHome { .. } => "Same home",
             Self::SameLogin { .. } => "Same login",
+            Self::Disputed { .. } | Self::Contradicted { .. } => "Identity conflict",
         }
     }
 
@@ -686,7 +843,38 @@ impl LoginConflict {
             Self::SameLogin { with } => format!(
                 "Signed in to the same login as {with}. Both draw on one allowance. Use Archive duplicate in the extra home's menu to keep its files, or sign it in to another login."
             ),
+            Self::Disputed { reported, other } => format!(
+                "Claude Code has two records of who this login is: one names {reported}, the other {other}. Only one is right, so these figures may be {other}'s. Sign in again to settle which login this is."
+            ),
+            Self::Contradicted {
+                with,
+                because: Contradiction::Disputed,
+            } => format!(
+                "Reports the same login as {with}, whose records disagree about who it is, so neither is known to be a duplicate. Sign in again on {with} to settle it."
+            ),
+            Self::Contradicted {
+                with,
+                because: Contradiction::SeparateAllowances,
+            } => format!(
+                "Reports the same login as {with}, but their weekly limits reset at different times, so they are separate logins and at least one of them is named wrongly. Sign in again to settle which login this is."
+            ),
         }
+    }
+}
+
+/// One admitted probe, separate from the home/login row's owner. Its private
+/// allocation stays alive in every delayed or duplicate callback, so a later
+/// admission cannot reissue its identity. This never crosses a wire or cache.
+#[derive(Debug, Clone)]
+pub struct ProbeTicket(std::sync::Arc<()>);
+
+impl ProbeTicket {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -699,9 +887,15 @@ struct AccountState {
     /// its home exists. An absent system account gets no chip, because most
     /// people use one of the two CLIs rather than both.
     present: bool,
+    /// When the latest discovery found the CLI or home missing. Live usage
+    /// from a conversation that is still running cannot overrule that
+    /// finding; only a later discovery, or a probe started after it that
+    /// reached the CLI, can.
+    absent_since: Option<Millis>,
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
     schedule: Schedule,
+    pending_probe: Option<ProbeTicket>,
     /// Why the latest probe produced nothing, while the figures on screen
     /// are older than that attempt.
     failure: Option<String>,
@@ -714,6 +908,11 @@ struct AccountState {
     /// This window's explicit re-login intent lasts through its terminal,
     /// including browser handoffs that outlive the usual polling grace.
     sign_in_terminal: Option<TerminalId>,
+    /// Whether this window's sign-in terminal for the account has just
+    /// finished signing in, which the next probe records as settling any
+    /// disagreement between two records of its login (see
+    /// [`Identity::disputed_by`]).
+    settle_records: bool,
 }
 
 impl AccountState {
@@ -721,6 +920,7 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
+        self.pending_probe = None;
         self.schedule.abandon();
         self.schedule.await_login(now);
         self.signing_in_from = self.identity.clone();
@@ -732,14 +932,37 @@ impl AccountState {
             id: account.id(),
             account,
             present: false,
+            absent_since: None,
             identity: None,
             snapshot: None,
             schedule: Schedule::default(),
+            pending_probe: None,
             failure: None,
             queued: None,
             signing_in_from: None,
             sign_in_terminal: None,
+            settle_records: false,
         }
+    }
+
+    fn start_probe(&mut self, trigger: Trigger, now: Millis) -> ProbeTicket {
+        let ticket = ProbeTicket::new();
+        self.pending_probe = Some(ticket.clone());
+        self.schedule.start(trigger, now);
+        ticket
+    }
+
+    fn consume_probe(&mut self, owner: u64, ticket: &ProbeTicket) -> bool {
+        if self.owner != owner
+            || !self
+                .pending_probe
+                .as_ref()
+                .is_some_and(|pending| pending.same(ticket))
+        {
+            return false;
+        }
+        self.pending_probe = None;
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -801,9 +1024,9 @@ struct Login {
     next_check: Millis,
     /// When the sign-in began, as the registry's pending entry records it.
     started_at: Millis,
-    /// Picked up from an earlier run, with no terminal in this window: its
-    /// home is only deleted once it is old enough that no window can still
-    /// be signing in to it.
+    /// Picked up from an earlier run, with no terminal in this window. Its
+    /// pending registration is settled only once no other window is likely
+    /// still signing in; its home and history remain on disk.
     recovered: bool,
 }
 
@@ -822,7 +1045,7 @@ enum LoginPhase {
     Waiting,
     /// The terminal ended and the home is being asked who it signed in as.
     Verifying,
-    /// The answer is in, and the home is being registered or deleted.
+    /// The answer is in; the home is being registered or its pending entry abandoned.
     Settling,
     /// The callback could not be acquired; retain the row until dismissed.
     CallbackBlocked,
@@ -839,6 +1062,7 @@ pub use crate::account::remote::Settled;
 /// What the startup load found.
 #[derive(Debug, Clone)]
 pub struct Loaded {
+    generation: u64,
     registry: Result<Registry, String>,
     restored: Vec<Restored>,
     catalogs: BTreeMap<Provider, Catalog>,
@@ -859,19 +1083,22 @@ pub struct Restored {
 #[derive(Debug, Clone)]
 pub enum Action {
     RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
-    RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
+    RemoteLoaded(u64, Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
     Install(Provider),
     Tick,
     Loaded(Loaded),
     /// Presence judged again on the shell's `PATH`, once it is known.
     Located {
+        generation: u64,
+        owners: Vec<(AccountId, u64)>,
         restored: Vec<Restored>,
         installed: BTreeMap<Provider, bool>,
     },
     Probed {
         owner: u64,
         id: AccountId,
+        ticket: ProbeTicket,
         outcome: Outcome,
     },
     /// Omp's usage record was read.
@@ -908,7 +1135,7 @@ pub enum Action {
         id: AccountId,
         provider: Provider,
         device: bool,
-        program: Result<PathBuf, String>,
+        program: Result<(PathBuf, Option<std::ffi::OsString>), String>,
     },
     /// The registry was read again, as another window may have changed it.
     RegistryLoaded(Result<Registry, String>),
@@ -932,7 +1159,7 @@ pub enum Action {
     HomeReady {
         provider: Provider,
         device: bool,
-        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+        result: Result<(uuid::Uuid, PathBuf, PathBuf, Option<std::ffi::OsString>), String>,
     },
     LoginTick,
     LoginCallbackBlocked(uuid::Uuid),
@@ -943,6 +1170,7 @@ pub enum Action {
     /// through the daemon, or could not.
     OffstripClosed {
         card: CardId,
+        source: TerminalSession,
         result: Result<(), String>,
     },
     LoginVerified {
@@ -1379,6 +1607,11 @@ fn chip_with_window(
             if let Some(as_of) = &as_of {
                 tooltip.push_str(&format!(" ({as_of})"));
             }
+            // The row greys these figures once a check fails; the status bar
+            // says the same rather than presenting them as current.
+            if let Some(failure) = &account.failure {
+                tooltip.push_str(&format!("\nLast check failed: {failure}"));
+            }
             // A model's own allowance binding is worth knowing, but it is not
             // what the account as a whole has left.
             if let Some(scoped) = snapshot
@@ -1391,7 +1624,7 @@ fn chip_with_window(
                     percent_left(scoped.used)
                 ));
             }
-            let tone = if stale {
+            let tone = if stale || account.failure.is_some() {
                 ChipTone::Stale
             } else {
                 ChipTone::of_usage(snapshot.status, window.used)
@@ -1426,26 +1659,37 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
 ///
 /// `auth` and `login` are account management, which the launch recognizer
 /// does not take for an agent conversation.
+#[cfg(test)]
 fn login_launch(
     account: &Account,
     program: &Path,
     home: PathBuf,
     device: bool,
 ) -> Option<LaunchRecipe> {
+    login_launch_with_path(
+        account,
+        program,
+        home,
+        device,
+        probe::current_search_path().as_deref(),
+    )
+}
+
+fn login_launch_with_path(
+    account: &Account,
+    program: &Path,
+    home: PathBuf,
+    device: bool,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<LaunchRecipe> {
     let command = login_arguments(account.provider, device)?;
     let mut environment = BTreeMap::new();
-    if let (Some(variable), Some(account_home)) = (
-        account::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.to_owned(), account_home.display().to_string());
-    }
     // The CLI was found on the search path the reader's shell sets up, and
     // runs with it, as the probes run it.
-    if let Some(path) = probe::shell_search_path().and_then(|path| path.to_str()) {
+    if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.to_owned());
     }
-    Some(LaunchRecipe {
+    let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()
             .iter()
@@ -1458,7 +1702,48 @@ fn login_launch(
             .collect(),
         working_directory: home,
         environment,
-    })
+    };
+    account.bind_home(&mut recipe).ok()?;
+    Some(recipe)
+}
+
+/// Whether the sign-in `recipe` signs `account` in: whether it names the
+/// account's home, as every sign-in on an account with a home of its own
+/// does, and one started before cagents stopped exporting the system default
+/// did; or names none, as one on the system account does (see
+/// [`Account::launch_home`]).
+fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
+    let Some(variable) = account::home_variable(account.provider) else {
+        return false;
+    };
+    let named = recipe
+        .environment
+        .get(variable)
+        .filter(|value| !value.is_empty() && !recipe.unset_environment.contains(variable))
+        .map(PathBuf::from);
+    match named {
+        Some(named) => account.resolved_home() == Some(named),
+        // An unset home is the CLI's default, which only a system account
+        // exporting no home of its own resolves (as `account_of_recipe`).
+        None => {
+            account.is_system()
+                && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
+        }
+    }
+}
+
+/// Whether the sign-in terminal `session` ended with its login finished:
+/// its CLI exited cleanly, rather than being closed or failing.
+fn signed_in(session: &TerminalSession) -> bool {
+    let exit = match &session.continuity {
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: Some(exit),
+            ..
+        }
+        | TerminalContinuity::Exited { last_exit: exit } => exit,
+        _ => return false,
+    };
+    exit.code == Some(0) && exit.signal.is_none()
 }
 
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
@@ -1494,6 +1779,11 @@ fn account_of_recipe<'a>(
     let system = accounts
         .iter()
         .find(|state| state.account.provider == provider && state.account.is_system());
+    if recipe.unset_environment.contains(variable) {
+        // The CLI resolves its default: the system account's, unless this
+        // window's system account names a home of its own.
+        return system.filter(|state| state.account.launch_home().is_none());
+    }
     let Some(chosen) = chosen else {
         return system;
     };
@@ -1653,8 +1943,10 @@ impl Cagents {
     /// Omp's usage record is read beside it, on its own: a read that waits
     /// on Omp writing holds back no other account.
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
+        self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
+        let generation = self.account_ui.discovery_generation;
         if crate::device::is_remote() {
-            return cosmic::task::future(async {
+            return cosmic::task::future(async move {
                 let result =
                     tokio::task::spawn_blocking(|| {
                         match crate::device_service::request(
@@ -1669,7 +1961,7 @@ impl Cagents {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(result))
+                Message::AccountUi(Action::RemoteLoaded(generation, result))
             });
         }
         let store = self.account_ui.store.clone();
@@ -1707,6 +1999,7 @@ impl Cagents {
                     }
                 }
                 Loaded {
+                    generation,
                     registry,
                     restored,
                     catalogs,
@@ -1716,6 +2009,7 @@ impl Cagents {
             })
             .await
             .unwrap_or_else(|_| Loaded {
+                generation,
                 registry: Err("The accounts could not be read".into()),
                 restored: Vec::new(),
                 catalogs: BTreeMap::new(),
@@ -1732,7 +2026,17 @@ impl Cagents {
 
     /// Judges again, on the shell's `PATH`, which accounts have a CLI to ask,
     /// restoring what the cache has for any found only there.
-    fn locate_accounts(&self) -> Task<Message> {
+    fn locate_accounts(&mut self) -> Task<Message> {
+        self.locate_accounts_for(None)
+    }
+
+    fn locate_accounts_for(&mut self, manual: Option<(AccountId, u64)>) -> Task<Message> {
+        if let Some((id, owner)) = manual {
+            self.account_ui.discovery_manual.insert(id, owner);
+        }
+        self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
+        let generation = self.account_ui.discovery_generation;
+        let owners = self.account_ui.discovery_owners();
         let accounts: Vec<Account> = self
             .account_ui
             .accounts
@@ -1743,7 +2047,7 @@ impl Cagents {
             .collect();
         let cache = self.account_ui.cache.clone();
         cosmic::task::future(async move {
-            let search_path = probe::search_path().await;
+            let search_path = probe::refresh_search_path().await;
             let (restored, installed) = tokio::task::spawn_blocking(move || {
                 let installed = provider_installations(search_path.as_deref());
                 (
@@ -1754,6 +2058,8 @@ impl Cagents {
             .await
             .unwrap_or_default();
             Message::AccountUi(Action::Located {
+                generation,
+                owners,
                 restored,
                 installed,
             })
@@ -1761,9 +2067,12 @@ impl Cagents {
     }
 
     /// Reads the registry again, for what another window changed.
-    pub(super) fn reload_registry(&self) -> Task<Message> {
+    pub(super) fn reload_registry(&mut self) -> Task<Message> {
         if crate::device::is_remote() {
-            return cosmic::task::future(async {
+            self.account_ui.discovery_generation =
+                self.account_ui.discovery_generation.wrapping_add(1);
+            let generation = self.account_ui.discovery_generation;
+            return cosmic::task::future(async move {
                 let result =
                     tokio::task::spawn_blocking(|| {
                         match crate::device_service::request(
@@ -1778,7 +2087,7 @@ impl Cagents {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(result))
+                Message::AccountUi(Action::RemoteLoaded(generation, result))
             });
         }
         let Some(store) = self.account_ui.store.clone() else {
@@ -1851,7 +2160,11 @@ impl Cagents {
         if !self.settings.show_status_bar {
             self.account_ui.popover = None;
         }
-        self.probe_accounts(Trigger::Focus)
+        if crate::device::is_remote() {
+            self.reload_registry()
+        } else {
+            self.locate_accounts()
+        }
     }
 
     /// Called with the main window's focus changes, after `refresh_ui` has
@@ -1870,7 +2183,12 @@ impl Cagents {
         if !regained {
             return Task::none();
         }
-        Task::batch([self.reload_registry(), self.probe_accounts(Trigger::Focus)])
+        let discovery = if crate::device::is_remote() {
+            Task::none() // reload_registry already reads remote CLI presence.
+        } else {
+            self.locate_accounts()
+        };
+        Task::batch([self.reload_registry(), discovery])
     }
 
     /// The account popups' share of a key event, like the chrome's popups:
@@ -1904,9 +2222,17 @@ impl Cagents {
             .accounts
             .iter()
             .filter(|account| !account.account.is_brokered())
+            .filter(|account| {
+                self.account_ui
+                    .probe_policy_ready(&account.id, trigger, now)
+            })
             .map(|account| account.id.clone())
             .collect();
-        let omp = self.read_omp(trigger, now);
+        let omp = if self.account_ui.registry_ready || trigger == Trigger::Manual {
+            self.read_omp(trigger, now)
+        } else {
+            None
+        };
         Task::batch(
             ids.iter()
                 .filter_map(|id| self.probe_account(id, trigger, now))
@@ -1920,6 +2246,12 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        // Focus can also arrive through a popover, a live login report or a
+        // queued probe. All automatic paths wait for policy, except an
+        // already explicit account-specific sign-in that needs verification.
+        if !self.account_ui.probe_policy_ready(id, trigger, now) {
+            return None;
+        }
         self.refresh_login_watch(id, now);
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
@@ -1935,6 +2267,12 @@ impl Cagents {
             return None;
         }
         let provider = account.provider;
+        // A fresh discovery already answered this question without starting
+        // the CLI. Do not repeatedly prepare missing-CLI probes or spend a
+        // manual attempt; explicit Refresh rediscovers before reaching here.
+        if self.account_ui.installed.get(&provider) == Some(&false) {
+            return None;
+        }
         let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
         // Figures from before a reset are wrong however recent they are, so
@@ -1965,11 +2303,33 @@ impl Cagents {
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
         let force = trigger == Trigger::Manual || state.schedule.awaiting_login(now);
-        state.schedule.start(trigger, now);
+        let ticket = state.start_probe(trigger, now);
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
+        // Only the system Claude login can have a second record, and only
+        // while it exports no home of its own (as the probe reads it).
+        let settle = (std::mem::take(&mut state.settle_records)
+            && account.provider == Provider::Claude
+            && matches!(account.home, account::AccountHome::System)
+            && account.launch_home().is_none())
+        .then(|| cache.clone().zip(account.cache_key()))
+        .flatten();
         let probe = cosmic::task::future(async move {
+            if let Some((cache, key)) = settle
+                && !crate::device::is_remote()
+            {
+                let settled = tokio::task::spawn_blocking(move || {
+                    let at = crate::chat::now_ms().ok_or_else(|| {
+                        std::io::Error::other("The system clock is before the Unix epoch")
+                    })?;
+                    cache.settle(&key, Some(account::cache::Settled::SignedIn { at }))
+                })
+                .await;
+                if let Ok(Err(error)) = settled {
+                    tracing::debug!(%error, "cannot record the finished sign-in");
+                }
+            }
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
@@ -1988,7 +2348,12 @@ impl Cagents {
             } else {
                 probe::run(account, cache, force).await
             };
-            Message::AccountUi(Action::Probed { owner, id, outcome })
+            Message::AccountUi(Action::Probed {
+                owner,
+                id,
+                ticket,
+                outcome,
+            })
         });
         // The refresh control comes back the moment its debounce lifts,
         // rather than on whichever tick next reads the clock.
@@ -2093,6 +2458,7 @@ impl Cagents {
         };
         let now = now_ms();
         self.account_ui.now_ms = now;
+        let cli_not_absent = self.account_ui.installed.get(&provider) != Some(&false);
         let Some(state) = self.account_ui.account_mut(&id) else {
             return Task::none();
         };
@@ -2112,10 +2478,14 @@ impl Cagents {
             }
         }
         if observed {
-            // A conversation reporting figures is running on a signed-in
-            // account whose CLI is installed.
-            state.present = true;
-            state.failure = None;
+            // A running CLI can still report after discovery found its
+            // executable or home absent, and a report may have been buffered
+            // before then. Keep those figures without undoing discovery: only
+            // a fresh discovery restores presence it found missing.
+            if cli_not_absent && state.absent_since.is_none() {
+                state.present = true;
+                state.failure = None;
+            }
             state.schedule.login_settled();
         }
         if login_changed {
@@ -2142,11 +2512,12 @@ impl Cagents {
         provider: Provider,
         models: Vec<crate::chat::Model>,
     ) -> Task<Message> {
+        let now = now_ms();
         let catalog = Catalog {
             models,
-            observed_at: now_ms(),
+            observed_at: now,
         };
-        if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog) {
+        if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog, now) {
             return Task::none();
         }
         self.refresh_chat_drafts();
@@ -2211,7 +2582,10 @@ impl Cagents {
                     Task::none()
                 }
             },
-            Action::RemoteLoaded(result) => {
+            Action::RemoteLoaded(generation, result) => {
+                if generation != self.account_ui.discovery_generation {
+                    return Task::none();
+                }
                 let snapshot = match result {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -2243,6 +2617,7 @@ impl Cagents {
                     })
                     .collect();
                 self.update_account_ui(Action::Loaded(Loaded {
+                    generation,
                     registry: Ok(snapshot.registry),
                     restored,
                     installed: snapshot.installed,
@@ -2283,7 +2658,13 @@ impl Cagents {
             }
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
-                self.account_ui.installed = loaded.installed;
+                let now = now_ms();
+                let current_discovery = loaded.generation == self.account_ui.discovery_generation;
+                if current_discovery {
+                    self.account_ui.installed = loaded.installed;
+                }
+                let owners_before = self.account_ui.discovery_owners();
+                let was_ready = self.account_ui.registry_ready;
                 let mut migration = Task::none();
                 match loaded.registry {
                     Ok(mut registry) => {
@@ -2301,33 +2682,102 @@ impl Cagents {
                         self.account_ui.set_registry(registry);
                         self.recover_logins();
                     }
-                    Err(error) => {
+                    Err(error) if current_discovery => {
                         self.status = Some(TransientNotice::error(format!(
                             "Your added accounts could not be read: {error}"
                         )));
                     }
+                    Err(_) => {}
                 }
-                self.account_ui.restore(loaded.restored);
+                if current_discovery {
+                    self.account_ui.restore(loaded.restored);
+                }
                 for (provider, catalog) in loaded.catalogs {
-                    self.account_ui.take_catalog(provider, catalog);
+                    self.account_ui.take_catalog(provider, catalog, now);
                 }
                 self.refresh_chat_drafts();
-                let locate = if loaded.provisional {
+                let changed = owners_before != self.account_ui.discovery_owners();
+                let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
+                } else if current_discovery || !was_ready {
+                    // A newer discovery may already have answered while
+                    // policy was unknown, so first readiness releases probes.
+                    self.probe_accounts(Trigger::Focus)
                 } else {
                     Task::none()
                 };
-                Task::batch([self.probe_accounts(Trigger::Focus), locate, migration])
+                Task::batch([follow_up, migration])
             }
             Action::Located {
+                generation,
+                owners,
                 restored,
                 installed,
             } => {
+                if generation != self.account_ui.discovery_generation {
+                    // A newer discovery is in flight and drains manual intent.
+                    return Task::none();
+                }
+                if owners != self.account_ui.discovery_owners() {
+                    // Accounts changed while this ran, so its result may
+                    // describe a removed or replaced row. Ask again rather than
+                    // dropping a Check now still waiting on this discovery.
+                    return self.locate_accounts();
+                }
                 self.account_ui.installed = installed;
+                // Fresh detection owns current presence, independently of an
+                // older usage snapshot which remains useful history.
+                let installed = self.account_ui.installed.clone();
+                for restored in &restored {
+                    let Some(state) = self.account_ui.account_mut(&restored.id) else {
+                        continue;
+                    };
+                    if !state.present && restored.present {
+                        state.schedule.invalidate();
+                    }
+                    state.present = restored.present;
+                    let absent = format!(
+                        "{} is not installed",
+                        probe::cli_name(state.account.provider)
+                    );
+                    if installed.get(&state.account.provider) == Some(&false) {
+                        state.failure = Some(absent);
+                    } else if state.failure.as_ref() == Some(&absent) {
+                        state.failure = None;
+                    }
+                    if !restored.present && self.account_ui.popover.as_ref() == Some(&restored.id) {
+                        self.account_ui.popover = None;
+                    }
+                }
                 self.account_ui.restore(restored);
-                Task::none()
+                let manual = std::mem::take(&mut self.account_ui.discovery_manual);
+                if manual.is_empty() {
+                    self.probe_accounts(Trigger::Focus)
+                } else {
+                    let now = now_ms();
+                    self.account_ui.now_ms = now;
+                    let current: Vec<_> = manual
+                        .into_iter()
+                        .filter_map(|(id, owner)| {
+                            self.account_ui
+                                .account(&id)
+                                .is_some_and(|state| state.owner == owner)
+                                .then_some(id)
+                        })
+                        .collect();
+                    Task::batch(
+                        current
+                            .iter()
+                            .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
+                    )
+                }
             }
-            Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
+            Action::Probed {
+                owner,
+                id,
+                ticket,
+                outcome,
+            } => self.account_probed(id, owner, ticket, outcome),
             Action::OmpRead(history) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -2335,10 +2785,25 @@ impl Cagents {
                 Task::none()
             }
             Action::Refresh(id) => {
+                let Some(state) = self.account_ui.account(&id) else {
+                    return Task::none();
+                };
+                if !crate::device::is_remote() && !state.account.is_brokered() {
+                    let owner = state.owner;
+                    return self.locate_accounts_for(Some((id, owner)));
+                }
+                let discovery = if crate::device::is_remote() {
+                    self.reload_registry()
+                } else {
+                    Task::none()
+                };
                 let now = now_ms();
                 self.account_ui.now_ms = now;
-                self.probe_account(&id, Trigger::Manual, now)
-                    .unwrap_or_else(Task::none)
+                Task::batch([
+                    discovery,
+                    self.probe_account(&id, Trigger::Manual, now)
+                        .unwrap_or_else(Task::none),
+                ])
             }
             Action::ManualReady => {
                 self.account_ui.now_ms = now_ms();
@@ -2480,7 +2945,7 @@ impl Cagents {
                 if !self.finish_login_preparation(&id, owner) {
                     return Task::none();
                 }
-                self.open_login(&id, provider, device, program)
+                self.open_login_prepared(&id, provider, device, program)
             }
             Action::RegistryLoaded(result) => {
                 if let Ok(mut registry) = result {
@@ -2491,12 +2956,29 @@ impl Cagents {
                         .map(|project| (project.id, project.repository.clone()))
                         .collect::<Vec<_>>();
                     let migrate = registry.migrate_project_ids(&projects);
-                    let before = self.account_ui.accounts.len();
+                    let before: Vec<_> = self
+                        .account_ui
+                        .accounts
+                        .iter()
+                        .map(|state| state.account.clone())
+                        .collect();
+                    let was_ready = self.account_ui.registry_ready;
                     self.account_ui.set_registry(registry);
                     for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
                         self.report_login_change(&id);
                     }
-                    let probe = if self.account_ui.accounts.len() != before {
+                    let changed = self
+                        .account_ui
+                        .accounts
+                        .iter()
+                        .map(|state| &state.account)
+                        .ne(before.iter());
+                    // Changed accounts are rediscovered before they are asked;
+                    // otherwise the first authoritative registry releases the
+                    // automatic probes that waited for its default policy.
+                    let probe = if changed {
+                        self.locate_accounts()
+                    } else if !was_ready {
                         self.probe_accounts(Trigger::Focus)
                     } else {
                         Task::none()
@@ -2554,11 +3036,20 @@ impl Cagents {
                 self.account_ui.table.linking = false;
                 match result {
                     Ok(registry) => {
+                        // A repeated link returns the registration the reader
+                        // already sees. A restored archive was hidden, so it
+                        // reads as added.
+                        let recovered = self.account_ui.registry.find(key).is_some()
+                            && !self.account_ui.registry.is_archived(key);
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
                         self.status = Some(
-                            TransientNotice::success("Existing account home added.")
-                                .with_key(NoticeKey::AccountLink),
+                            TransientNotice::success(if recovered {
+                                "That account home is already listed."
+                            } else {
+                                "Existing account home added."
+                            })
+                            .with_key(NoticeKey::AccountLink),
                         );
                         let id = self
                             .account_ui
@@ -2628,16 +3119,27 @@ impl Cagents {
                     }
                 }
             }
-            Action::OffstripClosed { card, result } => match result {
-                // With its card gone, the sign-in counts as ended.
-                Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(format!(
-                        "The sign-in could not be stopped: {error}"
-                    )));
-                    Task::none()
+            Action::OffstripClosed {
+                card,
+                source,
+                result,
+            } => {
+                // The card may have been retried while this close was in flight.
+                // Neither its result nor its error belongs to the replacement.
+                if !offstrip_close_matches(self.card_state(card), &source) {
+                    return Task::none();
                 }
-            },
+                match result {
+                    // With its original card gone, the sign-in counts as ended.
+                    Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "The sign-in could not be stopped: {error}"
+                        )));
+                        Task::none()
+                    }
+                }
+            }
             Action::LoginVerified { key, outcome } => self.login_verified(key, outcome),
             Action::LoginSettled { key, result } => self.login_settled(key, result),
             Action::CancelLogin(key) => {
@@ -2650,8 +3152,8 @@ impl Cagents {
                 }
                 match self.sign_in_card(login.provider, &login.home) {
                     // Closing the terminal ends the login; the next check
-                    // finds it ended and deletes the home. Cancelling is
-                    // itself the answer to whether to stop it.
+                    // settles its pending registration and retains the home.
+                    // Cancelling is the answer to whether to stop the child.
                     Some(card) if self.workspace.order().any(|id| id == card) => {
                         self.close_card_unasked(card)
                     }
@@ -2838,12 +3340,33 @@ impl Cagents {
         }
     }
 
-    fn account_probed(&mut self, id: AccountId, owner: u64, mut outcome: Outcome) -> Task<Message> {
+    fn account_probed(
+        &mut self,
+        id: AccountId,
+        owner: u64,
+        ticket: ProbeTicket,
+        mut outcome: Outcome,
+    ) -> Task<Message> {
         if !self
             .account_ui
-            .account(&id)
-            .is_some_and(|state| state.owner == owner)
+            .account_mut(&id)
+            .is_some_and(|state| state.consume_probe(owner, &ticket))
         {
+            return Task::none();
+        }
+        let provider = self
+            .account_ui
+            .account(&id)
+            .expect("owner checked")
+            .account
+            .provider;
+        if self.account_ui.installed.get(&provider) == Some(&false) {
+            // Discovery completed after this probe prepared its executable.
+            // Keep the last history and explicit absence instead of reviving it.
+            if let Some(state) = self.account_ui.account_mut(&id) {
+                state.schedule.abandon();
+                state.queued = None;
+            }
             return Task::none();
         }
         let now = now_ms();
@@ -2855,7 +3378,7 @@ impl Cagents {
             && let Some(state) = self.account_ui.account(&id)
         {
             let provider = state.account.provider;
-            if self.account_ui.take_catalog(provider, catalog) {
+            if self.account_ui.take_catalog(provider, catalog, now) {
                 self.refresh_chat_drafts();
             }
         }
@@ -2863,20 +3386,20 @@ impl Cagents {
             return Task::none();
         };
         let provider = state.account.provider;
+        let started = state.schedule.started();
         let mut learned = None;
         match outcome {
-            // Another window's cached answer can be older than what this
-            // window already shows, and then says nothing new.
+            // A delayed probe or cached answer can predate live figures.
+            // Keep the newer reading unless its future stamp indicates that
+            // the clock was set back, as when accepting live reports.
             Outcome::Answered { snapshot, .. }
-                if snapshot.source == UsageSource::Cache
-                    && state
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|current| snapshot.observed_at < current.observed_at) =>
+                if state.snapshot.as_ref().is_some_and(|current| {
+                    snapshot.observed_at < current.observed_at
+                        && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+                }) =>
             {
                 state.schedule.abandon();
             }
-            // A probe's own answer is always the newest.
             Outcome::Answered {
                 identity, snapshot, ..
             } => {
@@ -2907,8 +3430,17 @@ impl Cagents {
                     state.signing_in_from = None;
                     state.sign_in_terminal = None;
                 }
-                state.present =
-                    snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
+                // Only a probe that started after discovery found the account
+                // missing, and then reached its CLI, shows it is back.
+                if snapshot.status != UsageStatus::Unavailable
+                    && state
+                        .absent_since
+                        .is_some_and(|absent| started.is_some_and(|started| started >= absent))
+                {
+                    state.absent_since = None;
+                }
+                state.present = state.absent_since.is_none()
+                    && (snapshot.status != UsageStatus::Unavailable || !state.account.is_system());
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.
@@ -3084,6 +3616,7 @@ impl Cagents {
                     browser_login_available()?;
                 }
                 probe::find_executable(account.provider.executable(), search_path.as_deref())
+                    .map(|program| (program, search_path))
                     .ok_or_else(|| {
                         format!("{} is not installed", probe::cli_name(account.provider))
                     })
@@ -3101,12 +3634,28 @@ impl Cagents {
         })
     }
 
+    #[cfg(test)]
     fn open_login(
         &mut self,
         id: &AccountId,
         _provider: Provider,
         device: bool,
         program: Result<PathBuf, String>,
+    ) -> Task<Message> {
+        self.open_login_prepared(
+            id,
+            _provider,
+            device,
+            program.map(|program| (program, probe::current_search_path())),
+        )
+    }
+
+    fn open_login_prepared(
+        &mut self,
+        id: &AccountId,
+        _provider: Provider,
+        device: bool,
+        program: Result<(PathBuf, Option<std::ffi::OsString>), String>,
     ) -> Task<Message> {
         let program = match program {
             Ok(program) => Some(program),
@@ -3126,11 +3675,18 @@ impl Cagents {
             ));
             return Task::none();
         }
-        let launch = program
-            .zip(std::env::var_os("HOME"))
-            .and_then(|(program, home)| {
-                login_launch(&state.account, &program, PathBuf::from(home), device)
-            });
+        let launch =
+            program
+                .zip(std::env::var_os("HOME"))
+                .and_then(|((program, search_path), home)| {
+                    login_launch_with_path(
+                        &state.account,
+                        &program,
+                        PathBuf::from(home),
+                        device,
+                        search_path.as_deref(),
+                    )
+                });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
                 "{} could not be started to sign in.",
@@ -3163,6 +3719,11 @@ impl Cagents {
                 && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal && !terminal_ended(session))
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
         });
+        let succeeded = !running
+            && self.durable.cards.iter().any(|card| {
+                matches!(&card.kind, CardKind::Terminal(session)
+                    if session.id == terminal && signed_in(session))
+            });
         if let Some(state) = self.account_ui.account_mut(id) {
             if running {
                 state.schedule.extend_login_watch(now);
@@ -3173,6 +3734,9 @@ impl Cagents {
                 // Give the completed or cancelled terminal one final fresh
                 // verification window, then release its explicit intent.
                 state.sign_in_terminal = None;
+                // The login it finished wrote the record the CLI reads,
+                // which settles a disagreement with an older one.
+                state.settle_records = succeeded;
             }
         }
     }
@@ -3211,20 +3775,13 @@ impl Cagents {
         }) {
             return true;
         }
-        let (Some(variable), Some(home)) = (
-            account::home_variable(account.provider),
-            account.resolved_home(),
-        ) else {
-            return false;
-        };
         self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                 && matches!(&card.kind, CardKind::Terminal(session)
                     if is_sign_in(&session.launch)
                         && !terminal_ended(session)
-                        && session.launch.environment.get(variable)
-                            .is_some_and(|value| Path::new(value) == home))
+                        && signs_in(account, &session.launch))
         })
     }
 
@@ -3350,7 +3907,7 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
                 let (key, result) = match result {
-                    Ok((registry, key)) => (key, Ok(registry)),
+                    Ok((registry, linked)) => (linked, Ok(registry)),
                     Err(error) => (key, Err(error)),
                 };
                 Message::AccountUi(Action::LinkReady { key, result })
@@ -3368,17 +3925,8 @@ impl Cagents {
                     .map(Homes::lifecycle_lock)
                     .transpose()
                     .map_err(|error| error.to_string())?;
-                let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .ok_or("HOME is unavailable")?
-                        .join(relative)
-                } else {
-                    PathBuf::from(raw_path)
-                };
-                if !chosen.is_absolute() {
-                    return Err("Enter an absolute path or one starting with ~/".into());
-                }
+                let chosen =
+                    account::expand_linked_home(raw_path, std::env::var_os("HOME").as_deref())?;
                 let path = std::fs::canonicalize(&chosen)
                     .map_err(|error| format!("{}: {error}", chosen.display()))?;
                 crate::secure_file::validate_owned_directory(&path)
@@ -3409,7 +3957,7 @@ impl Cagents {
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             let (key, result) = match result {
-                Ok((registry, key)) => (key, Ok(registry)),
+                Ok((registry, linked)) => (linked, Ok(registry)),
                 Err(error) => (key, Err(error)),
             };
             Message::AccountUi(Action::LinkReady { key, result })
@@ -3475,7 +4023,7 @@ impl Cagents {
                     None => create(),
                 }
                 .map_err(|error| format!("Its home could not be created and recorded: {error}"))?;
-                Ok((key, home, program))
+                Ok((key, home, program, search_path))
             })
             .await
             .map_err(|error| error.to_string())
@@ -3492,12 +4040,12 @@ impl Cagents {
         &mut self,
         provider: Provider,
         device: bool,
-        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+        result: Result<(uuid::Uuid, PathBuf, PathBuf, Option<std::ffi::OsString>), String>,
     ) -> Task<Message> {
         if provider == Provider::Codex && !device {
             self.account_ui.browser_preparing = false;
         }
-        let (key, home, program) = match result {
+        let (key, home, program, search_path) = match result {
             Ok(ready) => ready,
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -3509,7 +4057,13 @@ impl Cagents {
         };
         let account = Account::managed(provider, key, home.clone());
         let launch = std::env::var_os("HOME").and_then(|reader_home| {
-            login_launch(&account, &program, PathBuf::from(reader_home), device)
+            login_launch_with_path(
+                &account,
+                &program,
+                PathBuf::from(reader_home),
+                device,
+                search_path.as_deref(),
+            )
         });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
@@ -3544,24 +4098,21 @@ impl Cagents {
         task
     }
 
-    /// Deletes a home that never became an account, and its pending entry.
+    /// Forgets a pending sign-in through the selected daemon. Its home and
+    /// any interrupted-removal history remain available for explicit recovery.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
-        if crate::device::is_remote() {
-            return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle(account::remote::Operation::Abandon { provider, key })
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                Message::AccountUi(Action::LoginSettled { key, result })
-            });
-        }
-        let homes = self.account_ui.homes.clone();
-        let store = self.account_ui.store.clone();
+        self.discard_home_via(key, provider, remote_lifecycle::<Settled>)
+    }
+
+    fn discard_home_via(
+        &self,
+        key: uuid::Uuid,
+        provider: Provider,
+        request: impl FnOnce(account::remote::Operation) -> Result<Settled, String> + Send + 'static,
+    ) -> Task<Message> {
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || -> Result<Settled, String> {
-                abandon_home(store.as_ref(), homes.as_ref(), provider, key).map(Settled::Abandoned)
+            let result = tokio::task::spawn_blocking(move || {
+                abandon_home(provider, key, request).map(Settled::Abandoned)
             })
             .await
             .map_err(|error| error.to_string())
@@ -3591,7 +4142,7 @@ impl Cagents {
                 Some(CardRuntime::Failed(_)) => ended.push(login.key),
                 // A card on the strip on screen follows its terminal.
                 Some(CardRuntime::Terminal(_) | CardRuntime::Completed) if on_screen => {
-                    if ended_terminal(self.card_state(card)).is_some() {
+                    if self.ended_terminal(card).is_some() {
                         ended.push(login.key);
                     }
                 }
@@ -3601,7 +4152,7 @@ impl Cagents {
                 // once it has taken the terminal on, since until then it has
                 // nothing to say about it.
                 _ => {
-                    if ended_terminal(self.card_state(card)).is_some() {
+                    if self.ended_terminal(card).is_some() {
                         ended.push(login.key);
                     } else if let Some(CardState {
                         kind: CardKind::Terminal(session),
@@ -3648,19 +4199,24 @@ impl Cagents {
             }) => session
                 .continuity
                 .live_proof()
-                .map(|proof| (session.id, proof)),
+                .map(|proof| (session.clone(), proof)),
             _ => None,
         };
-        let Some((terminal, proof)) = hosted else {
+        let Some((source, proof)) = hosted else {
             // Ended already, or never taken on by the daemon: nothing runs.
             return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
         };
+        let terminal = source.id;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::AccountUi(Action::OffstripClosed { card, result })
+            Message::AccountUi(Action::OffstripClosed {
+                card,
+                source,
+                result,
+            })
         })
     }
 
@@ -3672,7 +4228,7 @@ impl Cagents {
                 self.close_offstrip_sign_in(card)
             }
             Some(card)
-                if ended_terminal(self.card_state(card)).is_some()
+                if self.ended_terminal(card).is_some()
                     || matches!(self.cards.get(&card), Some(CardRuntime::Failed(_))) =>
             {
                 cosmic::task::message(Message::CloseCard(card))
@@ -3808,7 +4364,6 @@ impl Cagents {
         };
         let signed_in = probe::confirms_login(identity.as_ref(), snapshot.status);
         let provider = login.provider;
-        let account = login.account();
         if !signed_in {
             // A sign-in picked up from an earlier run may still be under way
             // in another window until it is old enough not to be.
@@ -3876,14 +4431,13 @@ impl Cagents {
                     snapshot: Some(snapshot),
                 }),
                 Ok((_, Err(existing))) => {
-                    // The same login twice would be one allowance counted
-                    // twice. The new home is signed out - its login is its
-                    // own, so the existing one is unaffected - and deleted.
-                    let _ = probe::logout(account).await;
+                    // The same login twice would count one allowance twice.
+                    // Match the daemon's duplicate path: abandon only pending
+                    // metadata, preserving this home's login and history.
                     tokio::task::spawn_blocking(move || -> Result<Settled, String> {
                         Ok(Settled::Duplicate {
                             existing,
-                            registry: abandon_home(store.as_ref(), homes.as_ref(), provider, key)?,
+                            registry: abandon_home(provider, key, remote_lifecycle::<Settled>)?,
                         })
                     })
                     .await
@@ -3941,7 +4495,9 @@ impl Cagents {
                     .and_then(|identity| identity.email.clone())
                     .unwrap_or_else(|| format!("A {} account", login.provider.label()));
                 if let Some(state) = self.account_ui.account_mut(&id) {
+                    // Signing in just ran its CLI in this home.
                     state.present = true;
+                    state.absent_since = None;
                     if let Some(snapshot) = snapshot {
                         state.schedule.start(Trigger::Manual, now);
                         state.schedule.succeed(snapshot.observed_at);
@@ -3992,86 +4548,41 @@ impl Cagents {
         }
     }
 
-    /// Forgets a linked home without touching it. A home cagents created is
-    /// signed out and deleted after it is removed from the registry.
+    /// Uses the same scoped daemon lifecycle operation on this device and
+    /// remote devices. Managed deletion is unsupported; linked forget keeps
+    /// all files and still requires the daemon's live-owner reservation.
     fn remove_account(&mut self, id: AccountId) -> Task<Message> {
+        self.remove_account_via(id, remote_lifecycle::<(Registry, Option<String>)>)
+    }
+
+    fn remove_account_via(
+        &mut self,
+        id: AccountId,
+        request: impl FnOnce(account::remote::Operation) -> Result<(Registry, Option<String>), String>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
         self.account_ui.table.close_popups();
-        let Some(account) = self
+        if !self
             .account_ui
             .account(&id)
-            .map(|state| state.account.clone())
-        else {
-            return Task::none();
-        };
-        let Some(key) = account.registry_key() else {
-            return Task::none();
-        };
-        let linked = account.is_linked();
-        if !self.account_ui.removing.insert(id.clone()) {
+            .is_some_and(|state| state.account.registry_key().is_some())
+            || !self.account_ui.removing.insert(id.clone())
+        {
             return Task::none();
         }
-        if crate::device::is_remote() {
-            return cosmic::task::future(async move {
-                let remove_id = id.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle::<(Registry, Option<String>)>(
-                        account::remote::Operation::Remove { id: remove_id },
-                    )
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                let (registry, error) = match result {
-                    Ok((registry, error)) => (Some(registry), error),
-                    Err(error) => (None, Some(error)),
-                };
-                Message::AccountUi(Action::Removed {
-                    id,
-                    registry,
-                    error,
-                })
-            });
-        }
-        let store = self.account_ui.store.clone();
-        let homes = self.account_ui.homes.clone();
-        let fallback = self.account_ui.registry.clone();
-        let provider = account.provider;
         cosmic::task::future(async move {
-            if !linked {
-                let _ = probe::logout(account).await;
-            }
-            let (registry, error) = tokio::task::spawn_blocking(move || {
-                if !linked && let (Some(store), Some(homes)) = (&store, &homes) {
-                    return match store.remove_home(homes, provider, key, true) {
-                        Ok((registry, error)) => (Some(registry), error),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
-                }
-                let registry = match store {
-                    Some(store) => match store.update(|registry| {
-                        registry.unregister(key);
-                    }) {
-                        Ok((registry, ())) => registry,
-                        Err(error) => return (None, Some(error.to_string())),
-                    },
-                    None => {
-                        let mut registry = fallback;
-                        registry.unregister(key);
-                        registry
-                    }
-                };
-                // Once forgotten, the home is no account's: a deletion that
-                // fails here leaves files, never a broken account.
-                let error = (!linked).then_some(homes).flatten().and_then(|homes| {
-                    homes
-                        .remove(provider, key)
-                        .err()
-                        .map(|error| format!("its files could not be deleted: {error}"))
-                });
-                (Some(registry), error)
+            let remove_id = id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                request(account::remote::Operation::Remove { id: remove_id })
             })
             .await
-            .unwrap_or_else(|error| (None, Some(error.to_string())));
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let (registry, error) = match result {
+                Ok((registry, error)) => (Some(registry), error),
+                Err(error) => (None, Some(error)),
+            };
             Message::AccountUi(Action::Removed {
                 id,
                 registry,
@@ -4161,7 +4672,10 @@ impl Cagents {
     /// The longest known worktree or repository root containing `directory`
     /// determines its project. This is a short in-memory scan only when
     /// starting work or drawing the Accounts pane; no filesystem query is needed.
-    fn project_for_directory(&self, directory: &Path) -> Option<(ProjectId, &str, &Path)> {
+    pub(super) fn project_for_directory(
+        &self,
+        directory: &Path,
+    ) -> Option<(ProjectId, &str, &Path)> {
         self.sidebar_model
             .projects
             .iter()
@@ -4438,7 +4952,12 @@ impl Cagents {
         )
         .width(Length::Fill)
         .height(STATUS_BAR_HEIGHT - design::BORDER_WIDTH)
-        .padding(Padding::from([0.0, space::S]))
+        // The rule above runs to the window edge; the trailing control stays
+        // out of the resize border.
+        .padding(Padding {
+            right: space::S + self.trailing_edge_inset(),
+            ..Padding::from([0.0, space::S])
+        })
         .align_y(Alignment::Center);
         Some(
             widget::column::with_children(vec![design::horizontal_rule(), bar.into()])
@@ -4705,9 +5224,18 @@ impl Cagents {
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
             );
-            if let LoginConflict::Changed { added_as, .. } = &conflict {
+            let sign_in = match &conflict {
+                LoginConflict::Changed { added_as, .. } => Some(format!("Sign in as {added_as}")),
+                LoginConflict::Disputed { .. }
+                | LoginConflict::Contradicted {
+                    because: Contradiction::SeparateAllowances,
+                    ..
+                } => Some("Sign in again".to_owned()),
+                _ => None,
+            };
+            if let Some(sign_in) = sign_in {
                 rows.push(
-                    crate::ui_controls::button::secondary(format!("Sign in as {added_as}"))
+                    crate::ui_controls::button::secondary(sign_in)
                         .on_press_maybe(
                             (!self.account_sign_in_running(&account.account))
                                 .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
@@ -4950,15 +5478,8 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self).map(pane_message)
+        table::view(self)
     }
-}
-
-/// Preserve every callback's pane origin, including responsive children and
-/// overlays. Shared global controls and accepted task completions are not
-/// wrapped: only these completed workspace pane views use this boundary.
-pub(super) fn pane_message(message: Message) -> Message {
-    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {
@@ -5070,6 +5591,22 @@ fn ended_on_host(
         .collect())
 }
 
+// Match process identity, not the continuity variant: the original terminal
+// may legitimately exit before its close acknowledgement reaches this window.
+fn offstrip_close_matches(state: Option<&CardState>, source: &TerminalSession) -> bool {
+    let Some(proof) = source.continuity.live_proof() else {
+        return false;
+    };
+    matches!(state, Some(CardState { kind: CardKind::Terminal(current), existence, .. })
+        if existence.is_open()
+            && current.id == source.id
+            && current.launch == source.launch
+            && (current.continuity.live_proof().as_ref() == Some(&proof)
+                || matches!(current.continuity,
+                    TerminalContinuity::Exited { .. }
+                    | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })))
+}
+
 /// Closes the hosted `terminal` for good. A daemon that restored it under
 /// a session of its own is asked again with that session, so a close is
 /// only reported done once the terminal has ended or is gone.
@@ -5100,47 +5637,26 @@ fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), Str
     };
     match outcome {
         CloseOutcome::Closed => Ok(()),
-        CloseOutcome::Active | CloseOutcome::Stale => {
+        CloseOutcome::NotHosted => Ok(()),
+        CloseOutcome::Active | CloseOutcome::Stale | CloseOutcome::Kept(_) => {
             Err("its terminal is still running and could not be closed".to_owned())
         }
         CloseOutcome::Unreachable(error) => Err(error),
     }
 }
 
-/// Forgets the pending sign-in `key`, returning the registry as it now
-/// stands where there is one on disk.
+/// Abandon only metadata through the selected daemon, with the original
+/// pending key. A refusal or uncertain reply never grants file-deletion or
+/// completion authority, and never falls back to local storage.
 fn abandon_home(
-    store: Option<&Store>,
-    homes: Option<&Homes>,
     provider: Provider,
     key: uuid::Uuid,
+    request: impl FnOnce(account::remote::Operation) -> Result<Settled, String>,
 ) -> Result<Option<Registry>, String> {
-    if let (Some(store), Some(homes)) = (store, homes) {
-        let (registry, error) = store
-            .remove_home(homes, provider, key, false)
-            .map_err(|error| error.to_string())?;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        return Ok(Some(registry));
+    match request(account::remote::Operation::Abandon { provider, key })? {
+        Settled::Abandoned(Some(registry)) => Ok(Some(registry)),
+        _ => Err("The device did not confirm the pending sign-in was abandoned".into()),
     }
-    if let Some(homes) = homes {
-        homes
-            .remove(provider, key)
-            .map_err(|error| error.to_string())?;
-    }
-    abandon(store, key)
-}
-
-fn abandon(store: Option<&Store>, key: uuid::Uuid) -> Result<Option<Registry>, String> {
-    store
-        .map(|store| {
-            store
-                .update(|registry| registry.abandon(key))
-                .map(|(registry, ())| registry)
-                .map_err(|error| error.to_string())
-        })
-        .transpose()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5256,12 +5772,357 @@ impl State {
 }
 
 #[cfg(test)]
+impl Cagents {
+    /// Answers the newest discovery as finding every home and CLI where the
+    /// window already believed it was, which is what a Check now's
+    /// rediscovery reports on an unchanged machine.
+    pub(super) fn settle_discovery_for_test(&mut self) {
+        let restored = self
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| Restored {
+                id: state.id.clone(),
+                present: state.present,
+                entry: None,
+            })
+            .collect();
+        drop(self.update(Message::AccountUi(Action::Located {
+            generation: self.account_ui.discovery_generation,
+            owners: self.account_ui.discovery_owners(),
+            restored,
+            installed: self.account_ui.installed.clone(),
+        })));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn hidden_explicit_account_policy_waits_for_the_authoritative_startup_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        store
+            .update(|registry| {
+                for provider in Account::PROVIDERS {
+                    registry.set_default(&Account::system(provider));
+                }
+            })
+            .unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        app.refresh_ui.focused = true;
+        assert!(!app.account_ui.registry_ready);
+        assert!(
+            app.account_ui.registry.automatic(Provider::Codex),
+            "constructor policy is only a placeholder"
+        );
+        assert!(app.utility_card(&CardKind::Accounts).is_none());
+        // These are the actual focus and tick scheduling paths. Their returned
+        // provider/registry futures remain unpolled in this regression.
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        let registry = store.load().unwrap();
+        drop(
+            app.update(Message::AccountUi(Action::Loaded(Loaded {
+                generation: app.account_ui.discovery_generation,
+                registry: Ok(registry.clone()),
+                restored: Account::PROVIDERS
+                    .into_iter()
+                    .map(|provider| Restored {
+                        id: Account::system(provider).id(),
+                        present: true,
+                        entry: None,
+                    })
+                    .collect(),
+                catalogs: BTreeMap::new(),
+                installed: BTreeMap::new(),
+                provisional: false,
+            }))),
+        );
+        assert!(app.account_ui.registry_ready);
+        assert_eq!(app.account_ui.registry, registry);
+        assert!(!app.accounts_surface_visible());
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        let id = Account::system(Provider::Codex).id();
+        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        app.settle_discovery_for_test();
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "explicit refresh remains available under hidden explicit defaults"
+        );
+    }
+
+    #[test]
+    fn a_successful_empty_registry_read_releases_normal_automatic_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            !app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        // A genuinely absent private registry file is an authoritative default,
+        // unlike the equal-valued in-memory constructor placeholder.
+        let registry = store.load().unwrap();
+        assert_eq!(registry, Registry::default());
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
+            registry: Ok(registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(app.account_ui.registry_ready);
+        assert_eq!(app.account_ui.account(&id).unwrap().owner, owner);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| state.schedule.in_flight(now_ms())),
+            "eligible automatic accounts resume after policy admission"
+        );
+        let ticket = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("the authoritative load admitted this probe");
+        drop(app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            owner: owner.wrapping_add(1),
+            ticket,
+            outcome: Outcome::Failed("stale owner".into()),
+        })));
+        let account = app.account_ui.account(&id).unwrap();
+        assert!(account.failure.is_none());
+        assert!(
+            account.schedule.in_flight(now_ms()),
+            "readiness does not relax stale-owner fencing"
+        );
+    }
+
+    #[test]
+    fn a_startup_read_finishing_after_newer_discovery_still_releases_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        let startup = app.account_ui.discovery_generation;
+        app.refresh_ui.focused = true;
+        // Focus rediscovers before the startup read answers; that newer
+        // discovery completes while registry policy is still unknown.
+        drop(app.accounts_focus_changed(true, true));
+        assert_ne!(app.account_ui.discovery_generation, startup);
+        app.settle_discovery_for_test();
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()))
+        );
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: startup,
+            registry: Ok(store.load().unwrap()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(app.account_ui.registry_ready);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| state.schedule.in_flight(now_ms())),
+            "the stale startup read still admits the probes discovery held back"
+        );
+    }
+
+    #[test]
+    fn failed_initial_registry_reads_stay_unready_until_a_successful_retry() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, None, None);
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Claude).id();
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            app.account_ui.discovery_generation,
+            Err("device unavailable".into()),
+        ))));
+        assert!(!app.account_ui.registry_ready);
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
+            registry: Err("registry unreadable".into()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(!app.account_ui.registry_ready);
+        let notices: Vec<_> = app
+            .notices
+            .recent()
+            .filter(|entry| {
+                entry.notice.message == "Your added accounts could not be read: registry unreadable"
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].notice.severity, NoticeSeverity::Error);
+        assert_eq!(notices[0].repeats, 1);
+        assert!(app.status.is_none(), "the reducer drains the write channel");
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        drop(app.update(Message::AccountUi(Action::Popover(Some(id.clone())))));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        app.settle_discovery_for_test();
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "an explicit manual request does not silently admit default policy"
+        );
+        assert!(!app.account_ui.registry_ready);
+        let count = app.account_ui.accounts.len();
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Err(
+            "still unreadable".into(),
+        )))));
+        assert!(!app.account_ui.registry_ready);
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(
+            Registry::default(),
+        )))));
+        assert_eq!(app.account_ui.accounts.len(), count);
+        assert!(app.account_ui.registry_ready);
+        let other = Account::system(Provider::Codex).id();
+        assert!(
+            app.account_ui
+                .account(&other)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "a successful retry admits eligible probes even with unchanged account count"
+        );
+    }
+
+    #[test]
+    fn an_explicit_login_can_finish_while_unrelated_initial_probes_wait() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, None, None);
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let other = Account::system(Provider::Claude).id();
+        let before = app.account_ui.account(&id).unwrap().owner;
+        // Real existing-account login admission; the terminal task is unpolled.
+        drop(app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into())));
+        let state = app.account_ui.account(&id).unwrap();
+        let owner = state.owner;
+        assert_ne!(owner, before);
+        assert!(state.sign_in_terminal.is_some());
+        assert!(state.schedule.awaiting_login(now_ms()));
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(!app.account_ui.registry_ready);
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        let unrelated = app.account_ui.account(&other).unwrap();
+        assert!(!unrelated.schedule.in_flight(now_ms()) && unrelated.queued.is_none());
+        let ticket = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("the explicit sign-in admitted this probe");
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner: before,
+            id: id.clone(),
+            ticket: ticket.clone(),
+            outcome: Outcome::Failed("stale pre-login reply".into()),
+        })));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .awaiting_login(now_ms())
+        );
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket,
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: Some(Identity {
+                    email: Some("signed-in@example.com".into()),
+                    ..Identity::default()
+                }),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "signed in", now_ms()),
+            },
+        })));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.sign_in_terminal.is_none());
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        assert_eq!(
+            state.identity.as_ref().unwrap().email.as_deref(),
+            Some("signed-in@example.com")
+        );
+        assert!(
+            !app.account_ui.registry_ready,
+            "explicit intent never promotes unknown registry policy"
+        );
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+    }
 
     #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {
@@ -5311,7 +6172,10 @@ mod tests {
             now,
         ));
         app.account_ui.account_mut(&managed).unwrap().snapshot =
-            Some(UsageSnapshot::state(UsageStatus::Ok, "", now));
+            Some(account::codex::parse_rate_limits(
+                &serde_json::json!({"ordinaryUsageAllowed": true}),
+                now,
+            ));
         assert_eq!(app.default_account(Provider::Codex).id(), managed);
         app.account_ui.account_mut(&system.id()).unwrap().snapshot = Some(UsageSnapshot::state(
             UsageStatus::Unavailable,
@@ -5374,7 +6238,7 @@ mod tests {
         let path = directory.path().join("daemon.sock");
         assert!(check_browser_login_host(&path).is_ok());
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
+        crate::daemon::shut_down_test_listener(listener);
         assert!(path.exists());
         assert!(check_browser_login_host(&path).is_ok());
     }
@@ -5603,6 +6467,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_check_keeps_figures_but_marks_the_status_bar_stale() {
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        snapshot.windows = vec![window(0.42, None)];
+        let mut state = state_with(Some(snapshot));
+        let current = chip(&state, "Codex", NOW);
+        assert_ne!(current.tone, ChipTone::Stale);
+        assert!(!current.tooltip.contains("Last check failed"));
+        state.failure = Some("Codex could not read usage just now".into());
+        let failed = chip(&state, "Codex", NOW);
+        assert_eq!(failed.text, current.text);
+        assert_eq!(failed.tone, ChipTone::Stale);
+        assert!(
+            failed
+                .tooltip
+                .ends_with("\nLast check failed: Codex could not read usage just now")
+        );
+    }
+
+    #[test]
     fn a_login_terminal_runs_the_probed_cli_at_home_and_is_not_an_agent() {
         let launch = login_launch(
             &Account::system(Provider::Claude),
@@ -5619,11 +6502,20 @@ mod tests {
                 .environment
                 .get("CLAUDE_CONFIG_DIR")
                 .map(String::as_str),
+            // The home every system launch exports: none unless cagents was
+            // started with one, since an explicit default would move the
+            // login's record out of `~/.claude.json`.
             Account::system(Provider::Claude)
-                .resolved_home()
+                .launch_home()
                 .as_deref()
                 .and_then(Path::to_str)
         );
+        // Unset when not exported, so the daemon's own value is not inherited.
+        assert_eq!(
+            launch.unset_environment.contains("CLAUDE_CONFIG_DIR"),
+            Account::system(Provider::Claude).launch_home().is_none()
+        );
+        assert!(signs_in(&Account::system(Provider::Claude), &launch));
         assert_eq!(Provider::recognize_launch(&launch), None);
         assert!(is_sign_in(&launch));
 
@@ -5712,6 +6604,17 @@ mod tests {
             .environment
             .insert("CLAUDE_CONFIG_DIR".into(), "/somewhere/else".into());
         assert_eq!(found(&recipe), None);
+        // An unset home is the CLI's default: the system login's, unless
+        // this window's system account names a home of its own.
+        recipe.environment.remove("CLAUDE_CONFIG_DIR");
+        recipe.unset_environment.insert("CLAUDE_CONFIG_DIR".into());
+        assert_eq!(
+            found(&recipe),
+            Account::system(Provider::Claude)
+                .launch_home()
+                .is_none()
+                .then(|| Account::system(Provider::Claude).id())
+        );
     }
 }
 
@@ -5762,7 +6665,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
         let state = app.account_ui.account_mut(&id).unwrap();
         state
@@ -5770,7 +6674,8 @@ mod app_tests {
             .await_login(now_ms() - 2 * account::schedule::LOGIN_WATCH);
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert!(state.sign_in_terminal.is_some());
-        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        let reply = signed_in_as(&mut app, &id, "new@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
@@ -5785,7 +6690,8 @@ mod app_tests {
         assert!(!state.schedule.awaiting_login(now_ms()));
         // Even if the auth terminal remains open, its completed intent cannot
         // authorize a later replacement of this home's credentials.
-        let _ = app.update(signed_in_as(&app, &id, "unexpected@example.com"));
+        let reply = signed_in_as(&mut app, &id, "unexpected@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("new@example.com")
@@ -5795,6 +6701,43 @@ mod app_tests {
                 .login_conflict(app.account_ui.account(&id).unwrap()),
             Some(LoginConflict::Changed { .. })
         ));
+    }
+
+    /// Only a sign-in whose CLI exited cleanly is taken to have written the
+    /// record its login is read from; a closed or failed one settles nothing.
+    #[test]
+    fn a_finished_sign_in_settles_the_next_disagreement_and_a_closed_one_does_not() {
+        for (code, signal, settles) in [
+            (Some(0), None, true),
+            (Some(1), None, false),
+            (None, Some("SIGHUP"), false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 515);
+            let home = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .account
+                .resolved_home()
+                .unwrap();
+            let _ = app.open_login(&id, Provider::Claude, false, Ok("/tools/claude".into()));
+            let card = app.sign_in_card(Provider::Claude, &home).unwrap();
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code,
+                    signal: signal.map(str::to_owned),
+                    occurred_at_unix_ms: 42,
+                },
+            };
+            app.refresh_login_watch(&id, NOW);
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.sign_in_terminal.is_none());
+            assert_eq!(state.settle_records, settles, "{code:?} {signal:?}");
+        }
     }
 
     #[test]
@@ -5854,7 +6797,7 @@ mod app_tests {
         let _ = app.open_account_login(
             Provider::Codex,
             false,
-            Ok((key, home, "/tools/codex".into())),
+            Ok((key, home, "/tools/codex".into(), None)),
         );
         let card = app
             .sign_in_card(Provider::Codex, &app.account_ui.logins[0].home)
@@ -6128,8 +7071,12 @@ mod app_tests {
             app.card_state(card)
                 .is_some_and(|state| state.existence.is_open())
         );
+        let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("the original sign-in terminal remains")
+        };
         let _ = app.update(Message::AccountUi(Action::OffstripClosed {
             card,
+            source: source.clone(),
             result: Err("unreachable".into()),
         }));
         assert!(
@@ -6138,6 +7085,7 @@ mod app_tests {
         );
         let _ = app.update(Message::AccountUi(Action::OffstripClosed {
             card,
+            source,
             result: Ok(()),
         }));
         assert!(
@@ -6146,6 +7094,264 @@ mod app_tests {
             "the settled sign-in's card was left open"
         );
         assert!(!app.durable.card_scopes.contains_key(&card));
+    }
+
+    // No terminal or close task is polled: these are accepted-message identity
+    // controls using the real navigation, exit reducer and public Retry path.
+    fn offstrip_close_fixture() -> (Cagents, CardId, TerminalSession) {
+        let mut app = app_in_repo();
+        let key = uuid::Uuid::from_u128(923);
+        let home = PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string());
+        let launch = login_launch(
+            &Account::managed(Provider::Claude, key, home.clone()),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .unwrap();
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|state| {
+                matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)
+                    .then_some(state.id)
+            })
+            .unwrap();
+        let CardKind::Terminal(source) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("sign-in terminal")
+        };
+        source.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("original-host"),
+            boot_id: crate::model::BootId::new("original-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("original-incarnation"),
+        };
+        let source = source.clone();
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        drop(app.select_worktree("/elsewhere".into(), false));
+        assert!(!app.workspace.order().any(|id| id == card));
+        drop(app.close_offstrip_sign_in(card));
+        (app, card, source)
+    }
+
+    #[test]
+    fn an_old_offstrip_close_cannot_retire_or_report_against_a_retried_sign_in() {
+        let (mut app, card, source) = offstrip_close_fixture();
+        drop(app.select_worktree("/repo".into(), false));
+        assert!(app.workspace.order().any(|id| id == card));
+        app.retire_ended_terminal(card, 7, None, true);
+        assert!(matches!(&app.card_state(card).unwrap().kind,
+            CardKind::Terminal(current) if current.id == source.id
+                && matches!(current.continuity, TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })));
+        drop(app.update(Message::RetryCard(card)));
+        let CardKind::Terminal(replacement) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("Retry retains the terminal card")
+        };
+        assert_ne!(
+            replacement.id, source.id,
+            "actual Retry creates a new terminal identity"
+        );
+        assert_eq!(replacement.predecessor, Some(source.id));
+        assert_eq!(replacement.launch, source.launch);
+        replacement.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("replacement-host"),
+            boot_id: crate::model::BootId::new("original-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("original-incarnation"),
+        };
+        drop(app.select_worktree("/elsewhere".into(), false));
+        assert!(!app.workspace.order().any(|id| id == card));
+        let replacement = app.card_state(card).unwrap().clone();
+        let scopes = app.durable.card_scopes.clone();
+        let lifecycle = app
+            .lifecycle
+            .state(card)
+            .map(|(exposure, residency)| (*exposure, residency.clone()));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        app.status = Some(TransientNotice::warning("replacement is current"));
+        for result in [Ok(()), Err("old close failed".into())] {
+            let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                card,
+                source: source.clone(),
+                result,
+            }));
+            assert_eq!(
+                task.units(),
+                0,
+                "no retirement, login check or follow-up task"
+            );
+            drop(task);
+            assert_eq!(app.card_state(card), Some(&replacement));
+            assert_eq!(app.durable.card_scopes, scopes);
+            assert_eq!(
+                app.lifecycle
+                    .state(card)
+                    .map(|(exposure, residency)| (*exposure, residency.clone())),
+                lifecycle
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+            assert_eq!(app.account_ui.logins.len(), 1);
+            assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
+            assert!(!app.account_ui.asking_host);
+            // Updates hand the pending notice to the notices list; the stale
+            // reply adds nothing after it.
+            assert_eq!(
+                app.notices
+                    .recent()
+                    .next()
+                    .map(|entry| entry.notice.message.as_str()),
+                Some("replacement is current")
+            );
+            assert!(
+                !app.notices
+                    .recent()
+                    .any(|entry| entry.notice.message.contains("old close failed"))
+            );
+        }
+    }
+
+    #[test]
+    fn offstrip_close_requires_original_source_but_allows_its_legitimate_exit() {
+        for changed in ["proof", "launch", "kind", "closed"] {
+            let (mut app, card, source) = offstrip_close_fixture();
+            let state = app.card_state_mut(card).unwrap();
+            match changed {
+                "proof" => {
+                    let CardKind::Terminal(current) = &mut state.kind else {
+                        unreachable!()
+                    };
+                    current.continuity = TerminalContinuity::Live {
+                        host_session_id: crate::model::HostSessionId::new("different-host"),
+                        boot_id: crate::model::BootId::new("original-boot"),
+                        host_incarnation: crate::model::HostIncarnation::new(
+                            "original-incarnation",
+                        ),
+                    };
+                }
+                "launch" => {
+                    let CardKind::Terminal(current) = &mut state.kind else {
+                        unreachable!()
+                    };
+                    current.launch.arguments.push("changed-command".into());
+                }
+                "kind" => state.kind = CardKind::Settings,
+                "closed" => {
+                    state.existence = Existence::Closed {
+                        tombstone: crate::model::Tombstone {
+                            operation_id: None,
+                            closed_at_unix_ms: 1,
+                            reason: None,
+                        },
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let current = app.card_state(card).unwrap().clone();
+            app.status = Some(TransientNotice::warning("current state"));
+            for result in [Ok(()), Err("stale failure".into())] {
+                let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                    card,
+                    source: source.clone(),
+                    result,
+                }));
+                assert_eq!(task.units(), 0, "{changed}");
+                drop(task);
+                assert_eq!(app.card_state(card), Some(&current), "{changed}");
+                assert!(!app.account_ui.asking_host, "{changed}");
+                assert_eq!(
+                    app.notices
+                        .recent()
+                        .next()
+                        .map(|entry| entry.notice.message.as_str()),
+                    Some("current state"),
+                    "{changed}"
+                );
+                assert!(
+                    !app.notices
+                        .recent()
+                        .any(|entry| entry.notice.message.contains("stale failure")),
+                    "{changed}"
+                );
+            }
+        }
+        // A still-original failure remains actionable, without checking logins.
+        let (mut app, card, source) = offstrip_close_fixture();
+        let task = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            source,
+            result: Err("original unavailable".into()),
+        }));
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.account_ui.asking_host);
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("original unavailable"))
+        );
+        // An original close acknowledged after returning to its strip must
+        // retain the visible card; normal strip close still owns its surface.
+        let (mut app, card, source) = offstrip_close_fixture();
+        drop(app.select_worktree("/repo".into(), false));
+        assert!(app.workspace.order().any(|id| id == card));
+        let task = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            source,
+            result: Ok(()),
+        }));
+        drop(task);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.durable.card_scopes.contains_key(&card));
+        for ended in ["exited", "relaunch"] {
+            let (mut app, card, source) = offstrip_close_fixture();
+            let last_exit = crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 42,
+            };
+            let CardKind::Terminal(current) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            current.continuity = if ended == "exited" {
+                TerminalContinuity::Exited { last_exit }
+            } else {
+                TerminalContinuity::RelaunchAvailable {
+                    recipe: current.launch.clone(),
+                    last_exit: Some(last_exit),
+                }
+            };
+            assert_eq!(current.id, source.id);
+            assert_eq!(current.launch, source.launch);
+            let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                card,
+                source,
+                result: Ok(()),
+            }));
+            drop(task);
+            assert!(
+                app.card_state(card)
+                    .is_none_or(|state| !state.existence.is_open()),
+                "{ended}"
+            );
+            assert!(!app.durable.card_scopes.contains_key(&card), "{ended}");
+            assert!(!app.cards.contains_key(&card), "{ended}");
+            assert_eq!(
+                app.account_ui.logins[0].phase,
+                LoginPhase::Verifying,
+                "original exit can settle sign-in"
+            );
+        }
     }
 
     #[test]
@@ -6316,9 +7522,11 @@ mod app_tests {
         accounts
     }
 
-    fn signed_in_as(app: &Cagents, id: &AccountId, email: &str) -> Message {
+    fn signed_in_as(app: &mut Cagents, id: &AccountId, email: &str) -> Message {
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
         Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6347,7 +7555,7 @@ mod app_tests {
             .pop()
             .unwrap();
         let original = app.account_ui.account(&id).unwrap().account.clone();
-        let stale_probe = signed_in_as(&app, &id, "wrong@example.com");
+        let stale_probe = signed_in_as(&mut app, &id, "wrong@example.com");
         let old_owner = app.account_ui.account(&id).unwrap().owner;
         app.account_ui.preparing_logins.insert(old_owner);
         app.account_ui.preparing_browser_login = Some(old_owner);
@@ -6401,9 +7609,10 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let old_owner = app.account_ui.probe_owner(&id).unwrap();
-        let old_reply = signed_in_as(&app, &id, "other@example.com");
+        let old_reply = signed_in_as(&mut app, &id, "other@example.com");
         app.account_ui
             .account_mut(&id)
             .unwrap()
@@ -6425,7 +7634,8 @@ mod app_tests {
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
         );
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
@@ -6473,7 +7683,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["expected@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let reply = signed_in_as(&mut app, &id, "actual@example.com");
+        let _ = app.update(reply);
         let account = app.account_ui.account(&id).unwrap().account.clone();
         assert!(app.account_login_change(&account).is_some());
         let captured = app
@@ -6494,7 +7705,8 @@ mod app_tests {
             .account_ui
             .reported_login_action(app.account_ui.account(&id).unwrap())
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "latest@example.com"));
+        let reply = signed_in_as(&mut app, &id, "latest@example.com");
+        let _ = app.update(reply);
         let _ = app.update(Message::AccountUi(captured));
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
@@ -6547,7 +7759,8 @@ mod app_tests {
         let unavailable = app.account_ui.account(&id).unwrap();
         assert!(!unavailable.present);
         assert!(app.account_ui.shown_in_switcher(unavailable));
-        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let reply = signed_in_as(&mut app, &id, "actual@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.account_origin(state), "Linked account");
         assert!(app.account_ui.shown_in_switcher(state));
@@ -6579,12 +7792,14 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // Something replaced the credentials in its home.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         let recorded = |app: &Cagents| {
             app.account_ui
                 .registry
@@ -6610,7 +7825,8 @@ mod app_tests {
         );
         assert_eq!(login_changes_noticed(&app), 1, "reported, not absorbed");
         // Once per change, not on every probe.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1);
         assert_eq!(recorded(&app), "work@example.com");
 
@@ -6623,7 +7839,8 @@ mod app_tests {
             state.signing_in_from = state.identity.clone();
         };
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         assert!(
             app.account_ui
@@ -6634,14 +7851,16 @@ mod app_tests {
             "the sign-in is still watched for"
         );
         // Signed back in to the login it was added with: nothing to adopt.
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
         assert!(!state.schedule.awaiting_login(now_ms()));
         // A different login after sign-in still requires explicit acceptance.
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        let reply = signed_in_as(&mut app, &id, "new@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         accept_reported_login(&mut app, &id);
         assert_eq!(recorded(&app), "new@example.com");
@@ -6656,10 +7875,15 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         // Its token expired: signed out, still the account it was.
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6679,23 +7903,27 @@ mod app_tests {
         state.signing_in_from = state.identity.clone();
 
         // Signed back in to the same login: the sign-in is over.
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert_eq!(state.signing_in_from, None);
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // A login that replaces it afterwards is reported, not adopted.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
         );
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1, "once per login");
         // Replaced again, by yet another login: that is a change of its own.
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 2);
     }
 
@@ -6720,7 +7948,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let changed = Identity {
             email: Some("personal@example.com".into()),
             ..Identity::default()
@@ -6728,7 +7957,8 @@ mod app_tests {
 
         // Another window signed it in to the login it now reports: the
         // registry it saved says so, and there is nothing to report.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             login_changes_noticed(&app),
             0,
@@ -6744,13 +7974,16 @@ mod app_tests {
         // Replaced behind every window's back: the registry still records
         // the login it was last signed in to, so the change is reported -
         // once, however many probes answer while the registry is read.
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(app.account_ui.login_changes_unconfirmed.len(), 1);
         let on_disk = app.account_ui.registry.clone();
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(on_disk))));
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1);
     }
 
@@ -6762,8 +7995,10 @@ mod app_tests {
         let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 0);
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Err(
             "unreadable".into(),
@@ -6782,7 +8017,8 @@ mod app_tests {
             &["one@example.com", "two@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(&app, id, "one@example.com"));
+            let reply = signed_in_as(&mut app, id, "one@example.com");
+            let _ = app.update(reply);
         }
         let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
         // The second home was added as another login: that is the louder
@@ -6803,6 +8039,211 @@ mod app_tests {
         let _ = app.accounts_pane();
     }
 
+    /// The answer a probe of `id` gives: `identity`, with a weekly allowance
+    /// that resets at `weekly_reset`, in Unix seconds.
+    fn probe_answered(
+        app: &mut Cagents,
+        id: &AccountId,
+        identity: Identity,
+        weekly_reset: Option<i64>,
+    ) -> Message {
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        snapshot.detail = None;
+        snapshot.windows = weekly_reset
+            .map(|resets_at| UsageWindow {
+                key: "weekly_all".into(),
+                kind: account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 0.1,
+                resets_at: Some(resets_at),
+                span_secs: Some(7 * 86_400),
+                binding: false,
+            })
+            .into_iter()
+            .collect();
+        Message::AccountUi(Action::Probed {
+            owner,
+            ticket,
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: Some(identity),
+                snapshot,
+            },
+        })
+    }
+
+    fn email(address: &str) -> Identity {
+        Identity {
+            email: Some(address.into()),
+            ..Identity::default()
+        }
+    }
+
+    #[test]
+    fn a_login_whose_records_disagree_is_an_identity_conflict_and_never_a_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let accounts = linked_logins(
+            &mut app,
+            directory.path(),
+            &["same@example.com", "same@example.com"],
+        );
+        let disputed = Identity {
+            disputed_by: Some("other@example.com".into()),
+            ..email("same@example.com")
+        };
+        let reply = probe_answered(&mut app, &accounts[0].1, disputed, None);
+        let _ = app.update(reply);
+        let reply = probe_answered(&mut app, &accounts[1].1, email("same@example.com"), None);
+        let _ = app.update(reply);
+        let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
+        assert_eq!(
+            app.account_ui.login_conflict(state(0)),
+            Some(LoginConflict::Disputed {
+                reported: "same@example.com".into(),
+                other: "other@example.com".into(),
+            })
+        );
+        // Both names it might be are shown wherever the account is offered;
+        // its own row lists the other beneath the address it reports.
+        assert!(
+            app.account_ui
+                .display_name(state(0))
+                .ends_with("same@example.com or other@example.com")
+        );
+        // The row reporting the same login is not taken for its duplicate.
+        assert_eq!(
+            app.account_ui.login_conflict(state(1)),
+            Some(LoginConflict::Contradicted {
+                with: app.account_ui.referred_name(state(0)),
+                because: Contradiction::Disputed,
+            })
+        );
+        // The other row's message names it by the address it reports; its
+        // own message names both.
+        let with = app.account_ui.referred_name(state(0));
+        assert!(with.ends_with("same@example.com") && !with.contains(" or "));
+        assert!(
+            app.account_ui
+                .login_conflict(state(1))
+                .unwrap()
+                .detail()
+                .starts_with(&format!("Reports the same login as {with}, whose records"))
+        );
+        for index in [0, 1] {
+            assert_eq!(
+                app.account_ui.login_conflict(state(index)).unwrap().label(),
+                "Identity conflict"
+            );
+            assert!(app.account_ui.duplicate_to_keep(state(index)).is_none());
+        }
+        let _ = app.accounts_pane();
+    }
+
+    #[test]
+    fn one_login_reported_by_homes_with_separate_weekly_limits_is_an_identity_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = (NOW / 1000) as i64;
+        for (second_reset, separate) in [
+            (now + 5 * 86_400, true),
+            // Rounded, or reported a moment apart: still one allowance.
+            (now + 2 * 86_400 + 1_800, false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let root = directory.path().join(second_reset.to_string());
+            std::fs::create_dir_all(&root).unwrap();
+            let accounts =
+                linked_logins(&mut app, &root, &["same@example.com", "same@example.com"]);
+            let reply = probe_answered(
+                &mut app,
+                &accounts[0].1,
+                email("same@example.com"),
+                Some(now + 2 * 86_400),
+            );
+            let _ = app.update(reply);
+            let reply = probe_answered(
+                &mut app,
+                &accounts[1].1,
+                email("same@example.com"),
+                Some(second_reset),
+            );
+            let _ = app.update(reply);
+            app.account_ui.now_ms = NOW;
+            let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
+            let with = app.account_ui.referred_name(state(0));
+            if separate {
+                assert_eq!(
+                    app.account_ui.login_conflict(state(1)),
+                    Some(LoginConflict::Contradicted {
+                        with,
+                        because: Contradiction::SeparateAllowances,
+                    })
+                );
+                assert!(app.account_ui.duplicate_to_keep(state(1)).is_none());
+            } else {
+                assert_eq!(
+                    app.account_ui.login_conflict(state(1)),
+                    Some(LoginConflict::SameLogin { with })
+                );
+                assert!(app.account_ui.duplicate_to_keep(state(1)).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn an_accounts_file_written_from_scratch_replaces_the_one_the_window_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("registry"));
+        let mut app = context_inspector_test_app(false);
+        for name in ["one", "two", "three"] {
+            store
+                .update(|registry| {
+                    registry.set_label(&Account::system(Provider::Codex), Some(name.into()))
+                })
+                .unwrap();
+        }
+        let held = store.load().unwrap();
+        app.account_ui.set_registry(held.clone());
+        assert_eq!(app.account_ui.registry.revision(), 3);
+        let (earlier, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("four".into()))
+            })
+            .unwrap();
+        // An older copy of the same file, answered late, is left alone.
+        app.account_ui.set_registry(earlier.clone());
+        app.account_ui.set_registry(held.clone());
+        assert_eq!(app.account_ui.registry, earlier);
+
+        // The file is lost and written again from scratch, at a revision
+        // below the one the window holds.
+        let path = directory.path().join("registry").join("accounts.toml");
+        std::fs::remove_file(&path).unwrap();
+        let (replaced, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("again".into()))
+            })
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let replaced_copy = store.load().unwrap();
+        assert!(replaced.revision() < earlier.revision());
+        app.account_ui.set_registry(replaced_copy.clone());
+        assert_eq!(app.account_ui.registry, replaced_copy);
+        assert_eq!(
+            app.account_ui
+                .registry
+                .label(&Account::system(Provider::Codex)),
+            Some("again")
+        );
+    }
+
     #[test]
     fn archiving_a_duplicate_keeps_existing_session_resolution() {
         let directory = tempfile::tempdir().unwrap();
@@ -6813,7 +8254,8 @@ mod app_tests {
             &["same@example.com", "same@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(&app, id, "same@example.com"));
+            let reply = signed_in_as(&mut app, id, "same@example.com");
+            let _ = app.update(reply);
         }
         let (_, duplicate) = &accounts[1];
         let home = app
@@ -6866,8 +8308,12 @@ mod app_tests {
             span_secs: None,
             binding: false,
         }];
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6878,8 +8324,12 @@ mod app_tests {
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.present);
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Failed("timed out".into()),
         }));
@@ -6891,8 +8341,12 @@ mod app_tests {
         // nothing - not the figures, and not who the account belongs to.
         let mut older = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW - 1);
         older.source = UsageSource::Cache;
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6900,6 +8354,7 @@ mod app_tests {
                     email: Some("someone@example.com".into()),
                     organization: None,
                     plan: None,
+                    disputed_by: None,
                 }),
                 snapshot: older,
             },
@@ -6908,6 +8363,1231 @@ mod app_tests {
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         assert_eq!(state.identity, None);
         assert!(!state.schedule.in_flight(NOW));
+    }
+
+    #[test]
+    fn a_delayed_probe_cannot_rewind_live_exhaustion_or_readmit_an_alternate() {
+        // A delay longer than clock slack still cannot rewind a reading
+        // stamped in the present; only a future current stamp signals rollback.
+        for (source, delay) in [
+            (UsageSource::Probe, 1_000),
+            (UsageSource::Probe, schedule::CLOCK_SLACK + 1_000),
+            (UsageSource::Cache, 1_000),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 1938);
+            let recipe = recipe_on(&app, &id);
+            let t2 = now_ms();
+            let t1 = t2 - delay;
+            let current = Account::system(Provider::Claude);
+            app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                Some(UsageSnapshot::state(UsageStatus::Limited, "", t2));
+            let key = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .account
+                .registry_key()
+                .unwrap();
+            let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+            identity.plan = Some("current plan".into());
+            let previous = account::claude::parse_usage(
+                &serde_json::json!({
+                    "subscription_type": "current quota plan",
+                    "rate_limits": {"limits": [{"kind": "session", "percent": 20.0}]},
+                }),
+                t1 - 1_000,
+            );
+            let (owner, ticket) = {
+                let state = app.account_ui.account_mut(&id).unwrap();
+                state.identity = Some(identity.clone());
+                state.snapshot = Some(previous.clone());
+                state.schedule.succeed(previous.observed_at);
+                let ticket = state.start_probe(Trigger::Focus, t1);
+                (state.owner, ticket)
+            };
+            assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+            let mut delayed = previous;
+            delayed.source = source;
+            delayed.observed_at = t1;
+            let mut old_identity = identity.clone();
+            old_identity.plan = Some("older plan".into());
+            let held = Message::AccountUi(Action::Probed {
+                owner,
+                ticket,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: Some(old_identity),
+                    snapshot: delayed,
+                },
+            });
+            let rejection = LiveReport::Claude(
+                account::claude::parse_rate_limit_event(&serde_json::json!({
+                    "status": "rejected",
+                    "unifiedWindows": {"five_hour": {"utilization": 1.0}},
+                }))
+                .unwrap(),
+            );
+            // The real reducers run; returned tasks stay unpolled, so no
+            // provider, daemon or durable account operation is executed.
+            drop(app.account_reported(Provider::Claude, &recipe, vec![(rejection, t2)]));
+            let state = app.account_ui.account(&id).unwrap();
+            let live = state.snapshot.clone().unwrap();
+            assert_eq!(live.status, UsageStatus::Limited);
+            assert_eq!(live.source, UsageSource::Live);
+            assert_eq!(live.observed_at, t2);
+            assert_eq!(state.owner, owner);
+            assert!(state.schedule.in_flight(t2));
+            assert!(app.automatic_account(&current).is_none());
+
+            drop(app.update(held));
+
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref(), Some(&live), "{source:?}");
+            assert_eq!(state.identity.as_ref(), Some(&identity), "{source:?}");
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert!(!state.schedule.in_flight(t2));
+            assert!(!state.schedule.should_probe(
+                Trigger::Tick,
+                t2 + schedule::REFRESH_INTERVAL - 1,
+                true,
+            ));
+            assert!(state.schedule.should_probe(
+                Trigger::Tick,
+                t2 + schedule::REFRESH_INTERVAL,
+                true,
+            ));
+            assert!(app.automatic_account(&current).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn probes_after_live_usage_accept_newer_readings_and_clock_rollback() {
+        for clock_rolled_back in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 1939);
+            let recipe = recipe_on(&app, &id);
+            let now = now_ms();
+            let live_at = if clock_rolled_back {
+                now + 10 * schedule::CLOCK_SLACK
+            } else {
+                now - 1_000
+            };
+            {
+                let state = app.account_ui.account_mut(&id).unwrap();
+                state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", live_at - 1));
+                state.schedule.succeed(live_at - 1);
+                state.start_probe(Trigger::Focus, now);
+            }
+            let rejection = LiveReport::Claude(
+                account::claude::parse_rate_limit_event(&serde_json::json!({"status": "rejected"}))
+                    .unwrap(),
+            );
+            drop(app.account_reported(Provider::Claude, &recipe, vec![(rejection, live_at)]));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+            assert_eq!(state.snapshot.as_ref().unwrap().observed_at, live_at);
+            let owner = state.owner;
+            let ticket = state.pending_probe.clone().unwrap();
+            let key = state.account.registry_key().unwrap();
+            let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+            identity.plan = Some("fresh probe plan".into());
+            let current = Account::system(Provider::Claude);
+            app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+            app.account_ui.account_mut(&id).unwrap().failure = Some("previous failure".into());
+            let fresh = account::claude::parse_usage(
+                &serde_json::json!({
+                    "rate_limits": {"limits": [{"kind": "session", "percent": 30.0}]},
+                }),
+                now,
+            );
+
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                ticket,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: Some(identity.clone()),
+                    snapshot: fresh.clone(),
+                },
+            })));
+
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref(), Some(&fresh), "{clock_rolled_back}");
+            assert_eq!(state.identity.as_ref(), Some(&identity));
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert!(!state.schedule.in_flight(now));
+            assert_eq!(state.schedule.failures(), 0);
+            assert!(!state.schedule.should_probe(
+                Trigger::Tick,
+                now + schedule::REFRESH_INTERVAL - 1,
+                true,
+            ));
+            assert!(state.schedule.should_probe(
+                Trigger::Tick,
+                now + schedule::REFRESH_INTERVAL,
+                true,
+            ));
+            assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CollectedProbeCase {
+        Delayed,
+        DelayedPastSlackWithNewerCatalog,
+        Newer,
+        ClockRollback,
+        SignedOut,
+        MissingCatalog,
+    }
+
+    fn assert_collected_probe_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
+    }
+
+    async fn collected_quota_interleaving(provider: Provider, case: CollectedProbeCase) {
+        use probe::collector_fixture::{Frames, held_outcome};
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        let mut app = context_inspector_test_app(false);
+        assert!(app.account_ui.cache.is_none());
+        assert!(app.account_ui.store.is_none());
+        let id = app.account_ui.add_managed_fixture(provider, 2017);
+        let recipe = recipe_on(&app, &id);
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let current = Account::system(provider);
+        let now = now_ms();
+        let delay = if matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog) {
+            schedule::CLOCK_SLACK + 1_000
+        } else {
+            1_000
+        };
+        let quota_at = if matches!(
+            case,
+            CollectedProbeCase::Newer | CollectedProbeCase::ClockRollback
+        ) {
+            now
+        } else {
+            now - delay
+        };
+        let live_at = match case {
+            CollectedProbeCase::Newer => now - 1_000,
+            CollectedProbeCase::ClockRollback => now + 10 * schedule::CLOCK_SLACK,
+            _ => now,
+        };
+        let auth_at = now + 1_000;
+        let models_at = auth_at + 1;
+        let signed_out = matches!(case, CollectedProbeCase::SignedOut);
+        let missing_catalog = matches!(case, CollectedProbeCase::MissingCatalog);
+        let keep_live = matches!(
+            case,
+            CollectedProbeCase::Delayed
+                | CollectedProbeCase::DelayedPastSlackWithNewerCatalog
+                | CollectedProbeCase::MissingCatalog
+        );
+        app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+        let key = account.registry_key().unwrap();
+        let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+        identity.plan = Some("retained plan".into());
+        let email = identity.email.clone().unwrap();
+        let quota = match provider {
+            Provider::Claude => serde_json::json!({
+                "subscription_type":"collected plan",
+                "rate_limits":{"limits":[{"kind":"session","percent":20.0}]},
+            }),
+            Provider::Codex => serde_json::json!({
+                "ordinaryUsageAllowed":true,
+                "rateLimits":{"limitId":"codex","primary":{
+                    "usedPercent":20.0,"windowDurationMins":300}},
+            }),
+            _ => unreachable!("this fixture exercises the two real collectors"),
+        };
+        let previous = match provider {
+            Provider::Claude => account::claude::parse_usage(&quota, quota_at - 1_000),
+            Provider::Codex => account::codex::parse_rate_limits(&quota, quota_at - 1_000),
+            _ => unreachable!(),
+        };
+        let (owner, ticket) = {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.identity = Some(identity.clone());
+            state.snapshot = Some(previous.clone());
+            state.schedule.succeed(previous.observed_at);
+            let ticket = state.start_probe(Trigger::Focus, quota_at);
+            (state.owner, ticket)
+        };
+        assert_eq!(
+            app.automatic_account(&current).unwrap().id(),
+            id,
+            "{case:?}"
+        );
+        let catalog = |observed_at, name: &str| Catalog {
+            observed_at,
+            models: vec![crate::chat::Model {
+                id: name.into(),
+                label: name.into(),
+                reasoning: Vec::new(),
+            }],
+        };
+        let known_catalog = catalog(
+            if matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog) {
+                models_at + 10
+            } else {
+                quota_at - 2
+            },
+            "fixture-known-model",
+        );
+        assert!(
+            app.account_ui
+                .take_catalog(provider, known_catalog.clone(), now)
+        );
+        let other_provider = if provider == Provider::Claude {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        };
+        let other_catalog = catalog(now, "fixture-unrelated-model");
+        assert!(
+            app.account_ui
+                .take_catalog(other_provider, other_catalog.clone(), now)
+        );
+        let (frames, observations) = match provider {
+            Provider::Claude => (
+                Frames::Claude {
+                    initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":if missing_catalog { serde_json::json!([]) } else {
+                        serde_json::json!([{"value":"opus"}])
+                    }}}}),
+                    quota: serde_json::json!({"type":"control_response","response":{
+                        "subtype":"success","request_id":"cagents-usage","response":quota}}),
+                    auth: serde_json::json!({"loggedIn":!signed_out,"email":email,
+                        "subscriptionType":"collected auth plan"}),
+                },
+                vec![quota_at - 1, quota_at, auth_at],
+            ),
+            Provider::Codex => (
+                Frames::Codex {
+                    quota: serde_json::json!({"id":3,"result":quota}),
+                    account: if signed_out {
+                        serde_json::json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}})
+                    } else {
+                        serde_json::json!({"id":2,"result":{"account":{
+                            "type":"chatgpt","email":email,"planType":"collected auth plan"},
+                            "requiresOpenaiAuth":true}})
+                    },
+                    models: (!missing_catalog).then(|| {
+                        serde_json::json!({"id":4,"result":{
+                        "data":[{"model":"gpt-5"}]}})
+                    }),
+                },
+                if missing_catalog {
+                    vec![quota_at, auth_at]
+                } else {
+                    vec![quota_at, auth_at, models_at]
+                },
+            ),
+            _ => unreachable!(),
+        };
+        // Only actual matched collector observations consume this local clock.
+        // No system/provider clock changes and no completion-time stamping.
+        let clock = RefCell::new(VecDeque::from(observations));
+        let (quota_seen, mut quota_observed) = oneshot::channel();
+        let (nonquota_ready, nonquota_wait) = oneshot::channel();
+        let (close_ready, close_wait) = oneshot::channel();
+        let mut completion = Box::pin(held_outcome(
+            account.clone(),
+            frames,
+            || {
+                clock
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected collector clock read")
+            },
+            quota_seen,
+            nonquota_wait,
+            close_wait,
+        ));
+        assert_collected_probe_pending(completion.as_mut());
+        assert!(quota_observed.try_recv().is_ok());
+        assert_eq!(
+            clock.borrow().len(),
+            if provider == Provider::Codex && !missing_catalog {
+                2
+            } else {
+                1
+            }
+        );
+        let rejection = match provider {
+            Provider::Claude => LiveReport::Claude(
+                account::claude::parse_rate_limit_event(
+                    &serde_json::json!({"status":"rejected","unifiedWindows":{
+                    "five_hour":{"utilization":1.0}}}),
+                )
+                .unwrap(),
+            ),
+            Provider::Codex => LiveReport::CodexLimits(
+                account::codex::parse_update(&serde_json::json!({"rateLimits":{"limitId":"codex",
+                    "rateLimitReachedType":"fixture-exhausted",
+                    "primary":{"usedPercent":100.0,"windowDurationMins":300}}}))
+                .unwrap(),
+            ),
+            _ => unreachable!(),
+        };
+        drop(app.account_reported(provider, &recipe, vec![(rejection, live_at)]));
+        let state = app.account_ui.account(&id).unwrap();
+        let live = state.snapshot.clone().unwrap();
+        assert_eq!(live.status, UsageStatus::Limited, "{case:?}");
+        assert_eq!(live.source, UsageSource::Live);
+        assert_eq!(live.observed_at, live_at);
+        assert_eq!(state.owner, owner);
+        assert!(state.schedule.in_flight(now));
+        assert!(app.automatic_account(&current).is_none());
+
+        nonquota_ready.send(()).unwrap();
+        assert_collected_probe_pending(completion.as_mut());
+        assert!(clock.borrow().is_empty());
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&live)
+        );
+        close_ready.send(()).unwrap();
+        let outcome = completion.await.unwrap();
+        let (produced_identity, produced_snapshot, produced_catalog) = match &outcome {
+            Outcome::Answered {
+                identity,
+                snapshot,
+                catalog,
+            } => (identity.clone(), snapshot.clone(), catalog.clone()),
+            _ => panic!("actual collector/finisher must build the answer"),
+        };
+        assert_eq!(produced_snapshot.source, UsageSource::Probe);
+        assert_eq!(
+            produced_snapshot.observed_at,
+            if signed_out { auth_at } else { quota_at }
+        );
+        assert_eq!(
+            produced_snapshot.status,
+            if signed_out {
+                UsageStatus::NeedsLogin
+            } else {
+                UsageStatus::Ok
+            }
+        );
+        assert!(clock.borrow().is_empty());
+        if signed_out {
+            assert!(produced_identity.is_none());
+        } else {
+            assert_eq!(produced_identity.as_ref().unwrap().email, identity.email);
+            assert!(!produced_snapshot.windows.is_empty());
+        }
+        if missing_catalog {
+            assert!(produced_catalog.is_none());
+        } else {
+            let listed = produced_catalog.as_ref().unwrap();
+            assert_eq!(
+                listed.observed_at,
+                if provider == Provider::Claude {
+                    quota_at - 1
+                } else {
+                    models_at
+                }
+            );
+            assert_eq!(
+                listed.models[0].id,
+                if provider == Provider::Claude {
+                    "opus"
+                } else {
+                    "gpt-5"
+                }
+            );
+        }
+        // The Outcome is untouched: only the actual production finisher built
+        // it. Returned UI/provider/cache Tasks remain unpolled.
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner,
+            ticket,
+            id: id.clone(),
+            outcome,
+        })));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.owner, owner);
+        assert_eq!(state.account, account);
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert!(!state.schedule.in_flight(now));
+        assert_eq!(state.schedule.failures(), 0);
+        if keep_live {
+            assert_eq!(state.snapshot.as_ref(), Some(&live), "{case:?}");
+            assert_eq!(state.identity.as_ref(), Some(&identity));
+            assert!(app.automatic_account(&current).is_none());
+        } else {
+            assert_eq!(
+                state.snapshot.as_ref(),
+                Some(&produced_snapshot),
+                "{case:?}"
+            );
+            assert_eq!(
+                state.identity.as_ref(),
+                produced_identity.as_ref().or(Some(&identity))
+            );
+            if signed_out {
+                assert!(app.automatic_account(&current).is_none());
+            } else {
+                assert_eq!(
+                    app.automatic_account(&current).unwrap().id(),
+                    id,
+                    "{case:?}"
+                );
+            }
+        }
+        let observed_at = if keep_live {
+            live_at
+        } else {
+            produced_snapshot.observed_at
+        };
+        assert!(!state.schedule.should_probe(
+            Trigger::Tick,
+            observed_at + schedule::REFRESH_INTERVAL - 1,
+            true
+        ));
+        assert!(state.schedule.should_probe(
+            Trigger::Tick,
+            observed_at + schedule::REFRESH_INTERVAL,
+            true
+        ));
+        let expected_catalog = if missing_catalog
+            || matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog)
+        {
+            known_catalog
+        } else {
+            produced_catalog.expect("this case must publish its independently observed list")
+        };
+        assert_eq!(app.account_ui.catalog(provider), Some(&expected_catalog));
+        assert_eq!(app.account_ui.catalog(other_provider), Some(&other_catalog));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_collected_quota_does_not_rewind_newer_live_rejection() {
+        for case in [
+            CollectedProbeCase::Delayed,
+            CollectedProbeCase::DelayedPastSlackWithNewerCatalog,
+            CollectedProbeCase::Newer,
+            CollectedProbeCase::ClockRollback,
+            CollectedProbeCase::SignedOut,
+            CollectedProbeCase::MissingCatalog,
+        ] {
+            collected_quota_interleaving(Provider::Claude, case).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_collected_quota_does_not_rewind_newer_live_rejection() {
+        for case in [
+            CollectedProbeCase::Delayed,
+            CollectedProbeCase::DelayedPastSlackWithNewerCatalog,
+            CollectedProbeCase::Newer,
+            CollectedProbeCase::ClockRollback,
+            CollectedProbeCase::SignedOut,
+            CollectedProbeCase::MissingCatalog,
+        ] {
+            collected_quota_interleaving(Provider::Codex, case).await;
+        }
+    }
+
+    async fn collected_ticket_answer(
+        app: &Cagents,
+        id: &AccountId,
+        quota_at: Millis,
+        catalog_at: Millis,
+    ) -> Outcome {
+        use probe::collector_fixture::{Frames, held_outcome};
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        let account = app.account_ui.account(id).unwrap().account.clone();
+        let email = app
+            .account_ui
+            .registry
+            .find(account.registry_key().unwrap())
+            .unwrap()
+            .identity()
+            .email
+            .unwrap();
+        let (frames, observations) = match account.provider {
+            Provider::Claude => (
+                Frames::Claude {
+                    initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":[{"value":"opus"}]}}}),
+                    quota: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage","response":{
+                        "rate_limits":{"limits":[{"kind":"session","percent":20.0}]}}}}),
+                    auth: serde_json::json!({"loggedIn":true,"email":email.clone()}),
+                },
+                vec![catalog_at, quota_at, quota_at + 1],
+            ),
+            Provider::Codex => (
+                Frames::Codex {
+                    quota: serde_json::json!({"id":3,"result":{"ordinaryUsageAllowed":true,
+                    "rateLimits":{"limitId":"codex","primary":{
+                        "usedPercent":20.0,"windowDurationMins":300}}}}),
+                    account: serde_json::json!({"id":2,"result":{"account":{
+                    "type":"chatgpt","email":email.clone()},"requiresOpenaiAuth":true}}),
+                    models: Some(serde_json::json!({"id":4,"result":{
+                    "data":[{"model":"gpt-5"}]}})),
+                },
+                vec![quota_at, quota_at + 1, catalog_at],
+            ),
+            _ => unreachable!("the two scheduled CLI collectors"),
+        };
+        let clock = RefCell::new(VecDeque::from(observations));
+        let (seen, mut observed) = oneshot::channel();
+        let (ready, wait) = oneshot::channel();
+        let (closed, close) = oneshot::channel();
+        ready.send(()).unwrap();
+        closed.send(()).unwrap();
+        let outcome = held_outcome(
+            account,
+            frames,
+            || {
+                clock
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("only matched observations read this clock")
+            },
+            seen,
+            wait,
+            close,
+        )
+        .await
+        .unwrap();
+        assert!(observed.try_recv().is_ok());
+        assert!(clock.borrow().is_empty());
+        let Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        } = &outcome
+        else {
+            panic!("the real collector and finisher must build the answer");
+        };
+        assert_eq!(
+            identity.as_ref().unwrap().email.as_deref(),
+            Some(email.as_str())
+        );
+        assert_eq!(snapshot.source, UsageSource::Probe);
+        assert_eq!(snapshot.status, UsageStatus::Ok);
+        assert_eq!(snapshot.observed_at, quota_at);
+        assert!(!snapshot.windows.is_empty());
+        assert_eq!(catalog.as_ref().unwrap().observed_at, catalog_at);
+        outcome
+    }
+
+    async fn seed_ticket_account(app: &mut Cagents, id: &AccountId, now: Millis) {
+        let Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        } = collected_ticket_answer(app, id, now, now - 1).await
+        else {
+            unreachable!()
+        };
+        let state = app.account_ui.account_mut(id).unwrap();
+        state.present = true;
+        state.identity = identity;
+        state.schedule.succeed(snapshot.observed_at);
+        state.snapshot = Some(snapshot);
+        let provider = state.account.provider;
+        app.account_ui.take_catalog(provider, catalog.unwrap(), now);
+    }
+
+    fn admit_actual_ticket(app: &mut Cagents, id: &AccountId, now: Millis) -> (u64, ProbeTicket) {
+        // This runs the actual gates and scheduling admission, but never polls
+        // a provider, remote request, cache or process task.
+        drop(
+            app.probe_account(id, Trigger::Manual, now)
+                .expect("actual probe admission"),
+        );
+        (
+            app.account_ui.probe_owner(id).unwrap(),
+            app.account_ui.pending_probe_for_test(id).unwrap(),
+        )
+    }
+
+    type ProbeRowEffects = (
+        AccountId,
+        u64,
+        Account,
+        bool,
+        Option<Identity>,
+        Option<UsageSnapshot>,
+        Schedule,
+        Option<String>,
+        Option<Trigger>,
+        (Option<Identity>, Option<TerminalId>),
+    );
+    type ProbeReplyEffects = (
+        Millis,
+        Registry,
+        BTreeMap<Provider, Catalog>,
+        Option<AccountId>,
+        Vec<ProbeRowEffects>,
+        (
+            BTreeMap<AccountId, Identity>,
+            BTreeSet<AccountId>,
+            BTreeSet<AccountId>,
+            BTreeSet<Provider>,
+            bool,
+        ),
+    );
+
+    fn probe_reply_effects(app: &Cagents) -> ProbeReplyEffects {
+        let ui = &app.account_ui;
+        (
+            ui.now_ms,
+            ui.registry.clone(),
+            ui.catalogs.clone(),
+            ui.popover.clone(),
+            ui.accounts
+                .iter()
+                .map(|state| {
+                    (
+                        state.id.clone(),
+                        state.owner,
+                        state.account.clone(),
+                        state.present,
+                        state.identity.clone(),
+                        state.snapshot.clone(),
+                        state.schedule.clone(),
+                        state.failure.clone(),
+                        state.queued,
+                        (state.signing_in_from.clone(), state.sign_in_terminal),
+                    )
+                })
+                .collect(),
+            (
+                ui.login_changes_reported.clone(),
+                ui.login_changes_unconfirmed.clone(),
+                ui.live_unsaved.clone(),
+                ui.catalogs_unsaved.clone(),
+                ui.saving_live,
+            ),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_probe_replies_cannot_consume_a_successor_slot() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for completion in ["answered", "failed", "busy"] {
+                let mut app = context_inspector_test_app(false);
+                app.refresh_ui.focused = true;
+                assert!(app.account_ui.cache.is_none() && app.account_ui.store.is_none());
+                let id = app.account_ui.add_managed_fixture(provider, 1938001);
+                let queued = app.account_ui.add_managed_fixture(provider, 1938002);
+                let recipe = recipe_on(&app, &id);
+                let now = now_ms();
+                let first = now - schedule::IN_FLIGHT_LIMIT - 1;
+                seed_ticket_account(&mut app, &id, first - 1_000).await;
+                let current = Account::system(provider);
+                app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                    Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+                let (owner, a) = admit_actual_ticket(&mut app, &id, first);
+                // Rejected in-flight/busy admissions cannot replace a ticket.
+                assert!(app.probe_account(&id, Trigger::Manual, first + 1).is_none());
+                assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&a));
+                assert!(
+                    app.probe_account(&queued, Trigger::Manual, first + 1)
+                        .is_none()
+                );
+                assert!(app.account_ui.pending_probe_for_test(&queued).is_none());
+                let outcome = match completion {
+                    "answered" => collected_ticket_answer(&app, &id, first + 1, now + 10).await,
+                    "failed" => Outcome::Failed("original A failed".into()),
+                    "busy" => Outcome::Busy,
+                    _ => unreachable!(),
+                };
+                let old = Action::Probed {
+                    owner,
+                    id: id.clone(),
+                    ticket: a,
+                    outcome,
+                };
+                let rejection = match provider {
+                    Provider::Claude => LiveReport::Claude(
+                        account::claude::parse_rate_limit_event(
+                            &serde_json::json!({"status":"rejected","unifiedWindows":{
+                            "five_hour":{"utilization":1.0}}}),
+                        )
+                        .unwrap(),
+                    ),
+                    Provider::Codex => LiveReport::CodexLimits(
+                        account::codex::parse_update(
+                            &serde_json::json!({"rateLimits":{"limitId":"codex",
+                            "rateLimitReachedType":"fixture-exhausted","primary":{
+                                "usedPercent":100.0,"windowDurationMins":300}}}),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                drop(app.account_reported(provider, &recipe, vec![(rejection, now - 1)]));
+                assert!(app.automatic_account(&current).is_none());
+                let (same_owner, b) = admit_actual_ticket(&mut app, &id, now);
+                assert_eq!(same_owner, owner);
+                let state = app.account_ui.account_mut(&id).unwrap();
+                // A stale completion must not even refresh this login watch.
+                state.schedule.await_login(now);
+                state.signing_in_from = state.identity.clone();
+                state.sign_in_terminal = Some(TerminalId::new());
+                state.failure = Some("previous failure retained while B runs".into());
+                app.account_ui.account_mut(&queued).unwrap().queued = Some(Trigger::Focus);
+                let before = probe_reply_effects(&app);
+                drop(app.update(Message::AccountUi(old.clone())));
+                assert_eq!(
+                    probe_reply_effects(&app),
+                    before,
+                    "{provider:?} {completion}"
+                );
+                assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&b));
+                assert!(app.account_ui.pending_probe_for_test(&queued).is_none());
+                assert!(app.automatic_account(&current).is_none());
+
+                let outcome = collected_ticket_answer(&app, &id, now, now + 20).await;
+                let expected = outcome.clone();
+                let current_reply = Action::Probed {
+                    owner,
+                    id: id.clone(),
+                    ticket: b,
+                    outcome,
+                };
+                drop(app.update(Message::AccountUi(current_reply.clone())));
+                let Outcome::Answered {
+                    identity,
+                    snapshot,
+                    catalog,
+                } = expected
+                else {
+                    unreachable!()
+                };
+                let state = app.account_ui.account(&id).unwrap();
+                assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                assert_eq!(state.identity, identity);
+                assert!(state.failure.is_none());
+                assert!(!state.schedule.in_flight(now));
+                assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+                let queued_ticket = app.account_ui.pending_probe_for_test(&queued).unwrap();
+                let settled = probe_reply_effects(&app);
+                for duplicate in [old, current_reply] {
+                    drop(app.update(Message::AccountUi(duplicate)));
+                    assert_eq!(probe_reply_effects(&app), settled);
+                    assert!(
+                        app.account_ui
+                            .pending_probe_for_test(&queued)
+                            .unwrap()
+                            .same(&queued_ticket)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_completion_tickets_are_single_use_across_successor_and_owner_changes() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 1938003);
+        let other = app
+            .account_ui
+            .add_managed_fixture(Provider::Claude, 1938004);
+        let now = now_ms();
+        let first = now - schedule::IN_FLIGHT_LIMIT - 1;
+        seed_ticket_account(&mut app, &id, first - 1_000).await;
+        seed_ticket_account(&mut app, &other, first - 1_000).await;
+        let (owner, a) = admit_actual_ticket(&mut app, &id, first);
+        let old = Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket: a,
+            outcome: collected_ticket_answer(&app, &id, first + 1, first + 2).await,
+        };
+        drop(app.update(Message::AccountUi(old.clone())));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        let settled = probe_reply_effects(&app);
+        drop(app.update(Message::AccountUi(old.clone())));
+        assert_eq!(probe_reply_effects(&app), settled);
+
+        let (same_owner, b) = admit_actual_ticket(&mut app, &id, now);
+        assert_eq!(same_owner, owner);
+        let outcome = collected_ticket_answer(&app, &id, now, now + 1).await;
+        let (other_owner, c) = admit_actual_ticket(&mut app, &other, now);
+        let current = probe_reply_effects(&app);
+        for rejected in [
+            old,
+            Action::Probed {
+                owner: other_owner,
+                id: other.clone(),
+                ticket: b.clone(),
+                outcome: outcome.clone(),
+            },
+            Action::Probed {
+                owner: other_owner,
+                id: id.clone(),
+                ticket: b.clone(),
+                outcome: outcome.clone(),
+            },
+        ] {
+            drop(app.update(Message::AccountUi(rejected)));
+            assert_eq!(probe_reply_effects(&app), current);
+            assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&b));
+            assert!(
+                app.account_ui
+                    .pending_probe_for_test(&other)
+                    .unwrap()
+                    .same(&c)
+            );
+        }
+        // Use the actual login lifecycle invalidation. A fresh admission on
+        // the same home has a new owner and a new request identity.
+        app.account_ui.account_mut(&id).unwrap().begin_sign_in(now);
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        let (new_owner, d) = admit_actual_ticket(&mut app, &id, now);
+        assert_ne!(new_owner, owner);
+        let current = probe_reply_effects(&app);
+        for (reply_owner, ticket) in [(owner, b.clone()), (new_owner, b), (owner, d.clone())] {
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner: reply_owner,
+                id: id.clone(),
+                ticket,
+                outcome: outcome.clone(),
+            })));
+            assert_eq!(probe_reply_effects(&app), current);
+            assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&d));
+        }
+        let accepted = Action::Probed {
+            owner: new_owner,
+            id: id.clone(),
+            ticket: d,
+            outcome,
+        };
+        drop(app.update(Message::AccountUi(accepted.clone())));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .observed_at,
+            now
+        );
+        let settled = probe_reply_effects(&app);
+        drop(app.update(Message::AccountUi(accepted)));
+        assert_eq!(probe_reply_effects(&app), settled);
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&other)
+                .unwrap()
+                .same(&c)
+        );
+    }
+
+    fn quota_retention_frames(
+        provider: Provider,
+        quota: serde_json::Value,
+    ) -> probe::collector_fixture::Frames {
+        use probe::collector_fixture::Frames;
+        match provider {
+            Provider::Claude => Frames::Claude {
+                initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":[{"value":"opus"}]}}}),
+                quota: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage","response":quota}}),
+                auth: serde_json::json!({"loggedIn":true,"email":"system@fixture.invalid",
+                    "subscriptionType":"max"}),
+            },
+            Provider::Codex => Frames::Codex {
+                quota: serde_json::json!({"id":3,"result":quota}),
+                account: serde_json::json!({"id":2,"result":{"account":{
+                    "type":"chatgpt","email":"system@fixture.invalid","planType":"pro"},
+                    "requiresOpenaiAuth":true}}),
+                models: Some(serde_json::json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}})),
+            },
+            _ => unreachable!("the two scheduled quota providers"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sparse_quota_completions_retain_known_system_usage_and_recover_on_current_answer() {
+        use probe::collector_fixture::held_completion;
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            for case in ["known-unknown", "known-malformed", "empty-unknown"] {
+                let known = case != "empty-unknown";
+                let mut app = context_inspector_test_app(false);
+                app.refresh_ui.focused = true;
+                assert!(app.account_ui.cache.is_none() && app.account_ui.store.is_none());
+                let exhausted = app.account_ui.add_managed_fixture(provider, 1938005);
+                // This remains a SYSTEM row, with a literal synthetic host
+                // path so routing checks never resolve the user's home.
+                let system = Account {
+                    provider,
+                    home: account::AccountHome::SystemAt {
+                        path: PathBuf::from(format!(
+                            "/cagents-fixture/quota-retention/{}",
+                            provider.executable()
+                        )),
+                    },
+                };
+                let id = system.id();
+                assert!(system.is_system());
+                app.account_ui.account_mut(&id).unwrap().account = system.clone();
+                app.account_ui.registry.set_default(&system);
+                app.account_ui.installed.insert(provider, true);
+                assert!(
+                    !table::row_ids_for_test(&app.account_ui, provider).contains(&id),
+                    "an unobserved system account without an error stays hidden"
+                );
+                let now = now_ms();
+                let first = now - schedule::MANUAL_DEBOUNCE - 1;
+                let prior = now - schedule::STALE_AFTER - 1_000;
+                app.account_ui.account_mut(&exhausted).unwrap().snapshot = Some(match provider {
+                    Provider::Claude => account::claude::parse_usage(
+                        &serde_json::json!({
+                            "rate_limits":{"limits":[{"kind":"session","percent":100.0}]},
+                        }),
+                        now,
+                    ),
+                    Provider::Codex => account::codex::parse_rate_limits(
+                        &serde_json::json!({
+                            "ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex",
+                                "primary":{"usedPercent":100.0,"windowDurationMins":300}},
+                        }),
+                        now,
+                    ),
+                    _ => unreachable!(),
+                });
+                let current = app.account_ui.account(&exhausted).unwrap().account.clone();
+                let valid = match provider {
+                    Provider::Claude => serde_json::json!({"subscription_type":"max",
+                        "rate_limits_available":true,"rate_limits":{
+                            "limits":[{"kind":"session","percent":20.0}],
+                            "spend":{"enabled":true,"percent":25.0,
+                                "used":{"amount_minor":250,"exponent":2,"currency":"USD"},
+                                "limit":{"amount_minor":1000,"exponent":2,"currency":"USD"}}}}),
+                    Provider::Codex => serde_json::json!({"ordinaryUsageAllowed":true,
+                        "rateLimits":{"limitId":"codex","planType":"pro",
+                            "primary":{"usedPercent":20.0,"windowDurationMins":300},
+                            "credits":{"hasCredits":true,"unlimited":false,"balance":"$12.34"}}}),
+                    _ => unreachable!(),
+                };
+                let malformed = match provider {
+                    Provider::Claude => serde_json::json!({"subscription_type":"unusable new plan",
+                        "rate_limits":{"limits":[{"kind":"session","percent":"not a number"}],
+                            "five_hour":{"utilization":"not a number"}}}),
+                    Provider::Codex => serde_json::json!({"rateLimits":{"limitId":"codex",
+                        "planType":"unusable new plan","primary":{"usedPercent":"not a number"}}}),
+                    _ => unreachable!(),
+                };
+                // Seed and recovery also use actual collectors and the real
+                // reducer. No Outcome::Failed/Answered is built in this test.
+                for phase in [0, 1, 2].into_iter().filter(|phase| known || *phase != 0) {
+                    let admitted_at = match phase {
+                        0 => prior - schedule::MANUAL_DEBOUNCE - 1,
+                        1 => first,
+                        _ => now_ms(),
+                    };
+                    let observed_at = match phase {
+                        0 => prior,
+                        1 => now - 200,
+                        _ => admitted_at,
+                    };
+                    let quota = if phase != 1 {
+                        valid.clone()
+                    } else if case == "known-malformed" {
+                        malformed.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    let (owner, ticket) = if phase == 2 {
+                        assert!(table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+                        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                        assert!(
+                            app.account_ui
+                                .account(&id)
+                                .unwrap()
+                                .schedule
+                                .manual_ready(admitted_at)
+                        );
+                        // The row's real Refresh action admits recovery; its
+                        // provider Task stays unpolled, as in the other phases.
+                        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+                        app.settle_discovery_for_test();
+                        (
+                            app.account_ui.probe_owner(&id).unwrap(),
+                            app.account_ui
+                                .pending_probe_for_test(&id)
+                                .expect("the visible row's Refresh admitted recovery"),
+                        )
+                    } else {
+                        admit_actual_ticket(&mut app, &id, admitted_at)
+                    };
+                    let state = app.account_ui.account(&id).unwrap();
+                    let retained = (
+                        state.snapshot.clone(),
+                        state.identity.clone(),
+                        state.present,
+                    );
+                    let retained_catalog = app.account_ui.catalog(provider).cloned();
+                    let waiting = probe_reply_effects(&app);
+                    let clock = RefCell::new(VecDeque::from(match provider {
+                        Provider::Claude => vec![observed_at - 1, observed_at, observed_at + 1],
+                        Provider::Codex => vec![observed_at, observed_at + 1, observed_at + 2],
+                        _ => unreachable!(),
+                    }));
+                    let (seen, mut observed) = oneshot::channel();
+                    let (ready, wait) = oneshot::channel();
+                    let (closed, close) = oneshot::channel();
+                    let mut completion = Box::pin(held_completion(
+                        system.clone(),
+                        quota_retention_frames(provider, quota),
+                        || {
+                            clock
+                                .borrow_mut()
+                                .pop_front()
+                                .expect("matched collector observation")
+                        },
+                        seen,
+                        wait,
+                        close,
+                    ));
+                    assert_collected_probe_pending(completion.as_mut());
+                    assert!(observed.try_recv().is_ok());
+                    assert_eq!(probe_reply_effects(&app), waiting);
+                    ready.send(()).unwrap();
+                    assert_collected_probe_pending(completion.as_mut());
+                    assert!(clock.borrow().is_empty());
+                    assert_eq!(probe_reply_effects(&app), waiting);
+                    closed.send(()).unwrap();
+                    let outcome = completion.await;
+                    let produced = outcome.clone();
+                    drop(app.update(Message::AccountUi(Action::Probed {
+                        owner,
+                        id: id.clone(),
+                        ticket,
+                        outcome,
+                    })));
+                    let finished = app.account_ui.now_ms;
+                    let state = app.account_ui.account(&id).unwrap();
+                    assert_eq!(state.account, system);
+                    assert_eq!(state.owner, owner);
+                    assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                    assert!(!state.schedule.in_flight(finished));
+                    assert!(
+                        table::row_ids_for_test(&app.account_ui, provider).contains(&id),
+                        "{provider:?} {case} phase {phase} keeps the system row discoverable"
+                    );
+                    assert_eq!(app.known_account(&id).as_ref(), Some(&system));
+                    assert_eq!(app.default_account(provider), system);
+                    assert!(
+                        app.default_account_choices()
+                            .iter()
+                            .find(|(p, _)| *p == provider)
+                            .unwrap()
+                            .1
+                            .iter()
+                            .any(|choice| choice.id == id && choice.selected)
+                    );
+                    assert!(
+                        app.automation_account_choices()
+                            .iter()
+                            .any(|choice| choice.id == id)
+                    );
+                    if phase == 1 {
+                        let Outcome::Failed(message) = produced else {
+                            panic!(
+                                "sparse/malformed quota must use the actual transient completion"
+                            );
+                        };
+                        assert!(!message.is_empty());
+                        assert_eq!(
+                            (
+                                state.snapshot.clone(),
+                                state.identity.clone(),
+                                state.present
+                            ),
+                            retained,
+                            "{provider:?} {case}"
+                        );
+                        assert_eq!(state.failure.as_deref(), Some(message.as_str()));
+                        assert_eq!(state.schedule.failures(), 1);
+                        assert!(!state.schedule.should_probe(
+                            Trigger::Focus,
+                            finished + schedule::BACKOFF_BASE - 1,
+                            true
+                        ));
+                        assert!(state.schedule.should_probe(
+                            Trigger::Focus,
+                            finished + schedule::BACKOFF_BASE,
+                            true
+                        ));
+                        assert!(state.schedule.manual_ready(finished));
+                        assert_eq!(app.account_ui.catalog(provider), retained_catalog.as_ref());
+                        assert!(app.automatic_account(&current).is_none());
+                        if known {
+                            let previous = state.snapshot.as_ref().unwrap();
+                            assert_eq!(previous.observed_at, prior);
+                            assert!(!previous.windows.is_empty());
+                            assert!(previous.plan.is_some() && previous.credits.is_some());
+                            assert!(state.identity.is_some() && state.present);
+                            assert!(app.account_ui.shown_in_switcher(state));
+                            assert_eq!(app.account_ui.account_origin(state), "System default");
+                            assert!(app.provider_chip(provider, finished, false).is_some());
+                            assert!(chip(state, "Fixture system", finished).gauge.is_some());
+                        } else {
+                            assert!(state.snapshot.is_none() && state.identity.is_none());
+                            assert!(!state.present);
+                        }
+                    } else {
+                        let Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        } = produced
+                        else {
+                            panic!("current valid quota must recover through the real finisher");
+                        };
+                        assert_eq!(snapshot.status, UsageStatus::Ok);
+                        assert_eq!(snapshot.source, UsageSource::Probe);
+                        assert_eq!(snapshot.observed_at, observed_at);
+                        assert!(!snapshot.windows.is_empty());
+                        assert!(snapshot.plan.is_some() && snapshot.credits.is_some());
+                        assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                        assert_eq!(state.identity, identity);
+                        assert!(state.present && state.failure.is_none());
+                        assert_eq!(state.schedule.failures(), 0);
+                        assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                        assert!(app.account_ui.shown_in_switcher(state));
+                        assert!(app.provider_chip(provider, finished, false).is_some());
+                        assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+                    }
+                }
+            }
+        }
     }
 
     fn claude_report(used: f64) -> LiveReport {
@@ -6938,6 +9618,119 @@ mod app_tests {
         recipe
     }
 
+    #[test]
+    fn model_catalog_clock_rollback_preserves_newer_current_observations() {
+        let now: Millis = 1_000_000;
+        let catalog = |observed_at, id: &str| Catalog {
+            observed_at,
+            models: vec![crate::chat::Model {
+                id: id.into(),
+                label: id.into(),
+                reasoning: Vec::new(),
+            }],
+        };
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut state = State::default();
+            assert!(state.take_catalog(provider, catalog(now - 1, "newer"), now));
+            assert!(!state.take_catalog(
+                provider,
+                catalog(now - schedule::CLOCK_SLACK - 2, "delayed"),
+                now,
+            ));
+            assert_eq!(state.catalog(provider).unwrap().models[0].id, "newer");
+
+            assert!(state.take_catalog(
+                provider,
+                catalog(now + schedule::CLOCK_SLACK, "within-slack"),
+                now,
+            ));
+            assert!(!state.take_catalog(provider, catalog(now, "older"), now));
+            assert_eq!(
+                state.catalog(provider).unwrap().models[0].id,
+                "within-slack"
+            );
+
+            assert!(state.take_catalog(
+                provider,
+                catalog(now + schedule::CLOCK_SLACK + 1, "pre-rollback"),
+                now,
+            ));
+            assert!(state.take_catalog(provider, catalog(now, "current"), now));
+            assert_eq!(state.catalog(provider).unwrap().models[0].id, "current");
+        }
+    }
+
+    #[test]
+    fn model_catalog_clock_rollback_recovers_through_each_admitted_source() {
+        let model = |id: &str| crate::chat::Model {
+            id: id.into(),
+            label: id.into(),
+            reasoning: Vec::new(),
+        };
+        let catalog = |observed_at, id: &str| Catalog {
+            observed_at,
+            models: vec![model(id)],
+        };
+        for provider in [Provider::Claude, Provider::Codex] {
+            for source in ["loaded", "probe", "live"] {
+                let mut app = context_inspector_test_app(false);
+                assert!(app.account_ui.cache.is_none());
+                assert!(app.account_ui.store.is_none());
+                let id = app.account_ui.add_managed_fixture(provider, 1938);
+                let now = now_ms();
+                let before_rollback = now + 10 * schedule::CLOCK_SLACK;
+                // The window's last event still belongs to the old clock;
+                // every actual callback must supply its own fresh event time.
+                app.account_ui.now_ms = before_rollback;
+                assert!(app.account_ui.take_catalog(
+                    provider,
+                    catalog(before_rollback, "pre-rollback"),
+                    before_rollback,
+                ));
+
+                let task = match source {
+                    "loaded" => app.update(Message::AccountUi(Action::Loaded(Loaded {
+                        generation: app.account_ui.discovery_generation,
+                        registry: Ok(app.account_ui.registry.clone()),
+                        restored: Vec::new(),
+                        catalogs: BTreeMap::from([(provider, catalog(now, "current"))]),
+                        installed: BTreeMap::new(),
+                        provisional: false,
+                    }))),
+                    "probe" => {
+                        let (owner, ticket) =
+                            app.account_ui
+                                .begin_probe_for_test(&id, Trigger::Focus, now);
+                        app.update(Message::AccountUi(Action::Probed {
+                            owner,
+                            ticket,
+                            id,
+                            outcome: Outcome::Answered {
+                                identity: None,
+                                snapshot: UsageSnapshot::state(
+                                    UsageStatus::Ok,
+                                    "probe after clock rollback",
+                                    now,
+                                ),
+                                catalog: Some(catalog(now, "current")),
+                            },
+                        }))
+                    }
+                    "live" => app.observe_listed_models(provider, vec![model("current")]),
+                    _ => unreachable!(),
+                };
+                // Apply the actual reducers, but never poll a provider, cache,
+                // registry or other asynchronous effect in this fixture.
+                drop(task);
+                assert_eq!(
+                    app.account_ui.catalog(provider).unwrap().models[0].id,
+                    "current",
+                    "{provider:?} {source}"
+                );
+            }
+        }
+    }
+
     /// The models each provider lists come from the cache at startup, from
     /// probes and from running conversations; the newest list wins, and one a
     /// conversation listed reaches other windows through the cache.
@@ -6959,6 +9752,7 @@ mod app_tests {
         };
         let now = now_ms();
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(app.account_ui.registry.clone()),
             restored: Vec::new(),
             catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached"))]),
@@ -6976,8 +9770,12 @@ mod app_tests {
         // the probe cached it.
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "ok", now - 5_000);
         snapshot.source = UsageSource::Probe;
+        let (owner, ticket) =
+            app.account_ui
+                .begin_probe_for_test(&managed, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&managed).unwrap().owner,
+            owner,
+            ticket,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 identity: None,
@@ -6990,7 +9788,7 @@ mod app_tests {
         // An older list, from another window's cache, does not rewind it.
         assert!(
             !app.account_ui
-                .take_catalog(Provider::Codex, catalog(1, "older"))
+                .take_catalog(Provider::Codex, catalog(1, "older"), now)
         );
 
         // A conversation's list is newer still, and is queued for the cache.
@@ -7072,8 +9870,12 @@ mod app_tests {
             UsageSnapshot::state(UsageStatus::Ok, "", now - 2 * schedule::REFRESH_INTERVAL);
         probed.detail = None;
         probed.plan = Some("max".into());
+        let (owner, ticket) =
+            app.account_ui
+                .begin_probe_for_test(&managed, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&managed).unwrap().owner,
+            owner,
+            ticket,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -7182,6 +9984,7 @@ mod app_tests {
             ]
         };
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(Registry::default()),
             restored: judged(false),
             catalogs: BTreeMap::new(),
@@ -7195,8 +9998,12 @@ mod app_tests {
 
         let mut probed = cached(0.8).snapshot;
         probed.observed_at = now + 1;
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&codex, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&codex).unwrap().owner,
+            owner,
+            ticket,
             id: codex.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -7205,6 +10012,8 @@ mod app_tests {
             },
         }));
         let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
             restored: judged(true),
             installed: BTreeMap::new(),
         }));
@@ -7233,6 +10042,7 @@ mod app_tests {
             }]
         };
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(Registry::default()),
             restored: judged(true),
             catalogs: BTreeMap::new(),
@@ -7242,6 +10052,8 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Popover(Some(claude.clone()))));
         assert_eq!(app.account_ui.popover.as_ref(), Some(&claude));
         let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
             restored: judged(false),
             installed: BTreeMap::new(),
         }));
@@ -7254,11 +10066,23 @@ mod app_tests {
     #[test]
     fn a_changed_login_reported_live_is_checked_at_once() {
         let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
+            registry: Ok(Registry::default()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Codex).id();
         let now = now_ms();
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -7294,6 +10118,10 @@ mod app_tests {
         let mut app = context_inspector_test_app(false);
         let id = app.account_ui.accounts[0].id.clone();
         let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
+        finish_discovery(
+            &mut app,
+            BTreeMap::from([(Provider::Codex, true), (Provider::Claude, true)]),
+        );
         let state = app.account_ui.account(&id).unwrap();
         let ready_at = state.schedule.manual_ready_at().unwrap();
         assert!(!state.schedule.manual_ready(app.account_ui.now_ms));
@@ -7523,6 +10351,7 @@ mod app_tests {
         let old = format!("version = 3\n[project_defaults.\"{project}\"]\ncodex = \"system\"\n");
         let registry: Registry = toml::from_str(&old).unwrap();
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(registry),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
@@ -7900,6 +10729,7 @@ mod app_tests {
             email: Some("new@example.com".into()),
             organization: None,
             plan: Some("max".into()),
+            disputed_by: None,
         };
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
@@ -7919,6 +10749,54 @@ mod app_tests {
         assert!(state.present);
         assert_eq!(state.identity.as_ref(), Some(&identity));
         assert_eq!(app.account_ui.display_name(state), "new@example.com");
+    }
+
+    /// Repeating a link to a listed home closes the form without claiming to
+    /// have added another account.
+    #[test]
+    fn a_recovered_link_says_the_home_is_already_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = |registry: &mut Registry, key| {
+            registry.link(Provider::Codex, key, home.clone(), None, None, 1)
+        };
+        let notice = |before: Registry, after: Registry, key| {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(before);
+            let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Codex)));
+            let _ = app.update(Message::AccountUi(Action::LinkReady {
+                key,
+                result: Ok(after),
+            }));
+            assert!(app.account_ui.table.link.is_none());
+            app.notices
+                .recent()
+                .map(|entry| entry.notice.message.clone())
+                .collect::<Vec<_>>()
+        };
+        let empty = Registry::default();
+        let mut listed = empty.clone();
+        let key = link(&mut listed, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(
+            notice(empty, listed.clone(), key),
+            ["Existing account home added."]
+        );
+        let mut repeated = listed.clone();
+        assert_eq!(link(&mut repeated, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(listed.clone(), repeated, key),
+            ["That account home is already listed."]
+        );
+        // An archived home is hidden, so restoring it reads as added.
+        let mut archived = listed;
+        assert!(archived.archive_duplicate(key, &Account::system(Provider::Codex)));
+        let mut restored = archived.clone();
+        assert_eq!(link(&mut restored, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(archived, restored, key),
+            ["Existing account home added."]
+        );
     }
 
     /// A failed link says why, and stops saying it once the reader gives up
@@ -8382,6 +11260,7 @@ mod app_tests {
             email: Some("other-reported-login@example.test".into()),
             organization: None,
             plan: None,
+            disputed_by: None,
         });
         let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
         usage.windows = [("session", 0.35), ("weekly", 0.55)]
@@ -8443,6 +11322,983 @@ mod app_tests {
         assert!(
             (measured.content.height - measured.y - measured.bounds.height).abs() < 1.0,
             "the final account reaches the visible viewport bottom"
+        );
+    }
+
+    fn finish_discovery(app: &mut Cagents, installed: BTreeMap<Provider, bool>) {
+        let restored = app
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| Restored {
+                id: state.id.clone(),
+                present: installed.get(&state.account.provider) == Some(&true),
+                entry: None,
+            })
+            .collect();
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
+            restored,
+            installed,
+        }));
+    }
+
+    #[test]
+    fn opening_and_returning_to_accounts_rediscovers_without_starting_a_probe_first() {
+        let mut app = context_inspector_test_app(false);
+        app.settings.show_status_bar = false;
+        app.account_ui.installed.insert(Provider::Codex, false);
+        // Startup's authoritative registry read admits automatic probes
+        // before the window is focused.
+        let registry = app.account_ui.registry.clone();
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(registry)))));
+        assert!(app.account_ui.registry_ready);
+        app.refresh_ui.focused = true;
+        let before = app.account_ui.discovery_generation;
+        let _ = app.update(Message::AccountUi(Action::OpenPane));
+        assert!(app.account_ui.discovery_generation > before);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()))
+        );
+        finish_discovery(
+            &mut app,
+            BTreeMap::from([(Provider::Codex, true), (Provider::Claude, true)]),
+        );
+        assert_eq!(
+            app.account_ui.provider_status(Provider::Codex),
+            "Installed · sign in to get started"
+        );
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .any(|state| state.schedule.in_flight(now_ms()))
+        );
+        let generation = app.account_ui.discovery_generation;
+        let _ = app.accounts_focus_changed(false, false);
+        assert_eq!(app.account_ui.discovery_generation, generation);
+        let _ = app.accounts_focus_changed(true, true);
+        assert!(app.account_ui.discovery_generation > generation);
+        finish_discovery(
+            &mut app,
+            BTreeMap::from([(Provider::Codex, false), (Provider::Claude, true)]),
+        );
+        assert_eq!(
+            app.account_ui.provider_status(Provider::Codex),
+            "CLI not found on PATH"
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_waits_for_current_discovery_and_keeps_coalesced_manual_intent() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let claude = Account::system(Provider::Claude).id();
+        let codex = Account::system(Provider::Codex).id();
+        for id in [&claude, &codex] {
+            let state = app.account_ui.account_mut(id).unwrap();
+            state.present = true;
+            state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "history", now_ms()));
+            state.schedule.observe(now_ms());
+        }
+        let _ = app.update(Message::AccountUi(Action::Refresh(claude.clone())));
+        let older = app.account_ui.discovery_generation;
+        let owners = app.account_ui.discovery_owners();
+        let _ = app.update(Message::AccountUi(Action::Refresh(codex.clone())));
+        assert!(app.account_ui.discovery_generation > older);
+        assert_eq!(app.account_ui.discovery_manual.len(), 2);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()))
+        );
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: older,
+            owners,
+            restored: Vec::new(),
+            installed: BTreeMap::from([(Provider::Codex, false)]),
+        }));
+        assert_eq!(
+            app.account_ui.discovery_manual.len(),
+            2,
+            "old read cannot spend either refresh"
+        );
+        finish_discovery(
+            &mut app,
+            BTreeMap::from([(Provider::Codex, true), (Provider::Claude, true)]),
+        );
+        assert!(app.account_ui.discovery_manual.is_empty());
+        for id in [&claude, &codex] {
+            let state = app.account_ui.account(id).unwrap();
+            assert!(state.schedule.in_flight(now_ms()));
+            assert!(
+                !state.schedule.manual_ready(app.account_ui.now_ms),
+                "current completion continues the manual, not a cache-eligible focus probe"
+            );
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().detail.as_deref(),
+                Some("history")
+            );
+        }
+    }
+
+    #[test]
+    fn stale_startup_and_replaced_home_discovery_cannot_reverse_current_presence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, root.path(), &["fixture@example.test"])
+            .pop()
+            .unwrap();
+        let stale_registry = app.account_ui.registry.clone();
+        let stale_generation = app.account_ui.discovery_generation;
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
+        let current = app.account_ui.discovery_generation;
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: stale_generation,
+            registry: Ok(stale_registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::from([(Provider::Codex, false)]),
+            provisional: false,
+        })));
+        assert_eq!(app.account_ui.discovery_generation, current);
+        assert_eq!(app.account_ui.installed.get(&Provider::Codex), Some(&true));
+        let owners = app.account_ui.discovery_owners();
+        let old_owner = app.account_ui.account(&id).unwrap().owner;
+        let replacement = root.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        let mut changed = app.account_ui.registry.clone();
+        changed.unregister(key);
+        changed
+            .link(Provider::Codex, key, replacement, None, None, 2)
+            .unwrap();
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(changed))));
+        assert_ne!(app.account_ui.account(&id).unwrap().owner, old_owner);
+        // Equal generation cannot override the complete captured account/home owner vector.
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners,
+            restored: Vec::new(),
+            installed: BTreeMap::from([(Provider::Codex, false)]),
+        }));
+        assert_eq!(app.account_ui.installed.get(&Provider::Codex), Some(&true));
+        assert!(app.account_ui.account(&id).unwrap().snapshot.is_none());
+
+        // Persisted writes have increasing Store revisions. A delayed startup
+        // snapshot must not restore the previous home or erase new pending work.
+        let homes = Homes::at(root.path().join("managed"));
+        let store = Store::at(root.path().join("registry"));
+        let old_registry = app.account_ui.registry.clone();
+        let (old_registry, ()) = store.update(|registry| *registry = old_registry).unwrap();
+        app.account_ui.homes = Some(homes.clone());
+        app.account_ui.set_registry(old_registry.clone());
+        let old_generation = app.account_ui.discovery_generation;
+        let newest_home = root.path().join("newest-home");
+        std::fs::create_dir(&newest_home).unwrap();
+        store
+            .update(|registry| {
+                registry.unregister(key);
+                registry
+                    .link(Provider::Codex, key, newest_home.clone(), None, None, 3)
+                    .unwrap();
+            })
+            .unwrap();
+        let (pending_key, _) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
+        let current_registry = store.load().unwrap();
+        assert!(current_registry.revision() > old_registry.revision());
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(
+            current_registry.clone(),
+        ))));
+        let current_owner = app.account_ui.account(&id).unwrap().owner;
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: old_generation,
+            registry: Ok(old_registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::from([(Provider::Codex, false)]),
+            provisional: false,
+        })));
+        assert_eq!(app.account_ui.registry, current_registry);
+        assert_eq!(app.account_ui.registry, store.load().unwrap());
+        assert_eq!(app.account_ui.account(&id).unwrap().owner, current_owner);
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().account.resolved_home(),
+            Some(newest_home)
+        );
+        assert!(
+            app.account_ui
+                .registry
+                .pending()
+                .iter()
+                .any(|pending| pending.key == pending_key)
+        );
+        assert_eq!(app.account_ui.installed.get(&Provider::Codex), Some(&true));
+    }
+
+    #[test]
+    fn disappearing_cli_keeps_last_usage_but_late_probe_cannot_restore_availability() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 909);
+        let old = UsageSnapshot::state(UsageStatus::Ok, "last known", now_ms());
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.snapshot = Some(old.clone());
+        }
+        let (_, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, false)]));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.present);
+        assert_eq!(state.snapshot.as_ref(), Some(&old));
+        assert_eq!(state.failure.as_deref(), Some("Codex is not installed"));
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket,
+            outcome: Outcome::Answered {
+                identity: Some(Identity::default()),
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "late old executable", now_ms()),
+            },
+        }));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.present);
+        assert_eq!(state.snapshot.as_ref(), Some(&old));
+        assert_eq!(state.failure.as_deref(), Some("Codex is not installed"));
+        assert!(!state.schedule.in_flight(now_ms()));
+        let manual_before = state.schedule.manual_ready_at();
+        app.refresh_ui.focused = true;
+        for tick in 1..=3 {
+            let now = now_ms() + tick * schedule::REFRESH_INTERVAL;
+            assert!(app.probe_account(&id, Trigger::Tick, now).is_none());
+            assert!(app.probe_account(&id, Trigger::Focus, now).is_none());
+            assert!(app.probe_account(&id, Trigger::Manual, now).is_none());
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(!state.schedule.in_flight(now));
+            assert_eq!(state.schedule.manual_ready_at(), manual_before);
+        }
+        // An explicit request still refreshes discovery, but missing metadata
+        // does not start/abandon a probe or manufacture a manual debounce.
+        let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, false)]));
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .manual_ready_at(),
+            manual_before
+        );
+        assert!(
+            !app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert_eq!(state.snapshot.as_ref(), Some(&old));
+        assert!(
+            state.schedule.in_flight(now_ms()),
+            "reappearance continues the explicit manual request"
+        );
+        assert!(state.schedule.manual_ready_at().is_some());
+        assert!(!state.schedule.manual_ready(app.account_ui.now_ms));
+        assert_eq!(
+            state.owner, owner,
+            "CLI detection does not replace account ownership"
+        );
+    }
+
+    #[test]
+    fn live_usage_during_cli_absence_keeps_discovery_authority_and_rejects_late_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.cache = Some(Cache::at(directory.path()));
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 910);
+        let recipe = recipe_on(&app, &id);
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let registry = app.account_ui.registry.clone();
+        let now = now_ms();
+        {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.snapshot = Some(UsageSnapshot::state(
+                UsageStatus::Ok,
+                "previous usage",
+                now - 1,
+            ));
+        }
+        let (_, late) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now);
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .await_login(now);
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, false)]));
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.43), now)]);
+        let state = app.account_ui.account(&id).unwrap();
+        let live = state.snapshot.clone().unwrap();
+        assert_eq!(live.source, UsageSource::Live);
+        assert_eq!(live.observed_at, now);
+        assert!((live.windows[0].used - 0.43).abs() < 1e-6);
+        assert!(
+            !state.present,
+            "the still-running actor does not rediscover a CLI"
+        );
+        assert_eq!(
+            state.failure.as_deref(),
+            Some("Claude Code is not installed")
+        );
+        assert!(
+            !state.schedule.awaiting_login(now),
+            "live figures still settle login watching"
+        );
+        assert!(app.account_ui.live_unsaved.contains(&id));
+        assert!(app.account_ui.saving_live);
+        assert_eq!(state.account, account);
+        assert_eq!(app.account_ui.registry, registry);
+
+        // Rejection depends on discovery, not mutable user-facing diagnostics.
+        app.account_ui.account_mut(&id).unwrap().failure = Some("another diagnostic".into());
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket: late,
+            outcome: Outcome::Answered {
+                identity: Some(Identity::default()),
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "late old executable", now + 1),
+            },
+        }));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.present);
+        assert_eq!(state.snapshot.as_ref(), Some(&live));
+        assert_eq!(state.failure.as_deref(), Some("another diagnostic"));
+        assert!(state.identity.is_none());
+        assert!(!state.schedule.in_flight(now));
+        assert_eq!(state.owner, owner);
+        assert!(app.probe_account(&id, Trigger::Manual, now).is_none());
+
+        // Fresh discovery can restore presence, but never admits another owner.
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
+        assert!(app.account_ui.account(&id).unwrap().present);
+        let fresh = UsageSnapshot::state(UsageStatus::Ok, "fresh executable", now + 2);
+        let (_, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+        let answer = |owner| {
+            Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket: ticket.clone(),
+                outcome: Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: fresh.clone(),
+                },
+            })
+        };
+        let _ = app.update(answer(owner + 1));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&live)
+        );
+        let _ = app.update(answer(owner));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert_eq!(state.snapshot.as_ref(), Some(&fresh));
+        assert_eq!(state.owner, owner);
+        assert_eq!(state.account, account);
+        assert_eq!(app.account_ui.registry, registry);
+
+        // Unknown or positive installation retains the established live-report behavior.
+        for installed in [None, Some(true)] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 911);
+            let recipe = recipe_on(&app, &id);
+            app.account_ui.installed.remove(&Provider::Claude);
+            if let Some(installed) = installed {
+                app.account_ui.installed.insert(Provider::Claude, installed);
+            }
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = false;
+            state.failure = Some("previous failure".into());
+            state.snapshot = Some(UsageSnapshot::state(
+                UsageStatus::Ok,
+                "previous usage",
+                now - 1,
+            ));
+            let _ =
+                app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.5), now)]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+        }
+    }
+
+    #[test]
+    fn live_usage_cannot_restore_an_account_whose_home_discovery_found_missing() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 912);
+        let recipe = recipe_on(&app, &id);
+        let now = now_ms();
+        {
+            // An earlier probe read this account's usage.
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            let mut probed = UsageSnapshot::state(UsageStatus::Ok, "", now - 60_000);
+            probed.detail = None;
+            state.snapshot = Some(probed);
+        }
+        // The CLI remains installed, but this account's home was moved aside.
+        let _ = app.locate_accounts();
+        let restored = app
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| Restored {
+                id: state.id.clone(),
+                present: state.id != id,
+                entry: None,
+            })
+            .collect();
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
+            restored,
+            installed: BTreeMap::from([(Provider::Claude, true)]),
+        }));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // A conversation still running from that home keeps reporting usage.
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.4), now)]);
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+        assert!(!state.present, "live usage does not prove the home exists");
+
+        // Only a fresh discovery that finds the home again restores it.
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
+        assert!(app.account_ui.account(&id).unwrap().present);
+    }
+
+    #[test]
+    fn only_a_probe_started_after_discovery_can_restore_a_missing_home() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 913);
+        let answer = |(owner, ticket): (u64, ProbeTicket), status| {
+            Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: None,
+                    snapshot: UsageSnapshot::state(status, "", now_ms()),
+                },
+            })
+        };
+        let missing = |app: &mut Cagents| {
+            let _ = app.locate_accounts();
+            let restored = app
+                .account_ui
+                .accounts
+                .iter()
+                .filter(|state| !state.account.is_brokered())
+                .map(|state| Restored {
+                    id: state.id.clone(),
+                    present: state.id != id,
+                    entry: None,
+                })
+                .collect();
+            let _ = app.update(Message::AccountUi(Action::Located {
+                generation: app.account_ui.discovery_generation,
+                owners: app.account_ui.discovery_owners(),
+                restored,
+                installed: BTreeMap::from([(Provider::Claude, true)]),
+            }));
+        };
+
+        // A probe already running when discovery found the home missing
+        // describes the home as it was.
+        let before = now_ms().saturating_sub(1_000);
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, before);
+        missing(&mut app);
+        let _ = app.update(answer(probe, UsageStatus::Ok));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // The probe discovery starts next confirms the home is not set up.
+        let after = now_ms();
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, after);
+        let _ = app.update(answer(probe, UsageStatus::Unavailable));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // Once the home is back, a later probe that reaches the CLI restores
+        // it, and live usage can again clear a failure.
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+        let _ = app.update(answer(probe, UsageStatus::Ok));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert_eq!(state.absent_since, None);
+        app.account_ui.account_mut(&id).unwrap().failure = Some("timed out".into());
+        let recipe = recipe_on(&app, &id);
+        let _ = app.account_reported(
+            Provider::Claude,
+            &recipe,
+            vec![(claude_report(0.4), now_ms() + 1_000)],
+        );
+        assert_eq!(app.account_ui.account(&id).unwrap().failure, None);
+    }
+
+    #[test]
+    fn a_manual_refresh_survives_account_changes_during_its_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let mut linked = linked_logins(
+            &mut app,
+            root.path(),
+            &["kept@example.test", "removed@example.test"],
+        );
+        let (removed_key, _) = linked.pop().unwrap();
+        let (_, kept) = linked.pop().unwrap();
+        {
+            let state = app.account_ui.account_mut(&kept).unwrap();
+            state.present = true;
+            state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "history", now_ms()));
+            state.schedule.observe(now_ms());
+        }
+        let _ = app.update(Message::AccountUi(Action::Refresh(kept.clone())));
+        let generation = app.account_ui.discovery_generation;
+        let owners = app.account_ui.discovery_owners();
+        // Another account's removal lands before this discovery answers.
+        let mut changed = app.account_ui.registry.clone();
+        changed.unregister(removed_key);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(changed))));
+        assert_ne!(owners, app.account_ui.discovery_owners());
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation,
+            owners,
+            restored: Vec::new(),
+            installed: BTreeMap::from([(Provider::Codex, true)]),
+        }));
+        assert!(
+            app.account_ui.discovery_generation > generation,
+            "the outdated result asks again instead of being dropped"
+        );
+        assert!(app.account_ui.discovery_manual.contains_key(&kept));
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
+        assert!(app.account_ui.discovery_manual.is_empty());
+        assert!(
+            app.account_ui
+                .account(&kept)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "the retained Check now still probes the kept account"
+        );
+    }
+
+    #[test]
+    fn a_prepared_login_keeps_the_path_that_selected_its_program() {
+        let account = Account::system(Provider::Codex);
+        let old = std::ffi::OsString::from("/old/node/bin:/old/cli/bin");
+        let new = std::ffi::OsString::from("/new/node/bin:/new/cli/bin");
+        let prepared = login_launch_with_path(
+            &account,
+            Path::new("/old/cli/bin/codex"),
+            "/private/home".into(),
+            true,
+            Some(&old),
+        )
+        .unwrap();
+        let later = login_launch_with_path(
+            &account,
+            Path::new("/new/cli/bin/codex"),
+            "/private/home".into(),
+            true,
+            Some(&new),
+        )
+        .unwrap();
+        assert_eq!(prepared.program, "/old/cli/bin/codex");
+        assert_eq!(
+            prepared.environment.get("PATH").map(String::as_str),
+            old.to_str()
+        );
+        assert_eq!(
+            later.environment.get("PATH").map(String::as_str),
+            new.to_str()
+        );
+        assert_eq!(prepared.arguments, later.arguments);
+        assert_eq!(prepared.unset_environment, later.unset_environment);
+    }
+
+    async fn lifecycle_message(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = iced::runtime::task::into_stream(task).expect("lifecycle task");
+            let action = stream.next().await.expect("one completion");
+            assert!(
+                stream.next().await.is_none(),
+                "no hidden follow-up operation"
+            );
+            match action {
+                iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
+                _ => panic!("only the captured account completion is emitted"),
+            }
+        })
+        .await
+        .expect("finite synthetic lifecycle reply")
+    }
+
+    #[tokio::test]
+    async fn selected_daemon_removal_refusal_keeps_managed_history_and_linked_forget_keeps_files() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let store = Store::at(directory.path().join("registry"));
+        let (key, home) = store
+            .create_pending(&homes, Provider::Codex, 1, || {
+                homes.create(Provider::Codex, None)
+            })
+            .unwrap();
+        std::fs::write(home.join("history.jsonl"), b"synthetic managed history").unwrap();
+        let managed = Account::managed(Provider::Codex, key, home.clone());
+        let (registry, registered) = store
+            .update(|registry| {
+                registry.register(
+                    registry::Registered {
+                        key,
+                        provider: Provider::Codex,
+                        linked_home: None,
+                        label: None,
+                        email: Some("fixture@example.test".into()),
+                        organization: None,
+                        added_at: 1,
+                    },
+                    &[],
+                )
+            })
+            .unwrap();
+        registered.unwrap();
+        assert!(registry.find(key).is_some());
+        let linked_home = directory.path().join("linked");
+        std::fs::create_dir(&linked_home).unwrap();
+        std::fs::write(
+            linked_home.join("history.jsonl"),
+            b"synthetic linked history",
+        )
+        .unwrap();
+        let linked_key = uuid::Uuid::new_v4();
+        store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    linked_key,
+                    linked_home.clone(),
+                    None,
+                    Some(&homes),
+                    2,
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        store
+            .update(|registry| {
+                registry.set_default(&managed);
+                registry.set_project_default(&directory.path().join("project"), &managed);
+            })
+            .unwrap();
+        let linked = Account::linked(Provider::Codex, linked_key, linked_home.clone());
+        let parked = home
+            .parent()
+            .unwrap()
+            .join(format!(".removing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parked).unwrap();
+        std::fs::write(parked.join("old-history"), b"unrelated interrupted removal").unwrap();
+        let original = store.load().unwrap();
+        let inode = home.metadata().unwrap().ino();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone()));
+        app.account_ui.set_registry(original.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let expected = managed.id();
+        let task = app.remove_account_via(managed.id(), move |operation| {
+            assert_eq!(operation, account::remote::Operation::Remove { id: expected });
+            seen.lock().unwrap().push(operation);
+            Err("File deletion is not available in this build. Your account and its files were kept.".into())
+        });
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no synchronous local deletion"
+        );
+        // Changing the open account cannot retarget the captured request.
+        app.account_ui.popover = Some(linked.id());
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::Removed { id, registry: None, error: Some(reason) }) if *id == managed.id() && reason.contains("files were kept"))
+        );
+        drop(app.update(message));
+        assert_eq!(app.account_ui.registry, original);
+        assert_eq!(store.load().unwrap(), original);
+        assert!(app.account_ui.account(&managed.id()).is_some());
+        assert!(app.account_ui.removing.is_empty());
+        assert_eq!(home.metadata().unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(home.join("history.jsonl")).unwrap(),
+            b"synthetic managed history"
+        );
+        assert_eq!(
+            std::fs::read(parked.join("old-history")).unwrap(),
+            b"unrelated interrupted removal"
+        );
+
+        // A linked home still requires admission; refusal keeps metadata and files.
+        let seen = requests.clone();
+        let task = app.remove_account_via(linked.id(), move |operation| {
+            seen.lock().unwrap().push(operation);
+            Err("This home still belongs to a hosted process".into())
+        });
+        drop(app.update(lifecycle_message(task).await));
+        assert_eq!(app.account_ui.registry, original);
+        assert_eq!(store.load().unwrap(), original);
+        assert!(app.account_ui.account(&linked.id()).is_some());
+        // The synthetic metadata backend models a successful reserved forget;
+        // real physical-owner admission is covered by the existing HOST tests.
+        let backend = store.clone();
+        let seen = requests.clone();
+        let expected = linked.id();
+        let task = app.remove_account_via(linked.id(), move |operation| {
+            assert_eq!(
+                operation,
+                account::remote::Operation::Remove { id: expected }
+            );
+            seen.lock().unwrap().push(operation);
+            let (registry, removed) = backend
+                .update(|registry| registry.unregister(linked_key))
+                .unwrap();
+            assert!(removed.is_some());
+            Ok((registry, None))
+        });
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::Removed { id, registry: Some(_), error: None }) if *id == linked.id())
+        );
+        drop(app.update(message));
+        assert!(app.account_ui.account(&linked.id()).is_none());
+        assert!(app.account_ui.account(&managed.id()).is_some());
+        assert_eq!(app.account_ui.registry, store.load().unwrap());
+        assert_eq!(
+            app.account_ui
+                .registry
+                .default_account(Provider::Codex, Some(&homes))
+                .id(),
+            managed.id()
+        );
+        assert_eq!(
+            app.account_ui
+                .registry
+                .project_choice(&directory.path().join("project"), Provider::Codex),
+            Some(key.to_string().as_str())
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                account::remote::Operation::Remove { id: managed.id() },
+                account::remote::Operation::Remove { id: linked.id() },
+                account::remote::Operation::Remove { id: linked.id() },
+            ]
+        );
+        assert_eq!(
+            std::fs::read(linked_home.join("history.jsonl")).unwrap(),
+            b"synthetic linked history"
+        );
+        assert_eq!(
+            std::fs::read(home.join("history.jsonl")).unwrap(),
+            b"synthetic managed history"
+        );
+        assert_eq!(
+            std::fs::read(parked.join("old-history")).unwrap(),
+            b"unrelated interrupted removal"
+        );
+        assert!(
+            iced::runtime::task::into_stream(app.remove_account_via(linked.id(), |_| panic!(
+                "missing row cannot issue another request"
+            )))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_abandon_keeps_original_key_home_and_unrelated_parked_history() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let store = Store::at(directory.path().join("registry"));
+        let (key, home) = store
+            .create_pending(&homes, Provider::Codex, 1, || {
+                homes.create(Provider::Codex, None)
+            })
+            .unwrap();
+        std::fs::write(home.join("history.jsonl"), b"synthetic pending history").unwrap();
+        let parked = home
+            .parent()
+            .unwrap()
+            .join(format!(".removing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parked).unwrap();
+        std::fs::write(
+            parked.join("old-history"),
+            b"keep original removal evidence",
+        )
+        .unwrap();
+        let original = store.load().unwrap();
+        let inode = home.metadata().unwrap().ino();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone()));
+        app.account_ui.set_registry(original.clone());
+        app.account_ui.logins.push(Login {
+            provider: Provider::Codex,
+            key,
+            home: home.clone(),
+            phase: LoginPhase::Settling,
+            attempts: 1,
+            next_check: 0,
+            started_at: 1,
+            recovered: false,
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let task = app.discard_home_via(key, Provider::Codex, move |operation| {
+            seen.lock().unwrap().push(operation);
+            Err("Synthetic lost reply; outcome unconfirmed".into())
+        });
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+        );
+        drop(app.update(message));
+        assert_eq!(store.load().unwrap(), original);
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(app.account_ui.logins[0].key, key);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
+        let seen = requests.clone();
+        let task = app.discard_home_via(key, Provider::Codex, move |operation| {
+            seen.lock().unwrap().push(operation);
+            Ok(Settled::Duplicate {
+                existing: Account::system(Provider::Codex).id(),
+                registry: None,
+            })
+        });
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+        );
+        drop(app.update(message));
+        assert_eq!(store.load().unwrap(), original);
+        assert_eq!(app.account_ui.logins[0].key, key);
+        let seen = requests.clone();
+        let task = app.discard_home_via(key, Provider::Codex, move |operation| {
+            seen.lock().unwrap().push(operation);
+            Ok(Settled::Abandoned(None))
+        });
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+        );
+        drop(app.update(message));
+        assert_eq!(store.load().unwrap(), original);
+        assert_eq!(app.account_ui.logins[0].key, key);
+        let backend = store.clone();
+        let seen = requests.clone();
+        let task = app.discard_home_via(key, Provider::Codex, move |operation| {
+            assert_eq!(
+                operation,
+                account::remote::Operation::Abandon {
+                    provider: Provider::Codex,
+                    key
+                }
+            );
+            seen.lock().unwrap().push(operation);
+            let (registry, ()) = backend.update(|registry| registry.abandon(key)).unwrap();
+            Ok(Settled::Abandoned(Some(registry)))
+        });
+        let message = lifecycle_message(task).await;
+        assert!(
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Ok(Settled::Abandoned(Some(_))) }) if *received == key)
+        );
+        drop(app.update(message));
+        assert!(app.account_ui.logins.is_empty());
+        assert_eq!(app.account_ui.registry, store.load().unwrap());
+        assert!(app.account_ui.registry.pending().is_empty());
+        assert_eq!(home.metadata().unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(home.join("history.jsonl")).unwrap(),
+            b"synthetic pending history"
+        );
+        assert_eq!(
+            std::fs::read(parked.join("old-history")).unwrap(),
+            b"keep original removal evidence"
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                account::remote::Operation::Abandon {
+                    provider: Provider::Codex,
+                    key
+                };
+                4
+            ]
+        );
+        // Already-settled/unknown metadata is not a fresh operation or a cleanup permit.
+        assert!(
+            abandon_home(Provider::Codex, key, |_| Err(
+                "The pending sign-in changed on the device".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(parked.join("old-history")).unwrap(),
+            b"keep original removal evidence"
         );
     }
 }

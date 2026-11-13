@@ -276,14 +276,22 @@ impl<'a> FontFallbackIter<'a> {
             .is_some_and(|face| face.families.iter().any(|(name, _)| name == family_name))
     }
 
-    fn default_font_match_key(&self) -> Option<&FontMatchKey> {
-        let default_family = self.default_families[self.default_i - 1];
-        let default_family_name = self.font_system.db().family_name(default_family);
+    /// Whether a matched face is of `family_name` and draws at the ideal
+    /// weight. Family is asked first, as it needs no font file.
+    fn of_family(&mut self, m_key: &FontMatchKey, family_name: &str) -> bool {
+        self.face_contains_family(m_key.id, family_name)
+            && self.font_system.matches_weight(m_key, self.ideal_weight)
+    }
 
-        self.font_match_keys
-            .iter()
-            .filter(|m_key| m_key.font_weight_diff == 0 || m_key.variable_weight_match)
-            .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+    fn default_font_match_key(&mut self) -> Option<&'a FontMatchKey> {
+        let default_family = self.default_families[self.default_i - 1];
+        let keys = self.font_match_keys;
+        keys.iter().find(|m_key| {
+            // The family's name is looked up again for each face rather than
+            // copied out, as the weight check below needs the font system.
+            self.face_contains_family(m_key.id, self.font_system.db().family_name(default_family))
+                && self.font_system.matches_weight(m_key, self.ideal_weight)
+        })
     }
 
     fn next_item(&mut self, fallbacks: &Fallbacks) -> Option<<Self as Iterator>::Item> {
@@ -295,12 +303,6 @@ impl<'a> FontFallbackIter<'a> {
                 return Some(font);
             }
         }
-
-        let font_match_keys_iter = |is_mono| {
-            self.font_match_keys.iter().filter(move |m_key| {
-                m_key.font_weight_diff == 0 || m_key.variable_weight_match || is_mono
-            })
-        };
 
         'DEF_FAM: while self.default_i < self.default_families.len() {
             self.default_i += 1;
@@ -379,7 +381,9 @@ impl<'a> FontFallbackIter<'a> {
                 Vec::new()
             };
 
-            for m_key in font_match_keys_iter(is_mono) {
+            // Only a Monospace default reaches here, and it considers every
+            // monospaced face whatever its weight.
+            for m_key in self.font_match_keys {
                 if Some(m_key.id) != default_font_match_key.as_ref().map(|m_key| m_key.id) {
                     let is_mono_id = if mono_ids_for_scripts.is_empty() {
                         self.font_system.is_monospace(m_key.id)
@@ -431,8 +435,8 @@ impl<'a> FontFallbackIter<'a> {
             while self.script_i.1 < script_families.len() {
                 let script_family = script_families[self.script_i.1];
                 self.script_i.1 += 1;
-                for m_key in font_match_keys_iter(false) {
-                    if self.face_contains_family(m_key.id, script_family) {
+                for m_key in self.font_match_keys {
+                    if self.of_family(m_key, script_family) {
                         if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
                             return Some(font);
                         }
@@ -454,8 +458,8 @@ impl<'a> FontFallbackIter<'a> {
         while self.common_i < common_families.len() {
             let common_family = common_families[self.common_i];
             self.common_i += 1;
-            for m_key in font_match_keys_iter(false) {
-                if self.face_contains_family(m_key.id, common_family) {
+            for m_key in self.font_match_keys {
+                if self.of_family(m_key, common_family) {
                     if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
                         return Some(font);
                     }

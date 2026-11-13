@@ -1,7 +1,9 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
-#[cfg(any(feature = "host", test))]
+pub(crate) mod floor;
+pub(crate) mod recovery;
+#[cfg(any(feature = "host", feature = "ui"))]
+use crate::lineage_birth::LineageBirth;
 use crate::model::HostSessionProof;
-#[cfg(any(feature = "host", feature = "ui", test))]
 use crate::model::{LaunchRecipe, TerminalSession};
 #[cfg(any(feature = "host", feature = "ui", test))]
 use std::{fs, io};
@@ -34,7 +36,6 @@ pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
 }
 
 /// How a terminal comes back after its daemon is gone, and why.
-#[cfg(any(feature = "host", feature = "ui", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryKind {
     /// The exact saved conversation resumes.
@@ -58,7 +59,6 @@ impl RecoveryKind {
 }
 
 /// Automatic recovery never replays arbitrary command recipes.
-#[cfg(any(feature = "host", test))]
 pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
     recovery_plan(session).map(|(recipe, _)| recipe)
 }
@@ -68,7 +68,6 @@ pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe,
 /// An agent the terminal was known to run is never downgraded to the shell it
 /// ran in: a shell would leave its conversation findable only by someone who
 /// knows where the provider keeps it.
-#[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) fn recovery_plan(
     session: &TerminalSession,
 ) -> Result<(LaunchRecipe, RecoveryKind), String> {
@@ -90,13 +89,12 @@ pub(crate) fn recovery_plan(
     if recoverable_shell(&session.launch) {
         return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
-    Err("This command has no agent identity and cannot safely be replayed; finish or close it before upgrading".into())
+    Err("This command cannot restart automatically; after you confirm, its pane reopens stopped with the saved screen".into())
 }
 
 /// A shell cagents made can carry the selected provider homes. Other
 /// environment overrides can change what the shell executes and are not
 /// enough evidence to replay a command during an upgrade.
-#[cfg(any(feature = "host", feature = "ui", test))]
 fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
     let Ok(shell) = LaunchRecipe::shell(recipe.working_directory.clone()) else {
         return false;
@@ -111,7 +109,6 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
 
 /// Setup recipes are retained for an explicit reviewed run, never automatic
 /// upgrade replay. The marker is classification, not execution authority.
-#[cfg(any(feature = "host", test))]
 pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
     recipe
         .environment
@@ -119,7 +116,6 @@ pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-#[cfg(any(feature = "host", test))]
 pub(crate) fn checkpoint_recipe(
     session: &TerminalSession,
     relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
@@ -145,7 +141,6 @@ pub(crate) fn checkpoint_recipe(
 /// Recipes passed here have already been normalized by agent_resume_recipe.
 /// Only the provider's resume selector identifies the writer, never UUID-shaped
 /// values of unrelated model, profile, or configuration flags.
-#[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) fn exact_conversation(
     recipe: &LaunchRecipe,
 ) -> Option<(crate::agent::Provider, uuid::Uuid)> {
@@ -163,64 +158,363 @@ pub(crate) fn ensure_no_surviving_process(
     owner: u32,
     proc_root: &Path,
 ) -> Result<(), String> {
-    use std::collections::HashMap;
-    let mut processes = HashMap::new();
-    let mut starts = HashMap::new();
-    let manager = UserManagerSession::connect();
-    for entry in fs::read_dir(proc_root).map_err(process_error)? {
-        let entry = entry.map_err(process_error)?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        if metadata.uid() != crate::daemon::current_uid() {
-            continue;
+    match surviving_process(session, owner, proc_root, &[]) {
+        Ok(Some(survivor)) => Err(survivor.reason),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A process that ties a saved terminal to something still running.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SurvivingProcess {
+    pub(crate) pid: u32,
+    /// The kernel's short name for it, unless it exited during the scan.
+    pub(crate) name: Option<String>,
+    pub(crate) link: SurvivorLink,
+    reason: String,
+}
+
+/// What ties the process to the terminal, which decides how sure a person can be
+/// that stopping it is theirs to do.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SurvivorLink {
+    Conversation,
+    /// The saved launch named this unit. Another launch can reuse a unit name.
+    Unit(String),
+    Lineage,
+}
+
+/// A process of this user whose environment the kernel won't show, because it
+/// made itself undumpable (ssh-agent) or changed credentials (an SSH login's
+/// `sshd-session`). Its arguments and cgroup were read and don't tie it to the
+/// terminal; only the terminal's markers could, and they can't be read.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnreadableProcess {
+    pub(crate) pid: u32,
+    /// Clock ticks after boot. With the PID it names one process, so leaving
+    /// it running can't extend to a later process given the same PID.
+    start: Option<u64>,
+    /// The kernel's short name for it, unless it exited during the scan.
+    pub(crate) name: Option<String>,
+    /// Its unified-hierarchy cgroup, which anyone can read.
+    cgroup: Option<String>,
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl UnreadableProcess {
+    #[cfg(all(test, feature = "ui"))]
+    pub(crate) fn fixture(pid: u32, start: u64, name: &str) -> Self {
+        Self {
+            pid,
+            start: Some(start),
+            name: Some(name.into()),
+            cgroup: None,
         }
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        let fields = stat
-            .rsplit_once(')')
-            .ok_or("cannot inspect process ancestry")?
-            .1;
-        let mut fields = fields.split_whitespace();
-        let state = fields.next().ok_or("cannot inspect process state")?;
-        let parent = fields
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or("cannot inspect process parent")?;
-        if state != "Z" && state != "X" {
-            processes.insert(pid, parent);
-            if let Some(start) = fields.nth(17).and_then(|start| start.parse::<u64>().ok()) {
-                starts.insert(pid, start);
+    }
+
+    /// Whether the lineage's records rule this process out of it. See
+    /// [`crate::lineage_birth`] for why each fact does.
+    fn outside_lineage(&self, birth: &LineageBirth, namespace: Option<&str>) -> bool {
+        match birth {
+            LineageBirth::Unborn => true,
+            LineageBirth::Born {
+                since,
+                contained_in,
+            } => {
+                self.start.is_some_and(|start| start < *since)
+                    || (contained_in.is_some()
+                        && contained_in.as_deref() == namespace
+                        && self.cgroup.as_deref().is_some_and(|cgroup| {
+                            crate::lineage_birth::placement(cgroup, crate::daemon::current_uid())
+                                == crate::lineage_birth::Placement::Outside
+                        }))
             }
         }
     }
-    let exact_resume = session.agent_resume_recipe();
-    let exact_identity = exact_resume.as_ref().and_then(exact_conversation);
-    let terminal_marker = format!("CAGENTS_TERMINAL_ID={}", session.id);
-    let origin_marker = format!(
-        "CAGENTS_RECOVERY_ORIGIN={}",
-        session.recovery_origin.unwrap_or(session.id)
-    );
-    for &pid in processes.keys() {
-        if pid == std::process::id() || belongs_to_owner(pid, owner, &processes) {
+
+    /// Whether it can be told apart from a later process given its PID.
+    #[cfg(feature = "ui")]
+    pub(crate) fn identified(&self) -> bool {
+        self.start.is_some()
+    }
+
+    fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start.is_some() && self.start == other.start
+    }
+}
+
+/// Why a scan found no survivor but can't say there is none.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScanError {
+    /// Every other process was ruled out; these couldn't be, and nothing
+    /// short of their exit or a person's decision will change that.
+    Unreadable(Vec<UnreadableProcess>),
+    /// The scan couldn't finish: a process kept changing as it was read, or
+    /// the process list itself couldn't be read.
+    Incomplete(String),
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(processes) => {
+                let processes = processes
+                    .iter()
+                    .map(|process| match &process.name {
+                        Some(name) => format!("{name} ({})", process.pid),
+                        None => format!("process {}", process.pid),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    formatter,
+                    "cannot rule out surviving terminal processes; the environment of {processes} cannot be read"
+                )
+            }
+            Self::Incomplete(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+/// `Err` means the scan could not rule everything out, not that anything is
+/// running. `leave` names unreadable processes a person chose to leave
+/// running; they are passed over, never signaled.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn surviving_process(
+    session: &TerminalSession,
+    owner: u32,
+    proc_root: &Path,
+    leave: &[UnreadableProcess],
+) -> Result<Option<SurvivingProcess>, ScanError> {
+    // Only the real process table goes with this instance's records.
+    let real = proc_root == Path::new("/proc");
+    scan_for_survivor(
+        session,
+        owner,
+        proc_root,
+        leave,
+        || {
+            real.then(|| crate::lineage_birth::instance_birth(session))
+                .flatten()
+        },
+        real.then(crate::lineage_birth::cgroup_namespace).flatten(),
+    )
+}
+
+/// A process shows no arguments for a moment while it execs or exits, which on a
+/// machine that's building happens often enough that one read alone would turn
+/// people away. Only the read that failed is repeated: repeating the whole scan
+/// let several processes that keep re-execing each fail a different attempt.
+/// A process that stays unreadable still fails: unknown is not absent.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    const ATTEMPTS: usize = 4;
+    const WAIT: std::time::Duration = if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_millis(100)
+    };
+    for _ in 1..ATTEMPTS {
+        match read() {
+            Err(_) => std::thread::sleep(WAIT),
+            finished => return finished,
+        }
+    }
+    read()
+}
+
+/// This user's processes, as one read of the process list saw them.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Default)]
+struct ProcessTable {
+    parents: std::collections::HashMap<u32, u32>,
+    sessions: std::collections::HashMap<u32, u32>,
+    starts: std::collections::HashMap<u32, u64>,
+}
+
+/// The fields of `/proc/<pid>/stat` after the parenthesized name, which can
+/// itself contain spaces and parentheses.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn stat_fields(stat: &str) -> Option<Vec<&str>> {
+    Some(stat.rsplit_once(')')?.1.split_whitespace().collect())
+}
+
+/// Indices into [`stat_fields`]: the stat field number less three.
+#[cfg(any(feature = "host", feature = "ui"))]
+mod stat_field {
+    pub(super) const STATE: usize = 0;
+    pub(super) const PARENT: usize = 1;
+    pub(super) const SESSION: usize = 3;
+    pub(super) const START: usize = 19;
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl ProcessTable {
+    fn read(proc_root: &Path) -> Result<Self, String> {
+        let mut table = Self::default();
+        for entry in fs::read_dir(proc_root).map_err(process_error)? {
+            let entry = entry.map_err(process_error)?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            if metadata.uid() != crate::daemon::current_uid() {
+                continue;
+            }
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            let fields = stat_fields(&stat).ok_or("cannot inspect process ancestry")?;
+            let state = *fields
+                .get(stat_field::STATE)
+                .ok_or("cannot inspect process state")?;
+            let parent = fields
+                .get(stat_field::PARENT)
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or("cannot inspect process parent")?;
+            if state != "Z" && state != "X" {
+                table.parents.insert(pid, parent);
+                let session = fields
+                    .get(stat_field::SESSION)
+                    .and_then(|value| value.parse::<u32>().ok());
+                let start = fields
+                    .get(stat_field::START)
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let Some(session) = session {
+                    table.sessions.insert(pid, session);
+                }
+                if let Some(start) = start {
+                    table.starts.insert(pid, start);
+                }
+            }
+        }
+        Ok(table)
+    }
+}
+
+/// What one process's evidence says about the terminal.
+#[cfg(any(feature = "host", feature = "ui"))]
+enum Inspected {
+    Unrelated,
+    Survivor(SurvivingProcess),
+    Unreadable(UnreadableProcess),
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn scan_for_survivor(
+    session: &TerminalSession,
+    owner: u32,
+    proc_root: &Path,
+    leave: &[UnreadableProcess],
+    lineage: impl FnOnce() -> Option<LineageBirth>,
+    namespace: Option<String>,
+) -> Result<Option<SurvivingProcess>, ScanError> {
+    let table = settle(|| ProcessTable::read(proc_root)).map_err(ScanError::Incomplete)?;
+    let scan = Scan::new(session, proc_root, &table);
+    let mut incomplete = None;
+    let mut unreadable = Vec::new();
+    let mut pids: Vec<_> = table.parents.keys().copied().collect();
+    pids.sort_unstable();
+    for pid in pids {
+        if pid == std::process::id() || belongs_to_owner(pid, owner, &table.parents) {
             continue;
         }
-        let path = proc_root.join(pid.to_string());
+        // A survivor anywhere is the answer even when another process
+        // couldn't be read, so the scan goes on past an unknown.
+        match settle(|| scan.inspect(pid)) {
+            Ok(Inspected::Unrelated) => {}
+            Ok(Inspected::Survivor(survivor)) => return Ok(Some(survivor)),
+            Ok(Inspected::Unreadable(process)) => {
+                if !leave.iter().any(|left| left.same_process(&process)) {
+                    unreadable.push(process);
+                }
+            }
+            Err(error) => {
+                incomplete.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = incomplete {
+        return Err(ScanError::Incomplete(error));
+    }
+    // Read after the processes, so it covers every launch that could have
+    // started one of them.
+    if !unreadable.is_empty()
+        && let Some(birth) = lineage()
+    {
+        unreadable.retain(|process| !process.outside_lineage(&birth, namespace.as_deref()));
+    }
+    if unreadable.is_empty() {
+        Ok(None)
+    } else {
+        Err(ScanError::Unreadable(unreadable))
+    }
+}
+
+/// The evidence one scan compares every process against.
+#[cfg(any(feature = "host", feature = "ui"))]
+struct Scan<'a> {
+    session: &'a TerminalSession,
+    proc_root: &'a Path,
+    table: &'a ProcessTable,
+    manager: Option<UserManagerSession>,
+    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
+    terminal_marker: String,
+    origin_marker: String,
+    unit: Option<&'a str>,
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl<'a> Scan<'a> {
+    fn new(session: &'a TerminalSession, proc_root: &'a Path, table: &'a ProcessTable) -> Self {
+        Self {
+            session,
+            proc_root,
+            table,
+            manager: UserManagerSession::connect(),
+            exact_identity: session
+                .agent_resume_recipe()
+                .as_ref()
+                .and_then(exact_conversation),
+            terminal_marker: format!("CAGENTS_TERMINAL_ID={}", session.id),
+            origin_marker: format!(
+                "CAGENTS_RECOVERY_ORIGIN={}",
+                session.recovery_origin.unwrap_or(session.id)
+            ),
+            unit: systemd_unit(&session.launch),
+        }
+    }
+
+    fn carries_marker(&self, environment: &[u8]) -> bool {
+        environment.split(|byte| *byte == 0).any(|entry| {
+            entry == self.terminal_marker.as_bytes() || entry == self.origin_marker.as_bytes()
+        })
+    }
+
+    fn inspect(&self, pid: u32) -> Result<Inspected, String> {
+        let session = self.session;
+        let path = self.proc_root.join(pid.to_string());
         let argv = match fs::read(path.join("cmdline")) {
             Ok(argv) => argv,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Inspected::Unrelated);
+            }
             Err(error) => return Err(process_error(error)),
         };
         // exec can temporarily expose an empty proc file before publishing the
@@ -234,7 +528,9 @@ pub(crate) fn ensure_no_surviving_process(
             // Keep its ancestry above; descendants are inspected separately.
             let stat = match fs::read_to_string(path.join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
                 Err(error) => return Err(process_error(error)),
             };
             if stat.rsplit_once(')').is_some_and(|(_, fields)| {
@@ -243,18 +539,18 @@ pub(crate) fn ensure_no_surviving_process(
                     && fields
                         .get(19)
                         .and_then(|start| start.parse::<u64>().ok())
-                        .is_some_and(|start| starts.get(&pid) == Some(&start))
+                        .is_some_and(|start| self.table.starts.get(&pid) == Some(&start))
                     && fields
                         .get(6)
                         .and_then(|flags| flags.parse::<u64>().ok())
                         .is_some_and(|flags| flags & 0x4 != 0)
             }) {
-                continue;
+                return Ok(Inspected::Unrelated);
             }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
         if argv.split(|byte| *byte == 0).any(|arg| {
-            exact_identity.is_some_and(|(provider, id)| {
+            self.exact_identity.is_some_and(|(provider, id)| {
                 std::str::from_utf8(arg).ok().is_some_and(|arg| {
                     uuid::Uuid::parse_str(arg).ok() == Some(id)
                         || provider
@@ -264,20 +560,72 @@ pub(crate) fn ensure_no_surviving_process(
                 })
             })
         }) {
-            return Err(format!(
-                "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
-            ));
+            return Ok(Inspected::Survivor(survivor(
+                &path,
+                pid,
+                SurvivorLink::Conversation,
+                format!(
+                    "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
+                ),
+            )));
+        }
+        if let Some(unit) = self.unit {
+            let cgroup = match fs::read_to_string(path.join("cgroup")) {
+                Ok(cgroup) => cgroup,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
+                Err(error) => return Err(process_error(error)),
+            };
+            if in_systemd_unit(&cgroup, unit) && !detached_browser_helper(&path) {
+                let marked = fs::read(path.join("environ"))
+                    .is_ok_and(|environment| self.carries_marker(&environment));
+                return Ok(Inspected::Survivor(survivor(
+                    &path,
+                    pid,
+                    if marked {
+                        SurvivorLink::Lineage
+                    } else {
+                        SurvivorLink::Unit(unit.to_owned())
+                    },
+                    if marked {
+                        format!(
+                            "terminal {} still has a live process ({pid}); preserving it",
+                            session.id
+                        )
+                    } else {
+                        format!(
+                            "terminal {} may still have a live process ({pid}) in {unit}, the systemd unit it was launched in; preserving it",
+                            session.id
+                        )
+                    },
+                )));
+            }
         }
         let environment = match fs::read(path.join("environ")) {
             Ok(environment) => environment,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    && manager
-                        .as_ref()
-                        .is_some_and(|manager| manager.contains(pid)) =>
-            {
-                continue;
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Inspected::Unrelated);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                if self
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.contains(pid))
+                    || self.in_unmarked_session(pid)
+                {
+                    return Ok(Inspected::Unrelated);
+                }
+                return Ok(Inspected::Unreadable(UnreadableProcess {
+                    pid,
+                    start: self.table.starts.get(&pid).copied(),
+                    name: process_name(&path),
+                    cgroup: fs::read_to_string(path.join("cgroup"))
+                        .ok()
+                        .and_then(|listing| {
+                            crate::lineage_birth::unified_cgroup(&listing).map(str::to_owned)
+                        }),
+                }));
             }
             Err(error) => return Err(process_error(error)),
         };
@@ -286,7 +634,9 @@ pub(crate) fn ensure_no_surviving_process(
             // initialized zero-length range proves this is not an exec-time gap.
             let stat = match fs::read_to_string(path.join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
                 Err(error) => return Err(process_error(error)),
             };
             let published_empty = stat.rsplit_once(')').is_some_and(|(_, fields)| {
@@ -300,22 +650,133 @@ pub(crate) fn ensure_no_surviving_process(
                 return Err(format!("cannot inspect process environment ({pid})"));
             }
         }
-        for entry in environment.split(|byte| *byte == 0) {
-            if entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes() {
-                if detached_browser_helper(&path) {
-                    break;
-                }
-                return Err(format!(
+        if self.carries_marker(&environment) && !detached_browser_helper(&path) {
+            return Ok(Inspected::Survivor(survivor(
+                &path,
+                pid,
+                SurvivorLink::Lineage,
+                format!(
                     "terminal {} still has a live process ({pid}); preserving it",
                     session.id
-                ));
-            }
+                ),
+            )));
         }
         // Terminal branding and another terminal's marker can be inherited by
         // detached browsers and services. Neither proves ownership of this
         // session. Recovery lineage and exact agent identities do.
+        Ok(Inspected::Unrelated)
     }
-    Ok(())
+
+    /// Whether `pid` sits in another process's POSIX session whose leader is
+    /// readable and unmarked, which rules it out as well as reading its own
+    /// environment would. A session is joined only by forking inside it, and a
+    /// terminal's shell starts a new one with `setsid`, so nothing the terminal
+    /// started can be in a session it didn't create. Any member of a session
+    /// the terminal's lineage created descends from that session's leader,
+    /// which would then be the terminal's own. A leader can't leave its
+    /// session, and Linux doesn't reuse a PID that still names a session with a
+    /// live member, so a live process at the session's PID is its leader. The
+    /// start times confirm the order in case every member left between reads.
+    fn in_unmarked_session(&self, pid: u32) -> bool {
+        let Some(&leader) = self.table.sessions.get(&pid) else {
+            return false;
+        };
+        if leader == pid || leader == 0 {
+            return false;
+        }
+        let path = self.proc_root.join(leader.to_string());
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            return false;
+        };
+        let Some(fields) = stat_fields(&stat) else {
+            return false;
+        };
+        let field = |index: usize| {
+            fields
+                .get(index)
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let alive = fields
+            .get(stat_field::STATE)
+            .is_some_and(|state| *state != "Z" && *state != "X");
+        let leads = field(stat_field::SESSION) == Some(u64::from(leader));
+        let earlier = matches!(
+            (field(stat_field::START), self.table.starts.get(&pid)),
+            (Some(leader), Some(&member)) if leader <= member
+        );
+        if !alive || !leads || !earlier {
+            return false;
+        }
+        // An empty read can be a moment of exec, so it rules nothing out.
+        fs::read(path.join("environ"))
+            .is_ok_and(|environment| !environment.is_empty() && !self.carries_marker(&environment))
+    }
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn process_name(process: &Path) -> Option<String> {
+    fs::read_to_string(process.join("comm"))
+        .ok()
+        .map(|name| name.trim_end().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn survivor(process: &Path, pid: u32, link: SurvivorLink, reason: String) -> SurvivingProcess {
+    SurvivingProcess {
+        pid,
+        name: process_name(process),
+        link,
+        reason,
+    }
+}
+
+/// The unit a `systemd-run` launch names for itself. Its cgroup still finds a
+/// process that cleared the inherited markers. A spelling this misses (a bundled
+/// `-qu`, an abbreviated `--un=`, a wrapper before `systemd-run`) leaves only the
+/// marker check. Arguments after the command can look like this option too. Both
+/// outcomes can only change whether a refusal happens on top of the marker check,
+/// never remove a check.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn systemd_unit(launch: &LaunchRecipe) -> Option<&str> {
+    if Path::new(&launch.program).file_name()? != "systemd-run" {
+        return None;
+    }
+    let mut arguments = launch
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .take_while(|argument| *argument != "--");
+    while let Some(argument) = arguments.next() {
+        if let Some(unit) = argument.strip_prefix("--unit=").or_else(|| {
+            argument
+                .strip_prefix("-u")
+                .filter(|attached| !attached.is_empty())
+        }) {
+            return Some(unit);
+        }
+        if argument == "--unit" || argument == "-u" {
+            return arguments.next();
+        }
+    }
+    None
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn in_systemd_unit(cgroup: &str, unit: &str) -> bool {
+    let stem = unit
+        .strip_suffix(".scope")
+        .or_else(|| unit.strip_suffix(".service"))
+        .unwrap_or(unit);
+    cgroup
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .flat_map(|path| path.split('/'))
+        .any(|part| {
+            part.strip_suffix(".scope")
+                .or_else(|| part.strip_suffix(".service"))
+                == Some(stem)
+        })
 }
 
 /// Browser tooling starts long-lived services which inherit the launching
@@ -489,12 +950,11 @@ pub(crate) fn process_error(error: io::Error) -> String {
 
 pub(crate) mod handoff {
     use super::*;
+    use crate::chat;
     use crate::fs_safety;
-    #[cfg(any(feature = "host", test))]
-    use crate::{chat, terminal_ipc::TerminalSpawnOptions};
-    use serde::Deserialize;
-    #[cfg(any(feature = "host", test))]
-    use serde::Serialize;
+    use crate::terminal_ipc::TerminalSpawnOptions;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     #[cfg(any(feature = "host", test))]
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
@@ -537,7 +997,6 @@ pub(crate) mod handoff {
         Ok(output.bytes)
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub(crate) enum Phase {
         /// Persisted before any irreversible stop. Provider closure is unproven.
@@ -548,7 +1007,15 @@ pub(crate) mod handoff {
         Restoring,
     }
 
-    #[cfg(any(feature = "host", test))]
+    /// A read-only observation of one exact private checkpoint. This grants
+    /// no authority to promote, consume, archive or replay the host payload.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CheckpointStatus {
+        pub(crate) proof: HostSessionProof,
+        pub(crate) phase: Phase,
+        pub(crate) digest: String,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Terminal {
         pub source: TerminalSession,
@@ -564,7 +1031,6 @@ pub(crate) mod handoff {
     /// A terminal left running under its holder for the next daemon to adopt,
     /// processes, screen and all. Its launch is unchanged, so its lineage
     /// records the carry as a source whose successor launched the same way.
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Carried {
         pub source: TerminalSession,
@@ -576,7 +1042,6 @@ pub(crate) mod handoff {
         pub options: TerminalSpawnOptions,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Chat {
         /// Immutable issued launch and former daemon ownership, independent of
@@ -588,7 +1053,6 @@ pub(crate) mod handoff {
         pub launch: chat::Launch,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct ChatSource {
         pub source: chat::Session,
@@ -597,10 +1061,9 @@ pub(crate) mod handoff {
         pub launch: chat::Launch,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Checkpoint {
-        /// Read, and checked, but written by [`Store::save`] from what the
+        /// Read and checked here; the host writer derives it from what the
         /// checkpoint holds.
         #[serde(skip_serializing)]
         version: u16,
@@ -616,8 +1079,8 @@ pub(crate) mod handoff {
         pub chats: Vec<Chat>,
     }
 
-    #[cfg(any(feature = "host", test))]
     impl Checkpoint {
+        #[cfg(any(feature = "host", test))]
         pub fn new(
             proof: HostSessionProof,
             terminals: Vec<Terminal>,
@@ -910,6 +1373,7 @@ pub(crate) mod handoff {
             Ok(())
         }
 
+        #[cfg(any(feature = "host", test))]
         pub fn require_ready(&self) -> Result<(), String> {
             self.validate()?;
             if self.phase != Phase::Ready {
@@ -922,10 +1386,26 @@ pub(crate) mod handoff {
         }
     }
 
+    /// Validate the complete supported host payload without granting replay or
+    /// mutation authority. Recovery receipts must bind valid checkpoint bytes,
+    /// not a reduced status/index shape that omits recipes or spawn options.
+    pub(crate) fn validate_checkpoint_bytes(bytes: &[u8]) -> Result<(), String> {
+        decode_checkpoint(bytes).map(|_| ())
+    }
+
+    fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, String> {
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("Upgrade checkpoint exceeds the 8 MiB durable byte limit".into());
+        }
+        let checkpoint: Checkpoint =
+            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     /// A retained execution carries its console without replaying its recipe.
     /// Only the live/detached presentation may differ from the issued pair;
     /// every ownership and execution field must remain exactly the same.
-    #[cfg(any(feature = "host", test))]
     fn paired_carried_source(
         chat: &Chat,
         carried: &Carried,
@@ -956,7 +1436,6 @@ pub(crate) mod handoff {
     /// Keep the descriptor already issued to the chat while validating the
     /// separate exact execution selected by its original daemon. Older writers
     /// stored the derived resume hint on the checkpoint's terminal copy.
-    #[cfg(any(feature = "host", test))]
     pub(crate) fn paired_terminal_source(
         chat: &Chat,
         terminal: &Terminal,
@@ -991,7 +1470,6 @@ pub(crate) mod handoff {
         Ok(issued)
     }
 
-    #[cfg(any(feature = "host", test))]
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
     pub(crate) fn validate_chat_source(
@@ -1159,7 +1637,6 @@ pub(crate) mod handoff {
     // issued aliases beside the authenticated replacement until panes have
     // attached or the conversation is explicitly closed.
     const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct RecoveredChat {
         pub evidence: Chat,
@@ -1168,9 +1645,73 @@ pub(crate) mod handoff {
         pub aliases: Vec<chat::Session>,
     }
 
+    /// Completed checkpoint lineage is evidence about a listed replacement,
+    /// never authority to restore or attach a conversation.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecoveredChats {
+        entries: Vec<RecoveredChat>,
+    }
+
+    impl RecoveredChat {
+        fn issued_sources(self) -> Vec<ChatSource> {
+            let mut sources = self.evidence.previous_sources;
+            sources.extend(self.aliases.into_iter().map(|source| ChatSource {
+                source,
+                launch: self.evidence.launch.clone(),
+            }));
+            sources.push(ChatSource {
+                source: self.evidence.source,
+                launch: self.evidence.launch.clone(),
+            });
+            sources.push(ChatSource {
+                source: self.replacement,
+                launch: self.evidence.launch,
+            });
+            sources
+        }
+    }
+
+    impl RecoveredChats {
+        pub(crate) fn proves(
+            &self,
+            source: &chat::Session,
+            current: &chat::Session,
+            serving: &HostSessionProof,
+        ) -> bool {
+            if !serving.is_complete()
+                || current.proof.as_ref() != Some(serving)
+                || !source
+                    .proof
+                    .as_ref()
+                    .is_some_and(HostSessionProof::is_complete)
+            {
+                return false;
+            }
+            self.entries.iter().any(|entry| {
+                // The live Resolve path may authenticate a later actor before
+                // adopting it. A read-only verifier cannot use that shape-only
+                // fallback: it needs the exact durably issued replacement.
+                entry.replacement == *current
+                    && entry.clone().issued_sources().iter().any(|issued| {
+                        if issued.source == *source {
+                            return true;
+                        }
+                        let mut confirmed = issued.source.clone();
+                        confirmed.launch.session_id = issued.launch.session_id.clone();
+                        confirmed == *source
+                    })
+            })
+        }
+    }
+
+    /// A restoring provider can take its full attachment timeout even when
+    /// there is no upgrade inventory (for example, after a daemon crash).
+    pub(crate) const STARTUP_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Budget sequential provider confirmation without parsing session payloads.
+    /// Estimating readiness must not create durable upgrade storage.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
-        Store::discover()?.startup_timeout()
+        Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 
     #[derive(Deserialize)]
@@ -1246,7 +1787,29 @@ pub(crate) mod handoff {
             })
         }
 
-        fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        /// Predict the source prepare's refusal to overwrite another update.
+        /// This reads the existing checkpoint without granting replay authority.
+        pub(crate) fn conflicts_with_source(
+            &self,
+            proof: &crate::model::HostSessionProof,
+        ) -> Result<bool, String> {
+            #[derive(Deserialize)]
+            struct Header {
+                version: u16,
+                proof: crate::model::HostSessionProof,
+                phase: String,
+            }
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(false);
+            };
+            let header: Header =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            Ok(!VERSIONS.contains(&header.version)
+                || header.proof != *proof
+                || header.phase != "Prepared")
+        }
+
+        pub(super) fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
             self.read_named(FILE)
         }
 
@@ -1275,9 +1838,40 @@ pub(crate) mod handoff {
             Ok(Some(bytes))
         }
 
+        /// Inspect only the common envelope, retaining the exact private-byte
+        /// identity. Readers in every feature lane share the same phase and
+        /// version contract without deserializing any host session payload.
+        pub(crate) fn checkpoint_status(&self) -> Result<Option<CheckpointStatus>, String> {
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(None);
+            };
+            #[derive(Deserialize)]
+            struct Envelope {
+                version: u16,
+                proof: HostSessionProof,
+                phase: Phase,
+            }
+            let envelope: Envelope = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Cannot read upgrade checkpoint status: {error}"))?;
+            if !VERSIONS.contains(&envelope.version) {
+                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
+            }
+            if !envelope.proof.is_complete() {
+                return Err(
+                    "Upgrade checkpoint has incomplete source ownership; checkpoint retained"
+                        .into(),
+                );
+            }
+            Ok(Some(CheckpointStatus {
+                proof: envelope.proof,
+                phase: envelope.phase,
+                digest: format!("{:x}", Sha256::digest(&bytes)),
+            }))
+        }
+
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
             let Some(bytes) = self.read_bytes()? else {
-                return Ok(std::time::Duration::from_secs(5));
+                return Ok(STARTUP_BASE);
             };
             let inventory: Inventory =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1290,10 +1884,11 @@ pub(crate) mod handoff {
                 return Err("Upgrade checkpoint exceeds session limits".into());
             }
             // Adopting a carried terminal is a local handshake with its holder.
-            Ok(std::time::Duration::from_secs(
-                5 + 30 * (inventory.terminals + inventory.chats) as u64
-                    + 5 * inventory.carried as u64,
-            ))
+            Ok(STARTUP_BASE
+                + std::time::Duration::from_secs(
+                    30 * (inventory.terminals + inventory.chats) as u64
+                        + 5 * inventory.carried as u64,
+                ))
         }
 
         #[cfg(any(feature = "host", test))]
@@ -1301,10 +1896,7 @@ pub(crate) mod handoff {
             let Some(bytes) = self.read_bytes()? else {
                 return Ok(None);
             };
-            let checkpoint: Checkpoint =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            checkpoint.validate()?;
-            Ok(Some(checkpoint))
+            decode_checkpoint(&bytes).map(Some)
         }
 
         #[cfg(any(feature = "host", test))]
@@ -1329,7 +1921,7 @@ pub(crate) mod handoff {
 
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
-        fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
@@ -1345,7 +1937,6 @@ pub(crate) mod handoff {
             result
         }
 
-        #[cfg(any(feature = "host", test))]
         fn read_recovered(&self) -> Result<Vec<RecoveredChat>, String> {
             let Some(bytes) = self.read_named(RECOVERED_FILE)? else {
                 return Ok(Vec::new());
@@ -1356,6 +1947,24 @@ pub(crate) mod handoff {
                 return Err("Unsupported recovered conversation evidence; it was preserved".into());
             }
             Ok(report.conversations)
+        }
+
+        /// Read immutable issued lineage once for a fenced daemon inventory.
+        /// Missing evidence grants no continuity; unsafe or ambiguous evidence
+        /// is an error and remains untouched.
+        pub(crate) fn recovered_chats(&self) -> Result<RecoveredChats, String> {
+            let entries = self.read_recovered()?;
+            let mut ids = std::collections::BTreeSet::new();
+            if entries
+                .iter()
+                .any(|entry| !ids.insert(entry.replacement.id))
+            {
+                return Err(
+                    "Recovered conversation evidence has duplicate replacements; it was preserved"
+                        .into(),
+                );
+            }
+            Ok(RecoveredChats { entries })
         }
 
         /// Preserve aliases after the replay checkpoint is consumed. This file
@@ -1480,19 +2089,7 @@ pub(crate) mod handoff {
                 {
                     continue;
                 }
-                let mut aliases = entry.evidence.previous_sources;
-                aliases.extend(entry.aliases.into_iter().map(|source| ChatSource {
-                    source,
-                    launch: entry.evidence.launch.clone(),
-                }));
-                aliases.push(ChatSource {
-                    source: entry.evidence.source,
-                    launch: entry.evidence.launch.clone(),
-                });
-                aliases.push(ChatSource {
-                    source: entry.replacement,
-                    launch: entry.evidence.launch,
-                });
+                let aliases = entry.issued_sources();
                 if aliases
                     .iter()
                     .any(|alias| issued_chat_source_matches(alias, source))
@@ -1648,6 +2245,19 @@ pub(crate) mod handoff {
             self.write_named(UNATTACHED_FILE, &bytes)
         }
 
+        /// The confirmed stop floor must never replay an earlier checkpoint.
+        /// Preserve it under a unique name after the updater owns the lease.
+        pub(crate) fn archive_floor(&self) -> Result<Option<PathBuf>, String> {
+            if self.read_bytes()?.is_none() {
+                return Ok(None);
+            }
+            self.archive_as(&format!(
+                "daemon-upgrade.stopped.{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .map(Some)
+        }
+
         pub fn archive(&self) -> Result<PathBuf, String> {
             self.archive_as("daemon-upgrade.abandoned.json")
         }
@@ -1717,14 +2327,307 @@ pub(crate) mod handoff {
             assert!(error.contains("evidence byte budget exceeded"), "{error}");
         }
 
+        const STATUS_CHECKPOINT: &[u8] = br#"{"version":5,"proof":{"host_session_id":"host","boot_id":"boot","host_incarnation":"daemon"},"phase":"Prepared","payload":{"unknown":"read only"}}"#;
+
+        fn write_status_fixture(store: &Store, bytes: &[u8]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        }
+
         #[test]
-        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+        fn checkpoint_status_observes_typed_phases_and_exact_bytes_without_changing_evidence() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.checkpoint_status().unwrap(), None);
+            assert!(!store.path.exists());
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            let original = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(original.phase, Phase::Prepared);
+            assert!(original.proof.is_complete());
+            assert_eq!(
+                original.digest,
+                "28832b59ca25b329709f14d502030bbac3292b883df6b68550e8779150148d97"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            // The digest names exact bytes, not a normalized JSON document.
+            let mut spaced = STATUS_CHECKPOINT.to_vec();
+            spaced.push(b'\n');
+            write_status_fixture(&store, &spaced);
+            let changed = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(changed.proof, original.proof);
+            assert_eq!(changed.phase, original.phase);
+            assert_ne!(changed.digest, original.digest);
+            assert_eq!(std::fs::read(&store.path).unwrap(), spaced);
+            for phase in [Phase::Prepared, Phase::Ready, Phase::Restoring] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION, "proof": original.proof, "phase": phase,
+                    // Deliberately not a host Checkpoint payload: status must
+                    // never turn inspection into host admission or replay.
+                    "terminals": {"opaque":"ignored"}, "chats": 42,
+                }))
+                .unwrap();
+                write_status_fixture(&store, &bytes);
+                let status = store.checkpoint_status().unwrap().unwrap();
+                assert_eq!(status.phase, phase);
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+            for version in VERSIONS {
+                let mut envelope: serde_json::Value =
+                    serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+                envelope["version"] = version.into();
+                write_status_fixture(&store, &serde_json::to_vec(&envelope).unwrap());
+                assert!(store.checkpoint_status().unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_refuses_unknown_or_incomplete_envelopes_without_mutation() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let valid: serde_json::Value = serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+            let mut cases = vec![b"not json".to_vec(), b"{}".to_vec()];
+            for version in [0, VERSION + 1] {
+                let mut envelope = valid.clone();
+                envelope["version"] = version.into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["host_session_id", "boot_id", "host_incarnation"] {
+                let mut envelope = valid.clone();
+                envelope["proof"][field] = "".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["proof", "phase"] {
+                let mut envelope = valid.clone();
+                envelope[field] = "malformed".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for bytes in cases {
+                write_status_fixture(&store, &bytes);
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_reuses_private_file_and_byte_limit_checks() {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            // Exercise a foreign owner when this test user has CAP_CHOWN;
+            // unprivileged runs still exercise every readable-file safeguard.
+            let owned = std::fs::File::open(&store.path).unwrap();
+            let uid = crate::daemon::current_uid();
+            if unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid + 1, u32::MAX) }
+                == 0
+            {
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(
+                    unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid, u32::MAX) },
+                    0
+                );
+            }
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let alias = directory.path().join("alias.json");
+            std::fs::hard_link(&store.path, &alias).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            std::fs::remove_file(&alias).unwrap();
+            std::fs::rename(&store.path, &alias).unwrap();
+            symlink(&alias, &store.path).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&alias).unwrap(), STATUS_CHECKPOINT);
+            std::fs::remove_file(&store.path).unwrap();
+            std::fs::rename(&alias, &store.path).unwrap();
+            let mut oversized = STATUS_CHECKPOINT.to_vec();
+            oversized.resize(MAX_BYTES as usize + 1, b' ');
+            write_status_fixture(&store, &oversized);
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::metadata(&store.path).unwrap().len(), MAX_BYTES + 1);
+            assert_eq!(std::fs::read(&store.path).unwrap(), oversized);
+        }
+
+        fn recovered_fixture(provider: crate::agent::Provider) -> RecoveredChat {
+            let source = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: vec![],
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                },
+                proof: Some(HostSessionProof {
+                    host_session_id: "host".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "source".into(),
+                }),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            let mut replacement = source.clone();
+            replacement.proof.as_mut().unwrap().host_incarnation = "replacement".into();
+            RecoveredChat {
+                evidence: Chat {
+                    launch: source.launch.clone(),
+                    source,
+                    previous_sources: vec![],
+                },
+                replacement,
+                aliases: vec![],
+            }
+        }
+
+        #[test]
+        fn recovered_chat_lineage_proves_claude_and_codex_only_for_exact_serving_replacement() {
+            for provider in [
+                crate::agent::Provider::Claude,
+                crate::agent::Provider::Codex,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Store::open(directory.path()).unwrap();
+                let entry = recovered_fixture(provider);
+                let source = &entry.evidence.source;
+                let current = &entry.replacement;
+                let serving = current.proof.as_ref().unwrap();
+                assert!(
+                    !store
+                        .recovered_chats()
+                        .unwrap()
+                        .proves(source, current, serving)
+                );
+                assert!(!store.path.with_file_name(RECOVERED_FILE).exists());
+                store.record_recovered(&[entry.clone()]).unwrap();
+                let path = store.path.with_file_name(RECOVERED_FILE);
+                let before = std::fs::read(&path).unwrap();
+                let evidence = store.recovered_chats().unwrap();
+                assert!(evidence.proves(source, current, serving), "{provider:?}");
+                assert!(!evidence.proves(source, current, source.proof.as_ref().unwrap()));
+                for mutation in 0..7 {
+                    let mut changed = current.clone();
+                    match mutation {
+                        0 => changed.proof.as_mut().unwrap().host_incarnation = "foreign".into(),
+                        1 => changed.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                        2 => changed.launch.recipe.arguments.push("--different".into()),
+                        3 => changed.id = crate::model::TerminalId::new(),
+                        4 => changed.proof = None,
+                        5 => {
+                            changed.native_continuity =
+                                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                        }
+                        _ => {
+                            changed
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("ACCOUNT".into(), "other".into());
+                        }
+                    }
+                    assert!(
+                        !evidence.proves(source, &changed, serving),
+                        "replacement mutation {mutation}"
+                    );
+                }
+                let mut unissued_successor = current.clone();
+                unissued_successor.proof.as_mut().unwrap().host_incarnation =
+                    "unissued-successor".into();
+                assert!(
+                    !evidence.proves(
+                        source,
+                        &unissued_successor,
+                        unissued_successor.proof.as_ref().unwrap()
+                    ),
+                    "matching a foreign serving proof is insufficient without its exact issued replacement"
+                );
+                let mut foreign_source = source.clone();
+                foreign_source.proof.as_mut().unwrap().host_incarnation = "foreign".into();
+                assert!(!evidence.proves(&foreign_source, current, serving));
+                assert_eq!(std::fs::read(path).unwrap(), before);
+                assert!(
+                    store.load().unwrap().is_none(),
+                    "reading lineage cannot mint a replay checkpoint"
+                );
+            }
+        }
+
+        #[test]
+        fn recovered_chat_lineage_reads_exact_recorded_aliases_and_rejects_ambiguous_reports() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let mut entry = recovered_fixture(crate::agent::Provider::Claude);
+            let mut earlier = entry.evidence.source.clone();
+            earlier.proof.as_mut().unwrap().host_incarnation = "earlier".into();
+            entry.aliases.push(earlier.clone());
+            let mut early_unconfirmed = earlier.clone();
+            early_unconfirmed.launch.session_id = None;
+            entry.evidence.previous_sources.push(ChatSource {
+                source: early_unconfirmed.clone(),
+                launch: earlier.launch.clone(),
+            });
+            store.record_recovered(&[entry.clone()]).unwrap();
+            let evidence = store.recovered_chats().unwrap();
+            let serving = entry.replacement.proof.as_ref().unwrap();
+            assert!(evidence.proves(&earlier, &entry.replacement, serving));
+            assert!(evidence.proves(&early_unconfirmed, &entry.replacement, serving));
+            let path = store.path.with_file_name(RECOVERED_FILE);
+            for (version, conversations) in [
+                (1, vec![entry.clone(), entry.clone()]),
+                (2, vec![entry.clone()]),
+            ] {
+                let bytes = serde_json::to_vec(&UnattachedReport {
+                    version,
+                    conversations,
+                })
+                .unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(store.recovered_chats().is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+            std::fs::write(&path, b"malformed").unwrap();
+            assert!(store.recovered_chats().is_err());
+            assert_eq!(std::fs::read(path).unwrap(), b"malformed");
+        }
+
+        #[test]
+        fn startup_budget_without_inventory_allows_provider_restoration() {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path()).unwrap();
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(5)
+                std::time::Duration::from_secs(30)
             );
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(br#"{"version":3,"terminals":[],"chats":[]}"#)
+                .unwrap();
+            assert_eq!(
+                store.startup_timeout().unwrap(),
+                std::time::Duration::from_secs(30)
+            );
+        }
+
+        #[test]
+        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.startup_timeout().unwrap(), STARTUP_BASE);
             let save = |bytes: &[u8]| {
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
@@ -1738,12 +2641,12 @@ pub(crate) mod handoff {
             save(br#"{"version":1,"terminals":[{"nested":["ignored"]},{}],"chats":[{}]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(95)
+                std::time::Duration::from_secs(120)
             );
             save(br#"{"version":2,"terminals":[{}],"carried":[{},{}],"chats":[]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(45)
+                std::time::Duration::from_secs(70)
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_ok());
@@ -1768,7 +2671,7 @@ pub(crate) mod handoff {
                 );
                 assert_eq!(
                     store.startup_timeout().unwrap(),
-                    std::time::Duration::from_secs(5 + 30 * chats as u64)
+                    STARTUP_BASE + std::time::Duration::from_secs(30 * chats as u64)
                 );
             }
             for (terminals, chats) in [(MAX_TERMINALS + 1, 0), (0, MAX_CHATS + 1)] {
@@ -2079,6 +2982,61 @@ mod tests {
     }
 
     #[test]
+    fn full_checkpoint_byte_validation_requires_recipes_options_and_valid_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint(directory.path());
+        let mut full = serde_json::to_value(&checkpoint).unwrap();
+        full["version"] = serde_json::json!(5);
+        let validate = |value: &serde_json::Value| {
+            handoff::validate_checkpoint_bytes(&serde_json::to_vec(value).unwrap())
+        };
+        validate(&full).unwrap();
+        for field in ["recipe", "options"] {
+            let mut incomplete = full.clone();
+            incomplete["terminals"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                validate(&incomplete).is_err(),
+                "missing {field} must refuse a receipt"
+            );
+        }
+        let mut carried = full.clone();
+        carried["terminals"] = serde_json::json!([]);
+        carried["carried"] = serde_json::json!([{
+            "source": full["terminals"][0]["source"],
+            "options": full["terminals"][0]["options"],
+        }]);
+        validate(&carried).unwrap();
+        carried["carried"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("options");
+        assert!(validate(&carried).is_err());
+        let mut foreign = full.clone();
+        foreign["proof"]["host_incarnation"] = serde_json::json!("foreign");
+        assert!(validate(&foreign).is_err());
+        let mut future = full.clone();
+        future["version"] = serde_json::json!(6);
+        assert!(validate(&future).is_err());
+        let mut unsafe_recipe = full;
+        unsafe_recipe["terminals"][0]["recipe"]["arguments"] = serde_json::json!(["-c", "replay"]);
+        assert!(validate(&unsafe_recipe).is_err());
+    }
+
+    #[test]
+    fn full_checkpoint_byte_validation_rejects_status_only_payload_and_byte_overflow() {
+        let status = br#"{"version":5,"proof":{"host_session_id":"host","boot_id":"boot","host_incarnation":"daemon"},"phase":"Prepared","payload":{"unknown":"read only"}}"#;
+        assert!(handoff::validate_checkpoint_bytes(status).is_err());
+        assert!(
+            handoff::validate_checkpoint_bytes(&vec![b' '; 8 * 1024 * 1024 + 1])
+                .unwrap_err()
+                .contains("8 MiB")
+        );
+    }
+
+    #[test]
     fn safe_recovery_accepts_shell_and_exact_agent_but_never_arbitrary_commands() {
         let directory = tempfile::tempdir().unwrap();
         let mut checkpoint = checkpoint(directory.path());
@@ -2285,6 +3243,426 @@ mod tests {
         fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
         let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
         assert!(error.contains("agent session still has a live process"));
+    }
+
+    /// A synthetic `/proc/<pid>/stat`. PIDs above `i32::MAX` keep the real
+    /// user-manager session check, which asks the kernel, from matching one.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn process_stat(pid: u32, state: &str, session: u32, start: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[stat_field::STATE] = state.into();
+        fields[stat_field::PARENT] = "1".into();
+        fields[stat_field::SESSION] = session.to_string();
+        fields[stat_field::START] = start.to_string();
+        format!("{pid} (process) {}", fields.join(" "))
+    }
+
+    /// A process whose environment the kernel won't show this user, as it
+    /// won't for ssh-agent or an SSH login's sshd-session.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn protected_process(root: &Path, pid: u32, name: &str, session: u32, start: u64) {
+        use std::os::unix::fs::PermissionsExt;
+        let process = root.join(pid.to_string());
+        // A PID that named another process names this one now.
+        if process.exists() {
+            fs::remove_dir_all(&process).unwrap();
+        }
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), process_stat(pid, "S", session, start)).unwrap();
+        fs::write(process.join("comm"), format!("{name}\n")).unwrap();
+        fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            fs::read(process.join("environ")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the test must exercise an unreadable environment"
+        );
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn readable_process(root: &Path, pid: u32, state: &str, environment: &str, start: u64) {
+        let process = root.join(pid.to_string());
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), process_stat(pid, state, pid, start)).unwrap();
+        fs::write(process.join("comm"), "fish\n").unwrap();
+        fs::write(process.join("cmdline"), b"fish\0").unwrap();
+        fs::write(process.join("environ"), environment).unwrap();
+    }
+
+    /// #2365: an unreadable process can't be ruled out, but the refusal names
+    /// every one of them so a person knows what is in the way.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn unreadable_processes_are_named_rather_than_left_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let agent = u32::MAX - 2;
+        let sftp = u32::MAX - 1;
+        protected_process(directory.path(), agent, "ssh-agent", agent, 100);
+        protected_process(directory.path(), sftp, "sshd-session", sftp, 200);
+
+        let error = surviving_process(&source, u32::MAX, directory.path(), &[]).unwrap_err();
+        let ScanError::Unreadable(processes) = &error else {
+            panic!("{error:?}");
+        };
+        let named: Vec<_> = processes
+            .iter()
+            .map(|process| (process.pid, process.name.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [(agent, Some("ssh-agent")), (sftp, Some("sshd-session"))]
+        );
+        let message = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        for expected in [
+            format!("ssh-agent ({agent})"),
+            format!("sshd-session ({sftp})"),
+        ] {
+            assert!(message.contains(&expected), "{message}");
+        }
+
+        // A live survivor is the answer even beside a process that can't be read.
+        readable_process(
+            directory.path(),
+            u32::MAX - 3,
+            "S",
+            &format!("CAGENTS_TERMINAL_ID={}\0", source.id),
+            300,
+        );
+        let survivor = surviving_process(&source, u32::MAX, directory.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(survivor.pid, u32::MAX - 3);
+        fs::remove_dir_all(directory.path().join((u32::MAX - 3).to_string())).unwrap();
+
+        // An unfinished read is not narrowed to the unreadable processes it saw.
+        let blank = directory.path().join((u32::MAX - 4).to_string());
+        fs::create_dir(&blank).unwrap();
+        fs::write(blank.join("stat"), process_stat(u32::MAX - 4, "R", 1, 1)).unwrap();
+        fs::write(blank.join("cmdline"), b"").unwrap();
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Incomplete(_))
+        ));
+    }
+
+    /// Leaving a process running covers that one process: not another one that
+    /// takes its PID later, and not one whose start couldn't be read.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_process_left_running_is_passed_over_only_while_it_is_the_same_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let pid = u32::MAX - 1;
+        protected_process(directory.path(), pid, "ssh-agent", pid, 100);
+        let Err(ScanError::Unreadable(seen)) =
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+        else {
+            panic!("the process must be unreadable");
+        };
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Ok(None)
+        );
+
+        // The PID now names a later process.
+        protected_process(directory.path(), pid, "ssh-agent", pid, 101);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Err(ScanError::Unreadable(processes)) if processes.len() == 1
+        ));
+
+        // Another unreadable process is still named.
+        protected_process(directory.path(), pid, "ssh-agent", pid, 100);
+        protected_process(directory.path(), pid - 1, "gpg-agent", pid - 1, 50);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Err(ScanError::Unreadable(processes))
+                if processes.len() == 1 && processes[0].pid == pid - 1
+        ));
+        fs::remove_dir_all(directory.path().join((pid - 1).to_string())).unwrap();
+
+        // Without a start time a PID alone identifies nothing.
+        fs::write(
+            directory.path().join(pid.to_string()).join("stat"),
+            format!("{pid} (ssh-agent) S 1 {pid} {pid} 0"),
+        )
+        .unwrap();
+        let Err(ScanError::Unreadable(unstarted)) =
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+        else {
+            panic!("the process must be unreadable");
+        };
+        assert!(surviving_process(&source, u32::MAX, directory.path(), &unstarted).is_err());
+    }
+
+    /// #2365: what the lineage's records prove rules an unreadable process out,
+    /// and nothing short of that does.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_lineage_record_rules_out_only_what_it_proves() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let pid = u32::MAX - 1;
+        protected_process(directory.path(), pid, "sshd-session", pid, 100);
+        let uid = crate::daemon::current_uid();
+        let set_cgroup = |cgroup: &str| {
+            fs::write(
+                directory.path().join(pid.to_string()).join("cgroup"),
+                format!("0::{cgroup}\n"),
+            )
+            .unwrap();
+        };
+        let login = format!("/user.slice/user-{uid}.slice/session-4.scope");
+        set_cgroup(&login);
+        let ruled_out =
+            |birth: Option<LineageBirth>, namespace: Option<&str>| match scan_for_survivor(
+                &source,
+                u32::MAX,
+                directory.path(),
+                &[],
+                || birth,
+                namespace.map(str::to_owned),
+            ) {
+                Ok(None) => true,
+                Err(ScanError::Unreadable(processes)) if processes.len() == 1 => false,
+                other => panic!("{other:?}"),
+            };
+        let born = |since, contained_in: Option<&str>| {
+            Some(LineageBirth::Born {
+                since,
+                contained_in: contained_in.map(str::to_owned),
+            })
+        };
+        assert!(!ruled_out(None, Some("ns")), "no records to go by");
+        assert!(ruled_out(Some(LineageBirth::Unborn), None));
+        assert!(
+            ruled_out(born(101, None), None),
+            "started before the lineage"
+        );
+        assert!(
+            !ruled_out(born(100, None), None),
+            "the same tick isn't before"
+        );
+        assert!(
+            ruled_out(born(50, Some("ns")), Some("ns")),
+            "outside the user manager"
+        );
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("other")),
+            "another view"
+        );
+        assert!(!ruled_out(born(50, Some("ns")), None));
+        assert!(
+            !ruled_out(born(50, None), Some("ns")),
+            "a launch was outside"
+        );
+        set_cgroup(&format!(
+            "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ssh-agent.service"
+        ));
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "reachable from the lineage"
+        );
+        set_cgroup("ssh-agent.service");
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "not a path from the root"
+        );
+        fs::remove_file(directory.path().join(pid.to_string()).join("cgroup")).unwrap();
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "no cgroup to read"
+        );
+        assert!(ruled_out(born(101, Some("ns")), Some("ns")));
+    }
+
+    /// An `ssh-agent -D` started in another shell is in that shell's session.
+    /// Nothing this terminal started can be, so a readable, unmarked leader rules
+    /// it out. Every way that inference could be wrong keeps it unreadable.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn an_unreadable_process_in_an_unmarked_session_is_ruled_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let leader = u32::MAX - 2;
+        let agent = u32::MAX - 1;
+        let other = "CAGENTS_TERMINAL_ID=other-terminal\0";
+        let unreadable = |directory: &Path| {
+            matches!(
+                surviving_process(&source, u32::MAX, directory, &[]),
+                Err(ScanError::Unreadable(processes))
+                    if processes.iter().map(|process| process.pid).eq([agent])
+            )
+        };
+        protected_process(directory.path(), agent, "ssh-agent", leader, 200);
+        assert!(unreadable(directory.path()), "no leader to read");
+
+        readable_process(directory.path(), leader, "S", other, 100);
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Ok(None)
+        );
+
+        // The leader is this terminal's (and is itself a survivor), or its
+        // evidence is a moment of exec, or a zombie, or a later process.
+        readable_process(
+            directory.path(),
+            leader,
+            "S",
+            &format!("CAGENTS_RECOVERY_ORIGIN={}\0", source.id),
+            100,
+        );
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+                .unwrap()
+                .map(|survivor| survivor.pid),
+            Some(leader)
+        );
+        for (state, start) in [("Z", 100), ("S", 300)] {
+            readable_process(directory.path(), leader, state, other, start);
+            assert!(unreadable(directory.path()), "{state} {start}");
+        }
+        // The blank leader can't be ruled out itself either.
+        readable_process(directory.path(), leader, "S", "", 100);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Incomplete(_))
+        ));
+
+        // A process at the session's PID that doesn't lead it isn't its leader.
+        readable_process(directory.path(), leader, "S", other, 100);
+        fs::write(
+            directory.path().join(leader.to_string()).join("stat"),
+            process_stat(leader, "S", 1, 100),
+        )
+        .unwrap();
+        assert!(unreadable(directory.path()));
+
+        // A leader whose own environment can't be read rules nothing out, as
+        // for an SSH login's sshd-session under its root-owned monitor.
+        protected_process(directory.path(), leader, "sshd-session", leader, 100);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Unreadable(processes))
+                if processes.iter().any(|process| process.pid == agent)
+        ));
+    }
+
+    /// A zombie shows no arguments for as long as its parent leaves it, and it
+    /// has stopped running, so it mustn't block every Close and Retry.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_zombie_does_not_fail_a_process_scan_but_a_lasting_blank_process_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+
+        fs::write(process.join("stat"), "42 (sleep) Z 1 41 41 0").unwrap();
+        assert_eq!(
+            ensure_no_surviving_process(&source, u32::MAX, directory.path()),
+            Ok(())
+        );
+
+        fs::write(process.join("stat"), "42 (sleep) R 1 41 41 0").unwrap();
+        let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        assert!(
+            error.contains("cannot inspect process invocation (42)"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_process_scan_gets_past_a_moment_of_exec_but_not_a_lasting_unknown() {
+        let mut scans = 0;
+        let finished = settle(|| {
+            scans += 1;
+            if scans < 3 {
+                Err("cannot inspect process invocation (42)".to_owned())
+            } else {
+                Ok(None::<u32>)
+            }
+        });
+        assert_eq!(finished, Ok(None));
+        assert_eq!(scans, 3);
+
+        let mut scans = 0;
+        let unknown = settle::<()>(|| {
+            scans += 1;
+            Err("cannot inspect process invocation (42)".to_owned())
+        });
+        assert!(unknown.is_err(), "unknown is not absent");
+        assert_eq!(scans, 4);
+
+        let mut scans = 0;
+        let found = settle(|| {
+            scans += 1;
+            Ok::<_, String>(Some(42))
+        });
+        assert_eq!(found, Ok(Some(42)));
+        assert_eq!(scans, 1, "a finished scan isn't repeated");
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn systemd_unit_finds_each_spelling_of_the_named_unit() {
+        let launch = |arguments: &[&str]| {
+            let mut launch = LaunchRecipe::shell("/tmp".into()).unwrap();
+            launch.program = "/usr/bin/systemd-run".into();
+            launch.arguments = arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect();
+            launch
+        };
+        for arguments in [
+            &["--user", "--scope", "--unit=named", "claude"][..],
+            &["--user", "--scope", "--unit", "named", "claude"],
+            &["--user", "--scope", "-u", "named", "claude"],
+            &["--user", "--scope", "-unamed", "claude"],
+        ] {
+            assert_eq!(
+                systemd_unit(&launch(arguments)),
+                Some("named"),
+                "{arguments:?}"
+            );
+        }
+        // `--user` is not `-u`, and nothing after `--` is an option.
+        assert_eq!(
+            systemd_unit(&launch(&["--user", "--scope", "claude"])),
+            None
+        );
+        assert_eq!(
+            systemd_unit(&launch(&["--user", "--", "-u", "named"])),
+            None
+        );
+        let mut other = launch(&["--unit=named"]);
+        other.program = "env".into();
+        assert_eq!(systemd_unit(&other), None);
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn in_systemd_unit_matches_a_whole_unit_at_any_depth() {
+        let base = "0::/user.slice/user-1000.slice/user@1000.service/app.slice";
+        for (cgroup, unit, expected) in [
+            (format!("{base}/named.scope\n"), "named", true),
+            (format!("{base}/named.scope\n"), "named.scope", true),
+            (format!("{base}/named.service\n"), "named.service", true),
+            (format!("{base}/named.scope/inner\n"), "named", true),
+            (format!("{base}/named-2.scope\n"), "named", false),
+            (format!("{base}/other.scope\n"), "named", false),
+            // A slice is not the unit the launch named.
+            (format!("{base}\n"), "app", false),
+            // Only the unified hierarchy is read.
+            ("1:name=systemd:/named.scope\n".to_owned(), "named", false),
+        ] {
+            assert_eq!(in_systemd_unit(&cgroup, unit), expected, "{cgroup} {unit}");
+        }
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
@@ -3090,6 +4468,44 @@ mod tests {
         assert_eq!(
             store.load().unwrap().unwrap().terminals[0].source.id,
             second.terminals[0].source.id
+        );
+    }
+}
+
+#[cfg(test)]
+mod floor_archive_tests {
+    use super::handoff::Store;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn floor_archives_stale_bytes_without_replaying_or_replacing_prior_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.archive_floor().unwrap().is_none());
+        let write_checkpoint = |bytes: &[u8]| {
+            std::fs::write(&store.path, bytes).unwrap();
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // Even an unreadable historical payload must be kept as evidence,
+        // rather than deserialized by the destination's boot path.
+        write_checkpoint(b"historical checkpoint bytes");
+        let first = store.archive_floor().unwrap().unwrap();
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        write_checkpoint(b"another refused checkpoint");
+        let second = store.archive_floor().unwrap().unwrap();
+        assert_ne!(first, second);
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        assert_eq!(
+            std::fs::read(second).unwrap(),
+            b"another refused checkpoint"
         );
     }
 }

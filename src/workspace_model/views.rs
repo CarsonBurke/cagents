@@ -29,6 +29,13 @@ impl From<ChannelId> for Scope {
     }
 }
 
+/// How long the daemon remembers an applied `ChangeView` operation, so a
+/// client that lost the reply can resend it and be told it already happened.
+/// A client must stop resending well before this; the window's publisher stops
+/// after a day.
+pub const OPERATION_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: CardId,
@@ -422,7 +429,7 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
         }
         _ => return false,
     };
-    agent
+    if agent
         .session
         .as_ref()
         .is_some_and(|session| session.same_process(&current))
@@ -430,6 +437,18 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
             .console
             .as_ref()
             .is_some_and(|session| HostedSession::Terminal(session.clone()).same_process(&current))
+    {
+        return true;
+    }
+    // A stopped pane retains its managed identity while paging the captured
+    // transcript under the successor. This grants display membership only;
+    // the agent's execution descriptor and accepted run remain unchanged.
+    match (&agent.session, &current) {
+        (Some(HostedSession::Chat(original)), HostedSession::Chat(current)) => {
+            crate::upgrade::floor::display_snapshot().history_replacement(original, current)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -475,6 +494,20 @@ impl View {
             panes: Vec::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Whether an update from `before` to `pane` has to be refused because the
+    /// source it changes moved on. Revision-only retries must not replay an old
+    /// source over a successor or undo host-owned start/location changes. A
+    /// result that already holds replays nothing: windows reopening together
+    /// all report the same attachment.
+    pub fn source_update_conflicts(&self, before: &Pane, pane: &Pane) -> bool {
+        let holds = |source: &Pane| {
+            self.panes
+                .iter()
+                .any(|current| current.id == source.id && !updates_source(current, source))
+        };
+        updates_source(before, pane) && !holds(before) && !holds(pane)
     }
 
     /// Typed changes preserve unrelated edits; the daemon fences them with the
@@ -555,6 +588,13 @@ impl View {
 
 /// Compare two local projections. This is invoked only for local changes;
 /// adopting a host snapshot resets the projection baseline first.
+/// Whether going from `before` to `pane` changes more than presentation.
+pub fn updates_source(before: &Pane, pane: &Pane) -> bool {
+    before.kind != pane.kind
+        || before.pending_terminal_start != pane.pending_terminal_start
+        || before.scope != pane.scope
+}
+
 pub fn changes(previous: &[Pane], desired: &[Pane]) -> Vec<Change> {
     let mut changes = Vec::new();
     let mut working = previous.to_vec();

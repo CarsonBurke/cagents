@@ -7,7 +7,28 @@ use std::collections::BTreeMap;
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
+///
+/// An agent that still runs as one of these conversations stays open: this
+/// also gives up allocations nobody asked to close, such as a failed start.
 pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Keep)
+}
+
+/// [`close_sessions`] for conversations the user closed, which retires an
+/// open agent that still runs as one whose actor is gone. A daemon stop keeps
+/// such agents open while their conversations come back without a live
+/// actor, and closing the card is how the user ends them.
+pub(super) fn close_sessions_retiring_agents(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Retire)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenAgents {
+    Keep,
+    Retire,
+}
+
+fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -22,24 +43,46 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
     let terminal_ids = channel_terminal_ids(&sessions, &chats);
+    // Read only once a conversation turns out not to be live, the state a
+    // daemon stop leaves an open agent's conversation in.
+    let mut agents = None;
     for kind in &sessions {
         if let CardKind::Chat(session) = kind {
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
-                if may_have_retained_owner(session) {
+                if may_have_retained_owner(session)
+                    || (open_agents == OpenAgents::Retire
+                        && bound_to_open_agent(
+                            session,
+                            read_open_agents(&mut agents, &mut client)?,
+                        ))
+                {
                     client
                         .close_retained_chat(session.clone())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.reason())?;
                 }
                 continue;
             };
-            if let Err(error) = client.close_chat(live.clone()) {
+            let closed = client.close_chat(live.clone());
+            if closed.is_ok() && open_agents == OpenAgents::Retire {
+                // A reopened conversation that was given no work yet leaves
+                // its agent stopped when it closes, for a later reopening to
+                // take over. Closing it for good retires that agent too, read
+                // afresh since the close may already have retired it.
+                agents = None;
+                if bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?) {
+                    client
+                        .close_retained_chat(live.clone())
+                        .map_err(|error| error.reason())?;
+                }
+            }
+            if let Err(error) = closed {
                 // Another window or a natural exit can win this race.
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
                 let Some(fresh) = connect(&socket)? else {
                     return if may_have_retained_owner(live) {
-                        Err(error.to_string())
+                        Err(error.reason())
                     } else {
                         no_daemon_close_result(&sessions)
                     };
@@ -51,14 +94,17 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                     .iter()
                     .any(|chat| chat.id == live.id)
                 {
-                    return Err(error.to_string());
+                    return Err(error.reason());
                 }
-                if may_have_retained_owner(live) {
+                if may_have_retained_owner(live)
+                    || (open_agents == OpenAgents::Retire
+                        && bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?))
+                {
                     // Disappearance from actor inventory can mean retained
                     // ownership, not process exit. Demand its close receipt.
                     client
                         .close_retained_chat(live.clone())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.reason())?;
                 }
             }
         }
@@ -101,6 +147,41 @@ fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
             session.native_continuity,
             crate::chat::NativeContinuity::Durable { .. }
         )
+}
+
+/// The registry's open agents, read on first use.
+fn read_open_agents<'a>(
+    agents: &'a mut Option<Vec<crate::agent_execution::Agent>>,
+    client: &mut crate::control::ControlClient,
+) -> Result<&'a [crate::agent_execution::Agent], String> {
+    if agents.is_none() {
+        let model = client
+            .read_workspace_model()
+            .map_err(|error| error.to_string())?;
+        *agents = Some(
+            model
+                .agents
+                .into_iter()
+                .filter(|agent| !agent.closed)
+                .collect(),
+        );
+    }
+    Ok(agents.as_deref().unwrap_or_default())
+}
+
+/// Whether an open agent still runs as this conversation, which the daemon
+/// finds by the conversation's identity when it retires the agent.
+fn bound_to_open_agent(
+    session: &crate::chat::Session,
+    agents: &[crate::agent_execution::Agent],
+) -> bool {
+    agents.iter().any(|agent| {
+        !agent.closed
+            && matches!(
+                &agent.session,
+                Some(crate::agent_execution::HostedSession::Chat(bound)) if bound.id == session.id
+            )
+    })
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
@@ -185,10 +266,11 @@ pub enum Action {
     RetryDelete(ChannelId),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
+    ReopenTimedOut(ChannelId, std::time::Instant),
 }
 
 impl Action {
-    /// Whether this action is the deletion dialog's own answer.
+    /// Whether this action is a dialog answer or an asynchronous completion.
     ///
     /// Everything else a channel can be asked to do is a navigation command
     /// and stands down behind any modal; refusing the dialog's own answers
@@ -196,7 +278,11 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete
+                | Self::Dismiss
+                | Self::SessionsClosed(..)
+                | Self::RetryDelete(_)
+                | Self::ReopenTimedOut(..)
         )
     }
 }
@@ -220,6 +306,93 @@ pub struct State {
     /// channel straight back. An identity is never reused, so remembering it
     /// for the life of the window is exact.
     deleted: HashSet<ChannelId>,
+    /// Open panes discarded with a deleted channel have no normal close
+    /// history, and the registry also removes their channel view. Keep their
+    /// known destination so the saved picker cannot file them into whichever
+    /// channel happens to be selected later. Pane identities are not reused.
+    deleted_cards: HashSet<CardId>,
+    /// Channels this window closed the last card of, as they were then, so a
+    /// card reopened from one can bring it back after it retires. Explicit
+    /// deletion forgets the channel; only automatic retirement is undone.
+    emptied: Vec<EmptiedChannel>,
+    /// The channel each retired one was revived as. A retired identity is
+    /// never reused, so a revival is a new channel, and every other card
+    /// closed in the old one follows it there.
+    revived: HashMap<ChannelId, ChannelId>,
+    /// Automatic names to give back to channels a closed card returned to.
+    /// The registry forgets an automatic name when a channel's conversation
+    /// leaves, and a conversation that comes back as a new card does not
+    /// reclaim it until it reports a name of its own, which one that fails
+    /// to reconnect never does.
+    names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
+    reopening: HashMap<ChannelId, PendingReopen>,
+    /// Emptied channels waiting for their view publication to settle, by the
+    /// incarnation the close saw. The registry checks that incarnation and
+    /// the settled view revision before it retires one.
+    pub(super) retire_candidates: HashSet<crate::channel_work::Home>,
+    /// Retirements sent to the registry, with the view revision each expects
+    /// and when it was sent. The registry applies edits in order, so a pane
+    /// published into one of these channels before the answer arrives would
+    /// land after it retired.
+    pub(super) retiring: HashMap<ChannelId, (u64, std::time::Instant)>,
+}
+
+/// Bound a deferred reopen's wait without assuming the retirement was refused.
+const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug)]
+struct PendingReopen {
+    home: crate::channel_work::Home,
+    sent: std::time::Instant,
+    intents: Vec<Reopen>,
+}
+
+#[derive(Debug)]
+pub(super) enum Reopen {
+    Conversation {
+        entry: crate::persistence::SavedConversation,
+        prepared: bool,
+        generation: u64,
+        replace: Option<CardId>,
+    },
+    Pane(CardId),
+}
+
+impl Reopen {
+    fn card(&self) -> CardId {
+        match self {
+            Self::Conversation { entry, .. } => entry.card,
+            Self::Pane(card) => *card,
+        }
+    }
+}
+
+/// What a channel was when its last card closed: enough to recreate it as the
+/// user knew it, under its own name and in its own project.
+#[derive(Debug, Clone)]
+struct EmptiedChannel {
+    id: ChannelId,
+    project_id: ProjectId,
+    title: String,
+    title_source: crate::model::ChannelTitleSource,
+}
+
+/// As many emptied channels as there are recently closed cards to reopen.
+const EMPTIED_CHANNELS: usize = 32;
+
+/// Where a closed card was when it closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClosedCardHome {
+    /// A channel that still exists and can take the card back.
+    Channel(ChannelId),
+    /// The registry must decide whether the original identity survives before
+    /// another pane can be published into it.
+    Pending(ChannelId),
+    /// A channel that retired when its last card closed, which reopening the
+    /// card recreates.
+    Retired(ChannelId),
+    /// A worktree or folder strip, or a channel that is gone for good.
+    Strip,
 }
 
 #[derive(Debug)]
@@ -316,8 +489,10 @@ impl Cagents {
         })
     }
 
+    /// Opens channel `id` as navigation alone; a caller that also changed the
+    /// workspace saves it.
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
-        let scope = self.select_channel(id);
+        let scope = self.navigate_to_channel(id);
         if self.durable.active_channel != Some(id) {
             return scope;
         }
@@ -359,6 +534,17 @@ impl Cagents {
     }
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
+        if let Action::ReopenTimedOut(id, sent) = action {
+            if self
+                .channel_ui
+                .reopening
+                .get(&id)
+                .is_some_and(|pending| pending.sent == sent)
+            {
+                self.fail_channel_reopen(id, "Could not confirm whether the channel closed. Reconnect the service and try reopening again.");
+            }
+            return Task::none();
+        }
         if let Action::RetryDelete(id) = action {
             if self.channel_ui.closing.contains_key(&id) {
                 return Task::none();
@@ -383,7 +569,20 @@ impl Cagents {
                 })
             });
             return match result {
-                Ok(()) => self.finish_delete_channel(id),
+                Ok(()) => {
+                    // Managed teardown can remove these captured-open panes
+                    // from the channel before its validated receipt arrives.
+                    // Remember their deleted origin while the exact capture
+                    // still names them; they are not ordinary undo history.
+                    self.channel_ui.deleted_cards.extend(
+                        attempt
+                            .panes
+                            .iter()
+                            .filter(|(_, kind, _)| !kind.is_utility())
+                            .map(|(card, _, _)| *card),
+                    );
+                    self.finish_delete_channel(id)
+                }
                 Err(error) => {
                     let title = self
                         .durable
@@ -413,7 +612,9 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::SessionsClosed(..) | Action::RetryDelete(_) | Action::ReopenTimedOut(..) => {
+                unreachable!()
+            }
             Action::RetryFailed(id) => {
                 if !self.channel_ui.failed.contains_key(&id) {
                     return Task::none();
@@ -421,58 +622,19 @@ impl Cagents {
                 self.delete_channel(id)
             }
             Action::Create(project_id) => {
-                let Some(project) = self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .find(|project| project.id == project_id)
+                let Some(id) = self.create_channel(project_id, String::new(), Default::default())
                 else {
                     return Task::none();
                 };
-                if self.project_ui.removing.contains_key(&project.repository)
-                    || self.project_ui.closed.contains(&project.repository)
-                {
-                    self.status = Some(TransientNotice::warning("That project is being removed."));
-                    return Task::none();
-                }
-                let Some(directory) = self.project_primary_worktree(project_id) else {
-                    return Task::none();
-                };
-                if let Err(error) = self.worktree_protections.protect_next(&directory) {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "Cannot open this worktree yet: {error}"
-                    )));
-                    return Task::none();
-                }
-                let id = ChannelId::new();
-                // The registry assigns the real rank and this window learns it
-                // from the answer to the publish below. Until then it takes one
-                // more than the highest rank it knows, which is what the
-                // registry would assign and what keeps two channels created
-                // before any answer arrives in the order they were made.
-                let ordinal = self.next_provisional_ordinal();
-                Arc::make_mut(&mut self.durable)
-                    .channels
-                    .push(ProjectChannel {
-                        title_source: Default::default(),
-                        id,
-                        project_id,
-                        // Empty means awaiting the channel's first accepted prompt.
-                        // Nonempty names, including user edits, are never replaced here.
-                        title: String::new(),
-                        ordinal,
-                        // Not shared until the registry answers the publish
-                        // below. Claiming it early would let a registry that
-                        // never received the create retire it on a reconnect.
-                        shared: false,
-                        cards: Vec::new(),
-                        focused: None,
-                    });
-                self.publish_channel_creation(id, project_id);
-                self.sidebar_state.reveal_project(project_id);
                 let scope = self.open_channel_with_default(id);
                 self.persist();
-                scope
+                Task::batch([
+                    scope,
+                    sidebar::reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(id),
+                    ))
+                    .map(cosmic::Action::App),
+                ])
             }
             // A channel being deleted is not somewhere to go; its row offers
             // nothing, and this refuses anything that raced it.
@@ -505,10 +667,486 @@ impl Cagents {
         }
     }
 
+    /// Adds a channel to `project_id` and publishes it, without entering it.
+    ///
+    /// An empty `title` means the channel awaits its first accepted prompt; a
+    /// nonempty one, including a user's, is never replaced by that prompt.
+    fn create_channel(
+        &mut self,
+        project_id: ProjectId,
+        title: String,
+        title_source: crate::model::ChannelTitleSource,
+    ) -> Option<ChannelId> {
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)?;
+        if self.project_ui.removing.contains_key(&project.repository)
+            || self.project_ui.closed.contains(&project.repository)
+        {
+            self.status = Some(TransientNotice::warning("That project is being removed."));
+            return None;
+        }
+        let directory = self.project_primary_worktree(project_id)?;
+        if let Err(error) = self.worktree_protections.protect_next(&directory) {
+            self.status = Some(TransientNotice::warning(format!(
+                "Cannot open this worktree yet: {error}"
+            )));
+            return None;
+        }
+        let id = ChannelId::new();
+        // The registry assigns the real rank and this window learns it from
+        // the answer to the publish below. Until then it takes one more than
+        // the highest rank it knows, which is what the registry would assign
+        // and what keeps two channels created before any answer arrives in the
+        // order they were made.
+        let ordinal = self.next_provisional_ordinal();
+        Arc::make_mut(&mut self.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source,
+                id,
+                project_id,
+                title,
+                ordinal,
+                // Not shared until the registry answers the publish below.
+                // Claiming it early would let a registry that never received
+                // the create retire it on a reconnect.
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        self.publish_channel_creation(id, project_id);
+        self.sidebar_state.reveal_project(project_id);
+        Some(id)
+    }
+
+    /// Where `card` was when it closed, when this window can tell: the scope
+    /// it was closed from, or else the one shared view that records removing
+    /// it. A deleted origin or more than one such view identifies no surviving
+    /// channel, so the card returns to its worktree. Only an unknown origin
+    /// leaves placement to the channel where the picker was opened.
+    pub(super) fn closed_card_home(&self, card: CardId) -> Option<ClosedCardHome> {
+        if self.channel_ui.deleted_cards.contains(&card) {
+            return Some(ClosedCardHome::Strip);
+        }
+        let closed_from = self
+            .recently_closed
+            .iter()
+            .rev()
+            .find(|(state, _)| state.id == card)
+            .and_then(|(_, destination)| destination.as_ref());
+        let channel = match closed_from {
+            Some(WorkspaceDestination::Channel(id)) => *id,
+            Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
+                return Some(ClosedCardHome::Strip);
+            }
+            None => {
+                let mut views = self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .filter(|view| view.retired.contains(&card));
+                let view = views.next()?;
+                if views.next().is_some() {
+                    return Some(ClosedCardHome::Strip);
+                }
+                match view.scope {
+                    crate::workspace_model::views::Scope::Channel(id) => id,
+                    crate::workspace_model::views::Scope::Worktree { .. } => {
+                        return Some(ClosedCardHome::Strip);
+                    }
+                }
+            }
+        };
+        self.closed_channel_home(channel)
+    }
+
+    /// The channel a card closed in `id` returns to: `id` itself, or the
+    /// channel that revived it, while it is still there to enter, or else a
+    /// retired one this window can recreate.
+    pub(super) fn closed_channel_home(&self, mut id: ChannelId) -> Option<ClosedCardHome> {
+        // Each revival maps a retired identity to a newer one, so the chain
+        // is acyclic and no longer than the map.
+        for _ in 0..self.channel_ui.revived.len() {
+            match self.channel_ui.revived.get(&id) {
+                Some(&next) => id = next,
+                None => break,
+            }
+        }
+        let present = self.durable.channels.iter().any(|channel| channel.id == id)
+            && !self.channel_ui.is_deleting(id);
+        if present {
+            return Some(if self.channel_retiring(id) {
+                ClosedCardHome::Pending(id)
+            } else {
+                ClosedCardHome::Channel(id)
+            });
+        }
+        // A channel gone any other way, deleted by the user in any window,
+        // is gone for good, and its cards reopen in their worktree.
+        Some(
+            if self
+                .channel_ui
+                .emptied
+                .iter()
+                .any(|emptied| emptied.id == id)
+            {
+                ClosedCardHome::Retired(id)
+            } else {
+                ClosedCardHome::Strip
+            },
+        )
+    }
+
+    /// Whether a card closed in channel `id` reopens from `scope`: from the
+    /// channel it now resolves to, or, once that channel retired, from the
+    /// project's worktrees, where the window fell back to when it retired.
+    /// Another channel keeps reopening its own panes.
+    pub(super) fn closed_channel_reopens_from(
+        &self,
+        id: ChannelId,
+        scope: Option<WorkspaceDestination>,
+    ) -> bool {
+        match self.closed_channel_home(id) {
+            Some(ClosedCardHome::Channel(home) | ClosedCardHome::Pending(home)) => {
+                scope == Some(WorkspaceDestination::Channel(home))
+            }
+            Some(ClosedCardHome::Retired(retired)) => {
+                let project = self
+                    .channel_ui
+                    .emptied
+                    .iter()
+                    .find(|emptied| emptied.id == retired)
+                    .map(|emptied| emptied.project_id);
+                !matches!(scope, Some(WorkspaceDestination::Channel(_)))
+                    && project.is_some()
+                    && project == self.destination_project(scope)
+            }
+            Some(ClosedCardHome::Strip) | None => false,
+        }
+    }
+
+    /// A timed out answer does not cancel the edit already in the publisher.
+    /// Keep its identity fenced until the registry answers definitively.
+    fn channel_retiring(&self, id: ChannelId) -> bool {
+        self.channel_ui.retiring.contains_key(&id)
+    }
+
+    pub(super) fn defer_channel_reopen(
+        &mut self,
+        home: ClosedCardHome,
+        intent: Reopen,
+    ) -> Option<Task<Message>> {
+        let ClosedCardHome::Pending(id) = home else {
+            return None;
+        };
+        let creation_ordinal = self
+            .workspace_model
+            .channel(id)
+            .map(|channel| channel.ordinal)
+            .or_else(|| {
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .map(|channel| channel.ordinal)
+            })?;
+        let home = crate::channel_work::Home {
+            registry: self.workspace_model.identity,
+            channel: id,
+            creation_ordinal,
+        };
+        let pending = self
+            .channel_ui
+            .reopening
+            .entry(id)
+            .or_insert_with(|| PendingReopen {
+                home,
+                sent: std::time::Instant::now(),
+                intents: Vec::new(),
+            });
+        if let Some(index) = pending
+            .intents
+            .iter()
+            .position(|current| current.card() == intent.card())
+        {
+            // A cancelled picker can select the same conversation in a new
+            // generation. Keep the latest intent, including its cancel fence.
+            pending.intents[index] = intent;
+            return Some(Task::none());
+        }
+        pending.intents.push(intent);
+        let sent = pending.sent;
+        Some(cosmic::task::future(async move {
+            tokio::time::sleep(RETIREMENT_ANSWERED).await;
+            Message::ChannelUi(Action::ReopenTimedOut(id, sent))
+        }))
+    }
+
+    pub(super) fn finish_channel_reopen(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(pending) = self.channel_ui.reopening.remove(&id) else {
+            return Task::none();
+        };
+        let same_home = pending.home.registry == self.workspace_model.identity
+            && self
+                .workspace_model
+                .channel(id)
+                .is_none_or(|channel| channel.ordinal == pending.home.creation_ordinal);
+        let mut tasks = Vec::new();
+        for intent in pending.intents {
+            match intent {
+                Reopen::Conversation {
+                    entry,
+                    prepared,
+                    generation,
+                    replace,
+                } => {
+                    tasks.push(self.finish_deferred_conversation(
+                        entry, prepared, generation, replace, same_home,
+                    ));
+                }
+                Reopen::Pane(card) if same_home => tasks.push(self.reopen_closed_pane(card)),
+                Reopen::Pane(_) => {}
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    pub(super) fn fail_channel_reopen(&mut self, id: ChannelId, error: &str) {
+        let Some(pending) = self.channel_ui.reopening.remove(&id) else {
+            return;
+        };
+        let mut active = false;
+        for intent in pending.intents {
+            match intent {
+                Reopen::Conversation { generation, .. } => {
+                    active |= self.fail_deferred_conversation(generation, error);
+                }
+                Reopen::Pane(_) => active = true,
+            }
+        }
+        if active {
+            self.status = Some(TransientNotice::warning(error));
+        }
+    }
+
+    pub(super) fn forget_channel_revival(&mut self, id: ChannelId) {
+        self.channel_ui.emptied.retain(|emptied| emptied.id != id);
+        self.channel_ui.revived.remove(&id);
+        self.channel_ui.retiring.remove(&id);
+    }
+
+    /// Enters the channel a closed card returns to, recreating it if it
+    /// retired, and keeps it from retiring under the card about to arrive.
+    /// `None` when the card belongs to no channel this window can enter.
+    pub(super) fn enter_closed_card_home(&mut self, home: ClosedCardHome) -> Option<Task<Message>> {
+        let (id, reveal) = match home {
+            ClosedCardHome::Channel(id) => {
+                self.channel_ui
+                    .retire_candidates
+                    .retain(|candidate| candidate.channel != id);
+                // No longer empty, so no longer a channel to revive, but one
+                // whose automatic name left with its conversation.
+                if let Some(index) = self
+                    .channel_ui
+                    .emptied
+                    .iter()
+                    .position(|emptied| emptied.id == id)
+                {
+                    let emptied = self.channel_ui.emptied.remove(index);
+                    self.remember_channel_name(id, emptied.title, emptied.title_source);
+                }
+                (id, Task::none())
+            }
+            ClosedCardHome::Retired(id) => {
+                let id = self.revive_channel(id)?;
+                (
+                    id,
+                    sidebar::reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(id),
+                    ))
+                    .map(cosmic::Action::App),
+                )
+            }
+            ClosedCardHome::Pending(_) | ClosedCardHome::Strip => return None,
+        };
+        let scope = self.select_channel(id);
+        (self.durable.active_channel == Some(id)).then(|| Task::batch([scope, reveal]))
+    }
+
+    /// The project `scope` belongs to.
+    fn destination_project(&self, scope: Option<WorkspaceDestination>) -> Option<ProjectId> {
+        match scope? {
+            WorkspaceDestination::Channel(id) => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| channel.project_id),
+            WorkspaceDestination::Folder(project) => Some(project),
+            WorkspaceDestination::Worktree(worktree) => self
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.worktrees.iter().any(|row| row.id == worktree))
+                .map(|project| project.id),
+        }
+    }
+
+    /// Takes back a revival that received no card, so the channel is not left
+    /// empty where nothing would retire it, and stays revivable.
+    pub(super) fn abandon_empty_revival(
+        &mut self,
+        retired: ChannelId,
+        previous: (Option<ChannelId>, Option<PathBuf>),
+    ) -> Task<Message> {
+        let Some(&revived) = self.channel_ui.revived.get(&retired) else {
+            return Task::none();
+        };
+        if self.channel_has_open_card(revived) {
+            return Task::none();
+        }
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == revived)
+        else {
+            return Task::none();
+        };
+        let snapshot = EmptiedChannel {
+            id: retired,
+            project_id: channel.project_id,
+            title: channel.title.clone(),
+            title_source: channel.title_source,
+        };
+        self.channel_ui.revived.remove(&retired);
+        self.remember_emptied(snapshot);
+        let retired = self.retire_channel(revived, false);
+        // Back where reopening started, not wherever retiring would land.
+        let returned = match previous {
+            (Some(channel), _) if self.durable.channels.iter().any(|row| row.id == channel) => {
+                self.select_channel(channel)
+            }
+            (_, Some(path)) => self.select_worktree(path, false),
+            _ => Task::none(),
+        };
+        Task::batch([retired, returned])
+    }
+
+    /// Keeps a snapshot of a channel this window emptied, newest last.
+    fn remember_emptied(&mut self, snapshot: EmptiedChannel) {
+        let state = &mut self.channel_ui;
+        state.emptied.retain(|emptied| emptied.id != snapshot.id);
+        state.emptied.push(snapshot);
+        if state.emptied.len() > EMPTIED_CHANNELS {
+            state.emptied.remove(0);
+        }
+    }
+
+    /// Recreates a channel that retired when its last card closed, under its
+    /// name and in its project. The old identity is gone for good, so the
+    /// channel returns as a new one that the old identity now resolves to.
+    fn revive_channel(&mut self, id: ChannelId) -> Option<ChannelId> {
+        let index = self
+            .channel_ui
+            .emptied
+            .iter()
+            .position(|emptied| emptied.id == id)?;
+        let emptied = self.channel_ui.emptied[index].clone();
+        let revived = self.create_channel(
+            emptied.project_id,
+            emptied.title.clone(),
+            emptied.title_source,
+        )?;
+        self.channel_ui.emptied.remove(index);
+        self.channel_ui.revived.insert(id, revived);
+        self.remember_channel_name(revived, emptied.title, emptied.title_source);
+        Some(revived)
+    }
+
+    /// A manual name survives its conversation leaving, so only an automatic
+    /// one needs giving back.
+    fn remember_channel_name(
+        &mut self,
+        id: ChannelId,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        if source != crate::model::ChannelTitleSource::Manual && !title.is_empty() {
+            self.channel_ui.names.insert(id, (title, source));
+        }
+    }
+
+    /// Gives a channel back the automatic name it had once the registry holds
+    /// the pane that returned to it, which is when it forgets the name. Any
+    /// name it holds by then, the conversation's own or one typed, wins.
+    ///
+    /// The name is the registry's own from before, not a new inference, so it
+    /// needs no live conversation to vouch for it, which one that failed to
+    /// reconnect could not.
+    pub(super) fn restore_channel_names(&mut self) {
+        let names = std::mem::take(&mut self.channel_ui.names);
+        for (id, (title, source)) in names {
+            let Some(index) = self
+                .durable
+                .channels
+                .iter()
+                .position(|channel| channel.id == id)
+            else {
+                continue;
+            };
+            let arrived = self.workspace_model.views.iter().any(|view| {
+                view.scope == crate::workspace_model::views::Scope::Channel(id)
+                    && view
+                        .panes
+                        .iter()
+                        .any(|pane| !view.retired.contains(&pane.id))
+            });
+            let Some(named) = self
+                .workspace_model
+                .channel(id)
+                .map(|shared| !shared.title.is_empty())
+                .filter(|_| arrived)
+            else {
+                self.channel_ui.names.insert(id, (title, source));
+                continue;
+            };
+            if named {
+                continue;
+            }
+            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+            channel.title = title.clone();
+            channel.title_source = source;
+            self.publish_model_edit(ModelEdit::SuggestChannelTitle { id, title, source });
+            self.refresh_sidebar_channels();
+            self.persist();
+        }
+    }
+
     /// Defer automatic retirement until the canonical view publication settles.
     /// A work-bearing channel survives its final conversation, across windows.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
+        for &id in &emptied {
+            let Some(channel) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+            else {
+                continue;
+            };
+            let snapshot = EmptiedChannel {
+                id,
+                project_id: channel.project_id,
+                title: channel.title.clone(),
+                title_source: channel.title_source,
+            };
+            self.remember_emptied(snapshot);
+        }
         let captured = emptied.into_iter().filter_map(|id| {
             let channel = self.workspace_model.channel(id)?;
             let home = crate::channel_work::Home {
@@ -518,8 +1156,60 @@ impl Cagents {
             };
             home.validate().ok().map(|_| home)
         });
-        self.channel_work.retire_candidates.extend(captured);
+        self.channel_ui.retire_candidates.extend(captured);
         Task::none()
+    }
+
+    /// View publication supplies the settled revision. The registry checks
+    /// that exact revision and the channel's incarnation before retiring it.
+    /// Until the daemon's channel work store is retired, it also keeps a
+    /// channel whose incarnation has channel work entries or operations.
+    pub(super) fn retire_settled_empty_channels(&mut self) {
+        let candidates = self
+            .channel_ui
+            .retire_candidates
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for captured in candidates {
+            let channel = captured.channel;
+            let Some(metadata) = self.workspace_model.channel(channel) else {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            };
+            if self.workspace_model.identity != captured.registry
+                || metadata.ordinal != captured.creation_ordinal
+            {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            }
+            let Some(view) =
+                self.workspace_model.views.iter().find(|view| {
+                    view.scope == crate::workspace_model::views::Scope::Channel(channel)
+                })
+            else {
+                continue;
+            };
+            if !view.panes.is_empty() {
+                continue;
+            }
+            // An empty view can precede a live pane's first publication. Closing
+            // that pane later captures the channel again.
+            if self.channel_holds_unpublished_work(channel) {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            }
+            let edit = ModelEdit::RetireEmptyChannel {
+                home: captured,
+                expected_view_revision: view.revision,
+            };
+            if self.workspace_model_tx.try_send(edit).is_ok() {
+                self.channel_ui.retire_candidates.remove(&captured);
+                self.channel_ui
+                    .retiring
+                    .insert(channel, (view.revision, std::time::Instant::now()));
+            }
+        }
     }
 
     /// The channels `retired` would leave without an open card.
@@ -554,6 +1244,25 @@ impl Cagents {
             })
             .map(|channel| channel.id)
             .collect()
+    }
+
+    /// An automatic composer nobody used does not keep a channel alive; any
+    /// other open content does, whether or not the registry has heard of it.
+    pub(super) fn channel_holds_unpublished_work(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel.cards.iter().any(|&card| {
+                    self.is_channel_content(card)
+                        && !self.chat_is_unused_default(card)
+                        && !self.shared_views.defaults.contains_key(&card)
+                        && self
+                            .card_state(card)
+                            .is_some_and(|state| state.existence.is_open())
+                })
+            })
     }
 
     pub(super) fn channel_has_open_card(&self, id: ChannelId) -> bool {
@@ -650,6 +1359,13 @@ impl Cagents {
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
+        // A channel the user deleted stays deleted; reopening one of its
+        // cards does not bring it back.
+        self.fail_channel_reopen(
+            id,
+            "Reopening was cancelled because the channel is being deleted.",
+        );
+        self.forget_channel_revival(id);
         self.channel_ui.failed.remove(&id);
         self.refresh_sidebar_channels();
         // Settling spawns and closing sessions take a round trip each, and the
@@ -736,10 +1452,11 @@ impl Cagents {
             },
         );
         let close = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result =
+                tokio::task::spawn_blocking(move || close_sessions_retiring_agents(sessions))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
             Message::ChannelUi(Action::SessionsClosed(id, operation, result))
         });
         Task::batch([leave, close])
@@ -756,12 +1473,49 @@ impl Cagents {
         };
         if self.workspace_model.identity != attempt.registry
             || channel.project_id != attempt.project
-            || channel.cards != attempt.members
             || attempt.inactive.iter().any(|card| {
                 self.card_state(*card)
                     .is_some_and(|state| state.existence.is_open())
             })
         {
+            return false;
+        }
+        // A close can publish its managed pane tombstone before the worker's
+        // receipt arrives. Only that exact source removal may shrink the
+        // captured membership; additions, moves and replacements still fail.
+        let removed = |card: CardId| {
+            attempt.panes.iter().any(|(captured, before, was_shared)| {
+                *captured == card
+                    && *was_shared
+                    && self.workspace_model.views.iter().any(|view| {
+                        view.scope == crate::workspace_model::views::Scope::Channel(id)
+                            && view.retired.contains(&card)
+                    })
+                    && !self
+                        .workspace_model
+                        .views
+                        .iter()
+                        .any(|view| view.panes.iter().any(|pane| pane.id == card))
+                    && !self.pane_transfer_pending(card)
+                    && !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.id != id && channel.cards.contains(&card))
+                    && self
+                        .card_state(card)
+                        .is_some_and(|current| closed_channel_source_matches(before, &current.kind))
+            })
+        };
+        let mut current = channel.cards.iter().peekable();
+        for original in &attempt.members {
+            if current.peek().is_some_and(|next| *next == original) {
+                current.next();
+            } else if !removed(*original) {
+                return false;
+            }
+        }
+        if current.next().is_some() {
             return false;
         }
         attempt.panes.iter().all(|(card, before, was_shared)| {
@@ -772,7 +1526,7 @@ impl Cagents {
                     .map(move |pane| (&view.scope, pane))
             });
             let shared_current = match (owners.next(), owners.next()) {
-                (None, None) => !was_shared,
+                (None, None) => !was_shared || removed(*card),
                 (Some((scope, pane)), None) => {
                     *scope == crate::workspace_model::views::Scope::Channel(id)
                         && closed_channel_source_matches(before, &pane.kind)
@@ -822,6 +1576,12 @@ impl Cagents {
         // identically whoever asked.
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         self.channel_ui.deleted.insert(id);
+        // Only this window's own retirement of an emptied channel is undone by
+        // reopening one of its cards; a deletion anywhere is final.
+        let own_retirement = self.channel_ui.retiring.remove(&id).is_some();
+        if !own_retirement {
+            self.channel_ui.emptied.retain(|emptied| emptied.id != id);
+        }
         let mut freed_utility = false;
         for card in channel.cards {
             // A utility pane outlives the channel it was visiting: it leaves
@@ -831,8 +1591,11 @@ impl Cagents {
                 freed_utility = true;
                 continue;
             }
+            // Whoever deleted the channel could not have meant a conversation
+            // that never reached its shared view.
             if passive
                 && (self.shared_chat_has_local_work(card)
+                    || self.chat_runs_unobserved_by_peers(card)
                     || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
             {
                 self.retain_local_pane(card);
@@ -860,6 +1623,13 @@ impl Cagents {
                 }
                 continue;
             }
+            if !own_retirement
+                && self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+            {
+                self.channel_ui.deleted_cards.insert(card);
+            }
             self.retire_lsp_card(card);
             self.sidebar_state.forget_card_attention(card);
             if passive {
@@ -875,7 +1645,7 @@ impl Cagents {
         }
         if retained_scope.is_some() {
             self.status = Some(TransientNotice::warning(
-                "A channel was deleted in another client. Your unsaved work is retained in its worktree.",
+                "A channel was deleted in another client. Your unsaved work and running conversations stay in its worktree.",
             ));
         }
         let select = if was_active {
@@ -1073,6 +1843,8 @@ impl Cagents {
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
         self.sidebar_state
+            .set_channel_selected(self.durable.active_channel.is_some());
+        self.sidebar_state
             .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
         let durable = &self.durable;
         let mut cards = HashMap::new();
@@ -1085,11 +1857,25 @@ impl Cagents {
         }
         let previews = &self.notification_ui.previews;
         let allow_previews = self.settings.notifications.message_previews;
+        // One pass groups channels by project, keeping the durable vector's
+        // order, so the refresh stays linear in channels and cards.
+        let mut project_channels = HashMap::<_, Vec<_>>::new();
+        for channel in &durable.channels {
+            project_channels
+                .entry(channel.project_id)
+                .or_default()
+                .push(channel);
+        }
         // A failure outlives nothing: a channel that has gone since, however
         // it went, has nothing left to retry.
-        self.channel_ui
-            .failed
-            .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
+        if !self.channel_ui.failed.is_empty() {
+            let live = durable
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<HashSet<_>>();
+            self.channel_ui.failed.retain(|id, _| live.contains(id));
+        }
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
@@ -1101,10 +1887,11 @@ impl Cagents {
             // ascending creation ranks. Display order is not decided here:
             // `sidebar::channels_in_display_order` owns it, one named ordering
             // helper per row kind beside the one the worktree rows use.
-            for channel in durable
-                .channels
-                .iter()
-                .filter(|channel| channel.project_id == project.id)
+            for channel in project_channels
+                .get(&project.id)
+                .into_iter()
+                .flatten()
+                .copied()
             {
                 let title = if channel.title.is_empty() {
                     Cow::Borrowed(unnamed.as_ref())
@@ -1239,6 +2026,131 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    fn captured_home() -> crate::channel_work::Home {
+        crate::channel_work::Home {
+            registry: uuid::Uuid::new_v4(),
+            channel: ChannelId::new(),
+            creation_ordinal: 4,
+        }
+    }
+
+    fn model_with_empty_channel(
+        home: crate::channel_work::Home,
+    ) -> crate::workspace_model::WorkspaceModel {
+        use crate::workspace_model::views::{Scope, View};
+        crate::workspace_model::WorkspaceModel {
+            identity: home.registry,
+            channels: vec![crate::workspace_model::ModelChannel {
+                id: home.channel,
+                repository: "/project".into(),
+                title: "Work".into(),
+                title_source: Default::default(),
+                ordinal: home.creation_ordinal,
+            }],
+            views: vec![View {
+                scope: Scope::Channel(home.channel),
+                revision: 7,
+                panes: vec![],
+                retired: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_channel_work_invalidation_never_skips_a_delayed_canonical_channel_edit() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let home = captured_home();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.workspace_model = model_with_empty_channel(home);
+        app.workspace_model.sequence = 8;
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 10,
+            edit: ModelEdit::ChannelWorkChanged { home },
+        }));
+        assert_eq!(
+            app.workspace_model.sequence, 8,
+            "an invalidation cannot acknowledge an unseen canonical edit"
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 9,
+            edit: ModelEdit::DeleteChannel { id: home.channel },
+        }));
+        assert!(app.workspace_model.channel(home.channel).is_none());
+        assert_eq!(app.workspace_model.sequence, 9);
+    }
+
+    #[test]
+    fn deferred_empty_retirement_never_rebinds_to_replacement_registry_or_channel_incarnation() {
+        let original = captured_home();
+        for current in [
+            crate::channel_work::Home {
+                registry: uuid::Uuid::new_v4(),
+                ..original
+            },
+            crate::channel_work::Home {
+                creation_ordinal: original.creation_ordinal + 1,
+                ..original
+            },
+            original,
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let (send, received) = async_channel::unbounded();
+            app.workspace_model_tx = send;
+            app.workspace_model = model_with_empty_channel(current);
+            app.channel_ui.retire_candidates.insert(original);
+            app.retire_settled_empty_channels();
+            if current == original {
+                assert_eq!(
+                    received.try_recv().unwrap(),
+                    ModelEdit::RetireEmptyChannel {
+                        home: original,
+                        expected_view_revision: 7
+                    }
+                );
+            } else {
+                assert!(
+                    received.try_recv().is_err(),
+                    "a delayed old close must not act on a replacement home"
+                );
+            }
+            assert!(app.channel_ui.retire_candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn close_intent_captures_only_a_confirmed_original_home() {
+        let original = captured_home();
+        for ordinal in [
+            original.creation_ordinal,
+            crate::workspace_model::PENDING_ORDINAL,
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let card = app.durable.cards[0].id;
+            app.workspace_model = model_with_empty_channel(crate::channel_work::Home {
+                creation_ordinal: ordinal,
+                ..original
+            });
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id: original.channel,
+                    project_id: ProjectId::new(),
+                    title: "Work".into(),
+                    title_source: Default::default(),
+                    ordinal,
+                    shared: true,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+            drop(app.close_emptied_channels(&[card]));
+            assert_eq!(
+                app.channel_ui.retire_candidates.contains(&original),
+                ordinal != crate::workspace_model::PENDING_ORDINAL
+            );
+        }
+    }
 
     #[test]
     fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
@@ -1591,6 +2503,121 @@ mod tests {
         assert_eq!(app.durable.channels[0].title, "My project name");
     }
 
+    /// Channel rows are rebuilt on every structural update, so the refresh
+    /// must stay linear: many projects, channels and cards produce exactly the
+    /// rows a per-project scan would, in durable order.
+    #[test]
+    fn sidebar_channel_rows_at_scale_follow_durable_order_per_project() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let template = app.durable.cards[0].clone();
+        let projects = (0..8).map(|_| ProjectId::new()).collect::<Vec<_>>();
+        for (index, project) in projects.iter().enumerate() {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                *project,
+                RepositoryId::new(),
+                format!("project {index}"),
+                format!("/repo-{index}").into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let durable = Arc::make_mut(&mut app.durable);
+        // Interleave projects so grouping cannot rely on adjacency.
+        for ordinal in 0..200 {
+            let cards = (0..3)
+                .map(|_| {
+                    let mut card = template.clone();
+                    card.id = CardId::new();
+                    durable.cards.push(card.clone());
+                    card.id
+                })
+                .collect::<Vec<_>>();
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: ChannelId::new(),
+                project_id: projects[ordinal % projects.len()],
+                title: format!("channel {ordinal}"),
+                ordinal: ordinal as u32,
+                shared: false,
+                focused: cards.first().copied(),
+                cards,
+            });
+        }
+        let live = app.durable.channels[7].id;
+        app.channel_ui.failed.insert(live, "kept".into());
+        app.channel_ui
+            .failed
+            .insert(ChannelId::new(), "gone".into());
+
+        app.refresh_sidebar_channels();
+        for project in &app.sidebar_model.projects {
+            let expected = app
+                .durable
+                .channels
+                .iter()
+                .filter(|channel| channel.project_id == project.id)
+                .map(|channel| (channel.id, channel.title.as_str()))
+                .collect::<Vec<_>>();
+            let rows = project
+                .channels
+                .iter()
+                .map(|row| (row.id, row.title.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected);
+            assert!(project.channels.iter().all(|row| row.has_panes));
+        }
+        assert_eq!(
+            app.channel_ui.failed.keys().copied().collect::<Vec<_>>(),
+            [live],
+            "only live channels keep a failure"
+        );
+
+        // A removed channel leaves its project's rows on the next refresh.
+        let removed = Arc::make_mut(&mut app.durable).channels.remove(0);
+        app.refresh_sidebar_channels();
+        let rows = &app.sidebar_model.projects[0].channels;
+        assert!(rows.iter().all(|row| row.id != removed.id));
+        assert_eq!(rows.len(), 200 / projects.len() - 1);
+    }
+
+    /// The chrome pass resolves channel titles in one sweep; it must present a
+    /// chat exactly as the single-card lookup does.
+    #[test]
+    fn chat_chrome_takes_its_channel_title_like_the_single_card_lookup() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let other = ChannelId::new();
+        let named = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let session = chat_session();
+        durable.cards[0].title =
+            super::super::chat_ui::chat_card_title(session.launch.provider).into();
+        durable.cards[0].kind = crate::model::CardKind::Chat(session);
+        let project = ProjectId::new();
+        // An untitled channel first: the first *titled* channel names the chat.
+        for (id, title) in [(other, ""), (named, "Parser rewrite")] {
+            durable.channels.push(ProjectChannel {
+                title_source: crate::model::ChannelTitleSource::Manual,
+                id,
+                project_id: project,
+                title: title.into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        drop(app.sync_chrome());
+        let state = app.card_state(card).unwrap();
+        assert_eq!(app.card_display_title(state), "Parser rewrite");
+        assert_eq!(app.repository_chrome(state), "Parser rewrite");
+        assert_eq!(app.card_chrome[&card].title, "Parser rewrite");
+
+        Arc::make_mut(&mut app.durable).channels[1].title = "Renamed".into();
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&card].title, "Renamed");
+    }
+
     fn chat_session() -> crate::chat::Session {
         crate::chat::Session {
             native_continuity: Default::default(),
@@ -1820,6 +2847,69 @@ mod tests {
         (app, doomed, survivor, conversation)
     }
 
+    /// Clicking down the channel list changes where this window is and
+    /// nothing else, so the clicks are saved once, after the burst, instead of
+    /// each one projecting and copying the whole workspace on the UI thread.
+    /// Showing a channel on the way back from a change is still saved at once.
+    #[test]
+    fn opening_channels_from_the_sidebar_saves_once_after_the_burst() {
+        use super::super::terminal_output_tests::persists;
+        let (mut app, first, second, _) = channel_with_a_conversation();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut other = durable.cards[0].clone();
+        other.id = CardId::new();
+        other.kind = crate::model::CardKind::Chat(chat_session());
+        durable.cards.push(other.clone());
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == second)
+            .unwrap()
+            .cards
+            .push(other.id);
+        app.refresh_sidebar_channels();
+        drop(app.select_channel(first));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+
+        let saved = persists();
+        let mut armed = None;
+        for channel in [second, first, second] {
+            drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+                channel_id: channel,
+            })));
+            assert_eq!(app.durable.active_channel, Some(channel));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
+            assert_eq!(persists(), saved, "a click alone waits for the burst");
+            assert!(app.navigation_save_pending);
+            // The burst's first click arms the one timer; later clicks don't
+            // push it back, so a long burst is still saved within the delay.
+            let generation = *armed.get_or_insert(app.navigation_save_generation);
+            assert_eq!(app.navigation_save_generation, generation);
+        }
+        let burst = app.navigation_save_generation;
+        drop(app.update(Message::NavigationSaveDue(burst)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+        assert!(!app.navigation_save_pending);
+
+        // A timer armed for a burst some other save already wrote does not
+        // cut the next burst short.
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        drop(app.select_channel(second));
+        assert_eq!(persists(), saved + 2, "a programmatic switch saves at once");
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        let stale = app.navigation_save_generation - 1;
+        drop(app.update(Message::NavigationSaveDue(stale)));
+        assert_eq!(persists(), saved + 2, "the earlier burst's timer is spent");
+        assert!(app.navigation_save_pending);
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 3);
+        assert_eq!(app.durable.active_channel, Some(first));
+    }
+
     /// A channel's conversations are reachable nowhere else, so deleting one
     /// has to take them with it, say so first, and leave the workspace on a
     /// scope that still exists.
@@ -2008,5 +3098,80 @@ mod tests {
             app.cards.get(&settings),
             Some(CardRuntime::Settings)
         ));
+    }
+}
+
+#[cfg(test)]
+mod revival_tests;
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use crate::agent_execution::{
+        Agent, HostedSession, Origin, Placement, Spec, Surface, Target as AgentTarget,
+    };
+
+    fn conversation(continuity: crate::chat::NativeContinuity) -> crate::chat::Session {
+        let mut session = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            "/repo".into(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        session.native_continuity = continuity;
+        session
+    }
+
+    fn agent(session: &crate::chat::Session) -> Agent {
+        let placement = Placement::Channel(ChannelId::new());
+        Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: AgentTarget {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 0,
+            closed: false,
+        }
+    }
+
+    /// A conversation a stopped daemon left without a live actor still runs
+    /// as its open agent, so closing it retires that agent. One no agent runs
+    /// as, and that nothing retained can own, asks the daemon nothing it
+    /// could only refuse.
+    #[test]
+    fn a_conversation_an_open_agent_runs_as_is_closed_through_the_daemon() {
+        for continuity in [
+            crate::chat::NativeContinuity::ReconnectOnly,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        ] {
+            let session = conversation(continuity);
+            assert!(!may_have_retained_owner(&session));
+            let mut bound = agent(&session);
+            assert!(bound_to_open_agent(&session, &[bound.clone()]));
+
+            let other = conversation(crate::chat::NativeContinuity::ReconnectOnly);
+            assert!(!bound_to_open_agent(&other, &[bound.clone()]));
+            assert!(!bound_to_open_agent(&session, &[]));
+            bound.closed = true;
+            assert!(!bound_to_open_agent(&session, &[bound]));
+        }
     }
 }

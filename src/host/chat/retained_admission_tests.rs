@@ -57,6 +57,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
             "--nocapture",
         ])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(MODE, name)
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
@@ -185,6 +186,9 @@ pub(super) fn pause_failed_confirmation(id: TerminalId) {
 
 #[test]
 fn named_claude_resume_failure_preserves_replacement_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_failure_preserves_replacement_attachment",
         false,
@@ -194,6 +198,9 @@ fn named_claude_resume_failure_preserves_replacement_attachment() {
 
 #[test]
 fn named_claude_resume_failure_retires_before_exact_retry() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_failure_retires_before_exact_retry",
         false,
@@ -203,6 +210,9 @@ fn named_claude_resume_failure_retires_before_exact_retry() {
 
 #[test]
 fn named_claude_resume_retry_finishes_failed_retirement_write() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_retry_finishes_failed_retirement_write",
         true,
@@ -212,6 +222,9 @@ fn named_claude_resume_retry_finishes_failed_retirement_write() {
 
 #[test]
 fn named_claude_resume_normal_close_finishes_failed_retirement_write() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_normal_close_finishes_failed_retirement_write",
         true,
@@ -602,7 +615,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             .unwrap()
             .is_some()
         {
-            assert!(!owner.owner().root.is_current() && !owner.owner().holder.is_current());
+            assert!(!owner.owner().root.is_current() && owner.owner().holder.reaped());
         }
     }
     client.close().unwrap();
@@ -762,6 +775,9 @@ impl Drop for HostClientWire {
 
 #[test]
 fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) =
         isolated("unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc")
     else {
@@ -829,6 +845,9 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
 
 #[test]
 fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) =
         isolated("installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry")
     else {
@@ -846,6 +865,7 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
     )
     .unwrap();
     let (host, proof) = setup(&root, "post-install-admission");
+    host.lock().unwrap().native_chat_capacity = 1;
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     let notifications = super::super::notifications::Broker::start(
@@ -898,7 +918,53 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
         thread::sleep(Duration::from_millis(10));
     };
     assert!(before.state.provider_process.as_ref().unwrap().is_current());
-    assert!(host.lock().unwrap().chats.is_empty());
+    {
+        let state = host.lock().unwrap();
+        assert!(state.chats.is_empty() && state.chat_spawning.is_empty());
+        assert_eq!(capacity::usage(&state), 1);
+        assert_eq!(capacity::status_from_state(&state).spawning, 1);
+    }
+    let mut other = requested.clone();
+    other.id = TerminalId::new();
+    other.launch.recipe.program = "/missing-provider-never-constructed".into();
+    let rejected = start(&host, other).unwrap_err();
+    assert_eq!(rejected.code, ProtocolErrorCode::ChatCapacity);
+
+    // Exact recovery must reuse the occupied slot, reach the original holder,
+    // and retain custody when the same publication fault still refuses it.
+    let failure = start(&host, requested.clone()).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("fixture initial ownership failure"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+
+    let mut changed = pending.source.clone();
+    changed.launch.recipe.program = "/different-exact-source".into();
+    let generation = {
+        let mut state = host.lock().unwrap();
+        state.native_chat_capacity = 2;
+        state.inventory_generation
+    };
+    assert!(
+        super::native_recovery::restore(&host, 0, &changed)
+            .unwrap_err()
+            .contains("retained startup belongs to another exact descriptor")
+    );
+    {
+        let mut state = host.lock().unwrap();
+        assert_eq!(state.inventory_generation, generation);
+        assert!(state.chat_spawning.is_empty());
+        assert!(Arc::ptr_eq(
+            &state.native_actor_startups[&requested.id].context,
+            &pending.context
+        ));
+        state.native_chat_capacity = 1;
+    }
     fault
         .execute_batch("DROP TRIGGER fail_initial_actor_ownership;")
         .unwrap();
@@ -922,6 +988,7 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
         "recovery must not invent or replay a prompt"
     );
     assert!(host.lock().unwrap().native_actor_startups.is_empty());
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
     assert_eq!(pending.requested, requested);
     assert_eq!(pending.source.id, requested.id);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -946,5 +1013,5 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
             .is_some()
     );
     super::native_cleanup::close_retained(&host, &session).unwrap();
-    assert!(!owner.root.is_current() && !owner.holder.is_current());
+    assert!(!owner.root.is_current() && owner.holder.reaped());
 }

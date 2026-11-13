@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Probe one named field in an explicitly owned, disposable native app fixture.
 
 No text values are printed. Optional replacement changes only the selected field;

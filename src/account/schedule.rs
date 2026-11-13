@@ -123,6 +123,11 @@ impl Schedule {
             .is_some_and(|since| now.saturating_sub(since) < IN_FLIGHT_LIMIT)
     }
 
+    /// When the probe in flight started, if one is.
+    pub fn started(&self) -> Option<Millis> {
+        self.in_flight
+    }
+
     pub fn start(&mut self, trigger: Trigger, now: Millis) {
         self.in_flight = Some(now);
         if trigger == Trigger::Manual {

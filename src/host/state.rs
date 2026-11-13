@@ -1,6 +1,8 @@
 #[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 mod presentation;
+mod retention;
+pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
@@ -23,7 +25,7 @@ use crate::{
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
@@ -48,7 +50,7 @@ pub(super) const RETAINED_CHILD_CLEANUP_MESSAGE: &str = "Original helper cleanup
 fn missing_registry() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::Internal,
-        "the shared workspace model store is unavailable",
+        crate::workspace_model::REGISTRY_UNAVAILABLE,
         false,
     )
 }
@@ -74,6 +76,7 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
+    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -252,18 +255,24 @@ pub(crate) struct HostState {
     /// subscriber's queue, and cloning three `String`s per subscriber per frame
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
+    /// Where this daemon allocates each Codex conversation's own listener.
+    pub(super) codex_listeners: super::chat::CodexListenerRoots,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    /// Missing original owners after an acknowledged incomplete update. Their
+    /// saved pane recipes are evidence, never automatic execution authority.
+    paused_update_terminals: BTreeSet<TerminalId>,
     startup_recovery: Option<String>,
     /// Immutable accepted inventory survives a failed final unlink/fsync as
     /// well as its Store handle. This is live custody, not a durable retry or
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     #[cfg(test)]
-    test_fail_startup_commit: Option<TerminalId>,
+    pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
     test_checkpoint_failure_at: Option<(TerminalId, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
@@ -281,6 +290,8 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    /// Layout persistence and hydration never borrow the global terminal lock.
+    pub(super) workspace_registry: Option<Arc<Mutex<super::model::Registry>>>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -294,7 +305,23 @@ pub(crate) struct HostState {
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     /// Operations own their gates, including while waiting to acquire them.
     /// Weak entries let later lookups reclaim gates after every caller leaves.
-    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
+    /// Each gate holds the run whose dispatcher released it to wait for the
+    /// provider to become ready, before the prompt was submitted.
+    pub(super) execution_gates:
+        BTreeMap<crate::model::AgentId, Weak<Mutex<Option<super::agent_execution::Undelivered>>>>,
+    /// Serializes starting an agent's queued prompts, which may first reopen
+    /// its conversation. Kept apart from `execution_gates`: reopening adopts
+    /// the successor under that gate.
+    pub(super) execution_starts: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
+    /// The latest runs that went out once their agent's conversation was
+    /// reopened for them, so a retry or a racing delivery still reports the
+    /// reopening. Bounded, and lost with the daemon.
+    pub(super) reopened_runs: std::collections::VecDeque<crate::model::RunId>,
+    /// Resume successors that took over their agent when they started and
+    /// have been given no work since. Ending one gives the agent back stopped,
+    /// for the next resume to take over, rather than retiring it: until then
+    /// the successor is only a reopening its card may still give up.
+    pub(super) idle_adoptions: BTreeSet<TerminalId>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -331,6 +358,8 @@ pub(crate) struct HostState {
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
+    /// Private inventory exclusions for exact historical cleanup reservations.
+    pub(super) historical_chat_retirements: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
     pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
@@ -417,9 +446,12 @@ impl HostState {
             account_lifecycle: Default::default(),
             worktree_removals: Default::default(),
             proof: Arc::new(proof),
+            codex_listeners: super::chat::CodexListenerRoots::at(std::env::temp_dir()),
             terminals: BTreeMap::new(),
+            terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
+            paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
             #[cfg(test)]
@@ -430,6 +462,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            workspace_registry: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
@@ -437,6 +470,9 @@ impl HostState {
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
+            execution_starts: BTreeMap::new(),
+            reopened_runs: std::collections::VecDeque::new(),
+            idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),
@@ -456,6 +492,7 @@ impl HostState {
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            historical_chat_retirements: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
             native_actor_outcomes: None,
@@ -545,7 +582,22 @@ impl HostState {
                 None
             }
         };
+        self.workspace_registry = match registry.execution_connection() {
+            Ok(connection) => Some(Arc::new(Mutex::new(connection))),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the workspace model writer");
+                None
+            }
+        };
         self.model = Some(registry);
+    }
+
+    /// Another connection to the shared-model store, for work that must not
+    /// hold the host lock while it writes.
+    pub(super) fn independent_model(&self) -> Option<Result<super::model::Registry, String>> {
+        self.model
+            .as_ref()
+            .map(super::model::Registry::execution_connection)
     }
 
     /// How many hosted agents are working, and how many are waiting on the
@@ -592,6 +644,24 @@ impl HostState {
         }
         self.notification_watchers.insert(client, presence);
         activation
+    }
+
+    /// The sessions this publication adds to its window's live claim.
+    pub(super) fn notification_sessions_unclaimed(
+        &self,
+        presence: &crate::notifications::Presence,
+    ) -> Vec<TerminalId> {
+        presence
+            .sessions
+            .iter()
+            .filter(|session| {
+                !self.notification_watchers.values().any(|current| {
+                    current.destination() == presence.destination()
+                        && current.sessions.contains(session)
+                })
+            })
+            .copied()
+            .collect()
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
@@ -684,11 +754,16 @@ impl HostState {
         destination
     }
 
+    pub(super) fn subscribe_model(&mut self, client_id: ClientId) {
+        self.model_watchers.insert(client_id);
+    }
+
     /// Subscribes `client_id` to shared-model edges and returns the model.
     ///
     /// Both happen under one lock, so an edit applied between subscribing and
     /// reading cannot fall into a gap: a client either sees it in the model it
     /// is handed or receives it as an edge afterwards, never neither.
+    #[cfg(test)]
     pub(crate) fn watch_model(
         &mut self,
         client_id: ClientId,
@@ -698,6 +773,7 @@ impl HostState {
         Ok(model)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_model(&self) -> Result<WorkspaceModel, ProtocolError> {
         self.model
             .as_ref()
@@ -712,40 +788,19 @@ impl HostState {
         origin: ClientId,
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ProtocolError> {
+        self.edit_model_delta(origin, edit)?;
+        self.registry()?.model().map_err(model_unavailable)
+    }
+
+    pub(crate) fn edit_model_delta(
+        &mut self,
+        origin: ClientId,
+        edit: ModelEdit,
+    ) -> Result<crate::workspace_model::delta::EditReceipt, ProtocolError> {
+        self.ensure_view_retention_available(&edit)?;
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
-        if let ModelEdit::ChangeView {
-            scope,
-            expected_revision,
-            operation,
-            change,
-        } = &edit
-        {
-            let registry = self.registry()?;
-            let seen = registry
-                .view_operation_seen(*operation)
-                .map_err(model_unavailable)?;
-            if !seen {
-                if let Some(reason) = registry
-                    .view_change_refusal(scope, change)
-                    .map_err(model_unavailable)?
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        reason,
-                        false,
-                    ));
-                }
-                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ViewConflict,
-                        "The workspace view changed; rebase this pane mutation on the current revision",
-                        true,
-                    ));
-                }
-            }
-        }
         if let ModelEdit::SuggestConversationTitle {
             id,
             card,
@@ -772,9 +827,9 @@ impl HostState {
             {
                 return Err(invalid());
             }
-            // Model mutations serialize under this HostLock. Read only resident
-            // metadata, not Store, snapshot/history or files. A later B edit
-            // cannot overtake this A admission; a delayed A sees B's current name.
+            // The request holds workspace writer admission as well as this
+            // resident identity guard. Read only current metadata, not Store,
+            // history or files; later edits cannot overtake this admission.
             let (session, current_title) =
                 actual.handle.conversation_title().map_err(|reason| {
                     let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
@@ -805,33 +860,16 @@ impl HostState {
                 _ => return Err(invalid()),
             }
         }
-        let registry = self.registry()?;
-        let applied = registry.apply(&edit).map_err(|error| {
-            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
-                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
-            }
-            // An execution writer can close a view after the preflight read.
-            // apply has rolled back; inspect authoritative membership again
-            // rather than making the client retry a permanently invalid edit.
-            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
-                match registry.view_change_refusal(scope, change) {
-                    Ok(Some(reason)) => {
-                        return ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            reason,
-                            false,
-                        );
-                    }
-                    Err(storage) => return model_unavailable(storage),
-                    Ok(None) => {}
-                }
-            }
-            model_unavailable(error)
-        })?;
+        let applied = super::workspace::apply_delta(self.registry()?, &edit)?;
         if applied.changed {
-            self.announce_model_edit(origin, applied.model.sequence, &edit);
+            self.announce_model_edit(
+                origin,
+                applied.receipt.sequence,
+                &edit,
+                &applied.receipt.effects,
+            );
         }
-        Ok(applied.model)
+        Ok(applied.receipt)
     }
 
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
@@ -844,7 +882,13 @@ impl HostState {
     /// broadcast, because a redraw broadcast returns early for a subscriber that
     /// is not visible and a sidebar edge is not a repaint - a hidden window that
     /// missed one would show a channel that no longer exists until it restarted.
-    pub(super) fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
+    pub(super) fn announce_model_edit(
+        &self,
+        origin: ClientId,
+        sequence: u64,
+        edit: &ModelEdit,
+        effects: &crate::workspace_model::delta::EditEffects,
+    ) {
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -855,6 +899,7 @@ impl HostState {
                     ServerMessage::WorkspaceModelEdited {
                         sequence,
                         edit: edit.clone(),
+                        effects: effects.clone(),
                     },
                 ));
             }
@@ -943,6 +988,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.ensure_retention_available(&[terminal_id])?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -1154,6 +1200,10 @@ impl HostState {
         Ok(current)
     }
 
+    pub(super) fn terminal_options(&self, id: TerminalId) -> Option<TerminalSpawnOptions> {
+        self.terminals.get(&id).map(|record| record.options.clone())
+    }
+
     /// The descriptor an observer with attachment state `attached` is owed.
     ///
     /// Attachment is the only per-client input, so a broadcast to observers
@@ -1337,7 +1387,7 @@ impl HostState {
             .any(|id| *id != predecessor && self.is_live(id))
     }
 
-    fn is_live(&self, id: &TerminalId) -> bool {
+    pub(super) fn is_live(&self, id: &TerminalId) -> bool {
         self.terminals
             .get(id)
             .is_some_and(|record| record.running || !record.handle.is_completed())
@@ -1437,6 +1487,7 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
+                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -1822,6 +1873,9 @@ impl HostState {
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
+        if !self.terminal_retirements.is_empty() {
+            return Err("Terminal retirement is not confirmed; retry after cleanup settles or explicitly close the retained result".into());
+        }
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1952,6 +2006,11 @@ impl HostState {
         self.ordinary_exit_cleanup_pending
     }
 
+    pub(super) fn terminal_close_admission_open(&self) -> bool {
+        !self.ordinary_exit_registration_closed
+            && (!self.shutting_down || self.ordinary_exit_cleanup_pending)
+    }
+
     /// Called only after the exit caller holds the core's sealed absence
     /// proof. Includes clients registered during the pending cleanup interval.
     pub(super) fn close_ordinary_exit_registration(&mut self) -> Vec<Arc<DeliveryQueue>> {
@@ -1987,7 +2046,9 @@ impl HostState {
     }
 
     pub(super) fn ordinary_exit_cleanup_blocked(&self) -> bool {
-        self.startup_blocks_shutdown() || !self.checked_close_replies.is_empty()
+        self.startup_blocks_shutdown()
+            || !self.checked_close_replies.is_empty()
+            || !self.terminal_retirements.is_empty()
     }
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {
@@ -1995,6 +2056,29 @@ impl HostState {
             (!self.startup_custody.is_empty())
                 .then_some("Original terminal ownership is awaiting its startup outcome")
         })
+    }
+
+    pub(in crate::host) fn pause_update_terminals(&mut self, ids: &[TerminalId]) {
+        self.paused_update_terminals.extend(ids.iter().copied());
+    }
+
+    /// A retained failure outranks custody still awaiting its outcome: it is
+    /// never cleared, so waiting on the remaining custody cannot finish startup.
+    pub(super) fn startup_state(&self) -> StartupState {
+        match &self.startup_recovery {
+            Some(detail) => StartupState::Retained {
+                detail: detail.clone(),
+            },
+            None if self.startup_custody.is_empty() => StartupState::Ready,
+            None => StartupState::Restoring {
+                awaiting: self.startup_custody.len() as u64,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::host) fn await_startup_for_test(&mut self, id: TerminalId) {
+        self.startup_custody.insert(id);
     }
 
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
@@ -2108,13 +2192,12 @@ fn upgrade_blockers_message(blockers: &[String], relaunch_agents: bool) -> Strin
     // session's process cannot be resumed after the daemon restarts, only
     // started again, and the upgrade will not make that choice for the user.
     let mut message = String::from(
-        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading.",
+        "These active terminals cannot be checkpointed automatically. The updater can stop the terminal service after listing the affected work for confirmation.",
     );
-    // With relaunching accepted, whatever still blocks is no identified agent.
     message.push_str(if relaunch_agents {
-        " Each runs a job that is not an agent cagents can relaunch:"
+        " These jobs require the stopped-pane fallback:"
     } else {
-        " Identified agents can instead be relaunched into their resume picker: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
+        " These sessions require the stopped-pane fallback:"
     });
     for blocker in blockers {
         message.push_str("\n  ");
@@ -2173,7 +2256,7 @@ fn validate_terminal_upgrade_environment(
     recipe.remove_unset_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
-            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this terminal before upgrading; no source was stopped",
+            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
         ));
     }
     Ok(())
@@ -2254,7 +2337,7 @@ fn prepare_upgrade_with_carry_policy(
             .any(|receipt| !receipt.unacknowledgeable(now))
         {
             return Err(upgrade_error(
-                "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
+                "A native-to-terminal handoff is not durably acknowledged and cannot be checkpointed",
             ));
         }
         for (chat, receipt) in &state.chat_handoffs {
@@ -2266,7 +2349,7 @@ fn prepare_upgrade_with_carry_policy(
         }
         if state.chats.values().any(|record| record.returning_terminal) {
             return Err(upgrade_error(
-                "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
+                "A native-to-terminal replacement is still pending and cannot be checkpointed",
             ));
         }
         // A durable native holder also keeps its paired terminal alive. Its
@@ -2326,7 +2409,7 @@ fn prepare_upgrade_with_carry_policy(
             }
             if record.handle.is_completed() {
                 return Err(upgrade_error(
-                    "A native provider stopped but may still hold unconfirmed work; close its conversation before upgrading",
+                    "A native provider stopped but may still hold unconfirmed work and cannot be checkpointed",
                 ));
             }
             let mut source = record.session.clone();
@@ -2934,6 +3017,36 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
+/// Lifecycle fixtures that prove their owned providers stopped can supply a
+/// controlled census without depending on unrelated protected host processes.
+#[cfg(test)]
+pub(in crate::host) fn restore_upgrade_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<Vec<TerminalId>, String> {
+    restore_upgrade_from(
+        host,
+        crate::upgrade::handoff::Store::discover()?,
+        processes,
+        holder_directory().ok().as_deref(),
+    )
+}
+
+/// An acknowledged incomplete update authorizes attaching its original holder
+/// only. In particular, missing holders never fall back to a launch recipe.
+pub(in crate::host) fn adopt_prepared_terminal(
+    host: &SharedHost,
+    terminal: &crate::upgrade::handoff::Carried,
+) -> bool {
+    adopt_carried_terminal(
+        host,
+        terminal,
+        holder_directory().ok().as_deref(),
+        std::path::Path::new("/proc"),
+        false,
+    )
+}
+
 /// A holder's private record is discovery only. The live holder must return
 /// matching process evidence and the previous daemon's issued lineage before
 /// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
@@ -2985,7 +3098,82 @@ fn restore_terminal_execution_authority(
     Ok(())
 }
 
+/// An agent row names the exact descriptor its provider was issued, and
+/// dispatch refuses any other. A relaunched provider has a new descriptor under
+/// the same ID, so move the agent, its console and its delegated authority to
+/// it. Only the previous daemons' checkpointed sources are lineage. The agent
+/// recorded one either as issued or after its provider confirmed the
+/// conversation, and before any console was paired with it: a console is
+/// recorded beside the agent's session, not in it.
+///
+/// A refusal leaves the agent on its previous descriptor, so its next prompt is
+/// refused rather than delivered to an unproved process. It does not fail the
+/// restore: the conversation itself was relaunched and confirmed, and windows
+/// still resolve it through the upgrade aliases.
+fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    let (registry, successor, sources) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(registry), Some(record), Some(sources)) = (
+            state.execution_registry.clone(),
+            state.chats.get(&id),
+            state.upgrade_chats.get(&id),
+        ) else {
+            return;
+        };
+        (registry, record.session.clone(), sources.clone())
+    };
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+fn adopt_relaunched_agent(
+    registry: &mut super::model::Registry,
+    sources: &[crate::upgrade::handoff::ChatSource],
+    successor: crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
+    let mut retained = Vec::new();
+    for saved in sources {
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        for issued in [saved.source.clone(), confirmed] {
+            if issued.terminal.is_some() {
+                let mut unpaired = issued.clone();
+                unpaired.terminal = None;
+                retained.push(HostedSession::Chat(unpaired));
+            }
+            retained.push(HostedSession::Chat(issued));
+        }
+    }
+    // This daemon issued the provider's capability as it started, before a
+    // relaunched paired view replaced the descriptor's terminal.
+    if let Some(HostedSession::Chat(started)) =
+        registry.retained_agent_authority_source(successor.id)?
+        && started.proof == successor.proof
+        && (crate::chat::Session {
+            terminal: successor.terminal.clone(),
+            ..started.clone()
+        }) == successor
+    {
+        retained.push(HostedSession::Chat(started));
+    }
+    registry.adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
+    restore_orphaned_holders_preserving(host, &Default::default())
+}
+
+/// A settled recovery can pause a console's chat while keeping its terminal.
+/// Those historical IDs remain eligible only for fresh holder authentication;
+/// the ordinary orphan route below never falls back to executing a recipe.
+pub(super) fn restore_orphaned_holders_preserving(
+    host: &SharedHost,
+    preserved: &std::collections::BTreeSet<TerminalId>,
+) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
         .lock()
@@ -2997,7 +3185,11 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         &proof.boot_id,
         crate::daemon::holder_registry::Kind::Terminal,
     )?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in records {
+        if stopped.blocks_terminal(record.terminal) && !preserved.contains(&record.terminal) {
+            continue;
+        }
         if crate::daemon::termination_requested() {
             break;
         }
@@ -3074,6 +3266,32 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
 /// [`restore_upgrade_from`].
 const RESTORE_TERMINATED: &str = "daemon termination was requested during upgrade restore";
 
+/// The one path that restores a checkpointed chat. Each chat takes exactly
+/// one: a second attempt on a retained conversation finds the actor the first
+/// attempt reattached and refuses it, failing the whole restore.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatRestore {
+    /// A managed Codex CLI, whose thread server must exist before its TUI.
+    CodexListener,
+    /// A provider that outlived the previous daemon. It is reattached, and a
+    /// refusal is that conversation's problem alone; it is never relaunched.
+    Retained,
+    /// Relaunched from its checkpointed launch once carried terminals return.
+    Relaunch,
+}
+
+impl ChatRestore {
+    fn of(chat: &crate::upgrade::handoff::Chat) -> Self {
+        if chat.source.native_continuity.retains_provider() {
+            Self::Retained
+        } else if super::chat::owns_codex_listener(&chat.source) {
+            Self::CodexListener
+        } else {
+            Self::Relaunch
+        }
+    }
+}
+
 /// Replays a checkpoint, abandoning the replay as soon as termination is
 /// requested.
 ///
@@ -3116,7 +3334,7 @@ fn restore_upgrade_from(
     if checkpoint
         .chats
         .iter()
-        .any(|chat| !chat.source.native_continuity.retains_provider())
+        .any(|chat| ChatRestore::of(chat) != ChatRestore::Retained)
     {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
@@ -3129,7 +3347,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if chat.source.native_continuity.retains_provider() {
+        if ChatRestore::of(chat) == ChatRestore::Retained {
             continue;
         }
         let terminal = TerminalSession {
@@ -3158,6 +3376,9 @@ fn restore_upgrade_from(
         );
         return Ok(Vec::new());
     }
+    // Restoration records its progress on disk, but retained-owner admission
+    // must still use the exact Ready payload accepted at this boundary.
+    let ready_checkpoint = (checkpoint.phase == Phase::Ready).then(|| checkpoint.clone());
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     host.lock()
@@ -3171,9 +3392,7 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source)
-                && !chat.source.native_continuity.retains_provider()
-            {
+            if ChatRestore::of(chat) == ChatRestore::CodexListener {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -3224,13 +3443,18 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !chat.source.native_continuity.retains_provider() {
+            if ChatRestore::of(chat) != ChatRestore::Retained {
                 continue;
             }
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            if let Err(reason) = super::chat::restore_upgrade(host, chat) {
+            let restore = if let Some(ready) = &ready_checkpoint {
+                super::chat::restore_ready_checkpoint(host, &chat.source, ready).map(|_| ())
+            } else {
+                super::chat::restore_upgrade(host, chat)
+            };
+            if let Err(reason) = restore {
                 if crate::daemon::termination_requested() {
                     return Err(RESTORE_TERMINATED.to_owned());
                 }
@@ -3328,7 +3552,7 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if ChatRestore::of(chat) != ChatRestore::Relaunch {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3405,6 +3629,14 @@ fn restore_upgrade_from(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
             store.path.display()
         ));
+    }
+    // Only now is every relaunched provider kept. Moving an agent earlier
+    // would leave it on a descriptor that a failed restore then closes, which
+    // a replay of this checkpoint could no longer recognize.
+    for chat in &checkpoint.chats {
+        if ChatRestore::of(chat) != ChatRestore::Retained {
+            restore_relaunched_execution_authority(host, chat.source.id);
+        }
     }
     let finalized = if interrupted_setups {
         store.archive_interrupted_setup().map(|evidence| {
@@ -3813,83 +4045,6 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
-fn finish_pending_terminal(state: &mut HostState, terminal_id: TerminalId) {
-    // Finish a durable automatic-terminal reservation only after its exact
-    // worker exists. A client lost before this point can resume the intent.
-    let session = state.terminals[&terminal_id].session.clone();
-    if let Some(registry) = state.model.as_mut() {
-        if let Ok(model) = registry.model() {
-            for view in model.views {
-                for before in view.panes {
-                    if before.pending_terminal_start
-                        && matches!(&before.kind,crate::model::CardKind::Terminal(terminal) if terminal.id==terminal_id)
-                    {
-                        let mut pane = before.clone();
-                        pane.pending_terminal_start = false;
-                        pane.kind = crate::model::CardKind::Terminal(session.clone());
-                        let edit = ModelEdit::ChangeView {
-                            scope: view.scope.clone(),
-                            expected_revision: view.revision,
-                            operation: uuid::Uuid::new_v4(),
-                            change: crate::workspace_model::views::Change::Update { before, pane },
-                        };
-                        match registry.apply(&edit) {
-                            Ok(applied) if applied.changed => {
-                                let sequence = applied.model.sequence;
-                                for watcher in &state.model_watchers {
-                                    if let Some(delivery) = state.clients.get(watcher) {
-                                        let _ = delivery.push(Outbound::broadcast(
-                                            &state.proof,
-                                            ServerMessage::WorkspaceModelEdited {
-                                                sequence,
-                                                edit: edit.clone(),
-                                            },
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(%terminal_id,%error,"could not finish automatic terminal reservation")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Reads only the daemon's accepted reservation, never a client's launch recipe.
-fn pending_terminal_session(
-    state: &HostState,
-    pane: crate::model::CardId,
-    terminal_id: TerminalId,
-    require_pending: bool,
-) -> Result<TerminalSession, ProtocolError> {
-    let model = state
-        .model
-        .as_ref()
-        .ok_or_else(|| model_unavailable("registry is unavailable".into()))?
-        .model()
-        .map_err(model_unavailable)?;
-    model
-        .views
-        .into_iter()
-        .flat_map(|view| view.panes)
-        .find_map(|candidate| {
-            if candidate.id == pane && (!require_pending || candidate.pending_terminal_start) {
-                if let crate::model::CardKind::Terminal(session) = candidate.kind {
-                    if session.id == terminal_id {
-                        return Some(session);
-                    }
-                }
-            }
-            None
-        })
-        .ok_or_else(|| not_found(terminal_id))
-}
-
 pub(super) fn spawn_pending_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -3898,8 +4053,9 @@ pub(super) fn spawn_pending_terminal(
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
-        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        pending_terminal_session(&state, pane, terminal_id, false)?
+        let writer = super::workspace::writer(shared)?;
+        let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+        super::workspace::pending_terminal(&registry, pane, terminal_id)?.session
     };
     start_terminal_view_owned(
         shared,
@@ -4059,6 +4215,59 @@ pub(super) fn spawn_codex_view_reserved(
     )
 }
 
+/// Restart only a thin console whose previous exact holder has proved closed.
+/// Keep the issued aliases and accepted launch in the new holder, so a crash
+/// before native re-pairing or a window save remains recoverable.
+pub(super) fn spawn_console_replacement(
+    shared: &SharedHost,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    aliases: &[TerminalSession],
+    requested: &crate::chat::Session,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    let (source, previous_sources) = aliases.split_last().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Console replacement has no authenticated previous view",
+            false,
+        )
+    })?;
+    let relaunches: Vec<_> = aliases
+        .iter()
+        .cloned()
+        .map(|source| crate::terminal_ipc::UpgradeRelaunch {
+            source,
+            recipe: session.launch.clone(),
+        })
+        .collect();
+    let previous = crate::terminal::holder::Recovery {
+        source: source.clone(),
+        previous_sources: previous_sources.to_vec(),
+        relaunches: relaunches.clone(),
+        options: options.clone(),
+        execution_environment: None,
+        execution_recipe: None,
+    };
+    let (_, handle) = start_terminal_view_owned_reserved(
+        shared,
+        0,
+        session,
+        options,
+        None,
+        true,
+        None,
+        Some(previous),
+        None,
+        None,
+        Some(&super::chat::TerminalViewReservation::retained_console(
+            requested,
+        )),
+    )?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    state.adopt_upgrade_lineage(source, previous_sources, &relaunches)?;
+    Ok((state.descriptor(0, source.id)?, handle))
+}
+
 fn start_terminal_view_owned_reserved(
     shared: &SharedHost,
     client_id: ClientId,
@@ -4072,6 +4281,18 @@ fn start_terminal_view_owned_reserved(
     execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    if shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .paused_update_terminals
+        .contains(&session.id)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "This terminal is paused after an incomplete update; its original process could not be authenticated. Open a new terminal to continue without replaying its saved command.",
+            false,
+        ));
+    }
     let recovery = shared
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4155,21 +4376,38 @@ fn start_terminal_view_owned_reserved(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
+    // Adoption already inspected this holder's issued source. Keep that exact
+    // receipt alias in the independently installed owner, including when the
+    // startup commit fails; the relaunch projection has no ownership proof.
+    let install_session = previous
+        .as_ref()
+        .map_or_else(|| session.clone(), |previous| previous.source.clone());
+    // Pane reservations are read on the workspace writer, which is always
+    // locked before HostState and never while holding it.
+    let pending_writer = pending_pane
+        .map(|_| super::workspace::writer(shared))
+        .transpose()?;
     let holder_recovery = {
+        let registry = pending_writer
+            .as_ref()
+            .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+        let reservation = registry
+            .as_deref()
+            .zip(pending_pane)
+            .map(|(registry, pane)| super::workspace::pending_terminal(registry, pane, terminal_id))
+            .transpose()?;
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pane) = pending_pane {
+        if let Some(reservation) = reservation {
             // Completion is idempotent across clients, but an actor alone is
             // insufficient: its authoritative pane must still name it.
             if state.terminals.contains_key(&terminal_id) {
-                pending_terminal_session(&state, pane, terminal_id, false)?;
                 let descriptor = state.attach(client_id, terminal_id)?;
                 let handle = state.terminals[&terminal_id].handle.clone();
                 return Ok((descriptor, handle));
             }
-            let accepted = pending_terminal_session(&state, pane, terminal_id, true)?;
-            if accepted.launch != session.launch {
+            if !reservation.accepts(&session) {
                 return Err(not_found(terminal_id));
             }
         }
@@ -4227,6 +4465,12 @@ fn start_terminal_view_owned_reserved(
             }
         })
     };
+    // Fresh holders receive this exact daemon-issued source. Retain it after
+    // successful startup instead of the caller's proofless relaunch projection.
+    // Adoption keeps its independently installed previous source above.
+    let registered_session = holder_recovery
+        .as_ref()
+        .map_or_else(|| session.clone(), |recovery| recovery.source.clone());
 
     let agent_authority = if paired {
         match super::agent_execution::registry(shared) {
@@ -4308,6 +4552,15 @@ fn start_terminal_view_owned_reserved(
     });
     let config = TerminalConfig {
         agent_authority,
+        console_startup_owner: (paired
+            && crate::agent_execution::console_agent(&session.launch).is_some())
+        .then(|| {
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone()
+        }),
         columns: options.columns,
         rows: options.rows,
         cell_width_px: options.cell_width_px,
@@ -4322,7 +4575,6 @@ fn start_terminal_view_owned_reserved(
     };
     let wake_redraw = Arc::clone(&redraw);
     let adopting = config.adoption.is_some();
-    let install_session = session.clone();
     let install_options = options.clone();
     let install_environment = retained_environment.clone();
     let install_execution = execution_recipe.clone();
@@ -4426,7 +4678,25 @@ fn start_terminal_view_owned_reserved(
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
     let redraw_handle = handle.clone();
-    let descriptor = {
+    // Hold writer admission from this check through the completion save.
+    let mut pending_registry = pending_writer
+        .as_ref()
+        .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+    let reservation = pending_registry
+        .as_deref()
+        .zip(pending_pane)
+        .map(|(registry, pane)| {
+            super::workspace::pending_terminal(registry, pane, terminal_id).and_then(
+                |reservation| {
+                    if reservation.accepts(&session) {
+                        Ok(reservation)
+                    } else {
+                        Err(not_found(terminal_id))
+                    }
+                },
+            )
+        });
+    let (descriptor, completion) = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4440,16 +4710,9 @@ fn start_terminal_view_owned_reserved(
                 false,
             ));
         }
-        if let Some(pane) = pending_pane {
-            let validation =
-                pending_terminal_session(&state, pane, terminal_id, true).and_then(|accepted| {
-                    if accepted.launch == session.launch {
-                        Ok(())
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
-                });
-            if let Err(error) = validation {
+        let reservation = match reservation.transpose() {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 if adopting {
                     state.retain_startup_recovery(format!(
                         "Adopted terminal {terminal_id} lost its pane reservation after commit: {}",
@@ -4459,6 +4722,7 @@ fn start_terminal_view_owned_reserved(
                 }
                 state.cancel_spawn(terminal_id);
                 drop(state);
+                drop(pending_registry);
                 // The reservation was withdrawn while the worker was starting.
                 // Shut down only this unpublished worker, never an actor
                 // already attached by another client.
@@ -4466,7 +4730,7 @@ fn start_terminal_view_owned_reserved(
                 drop(handle);
                 return Err(error);
             }
-        }
+        };
         let issued_hint = execution_recipe
             .as_ref()
             .map(|_| session.resume_hint.clone());
@@ -4501,7 +4765,7 @@ fn start_terminal_view_owned_reserved(
         } else {
             state.finish_spawn_with_execution(
                 client_id,
-                session,
+                registered_session,
                 handle,
                 options.initially_visible,
                 execution_recipe.clone(),
@@ -4517,9 +4781,9 @@ fn start_terminal_view_owned_reserved(
                 .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
-        if descriptor.is_ok() && pending_pane.is_some() {
-            finish_pending_terminal(&mut state, terminal_id);
-        }
+        let completion = reservation
+            .filter(|_| descriptor.is_ok())
+            .map(|reservation| (reservation, state.terminals[&terminal_id].session.clone()));
         if descriptor.is_ok() {
             state
                 .terminals
@@ -4538,8 +4802,14 @@ fn start_terminal_view_owned_reserved(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        descriptor
+        (descriptor, completion)
     };
+    if let (Some(registry), Some((reservation, session))) =
+        (pending_registry.as_deref_mut(), completion)
+    {
+        super::workspace::complete_terminal(shared, registry, reservation, session);
+    }
+    drop(pending_registry);
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
@@ -4974,12 +5244,14 @@ mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
 #[cfg(test)]
+mod relaunch_lineage_tests;
+#[cfg(test)]
 mod retained_child_shutdown_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
@@ -4993,6 +5265,46 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
+        use crate::terminal_ipc::{ClientRequest, ServerResponse};
+        let host = Arc::new(HostLock::new(test_host()));
+        let inspect =
+            || match crate::host::client::process_request(&host, 0, ClientRequest::StartupState)
+                .unwrap()
+                .0
+            {
+                ServerResponse::StartupState(state) => state,
+                response => panic!("unexpected startup state response: {response:?}"),
+            };
+        let refused = || {
+            crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(inspect(), StartupState::Ready);
+
+        let custody = TerminalId::new();
+        host.lock().unwrap().startup_custody.insert(custody);
+        assert_eq!(inspect(), StartupState::Restoring { awaiting: 1 });
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+
+        let detail = "Upgrade restore retained original ownership: fixture restore failed";
+        host.lock().unwrap().retain_startup_recovery(detail.into());
+        let retained = StartupState::Retained {
+            detail: detail.into(),
+        };
+        assert_eq!(inspect(), retained);
+        // Custody settling afterwards does not end a retained recovery, and a
+        // later failure does not replace the original reason.
+        host.lock().unwrap().startup_custody.remove(&custody);
+        host.lock()
+            .unwrap()
+            .retain_startup_recovery("a later failure".into());
+        assert_eq!(inspect(), retained);
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
     }
 
     #[test]
@@ -5752,7 +6064,10 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore() {
+    pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::Store;
         let directory = tempfile::tempdir().unwrap();
         // A real foreground process, recognized by its provider argv. Its
@@ -5770,10 +6085,21 @@ mod tests {
             program: executable.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
-            environment: BTreeMap::from([(
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            )]),
+            environment: BTreeMap::from([
+                (
+                    "HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                ),
+                // Keep Claude's account state in this fixture, not the real home.
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory
+                        .path()
+                        .join(".claude")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]),
         };
         let source = TerminalSession {
             owned_codex_listener: None,
@@ -5862,7 +6188,10 @@ mod tests {
     /// provider can stop on its own. Neither an idle resumed conversation nor
     /// one that already ended may hold an update hostage.
     #[test]
-    fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
+    pub(super) fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -5880,7 +6209,7 @@ mod tests {
         let executable = cwd.join("claude");
         // Silent until asked, like the CLI. An interrupt makes it claim a
         // different conversation, which the adapter refuses as a failure.
-        fs::write(&executable, r#"#!/usr/bin/env python3
+        fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
 for line in sys.stdin:
     request = json.loads(line)
@@ -6015,7 +6344,11 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once() {
+    pub(super) fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once()
+     {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -6030,7 +6363,7 @@ for line in sys.stdin:
         let cwd = directory.path().canonicalize().unwrap();
         let executable = cwd.join("claude");
         let log = cwd.join("launches");
-        fs::write(&executable, r#"#!/usr/bin/env python3
+        fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
 identity = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--resume="))
 with open(os.environ["LAUNCH_LOG"], "a") as log:
@@ -6256,8 +6589,103 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
+    pub(in crate::host) fn upgrade_fixture_in_fresh_process() -> bool {
+        // Capability validation consults process-global retained child custody,
+        // and any terminal test may legitimately hold some. These fixtures need
+        // a fresh service. Preserve the caller's environment, but give each
+        // child its own storage: update inspection reads the real data store.
+        const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
+        let current = std::thread::current();
+        let selector = current.name().expect("named test thread");
+        match std::env::var_os(SELECTOR_ENV) {
+            Some(value) => {
+                assert_eq!(value, selector, "unexpected fixture selector");
+                true
+            }
+            None => {
+                struct OriginalChild(std::process::Child);
+                impl Drop for OriginalChild {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut output = tempfile::tempdir().unwrap();
+                output.disable_cleanup(true);
+                eprintln!("Upgrade fixture output: {}", output.path().display());
+                let runtime = output.path().canonicalize().unwrap().join("run");
+                crate::secure_file::prepare_private_directory(&runtime).unwrap();
+                let stdout_path = output.path().join("stdout");
+                let stderr_path = output.path().join("stderr");
+                let mut child = OriginalChild(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            selector,
+                            "--nocapture",
+                            "--test-threads=1",
+                            "--color=never",
+                        ])
+                        .env(SELECTOR_ENV, selector)
+                        .env("XDG_DATA_HOME", output.path().join("data"))
+                        .env("XDG_CONFIG_HOME", output.path().join("config"))
+                        .env("XDG_RUNTIME_DIR", &runtime)
+                        .stdout(fs::File::create(&stdout_path).unwrap())
+                        .stderr(fs::File::create(&stderr_path).unwrap())
+                        .spawn()
+                        .unwrap(),
+                );
+                // Generous on purpose: the limit exists to report a hang, and a
+                // loaded broad run must not turn slowness into a failure.
+                let deadline = Instant::now() + Duration::from_secs(180);
+                let status = loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.0.kill();
+                        let _ = child.0.wait();
+                        let retained = output.keep();
+                        panic!(
+                            "upgrade fixture timed out; retained at {}; stdout: {}; stderr: {}",
+                            retained.display(),
+                            fs::read_to_string(&stdout_path).unwrap_or_default(),
+                            fs::read_to_string(&stderr_path).unwrap_or_default()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let stdout = fs::read_to_string(stdout_path).unwrap();
+                let stderr = fs::read_to_string(stderr_path).unwrap();
+                let named = stdout
+                    .lines()
+                    .filter(|line| *line == format!("test {selector} ... ok"))
+                    .count()
+                    == 1;
+                let summaries = stdout
+                    .lines()
+                    .filter(|line| line.starts_with("test result:"))
+                    .collect::<Vec<_>>();
+                let qualified = summaries.len() == 1
+                    && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
+                if !status.success() || !named || !qualified {
+                    let retained = output.keep();
+                    panic!(
+                        "upgrade fixture child failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
+                        retained.display()
+                    );
+                }
+                output.close().unwrap();
+                false
+            }
+        }
+    }
+
     #[test]
-    fn upgrade_commit_failure_preserves_live_control_authority() {
+    pub(super) fn upgrade_commit_failure_preserves_live_control_authority() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         // An open directory descriptor is retained but cannot create files after
@@ -6270,14 +6698,18 @@ for line in sys.stdin:
             .shutdown_preflight(Instant::now())
             .unwrap()
             .capability;
-        assert!(prepare_upgrade_with(&host, capability, || Ok(store)).is_err());
+        let error = prepare_upgrade_with(&host, capability, || Ok(store)).unwrap_err();
+        assert_ne!(error.message, RETAINED_CHILD_CLEANUP_MESSAGE);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         assert!(!state.is_shutting_down());
         assert!(state.reserve_spawn(TerminalId::new()).is_ok());
     }
 
     #[test]
-    fn upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown() {
+    pub(super) fn upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let mut state = test_host();
         let now = Instant::now();
         let stale = state.shutdown_preflight(now).unwrap().capability;
@@ -6293,7 +6725,98 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
+    pub(super) fn restore_does_not_relaunch_beside_a_process_in_the_saved_unit() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&host, capability, || Ok(store)).unwrap();
+        finish_upgrade(&host).unwrap();
+
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let mut checkpoint = store.load().unwrap().unwrap();
+        let conversation = "aaaaaaaa-1111-4222-8333-444444444444";
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        recipe.program = "claude".into();
+        recipe.arguments = vec!["--resume".into(), conversation.into()];
+        let mut launch = recipe.clone();
+        launch.program = "/usr/bin/systemd-run".into();
+        launch.arguments = vec![
+            "--user".into(),
+            "--scope".into(),
+            "--unit=saved-unit".into(),
+            "claude".into(),
+            "--resume".into(),
+            conversation.into(),
+        ];
+        checkpoint
+            .terminals
+            .push(crate::upgrade::handoff::Terminal {
+                source: TerminalSession {
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    id: TerminalId::new(),
+                    launch,
+                    transcript_path: None,
+                    resume_hint: crate::model::agent_recovery::hint_from_launch(&recipe),
+                    continuity: TerminalContinuity::DetachedSameBoot {
+                        host_session_id: checkpoint.proof.host_session_id.clone(),
+                        boot_id: checkpoint.proof.boot_id.clone(),
+                        host_incarnation: checkpoint.proof.host_incarnation.clone(),
+                    },
+                },
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                recipe,
+                options: TerminalSpawnOptions::default(),
+            });
+        store.save(&checkpoint).unwrap();
+
+        // Its environment was cleared, so only the unit ties it to the terminal.
+        let process = directory.path().join("proc/43");
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), "43 (sleep) S 1").unwrap();
+        fs::write(process.join("cmdline"), b"sleep\01800\0").unwrap();
+        fs::write(process.join("environ"), b"").unwrap();
+        fs::write(
+            process.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/saved-unit.scope\n",
+        )
+        .unwrap();
+
+        let replacement = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let refusal =
+            restore_upgrade_from(&replacement, store, &directory.path().join("proc"), None)
+                .unwrap_err();
+        assert!(
+            refusal.contains("may still have a live process (43)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("saved-unit"), "{refusal}");
+        assert!(
+            replacement
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminals
+                .is_empty(),
+            "nothing may relaunch beside it"
+        );
+    }
+
+    #[test]
+    pub(super) fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
@@ -6330,7 +6853,10 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+    pub(super) fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Launch, Session},
@@ -6394,7 +6920,10 @@ for line in sys.stdin:
         let live = retain(Instant::now() + Duration::from_secs(3600));
         let failure =
             prepare_upgrade_with(&host, live, || Store::open(directory.path())).unwrap_err();
-        assert!(failure.message.contains("not durably acknowledged"));
+        assert!(
+            failure.message.contains("not durably acknowledged"),
+            "expected the live receipt to block upgrade; actual error: {failure:?}"
+        );
         // Nothing is destroyed by a refused upgrade: the window this receipt
         // belongs to can still replay its replacement afterwards.
         assert!(
@@ -6416,244 +6945,172 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
+    pub(super) fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
+        if upgrade_fixture_in_fresh_process() {
+            carried_terminal_across_upgrade(false);
+        }
+    }
+
+    /// Recovery failure retains the live original instead of authorizing replay.
+    #[test]
+    pub(super) fn a_carried_terminal_survives_a_failed_recovery_after_adoption() {
+        if upgrade_fixture_in_fresh_process() {
+            carried_terminal_across_upgrade(true);
+        }
+    }
+
+    // One process per case: an earlier case's original can still be settling in
+    // the process-wide custody that the next case's preparation refuses on.
+    fn carried_terminal_across_upgrade(invalid_successor: bool) {
         use crate::upgrade::handoff::{Phase, Store};
         use std::os::fd::AsRawFd;
-        // Exercise both the successful carry and failure after original adoption.
-        // Failed recovery retains its live original instead of authorizing replay.
-        for invalid_successor in [false, true] {
-            let mut directory = tempfile::tempdir().unwrap();
-            // Preserve the exact detached socket/checkpoint namespace on success
-            // and panic until the outer original-family guardian has settled it.
-            directory.disable_cleanup(true);
-            eprintln!(
-                "Retained terminal carry fixture: {}",
-                directory.path().display()
-            );
-            let holders = directory.path().join("holders");
-            let empty_proc = directory.path().join("proc");
-            fs::create_dir(&empty_proc).unwrap();
-            let pid_file = directory.path().join("pid");
-            let recipe = crate::model::LaunchRecipe {
-                unset_environment: Default::default(),
-                program: "/bin/sh".into(),
-                arguments: vec![
-                    "-c".into(),
-                    format!("echo $$ > '{}'; exec sleep 1000", pid_file.display()),
-                ],
-                working_directory: directory.path().into(),
-                environment: BTreeMap::new(),
-            };
-            let source = TerminalSession {
-                owned_codex_listener: None,
-                recovery_origin: None,
-                predecessor: None,
-                id: TerminalId::new(),
-                launch: recipe.clone(),
-                transcript_path: None,
-                resume_hint: None,
-                continuity: TerminalContinuity::RelaunchAvailable {
-                    recipe,
-                    last_exit: None,
-                },
-            };
-            let host = Arc::new(crate::host::state::HostLock::new(test_host()));
-            spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let pid = loop {
-                if let Some(pid) = fs::read_to_string(&pid_file)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<i32>().ok())
-                {
-                    break pid;
-                }
-                assert!(Instant::now() < deadline, "the shell never started");
-                thread::sleep(Duration::from_millis(10));
-            };
-            let original_root = crate::terminal::holder::Process::read(pid).unwrap();
-            let old = host.lock().unwrap().terminals[&source.id].handle.clone();
-            let carried_source = host
-                .lock()
-                .unwrap()
-                .descriptor(0, source.id)
-                .unwrap()
-                .session;
-            let capability = host
-                .lock()
-                .unwrap()
-                .shutdown_preflight(Instant::now())
-                .unwrap()
-                .capability;
-            // Its job keeps running, so no relaunch has to be accepted for it.
-            assert_eq!(
-                prepare_upgrade_with_policy(&host, capability, false, Some(&holders), || {
-                    Store::open(directory.path())
-                })
-                .unwrap(),
-                (1, 0)
-            );
-            finish_upgrade(&host).unwrap();
-            assert!(old.is_completed());
-            let saved = Store::open(directory.path())
-                .unwrap()
-                .load()
-                .unwrap()
-                .unwrap();
-            assert!(saved.terminals.is_empty());
-            assert_eq!(saved.carried[0].source, carried_source);
-            // An anonymous carry listens until a successor adopts it. Verify
-            // the real handoff endpoint before either restore consumes it.
-            assert!(holders.join(source.id.to_string()).exists());
-
-            if invalid_successor {
-                // Preserve the malformed successor as the real post-adoption failure.
-                let store = Store::open(directory.path()).unwrap();
-                let mut failing = store.load().unwrap().unwrap();
-                let recipe =
-                    crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
-                failing.terminals.push(crate::upgrade::handoff::Terminal {
-                    source: TerminalSession {
-                        owned_codex_listener: None,
-                        recovery_origin: None,
-                        predecessor: None,
-                        id: TerminalId::new(),
-                        launch: recipe.clone(),
-                        transcript_path: None,
-                        resume_hint: None,
-                        continuity: TerminalContinuity::DetachedSameBoot {
-                            host_session_id: failing.proof.host_session_id.clone(),
-                            boot_id: failing.proof.boot_id.clone(),
-                            host_incarnation: failing.proof.host_incarnation.clone(),
-                        },
-                    },
-                    previous_sources: Vec::new(),
-                    relaunches: Vec::new(),
-                    recipe,
-                    // No terminal can start at this size.
-                    options: TerminalSpawnOptions {
-                        columns: 0,
-                        ..TerminalSpawnOptions::default()
-                    },
-                });
-                store.save(&failing).unwrap();
-                let mut expected_retained: serde_json::Value =
-                    serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
-                let failed = Arc::new(crate::host::state::HostLock::new(
-                    test_host_with_incarnation("failed"),
-                ));
-                failed.lock().unwrap().install_model(
-                    crate::host::model::Registry::at(
-                        &directory.path().join("failed-model.sqlite3"),
-                    )
-                    .unwrap(),
-                );
-                let failure =
-                    restore_upgrade_from(&failed, store, &empty_proc, Some(&holders)).unwrap_err();
-                assert!(
-                    failure.starts_with("Upgrade restore retained original ownership:"),
-                    "{failure}"
-                );
-                assert!(
-                    failure
-                        .contains("terminal dimensions or scrollback are outside supported bounds"),
-                    "{failure}"
-                );
-                let handle = {
-                    let state = failed.lock().unwrap();
-                    assert_eq!(state.terminals.len(), 1);
-                    assert_eq!(state.startup_recovery(), Some(failure.as_str()));
-                    let descriptor = state.descriptor(0, source.id).unwrap();
-                    assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
-                    assert_eq!(descriptor.session.launch, source.launch);
-                    state.terminals[&source.id].handle.clone()
-                };
-                assert!(!handle.is_completed());
-                let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-                let fdinfo =
-                    fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd()))
-                        .unwrap();
-                let pinned_pid = fdinfo
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Pid:"))
-                    .unwrap()
-                    .trim()
-                    .parse::<i32>()
-                    .unwrap();
-                assert_eq!(pinned_pid, original_root.pid);
-                let mut readiness = libc::pollfd {
-                    fd: root_pidfd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: the cloned original pidfd stays owned across poll.
-                assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
-                assert!(original_root.is_current());
-                // Anonymous adoption intentionally unlinks its old listener;
-                // the retained current worker is the reachable Close surface.
-                handle.observe_agent().unwrap();
-                let retained_store = Store::open(directory.path()).unwrap();
-                assert_eq!(
-                    retained_store.load().unwrap().unwrap().phase,
-                    Phase::Restoring
-                );
-                expected_retained["phase"] = serde_json::to_value(Phase::Restoring).unwrap();
-                let actual_retained: serde_json::Value =
-                    serde_json::from_slice(&fs::read(&retained_store.path).unwrap()).unwrap();
-                assert_eq!(actual_retained, expected_retained);
-                assert_eq!(
-                    fs::read_to_string(format!("/proc/{pid}/comm"))
-                        .unwrap()
-                        .trim(),
-                    "sleep"
-                );
-                assert_eq!(
-                    handle.close_checked(true),
-                    crate::terminal_ipc::TerminalCloseResult::Closed
-                );
-                assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
-                continue;
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
+        let holders = directory.path().join("holders");
+        let empty_proc = directory.path().join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let pid_file = directory.path().join("pid");
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; exec sleep 1000", pid_file.display()),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let source = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
+        spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
             }
-
-            let replacement = Arc::new(crate::host::state::HostLock::new(
-                test_host_with_incarnation("second"),
-            ));
-            replacement.lock().unwrap().install_model(
-                crate::host::model::Registry::at(
-                    &directory.path().join("replacement-model.sqlite3"),
-                )
-                .unwrap(),
-            );
-            restore_upgrade_from(
-                &replacement,
-                Store::open(directory.path()).unwrap(),
-                &empty_proc,
-                Some(&holders),
-            )
-            .unwrap();
-            assert!(
+            assert!(Instant::now() < deadline, "the shell never started");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let original_root = crate::terminal::holder::Process::read(pid).unwrap();
+        let old = host.lock().unwrap().terminals[&source.id].handle.clone();
+        let carried_source = host
+            .lock()
+            .unwrap()
+            .descriptor(0, source.id)
+            .unwrap()
+            .session;
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        // Its job keeps running, so no relaunch has to be accepted for it.
+        assert_eq!(
+            prepare_upgrade_with_policy(&host, capability, false, Some(&holders), || {
                 Store::open(directory.path())
-                    .unwrap()
-                    .load()
-                    .unwrap()
-                    .is_none()
+            })
+            .unwrap(),
+            (1, 0)
+        );
+        finish_upgrade(&host).unwrap();
+        assert!(old.is_completed());
+        let saved = Store::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(saved.terminals.is_empty());
+        assert_eq!(saved.carried[0].source, carried_source);
+        // An anonymous carry listens until a successor adopts it. Verify
+        // the real handoff endpoint before either restore consumes it.
+        assert!(holders.join(source.id.to_string()).exists());
+
+        if invalid_successor {
+            // Preserve the malformed successor as the real post-adoption failure.
+            let store = Store::open(directory.path()).unwrap();
+            let mut failing = store.load().unwrap().unwrap();
+            let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+            failing.terminals.push(crate::upgrade::handoff::Terminal {
+                source: TerminalSession {
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    id: TerminalId::new(),
+                    launch: recipe.clone(),
+                    transcript_path: None,
+                    resume_hint: None,
+                    continuity: TerminalContinuity::DetachedSameBoot {
+                        host_session_id: failing.proof.host_session_id.clone(),
+                        boot_id: failing.proof.boot_id.clone(),
+                        host_incarnation: failing.proof.host_incarnation.clone(),
+                    },
+                },
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                recipe,
+                // No terminal can start at this size.
+                options: TerminalSpawnOptions {
+                    columns: 0,
+                    ..TerminalSpawnOptions::default()
+                },
+            });
+            store.save(&failing).unwrap();
+            let mut expected_retained: serde_json::Value =
+                serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+            let failed = Arc::new(crate::host::state::HostLock::new(
+                test_host_with_incarnation("failed"),
+            ));
+            failed.lock().unwrap().install_model(
+                crate::host::model::Registry::at(&directory.path().join("failed-model.sqlite3"))
+                    .unwrap(),
             );
-            let descriptor = replacement
-                .lock()
-                .unwrap()
-                .descriptor(0, source.id)
-                .unwrap();
-            assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
-            assert_eq!(descriptor.session.launch, source.launch);
-            assert_eq!(
-                fs::read_to_string(format!("/proc/{pid}/comm"))
-                    .unwrap()
-                    .trim(),
-                "sleep",
-                "the successor adopted the same process rather than starting another"
+            let failure =
+                restore_upgrade_from(&failed, store, &empty_proc, Some(&holders)).unwrap_err();
+            assert!(
+                failure.starts_with("Upgrade restore retained original ownership:"),
+                "{failure}"
             );
-            let handle = replacement.lock().unwrap().terminals[&source.id]
-                .handle
-                .clone();
+            assert!(
+                failure.contains("terminal dimensions or scrollback are outside supported bounds"),
+                "{failure}"
+            );
+            let handle = {
+                let state = failed.lock().unwrap();
+                assert_eq!(state.terminals.len(), 1);
+                assert_eq!(state.startup_recovery(), Some(failure.as_str()));
+                assert_eq!(
+                    state.startup_state(),
+                    StartupState::Retained {
+                        detail: failure.clone()
+                    }
+                );
+                let descriptor = state.descriptor(0, source.id).unwrap();
+                assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
+                assert_eq!(descriptor.session.launch, source.launch);
+                state.terminals[&source.id].handle.clone()
+            };
             assert!(!handle.is_completed());
             let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
             let fdinfo =
@@ -6675,12 +7132,95 @@ for line in sys.stdin:
             // SAFETY: the cloned original pidfd stays owned across poll.
             assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
             assert!(original_root.is_current());
+            // Anonymous adoption intentionally unlinks its old listener;
+            // the retained current worker is the reachable Close surface.
+            handle.observe_agent().unwrap();
+            let retained_store = Store::open(directory.path()).unwrap();
+            assert_eq!(
+                retained_store.load().unwrap().unwrap().phase,
+                Phase::Restoring
+            );
+            expected_retained["phase"] = serde_json::to_value(Phase::Restoring).unwrap();
+            let actual_retained: serde_json::Value =
+                serde_json::from_slice(&fs::read(&retained_store.path).unwrap()).unwrap();
+            assert_eq!(actual_retained, expected_retained);
+            assert_eq!(
+                fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .unwrap()
+                    .trim(),
+                "sleep"
+            );
             assert_eq!(
                 handle.close_checked(true),
                 crate::terminal_ipc::TerminalCloseResult::Closed
             );
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            return;
         }
+
+        let replacement = Arc::new(crate::host::state::HostLock::new(
+            test_host_with_incarnation("second"),
+        ));
+        replacement.lock().unwrap().install_model(
+            crate::host::model::Registry::at(&directory.path().join("replacement-model.sqlite3"))
+                .unwrap(),
+        );
+        restore_upgrade_from(
+            &replacement,
+            Store::open(directory.path()).unwrap(),
+            &empty_proc,
+            Some(&holders),
+        )
+        .unwrap();
+        assert!(
+            Store::open(directory.path())
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        let descriptor = replacement
+            .lock()
+            .unwrap()
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
+        assert_eq!(descriptor.session.launch, source.launch);
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "sleep",
+            "the successor adopted the same process rather than starting another"
+        );
+        let handle = replacement.lock().unwrap().terminals[&source.id]
+            .handle
+            .clone();
+        assert!(!handle.is_completed());
+        let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
+        let fdinfo =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd())).unwrap();
+        let pinned_pid = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(pinned_pid, original_root.pid);
+        let mut readiness = libc::pollfd {
+            fd: root_pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the cloned original pidfd stays owned across poll.
+        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+        assert!(original_root.is_current());
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
@@ -6741,7 +7281,10 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+    pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
         let directory = tempfile::tempdir().unwrap();
         let empty_proc = directory.path().join("proc");
@@ -6801,13 +7344,42 @@ for line in sys.stdin:
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
         restored.observe_agent().unwrap();
-        let capability = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown_preflight(Instant::now())
-            .unwrap()
-            .capability;
-        prepare_upgrade_with(&host, capability, || Store::open(directory.path())).unwrap();
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
+        loop {
+            assert!(
+                // This waits on the passwd shell's own startup in a fresh HOME.
+                prepare_started.elapsed() < Duration::from_secs(60),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
+            );
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
+        }
         finish_upgrade(&host).unwrap();
         let store = Store::open(directory.path()).unwrap();
         let second = store.load().unwrap().unwrap();
@@ -7897,6 +8469,7 @@ for line in sys.stdin:
             crate::model::agent_recovery::fresh_native_environment(Provider::Claude, false);
         environment.extend(selected.clone());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7970,9 +8543,18 @@ for line in sys.stdin:
         assert_eq!(interrupt.sessions[0].disposition, Disposition::Interrupted);
         assert_eq!(interrupt.sessions[0].interrupted_subagents, ["first"]);
         assert!(
-            interrupt.sessions[0]
+            interrupt.sessions[0].reason.starts_with(
+                "The update will stop 1 running background subagent (\u{201c}first\u{201d})"
+            ),
+            "only a turn under way is called the active turn: {}",
+            interrupt.sessions[0].reason
+        );
+        assert!(
+            waiting.sessions[0]
                 .reason
-                .contains("1 running background")
+                .contains("Background subagent \u{201c}first\u{201d} is still running"),
+            "{}",
+            waiting.sessions[0].reason
         );
         let now = Instant::now();
         let capability = state.shutdown_preflight(now).unwrap().capability;

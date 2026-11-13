@@ -28,6 +28,31 @@ handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
 together.
 
+A session carried across an update keeps running the `cagents` CLI it was
+launched with. The daemon still serves that CLI when its protocol is listed as
+an older client: currently protocol 128, the 0.1.3+local.c68275e94 line. Only
+a peer running the `cagents` executable is served this way, and not one
+running `cagents daemon bridge`, which relays a remote device's window. An
+older window or daemon is still refused at its handshake, which is how a stale window learns
+that an update superseded it. The daemon answers that CLI in its protocol's
+version. It refuses requests to stop, update or hand off the daemon, and requests whose
+reply the CLI couldn't read, such as `automation history`, `automation run` and
+`automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+What a later protocol only added detail to is sent as the CLI knew it: on
+protocols before 166, a subagent waiting on its own background work reads as
+running.
+Each protocol's postcard wire format is recorded under
+`tests/fixtures/wire-formats/`. A test checks that every listed older protocol
+encodes the same way, except for what is refused, withheld or restated. It checks
+encoding, not meaning, and not JSON carried as text inside a message.
+
+When a daemon takes the runtime lease, it points `bin` in its runtime
+directory at its own matched CLI. That runtime directory is
+`$XDG_RUNTIME_DIR/cagents` in production, or the development instance's
+directory. The sessions it launches find `cagents` there first, so a later
+update gives them the new daemon's CLI. A daemon without a matched CLI removes
+the link instead.
+
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
 older running UI or Debian peer package that predates the lease marker; upgrade
@@ -71,11 +96,14 @@ cagents daemon stop --confirm
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
 | `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
 | `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
+| `daemon store-schema` | Print the shared workspace store's schema on disk, or nothing if there is none; refuses while a daemon runs |
+| `daemon downgrade-store SCHEMA` | Convert the shared workspace store back to an older schema for an older release; refuses while a daemon runs |
 | `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
-| `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `sessions [--project PATH \| --all \| --channel [CHANNEL]]` (alias `ls`), `whoami` | List live agent sessions in this project or everyone in a channel, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `transcript SESSION [-n N] [--before ID] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
 | `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 
@@ -97,6 +125,10 @@ cagents daemon stop --confirm
   valid for 60 seconds; inventory changes require a new one.
 - A successful stop means **termination requested**, not that every PTY has
   exited. Plain `daemon stop` without these flags is a force stop.
+- Stopping the daemon ends each agent's provider process and any turn in
+  progress, but does not close the agent. The agent keeps its ID, and its card
+  stays in its channel, where its saved conversation can be resumed. A turn
+  the stop cut short is never resent. Only closing an agent removes it.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the
@@ -162,12 +194,28 @@ launches and automation prechecks must settle first. Changed ownership or impact
 requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
-`daemon upgrade` uses this same worker and confirmation. `--yes` skips the
+`daemon upgrade` uses the served candidate's worker and this same confirmation.
+The candidate drives qualified source daemons through a frozen lifecycle subset:
+protocol 156 (the `991daa43e` desktop build) and the matched current protocol 166.
+Other source protocols, including 160 and 165, are refused before preparation,
+shutdown or checkpoint changes. Use a cold installation instead: finish and close
+hosted sessions, quit every window, then use the installed build's matching CLI
+to run `cagents --no-start daemon stop --require-empty`. Confirm that its
+`cagents --no-start daemon status` reports stopped, run the verified installer
+without `--restart-daemon`, and reopen the application. For a newer service,
+choose a newer release. The update is never handed to an older build's worker.
+`--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
-It does not grant approval for a different inventory discovered afterward.
+Saved panes that cannot reconnect reopen stopped, with a reason and a recovery
+action in the review. A changed inventory requires another review.
 Unsaved window work blocks replacement, and failures remain visible in the
 application's update state. A compatible update closes and reopens windows
 without replacing the daemon or recovering sessions.
+
+Recovery windows first attach saved panes to existing work or display retained
+history, without starting replacement providers. Once startup finishes, new
+terminals and later reconnects use ordinary daemon startup behavior. Initial
+restores already in progress retain their attachment-only intent.
 
 ## Full daemon upgrades
 
@@ -223,7 +271,9 @@ Close to finish after daemon restart. A terminal receipt proves its root and PTY
 owner were released (active close also stops the inspected terminal family); it
 makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
-confirming their release.
+confirming their release. While they run, native holders and retained Claude
+actors also reap tool processes that their provider left behind and that have
+exited, without signalling any process that is still running.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
@@ -306,6 +356,33 @@ failure rolls back only when its status proves it stopped; if startup state is
 ambiguous, the installer keeps the new installation and recovery state rather
 than risk a second writer. Inspect `cagents daemon status` before retrying.
 
+A replacement daemon that started may already have converted the shared
+workspace store (`workspace-model.sqlite3`) to a newer schema, which the
+previous daemon refuses to open. Once the previous daemon has stopped and
+before the replacement starts, the installer records the store's schema with
+the replacement's `cagents daemon store-schema`; that is the schema the
+previous daemon reads. A rollback then runs the replacement's
+`cagents daemon downgrade-store <schema>` (schema 22 for a store the
+replacement created), which converts the store back in one transaction,
+keeping every view, pane, retired id and applied pane change. Both commands
+run the matched `cagentsd --stored-schema` or `--downgrade-store`, and both
+refuse while a daemon runs.
+
+The installer only asks through the replacement's command line, and only when
+its `--help` shows these commands. It never gives a daemon an option it may
+not know: released daemons through v0.1.3 ignore their arguments and would start
+serving. A replacement without the commands predates every store downgrade a
+release ships, so the installer neither records the schema nor converts
+anything back.
+
+Installing an older release on purpose is not a rollback: its daemon cannot
+open a store a newer release converted, and runs without the shared model
+until the newer release is back. To keep it, stop the daemon and run the
+newer release's `cagents daemon downgrade-store SCHEMA` first, with the
+schema the older release reads (22 for releases before the conversion). If the schema cannot be read, the installation is not changed; if the
+conversion fails, the installer keeps the new installation, which reads the
+store, rather than restore a daemon that cannot.
+
 A retained native conversation that its provider refuses to reattach, for
 example because Codex no longer finds the thread's rollout in its account
 storage, does not fail the restore. The replacement daemon still starts and
@@ -361,6 +438,18 @@ receipt for exact disk resume; other transport teardown consumes it. A paired
 terminal must also acknowledge teardown before that receipt authorizes resume.
 Across a kernel boot change, the old process tree is necessarily gone, so an
 exact saved conversation can resume without the ephemeral runtime receipt.
+
+Each owned Codex server listens at `cagents-codex-<conversation>/control.sock`
+under `codex/` in the daemon's runtime directory (`$XDG_RUNTIME_DIR/cagents`
+for the production instance), which the system's temporary-file cleaner does
+not age. Earlier releases allocated it in the daemon's `TMPDIR`, and a
+runtime directory too long for a Unix socket address (some development
+instances) still does. A conversation allocated there keeps that path, also
+when its server is started again, because the recipe every window was issued
+names it. While its server runs, the daemon refreshes the timestamps of the
+entry and its private directory at startup and every six hours, so
+`systemd-tmpfiles` does not remove the published symlink from a server that is
+still running.
 
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The
@@ -465,15 +554,11 @@ without that feature are production builds.
 
 Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
 
-### Automatic merged worktree cleanup
+### Merged worktree notices
 
-Settings → General → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
-
-Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
+Settings → General → **Merged worktrees** is disabled by default. When enabled, sidebar PR refreshes look for GitHub worktrees whose exact branch and current commit were merged, one at a time, and show a notice naming what deleting each would discard, such as uncommitted changes or an ignored `.env`. The worktree, its catalog entry and its branch are always kept: an inventory cannot exclude files another program writes later, so only an explicitly confirmed **Delete worktree** removes it. The daemon refuses automatic-removal requests from older clients. See [Merged worktree notices and ignored files](configuration.md#merged-worktree-notices-and-ignored-files).
 
 Directory protection covers both the pathname and a held directory identity. Moving an open checkout with `git worktree move` preserves its protection, and replacing its old pathname does not bypass the original path lease.
-
-Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
 
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).
 
@@ -486,6 +571,23 @@ belongs to the exact kernel lease owner, process lifetime, boot, and executable;
 it does not depend on the installation pathname. Compatible windows can
 reconnect to a matched daemon, including development builds in their separate
 runtime namespace.
+
+A daemon that takes the fence itself declares it as an admission until its
+listener is ready, and so does a worktree removal that briefly checks the
+running windows. A window opened meanwhile waits for that admission instead of
+reporting an update, then opens normally. If the wait passes two seconds it
+shows a **Starting cagents** notice, which closes when the workspace opens;
+launches that wait together share one notice. A
+daemon that dies during admission releases the waiting window at once, and
+that window starts a daemon itself. The wait is bounded by the daemon's own
+startup allowance plus ten seconds; past that, the window reports that the
+daemon is still starting and offers **Retry**. An exclusive holder without the
+declaration is treated as an update: the reviewed update coordinator, an
+installer's inherited guard, a daemon admitted under one of those, and builds
+that predate the declaration. An update that takes the fence while a window
+is waiting therefore still opens the update progress window. A standalone
+editor does not wait: while a daemon is starting it opens without its folders
+and says they cannot be opened safely yet.
 
 An incompatible window, or an older window without this capability, refuses
 startup before socket or daemon state changes. Close that window through the

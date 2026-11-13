@@ -40,6 +40,8 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::RefreshProject { .. }
             | SidebarAction::ToggleProjects
             | SidebarAction::ToggleProject(_)
+            | SidebarAction::ToggleWorktrees(_)
+            | SidebarAction::SetWorktreeDisplay { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
             | SidebarAction::WindowMenu
@@ -569,6 +571,7 @@ impl Cagents {
                 return Task::none();
             }
             Action::Close => {
+                let was_open = self.device_ui.open;
                 if let Some(image) = self.device_ui.image.take() {
                     image.task.abort();
                     self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
@@ -577,6 +580,9 @@ impl Cagents {
                 }
                 if !self.device_ui.busy {
                     self.device_ui.open = false;
+                    if was_open && self.daemon_health_ui.confirmation {
+                        return self.focus_daemon_health_after_cover();
+                    }
                 }
                 return Task::none();
             }

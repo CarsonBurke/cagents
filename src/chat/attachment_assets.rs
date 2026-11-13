@@ -30,6 +30,7 @@ pub(crate) const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_STORE_IMAGES: usize = 4096;
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+const STORE_DIRECTORY: &str = "chat-image-assets";
 const REGISTRY: &str = "receipts.json";
 const LOCK: &str = "receipts.lock";
 
@@ -291,8 +292,16 @@ impl Store {
     }
     #[cfg(any(feature = "host", feature = "ui"))]
     fn restore(&self, reference: &ImageReference, source: &str) -> Option<ImageReference> {
-        let registry = self.read_registry().ok()?;
-        let receipt = self.receipt(&registry, reference).ok()?;
+        self.restore_with(&self.read_registry().ok()?, reference, source)
+    }
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn restore_with(
+        &self,
+        registry: &Registry,
+        reference: &ImageReference,
+        source: &str,
+    ) -> Option<ImageReference> {
+        let receipt = self.receipt(registry, reference).ok()?;
         if let Some(data) = source.strip_prefix("data:image/") {
             let (kind, data) = data.split_once(";base64,")?;
             if !matches!(kind, "png" | "jpeg" | "gif" | "webp")
@@ -311,9 +320,24 @@ impl Store {
                 path: source.into(),
                 reference: Some(reference.clone()),
             };
-            self.validate_with(&registry, &attachment).ok()?;
+            self.validate_with(registry, &attachment).ok()?;
         }
         Some(reference.clone())
+    }
+    /// A display number names at most one receipt on this device. It only
+    /// identifies the image when `source` carries that receipt's exact bytes.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn restore_number(
+        &self,
+        registry: &Registry,
+        number: u64,
+        source: &str,
+    ) -> Option<ImageReference> {
+        let receipt = registry
+            .images
+            .values()
+            .find(|receipt| receipt.reference.number == number)?;
+        self.restore_with(registry, &receipt.reference, source)
     }
 
     /// Caller has validated real image decoding under UI's shared budgets.
@@ -593,7 +617,7 @@ fn store_path() -> Result<PathBuf, String> {
     Ok(crate::instance::project_dirs()
         .ok_or("Application image storage is unavailable")?
         .data_dir()
-        .join("chat-image-assets"))
+        .join(STORE_DIRECTORY))
 }
 fn store(create: bool) -> Result<Store, String> {
     Store::at(&store_path()?, create)
@@ -637,6 +661,37 @@ pub fn read(reference: &ImageReference, limit: usize) -> Result<Vec<u8>, String>
 pub fn restore_reference(reference: &ImageReference, source: &str) -> Option<ImageReference> {
     store(false).ok()?.restore(reference, source)
 }
+/// Each `(number, source)` pair's receipt, read from one registry snapshot;
+/// `None` unless every pair verifies.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub fn restore_numbers<'a>(
+    pairs: impl IntoIterator<Item = (u64, &'a str)>,
+) -> Option<Vec<ImageReference>> {
+    let store = store(false).ok()?;
+    let registry = store.read_registry().ok()?;
+    pairs
+        .into_iter()
+        .map(|(number, source)| store.restore_number(&registry, number, source))
+        .collect()
+}
+#[cfg(any(feature = "host", feature = "ui"))]
+pub fn restore_number(number: u64, source: &str) -> Option<ImageReference> {
+    restore_numbers([(number, source)])?.pop()
+}
+/// Whether `path` is shaped like a stored image of some cagents instance or
+/// device: `chat-image-assets/<receipt UUID>.<extension>`. Only such a file
+/// can be the image a bare `[Image N]` caption labels.
+pub fn is_stored_image_path(path: &Path) -> bool {
+    path.parent().and_then(Path::file_name) == Some(OsStr::new(STORE_DIRECTORY))
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|leaf| leaf.rsplit_once('.'))
+            .is_some_and(|(id, extension)| {
+                Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+                    && matches!(extension, "png" | "jpg" | "gif" | "webp")
+            })
+}
 #[cfg(feature = "ui")]
 pub(crate) fn stage_validated(
     bytes: &[u8],
@@ -652,7 +707,7 @@ pub(crate) fn stage_validated(
 #[cfg(all(test, any(feature = "ui", feature = "host")))]
 pub(crate) fn with_test_image<T>(test: impl FnOnce(Attachment) -> T) -> T {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("assets");
+    let path = directory.path().join(STORE_DIRECTORY);
     let store = Store::at(&path, true).unwrap();
     let bytes = fixture_bytes("first image");
     let attachment = store

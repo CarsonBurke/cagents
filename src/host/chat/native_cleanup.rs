@@ -11,6 +11,22 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
+    /// A retained close of `source`'s unpaired owner, as Close records it once
+    /// it adopts that owner, and once its Release is answered when `closed`.
+    #[cfg(test)]
+    pub(in crate::host) fn adopted(
+        source: Session,
+        owner: chat::native_holder::Detached,
+        closed: bool,
+    ) -> Self {
+        Self {
+            source,
+            owner,
+            closed,
+            paired: None,
+        }
+    }
+
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
         &self.source.launch.recipe.working_directory
     }
@@ -30,7 +46,9 @@ struct RetainedPair {
 /// Claude cleanup adopts its authenticated resident reducer with close-only
 /// authority from its durable registration; this grants no account read or input
 /// authority. Exact ownership and the current daemon lease authorize either
-/// route; disappearance never proves a successful close.
+/// route; disappearance never proves a successful close. A Codex owner that
+/// ended without a receipt settles only on the evidence that nothing of it can
+/// still run; see `settle_lost_execution`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
     close_retained_inner(host, source, None, None)
 }
@@ -123,7 +141,12 @@ fn close_retained_inner(
             return Err("The exact hosted attachment changed before native cleanup".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() {
+            // Ordinary close has joined this exact captured attachment and
+            // proved its provider teardown. A retained protocol diagnosis must
+            // not block its paired cleanup; unattached cleanup still cannot
+            // bypass a failed or live actor's own close path.
+            let closed_capture = expected.is_some() && record.handle.is_completed();
+            if record.handle.owns_work() && !closed_capture {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
             // Identity/continuity are cached actor metadata; never hydrate a
@@ -168,22 +191,29 @@ fn close_retained_inner(
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
-        let owner = pending
+        let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
-            .map(Ok)
-            .unwrap_or_else(|| {
-                registry::recovery_candidate(&socket, Kind::Native).and_then(|record| {
-                    record.ok_or_else(|| {
-                        "No exact native holder or confirmed close receipt is available".to_owned()
-                    })
-                })
-            })?;
+        {
+            Some(owner) => owner,
+            None => match registry::recovery_candidate(&socket, Kind::Native)? {
+                Some(record) if !chat::native_holder::retire_abandoned(&record)? => record,
+                // The owner ended without a receipt and left nothing to
+                // adopt. The resident, if any, is removed below.
+                _ => return super::settle_lost_execution(host, source, &proof),
+            },
+        };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
             retire_closed_execution(host, source, record, &proof)?;
             return Ok(());
+        }
+        // A holder that died while its provider runs on can no longer be
+        // asked to stop it, and nothing else may: say so, rather than fail
+        // reaching the holder.
+        if let Some(refusal) = super::holder_lost_refusal(source, &owner)? {
+            return Err(refusal);
         }
         let mut pending = match pending {
             Some(pending) => pending,
@@ -270,6 +300,15 @@ fn close_retained_inner(
             expected
                 .require_current(host)
                 .map_err(|error| error.message)?;
+        }
+        // An owner that ended before its Release, or with its provider during
+        // it, settled this close without a receipt, so there is none to
+        // confirm. Its close stays pending until the loss is proved; an owner
+        // still running keeps its record, which refuses the loss.
+        if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
+        {
+            chat::native_holder::retire_abandoned(&pending.owner.record)?;
+            return super::settle_lost_execution(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
             if let Some(source) = &pair.source {

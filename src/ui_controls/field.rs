@@ -37,18 +37,21 @@ pub fn text<'a, Message: Clone + 'static>(
 }
 
 /// A field that filters or finds: a [`text`] field led by the search glyph.
+///
+/// The glyph sits in the list grid's icon column and the text starts on its
+/// label column, so a search field above a list lines up with the rows it
+/// filters; see [`design::list`].
 pub fn search<'a, Message: Clone + 'static>(
     placeholder: impl Into<Cow<'a, str>>,
     value: impl Into<Cow<'a, str>>,
 ) -> TextInput<'a, Message> {
     text(placeholder, value)
-        .padding([INSET_Y, space::S, INSET_Y, space::XS])
+        .padding([INSET_Y, design::list::INSET])
         .leading_icon(
-            widget::container(
-                widget::icon(Icon::Search.handle()).size(design::TAB_STATUS_ICON_SIZE),
-            )
-            .center_x(Length::Fixed(design::DENSE_ROW_HEIGHT - space::XS))
-            .into(),
+            widget::container(widget::icon(Icon::Search.handle()).size(design::ROW_ICON_SIZE))
+                .class(design::transparent())
+                .center_x(Length::Fixed(design::list::ICON))
+                .into(),
         )
 }
 
@@ -138,11 +141,11 @@ fn style() -> cosmic::theme::TextInput {
                 Status::Active | Status::Disabled => design::hairline(theme),
             },
             label_color: on,
-            placeholder_color: design::mix(surface, on, 0.5),
+            placeholder_color: design::field_placeholder_color(theme),
             icon_color: Some(design::muted_icon_color(theme)),
             text_color: Some(match status {
                 Status::Disabled => design::disabled_color(theme),
-                _ => on,
+                _ => design::field_text_color(theme),
             }),
             selected_text_color: cosmic.on_accent_color().into(),
             selected_fill: cosmic.accent_color().into(),

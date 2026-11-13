@@ -16,7 +16,7 @@ use crate::{
     },
     persistence::{
         SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
-        TranscriptRetention,
+        TranscriptRetention, invalid_state,
     },
 };
 
@@ -91,7 +91,7 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
 /// content cannot help, so the remedy is changing it.
 pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
      its own; everything else keeps saving. Changing or closing the item saves it again. If this \
-     repeats, report the failure category and database path.";
+     repeats, report the rule it broke, which cagents diagnostics keeps, and the database path.";
 
 impl SaveFailureCategory {
     pub fn label(self) -> &'static str {
@@ -198,6 +198,11 @@ pub enum WriteSubject {
     Workspace {
         card: Option<CardId>,
     },
+    /// The latest content of one open pane. The rest of the window saved
+    /// around it; storage keeps what it last held for this pane.
+    Pane {
+        card: CardId,
+    },
     /// The fresh identity a card's payload was rebound to: a relaunched
     /// terminal, or a new conversation in a chat card.
     CardIdentity {
@@ -227,7 +232,10 @@ impl WriteSubject {
     /// state a restart restores and a terminal handoff has to be committed in.
     /// A refused catalog row loses that row alone.
     pub fn is_window_state(&self) -> bool {
-        matches!(self, Self::Workspace { .. } | Self::CardIdentity { .. })
+        matches!(
+            self,
+            Self::Workspace { .. } | Self::Pane { .. } | Self::CardIdentity { .. }
+        )
     }
 
     /// The subject as a refused barrier names it: what kind of write it was
@@ -240,6 +248,7 @@ impl WriteSubject {
             Self::Workspace { card: Some(card) } => {
                 format!("the window's layout and panes, at pane {card}")
             }
+            Self::Pane { card } => format!("the latest changes to pane {card}"),
             Self::CardIdentity {
                 card,
                 kind: ReplacedIdentity::Terminal,
@@ -252,6 +261,26 @@ impl WriteSubject {
             Self::Worktree { id, .. } => format!("worktree {id}"),
         }
     }
+
+    /// The subject as private diagnostics record it: its kind and identifier.
+    fn diagnostic(&self) -> (crate::diagnostics::RefusedWrite, Option<uuid::Uuid>) {
+        use crate::diagnostics::RefusedWrite;
+
+        match self {
+            Self::Workspace { card } => (RefusedWrite::Workspace, card.map(CardId::as_uuid)),
+            Self::Pane { card } => (RefusedWrite::Pane, Some(card.as_uuid())),
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Terminal,
+            } => (RefusedWrite::RelaunchedTerminal, Some(card.as_uuid())),
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Chat,
+            } => (RefusedWrite::NewConversation, Some(card.as_uuid())),
+            Self::Project { id, .. } => (RefusedWrite::Project, Some(id.as_uuid())),
+            Self::Worktree { id, .. } => (RefusedWrite::Worktree, Some(id.as_uuid())),
+        }
+    }
 }
 
 /// A write storage refused by construction. It is never retried on its own;
@@ -261,6 +290,9 @@ impl WriteSubject {
 pub struct QuarantinedWrite {
     pub subject: WriteSubject,
     pub category: SaveFailureCategory,
+    /// The rule storage refused the write for, in words that name none of
+    /// its content: see [`crate::persistence::RefusedCheck`].
+    pub check: crate::diagnostics::Check,
     pub refused_at_unix_ms: i64,
     /// Writes that cannot land before this one does and are held back until
     /// it is superseded: the worktree rows of a project storage has no row for.
@@ -302,6 +334,15 @@ pub enum SessionError {
     Worker(std::io::Error),
 }
 
+/// A chat card whose shared view holds conversation `canonical` where this
+/// window last saved conversation `expected`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatIdentityAdoption {
+    pub card: CardId,
+    pub expected: TerminalId,
+    pub canonical: crate::chat::Session,
+}
+
 /// An explicit change of the identity a card's payload is bound to, which
 /// ordinary snapshots are not allowed to make.
 #[derive(Debug, Clone)]
@@ -317,24 +358,30 @@ enum Replacement {
     Terminal(TerminalSession),
     /// A new conversation started in a chat card in place of its own.
     Chat(crate::chat::Session),
+    /// The conversation the card's shared view now holds, which another
+    /// client put in place of the one this window last saved.
+    SharedChat(crate::chat::Session),
 }
 
 impl Replacement {
     fn id(&self) -> TerminalId {
         match self {
             Self::Terminal(session) => session.id,
-            Self::Chat(session) => session.id,
+            Self::Chat(session) | Self::SharedChat(session) => session.id,
         }
     }
 
+    /// Whether both rebind the same kind of payload, so one can continue the
+    /// other's chain. Who authorized each step does not matter: a chain is
+    /// applied under the authority of its newest step.
     fn same_kind(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        self.kind() == other.kind()
     }
 
     fn kind(&self) -> ReplacedIdentity {
         match self {
             Self::Terminal(_) => ReplacedIdentity::Terminal,
-            Self::Chat(_) => ReplacedIdentity::Chat,
+            Self::Chat(_) | Self::SharedChat(_) => ReplacedIdentity::Chat,
         }
     }
 }
@@ -345,7 +392,9 @@ impl IdentityReplacement {
     fn replaces(&self, kind: &CardKind) -> bool {
         let held = match (&self.replacement, kind) {
             (Replacement::Terminal(_), CardKind::Terminal(session)) => session.id,
-            (Replacement::Chat(_), CardKind::Chat(session)) => session.id,
+            (Replacement::Chat(_) | Replacement::SharedChat(_), CardKind::Chat(session)) => {
+                session.id
+            }
             _ => return false,
         };
         held == self.expected_terminal_id && held != self.replacement.id()
@@ -358,6 +407,9 @@ impl IdentityReplacement {
             }
             Replacement::Chat(session) => {
                 store.replace_chat_identity(self.card_id, self.expected_terminal_id, session)
+            }
+            Replacement::SharedChat(session) => {
+                store.adopt_chat_identity(self.card_id, self.expected_terminal_id, session)
             }
         }
     }
@@ -390,6 +442,7 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    Resume,
     #[cfg(feature = "ui")]
     AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
 }
@@ -435,9 +488,57 @@ struct QueueState {
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     identity_replacements: HashMap<CardId, IdentityReplacement>,
+    /// Conversations shared views re-pointed chat cards to, waiting for the
+    /// write that shows them. The writer never takes them on its own: they
+    /// are queued ahead of that write under its lock, so the writer can pair
+    /// them neither with an older state that still shows the replaced
+    /// conversations nor with a state that shows a change queued after them.
+    staged_adoptions: Vec<IdentityReplacement>,
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    /// Queues `replacement` behind everything already offered: after the
+    /// pending snapshot while conversions are kept in order, merged with the
+    /// other pending replacements otherwise.
+    fn queue_identity_replacement(&mut self, replacement: IdentityReplacement) {
+        if self.ordered_identities {
+            if let Some(previous) = self.latest.take() {
+                self.conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            self.conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        } else {
+            merge_identity_replacement(&mut self.identity_replacements, replacement);
+        }
+    }
+
+    /// Switches the lane to keeping writes in order, behind everything
+    /// already offered: the merged replacements, which arrived with the
+    /// pending snapshot that shows them, then that snapshot, then the staged
+    /// adoptions, which only the write being queued shows.
+    fn keep_writes_in_order(&mut self) {
+        self.ordered_identities = true;
+        for replacement in std::mem::take(&mut self.identity_replacements).into_values() {
+            self.conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(previous) = self.latest.take() {
+            self.conversions
+                .push_back(ConversionCheckpoint::Snapshot(previous));
+        }
+        self.admit_staged_adoptions();
+    }
+
+    /// Queues the staged adoptions ahead of the write being queued.
+    fn admit_staged_adoptions(&mut self) {
+        for adoption in std::mem::take(&mut self.staged_adoptions) {
+            self.queue_identity_replacement(adoption);
+        }
+    }
 }
 
 pub struct SessionRuntime {
@@ -580,6 +681,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             queue.latest = Some(state);
             changed.notify_one();
         }
@@ -593,17 +695,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            queue.ordered_identities = true;
-            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
-            }
+            queue.keep_writes_in_order();
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::Snapshot(state));
@@ -629,17 +721,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            queue.ordered_identities = true;
-            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
-            }
+            queue.keep_writes_in_order();
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::PaneAdoptions {
@@ -666,17 +748,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(previous) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(previous));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
@@ -753,6 +825,27 @@ impl SessionRuntime {
         );
     }
 
+    /// Records the conversations chat cards' shared views now hold in place
+    /// of the ones this window last saved for them, which other clients
+    /// started or replaced. Snapshots refuse such a change on their own.
+    ///
+    /// They are staged for the next write of the window's state, which must
+    /// follow: it queues them ahead of itself under its own lock.
+    pub fn stage_chat_adoptions(&self, adoptions: impl IntoIterator<Item = ChatIdentityAdoption>) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut queue) = lock.lock()
+            && !queue.shutdown
+        {
+            queue
+                .staged_adoptions
+                .extend(adoptions.into_iter().map(|adoption| IdentityReplacement {
+                    card_id: adoption.card,
+                    expected_terminal_id: adoption.expected,
+                    replacement: Replacement::SharedChat(adoption.canonical),
+                }));
+        }
+    }
+
     /// Commit an exact account transition once, in order with queued snapshots.
     /// The caller keeps its candidate inactive until this receipt succeeds;
     /// failures are returned without retaining an automatic retry.
@@ -764,6 +857,17 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         self.rebind_chat(ChatRecoveryKind::Account, card_id, source, replacement)
+    }
+
+    /// Commit a daemon-prepared resume successor before activating the chat.
+    pub fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        self.rebind_chat(ChatRecoveryKind::Resume, card_id, source, replacement)
     }
 
     /// Commit authenticated daemon-upgrade lineage before activating the chat.
@@ -790,17 +894,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::RetainedChatCopy {
@@ -844,17 +938,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
@@ -874,21 +958,23 @@ impl SessionRuntime {
         replacement: IdentityReplacement,
         state: Option<Arc<WorkspaceState>>,
     ) {
+        self.replace_identities([replacement], state);
+    }
+
+    /// Queues `replacements` in order, then `state` as the newest snapshot
+    /// when given.
+    fn replace_identities(
+        &self,
+        replacements: impl IntoIterator<Item = IdentityReplacement>,
+        state: Option<Arc<WorkspaceState>>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            if queue.ordered_identities {
-                if let Some(previous) = queue.latest.take() {
-                    queue
-                        .conversions
-                        .push_back(ConversionCheckpoint::Snapshot(previous));
-                }
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            } else {
-                merge_identity_replacement(&mut queue.identity_replacements, replacement);
+            queue.admit_staged_adoptions();
+            for replacement in replacements {
+                queue.queue_identity_replacement(replacement);
             }
             if let Some(state) = state {
                 queue.latest = Some(state);
@@ -1037,6 +1123,9 @@ impl SessionRuntime {
     pub fn shutdown(&mut self) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock() {
+            // Nothing will write them now; what storage holds should still
+            // follow what the shared views showed.
+            queue.admit_staged_adoptions();
             queue.shutdown = true;
             changed.notify_one();
         }
@@ -1079,9 +1168,11 @@ struct PendingWrites {
 }
 
 /// When storage first refused a subject, and why it refuses it now.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Refusal {
     category: SaveFailureCategory,
+    /// The rule the write broke, which is safe to show and record.
+    check: crate::diagnostics::Check,
     at_unix_ms: i64,
     /// Tells one cause from another without keeping the store error, which
     /// stays on this thread. A subject refused again for a new reason is a new
@@ -1105,6 +1196,11 @@ struct Quarantine {
     /// refused within it when it named one. Every snapshot is the whole
     /// window, so any later one that lands supersedes it.
     workspace: Option<(Arc<WorkspaceState>, Option<CardId>, Refusal)>,
+    /// Open panes whose content storage refused within the newest snapshot
+    /// that landed, which is kept for an explicit retry. Storage still holds
+    /// each pane's earlier content; any later snapshot that lands supersedes
+    /// the set.
+    panes: Option<(Arc<WorkspaceState>, BTreeMap<CardId, Refusal>)>,
     identity_replacements: HashMap<CardId, (IdentityReplacement, Refusal)>,
     projects: HashMap<ProjectId, (ProjectState, Refusal)>,
     worktrees: HashMap<WorktreeId, (WorktreeState, Refusal)>,
@@ -1118,6 +1214,12 @@ impl Refusal {
         error.to_string().hash(&mut cause);
         Self {
             category: save_failure_category(error),
+            // Only a refusal by construction is set aside, and each names
+            // the rule it broke.
+            check: error.refused_check().map_or_else(
+                || crate::diagnostics::Check::new("an unnamed storage rule"),
+                Into::into,
+            ),
             at_unix_ms: unix_millis(),
             cause: cause.finish(),
         }
@@ -1139,21 +1241,34 @@ fn refuse<K: Eq + std::hash::Hash, V>(
     error: &StoreError,
 ) {
     let refusal = record_refusal(
-        entries.get(&key).map(|(_, refusal)| *refusal),
+        entries.get(&key).map(|(_, refusal)| refusal.clone()),
         subject,
         error,
     );
     entries.insert(key, (write, refusal));
 }
 
+/// Logs a refusal of `subject` and returns it, keeping the time of the first
+/// of an unbroken run of refusals.
+///
+/// The log is not where a refusal is found after the fact: it is written only
+/// under local debugging, and a window started by `cagents ui` has nowhere to
+/// write it. Private diagnostics keep the subject and the rule it broke each
+/// time the rule is new. A subject whose every edit is refused for the same
+/// rule is one record, not one per edit, so it cannot push the window's other
+/// records out of the bounded ring.
 fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &StoreError) -> Refusal {
     let refusal = Refusal::new(error);
+    if names_a_new_rule(previous.as_ref(), &refusal) {
+        crate::diagnostics::record(refusal_event(&subject, &refusal));
+    }
     match previous {
         None => {
             tracing::warn!(
                 ?subject,
                 %error,
                 category = refusal.category.label(),
+                check = %refusal.check,
                 "storage refused a cagents write by construction; setting it aside so the rest \
                  of the session keeps saving"
             );
@@ -1171,6 +1286,7 @@ fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &Stor
                     ?subject,
                     %error,
                     category = refusal.category.label(),
+                    check = %refusal.check,
                     "storage refused a newer write of a refused subject, for a different reason"
                 );
             }
@@ -1179,6 +1295,42 @@ fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &Stor
                 ..refusal
             }
         }
+    }
+}
+
+/// Whether `refusal` breaks a rule other than the one `previous` refusal of the
+/// same subject broke, which is when private diagnostics record it. Another
+/// value in the same rule, such as a newer edit of the refused pane, is not.
+fn names_a_new_rule(previous: Option<&Refusal>, refusal: &Refusal) -> bool {
+    previous.is_none_or(|previous| previous.check != refusal.check)
+}
+
+/// The private diagnostic of a refusal: what was refused, by identifier, and
+/// the rule it broke. Never a title, name, path or any other content.
+fn refusal_event(subject: &WriteSubject, refusal: &Refusal) -> crate::diagnostics::Event {
+    let (write, id) = subject.diagnostic();
+    crate::diagnostics::Event::StorageRefused {
+        write,
+        id,
+        check: refusal.check.clone(),
+    }
+}
+
+/// Records a refusal of a one-shot write. Its error goes back to whoever asked
+/// for it, and nothing retries it or keeps it on a notice, so this record is
+/// the only one that outlasts the reply.
+fn record_one_shot_refusal(
+    write: crate::diagnostics::RefusedWrite,
+    id: uuid::Uuid,
+    error: &StoreError,
+) {
+    if let Some(check) = error.refused_check() {
+        tracing::warn!(?write, %id, %error, "storage refused a one-shot cagents write");
+        crate::diagnostics::record(crate::diagnostics::Event::StorageRefused {
+            write,
+            id: Some(id),
+            check: check.into(),
+        });
     }
 }
 
@@ -1217,6 +1369,7 @@ fn superseded(subject: Option<WriteSubject>) {
 impl Quarantine {
     fn is_empty(&self) -> bool {
         self.workspace.is_none()
+            && self.panes.is_none()
             && self.identity_replacements.is_empty()
             && self.projects.is_empty()
             && self.worktrees.is_empty()
@@ -1228,6 +1381,7 @@ impl Quarantine {
         self.workspace
             .iter()
             .map(|(_, _, refusal)| refusal)
+            .chain(self.panes.iter().flat_map(|(_, panes)| panes.values()))
             .chain(
                 self.identity_replacements
                     .values()
@@ -1260,7 +1414,9 @@ impl Quarantine {
             _ => None,
         };
         let refusal = record_refusal(
-            self.workspace.as_ref().map(|(_, _, refusal)| *refusal),
+            self.workspace
+                .as_ref()
+                .map(|(_, _, refusal)| refusal.clone()),
             WriteSubject::Workspace { card },
             error,
         );
@@ -1268,34 +1424,64 @@ impl Quarantine {
     }
 
     /// Clears what a snapshot storage accepted settles: the refused snapshot it
-    /// replaces, and every refused identity replacement whose card it no
-    /// longer holds open at the identity that replacement would replace.
+    /// replaces, the panes it refused before and saved now, and every refused
+    /// identity replacement whose card it no longer holds open at the
+    /// identity that replacement would replace. `refused` names the open panes
+    /// storage kept at their earlier content instead, which stay refused.
     ///
     /// Storage rejects a snapshot that rebinds a card's payload to an identity
     /// other than the one it holds, so the card's identity in a landed
-    /// snapshot is the one storage holds. Anything but the replaced identity
-    /// leaves the refusal with nothing to replace - the card closed, converted,
-    /// or first stored at its new identity - and nothing else could clear it:
-    /// it would fail every barrier and the clean shutdown for the rest of the
-    /// session.
-    fn snapshot_landed(&mut self, snapshot: &WorkspaceState) {
+    /// snapshot is the one storage holds, unless storage refused that card.
+    /// Anything but the replaced identity leaves the refusal with nothing to
+    /// replace - the card closed, converted, or first stored at its new
+    /// identity - and nothing else could clear it: it would fail every
+    /// barrier and the clean shutdown for the rest of the session.
+    fn snapshot_landed(&mut self, snapshot: &Arc<WorkspaceState>, refused: &[StoreError]) {
         superseded(
             self.workspace
                 .take()
                 .map(|(_, card, _)| WriteSubject::Workspace { card }),
         );
-        self.identity_replacements.retain(|card, (refused, _)| {
-            let outstanding = snapshot.cards.iter().any(|state| {
-                state.id == *card && state.existence.is_open() && refused.replaces(&state.kind)
-            });
+        let mut previous = self
+            .panes
+            .take()
+            .map(|(_, panes)| panes)
+            .unwrap_or_default();
+        let panes = refused
+            .iter()
+            .filter_map(|error| match error {
+                StoreError::Card { card, .. } => Some((
+                    *card,
+                    record_refusal(
+                        previous.remove(card),
+                        WriteSubject::Pane { card: *card },
+                        error,
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        for card in previous.into_keys() {
+            superseded(Some(WriteSubject::Pane { card }));
+        }
+        self.identity_replacements.retain(|card, (replacement, _)| {
+            let outstanding = panes.contains_key(card)
+                || snapshot.cards.iter().any(|state| {
+                    state.id == *card
+                        && state.existence.is_open()
+                        && replacement.replaces(&state.kind)
+                });
             if !outstanding {
                 tracing::info!(
-                    subject = ?identity_subject(refused),
+                    subject = ?identity_subject(replacement),
                     "a refused identity replacement no longer applies to the saved window"
                 );
             }
             outstanding
         });
+        if !panes.is_empty() {
+            self.panes = Some((Arc::clone(snapshot), panes));
+        }
     }
 
     fn refuse_replacement(&mut self, replacement: IdentityReplacement, error: &StoreError) {
@@ -1353,12 +1539,20 @@ impl Quarantine {
         let entry = |subject, refusal: &Refusal, held_back| QuarantinedWrite {
             subject,
             category: refusal.category,
+            check: refusal.check.clone(),
             refused_at_unix_ms: refusal.at_unix_ms,
             held_back,
         };
         let mut report = Vec::new();
         if let Some((_, card, refusal)) = &self.workspace {
             report.push(entry(WriteSubject::Workspace { card: *card }, refusal, 0));
+        }
+        if let Some((_, panes)) = &self.panes {
+            report.extend(
+                panes
+                    .iter()
+                    .map(|(card, refusal)| entry(WriteSubject::Pane { card: *card }, refusal, 0)),
+            );
         }
         let mut replacements = self.identity_replacements.values().collect::<Vec<_>>();
         replacements.sort_by_key(|(replacement, _)| replacement.card_id);
@@ -1400,16 +1594,16 @@ trait SessionStore {
         _base: SnapshotBase<'_>,
         _recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support terminal ownership recovery".into(),
+        Err(invalid_state!(
+            "This store does not support terminal ownership recovery"
         ))
     }
     fn preserve_chat_copy(
         &self,
         _copy: &crate::persistence::RetainedChatCopy,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support retained chat copies".into(),
+        Err(invalid_state!(
+            "This store does not support retained chat copies"
         ))
     }
 
@@ -1419,8 +1613,8 @@ trait SessionStore {
         _card_id: CardId,
         _recovery: &crate::chat::client::UpgradeRecovery,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support authenticated chat recovery".into(),
+        Err(invalid_state!(
+            "This store does not support authenticated chat recovery"
         ))
     }
     fn rebind_chat_upgrade(
@@ -1429,8 +1623,18 @@ trait SessionStore {
         _source: &crate::chat::Session,
         _replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support upgrade recovery".into(),
+        Err(invalid_state!(
+            "This store does not support upgrade recovery"
+        ))
+    }
+    fn rebind_chat_resume(
+        &self,
+        _card_id: CardId,
+        _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(invalid_state!(
+            "This store does not support resume recovery"
         ))
     }
     fn rebind_chat_account(
@@ -1439,8 +1643,8 @@ trait SessionStore {
         _source: &crate::chat::Session,
         _replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support account recovery".into(),
+        Err(invalid_state!(
+            "This store does not support account recovery"
         ))
     }
     fn replace_terminal_identity(
@@ -1455,6 +1659,16 @@ trait SessionStore {
         expected_id: TerminalId,
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError>;
+    fn adopt_chat_identity(
+        &self,
+        _card_id: CardId,
+        _expected_id: TerminalId,
+        _canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(invalid_state!(
+            "This store does not support shared chat identities"
+        ))
+    }
     fn save_workspace(
         &self,
         state: &WorkspaceState,
@@ -1469,8 +1683,8 @@ trait SessionStore {
         if adoptions.is_empty() {
             self.save_workspace(state, base)
         } else {
-            Err(StoreError::InvalidState(
-                "This store does not support canonical pane adoption".into(),
+            Err(invalid_state!(
+                "This store does not support canonical pane adoption"
             ))
         }
     }
@@ -1484,8 +1698,8 @@ trait SessionStore {
         if restorations.is_empty() {
             self.save_workspace_with_terminal_adoptions(state, base, adoptions)
         } else {
-            Err(StoreError::InvalidState(
-                "This store does not support restored pane ownership".into(),
+            Err(invalid_state!(
+                "This store does not support restored pane ownership"
             ))
         }
     }
@@ -1543,6 +1757,14 @@ impl SessionStore for StateStore {
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
     }
+    fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_resume(self, card_id, source, replacement)
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1559,6 +1781,15 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         Self::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Self::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
 
     fn save_workspace(
@@ -1655,6 +1886,14 @@ impl SessionStore for Arc<StateStore> {
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
     }
+    fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_resume(self, card_id, source, replacement)
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1670,6 +1909,14 @@ impl SessionStore for Arc<StateStore> {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
     fn save_workspace(
         &self,
@@ -1795,7 +2042,12 @@ impl PendingWrites {
     /// asked to retry. A subject with a newer write pending is already being
     /// retried by that write, so its refused one is not reinstated.
     fn rearm_quarantine(&mut self) {
-        if let Some((snapshot, _, _)) = &self.quarantine.workspace
+        if let Some(snapshot) = self
+            .quarantine
+            .workspace
+            .as_ref()
+            .map(|(snapshot, _, _)| snapshot)
+            .or_else(|| self.quarantine.panes.as_ref().map(|(snapshot, _)| snapshot))
             && self.workspace.is_none()
             && self.conversions.is_empty()
         {
@@ -1983,19 +2235,45 @@ impl PendingWrites {
                     reply,
                 } => {
                     self.translate_chat_rebindings(&mut snapshot);
+                    let canonical = recovery.canonical;
+                    let repair = move |error: &StoreError| {
+                        record_one_shot_refusal(
+                            crate::diagnostics::RefusedWrite::TerminalRepair,
+                            canonical.as_uuid(),
+                            error,
+                        );
+                        error.to_string()
+                    };
                     if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
-                        let _ = reply.send(Err(error.to_string()));
+                        let _ = reply.send(Err(repair(&error)));
                         continue;
                     }
-                    let refused = self.quarantine.workspace.as_ref().filter(|(state, card, _)| {
+                    let holds_refused_terminal = |state: &WorkspaceState| {
                         state.id == snapshot.id
-                            && *card == Some(recovery.canonical)
                             && state.cards.iter().any(|card| {
                                 card.id == recovery.canonical
                                     && card.existence.is_open()
                                     && matches!(&card.kind, CardKind::Terminal(session) if session.id == recovery.terminal)
                             })
-                    }).map(|(state, _, _)| Arc::clone(state));
+                    };
+                    let refused = self
+                        .quarantine
+                        .workspace
+                        .as_ref()
+                        .filter(|(state, card, _)| {
+                            *card == Some(recovery.canonical) && holds_refused_terminal(state)
+                        })
+                        .map(|(state, _, _)| Arc::clone(state))
+                        .or_else(|| {
+                            self.quarantine
+                                .panes
+                                .as_ref()
+                                .filter(|(state, panes)| {
+                                    panes.contains_key(&recovery.canonical)
+                                        && holds_refused_terminal(state)
+                                })
+                                .map(|(state, _)| Arc::clone(state))
+                        });
                     let result = match refused {
                         None => Err("The exact refused terminal pane changed; review the current save notice.".into()),
                         Some(refused) => match store.recover_terminal_ownership(
@@ -2016,11 +2294,11 @@ impl PendingWrites {
                                 if self.workspace.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &refused)) {
                                     self.workspace = None;
                                 }
-                                self.quarantine.snapshot_landed(&snapshot);
+                                self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                                 self.acknowledge_retained_copy_closures(&snapshot);
                                 Ok(())
                             }
-                            Err(error) => Err(error.to_string()),
+                            Err(error) => Err(repair(&error)),
                         },
                     };
                     if result.is_err() {
@@ -2045,6 +2323,11 @@ impl PendingWrites {
                             }
                         }
                         Err(error) => {
+                            record_one_shot_refusal(
+                                crate::diagnostics::RefusedWrite::RetainedChatCopy,
+                                copy.copy.id.as_uuid(),
+                                &error,
+                            );
                             if let Some(reply) = reply {
                                 let _ = reply.send(Err(error.to_string()));
                             }
@@ -2072,13 +2355,18 @@ impl PendingWrites {
                             &recovery.source,
                             &recovery.replacement,
                         ),
+                        ChatRecoveryKind::Resume => store.rebind_chat_resume(
+                            recovery.card,
+                            &recovery.source,
+                            &recovery.replacement,
+                        ),
                         #[cfg(feature = "ui")]
                         ChatRecoveryKind::AuthenticatedUpgrade(witness) => {
                             if witness.source() != &recovery.source
                                 || witness.replacement() != &recovery.replacement
                             {
-                                Err(StoreError::InvalidState(
-                                    "Authenticated recovery payload changed before commit".into(),
+                                Err(invalid_state!(
+                                    "Authenticated recovery payload changed before commit"
                                 ))
                             } else {
                                 store.rebind_authenticated_chat_upgrade(recovery.card, &witness)
@@ -2092,9 +2380,14 @@ impl PendingWrites {
                     // An explicit identity change is one-shot. In particular an
                     // I/O failure must not silently commit after the UI has
                     // refused activation and retired its candidate.
-                    let _ = recovery
-                        .reply
-                        .send(result.map_err(|error| error.to_string()));
+                    let _ = recovery.reply.send(result.map_err(|error| {
+                        record_one_shot_refusal(
+                            crate::diagnostics::RefusedWrite::ConversationRecovery,
+                            recovery.card.as_uuid(),
+                            &error,
+                        );
+                        error.to_string()
+                    }));
                 }
                 ConversionCheckpoint::IdentityReplacement(mut replacement) => {
                     self.quarantine.continue_refused(&mut replacement);
@@ -2128,7 +2421,7 @@ impl PendingWrites {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
-                            self.quarantine.snapshot_landed(&snapshot);
+                            self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                             self.acknowledge_retained_copy_closures(&snapshot);
                         }
                         Err(error) if error.refuses_content() => {
@@ -2410,7 +2703,7 @@ fn unix_millis() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriterExit {
     Shutdown(crate::diagnostics::Event),
     Unavailable,
@@ -2697,7 +2990,7 @@ fn persistence_loop(
                     )
                 },
             };
-            crate::diagnostics::record(final_flush);
+            crate::diagnostics::record(final_flush.clone());
             return WriterExit::Shutdown(final_flush);
         }
     }
@@ -2827,15 +3120,22 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
 
 /// Why a barrier cannot vouch for a window whose state storage refused.
 ///
-/// It names each refused part of that state. The guidance asks the reader to
-/// change or close "the item", and whoever reads this is often not looking at
-/// the window - an updater relays it to a terminal - so without the names
-/// there is nothing to act on.
+/// It names each refused part of that state and the rule storage refused it
+/// for. The guidance asks the reader to change or close "the item", and
+/// whoever reads this is often not looking at the window - an updater relays
+/// it to a terminal - so without the names there is nothing to act on, and
+/// without the rule nothing to report. Neither carries a title, name or path.
 fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWrite]) -> String {
     let subjects = refused
         .iter()
         .filter(|write| write.subject.is_window_state())
-        .map(|write| write.subject.summary())
+        .map(|write| {
+            format!(
+                "{} (refused by rule: {})",
+                write.subject.summary(),
+                write.check
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ");
     format!(
@@ -2864,8 +3164,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::model::{
-        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, WorkspaceId,
+        CardId, CardKind, CardState, Existence, LaunchRecipe, TerminalContinuity, TerminalId,
+        TerminalSession, Tombstone, WorkspaceId,
     };
 
     use super::*;
@@ -2943,7 +3243,7 @@ mod tests {
                     expected: 1,
                     actual: 2,
                 }),
-                FakeWrite::Refuse => Err(StoreError::InvalidState("injected refusal".to_owned())),
+                FakeWrite::Refuse => Err(invalid_state!("injected refusal")),
                 FakeWrite::Panic => panic!("injected writer panic"),
             }
         }
@@ -2958,6 +3258,7 @@ mod tests {
             Ok(crate::persistence::WorkspaceCommit {
                 generation: 1,
                 card_generations: BTreeMap::from([(copy.source_card, 1), (copy.copy.id, 1)]),
+                refused: Vec::new(),
             })
         }
 
@@ -3090,6 +3391,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -3103,8 +3405,6 @@ mod tests {
                 title: "shell".into(),
                 width_fraction: 0.7,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,
@@ -3118,7 +3418,8 @@ mod tests {
                         last_exit: None,
                     },
                 }),
-            }],
+            }]
+            .into(),
         }
     }
 
@@ -3735,6 +4036,244 @@ mod tests {
             assert_eq!(restored.cards[0].title, "Claude chat");
             reopened.shutdown();
         }
+    }
+
+    /// A write that records the conversations other windows gave shared chat
+    /// cards and then replaces another card's conversation, both with the
+    /// state that shows them, saves both, whether or not the lane is keeping
+    /// conversions in order.
+    #[test]
+    fn adopted_and_replaced_conversations_save_with_their_one_snapshot() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("adopted-and-replaced.sqlite3");
+            let boot = BootId::new("adopted-and-replaced");
+            let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+            let health = runtime.health_receiver();
+            let mut state = workspace();
+            let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let chat = |provider: crate::agent::Provider| crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe: LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: Vec::new(),
+                        ..terminal.launch.clone()
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            };
+            let shared_before = chat(crate::agent::Provider::Codex);
+            let own_before = chat(crate::agent::Provider::Codex);
+            let mut own = state.cards[0].clone();
+            own.id = CardId::new();
+            own.kind = CardKind::Chat(own_before.clone());
+            state.cards[0].kind = CardKind::Chat(shared_before.clone());
+            state.cards.push(own.clone());
+            let shared = state.cards[0].id;
+            runtime.snapshot(Arc::new(state.clone()));
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            if ordered {
+                runtime.snapshot_conversion(Arc::new(state.clone()));
+            }
+
+            let theirs = chat(crate::agent::Provider::Claude);
+            let mine = chat(crate::agent::Provider::Claude);
+            state.cards[0].kind = CardKind::Chat(theirs.clone());
+            state.cards[1].kind = CardKind::Chat(mine.clone());
+            let saved = Arc::new(state.clone());
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
+                card: shared,
+                expected: shared_before.id,
+                canonical: theirs.clone(),
+            }]);
+            runtime.replace_chat_identity(own.id, own_before.id, mine.clone(), saved);
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            runtime.shutdown();
+            assert_eq!(runtime.last_error(), None, "ordered: {ordered}");
+            while let Ok(event) = health.try_recv() {
+                assert!(event.quarantined.is_empty(), "ordered: {ordered}");
+            }
+
+            let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+            let restored = restored.unwrap();
+            assert_eq!(
+                restored
+                    .cards
+                    .iter()
+                    .map(|card| card.kind.clone())
+                    .collect::<Vec<_>>(),
+                [CardKind::Chat(theirs), CardKind::Chat(mine)],
+                "ordered: {ordered}"
+            );
+            reopened.shutdown();
+        }
+    }
+
+    /// A session runtime with no writer thread, whose queue holds `older` as
+    /// the pending snapshot, so a test can read what each call queues.
+    fn queue_only_runtime(
+        directory: &tempfile::TempDir,
+        older: &Arc<WorkspaceState>,
+        ordered: bool,
+    ) -> SessionRuntime {
+        let path = directory.path().join("queue-only.sqlite3");
+        let store = Arc::new(StateStore::open(&path, BootId::new("queue-only")).unwrap());
+        let (health_tx, health) = async_channel::unbounded();
+        drop(health_tx);
+        SessionRuntime {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    latest: Some(Arc::clone(older)),
+                    ordered_identities: ordered,
+                    ..QueueState::default()
+                }),
+                Condvar::new(),
+            )),
+            last_error: Arc::new(Mutex::new(None)),
+            health,
+            worker: None,
+            database_path: path,
+            restored_projects: Vec::new(),
+            restored_worktrees: Vec::new(),
+            restore_warnings: Vec::new(),
+            operation_store: store,
+        }
+    }
+
+    fn staged_chat(state: &WorkspaceState) -> crate::chat::Session {
+        let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal.launch,
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        }
+    }
+
+    /// Adoptions wait, out of the writer's reach, for the write that shows
+    /// them, and are queued ahead of it under the same lock: never behind an
+    /// older state that still shows the replaced conversation on its own,
+    /// nor ahead of a replacement queued with a state that shows both.
+    #[test]
+    fn adoptions_are_queued_with_the_write_that_shows_them() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let older = Arc::new(workspace());
+            let runtime = queue_only_runtime(&directory, &older, ordered);
+            let chat = staged_chat(&older);
+            let (shared, own) = (CardId::new(), CardId::new());
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
+                card: shared,
+                expected: TerminalId::new(),
+                canonical: chat.clone(),
+            }]);
+            {
+                let queue = runtime.queue.0.lock().unwrap();
+                assert!(
+                    queue.conversions.is_empty() && queue.identity_replacements.is_empty(),
+                    "the writer cannot take a staged adoption, ordered: {ordered}"
+                );
+            }
+            let saved = Arc::new(workspace());
+            runtime.replace_chat_identity(own, TerminalId::new(), chat, Arc::clone(&saved));
+
+            let queue = runtime.queue.0.lock().unwrap();
+            let name = |card: CardId| {
+                if card == shared {
+                    "adoption"
+                } else {
+                    "replacement"
+                }
+            };
+            let order = queue
+                .conversions
+                .iter()
+                .map(|checkpoint| match checkpoint {
+                    ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                        "older state"
+                    }
+                    ConversionCheckpoint::IdentityReplacement(replacement) => {
+                        name(replacement.card_id)
+                    }
+                    _ => "something else",
+                })
+                .collect::<Vec<_>>();
+            if ordered {
+                assert_eq!(order, ["older state", "adoption", "replacement"]);
+            } else {
+                assert!(order.is_empty());
+                let mut merged = queue
+                    .identity_replacements
+                    .keys()
+                    .map(|card| name(*card))
+                    .collect::<Vec<_>>();
+                merged.sort_unstable();
+                assert_eq!(merged, ["adoption", "replacement"]);
+            }
+            assert!(
+                queue
+                    .latest
+                    .as_ref()
+                    .is_some_and(|latest| Arc::ptr_eq(latest, &saved)),
+                "the state that shows both is written after them, ordered: {ordered}"
+            );
+            assert!(queue.staged_adoptions.is_empty());
+        }
+    }
+
+    /// The write that first keeps the lane in order queues staged adoptions
+    /// behind the older pending snapshot, not ahead of it: that snapshot still
+    /// shows the conversations the adoptions replace.
+    #[test]
+    fn adoptions_follow_the_older_state_when_the_lane_turns_ordered() {
+        let directory = tempdir().unwrap();
+        let older = Arc::new(workspace());
+        let runtime = queue_only_runtime(&directory, &older, false);
+        let shared = CardId::new();
+        runtime.stage_chat_adoptions([ChatIdentityAdoption {
+            card: shared,
+            expected: TerminalId::new(),
+            canonical: staged_chat(&older),
+        }]);
+        let saved = Arc::new(workspace());
+        runtime.snapshot_conversion(Arc::clone(&saved));
+
+        let queue = runtime.queue.0.lock().unwrap();
+        let order = queue
+            .conversions
+            .iter()
+            .map(|checkpoint| match checkpoint {
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                    "older state"
+                }
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &saved) => {
+                    "saved state"
+                }
+                ConversionCheckpoint::IdentityReplacement(replacement)
+                    if replacement.card_id == shared =>
+                {
+                    "adoption"
+                }
+                _ => "something else",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["older state", "adoption", "saved state"]);
     }
 
     #[test]
@@ -4540,10 +5079,10 @@ mod tests {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                     None,
                 ))),
-                ProjectWrite::Refuse => Err(StoreError::InvalidState(format!(
+                ProjectWrite::Refuse => Err(invalid_state!(
                     "tombstoned project {} cannot be resurrected",
                     project.id
-                ))),
+                )),
             }
         }
 
@@ -4857,6 +5396,14 @@ mod tests {
             ) -> Result<(), StoreError> {
                 self.store
                     .replace_chat_identity(card, expected, replacement)
+            }
+            fn adopt_chat_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                canonical: &crate::chat::Session,
+            ) -> Result<(), StoreError> {
+                self.store.adopt_chat_identity(card, expected, canonical)
             }
             fn save_workspace(
                 &self,
@@ -5251,7 +5798,7 @@ mod tests {
             ))
         };
         for permanent in [
-            StoreError::InvalidState("tombstoned card cannot be resurrected".into()),
+            invalid_state!("tombstoned card cannot be resurrected"),
             StoreError::Serialization(serde_json::from_str::<u8>("x").unwrap_err()),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
@@ -5259,7 +5806,7 @@ mod tests {
             foreign_key_violation(),
             StoreError::Card {
                 card: CardId::new(),
-                error: Box::new(StoreError::InvalidState("invalid conversion".into())),
+                error: Box::new(invalid_state!("invalid conversion")),
             },
         ] {
             assert!(permanent.refuses_content(), "{permanent:?}");
@@ -5497,6 +6044,7 @@ mod tests {
                     name: "refused".into(),
                 },
                 category: SaveFailureCategory::InvalidData,
+                check: crate::diagnostics::Check::new("tombstoned project … cannot be resurrected"),
                 refused_at_unix_ms: writes.quarantine.projects[&refused.id].1.at_unix_ms,
                 held_back: 1,
             }]
@@ -5618,9 +6166,13 @@ mod tests {
         runtime.snapshot(Arc::new(state.clone()));
         runtime.flush(timeout).unwrap();
 
-        // Bringing a closed card back is refused by construction.
+        // Bringing a closed card back is refused by construction. Storage
+        // keeps its tombstone, and the rest of the window saves around it,
+        // without focusing a closed card.
         let resurrected = card.id;
         state.cards.push(card);
+        state.focused = Some(resurrected);
+        state.chat_drafts.insert(resurrected, "first draft".into());
         runtime.snapshot(Arc::new(state.clone()));
         let refusal = runtime
             .flush(timeout)
@@ -5628,10 +6180,13 @@ mod tests {
         assert!(refusal.contains("refused part of the window"), "{refusal}");
         assert!(
             refusal.contains(&format!(
-                "the window's layout and panes, at pane {resurrected}"
+                "the latest changes to pane {resurrected} (refused by rule: tombstoned card … \
+                 cannot be resurrected)."
             )),
-            "a refused barrier names what the reader has to change: {refusal}"
+            "a refused barrier names what the reader has to change, and the rule it broke: \
+             {refusal}"
         );
+        assert!(!refusal.contains("first draft"), "{refusal}");
         assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
         let refused = latest_health(&health);
         assert_eq!(refused.health, SessionSaveHealth::Healthy);
@@ -5641,9 +6196,50 @@ mod tests {
                 .iter()
                 .map(|write| &write.subject)
                 .collect::<Vec<_>>(),
-            vec![&WriteSubject::Workspace {
-                card: Some(resurrected)
-            }]
+            vec![&WriteSubject::Pane { card: resurrected }]
+        );
+        let saved = runtime
+            .operation_store()
+            .load_workspace(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.focused, None);
+        assert_eq!(
+            saved.chat_drafts.get(&resurrected).map(String::as_str),
+            Some("first draft")
+        );
+        assert!(matches!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == resurrected)
+                .map(|card| &card.existence),
+            Some(Existence::Closed { .. })
+        ));
+
+        // Later edits to the window keep saving while the pane stays refused,
+        // and an explicit retry offers the pane again without clearing it.
+        state.chat_drafts.insert(resurrected, "kept draft".into());
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap_err();
+        assert!(runtime.retry_save());
+        runtime.flush(timeout).unwrap_err();
+        let saved = runtime
+            .operation_store()
+            .load_workspace(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.chat_drafts.get(&resurrected).map(String::as_str),
+            Some("kept draft")
+        );
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::Pane { card: resurrected }]
         );
 
         // The catalog still saves beside it.
@@ -5802,7 +6398,7 @@ mod tests {
             let unrelated = project("unrelated refusal");
             writes
                 .quarantine
-                .refuse_project(unrelated, &StoreError::InvalidState("unrelated".into()));
+                .refuse_project(unrelated, &invalid_state!("unrelated"));
             let mut reviewed = (*refused).clone();
             reviewed
                 .chat_drafts
@@ -6112,7 +6708,10 @@ mod tests {
         runtime.snapshot(Arc::new(state.clone()));
         let refusal = runtime.flush(timeout).unwrap_err();
         assert!(
-            refusal.contains("(saved state is invalid): the window's layout and panes."),
+            refusal.contains(
+                "(saved state is invalid): the window's layout and panes (refused by rule: \
+                 workspace … focuses missing or closed card …)."
+            ),
             "{refusal}"
         );
         // Asking again changes nothing: the same window is still unsaved.
@@ -6129,11 +6728,97 @@ mod tests {
         assert!(!store.recovery_report().dirty_shutdown);
     }
 
+    /// Private diagnostics keep which subject storage refused, by identifier,
+    /// and the rule it broke - never the content the full error names.
+    #[test]
+    fn a_refusal_is_recorded_by_subject_and_rule_without_its_content() {
+        let project = project("private-client");
+        let worktree = worktree(&project, "secret-branch");
+        let card = CardId::new();
+        let cases = [
+            (
+                project_subject(&project),
+                invalid_state!(
+                    "project {} at {} cannot be saved",
+                    project.name,
+                    project.repository.display()
+                ),
+                "project",
+                Some(project.id.as_uuid()),
+                "project … at … cannot be saved",
+            ),
+            (
+                worktree_subject(&worktree),
+                invalid_state!(
+                    "worktree {} on {:?} is invalid",
+                    worktree.path.display(),
+                    worktree.branch
+                ),
+                "worktree",
+                Some(worktree.id.as_uuid()),
+                "worktree … on … is invalid",
+            ),
+            (
+                WriteSubject::Pane { card },
+                StoreError::Card {
+                    card,
+                    error: Box::new(invalid_state!("chat card {card} changed source identity")),
+                },
+                "pane",
+                Some(card.as_uuid()),
+                "chat card … changed source identity",
+            ),
+            (
+                WriteSubject::CardIdentity {
+                    card,
+                    kind: ReplacedIdentity::Chat,
+                },
+                StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+                    Some("UNIQUE constraint failed: cards.terminal_id".into()),
+                )),
+                "new_conversation",
+                Some(card.as_uuid()),
+                "a SQLite UNIQUE constraint on cards.terminal_id",
+            ),
+            (
+                WriteSubject::Workspace { card: None },
+                StoreError::Serialization(
+                    serde_json::to_string(&HashMap::from([((1, 2), "/home/someone")])).unwrap_err(),
+                ),
+                "workspace",
+                None,
+                "the state could not be encoded as JSON",
+            ),
+        ];
+        for (subject, error, write, id, check) in cases {
+            let refusal = Refusal::new(&error);
+            let event = refusal_event(&subject, &refusal);
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "kind": "storage_refused",
+                    "write": write,
+                    "id": id,
+                    "check": check,
+                }),
+                "{error}"
+            );
+            let text = json.to_string();
+            for private in ["private-client", "secret-branch", "/repo", "/home/someone"] {
+                assert!(!text.contains(private), "{text} leaks {private}");
+            }
+        }
+    }
+
     /// A subject refused again keeps the time of its first refusal, and the
     /// lane can still tell that the reason it is refused for has changed.
     #[test]
     fn a_refusal_for_a_new_reason_is_told_apart_from_a_repeated_one() {
-        let refused = |reason: &str| StoreError::InvalidState(reason.to_owned());
+        let refused = |reason: &'static str| {
+            StoreError::InvalidState(crate::persistence::Violation::new(reason, reason))
+        };
         let mut quarantine = Quarantine::default();
         quarantine.refuse_workspace(Arc::new(workspace()), &refused("first"));
         let (_, _, first) = quarantine.workspace.clone().unwrap();
@@ -6145,6 +6830,26 @@ mod tests {
         assert_eq!(repeated.cause, first.cause);
         assert_ne!(changed.cause, first.cause);
         assert_eq!(changed.at_unix_ms, first.at_unix_ms);
+        assert_eq!(
+            (first.check.as_str(), changed.check.as_str()),
+            ("first", "second"),
+            "the reported rule follows the newest refusal"
+        );
+
+        // Diagnostics record a subject once per rule: the same rule over
+        // other values is logged as a new cause but not recorded again.
+        let card = CardId::new();
+        let pane = |generation: i64| {
+            Refusal::new(&invalid_state!(
+                "card {card} expected generation {generation}"
+            ))
+        };
+        let (earlier, later) = (pane(1), pane(2));
+        assert_ne!(earlier.cause, later.cause);
+        assert!(names_a_new_rule(None, &earlier));
+        assert!(!names_a_new_rule(Some(&earlier), &later));
+        assert!(names_a_new_rule(Some(&first), &changed));
+        assert!(!names_a_new_rule(Some(&first), &repeated));
     }
 
     /// A relaunch storage refused leaves the stored identity where it was, and
@@ -6259,8 +6964,8 @@ mod tests {
             }]
         );
 
-        // The window moves on to the relaunch, and storage refuses every
-        // snapshot that rebinds the card to it.
+        // The window moves on to the relaunch, and storage refuses that pane
+        // of every snapshot that rebinds the card to it.
         state.cards[0].kind = CardKind::Terminal(refused);
         runtime.snapshot(Arc::new(state.clone()));
         runtime.flush(timeout).unwrap_err();
@@ -6271,9 +6976,7 @@ mod tests {
                 .map(|write| &write.subject)
                 .collect::<Vec<_>>(),
             vec![
-                &WriteSubject::Workspace {
-                    card: Some(card_id)
-                },
+                &WriteSubject::Pane { card: card_id },
                 &WriteSubject::CardIdentity {
                     card: card_id,
                     kind: ReplacedIdentity::Terminal,
@@ -6552,6 +7255,7 @@ mod tests {
         let refused = QuarantinedWrite {
             subject: WriteSubject::Workspace { card: None },
             category: SaveFailureCategory::InvalidData,
+            check: crate::diagnostics::Check::new("injected refusal"),
             refused_at_unix_ms: 1,
             held_back: 0,
         };

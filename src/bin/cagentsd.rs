@@ -1,7 +1,26 @@
 fn command() -> clap::Command {
     clap::Command::new("cagentsd")
-        .version(cagents::VERSION)
+        .version(cagents::version())
         .about("Run the cagents terminal and conversation daemon. Prefer `cagents daemon start`.")
+        .arg(
+            clap::Arg::new("stored-schema")
+                .long("stored-schema")
+                .help(
+                    "Print the schema of the shared-model store on disk, or nothing if there is \
+                     none, then exit. Refuses while a daemon runs.",
+                )
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("downgrade-store")
+                .long("downgrade-store")
+                .value_name("SCHEMA")
+                .help(
+                    "Convert the shared-model store back to SCHEMA for an older daemon, then exit. \
+                     Refuses while a daemon runs.",
+                )
+                .value_parser(clap::value_parser!(u32)),
+        )
         .arg(
             clap::Arg::new("ceditor-notifications")
                 .long(cagents::instance::CEDITOR_NOTIFICATION_ARGUMENT.trim_start_matches("--"))
@@ -9,6 +28,8 @@ fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue),
         )
 }
+
+cagents::stamp_version!();
 
 fn main() -> std::process::ExitCode {
     if let Some(result) = cagents::host::run_retained_actor_helper() {
@@ -43,8 +64,41 @@ fn main() -> std::process::ExitCode {
         };
     }
     // Informational flags exit before opening runtime state or taking its
-    // daemon lease. Internal precheck owners keep their separate entrypoint.
-    command().get_matches();
+    // daemon lease; the store maintenance flags below hold the lease only for
+    // maintenance and never serve. Internal precheck owners keep their
+    // separate entrypoint.
+    let matches = command().get_matches();
+    if matches.get_flag("stored-schema") {
+        return match cagents::host::stored_schema() {
+            Ok(schema) => {
+                if let Some(schema) = schema {
+                    println!("{schema}");
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cagentsd: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(&target) = matches.get_one::<u32>("downgrade-store") {
+        return match cagents::host::downgrade_store(target) {
+            Ok(Some(from)) => {
+                println!("converted the shared-model store from schema {from} to {target}");
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(None) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagentsd: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    // SAFETY: entry is still single-threaded. After the maintenance flags,
+    // whose answers and refusals belong on the caller's stderr, and before
+    // admission, so a refused start is in the development log too.
+    unsafe { cagents::instance::redirect_development_daemon_log() };
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
     let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
         Ok(admission) => admission,
@@ -58,7 +112,7 @@ fn main() -> std::process::ExitCode {
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.
     cagents::instance::install_panic_hook("cagentsd");
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
-    tracing::info!(version = cagents::VERSION, "starting cagentsd");
+    tracing::info!(version = cagents::version(), "starting cagentsd");
     match cagents::host::run(admission) {
         Ok(()) => {
             cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: true });

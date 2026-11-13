@@ -235,7 +235,7 @@ pub(in crate::host) fn snapshot(
     after: u64,
 ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
     for _ in 0..4 {
-        let (handle, offset, rows, epoch) = {
+        let (handle, offset, rows, epoch, shown) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let handle = state.history_handle(client, id)?;
             let revision = state.presentation_revision(client, id);
@@ -246,14 +246,16 @@ pub(in crate::host) fn snapshot(
             (
                 handle.clone(),
                 view.offset,
-                view.size
-                    .map_or(handle.snapshot().rows.max(1), |size| size.rows),
+                view.size.map(|size| size.rows),
                 view.epoch,
+                state.subscriptions.visibility(id) == TerminalVisibility::Visible,
             )
         };
-        let capture = handle.viewport_snapshot(offset, rows).map_err(|message| {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        })?;
+        let capture = handle
+            .viewport_snapshot(offset, rows, shown)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+            })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state.subscriptions.attached(client, id) {
             return Err(ProtocolError::new(
@@ -422,8 +424,127 @@ mod tests {
         assert_eq!(handle.snapshot().rows, 10);
         handle.shutdown().unwrap();
     }
+    /// A window holding an off-screen pane keeps the terminal hibernated. Each
+    /// `terminal snapshot` attaches, asks to see it and reads it at once; the
+    /// read must show the screen it revealed, not the dropped picture (#2401).
+    #[test]
+    fn a_read_after_revealing_a_hibernated_terminal_shows_its_screen() {
+        let (host, handle, id, _dir) = fixture();
+        {
+            let mut state = host.lock().unwrap();
+            state
+                .set_visibility(1, id, TerminalVisibility::Hibernated)
+                .unwrap();
+            state.detach(2, id).unwrap();
+            state.register_client(3);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.snapshot().detached && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.snapshot().detached);
+        // The window that hibernated it still gets the marker, without a
+        // trip through the worker.
+        assert!(snapshot(&host, 1, id, 0).unwrap().unwrap().detached);
+        for read in 0..20 {
+            {
+                let mut state = host.lock().unwrap();
+                state.attach(3, id).unwrap();
+                state
+                    .set_visibility(3, id, TerminalVisibility::Visible)
+                    .unwrap();
+            }
+            let capture = snapshot(&host, 3, id, 0).unwrap().unwrap();
+            assert!(
+                !capture.detached && capture.rows > 0 && capture.columns > 0,
+                "read {read} returned the hibernated picture: {}x{}",
+                capture.columns,
+                capture.rows
+            );
+            let screen = capture.apply(None).unwrap();
+            assert!(
+                screen.lines.iter().any(|row| row
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("ROW-100")),
+                "read {read} is missing the screen"
+            );
+            let mut state = host.lock().unwrap();
+            state
+                .set_visibility(3, id, TerminalVisibility::Hidden)
+                .unwrap();
+            state.detach(3, id).unwrap();
+        }
+        handle.shutdown().unwrap();
+    }
+    /// Nothing is drawn while a terminal is hidden, so its published screen
+    /// is the one from before. A read that just asked to see it must show
+    /// what has arrived since.
+    #[test]
+    fn a_read_after_revealing_a_hidden_terminal_shows_output_from_while_hidden() {
+        let (host, handle, id, _dir) = fixture_with(
+            r#"i=1; while [ $i -le 100 ]; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); done; while read line; do echo "GOT-$line"; done"#,
+        );
+        {
+            let mut state = host.lock().unwrap();
+            state
+                .set_visibility(1, id, TerminalVisibility::Hidden)
+                .unwrap();
+            state.detach(2, id).unwrap();
+            state.register_client(3);
+        }
+        let shows_reply = |snapshot: &RenderSnapshot| {
+            snapshot.lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("GOT-FRESH")
+            })
+        };
+        handle.input(b"FRESH\n".to_vec()).unwrap();
+        // A hidden terminal's parser can still be read with a viewport other
+        // than the published one. Wait until it holds the reply.
+        let rows = handle.snapshot().rows - 1;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !shows_reply(&handle.viewport_snapshot(None, Some(rows), false).unwrap()) {
+            assert!(Instant::now() < deadline, "the shell never replied");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !shows_reply(&handle.snapshot()),
+            "a hidden terminal published a screen"
+        );
+        {
+            let mut state = host.lock().unwrap();
+            state.attach(3, id).unwrap();
+            state
+                .set_visibility(3, id, TerminalVisibility::Visible)
+                .unwrap();
+        }
+        let screen = snapshot(&host, 3, id, 0)
+            .unwrap()
+            .unwrap()
+            .apply(None)
+            .unwrap();
+        assert!(
+            screen.lines.iter().any(|row| row
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("GOT-FRESH")),
+            "the read showed the screen from before the terminal was hidden"
+        );
+        handle.shutdown().unwrap();
+    }
     #[test]
     fn continuously_dirty_output_keeps_two_custom_viewports_responsive() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         let (host, handle, id, _dir) = fixture_with(
             r#"i=1; while :; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); sleep 0.005; done"#,
         );
@@ -453,7 +574,11 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "60 viewport reads took {elapsed:?}"
+        );
         handle.shutdown().unwrap();
     }
 }

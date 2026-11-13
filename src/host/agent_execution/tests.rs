@@ -1,7 +1,9 @@
+mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 #[cfg(target_os = "linux")]
 mod retained_automation;
+mod transcript;
 
 use super::*;
 use crate::{
@@ -16,9 +18,26 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
 pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
+    isolated_with_process_namespace(name, false)
+}
+
+fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tempfile::TempDir> {
+    const OUTER_PID_NAMESPACE: &str = "CAGENTS_EXECUTION_OUTER_PID_NAMESPACE";
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        if private_proc {
+            let outer = std::env::var_os(OUTER_PID_NAMESPACE)
+                .expect("process-census fixture requires its outer namespace receipt");
+            let namespace = std::fs::read_link("/proc/self/ns/pid").unwrap();
+            assert_eq!(std::process::id(), 1, "fixture must be its namespace init");
+            assert_ne!(namespace, std::path::PathBuf::from(outer));
+            assert_eq!(
+                std::fs::read_link("/proc/1/ns/pid").unwrap(),
+                namespace,
+                "fixture requires procfs mounted for its private PID namespace"
+            );
+        }
         // Only this helper sets the presence marker. The separate owned-late-
         // decision controller also uses CHILD, without this helper's spawn.
         if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
@@ -36,7 +55,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -51,13 +72,40 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    // Keep the caller's delegation inherited unchanged, without inspecting or
-    // copying its value. Every other environment input is fixture-owned.
+    let executable = std::env::current_exe().unwrap();
+    let mut command = if private_proc {
+        // This fixture runs the real upgrade restore's process census. Keep
+        // other host tests and the developer's processes outside its procfs;
+        // an unreadable peer must still block recovery in the product.
+        let mut command = std::process::Command::new("/usr/bin/unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+            ])
+            .arg(executable);
+        command
+    } else {
+        std::process::Command::new(executable)
+    };
+    // Keep the caller's delegation and optional matched helper inherited
+    // unchanged. Retained mode still requires its separate explicit opt-in;
+    // ordinary service fixtures continue using the local transport.
     for (name, _) in std::env::vars_os() {
-        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+        {
             command.env_remove(name);
         }
+    }
+    if private_proc {
+        command.env(
+            OUTER_PID_NAMESPACE,
+            std::fs::read_link("/proc/self/ns/pid").unwrap(),
+        );
     }
     let result = command
         .args([
@@ -78,7 +126,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -138,6 +186,15 @@ while IFS= read -r frame; do
     *'"type":"user"'*)
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
+      case "$frame" in
+        # Ends the provider mid-turn, as a usage limit does.
+        *EXIT_NOW*) exit 3 ;;
+        # Refuses the turn as Claude does when the account is out of usage.
+        *USAGE_LIMIT*)
+          printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":true,"result":"You'"'"'ve hit your weekly limit · resets Nov 8, 8am (America/Vancouver)","session_id":"%s","usage":{"input_tokens":0,"output_tokens":0}}\n' "$n" "$session"
+          continue
+          ;;
+      esac
       case "$frame" in
         *HOLD_CLEANUP_BUSY*)
           : > "$HOME/../cleanup-busy"
@@ -459,6 +516,7 @@ fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join(
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -864,32 +922,36 @@ fn assert_upgrade_environment(host: &SharedHost, agent: AgentId) {
             "selected {name} must still be compared"
         );
     }
-    let (busy, _) = record.handle.update_activity();
     use crate::update::impact::{Disposition, Policy};
-    for (policy, expected) in [
-        (
-            Policy::WhenIdle,
-            if busy {
-                Disposition::WaitsForIdle
-            } else {
-                Disposition::Resumes
-            },
-        ),
-        (
-            Policy::Interrupt,
-            if busy {
-                Disposition::Interrupted
-            } else {
-                Disposition::Resumes
-            },
-        ),
-    ] {
-        let impact = state.upgrade_impact(policy).unwrap();
-        let impact = impact
-            .sessions
-            .iter()
-            .find(|impact| impact.id == session)
-            .unwrap();
+    // The provider can finish draining between two reads of its activity, so
+    // judge the impact only against activity that held across it.
+    let handle = record.handle.clone();
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    let (busy, impacts) = loop {
+        let (busy, _) = handle.update_activity();
+        let impacts = [Policy::WhenIdle, Policy::Interrupt].map(|policy| {
+            let impact = state.upgrade_impact(policy).unwrap();
+            let impact = impact
+                .sessions
+                .into_iter()
+                .find(|impact| impact.id == session)
+                .unwrap();
+            (policy, impact)
+        });
+        if handle.update_activity().0 == busy {
+            break (busy, impacts);
+        }
+        assert!(
+            Instant::now() < hang_guard,
+            "provider activity never settled"
+        );
+    };
+    for (policy, impact) in impacts {
+        let expected = match (policy, busy) {
+            (_, false) => Disposition::Resumes,
+            (Policy::WhenIdle, true) => Disposition::WaitsForIdle,
+            (Policy::Interrupt, true) => Disposition::Interrupted,
+        };
         assert_eq!(impact.disposition, expected, "{}", impact.reason);
     }
 }
@@ -964,7 +1026,7 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     dispatch_accepted(&host, next.clone()).unwrap();
     let done = settled(&host, next.run.id);
     assert_eq!(
-        reconcile_agent_run(&host, &done, true).unwrap(),
+        reconcile_settled(&host, &done, true),
         Reconciliation::Closed
     );
     assert_eq!(
@@ -1053,8 +1115,222 @@ done
         "interrupt\n"
     );
     assert_eq!(
-        reconcile_agent_run(&host, &finished, true).unwrap(),
+        reconcile_settled(&host, &finished, true),
         Reconciliation::Closed
+    );
+}
+
+/// A provider can take seconds to start after its run is accepted. Its owner
+/// interrupting then withdraws the prompt, since the provider has no turn to
+/// interrupt, and the agent stays usable.
+/// Holds the fixture provider in initialization until the test creates
+/// `initialize-release` beside its home.
+fn hold_provider_initialization(root: &Path) {
+    let provider = root.join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let held = r#"      case "$frame" in
+        *'"subtype":"initialize"'*)
+          while [ ! -e "$HOME/../initialize-release" ]; do sleep 0.01; done
+          ;;
+      esac
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(&provider, script.replace(original, held)).unwrap();
+}
+
+/// Waits until the run's dispatcher has bound its provider and released the
+/// agent's gate to await readiness, before any prompt reaches the provider.
+fn await_undelivered(host: &SharedHost, accepted: &Accepted) {
+    let gate = agent_gate(host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while !gate
+        .lock()
+        .unwrap()
+        .is_some_and(|claim| claim.run == accepted.run.id && !claim.withdrawn)
+    {
+        assert!(
+            Instant::now() < hang_guard,
+            "dispatch never awaited the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn assert_withdrawn(host: &SharedHost, run: RunId) -> Run {
+    let withdrawn = registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(run)
+        .unwrap();
+    assert_eq!(withdrawn.state, State::Cancelled);
+    assert_eq!(
+        withdrawn.result.diagnostic.as_deref(),
+        Some(UNDELIVERED_CANCELLATION)
+    );
+    withdrawn
+}
+
+#[test]
+fn cancelled_automation_waits_for_its_starting_provider_before_release() {
+    if isolated("cancelled_automation_waits_for_its_starting_provider_before_release").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
+    };
+    let automation = crate::host::automations::service::create(
+        &host,
+        crate::automations::Definition {
+            name: "Slow start fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Fresh,
+            precheck: None,
+        },
+    )
+    .unwrap();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    await_undelivered(&host, &accepted);
+    cancel_agent_run(&host, &accepted.run).unwrap();
+    let cancelled = assert_withdrawn(&host, accepted.run.id);
+    // The broker retries Busy instead of blocking the automation on a
+    // provider that cannot be released until its startup settles.
+    assert_eq!(
+        reconcile_agent_run(&host, &cancelled, true).unwrap(),
+        Reconciliation::Busy
+    );
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    assert_eq!(
+        reconcile_settled(&host, &cancelled, true),
+        Reconciliation::Closed
+    );
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn stopping_a_starting_agent_from_its_chat_withdraws_its_prompt() {
+    if isolated("stopping_a_starting_agent_from_its_chat_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    await_undelivered(&host, &accepted);
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let stopped = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Interrupt,
+        },
+    );
+    assert!(
+        matches!(stopped, Ok(ServerResponse::Accepted)),
+        "{stopped:?}"
+    );
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let gate = agent_gate(&host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while gate.lock().unwrap().is_some() {
+        assert!(Instant::now() < hang_guard, "dispatch never settled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
+    if isolated("interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request.clone()).unwrap();
+    let agent = accepted.agent.id;
+    await_undelivered(&host, &accepted);
+    let reply = process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    )
+    .unwrap();
+    assert!(matches!(reply, Reply::Requests(requests) if requests.is_empty()));
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let mut follow_up = request;
+    follow_up.destination = Destination::Existing(agent);
+    follow_up.idempotency_key = "follow-up".into();
+    let next = submit(&host, &owner, follow_up).unwrap();
+    let next = settled(&host, next.run.id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\n",
+        "only the follow-up reached the provider"
     );
 }
 
@@ -1123,7 +1399,7 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
     )
     .unwrap();
     assert_eq!(
-        reconcile_agent_run(&host, &done, false).unwrap(),
+        reconcile_settled(&host, &done, false),
         Reconciliation::Idle,
         "presentation alone is not takeover"
     );
@@ -1325,11 +1601,24 @@ fn claim_fixture(host: &SharedHost, automation: &crate::automations::Automation)
         .unwrap()
 }
 
+/// Reconciles a settled run as the automation broker does: the registry can
+/// record a run's result before its provider reports itself idle, and the
+/// broker retries `Busy` on its next pass.
+fn reconcile_settled(host: &SharedHost, run: &Run, retire: bool) -> Reconciliation {
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    loop {
+        match reconcile_agent_run(host, run, retire).unwrap() {
+            Reconciliation::Busy => {
+                assert!(Instant::now() < hang_guard, "provider stayed busy");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            reconciliation => return reconciliation,
+        }
+    }
+}
+
 fn release_fixture(host: &SharedHost, run: &Run) {
-    assert_eq!(
-        reconcile_agent_run(host, run, false).unwrap(),
-        Reconciliation::Idle
-    );
+    assert_eq!(reconcile_settled(host, run, false), Reconciliation::Idle);
     let registry = registry(host).unwrap();
     let mut registry = registry.lock().unwrap();
     let firing = registry
@@ -1399,6 +1688,61 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
         assert!(Instant::now() < deadline, "run never settled: {run:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Closing a conversation leaves running what its provider detached, such
+/// as a server a command started with `nohup`, unless nobody attends it: an
+/// automation's agent stops it, until a person takes part.
+#[test]
+fn only_an_unattended_agent_stops_its_detached_work_on_close() {
+    if isolated("only_an_unattended_agent_stops_its_detached_work_on_close").is_some() {
+        return;
+    }
+    use crate::daemon::owned_children::DetachedWork;
+    let (host, request, _path) = fixture();
+    let session = |agent| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap()
+            .id()
+    };
+    assert_eq!(
+        detached_work_on_close(&host, TerminalId::new()),
+        DetachedWork::Spare,
+        "a conversation that is not an agent"
+    );
+    let started = submit(&host, &Authority::default(), request.clone()).unwrap();
+    settled(&host, started.run.id);
+    assert_eq!(
+        detached_work_on_close(&host, session(started.agent.id)),
+        DetachedWork::Spare,
+        "an agent a person started"
+    );
+    let automation = automation_fixture(&host, &request);
+    let accepted = claim_fixture(&host, &automation);
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    settled(&host, accepted.run.id);
+    let unattended = session(accepted.agent.id);
+    assert_eq!(
+        detached_work_on_close(&host, unattended),
+        DetachedWork::Stop
+    );
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_agent_interaction(accepted.agent.id, None)
+        .unwrap();
+    assert_eq!(
+        detached_work_on_close(&host, unattended),
+        DetachedWork::Spare,
+        "once a person takes part"
+    );
 }
 
 #[test]
@@ -1664,6 +2008,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
         std::fs::File::open(directory).unwrap(),
     ))));
     let process = ProcessSpec {
+        stdout_noise: None,
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -1940,8 +2285,8 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
 }
 
 #[test]
-fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery() {
-    if isolated("graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery")
+fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process() {
+    if isolated("graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process")
         .is_some()
     {
         return;
@@ -1966,6 +2311,17 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(!host.lock().unwrap().chats[&source.id()].handle.owns_work());
+    // The stop ends the process, not the agent: it stays listed and its card
+    // can resume, but the stopped process can no longer act for it.
+    {
+        let registry = registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        let stopped = registry.agent(agent.id).unwrap();
+        assert!(!stopped.closed);
+        assert_eq!(stopped.session.as_ref(), Some(&source));
+        assert!(registry.agent_process_ended(agent.id).unwrap());
+    }
+    assert!(origin(&host, &token).is_err());
     drop(host);
     let mut state = HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new("restarted-execution-fixture"),
@@ -1974,8 +2330,41 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
     });
     state.install_model(Registry::at(&path).unwrap());
     let restarted = Arc::new(crate::host::state::HostLock::new(state));
-    // The close command remains idempotent even though the old actor is gone
-    // and any UI resume would carry the new daemon's proof.
+    assert_eq!(
+        registry(&restarted)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agents(None)
+            .unwrap()
+            .len(),
+        1
+    );
+    // Work for the stopped agent is never sent to a process that is gone. A
+    // conversation that cannot reopen by itself fails with a way forward.
+    let refused = submit(
+        &restarted,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent.id),
+            prompt: "Never reaches the stopped provider".into(),
+            idempotency_key: "after-stop".into(),
+        },
+    )
+    .unwrap();
+    let refused = settled(&restarted, refused.run.id);
+    assert_eq!(refused.state, State::Failed, "{refused:?}");
+    assert!(
+        refused
+            .result
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("Resume it from its pane")),
+        "{refused:?}"
+    );
+    // Closing needs no teardown proof from the gone actor: the stop recorded
+    // that its process ended.
     assert!(
         close(&restarted, &Authority::default(), agent.id)
             .unwrap()
@@ -1991,9 +2380,12 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
             .is_empty()
     );
     assert_eq!(
-        status(&restarted, &Authority::default(), agent.id)
+        registry(&restarted)
             .unwrap()
-            .1
+            .lock()
+            .unwrap()
+            .agent_run(accepted.run.id)
+            .unwrap()
             .state,
         State::Succeeded
     );
@@ -2010,8 +2402,8 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 }
 
 #[test]
-fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved() {
-    if isolated("failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved")
+fn failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved() {
+    if isolated("failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved")
         .is_some()
     {
         return;
@@ -2020,7 +2412,7 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let fault = rusqlite::Connection::open(path).unwrap();
-    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF record ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
     assert!(
         super::super::finish_chat_shutdown(&host)
             .unwrap_err()
@@ -2043,10 +2435,26 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
             .unwrap()
             .is_some()
     );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     fault
         .execute_batch("DROP TRIGGER refuse_shutdown_retirement")
         .unwrap();
     super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     assert!(
         close(&host, &Authority::default(), accepted.agent.id)
             .unwrap()
@@ -2195,7 +2603,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(
-        registry(&host)
+        !registry(&host)
             .unwrap()
             .lock()
             .unwrap()
@@ -2214,6 +2622,311 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
     assert_eq!(server.join().unwrap(), 1);
+}
+
+/// An unverified Codex (ReconnectOnly) agent is not carried through an update:
+/// the successor daemon relaunches its server and resumes the saved thread.
+/// The agent must then follow its relaunched conversation instead of refusing
+/// every prompt as an unavailable conversation, through successive updates.
+#[test]
+fn updated_codex_agent_answers_through_its_relaunched_server() {
+    if isolated_with_process_namespace(
+        "updated_codex_agent_answers_through_its_relaunched_server",
+        true,
+    )
+    .is_some()
+    {
+        return;
+    }
+    use serde_json::{Value, json};
+    const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    // This service fixture owns its daemon and provider stubs. An unrelated
+    // process with unreadable invocation/environment data is not an input to
+    // its relaunch contract. Keep real kernel data for the service and the
+    // exact providers this test tracks.
+    let processes = root.join("processes");
+    std::fs::create_dir(&processes).unwrap();
+    std::os::unix::fs::symlink(
+        format!("/proc/{}", std::process::id()),
+        processes.join(std::process::id().to_string()),
+    )
+    .unwrap();
+    let program = root.join("bin/codex");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Codex;
+    // Each server the daemon launches: its methods in order and its prompts.
+    let (listener_finished, listener_closed) = std::sync::mpsc::sync_channel(1);
+    let server_root = root.clone();
+    let server = std::thread::spawn(move || {
+        let mut served = Vec::new();
+        for launch in 1..=3 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let socket = loop {
+                let launches =
+                    std::fs::read_to_string(server_root.join("codex-launches")).unwrap_or_default();
+                if launches.lines().count() >= launch
+                    && let Ok(arguments) =
+                        std::fs::read_to_string(server_root.join("codex-arguments"))
+                    && let Some(socket) = arguments
+                        .lines()
+                        .find_map(|arg| arg.strip_prefix("unix://"))
+                {
+                    break std::path::PathBuf::from(socket);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Codex server {launch} was not launched"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // The stand-in, not the stopped stub, owned the previous socket.
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "adapter did not join Codex server {launch}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let mut methods = Vec::new();
+            let mut prompts = 0;
+            loop {
+                let message = match websocket.read() {
+                    Ok(message) if message.is_close() => break,
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let Some(id) = frame.get("id") else { continue };
+                let method = frame["method"].as_str().unwrap().to_owned();
+                methods.push(method.clone());
+                let thread =
+                    json!({"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}});
+                let result = match method.as_str() {
+                    // A version outside VERIFIED_CODEX_VERSIONS, as in production.
+                    "initialize" => {
+                        json!({"userAgent":"codex/0.166.0", "codexHome":server_root.join("home/.codex")})
+                    }
+                    "thread/start" => json!({"thread":thread,"model":"fixture-model"}),
+                    "thread/resume" => {
+                        assert_eq!(frame["params"]["threadId"], THREAD);
+                        json!({"thread":thread,"model":"fixture-model"})
+                    }
+                    "model/list" | "skills/list" => json!({"data":[]}),
+                    "thread/queue/list" | "thread/list" | "thread/turns/list" => {
+                        json!({"data":[],"nextCursor":null})
+                    }
+                    "turn/start" => {
+                        prompts += 1;
+                        json!({"turn":{"id":format!("turn-{launch}")}})
+                    }
+                    "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
+                    method => panic!("unexpected Codex request {method}"),
+                };
+                if websocket
+                    .send(tungstenite::Message::Text(
+                        json!({"id":id,"result":result}).to_string().into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                if method == "turn/start" {
+                    let answer = format!("CODEX_SERVER_{launch}_ANSWER");
+                    websocket.send(tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":format!("turn-{launch}"),"status":"completed","items":[{"id":format!("answer-{launch}"),"type":"agentMessage","text":answer}]}}}).to_string().into())).unwrap();
+                }
+            }
+            // The stand-in lives in this thread, independently of the stub
+            // process the daemon stops. Its listener must finish closing too
+            // before the next daemon can decide whether to join or relaunch.
+            drop(websocket);
+            drop(listener);
+            listener_finished.send(launch).unwrap();
+            served.push((methods, prompts));
+        }
+        served
+    });
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    assert_eq!(run.result.text, "CODEX_SERVER_1_ANSWER");
+    let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+    let Some(HostedSession::Chat(issued)) = agent.session else {
+        panic!("Codex agent has no hosted conversation")
+    };
+    assert_eq!(
+        host.lock().unwrap().chats[&issued.id]
+            .handle
+            .native_continuity(),
+        chat::NativeContinuity::ReconnectOnly
+    );
+    // The previous daemon prepares its checkpoint and stops; its successor
+    // restores the checkpoint from the same registry.
+    let update = |host: SharedHost, incarnation: &str, previous_launch: usize| {
+        let providers = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), 1, "the fixture owns exactly one provider");
+        // A local holder-backed runtime does not populate provider_process().
+        // The controlled stub records its own kernel identity before exec,
+        // which retains PID/start, so this also detects death or PID reuse
+        // between launch and this proof rather than trusting a PID alone.
+        let recorded = std::fs::read_to_string(root.join("codex-processes")).unwrap();
+        let recorded = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            previous_launch,
+            "one exact process per launch"
+        );
+        let stat = recorded[previous_launch - 1];
+        let pid = stat.split_whitespace().next().unwrap().parse().unwrap();
+        let (_, start) = crate::model::agent_recovery::process_identity(stat.as_bytes())
+            .expect("the fixture recorded a complete kernel process identity");
+        let provider = crate::daemon::holder_registry::Process { pid, start };
+        assert_eq!(
+            crate::daemon::holder_registry::Process::read(provider.pid).unwrap(),
+            provider,
+            "the fixture server changed before entering its process roster"
+        );
+        let entry = processes.join(provider.pid.to_string());
+        std::os::unix::fs::symlink(format!("/proc/{}", provider.pid), &entry).unwrap();
+        let control_gate = host.lock().unwrap().control_gate.clone();
+        let control = control_gate.write().unwrap();
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        crate::host::state::prepare_upgrade(&host, capability, false).unwrap();
+        drop(control);
+        let (shutdown, _) = host.lock().unwrap().graceful_shutdown();
+        super::super::finish_chat_shutdown(&host).unwrap();
+        for terminal in shutdown {
+            let _ = terminal.shutdown();
+        }
+        for handle in providers {
+            assert!(handle.is_completed(), "the provider teardown must complete");
+        }
+        // Removal is justified by this original process's actual retirement,
+        // not by assuming that shutdown succeeded or by hiding it from the
+        // scan. Reaping may follow the worker's exit proof asynchronously.
+        assert!(
+            provider.reaped(),
+            "the original fixture server was not reaped"
+        );
+        match crate::daemon::holder_registry::Process::read(provider.pid) {
+            Ok(current) => assert_ne!(
+                current, provider,
+                "the original server still survives the daemon shutdown"
+            ),
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "cannot prove the original fixture server ended: {error}"
+            ),
+        }
+        std::fs::remove_file(entry).unwrap();
+        assert_eq!(
+            listener_closed
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the original fixture listener did not close"),
+            previous_launch,
+            "the close acknowledgment belongs to the exact previous server"
+        );
+        drop(host);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new(format!("{incarnation}-execution-fixture")),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new(incarnation),
+        };
+        let mut state = HostState::new(proof.clone());
+        state.install_model(Registry::at(&path).unwrap());
+        let successor = Arc::new(crate::host::state::HostLock::new(state));
+        assert!(
+            crate::host::state::restore_upgrade_with_process_fixture(&successor, &processes)
+                .unwrap()
+                .is_empty()
+        );
+        (successor, proof)
+    };
+    let mut host = host;
+    for (launch, incarnation) in [(2, "first-update"), (3, "second-update")] {
+        let (successor, proof) = update(host, incarnation, launch - 1);
+        host = successor;
+        let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+        let Some(HostedSession::Chat(relaunched)) = agent.session else {
+            panic!("the updated agent lost its hosted conversation")
+        };
+        assert_eq!(relaunched.id, issued.id);
+        assert_eq!(relaunched.proof.as_ref(), Some(&proof));
+        let followup = submit(
+            &host,
+            &Authority::default(),
+            Submit {
+                name: None,
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: format!("after the {incarnation}"),
+                idempotency_key: incarnation.into(),
+            },
+        )
+        .unwrap();
+        let after = settled(&host, followup.run.id);
+        assert_eq!(after.state, State::Succeeded, "{incarnation}: {after:?}");
+        assert_eq!(after.result.text, format!("CODEX_SERVER_{launch}_ANSWER"));
+    }
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+    assert_eq!(
+        listener_closed
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the last fixture listener did not close"),
+        3
+    );
+    let served = server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("codex-processes"))
+            .unwrap()
+            .lines()
+            .count(),
+        3,
+        "only the three expected provider processes were launched"
+    );
+    assert_eq!(served[0].1, 1);
+    for (methods, prompts) in &served[1..] {
+        assert!(
+            methods.iter().any(|method| method == "thread/resume")
+                && !methods.iter().any(|method| method == "thread/start"),
+            "each relaunched server must resume the saved thread: {methods:?}"
+        );
+        assert_eq!(*prompts, 1, "each follow-up reached its server once");
+    }
 }
 
 #[test]
@@ -2459,8 +3172,9 @@ fn edges_through(
     let queue = Arc::clone(watcher);
     std::thread::spawn(move || {
         while let Some(queued) = queue.pop() {
-            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } =
-                queued.message
+            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited {
+                sequence, edit, ..
+            } = queued.message
                 && sender.send((sequence, edit)).is_err()
             {
                 return;
@@ -2543,7 +3257,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     watcher.close_after_drain();
     let edges = std::iter::from_fn(|| watcher.pop())
         .filter_map(|queued| match queued.message {
-            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
                 Some((sequence, edit))
             }
             _ => None,
@@ -3224,10 +3938,27 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
     let [asked] = asked.as_slice() else {
         panic!("{asked:?}")
     };
-    assert_eq!(
-        status(&host, &owner, agent).unwrap().1.state,
-        State::Waiting
-    );
+    // Requests can become visible in the actor before its activity observer
+    // commits the corresponding run state to the registry.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waiting = loop {
+        let (_, latest) = status(&host, &owner, agent).unwrap();
+        assert_eq!(latest.id, accepted.run.id, "another run replaced the owner");
+        assert!(
+            !latest.state.is_terminal(),
+            "the permission request's run settled before waiting: {latest:?}"
+        );
+        if latest.state == State::Waiting {
+            break latest;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the permission request's run never waited: {latest:?}; requests: {:?}",
+            process(&host, owner.clone(), Operation::Requests(agent))
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(waiting.state, State::Waiting);
     let error = control(answer(&asked.id, "always", Vec::new())).unwrap_err();
     assert!(error.contains("accepts the actions allow, deny"), "{error}");
     let error = control(answer(
@@ -3793,7 +4524,16 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
     };
     let courier = mailbox::Courier::start(&host).unwrap();
     courier.wait_for_scan(0); // Completes before result; never wakes the courier.
-    assert_eq!(stored().state, Delivery::Pending);
+    // The busy agent takes the message as a run that waits, unsent, for the
+    // parent's turn to end.
+    assert_eq!(stored().state, Delivery::Delivered);
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     assert_eq!(handle.activity(), crate::agent::ActivityState::Working);
     std::fs::write(&release.0, "release").unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -3845,6 +4585,213 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
         "one original prompt and one courier prompt, including after another scan"
     );
     drop(courier);
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
+fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
+    use crate::agent_execution::mailbox::{Outgoing, State as Delivery, To};
+    if isolated("a_usage_limited_session_lists_its_limit_and_holds_its_messages").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    request.prompt = "USAGE_LIMIT".into();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    settled(&host, accepted.run.id);
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let member = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the limited session is listed");
+    let limit = member.limit.as_ref().expect("its limit is reported");
+    assert_eq!(limit.summary, "Claude weekly limit reached");
+    assert_eq!(
+        limit.reset.as_deref(),
+        Some("Nov 8, 8am (America/Vancouver)")
+    );
+    // The fixture has no usage reading to date the reset by.
+    assert_eq!(limit.resets_at, None);
+    assert_eq!(member.state_label(), "limited");
+    // The read older CLIs make keeps its layout and reports no limit.
+    let Reply::Directory(directory) = process(
+        &host,
+        Authority::default(),
+        Operation::Directory(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("directory reply");
+    };
+    assert!(directory.sessions.iter().any(|entry| entry.id == session));
+
+    let Reply::Delivered(delivery) = process(
+        &host,
+        Authority::default(),
+        Operation::Send(Outgoing {
+            to: To::Session(session.to_string()),
+            body: "Can you look at this?".into(),
+            wait_ms: Some(60_000),
+        }),
+    )
+    .unwrap() else {
+        panic!("delivery reply");
+    };
+    let recipient = delivery
+        .recipient
+        .as_ref()
+        .expect("the recipient is reported");
+    assert_eq!(recipient.session.id, session);
+    assert_eq!(recipient.limit.as_ref(), Some(limit));
+    assert_eq!(
+        delivery.sent.message.wait_until_ms, None,
+        "no reply can come before the limit resets, so none is held for the asker"
+    );
+    // A surface showing the conversation, hidden as most are, hears of its
+    // limit from the courier without reading the transcript.
+    let subscriber = 9_001;
+    let queue = {
+        let mut state = host.lock().unwrap();
+        let queue = state.register_client(subscriber);
+        state
+            .chats
+            .get_mut(&session)
+            .unwrap()
+            .subscribers
+            .insert(subscriber, false);
+        queue
+    };
+    let (limits, heard) = std::sync::mpsc::channel();
+    let reader = {
+        let queue = queue.clone();
+        std::thread::spawn(move || {
+            while let Some(outbound) = queue.pop() {
+                if let crate::terminal_ipc::ServerMessage::ChatLimit { chat_id, limit } =
+                    outbound.message
+                {
+                    limits.send((chat_id, limit)).unwrap();
+                }
+            }
+        })
+    };
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, Some(limit.clone())),
+        "the subscriber is told of the limit"
+    );
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a limit it was told of is not repeated"
+    );
+    let stored = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.state,
+        Delivery::Pending,
+        "the limit holds the message"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the limited provider received no courier prompt"
+    );
+
+    // A limit of unknown end is no reason to refuse a follow-up run, which
+    // is what shows whether it still holds. While that run works, the
+    // provider's last error is not its fate: the session is not limited, and
+    // the subscriber hears so. The run succeeds, so the limit stays lifted
+    // and the held message is delivered.
+    let follow_up = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "carry on HOLD_CLEANUP_BUSY".into(),
+            idempotency_key: "after-the-limit".into(),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("cleanup-busy").exists() {
+        assert!(Instant::now() < deadline, "the follow-up turn starts");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let working = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the working session is listed");
+    assert_eq!(working.limit, None, "a working session is not limited");
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, None),
+        "the subscriber hears the limit lifted while the turn works"
+    );
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, follow_up.run.id).state, State::Succeeded);
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.try_recv().is_err(),
+        "a lifted limit that stays lifted is not told again"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap()
+        .state
+        == Delivery::Pending
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the held message is delivered once the limit lifts"
+        );
+        courier.wake_and_wait_for_scan();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(courier);
+    queue.close_after_drain();
+    reader.join().unwrap();
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }
 
@@ -4335,6 +5282,32 @@ fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted
 }
 
 #[test]
+fn startup_readiness_retries_an_unanswered_snapshot_within_its_budget() {
+    // One missed helper RPC is not evidence of exit: the readiness wait keeps
+    // asking until its own budget ends, then preserves ownership as before.
+    let (handle, _) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    let start = Instant::now();
+    let result = await_provider_ready_until(&handle, start + Duration::from_millis(300));
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert!(
+        matches!(&result, Err((State::Interrupted, reason)) if reason.contains("ownership was preserved")),
+        "{result:?}"
+    );
+    assert!(handle.owns_work());
+
+    // An attachment that already recorded its failure does not wait out the
+    // budget.
+    let failed = chat::runtime::Handle::fixture_failed_remote();
+    let start = Instant::now();
+    let result = await_provider_ready_until(&failed, start + Duration::from_secs(30));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(
+        matches!(&result, Err((State::Interrupted, _))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn execution_gates_reclaim_failed_and_repeated_close_churn() {
     if isolated("execution_gates_reclaim_failed_and_repeated_close_churn").is_some() {
         return;
@@ -4440,4 +5413,985 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
             .closed
     );
     assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
+}
+
+#[test]
+fn console_lines_summarize_steps_without_their_payloads() {
+    use chat::{
+        ChangeKind, CommandAction, DeliveryKind, FileChange, Item, ItemContent, Role, ToolStatus,
+    };
+    let item = |role, content| Item {
+        started_at: None,
+        id: "item".into(),
+        role,
+        content,
+        at: None,
+    };
+    let command = |action, label: &str, status, exit_code| {
+        item(
+            Role::Assistant,
+            ItemContent::Command {
+                label: label.into(),
+                command: "cargo test --locked\nexit 0".into(),
+                working_directory: "/repo".into(),
+                action,
+                status,
+                exit_code,
+                duration_ms: None,
+                output: "SECRET_OUTPUT".into(),
+            },
+        )
+    };
+    let tool = |status| {
+        item(
+            Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: "{\"prompt\":\"internal instructions\"}".into(),
+                output: "agentId: internal metadata".into(),
+                status,
+            },
+        )
+    };
+    let change = |path: &str, kind| FileChange {
+        path: path.into(),
+        kind,
+        diff: "+SECRET_DIFF".into(),
+    };
+    let changes = |changes| {
+        item(
+            Role::Assistant,
+            ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            },
+        )
+    };
+    let delivery = |kind, body: &str| {
+        item(
+            Role::User,
+            ItemContent::Delivery {
+                kind,
+                from: "Explore".into(),
+                sender: "task".into(),
+                summary: "Mapped the console".into(),
+                body: body.into(),
+            },
+        )
+    };
+    let items = [
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "Done.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        ),
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "private reasoning".into(),
+                thinking: true,
+                phase: Default::default(),
+            },
+        ),
+        command(CommandAction::Run, " \n", ToolStatus::Succeeded, Some(0)),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Failed,
+            Some(101),
+        ),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Running,
+            None,
+        ),
+        command(
+            CommandAction::Read,
+            "Read src/app.rs",
+            ToolStatus::Succeeded,
+            None,
+        ),
+        tool(ToolStatus::Succeeded),
+        tool(ToolStatus::Denied),
+        tool(ToolStatus::Running),
+        changes(vec![]),
+        changes(vec![change("src/new.rs", ChangeKind::Added)]),
+        changes(vec![
+            change("a.rs", ChangeKind::Updated),
+            change("b.rs", ChangeKind::Deleted),
+        ]),
+        delivery(DeliveryKind::Report, "FULL_REPORT_BODY"),
+        delivery(DeliveryKind::Message, "Please rerun the build.\n"),
+    ];
+    let lines = items
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    let report = chat::delivery_heading(
+        DeliveryKind::Report,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    let message = chat::delivery_heading(
+        DeliveryKind::Message,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    assert_eq!(
+        lines,
+        format!(
+            "Assistant: Done.\n\
+             Ran cargo test --locked\n\
+             Ran Run the tests (failed, exit 101)\n\
+             Read src/app.rs\n\
+             Called Agent\n\
+             Called Agent (denied)\n\
+             Added src/new.rs\n\
+             Edited 2 files\n\
+             {report}\n\
+             {message}:\nPlease rerun the build.\n"
+        )
+    );
+    for hidden in [
+        "private reasoning",
+        "SECRET",
+        "exit 0",
+        "internal",
+        "FULL_REPORT_BODY",
+    ] {
+        assert!(!lines.contains(hidden), "{hidden} leaked into {lines:?}");
+    }
+    // Settling the running steps in sequence only appends to what the client
+    // already printed, so it never reprints the transcript.
+    let mut settled = items.to_vec();
+    for item in &mut settled {
+        if let ItemContent::Command { status, .. } | ItemContent::Tool { status, .. } =
+            &mut item.content
+            && *status == ToolStatus::Running
+        {
+            *status = ToolStatus::Succeeded;
+        }
+    }
+    let before = items[..5]
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    let after = settled[..5]
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    assert!(after.starts_with(&before) && after.len() > before.len());
+}
+
+fn console_snapshot(texts: &[&str], busy: bool) -> chat::Snapshot {
+    chat::Snapshot {
+        busy,
+        items: texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                std::sync::Arc::new(chat::Item {
+                    started_at: None,
+                    id: index.to_string(),
+                    role: chat::Role::Assistant,
+                    content: chat::ItemContent::Text {
+                        text: (*text).into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    at: None,
+                })
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The client prints only complete lines, so the daemon leaves the line a
+/// provider is still writing unterminated, and only that one.
+#[test]
+fn console_text_leaves_only_a_line_still_being_written_open() {
+    let (text, _) = console_text(&console_snapshot(&["One.", "Two"], true), 0);
+    assert_eq!(text, "Assistant: One.\nAssistant: Two");
+    let (text, _) = console_text(&console_snapshot(&["One.", "Two"], false), 0);
+    assert_eq!(text, "Assistant: One.\nAssistant: Two\n");
+    // Text followed by a step in progress is finished: it is not held back
+    // for as long as that step runs.
+    let mut running = console_snapshot(&["About to run the tests."], true);
+    running.items.push(std::sync::Arc::new(chat::Item {
+        started_at: None,
+        id: "tool".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Tool {
+            name: "Bash".into(),
+            input: String::new(),
+            output: String::new(),
+            status: chat::ToolStatus::Running,
+        },
+        at: None,
+    }));
+    let (text, _) = console_text(&running, 0);
+    assert_eq!(text, "Assistant: About to run the tests.\n");
+}
+
+/// A line the client printed never comes back shorter, which would make it
+/// look new when the front of a long transcript is dropped.
+#[test]
+fn console_text_drops_whole_items_from_the_front_of_a_long_transcript() {
+    let limit = crate::agent_execution::MAX_RESULT_BYTES;
+    let old = "o".repeat(limit / 2);
+    let new = "n".repeat(limit / 2 + 64);
+    let (text, truncated) = console_text(&console_snapshot(&[&old, &new, "Last."], false), 0);
+    assert!(truncated);
+    assert_eq!(text, format!("Assistant: {new}\nAssistant: Last.\n"));
+
+    // An item too long to fit at all is still a complete line.
+    let huge = "h".repeat(limit + 1);
+    let (text, truncated) = console_text(&console_snapshot(&[&huge], false), 0);
+    assert!(truncated);
+    assert!(text.len() <= limit && text.ends_with('\n'));
+
+    let mut paged = console_snapshot(&["Recent."], false);
+    paged.has_earlier = true;
+    assert_eq!(
+        console_text(&paged, 0),
+        ("Assistant: Recent.\n".to_owned(), true)
+    );
+}
+
+#[test]
+fn console_says_a_step_is_running_only_once_it_has_taken_a_while() {
+    let started = 1_000_000;
+    let command = chat::Item {
+        started_at: Some(started),
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: String::new(),
+            command: "cargo test".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: "PAYLOAD".into(),
+        },
+        at: None,
+    };
+    assert_eq!(console_line(&command, started + 4_999), None);
+    assert_eq!(
+        console_line(&command, started + 5_000).as_deref(),
+        Some("Running cargo test\n")
+    );
+    // A replayed step has no known start, so its age is unknown too.
+    let replayed = chat::Item {
+        started_at: None,
+        ..command
+    };
+    assert_eq!(console_line(&replayed, started + 60_000), None);
+}
+
+#[test]
+fn console_holds_no_line_back_for_a_text_block_that_is_still_empty() {
+    let (text, _) = console_text(&console_snapshot(&["One.", ""], true), 0);
+    assert_eq!(text, "Assistant: One.\n");
+}
+
+#[test]
+fn console_prints_a_paged_item_as_one_step() {
+    let part = |id: &str, content| chat::Item {
+        started_at: None,
+        id: id.into(),
+        role: chat::Role::Assistant,
+        content,
+        at: None,
+    };
+    let tool = |name: &str| chat::ItemContent::Tool {
+        name: name.into(),
+        input: "PAYLOAD".into(),
+        output: "PAYLOAD".into(),
+        status: chat::ToolStatus::Succeeded,
+    };
+    let later = "tool:native-part:1:tool:0-0:0-0";
+    assert_eq!(
+        console_line(&part("tool", tool("Agent (part 1/3)")), 0).as_deref(),
+        Some("Called Agent\n")
+    );
+    assert_eq!(
+        console_line(&part(later, tool("Agent (part 2/3)")), 0),
+        None
+    );
+    // A provider's own ID can contain the store's marker without being a part.
+    assert_eq!(
+        console_line(&part("provider:native-part:tool", tool("Agent")), 0).as_deref(),
+        Some("Called Agent\n")
+    );
+    let text = chat::ItemContent::Text {
+        text: "and the rest.".into(),
+        thinking: false,
+        phase: Default::default(),
+    };
+    assert_eq!(
+        console_line(&part("answer:native-part:1:text:0-0:0-0", text), 0).as_deref(),
+        Some("and the rest.\n")
+    );
+    assert_eq!(chat::without_page_mark("Fix (part one)"), "Fix (part one)");
+}
+
+#[test]
+fn console_prints_a_provider_notice_as_one_unlabelled_line() {
+    let notice = |id: &str, text: &str| chat::Item {
+        id: id.into(),
+        role: chat::Role::System,
+        content: chat::ItemContent::Text {
+            text: text.into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        started_at: None,
+        at: None,
+    };
+    let line = |id: &str, text: &str| console_line(&notice(id, text), 0);
+    assert_eq!(
+        line("summary", "Searched the retry path").as_deref(),
+        Some("Searched the retry path\n")
+    );
+    assert_eq!(
+        line("output", "Current model: example\nsecond\nthird").as_deref(),
+        Some("Current model: example\n"),
+        "command output filed as a notice stays one line"
+    );
+    let long = line("long", &"x".repeat(5_000)).unwrap();
+    assert!(long.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", long.len());
+    assert_eq!(
+        line(
+            "frame",
+            r#"{"type":"model_refusal_fallback","retracted":[]}"#
+        ),
+        None,
+        "a protocol frame is not a message"
+    );
+    assert_eq!(line("fragments", r#"[{"text":"internal"}]"#), None);
+    assert_eq!(
+        line(
+            "output:native-part:1:text:0-0:0-0",
+            "the rest of the output"
+        ),
+        None,
+        "a later part of a notice adds no line"
+    );
+}
+
+#[test]
+fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
+    let change = |path: &str| chat::FileChange {
+        path: path.into(),
+        kind: chat::ChangeKind::Updated,
+        diff: String::new(),
+    };
+    let part = |id: &str, paths: &[&str]| {
+        std::sync::Arc::new(chat::Item {
+            started_at: None,
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: chat::ItemContent::Changes {
+                changes: paths.iter().map(|path| change(path)).collect(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+        })
+    };
+    let snapshot = chat::Snapshot {
+        items: vec![
+            part("edit", &["a.rs"]),
+            part("edit:native-part:1:changes:0-0:0-0", &["a.rs"]),
+            part(
+                "edit:native-part:2:changes:0-0:0-0",
+                &["a.rs", "b.rs", "c.rs"],
+            ),
+        ],
+        ..Default::default()
+    };
+    let (text, _) = console_text(&snapshot, 0);
+    assert_eq!(text, "Edited a.rs\nEdited 2 more files\n");
+}
+
+#[test]
+fn console_names_a_paged_command_once() {
+    let command = chat::Item {
+        started_at: None,
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: "cargo test (part 1/8)".into(),
+            command: "cargo test".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: "PAYLOAD".into(),
+        },
+        at: None,
+    };
+    assert_eq!(
+        console_line(&command, 0).as_deref(),
+        Some("Ran cargo test\n")
+    );
+}
+
+/// Waits for `condition`, failing with `reason` after a few seconds.
+fn eventually(mut condition: impl FnMut() -> bool, reason: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{reason}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn deliver(host: &SharedHost, to: String, body: &str) -> crate::agent_execution::mailbox::Handed {
+    use crate::agent_execution::mailbox::{Outgoing, To};
+    let Reply::Handed(handed) = process(
+        host,
+        Authority::default(),
+        Operation::Deliver(Outgoing {
+            to: To::Session(to),
+            body: body.into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("expected a handed receipt");
+    };
+    handed
+}
+
+fn prompts(root: &Path) -> usize {
+    std::fs::read_to_string(root.join("prompts"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Starts the agent's first run on a turn the fake provider holds until
+/// `cleanup-release` exists, and returns once the provider is in that turn.
+fn busy_agent(host: &SharedHost, mut request: Submit, root: &Path) -> Accepted {
+    request.prompt = "HOLD_CLEANUP_BUSY".into();
+    let accepted = submit(host, &Authority::default(), request).unwrap();
+    eventually(
+        || root.join("cleanup-busy").exists(),
+        "the provider never began its held turn",
+    );
+    accepted
+}
+
+#[test]
+fn a_message_to_a_settled_agent_starts_a_run_with_it() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
+    if isolated("a_message_to_a_settled_agent_starts_a_run_with_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+
+    let handed = deliver(&host, first.agent.id.to_string(), "Review the result");
+    let Some(Handoff::Run {
+        agent,
+        run,
+        start: Start::Sent { resumed: false },
+    }) = handed.agent
+    else {
+        panic!("a settled agent takes the message as a run now: {handed:?}");
+    };
+    assert_eq!(agent, first.agent.id);
+    let run = settled(&host, run);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    // Its owner sees the work as the agent's latest run, not a turn no run
+    // recorded.
+    let (_, latest) = status(&host, &Authority::default(), agent).unwrap();
+    assert_eq!(latest.id, run.id);
+    let message = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(handed.delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.state, Delivery::Delivered);
+    assert_eq!(prompts(root), 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the same provider took it"
+    );
+}
+
+#[test]
+fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
+    if isolated("a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request, root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+
+    let handed = deliver(&host, first.agent.id.to_string(), "After your run");
+    let Some(Handoff::Run {
+        agent,
+        run: queued,
+        start: Start::Queued {
+            behind: Some(behind),
+        },
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message as its next run: {handed:?}");
+    };
+    assert_eq!((agent, behind), (first.agent.id, first.run.id));
+    let message = |host: &SharedHost| {
+        registry(host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(handed.delivery.sent.message.id)
+            .unwrap()
+            .unwrap()
+    };
+    // The run has the message; it waits unsent, interrupting nothing.
+    assert_eq!(message(&host).state, Delivery::Delivered);
+    courier.wake_and_wait_for_scan();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_run_is_queued(queued)
+            .unwrap()
+    );
+    assert_eq!(prompts(root), 1, "nothing interrupts");
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn messages_and_follow_ups_reach_an_agent_in_the_order_they_were_accepted() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, Outgoing, State as Delivery, To},
+    };
+    if isolated("messages_and_follow_ups_reach_an_agent_in_the_order_they_were_accepted").is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let agent = first.agent.id;
+
+    // A message left without being handed over, as when the courier has not
+    // reached it yet.
+    let Reply::Delivered(earlier) = process(
+        &host,
+        Authority::default(),
+        Operation::Send(Outgoing {
+            to: To::Session(agent.to_string()),
+            body: "First".into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("expected a sent receipt");
+    };
+    let earlier = earlier.sent.message.id;
+    // A later one waits behind it, rather than overtaking it.
+    let later = deliver(&host, agent.to_string(), "Second");
+    assert_eq!(later.agent, Some(Handoff::Behind { agent }));
+    let message = |id| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(id)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(message(later.delivery.sent.message.id), Delivery::Pending);
+
+    // A follow-up accepted after both hands them over first, in order, and
+    // waits behind them.
+    let Reply::Prompted { accepted, start } = process(
+        &host,
+        Authority::default(),
+        Operation::Prompt {
+            request: Submit {
+                destination: Destination::Existing(agent),
+                prompt: "Third".into(),
+                idempotency_key: "ordered-follow-up".into(),
+                ..request
+            },
+            interrupt: false,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a prompted receipt");
+    };
+    assert_eq!(
+        start,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    for id in [earlier, later.delivery.sent.message.id] {
+        assert_eq!(message(id), Delivery::Delivered);
+    }
+    let store = registry(&host).unwrap();
+    let keys = |runs: &[crate::agent_execution::Run]| -> Vec<String> {
+        let store = store.lock().unwrap();
+        runs.iter()
+            .map(|run| store.agent_request(run.id).unwrap().idempotency_key)
+            .collect()
+    };
+    let queue = store.lock().unwrap().unfinished_agent_runs(agent).unwrap();
+    let key = crate::host::model::MESSAGE_RUN_KEY;
+    assert_eq!(
+        keys(&queue[1..]),
+        [
+            format!("{key}{earlier}"),
+            format!("{key}{}", later.delivery.sent.message.id),
+            "ordered-follow-up".into(),
+        ]
+    );
+
+    // They run in that order once the current run ends.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let ran: Vec<_> = queue.iter().map(|run| settled(&host, run.id)).collect();
+    assert!(
+        ran.iter().all(|run| run.state == State::Succeeded),
+        "{ran:?}"
+    );
+    assert_eq!(ran.last().unwrap().id, accepted.run.id);
+    let started: Vec<_> = ran.iter().map(|run| run.started_ms.unwrap()).collect();
+    assert!(started.is_sorted(), "{started:?}");
+    assert_eq!(prompts(root), 4);
+    drop(courier);
+}
+
+#[test]
+fn a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles() {
+    use crate::agent_execution::Start;
+    if isolated("a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let follow_up = Submit {
+        destination: Destination::Existing(first.agent.id),
+        prompt: "Next".into(),
+        idempotency_key: "busy-follow-up".into(),
+        ..request
+    };
+    let prompt = |follow_up: Submit| {
+        let Reply::Prompted { accepted, start } = process(
+            &host,
+            Authority::default(),
+            Operation::Prompt {
+                request: follow_up,
+                interrupt: false,
+            },
+        )
+        .unwrap() else {
+            panic!("expected a prompted receipt");
+        };
+        (accepted, start)
+    };
+    let (queued, start) = prompt(follow_up.clone());
+    assert_eq!(
+        start,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    assert_eq!(queued.run.state, State::Accepted);
+    // A retry whose answer was lost says the same.
+    let (retried, start) = prompt(follow_up);
+    assert_eq!((retried.run.id, retried.created), (queued.run.id, false));
+    assert!(matches!(start, Start::Queued { .. }), "{start:?}");
+    courier.wake_and_wait_for_scan();
+    assert_eq!(prompts(root), 1, "the queued prompt was not sent early");
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued.run.id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn an_interrupt_withdraws_the_prompts_waiting_behind_the_run() {
+    if isolated("an_interrupt_withdraws_the_prompts_waiting_behind_the_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let queued = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(first.agent.id),
+            prompt: "Withdrawn".into(),
+            idempotency_key: "withdrawn".into(),
+            ..request
+        },
+    )
+    .unwrap();
+    // Let the held turn end with the interrupt, as a provider does.
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let _ = process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent: first.agent.id,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    );
+    let withdrawn = settled(&host, queued.run.id);
+    assert_eq!(withdrawn.state, State::Cancelled, "{withdrawn:?}");
+    assert_eq!(
+        withdrawn.result.diagnostic.as_deref(),
+        Some(WITHDRAWN),
+        "{withdrawn:?}"
+    );
+    settled(&host, first.run.id);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(prompts(root), 1, "a withdrawn prompt is never sent");
+}
+
+#[test]
+fn an_interrupt_keeps_the_messages_waiting_behind_the_run() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
+    if isolated("an_interrupt_keeps_the_messages_waiting_behind_the_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let handed = deliver(&host, first.agent.id.to_string(), "From a colleague");
+    let Some(Handoff::Run {
+        run: message_run,
+        start: Start::Queued { .. },
+        ..
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message: {handed:?}");
+    };
+    let prompt = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(first.agent.id),
+            prompt: "Withdrawn".into(),
+            idempotency_key: "withdrawn-after-message".into(),
+            ..request
+        },
+    )
+    .unwrap();
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let _ = process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent: first.agent.id,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    );
+    // The owner's own prompt is withdrawn; the message stays a run.
+    let withdrawn = settled(&host, prompt.run.id);
+    assert_eq!(withdrawn.result.diagnostic.as_deref(), Some(WITHDRAWN));
+    settled(&host, first.run.id);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let ran = settled(&host, message_run);
+    assert_eq!(ran.state, State::Succeeded, "{ran:?}");
+    let message = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(handed.delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.state, Delivery::Delivered);
+    assert_eq!(prompts(root), 2, "the message ran once, as its run");
+    drop(courier);
+}
+
+/// Retrying a follow-up whose run the agent received and that has since
+/// ended reports how it ended, rather than that it was sent or never was.
+#[test]
+fn a_retried_follow_up_says_the_agent_received_it() {
+    use crate::agent_execution::{ENDED, ResultSummary, Start};
+    if isolated("a_retried_follow_up_says_the_agent_received_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let follow_up = Submit {
+        destination: Destination::Existing(first.agent.id),
+        prompt: "HOLD_CLEANUP_BUSY".into(),
+        idempotency_key: "held".into(),
+        ..request
+    };
+    let (held, start) =
+        super::prompt(&host, &Authority::default(), follow_up.clone(), false).unwrap();
+    assert_eq!(start, Start::Sent { resumed: false });
+    let registry = registry(&host).unwrap();
+    let run = || registry.lock().unwrap().agent_run(held.run.id).unwrap();
+    eventually(
+        || run().provider_key.is_some(),
+        "the provider never acknowledged its held turn",
+    );
+    // The provider fails the turn it had begun.
+    let current = run();
+    registry
+        .lock()
+        .unwrap()
+        .update_agent_run(
+            current.id,
+            current.revision,
+            Update::Finished {
+                state: State::Failed,
+                result: ResultSummary {
+                    diagnostic: Some("The provider reported an API error.".into()),
+                    ..Default::default()
+                },
+            },
+            now(),
+        )
+        .unwrap();
+
+    let error = super::prompt(&host, &Authority::default(), follow_up, false).unwrap_err();
+    assert_eq!(
+        error,
+        format!(
+            "{ENDED}run {} ended failed after the agent received it. The provider reported an API error.",
+            &held.run.id.to_string()[..8]
+        )
+    );
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+}
+
+/// A message for an agent whose process stopped and whose conversation cannot
+/// reopen by itself is held, not lost, and says why; it becomes a run once.
+#[test]
+fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
+    use crate::agent_execution::mailbox::{Handoff, Reach, State as Delivery};
+    if isolated("a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    super::super::finish_chat_shutdown(&host).unwrap();
+    drop(host);
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("restarted-delivery-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("restarted-delivery"),
+    });
+    state.install_model(Registry::at(&path).unwrap());
+    let host = Arc::new(crate::host::state::HostLock::new(state));
+
+    // The agent is named though no session of it runs.
+    let handed = deliver(&host, accepted.agent.id.to_string(), "Are you there?");
+    assert_eq!(handed.delivery.sent.reach, Reach::Offline);
+    let Some(Handoff::Held { agent, reason }) = &handed.agent else {
+        panic!("{handed:?}");
+    };
+    assert_eq!(*agent, accepted.agent.id);
+    assert!(reason.contains("Resume it from its pane"), "{reason}");
+    let (message, latest) = {
+        let registry = registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        (
+            registry
+                .message(handed.delivery.sent.message.id)
+                .unwrap()
+                .unwrap(),
+            registry.latest_agent_run(accepted.agent.id).unwrap(),
+        )
+    };
+    assert_eq!(message.state, Delivery::Pending, "the message is not lost");
+    assert_eq!(latest.state, State::Failed, "{latest:?}");
+    // The courier does not try again with every scan.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_agent_run(accepted.agent.id)
+            .unwrap()
+            .id,
+        latest.id
+    );
+
+    // A follow-up fails the same way, and retrying it reports that failure
+    // again rather than that it was sent.
+    let follow_up = Submit {
+        name: None,
+        destination: Destination::Existing(accepted.agent.id),
+        prompt: "Carry on".into(),
+        idempotency_key: "follow-up".into(),
+    };
+    for attempt in ["first", "retry"] {
+        let error = super::prompt(&host, &Authority::default(), follow_up.clone(), false)
+            .expect_err(attempt);
+        assert!(
+            error.starts_with(crate::agent_execution::NOT_SENT),
+            "{attempt}: {error}"
+        );
+        assert!(
+            error.contains("Resume it from its pane"),
+            "{attempt}: {error}"
+        );
+    }
 }

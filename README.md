@@ -6,6 +6,9 @@
 
 <p align="center">A native Linux workspace for coding agents.</p>
 
+> [!NOTE]
+> This product is in beta. Expect bugs.
+
 Run Claude Code, Codex, and OMP across repositories and Git worktrees. Keep
 conversations, terminals, files, diffs, and pull requests together, with a
 separate workspace for each worktree.

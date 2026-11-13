@@ -5,6 +5,8 @@ mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
+#[path = "support/retained_fixture.rs"]
+mod retained_fixture;
 
 use serde_json::Value;
 use std::{
@@ -64,8 +66,8 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
-        // Project discovery requires a checkout with a HEAD. Keep its Git
-        // identity, configuration and initial commit inside this fixture.
+        // These console scenarios use a private checkout with a HEAD. Keep
+        // its Git identity, configuration and initial commit in this fixture.
         for arguments in [
             vec!["init", "--initial-branch=main", "--template="],
             vec!["commit", "--allow-empty", "-m", "fixture"],
@@ -152,6 +154,64 @@ impl Fixture {
         value["data"]["results"][0].clone()
     }
 
+    /// Runs an `agent spawn` that names an idempotency key, repeating it with
+    /// that key while the daemon's acceptance goes unanswered, as the CLI's
+    /// error instructs. Acceptance commits durably before the daemon answers,
+    /// and a stalled disk can hold that commit past even the CLI's 30 s
+    /// acceptance budget, which this capacity contract does not test. The key
+    /// keeps a repeat from starting the work twice. Says whether it repeated.
+    fn answered_spawn(&self, arguments: &[&str]) -> (Output, bool) {
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        let mut repeated = false;
+        loop {
+            // Thirty seconds per submit, its built-in retry and the 10 s wait
+            // can together outlast output()'s whole 20 s, so allow more here.
+            let output = self.output_until(arguments, Instant::now() + Duration::from_secs(80));
+            let unanswered = !output.status.success()
+                && serde_json::from_slice::<Value>(&output.stderr).is_ok_and(|error| {
+                    error["error"]["details"]["idempotency_key"].is_string()
+                        && error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("the daemon did not answer"))
+                });
+            if !unanswered {
+                return (output, repeated);
+            }
+            assert!(
+                Instant::now() < hang_guard,
+                "acceptance never answered: {output:?}"
+            );
+            repeated = true;
+        }
+    }
+
+    /// Returns an `agent spawn --wait` receipt with its run, once settled, as
+    /// `settled`. The CLI's wait budget is not the contract under test: under
+    /// load a run can still be starting when it lapses, so this keeps waiting
+    /// on that exact run.
+    fn settled_spawn(&self, spawned: Output) -> Value {
+        let json = |output: &Output| {
+            // Exit 3 is the CLI's timed-out wait; anything else is a failure.
+            assert!(matches!(output.status.code(), Some(0 | 3)), "{output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], true, "{value}");
+            value["data"].clone()
+        };
+        let mut receipt = json(&spawned);
+        let run = receipt["run"]["id"].as_str().unwrap().to_owned();
+        let mut settled = receipt.clone();
+        let mut timed_out = !spawned.status.success();
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        while timed_out {
+            assert!(Instant::now() < hang_guard, "run never settled: {settled}");
+            let waited = self.output(&["agent", "wait", &run, "--timeout", "10"]);
+            settled = json(&waited)["results"][0].clone();
+            timed_out = !waited.status.success();
+        }
+        receipt["settled"] = settled;
+        receipt
+    }
+
     fn cli(&self, arguments: &[&str]) -> Value {
         let output = self.output(arguments);
         assert!(output.status.success(), "{arguments:?}: {output:?}");
@@ -205,6 +265,9 @@ impl Drop for Fixture {
 
 #[test]
 fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::with_provider(include_str!("fixtures/automation-claude.sh"));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
@@ -213,7 +276,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
     let mut first = None;
     for index in 0..100 {
         let name = format!("capacity-{index}");
-        let accepted = fixture.cli(&[
+        let (spawned, repeated) = fixture.answered_spawn(&[
             "agent",
             "spawn",
             "--provider",
@@ -234,8 +297,15 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
             "--timeout",
             "10",
         ]);
-        assert_eq!(accepted["created"], true, "conversation {index}");
-        assert_eq!(accepted["timed_out"], false);
+        let receipt = fixture.settled_spawn(spawned);
+        assert!(receipt["retried"].is_boolean(), "{receipt}");
+        // A repeat, or the CLI's own retry after a lost answer, finds the
+        // acceptance its unanswered attempt committed.
+        assert!(
+            receipt["created"] == true || receipt["retried"] == true || repeated,
+            "conversation {index}: {receipt}"
+        );
+        let accepted = &receipt["settled"];
         assert_eq!(accepted["agent"]["origin"], "User");
         assert_eq!(accepted["agent"]["closed"], false);
         assert!(accepted["agent"]["session"]["Chat"].is_object());
@@ -245,7 +315,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
         let run = accepted["run"]["id"].as_str().unwrap().to_owned();
         assert!(completed.insert(agent, run).is_none());
         if index == 0 {
-            first = Some(accepted);
+            first = Some(accepted.clone());
         }
     }
     assert_eq!(completed.len(), 100);
@@ -297,6 +367,9 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
 
 #[test]
 fn terminal_console_answers_requests_and_submits_durable_followups() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -322,8 +395,8 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
-    // PTY snapshots can split the heading from its following instructions.
-    // Wait for the actionable line before asserting the complete request.
+    // Wait for the actionable line that ends the console's request block, then
+    // assert the choices it refers to.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
@@ -333,11 +406,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "--timeout",
         "10",
     ]);
+    let screen = displayed["snapshot"]["text"].as_str().unwrap();
     assert!(
-        displayed["snapshot"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Input requested")
+        screen.contains("Actions: allow (Allow once); deny (Deny)"),
+        "actions in {displayed}"
     );
     fixture.cli(&[
         "terminal",
@@ -350,7 +422,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "wait",
         terminal,
         "--text",
-        "Succeeded",
+        "Finished (7 input, 3 output tokens)",
         "--timeout",
         "10",
     ]);
@@ -402,6 +474,70 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     assert_eq!(closed["agent"]["closed"], true);
 }
 
+/// The shipped daemon and console over a provider that streams its answer and
+/// runs tools with large outputs: the pane shows what the agent said and one
+/// line per step, each once, and none of what those steps carried.
+#[test]
+fn terminal_console_prints_each_line_once_without_tool_payloads() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    let fixture = Fixture::with_provider(include_str!("fixtures/console-transcript-claude.sh"));
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--directory",
+        project,
+        "--surface",
+        "terminal",
+        "--prompt",
+        "first",
+        "--idempotency-key",
+        "console-transcript",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    let finished = fixture.wait(&["agent", "wait", run, "--timeout", "30"], 0);
+    assert_eq!(finished["run"]["state"], "Succeeded", "{finished}");
+    let terminal = finished["agent"]["console"]["id"].as_str().unwrap();
+    let displayed = fixture.cli(&[
+        "terminal",
+        "wait",
+        terminal,
+        "--text",
+        "Finished",
+        "--timeout",
+        "10",
+    ]);
+    let text = displayed["snapshot"]["text"].as_str().unwrap();
+    for once in [
+        "Assistant: Looking at the failing test.",
+        "Ran cargo test --locked (failed)",
+        "Called Agent",
+        "Assistant: The second paragraph follows.",
+    ] {
+        assert_eq!(text.matches(once).count(), 1, "{once}: {text}");
+    }
+    for hidden in [
+        "PAYLOAD_OUTPUT",
+        "PAYLOAD_INPUT",
+        "Current transcript",
+        "\"input_tokens\"",
+        run,
+        agent,
+    ] {
+        assert!(!text.contains(hidden), "{hidden}: {text}");
+    }
+    fixture.cli(&["agent", "close", agent]);
+}
+
 #[test]
 fn repeated_private_cli_capture_does_not_renew_original_deadline() {
     let root = tempfile::tempdir().unwrap();
@@ -429,6 +565,9 @@ fn repeated_private_cli_capture_does_not_renew_original_deadline() {
 
 #[test]
 fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -491,6 +630,9 @@ fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
 
 #[test]
 fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let worktree = fixture.root.path().join("linked");
@@ -564,6 +706,9 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
 
 #[test]
 fn an_owner_drives_its_agent_by_short_handles() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -622,6 +767,9 @@ fn an_owner_drives_its_agent_by_short_handles() {
 
 #[test]
 fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::with_provider(include_str!("fixtures/wait-outcomes-claude.sh"));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
@@ -708,6 +856,9 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
 
 #[test]
 fn active_native_chat_moves_without_restarting_and_accepts_followups() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     use cagents::{
         control::{ControlClient, ControlError},
         model::{CardId, CardKind, ChannelId},

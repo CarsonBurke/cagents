@@ -1,4 +1,4 @@
-//! Resident actors and in-flight starts share one bounded admission budget.
+//! Resident actors, in-flight starts and retained startup custody share one budget.
 use super::*;
 
 pub(in crate::host) fn usage(state: &HostState) -> usize {
@@ -7,6 +7,20 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .chat_spawning
             .keys()
             .filter(|id| !state.chats.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .count()
+}
+
+fn pending(state: &HostState) -> usize {
+    state.chat_spawning.len()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chat_spawning.contains_key(id))
             .count()
 }
 
@@ -18,7 +32,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
             format!(
                 "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
                 state.chats.len(),
-                state.chat_spawning.len(),
+                pending(state),
                 state.native_chat_capacity,
                 used,
             ),
@@ -190,6 +204,7 @@ impl Drop for Reservation {
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
+            crate::daemon::wake();
         }
     }
 }
@@ -374,8 +389,14 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        // The reader publishes its read-only reason and its exit as separate
+        // events of one frame, and a snapshot can fall between them. Release
+        // inspection requires both, so wait for the last.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.snapshot(None).unwrap().read_only_reason.is_none() {
+        while !handle
+            .snapshot(None)
+            .is_some_and(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
+        {
             assert!(
                 Instant::now() < deadline,
                 "history initialization did not complete"
@@ -507,14 +528,28 @@ mod tests {
     #[test]
     fn recovery_reservation_counts_existing_resident_once_above_lowered_limit() {
         let host = host();
-        let (_directory, source, _) = closed_history(&host);
+        let (directory, source, _) = closed_history(&host);
         let mut admission = Reservation::new(&host, &source).unwrap();
         assert!(admission.is_some());
         {
             let mut state = host.lock().unwrap();
             state.native_chat_capacity = 1;
             Reservation::install(&mut admission, &host, &mut state, &source).unwrap();
+            // Even an unclaimed context is custody until its exact owner
+            // reconciles it; a cached NoProvider outcome is not a release.
+            let context =
+                Arc::new(chat::protocol::ExecutionContext::capture(directory.path()).unwrap());
+            state.native_actor_startups.insert(
+                source.id,
+                retained_actor::Startup {
+                    source: source.clone(),
+                    requested: source.clone(),
+                    context,
+                    failed_close: None,
+                },
+            );
             assert_eq!(usage(&state), 1);
+            assert_eq!(status_from_state(&state).spawning, 1);
             assert!(require_available(&state).is_err());
         }
         drop(admission);
@@ -733,10 +768,20 @@ mod tests {
         let (directory, mut source, _) = closed_history(host);
         std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
         let program = directory.path().join("completed-provider");
-        // A real pipe transport consumes initialization and exits normally.
+        // A real pipe transport acknowledges initialization and exits normally.
         // Its transcript comes from the real Claude history adapter, not a
         // hand-built Store or a history reader relabeled as a writer.
-        std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+read -r initialization
+id=${initialization#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+exit 0
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         source.launch.recipe.program = program.to_string_lossy().into_owned();
         // Enter through the real daemon start path: ordinary UI writers also
@@ -1048,13 +1093,8 @@ mod tests {
         let (_directory, source, handle) = history_reader(&host, false);
         let proof = inspect(&host, source.id).unwrap().proof;
         let verified_registry = host.lock().unwrap().execution_registry.take().unwrap();
-        let blocked = inspect(&host, source.id).unwrap();
-        assert!(
-            blocked
-                .release_blocked
-                .unwrap()
-                .contains("registry is unavailable")
-        );
+        let blocked = inspect(&host, source.id).unwrap().release_blocked.unwrap();
+        assert!(blocked.contains("registry is unavailable"), "{blocked}");
         assert!(release(&host, &proof, false).is_err());
         assert!(
             !handle.is_completed(),
@@ -1155,7 +1195,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = client.snapshot();
-            if (!read_only || snapshot.read_only_reason.is_some())
+            // A reader's single initial frame applies its history, read-only
+            // reason and exit one event at a time, so a view can attach between
+            // them. Release requires the settled reader, so wait for its exit.
+            if (!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
                 && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
             {
                 return;
@@ -1586,7 +1629,7 @@ pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCap
 pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
     crate::terminal_ipc::ChatCapacity {
         resident: state.chats.len() as u32,
-        spawning: state.chat_spawning.len() as u32,
+        spawning: pending(state) as u32,
         limit: state.native_chat_capacity as u32,
         used: usage(&state) as u32,
         residents: state

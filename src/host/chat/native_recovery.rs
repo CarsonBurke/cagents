@@ -5,6 +5,8 @@ use crate::daemon::holder_registry::{self as registry, Kind};
 
 #[cfg(test)]
 mod paired_projection_tests;
+#[cfg(test)]
+mod settled_retry_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -184,12 +186,47 @@ pub(super) fn restore_with_admission(
     host: &SharedHost,
     client: ClientId,
     source: &Session,
-    mut admission: Option<capacity::Reservation>,
+    admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, String> {
+    restore_with_policy(host, client, source, admission, false)
+}
+
+/// A Ready checkpoint proves the exact prior daemon issued this retained
+/// source. An older unavailable-history floor must not prevent authenticating
+/// its still-owned provider. This retained-owner path never replays a recipe.
+pub(in crate::host) fn restore_ready_checkpoint(
+    host: &SharedHost,
+    source: &Session,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
+) -> Result<ServerResponse, String> {
+    checkpoint.require_ready()?;
+    if !source.native_continuity.retains_provider()
+        || source.proof.as_ref() != Some(&checkpoint.proof)
+        || !checkpoint.chats.iter().any(|chat| &chat.source == source)
+    {
+        return Err("The Ready checkpoint does not identify this exact retained source".into());
+    }
+    restore_with_policy(host, 0, source, None, true)
+}
+
+fn restore_with_policy(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+    previously_adopted: bool,
+) -> Result<ServerResponse, String> {
+    if crate::upgrade::floor::load()?.blocks_id(source.id) && !previously_adopted {
+        return Err(
+            "This conversation was stopped for the update; its earlier provider is not attached"
+                .into(),
+        );
+    }
     // Main's durable holder format has no immutable account-home proof.
     super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, source).map_err(|error| error.message)?;
         if state.shutting_down
             || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
@@ -216,7 +253,19 @@ pub(super) fn restore_with_admission(
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        if !state.chats.contains_key(&source.id) && admission.is_none() {
+        // A prepublication failure still owns a slot. Only its complete issued
+        // source may reuse that slot, even when the daemon has spare capacity.
+        // This is admission bookkeeping; restore_reserved still authenticates
+        // the retained holder before it can publish an actor.
+        let retained_startup = if let Some(pending) = state.native_actor_startups.get(&source.id) {
+            if &pending.source != source {
+                return Err("The retained startup belongs to another exact descriptor".into());
+            }
+            true
+        } else {
+            false
+        };
+        if !state.chats.contains_key(&source.id) && admission.is_none() && !retained_startup {
             capacity::require_available(&state).map_err(|error| error.message)?;
         }
         capacity::Reservation::install(&mut admission, host, &mut state, source)
@@ -329,21 +378,7 @@ fn restore_authenticated(
         store,
         recovery,
         holder,
-        move |update| {
-            if let Update::Execution { run, update } = update {
-                if let Some(host) = weak.upgrade() {
-                    super::super::agent_execution::observed(
-                        &host,
-                        id,
-                        execution_instance,
-                        run,
-                        update,
-                    );
-                }
-            } else {
-                changed(&weak, id, update);
-            }
-        },
+        move |update| changed_owned(&weak, id, execution_instance, update),
     )?;
     // Installation is still reversible: close drops only this new connection
     // until the exact server confirms the retained thread and the host owns it.
@@ -426,21 +461,27 @@ fn restore_authenticated(
             .cloned()
             .map(crate::agent_execution::HostedSession::Chat),
     );
-    if let Err(error) = execution_registry
+    let adopted = execution_registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .adopt_authenticated_agent_session(
             &retained,
             &crate::agent_execution::HostedSession::Chat(session.clone()),
-        )
-    {
-        let _ = handle.close();
-        return Err(error);
-    }
+        );
+    let adopted = match adopted {
+        Ok(adopted) => adopted,
+        Err(error) => {
+            let _ = handle.close();
+            return Err(error);
+        }
+    };
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged =
         pair_projection_is_current(&state, session.terminal.as_ref(), paired.as_ref());
-    if state.shutting_down || !pair_unchanged {
+    if state.shutting_down
+        || !pair_unchanged
+        || require_unreserved_terminals(&state, &session).is_err()
+    {
         drop(state);
         let _ = handle.close();
         return Err(
@@ -482,6 +523,7 @@ fn restore_authenticated(
     });
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
+        || require_unreserved_terminals(&state, &record.session).is_err()
         || state.proof() != proof
         || state
             .chats
@@ -509,6 +551,12 @@ fn restore_authenticated(
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
+    // The agent's record, and possibly its pane, now name the successor, which
+    // is installed; watching windows learn it from the edge. A refusal above
+    // leaves the change for the next announcement.
+    if adopted {
+        super::super::agent_execution::announce(host, &execution_registry);
+    }
     Ok(response)
 }
 
@@ -519,6 +567,17 @@ pub(super) fn retained_upgrade_sources(
     sources
         .into_iter()
         .filter(|source| source != successor)
+        .filter(|source| {
+            // Adopt rotates the native proof before the independently recovered
+            // terminal projection is acknowledged. Holders retain that internal
+            // state for exact cleanup, but no pane was issued the mismatched
+            // pair. Keep it out of checkpoints, including older helper journals.
+            let paired_proof = source
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.continuity.live_proof());
+            paired_proof.is_none_or(|proof| source.proof.as_ref() == Some(&proof))
+        })
         .map(|source| crate::upgrade::handoff::ChatSource {
             // The holder authenticated these immutable aliases, including the
             // first descriptor issued before the provider named its thread.
@@ -537,14 +596,29 @@ pub(in crate::host) fn restore_orphaned_native(
     host: &SharedHost,
     refused: &[TerminalId],
 ) -> Result<(), String> {
+    restore_orphaned_native_preserving(host, refused, &Default::default())
+}
+
+/// Retry historically adopted owners through the ordinary authentication path.
+/// A failed earlier restart may have saved their history in the floor ledger;
+/// that snapshot is not evidence that an original helper has stopped forever.
+/// Originally paused IDs never enter this set, and no recipe is executed.
+pub(in crate::host) fn restore_orphaned_native_preserving(
+    host: &SharedHost,
+    refused: &[TerminalId],
+    preserved: &std::collections::BTreeSet<TerminalId>,
+) -> Result<(), String> {
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
     let directory = registry::directory(Kind::Native)?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in registry::recovery_candidates(&directory, &proof.boot_id, Kind::Native)? {
-        if refused.contains(&record.terminal) {
+        if (stopped.blocks_id(record.terminal) && !preserved.contains(&record.terminal))
+            || refused.contains(&record.terminal)
+        {
             continue;
         }
         if host
@@ -556,11 +630,33 @@ pub(in crate::host) fn restore_orphaned_native(
             continue;
         }
         let result = if Handle::is_remote_record(&record) {
-            Handle::inspect_remote(&record, proof.clone())
-                .and_then(|inspection| restore(host, 0, &inspection.source))
+            match super::retained_actor::finish_interrupted_exit(host, &record) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(session = %record.terminal, %error, "an interrupted exit could not be finished; holder evidence preserved");
+                    continue;
+                }
+            }
+            Handle::inspect_remote(&record, proof.clone()).and_then(|inspection| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &inspection.source,
+                    None,
+                    preserved.contains(&inspection.source.id),
+                )
+            })
         } else {
-            chat::native_holder::inspect(&record, &proof)
-                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+            chat::native_holder::inspect(&record, &proof).and_then(|(recovery, _)| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &recovery.source,
+                    None,
+                    preserved.contains(&recovery.source.id),
+                )
+            })
         };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");

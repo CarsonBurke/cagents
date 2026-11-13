@@ -1,6 +1,11 @@
 //! Upgrade-only access to an authenticated source daemon. Ordinary application
 //! clients continue to require a fully matched protocol.
+mod interrupts;
+mod turns;
 mod v77;
+
+pub(super) use interrupts::Interrupts;
+pub(super) use turns::TurnReview;
 
 use super::{UpdateError, impact, invalid};
 use crate::{
@@ -8,21 +13,45 @@ use crate::{
     model::HostSessionProof,
 };
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read},
+    fs::{self, File},
+    io,
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::net::UnixStream,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{MetadataExt, OpenOptionsExt},
-    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 pub(crate) enum Client {
     Current { client: ControlClient, peer: Peer },
-    V77(v77::Client),
-    V119(v77::Client),
+    Legacy(v77::Client),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrepareError {
+    #[error("{0}")]
+    Refused(UpdateError),
+    #[error(
+        "The source preparation was not confirmed: {0}. Its checkpoint and owners require inspection; preparation was not retried and automatic recovery was not authorized"
+    )]
+    Unconfirmed(UpdateError),
+    #[error("{0}")]
+    Invalid(UpdateError),
+}
+
+impl From<PrepareError> for UpdateError {
+    fn from(error: PrepareError) -> Self {
+        invalid(error.to_string())
+    }
+}
+
+fn prepare_reply(reply: Result<(u64, u64), ControlError>) -> Result<(u64, u64), PrepareError> {
+    reply.map_err(|error| {
+        if matches!(error, ControlError::Remote { .. }) {
+            PrepareError::Refused(invalid(error.to_string()))
+        } else {
+            PrepareError::Unconfirmed(invalid(error.to_string()))
+        }
+    })
 }
 
 pub(crate) struct Peer {
@@ -88,6 +117,13 @@ impl Peer {
         self.alive()
     }
 
+    pub(super) fn executable(&self) -> Result<PathBuf, UpdateError> {
+        self.alive()?;
+        let executable = fs::read_link(format!("/proc/{}/exe", self.pid))?;
+        self.alive()?;
+        Ok(executable)
+    }
+
     fn alive(&self) -> Result<(), UpdateError> {
         let mut poll = libc::pollfd {
             fd: self.process.as_raw_fd(),
@@ -99,62 +135,6 @@ impl Peer {
             return Err(invalid("The original upgrade source has exited or changed"));
         }
         Ok(())
-    }
-
-    fn installed_identity(&self) -> Result<(HostSessionProof, PathBuf), UpdateError> {
-        #[derive(serde::Deserialize)]
-        struct Lease {
-            pid: u32,
-            proof: HostSessionProof,
-        }
-        self.alive()?;
-        let path = self.socket.with_file_name("cagentsd.lock");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path)?;
-        let before = file.metadata()?;
-        if !before.is_file()
-            || before.uid() != crate::daemon::current_uid()
-            || before.mode() & 0o077 != 0
-            || before.nlink() != 1
-            || before.len() > 4096
-        {
-            return Err(invalid(
-                "The upgrade source lease cannot be safely inspected",
-            ));
-        }
-        let identity = |m: &fs::Metadata| {
-            (
-                m.dev(),
-                m.ino(),
-                m.len(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-            )
-        };
-        let mut bytes = Vec::new();
-        Read::by_ref(&mut file).take(4097).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != before.len()
-            || identity(&before) != identity(&file.metadata()?)
-            || identity(&before) != identity(&fs::symlink_metadata(&path)?)
-        {
-            return Err(invalid(
-                "The upgrade source lease changed during inspection",
-            ));
-        }
-        let lease: Lease = serde_json::from_slice(&bytes)?;
-        if lease.pid != self.pid {
-            return Err(invalid(
-                "The upgrade socket is not the original lease owner",
-            ));
-        }
-        self.verify(&lease.proof)?;
-        let executable = fs::read_link(format!("/proc/{}/exe", self.pid))?;
-        self.verify(&lease.proof)?;
-        Ok((lease.proof, executable))
     }
 }
 
@@ -173,7 +153,10 @@ impl Client {
                 "Cross-version application upgrades require the local source daemon",
             )));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        Self::connect_until(socket, Instant::now() + Duration::from_secs(5))
+    }
+
+    fn connect_until(socket: &Path, deadline: Instant) -> Result<Self, ControlError> {
         // The source may answer a newer Connect with an old error DTO. Read
         // only its bounded version header before choosing a decoder. Discovery
         // authorizes nothing: the selected client authenticates its own fresh
@@ -186,8 +169,8 @@ impl Client {
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, ControlError> {
-        match protocol {
-            crate::terminal_ipc::PROTOCOL_VERSION => {
+        match client_family(protocol) {
+            Some(ClientFamily::Current) => {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -196,34 +179,61 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                let client = ControlClient::from_stream_with_deadline(stream, deadline)?;
+                // The lifecycle and inspector subset is wire-proven for each source.
+                let client =
+                    ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
                 Ok(Self::Current { client, peer })
             }
-            77 => v77::Client::connect(socket, deadline)
-                .map(Self::V77)
-                .map_err(|error| ControlError::Configure(io::Error::other(error.to_string()))),
-            119 => v77::Client::connect_at_protocol(socket, deadline, 119)
-                .map(Self::V119)
-                .map_err(|error| ControlError::Configure(io::Error::other(error.to_string()))),
-            actual => Err(ControlError::UnsupportedVersion { actual }),
+            Some(ClientFamily::V68 | ClientFamily::V77) => {
+                v77::Client::connect_at_protocol(socket, deadline, protocol)
+                    .map(Self::Legacy)
+                    .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))
+            }
+            None => Err(ControlError::Configure(io::Error::other(
+                unsupported_source(protocol),
+            ))),
+        }
+    }
+
+    /// The authenticated local socket peer, for a read-only shutdown survivor
+    /// census. This is a daemon PID, never a terminal-child PID from List.
+    pub(crate) fn peer_pid(&self) -> Option<u32> {
+        match self {
+            Self::Current { peer, .. } => Some(peer.pid),
+            Self::Legacy(_) => None,
         }
     }
 
     pub(crate) fn protocol(&self) -> u16 {
         match self {
-            Self::Current { .. } => crate::terminal_ipc::PROTOCOL_VERSION,
-            Self::V77(_) => 77,
-            Self::V119(_) => 119,
+            Self::Current { client, .. } => client.protocol(),
+            Self::Legacy(client) => client.protocol(),
         }
     }
 
     pub(crate) fn proof(&self) -> &HostSessionProof {
         match self {
             Self::Current { client, .. } => client.proof(),
-            Self::V77(client) | Self::V119(client) => client.proof(),
+            Self::Legacy(client) => client.proof(),
+        }
+    }
+
+    /// The pidfd-pinned, lease-authenticated peer's executable. Installation
+    /// pointers cannot establish which binary is actually serving this roster.
+    pub(crate) fn serving_executable(&self) -> Result<PathBuf, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                let executable = peer.executable()?;
+                peer.verify(client.proof())?;
+                Ok(executable)
+            }
+            Self::Legacy(_) => Err(invalid(
+                "The legacy source cannot prove a Ready recovery inventory",
+            )),
         }
     }
 
@@ -239,7 +249,7 @@ impl Client {
                     .upgrade_impact_with_deadline(policy, deadline)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::V77(client) | Self::V119(client) => client.upgrade_impact(policy),
+            Self::Legacy(client) => client.upgrade_impact(policy),
         }
     }
 
@@ -247,22 +257,179 @@ impl Client {
         &mut self,
         impact: impact::DaemonImpact,
         relaunch_agents: bool,
-    ) -> Result<(u64, u64), UpdateError> {
+    ) -> Result<(u64, u64), PrepareError> {
         if impact.capability.proof != *self.proof() || !impact.ready() {
-            return Err(invalid(
+            return Err(PrepareError::Invalid(invalid(
                 "The source migration capability no longer matches its reviewed ownership",
-            ));
+            )));
+        }
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof()).map_err(PrepareError::Invalid)?;
+                prepare_reply(client.prepare_confirmed_upgrade(impact, relaunch_agents))
+            }
+            Self::Legacy(client) => client
+                .prepare_confirmed_upgrade(impact, relaunch_agents)
+                .map_err(PrepareError::Unconfirmed),
+        }
+    }
+}
+
+impl Client {
+    pub(crate) fn list(
+        &mut self,
+    ) -> Result<Vec<crate::terminal_ipc::TerminalDescriptor>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.list().map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot list terminals for a confirmed stop",
+            )),
+        }
+    }
+
+    pub(crate) fn shutdown_preflight(
+        &mut self,
+    ) -> Result<crate::terminal_ipc::ShutdownCapability, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .shutdown_preflight()
+                    .map(|preflight| preflight.capability)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot confirm a terminal service stop",
+            )),
+        }
+    }
+
+    pub(crate) fn confirm_shutdown(
+        &mut self,
+        capability: crate::terminal_ipc::ShutdownCapability,
+    ) -> Result<crate::terminal_ipc::ShutdownOutcome, UpdateError> {
+        if &capability.proof != self.proof() {
+            return Err(invalid("The source changed before its confirmed stop"));
         }
         match self {
             Self::Current { client, peer } => {
                 peer.verify(client.proof())?;
                 client
-                    .prepare_confirmed_upgrade(impact, relaunch_agents)
+                    .confirm_shutdown(capability)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::V77(client) | Self::V119(client) => {
-                client.prepare_confirmed_upgrade(impact, relaunch_agents)
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot confirm a terminal service stop",
+            )),
+        }
+    }
+
+    /// The conversations the source lists, as it issued them.
+    pub(crate) fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .list_chats()
+                    .map_err(|error| invalid(error.to_string()))
             }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot end conversations for the update",
+            )),
+        }
+    }
+
+    /// A daemon-bound monotonic fence for the split terminal/chat inventory
+    /// RPCs. Preflight only issues an ephemeral capability; it never stops,
+    /// adopts or replays a session. No capability is confirmed by this reader.
+    pub(crate) fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                let preflight = client
+                    .shutdown_preflight()
+                    .map_err(|error| invalid(error.to_string()))?;
+                peer.verify(client.proof())?;
+                if preflight.capability.proof != *client.proof() {
+                    return Err(invalid("The inventory fence belongs to another daemon"));
+                }
+                Ok(preflight.capability.inventory_generation)
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot fence a read-only terminal census. Keep it running and use a compatible intermediate build before retrying.",
+            )),
+        }
+    }
+
+    /// Every admitted Current source has the exact recorded StartupState
+    /// request, response and nested phase DTO in LIFECYCLE_VARIANTS. Legacy
+    /// families remain refused here instead of guessing their readiness.
+    pub(crate) fn startup_state(
+        &mut self,
+    ) -> Result<crate::terminal_ipc::StartupState, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.startup_state().map_err(|e| invalid(e.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot prove startup readiness. Keep it running and use a compatible intermediate build before retrying.",
+            )),
+        }
+    }
+    pub(crate) fn list_terminals(
+        &mut self,
+    ) -> Result<Vec<crate::terminal_ipc::TerminalDescriptor>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.list().map_err(|e| invalid(e.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot provide a verified terminal census. Keep it running and use a compatible intermediate build before retrying.",
+            )),
+        }
+    }
+
+    /// Capture history once, immediately before a confirmed service stop. The
+    /// returned snapshot is not evidence that shutdown was accepted.
+    pub(crate) fn capture_chat_snapshot(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .capture_chat_snapshot(session)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "The source cannot capture this conversation's history",
+            )),
+        }
+    }
+
+    /// Ends one listed conversation through the source's own authenticated
+    /// close: attached, as any client the source did not open must be, and
+    /// answered only once the source confirms its provider's teardown.
+    pub(crate) fn close_chat(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .close_chat_with_snapshot(session)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot end conversations for the update",
+            )),
         }
     }
 }
@@ -270,7 +437,6 @@ impl Client {
 pub(super) struct InstalledIdentity {
     pub protocol: u16,
     pub proof: Option<HostSessionProof>,
-    unqualified_executable: Option<PathBuf>,
     peer: Option<Peer>,
     deadline: Instant,
 }
@@ -298,10 +464,6 @@ impl InstalledIdentity {
         }
     }
 
-    pub(super) fn requires_matched_owner_worker(&self) -> bool {
-        self.unqualified_executable.is_some()
-    }
-
     pub(super) fn verify_owner(&self, executable: Option<&Path>) -> Result<(), UpdateError> {
         if Instant::now() >= self.deadline {
             return Err(invalid("The installed source inspection timed out"));
@@ -310,12 +472,7 @@ impl InstalledIdentity {
             (Some(peer), Some(proof), Some(expected)) => {
                 peer.verify(proof)?;
                 let current = fs::read_link(format!("/proc/{}/exe", peer.pid))?;
-                if current != expected
-                    || self
-                        .unqualified_executable
-                        .as_ref()
-                        .is_some_and(|observed| observed != expected)
-                {
+                if current != expected {
                     return Err(invalid(
                         "The installed source owner changed before worker selection",
                     ));
@@ -336,8 +493,145 @@ impl InstalledIdentity {
     }
 }
 
-/// Installed entry routing, not permission to decode or mutate an unknown
-/// source. Only its exact authenticated old executable may own that workflow.
+/// Frozen lifecycle and inspector contract, using the wire variant names.
+/// Named variants define each qualified operation; unselected commands grant
+/// no source authority. Remaining reachable payloads, including errors and
+/// historical unsolicited chat traffic, must match in full.
+/// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
+/// include status reads. StartupState and every nested phase are frozen for
+/// readiness checks on all admitted Current sources. Current-only ChatLimit
+/// and ChatAgentAddresses cannot arrive from historical sources; the full current-wire recording test
+/// covers that message.
+/// Keep this beside source admission so adding support always runs the proof.
+#[cfg(test)]
+pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
+    (
+        "ClientRequest",
+        &[
+            "Connect",
+            "List",
+            "ChatList",
+            "ChatCommand",
+            "Agent",
+            "ChatStart",
+            "ChatAttach",
+            "ChatVisibility",
+            "ChatRead",
+            "ChatClose",
+            "ChatDetach",
+            "ResolveUpgradeChat",
+            "Shutdown",
+            "ShutdownV1",
+            "PrepareUpgrade",
+            "UpgradeImpact",
+            "PrepareConfirmedUpgrade",
+            "BuildInfo",
+            "StartupState",
+        ],
+    ),
+    (
+        "ServerResponse",
+        &[
+            "connected",
+            "listed",
+            "chat_listed",
+            "chat_attached",
+            "chat_snapshot",
+            "chat_update",
+            "chat_closed",
+            "detached",
+            "accepted",
+            "upgrade_chat_resolved",
+            "shutdown_accepted",
+            "shutdown_preflight",
+            "shutdown_outcome",
+            "upgrade_impact",
+            "upgrade_prepared",
+            "build_info",
+            "startup_state",
+            "agent",
+        ],
+    ),
+    ("cagents::chat::Command", &["Interrupt", "StopSubagent"]),
+    (
+        "cagents::agent_execution::Operation",
+        &["Directory", "Control"],
+    ),
+    ("cagents::agent_execution::Control", &["Interrupt"]),
+    (
+        "cagents::agent_execution::Reply",
+        &["Directory", "Requests"],
+    ),
+    (
+        "ServerMessage",
+        &[
+            "response",
+            "error",
+            "host_shutting_down",
+            "chat_changed",
+            "chat_observed",
+            "chat_activity",
+            "chat_account_usage",
+        ],
+    ),
+];
+
+/// One source qualification for lifecycle control and migration inspection.
+/// The bespoke families share the frozen lifecycle subset but need separate
+/// inventory decoders. Their byte proofs live beside those clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientFamily {
+    Current,
+    V77,
+    V68,
+}
+
+/// Live updates are qualified only for the frozen desktop baseline and the
+/// current matched release. Historical DTO recordings do not grant admission:
+/// every source also needs the complete readiness, census and recovery flow.
+const SOURCE_CLIENTS: &[(u16, ClientFamily)] = &[
+    (156, ClientFamily::Current),
+    (crate::terminal_ipc::PROTOCOL_VERSION, ClientFamily::Current),
+];
+
+pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
+    SOURCE_CLIENTS
+        .iter()
+        .find_map(|&(version, family)| (version == protocol).then_some(family))
+}
+
+#[cfg(test)]
+pub(crate) fn protocols() -> impl Iterator<Item = u16> {
+    SOURCE_CLIENTS.iter().map(|&(protocol, _)| protocol)
+}
+
+#[cfg(test)]
+pub(crate) fn current_client_protocols() -> impl Iterator<Item = u16> {
+    protocols().filter(|&protocol| current_client_supports(protocol))
+}
+
+pub(crate) fn current_client_supports(protocol: u16) -> bool {
+    client_family(protocol) == Some(ClientFamily::Current)
+}
+
+pub(crate) fn is_qualified_source(protocol: u16) -> bool {
+    client_family(protocol).is_some()
+}
+
+pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
+    let release = if protocol > crate::terminal_ipc::PROTOCOL_VERSION {
+        " Choose a newer release for the cold install."
+    } else {
+        ""
+    };
+    invalid(format!(
+        "The running cagents service uses protocol {protocol}; live updates support only protocol 156 (desktop 0.1.3+local.991daa43e) and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.",
+        crate::terminal_ipc::PROTOCOL_VERSION,
+    ))
+}
+
+/// Authenticate an admitted source and retain its original peer through the
+/// installed executable recheck. Discovery alone grants no update authority.
 pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid(
@@ -348,26 +642,15 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
     let deadline = Instant::now() + Duration::from_secs(5);
     match v77::discover_installed_protocol(&socket, deadline) {
         Ok((protocol, peer)) => {
-            if matches!(protocol, 77 | 119 | crate::terminal_ipc::PROTOCOL_VERSION) {
-                let client = Client::connect_selected(&socket, deadline, protocol)
-                    .map_err(|error| invalid(error.to_string()))?;
-                peer.verify(client.proof())?;
-                return Ok(InstalledIdentity {
-                    protocol,
-                    proof: Some(client.proof().clone()),
-                    unqualified_executable: None,
-                    peer: Some(peer),
-                    deadline,
-                });
+            if !is_qualified_source(protocol) {
+                return Err(unsupported_source(protocol));
             }
-            let (proof, executable) = peer.installed_identity()?;
-            if Instant::now() >= deadline {
-                return Err(invalid("The installed source inspection timed out"));
-            }
+            let client = Client::connect_selected(&socket, deadline, protocol)
+                .map_err(|error| invalid(error.to_string()))?;
+            peer.verify(client.proof())?;
             Ok(InstalledIdentity {
                 protocol,
-                proof: Some(proof),
-                unqualified_executable: Some(executable),
+                proof: Some(client.proof().clone()),
                 peer: Some(peer),
                 deadline,
             })
@@ -382,7 +665,6 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
             Ok(InstalledIdentity {
                 protocol: crate::terminal_ipc::PROTOCOL_VERSION,
                 proof: None,
-                unqualified_executable: None,
                 peer: None,
                 deadline,
             })
@@ -428,4 +710,143 @@ fn absent_source(expected: Option<&HostSessionProof>) -> Result<(), UpdateError>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prepare_receipt_tests {
+    use super::*;
+    use crate::{
+        model::{BootId, HostIncarnation, HostSessionId},
+        terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability, read_frame,
+            write_frame,
+        },
+    };
+
+    #[test]
+    fn only_an_explicit_prepare_refusal_allows_destructive_fallback() {
+        for outcome in [
+            "accepted",
+            "refused",
+            "accepted-with-lost-ack",
+            "foreign-ack",
+        ] {
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("prepare-source"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("daemon"),
+            };
+            let daemon = impact::DaemonImpact {
+                capability: ShutdownCapability {
+                    proof: proof.clone(),
+                    token: "confirmed-prepare".into(),
+                    inventory_generation: 1,
+                    live_terminals: 0,
+                    background_subagents: 0,
+                    background_identity: String::new(),
+                    expires_at_unix_ms: i64::MAX,
+                },
+                policy: impact::Policy::WhenIdle,
+                sessions: Vec::new(),
+                blockers: Vec::new(),
+            };
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let server = std::thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(connect.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let prepare: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    prepare.request,
+                    ClientRequest::PrepareConfirmedUpgrade {
+                        relaunch_agents: false,
+                        ..
+                    }
+                ));
+                if outcome == "accepted-with-lost-ack" {
+                    // The old daemon accepted preparation and could have
+                    // written Prepared, but its acknowledgement never arrives.
+                    return;
+                }
+                let message = if outcome == "refused" {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Cannot checkpoint this conversation",
+                        false,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::UpgradePrepared {
+                            terminals: 0,
+                            chats: 0,
+                        },
+                    }
+                };
+                let mut response = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(prepare.request_id),
+                    proof,
+                    message,
+                };
+                if outcome == "foreign-ack" {
+                    response.proof.host_incarnation = HostIncarnation::new("another-daemon");
+                }
+                write_frame(&mut peer, &response).unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            let reply = prepare_reply(client.prepare_confirmed_upgrade(daemon, false));
+            match outcome {
+                "accepted" => assert_eq!(reply.unwrap(), (0, 0)),
+                "refused" => assert!(matches!(reply, Err(PrepareError::Refused(_)))),
+                _ => assert!(matches!(reply, Err(PrepareError::Unconfirmed(_)))),
+            }
+            server.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_message_tests {
+    use super::*;
+
+    #[test]
+    fn live_sources_are_only_the_frozen_desktop_and_current_release() {
+        assert_eq!(
+            protocols().collect::<Vec<_>>(),
+            [156, crate::terminal_ipc::PROTOCOL_VERSION]
+        );
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165] {
+            assert!(!is_qualified_source(protocol), "protocol {protocol}");
+            let message = unsupported_source(protocol).to_string();
+            assert!(message.contains(&format!("uses protocol {protocol}")));
+            assert!(message.contains("live updates support only protocol 156"));
+            assert!(message.contains("did not request preparation or shutdown"));
+            assert!(message.contains("--no-start daemon stop --require-empty"));
+            assert!(message.contains("sh /path/to/install.sh"));
+            assert!(!message.contains("Update it to a build serving protocol 156"));
+        }
+    }
+
+    #[test]
+    fn newer_service_names_a_newer_cold_install_without_stopping_it() {
+        let message = unsupported_source(crate::terminal_ipc::PROTOCOL_VERSION + 1).to_string();
+        assert!(message.contains("Choose a newer release for the cold install"));
+        assert!(message.contains("did not request preparation or shutdown"));
+    }
 }

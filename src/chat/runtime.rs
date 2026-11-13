@@ -1,10 +1,11 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
-    Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
+    AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
+use crate::daemon::owned_children::DetachedWork;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
@@ -20,6 +21,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_diagnostics;
 mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
@@ -28,10 +30,16 @@ mod handle;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
+/// Process evidence only, without the reader lease: no retirement authority.
+pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
+pub(crate) use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
 mod retained_actor;
+/// Synthetic retained-actor receipts for the daemon's collection tests.
+#[cfg(test)]
+pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
 mod websocket;
 pub(crate) use store::Store;
@@ -40,6 +48,9 @@ const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long provider frames can keep extending an unfinished initialization.
+/// Hooks, MCP servers and a large resume can legitimately outlast `IO_TIMEOUT`.
+const STARTUP_LIMIT: Duration = Duration::from_secs(300);
 // Pipe EOF may precede the kernel's child-exit publication. Do not turn that
 // short interval into an uncertain provider owner, or wait for a live writer.
 const PROTOCOL_EXIT_GRACE: Duration = Duration::from_millis(100);
@@ -107,15 +118,18 @@ impl Drop for InputEffects {
     }
 }
 
-type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
+type CommandRequest = (
+    ActorCommand,
+    crossbeam_channel::Sender<Result<(), Rejection>>,
+);
 
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rejection {
-    /// The actor never took the command, or refused it.
+    /// The actor never took the command, or refused it before effects were possible.
     Refused(String),
-    /// The actor took the command but did not answer in time; the provider
-    /// may still receive it.
+    /// The actor did not answer in time, or failed after effects became possible;
+    /// the provider may still receive it. Never replay automatically.
     Unacknowledged(String),
 }
 
@@ -169,6 +183,10 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// The provider said how it addresses another of the conversation's
+    /// subagents. Every address known so far, which only accumulate; the
+    /// snapshot, whose layout older peers share, holds none.
+    AgentAddresses(Vec<AgentAddress>),
 }
 
 #[derive(Clone)]
@@ -195,11 +213,42 @@ pub(crate) enum TitleUnavailable {
     Poisoned,
 }
 
+/// How the provider addresses a conversation's subagents, shared between its
+/// actor, which learns them, and its handle, which reports them.
+#[derive(Clone, Default)]
+struct AgentAddresses(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl AgentAddresses {
+    /// Records an address, and says whether it was news. An address keeps
+    /// the agent it first named.
+    fn learn(&self, address: AgentAddress) -> bool {
+        let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if known.contains_key(&address.address) {
+            return false;
+        }
+        known.insert(address.address, address.subagent);
+        true
+    }
+
+    fn list(&self) -> Vec<AgentAddress> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(address, subagent)| AgentAddress {
+                address: address.clone(),
+                subagent: subagent.clone(),
+            })
+            .collect()
+    }
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -214,6 +263,9 @@ struct Inner {
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
     retain_cleanup_receipt: Arc<AtomicBool>,
+    /// What closing does with the work the provider already detached, once
+    /// its owner decides. See [`DetachedDecision`].
+    detached_work: Arc<DetachedDecision>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -229,6 +281,24 @@ enum NativeOwnership {
         crate::daemon::holder_registry::Process,
     ),
 }
+/// Why the provider actor did not queue a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueRefusal {
+    /// The actor has finished or is shutting down.
+    Closed,
+    /// Its command queue is full for now.
+    Full,
+}
+impl From<QueueRefusal> for String {
+    fn from(refusal: QueueRefusal) -> Self {
+        match refusal {
+            QueueRefusal::Closed => "Provider actor is no longer accepting commands",
+            QueueRefusal::Full => "Chat command queue is full",
+        }
+        .into()
+    }
+}
+
 impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn start(
@@ -314,7 +384,7 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         Self::start_with_scope(
-            spec, adapter, initial, store, session_id, ownership, None, notify,
+            spec, adapter, initial, store, session_id, ownership, None, None, notify,
         )
     }
 
@@ -326,6 +396,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         notify: impl Fn(Update) + Send + Sync + 'static,
+        resident_changed: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
         if source.launch.provider != crate::agent::Provider::Claude {
             return Err("Retained stream actors require Claude".into());
@@ -343,6 +414,7 @@ impl LocalHandle {
             source.launch.session_id,
             None,
             Some(scope),
+            Some(Arc::new(resident_changed)),
             notify,
         )
     }
@@ -355,6 +427,7 @@ impl LocalHandle {
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
+        resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -377,6 +450,21 @@ impl LocalHandle {
             let directory = socket
                 .parent()
                 .ok_or("Provider socket needs a parent directory")?;
+            // The allocation root under the daemon's runtime directory exists
+            // only once a listener has been allocated there. Only the
+            // conversation's own directory below it must be new or private.
+            if let Some(root) = directory.parent() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(root)
+                    .map_err(|error| {
+                        format!(
+                            "Cannot create provider socket directory {}: {error}",
+                            root.display()
+                        )
+                    })?;
+            }
             let created = std::fs::DirBuilder::new().mode(0o700).create(directory);
             if let Err(error) = created {
                 use std::os::unix::fs::MetadataExt;
@@ -415,6 +503,8 @@ impl LocalHandle {
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
+        // Optional: without it a stopped command is reported at the next wake.
+        let scope_wake = wake.try_clone().ok();
         let (commands, incoming) = crossbeam_channel::bounded(64);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
@@ -428,9 +518,11 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let agent_addresses = AgentAddresses::default();
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
+        let detached_work = Arc::new(DetachedDecision::default());
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -439,6 +531,7 @@ impl LocalHandle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            agent_addresses: agent_addresses.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -455,6 +548,7 @@ impl LocalHandle {
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
+            detached_work: detached_work.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -478,6 +572,7 @@ impl LocalHandle {
                     child: None,
                     native_holder,
                     reconnect_only_reported: false,
+                    command_stops: 0,
                     expected_native_peer,
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
@@ -485,6 +580,7 @@ impl LocalHandle {
                     adapter,
                     state,
                     confirmed_session,
+                    agent_addresses,
                     store,
                     visible,
                     observe_next,
@@ -492,6 +588,8 @@ impl LocalHandle {
                     incoming,
                     wake: reader,
                     notify,
+                    resident_changed,
+                    resident_dirty: false,
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
@@ -512,6 +610,7 @@ impl LocalHandle {
                     waiting_fingerprint: None,
                     last_present: Instant::now(),
                     first_frame: false,
+                    stdout_noise: spec.stdout_noise,
                     started: Instant::now(),
                     write_started: None,
                 };
@@ -528,7 +627,7 @@ impl LocalHandle {
                         let child = if actor.native_holder.is_some() {
                             Ok(None)
                         } else {
-                            spawn_provider(&spec, &actor.stop)
+                            spawn_provider(&spec, &actor.stop, scope_wake)
                         };
                         let child = child.and_then(|child| {
                             if let Some(child) = &child {
@@ -607,7 +706,12 @@ impl LocalHandle {
                         .ok()
                         .flatten()
                         .and_then(|s| s.code());
-                    if let Err(error) = child.terminate() {
+                    child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    let result = child.terminate();
+                    if child.force_stopped == Some(true) {
+                        detached_work.force_stopped();
+                    }
+                    if let Err(error) = result {
                         direct_closed = false;
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(format!("Provider cleanup is unconfirmed: {error}"));
@@ -619,9 +723,10 @@ impl LocalHandle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) =
-                        holder.close_inner(retain_cleanup_receipt.load(Ordering::Acquire))
-                    {
+                    } else if let Err(error) = holder.close_inner(
+                        retain_cleanup_receipt.load(Ordering::Acquire),
+                        detached_work.holder(),
+                    ) {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -631,6 +736,19 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                // Nothing reports the end of a step the provider left running.
+                // A preserved holder's provider is still running its steps.
+                if !preserve_holder {
+                    if let Err(error) = actor
+                        .store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .stop_running_steps()
+                    {
+                        tracing::warn!(%error, "steps left running could not be marked stopped");
+                    }
+                    stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
+                }
                 actor.apply(Event::Exited { code });
                 let usage = actor
                     .state
@@ -646,6 +764,13 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // Completion can leave a detached daemon with no other
+                    // event. Publish once after the ownership flag, even when
+                    // its hidden observation was already consumed. Reuse the
+                    // existing helper-compatible metadata notification.
+                    actor.observe_next.store(true, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -711,18 +836,21 @@ impl LocalHandle {
     pub(super) fn enqueue_actor(
         &self,
         command: ActorCommand,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, QueueRefusal> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
             || self.0.stop.load(Ordering::Acquire)
         {
-            return Err("Provider actor is no longer accepting commands".into());
+            return Err(QueueRefusal::Closed);
         }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => QueueRefusal::Full,
+                crossbeam_channel::TrySendError::Disconnected(_) => QueueRefusal::Closed,
+            })?;
         self.wake();
         Ok(response)
     }
@@ -825,7 +953,6 @@ impl LocalHandle {
                     "Provider command acknowledgement timed out; do not retry blindly".into(),
                 )
             })?
-            .map_err(Rejection::Refused)
     }
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()
@@ -843,6 +970,7 @@ impl LocalHandle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+            .map_err(String::from)
     }
 
     fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
@@ -942,6 +1070,7 @@ impl LocalHandle {
                 "Native ownership acknowledgement timed out; retain the previous descriptor"
                     .to_string()
             })?
+            .map_err(String::from)
     }
     pub fn set_visible(&self, visible: bool) {
         self.0.visible.store(visible, Ordering::Release);
@@ -976,11 +1105,43 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .text_copy(source, offset),
-            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
-                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
-                source,
-                offset,
-            ),
+            super::TextCopyScope::Subagent { id } => {
+                // Keep the existing store-before-state lock order. Resident
+                // authority is checked before disk IO; no database read holds
+                // the state lock, and guessed child/item IDs grant no access.
+                let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                let item = state
+                    .text_copy_sources
+                    .children
+                    .get(id)
+                    .and_then(|sources| {
+                        sources
+                            .iter()
+                            .position(|current| current.as_ref() == Some(source))
+                    })
+                    .and_then(|index| {
+                        state
+                            .subagents
+                            .iter()
+                            .find(|agent| agent.id == *id)
+                            .and_then(|agent| agent.items.get(index))
+                    })
+                    .filter(|item| child_diagnostics::marked(item))
+                    .map(|item| item.id.clone());
+                if let Some(item) = item {
+                    drop(state);
+                    let result = store.diagnostics.read(id, &item, source, offset);
+                    if result.is_err() && store.diagnostics.is_empty() {
+                        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                        store.diagnostics.publish(&mut state);
+                        state.generation = state.generation.saturating_add(1);
+                    }
+                    result
+                } else {
+                    child_text_copy::read(&state, source, offset)
+                }
+            }
         }
     }
     /// Resident provider usage only: never opens the transcript store.
@@ -1183,6 +1344,10 @@ impl LocalHandle {
             .session_id
             .clone()
     }
+    /// Whether the provider answered its initialize handshake.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
+    }
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         self.0
@@ -1202,6 +1367,16 @@ impl LocalHandle {
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
+    }
+    /// When the latest turn and its delegated work finished, in daemon Unix
+    /// milliseconds; absent while a turn runs or before the first one ends.
+    /// Like [`Self::failure`], this reads no transcript.
+    pub fn finished_at(&self) -> Option<u64> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finished_at
     }
     /// The recorded failure, without rebuilding the transcript window. Restore polls
     /// this; it must never pay for a multi-megabyte snapshot.
@@ -1253,13 +1428,21 @@ impl LocalHandle {
             .activity()
     }
 
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .turn_accepted()
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            state.is_working() || state.waiting || !state.requests.is_empty(),
-            state.ready,
-        )
+        (state.holds_work(), state.ready)
     }
     /// Whether the conversation would take a prompt now without interrupting
     /// a turn or passing over a question it put to the user.
@@ -1276,12 +1459,24 @@ impl LocalHandle {
             .requests
             .clone()
     }
+    pub(crate) fn work_hold(&self) -> super::WorkHold {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .work_hold()
+    }
+    /// How the provider addresses this conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn agent_addresses(&self) -> Vec<AgentAddress> {
+        self.0.agent_addresses.list()
+    }
     pub(crate) fn background_subagents(&self) -> Vec<String> {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status == ToolStatus::Running)
+            .filter(|agent| agent.background && agent.status.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -1358,6 +1553,18 @@ impl LocalHandle {
         self.close()
     }
 
+    /// Decides, before the close, whether it leaves running the work the
+    /// provider had already detached from itself. See [`DetachedWork`].
+    pub(crate) fn decide_detached_work(&self, detached: DetachedWork) {
+        self.0.detached_work.decide(detached);
+    }
+
+    /// Whether teardown found the provider killed by something outside
+    /// cagents. Known once the provider's teardown has run.
+    pub(crate) fn provider_was_force_stopped(&self) -> bool {
+        self.0.detached_work.was_force_stopped()
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -1391,7 +1598,10 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
+                holder.close_inner(
+                    self.0.retain_cleanup_receipt.load(Ordering::Acquire),
+                    self.0.detached_work.holder(),
+                )?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
             }
@@ -1403,11 +1613,10 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(owner) = detached.as_ref() {
-                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
-                    owner.close_retaining_receipt()?;
-                } else {
-                    owner.close()?;
-                }
+                owner.close_with(
+                    self.0.retain_cleanup_receipt.load(Ordering::Acquire),
+                    self.0.detached_work.holder(),
+                )?;
                 detached.take();
             }
         }
@@ -1545,6 +1754,10 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            // The worker's own final notification can release the last
+            // handle, for example when the host retires its record. That
+            // thread is already finishing, and joining itself panics.
+            && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
@@ -1575,7 +1788,13 @@ impl super::protocol::LaunchCleanup for LocalHandle {
     }
 }
 
-fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildGuard>, String> {
+/// `wake` is written when the provider's scope reports a command stopped for
+/// memory, so the actor can say so.
+fn spawn_provider(
+    spec: &ProcessSpec,
+    stop: &AtomicBool,
+    wake: Option<UnixStream>,
+) -> Result<Option<ChildGuard>, String> {
     if matches!(
         spec.transport,
         TransportSpec::History | TransportSpec::UnixWebSocket { .. }
@@ -1643,17 +1862,21 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
-    let child = process
-        .spawn()
+    // A retained actor sweeps its unregistered exited children; this
+    // registration keeps the provider's status for its ChildGuard.
+    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
-    let mut child = ChildGuard::new(child)
+    let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
     child.directory = Some(directory);
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
-    if let Err(error) = crate::daemon::process_scope::enroll_process(child.child.id()) {
-        tracing::warn!(%error, provider = %spec.program, "provider scope isolation unavailable; using existing launch fallback");
+    match crate::daemon::process_scope::enroll_provider(child.child.id(), wake) {
+        Ok(scope) => child.scope = scope,
+        Err(error) => {
+            tracing::warn!(%error, provider = %spec.program, "provider scope isolation unavailable; using existing launch fallback");
+        }
     }
     crate::daemon::process_scope::warn_if_shared(child.child.id(), child.child.id());
     crate::daemon::process_scope::warn_if_bootstrap_shared(child.child.id());
@@ -1662,11 +1885,58 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
 
 /// Sole reaper of the provider leader. Observations retain its zombie until
 /// every group signal is finished, so its numeric PID/PGID cannot be recycled.
+/// An owner's decision about the work its provider detached. Until it
+/// decides, each teardown keeps what it did before decisions existed: a
+/// direct provider's leaves that work running unless the provider was
+/// force-stopped, and a native holder stops it with the provider.
+#[derive(Default)]
+struct DetachedDecision(std::sync::atomic::AtomicU8, AtomicBool);
+impl DetachedDecision {
+    /// Something outside cagents killed the provider, such as the system
+    /// for memory: what it left would hold that memory, so nothing is spared.
+    fn force_stopped(&self) {
+        self.1.store(true, Ordering::Release);
+    }
+    fn was_force_stopped(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+    const STOP: u8 = 1;
+    const SPARE: u8 = 2;
+    fn decide(&self, detached: DetachedWork) {
+        self.0.store(
+            match detached {
+                DetachedWork::Stop => Self::STOP,
+                DetachedWork::Spare => Self::SPARE,
+            },
+            Ordering::Release,
+        );
+    }
+    fn get(&self) -> Option<DetachedWork> {
+        match self.0.load(Ordering::Acquire) {
+            Self::STOP => Some(DetachedWork::Stop),
+            Self::SPARE => Some(DetachedWork::Spare),
+            _ => None,
+        }
+    }
+    fn holder(&self) -> DetachedWork {
+        self.get().unwrap_or(DetachedWork::Stop)
+    }
+}
 struct ChildGuard {
     child: Child,
     identity: OwnedFd,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
+    /// The provider's cgroup scope, when the OS user manager provided one.
+    scope: Option<crate::daemon::process_scope::ProviderScope>,
+    /// Whether the provider had been force-stopped, settled by the first
+    /// teardown: a retry must not take cagents' own `SIGKILL` for one.
+    force_stopped: Option<bool>,
+    /// Whether teardown also ends the commands the provider detached, as
+    /// when its owner decided to stop them.
+    stop_detached: bool,
+    // Dropped after `Drop::drop` has run the final reap in `terminate`.
+    _registration: crate::daemon::adopted_orphans::Registration,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -1709,7 +1979,10 @@ impl ChildGuard {
     }
 
     /// Capture immediately after spawn, before any code can reap this child.
-    fn new(mut child: Child) -> std::io::Result<Self> {
+    fn new(
+        mut child: Child,
+        registration: crate::daemon::adopted_orphans::Registration,
+    ) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
         // unreaped child. Its PID remains reserved even if it has exited.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
@@ -1748,8 +2021,19 @@ impl ChildGuard {
             child,
             identity,
             terminated: false,
+            force_stopped: None,
+            stop_detached: false,
             directory: None,
+            scope: None,
+            _registration: registration,
         })
+    }
+
+    /// Test fixtures spawn through the same ownership registration.
+    #[cfg(test)]
+    fn spawn(command: &mut Process) -> Self {
+        let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(command).unwrap();
+        Self::new(child, registration).unwrap()
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -1804,7 +2088,15 @@ impl ChildGuard {
         }
         // ECHILD or another observation failure does not establish authority
         // over the old numeric group. Refuse before any signal in that case.
-        self.observed_exit_status()?;
+        let ended = self.observed_exit_status()?;
+        // Something outside cagents force-stopped the provider, such as the
+        // system for memory: a closed or finished chat is not, whether or
+        // not it ignores the signals below.
+        let force_stopped = *self.force_stopped.get_or_insert_with(|| {
+            ended.is_some_and(|status| {
+                std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
+            })
+        });
         let pid = self.child.id() as i32;
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
@@ -1830,6 +2122,17 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        // Commands in process groups of their own outlive that signal. A
+        // force-stopped provider's would hold memory the system needed, with
+        // no agent left to use them, so they end with it, as do those of an
+        // owner that decided to stop them. Otherwise they outlive the chat,
+        // as a process the agent detached asked to.
+        if (force_stopped || self.stop_detached)
+            && let Some(scope) = self.scope.as_mut()
+            && let Err(error) = scope.end()
+        {
+            tracing::warn!(%error, "commands the provider left could not be ended");
+        }
         self.child.wait()?;
         self.terminated = true;
         Ok(())
@@ -1867,6 +2170,8 @@ struct Actor {
     native_holder: Option<super::native_holder::Holder>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
+    /// Commands memory exhaustion stopped while this actor ran.
+    command_stops: usize,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
@@ -1874,6 +2179,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -1881,6 +2187,10 @@ struct Actor {
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
+    /// Retained helpers observe semantic metadata independently of visible
+    /// presentation and the once-per-unread-epoch output observation.
+    resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
+    resident_dirty: bool,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
@@ -1905,8 +2215,96 @@ struct Actor {
     waiting_fingerprint: Option<String>,
     last_present: Instant,
     first_frame: bool,
+    stdout_noise: Option<fn(&[u8]) -> bool>,
     started: Instant,
     write_started: Option<Instant>,
+}
+
+/// Each valid frame earns a fresh `IO_TIMEOUT`, up to `STARTUP_LIMIT` overall.
+fn startup_expired(started: Instant, last_progress: Instant, now: Instant) -> bool {
+    now.duration_since(last_progress) > IO_TIMEOUT || now.duration_since(started) > STARTUP_LIMIT
+}
+
+/// A provider that exited without being asked to, naming memory exhaustion
+/// when the provider's cgroup shows the system ended it for that.
+fn exit_report(child: &ChildGuard, status: std::process::ExitStatus) -> String {
+    use crate::daemon::process_scope::Killer;
+    use std::os::unix::process::ExitStatusExt;
+    let exited = format!("{}{status}", super::failure::PROVIDER_EXITED);
+    let Some(scope) = child.scope.as_ref() else {
+        return exited;
+    };
+    let killer = (status.signal() == Some(libc::SIGKILL))
+        .then(|| scope.provider_killer())
+        .flatten();
+    let out_of_memory = super::failure::PROVIDER_OUT_OF_MEMORY;
+    match killer {
+        // A shared cgroup is killed whole.
+        Some(Killer::Oomd) if scope.keeps_commands_apart() => {
+            format!("{out_of_memory} systemd-oomd ended it. {exited}")
+        }
+        Some(Killer::Oomd) => format!(
+            "{out_of_memory} systemd-oomd ended it and the commands it was running. {exited}"
+        ),
+        Some(Killer::Kernel) => {
+            format!("{out_of_memory} The kernel's out-of-memory killer ended it. {exited}")
+        }
+        None => exited,
+    }
+}
+
+/// One notice for the commands memory exhaustion stopped since the last
+/// check. `earlier` were stopped before them since the agent started: a retried
+/// command stopped again still gets a notice of its own.
+fn command_stop_report(
+    stops: &[crate::daemon::process_scope::CommandStop],
+    earlier: usize,
+) -> String {
+    use crate::daemon::process_scope::Killer;
+    let mut killers = Vec::new();
+    for stop in stops {
+        let by = match stop.killer {
+            Killer::Oomd => "systemd-oomd",
+            Killer::Kernel => "the kernel's out-of-memory killer",
+        };
+        if !killers.contains(&by) {
+            killers.push(by);
+        }
+    }
+    // It opens a sentence; systemd-oomd keeps its own lower case.
+    let by = killers.join(" and ");
+    let by = match by.strip_prefix("the ") {
+        Some(rest) => format!("The {rest}"),
+        None => by,
+    };
+    let what = match stops.len() {
+        1 => "it".to_owned(),
+        count => format!("{count} commands"),
+    };
+    let processes = match stops.iter().map(|stop| stop.processes).sum::<Option<u64>>() {
+        Some(1) => " (1 process)".to_owned(),
+        Some(count) => format!(" ({count} processes)"),
+        None => String::new(),
+    };
+    let mut report = format!(
+        "{} {by} ended {what}{processes}; the agent is still running.",
+        super::failure::COMMAND_OUT_OF_MEMORY
+    );
+    if earlier > 0 {
+        report.push_str(&format!(
+            " Commands stopped for memory since the agent started: {}.",
+            earlier + stops.len()
+        ));
+    }
+    report
+}
+
+/// Append the most recent skipped stdout line, which often names the real cause.
+fn with_ignored_output(message: &str, ignored: &Option<String>) -> String {
+    match ignored {
+        Some(preview) => format!("{message}. Last ignored output: {preview}"),
+        None => message.to_owned(),
+    }
 }
 
 struct TurnAttention {
@@ -1966,6 +2364,39 @@ impl TurnAttention {
         false
     }
 }
+/// Why an interrupt that would also stop background subagents was refused.
+fn interrupt_refusal(affected: &super::Held<'_>) -> String {
+    format!(
+        "Interrupting would also stop {}. {} Use --including-subagents to permit this, or stop {} in the app first.",
+        affected.count(),
+        affected.detail(),
+        affected.where_to_stop()
+    )
+}
+
+/// Why a close that requires an idle conversation left it open. Subagents
+/// that hold a conversation whose turn has ended leave it looking finished,
+/// so they are named along with how to let them go.
+fn idle_close_refusal(readiness: UpdateReadiness, state: &Snapshot) -> String {
+    let hold = state.work_hold();
+    match readiness {
+        UpdateReadiness::Busy if !hold.turn && !hold.subagents.is_empty() => {
+            let held = hold.subagents();
+            format!(
+                "{} Stop {} in the conversation to let it close.",
+                held.detail(),
+                held.where_to_stop()
+            )
+        }
+        UpdateReadiness::Busy => {
+            "The conversation is busy or waiting for an answer, so it was left open.".into()
+        }
+        UpdateReadiness::Unready | UpdateReadiness::Idle => {
+            "The conversation's provider still has work in flight, so it was left open. Try again in a moment.".into()
+        }
+    }
+}
+
 /// Parent admission deliberately excludes aggregate background-child activity.
 fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
@@ -1988,6 +2419,7 @@ impl Actor {
                 self.dirty = false;
                 (self.notify)(Update::Presentation);
             }
+            self.publish_resident_metadata();
             if !self.incoming.is_empty() {
                 continue;
             }
@@ -2040,10 +2472,17 @@ impl Actor {
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
+        // A provider that exits closes its stdin before its exit is observable.
+        // Keep the write error only as a fallback: the exit explains the failure.
+        let mut stdin_closed: Option<String> = None;
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
+        let mut garbage_lines = 0usize;
+        let mut garbage_total = 0u64;
+        let mut last_ignored = None;
+        let mut startup_progress = self.started;
         loop {
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
@@ -2061,12 +2500,18 @@ impl Actor {
                         Err(error) => interrupt_error = error,
                     }
                 }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
+                // A result that arrives before the interrupt's acknowledgement
+                // settles the turn, but only that acknowledgement says whether
+                // it was cancelled. Returning before it drops the outcome.
+                let settled = self.pending.is_empty()
+                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                if settled && !self.adapter.outcome_pending() {
                     return Ok(());
                 }
                 if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                    if settled {
+                        return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
+                    }
                     return Err(format!(
                         "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
                     ));
@@ -2092,16 +2537,53 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
-                    format!("Unsupported provider stdout (expected JSON-lines): {error}")
-                })?;
+                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                    Ok(frame) => {
+                        garbage_lines = 0;
+                        Some(frame)
+                    }
+                    Err(error) => {
+                        let Some(hides_frame) = self.stdout_noise else {
+                            return Err(format!(
+                                "Unsupported provider stdout (expected JSON-lines): {error}"
+                            ));
+                        };
+                        let preview =
+                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
+                        if hides_frame(&self.output[..newline]) {
+                            return Err(format!(
+                                "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
+                            ));
+                        }
+                        garbage_lines += 1;
+                        garbage_total = garbage_total.saturating_add(1);
+                        if garbage_total <= 3 || garbage_total.is_power_of_two() {
+                            tracing::warn!(
+                                consecutive = garbage_lines,
+                                ignored_total = garbage_total,
+                                "Skipping non-JSON provider stdout line"
+                            );
+                        }
+                        if garbage_lines >= 8 {
+                            return Err(format!(
+                                "The agent printed 8 lines in a row that are not part of the conversation, so it was stopped. This usually comes from a wrapper script or shell startup file. Last output: {preview}"
+                            ));
+                        }
+                        last_ignored = Some(preview);
+                        None
+                    }
+                };
                 self.output.drain(..=newline);
                 self.scanned = 0;
                 partial_started = None;
                 parsed += 1;
+                let Some(frame) = frame else {
+                    continue;
+                };
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
+                startup_progress = Instant::now();
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -2112,14 +2594,21 @@ impl Actor {
             } else {
                 let since = partial_started.get_or_insert_with(Instant::now);
                 if since.elapsed() > IO_TIMEOUT {
-                    return Err(
-                        "Provider JSON frame remained incomplete or blocked for 30 seconds".into(),
-                    );
+                    return Err(with_ignored_output(
+                        "Provider JSON frame remained incomplete or blocked for 30 seconds",
+                        &last_ignored,
+                    ));
                 }
             }
-            if stdout_eof && self.pending.is_empty() {
+            // A parsing budget can leave complete lines queued even after
+            // the pipe closes. Keep fair poll passes until those drain. Input
+            // the provider stopped reading no longer holds the actor open.
+            if stdout_eof && (self.pending.is_empty() || stdin_closed.is_some()) && !frames_ready {
                 if !self.output.is_empty() {
-                    return Err("Provider ended with an incomplete JSON line".into());
+                    return Err(with_ignored_output(
+                        "Provider ended with an incomplete JSON line",
+                        &last_ignored,
+                    ));
                 }
                 if let Some(status) = self
                     .child
@@ -2129,22 +2618,45 @@ impl Actor {
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
-                        return Ok(());
+                        if closing.is_none() && self.adapter.initialization_pending() {
+                            return Err(with_ignored_output(
+                                "Provider exited before completing initialization",
+                                &last_ignored,
+                            ));
+                        }
+                        // A clean exit still lost any input it never read.
+                        return stdin_closed.map_or(Ok(()), Err);
                     }
-                    return Err(format!("Provider exited with {status}"));
+                    let report = exit_report(
+                        self.child.as_ref().ok_or("Provider process unavailable")?,
+                        status,
+                    );
+                    return Err(with_ignored_output(&report, &last_ignored));
                 }
-                return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
+                return Err(with_ignored_output(
+                    "Provider closed its protocol stream; process terminated to avoid an unobservable writer",
+                    &last_ignored,
+                ));
             }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
+            if (!self.first_frame || self.adapter.initialization_pending())
+                && startup_expired(self.started, startup_progress, Instant::now())
+            {
+                return Err(with_ignored_output(
+                    if self.first_frame {
+                        "Provider initialization timed out before the provider reported it was ready"
+                    } else {
+                        "Provider initialization timed out without a JSON protocol frame"
+                    },
+                    &last_ignored,
+                ));
             }
             if self
                 .write_started
                 .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
-                return Err("Provider stdin stalled for 30 seconds".into());
+                return Err(
+                    stdin_closed.unwrap_or_else(|| "Provider stdin stalled for 30 seconds".into())
+                );
             }
             if self.dirty
                 && self.visible.load(Ordering::Acquire)
@@ -2154,6 +2666,7 @@ impl Actor {
                 self.last_present = Instant::now();
                 (self.notify)(Update::Presentation);
             }
+            self.publish_resident_metadata();
             let mut fds = [
                 libc::pollfd {
                     fd: self.wake.as_raw_fd(),
@@ -2175,7 +2688,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2191,6 +2704,7 @@ impl Actor {
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
             } else if !self.first_frame
+                || self.adapter.initialization_pending()
                 || !self.output.is_empty()
                 || self.write_started.is_some()
                 || closing.is_some()
@@ -2209,6 +2723,7 @@ impl Actor {
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
+            self.report_command_stops();
             if fds[3].revents != 0 {
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
@@ -2227,6 +2742,12 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        // The provider closed its input, ordinarily by exiting.
+                        // Drain its output to EOF so its exit status, and any
+                        // final frames, explain the failure instead of EPIPE.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some(format!("Provider stdin: {e}"));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
@@ -2238,6 +2759,10 @@ impl Actor {
                     Ok(n) => {
                         reserve_frame(&mut self.output, n)?;
                         self.output.extend_from_slice(&buffer[..n]);
+                        // Output often announces a command: move it soon.
+                        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+                            scope.poke();
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stdout: {e}")),
@@ -2260,6 +2785,24 @@ impl Actor {
             }
         }
     }
+    /// Say so when the system stopped one of the provider's commands
+    /// because memory ran out. The provider is still running.
+    fn report_command_stops(&mut self) {
+        let stops = match self.child.as_ref().and_then(|child| child.scope.as_ref()) {
+            Some(scope) => scope.take_command_stops(),
+            None => return,
+        };
+        if stops.is_empty() {
+            return;
+        }
+        let message = command_stop_report(&stops, self.command_stops);
+        self.command_stops += stops.len();
+        self.apply(Event::Error {
+            message,
+            fatal: false,
+        });
+    }
+
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
             // Backpressure applies to queued bytes, not to the mere existence of a
@@ -2289,8 +2832,9 @@ impl Actor {
                 command => (command, None),
             };
             let effects = InputEffects(effects);
+            let refuse = |error| reply.send(Err(Rejection::Refused(error)));
             if closing || self.stop.load(Ordering::Acquire) {
-                let _ = reply.send(Err("Chat is closing".into()));
+                let _ = refuse("Chat is closing".into());
                 continue;
             }
             let (run, command) = match command {
@@ -2352,9 +2896,9 @@ impl Actor {
                             _ => false,
                         };
                         if !valid {
-                            let _ = reply.send(Err(
+                            let _ = refuse(
                                 "A settled run may only decline a current pending request".into(),
-                            ));
+                            );
                             continue;
                         }
                     }
@@ -2362,9 +2906,9 @@ impl Actor {
                 }
                 ActorCommand::IdlePrompt(text) => {
                     if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
-                        let _ = reply.send(Err(
+                        let _ = refuse(
                             "The conversation is no longer idle for courier delivery".into(),
-                        ));
+                        );
                         continue;
                     }
                     (
@@ -2385,7 +2929,7 @@ impl Actor {
                             holder.update_source(source, execution_console, paired_holder)
                         });
                     let failed = result.is_err();
-                    let _ = reply.send(result);
+                    let _ = reply.send(result.map_err(Rejection::Unacknowledged));
                     // A partial control reply must never be reused.
                     if failed {
                         return Err("Native ownership update was not acknowledged".into());
@@ -2397,9 +2941,9 @@ impl Actor {
                     including_subagents,
                 } => {
                     if run.is_some_and(|run| self.execution.active() != Some(run)) {
-                        let _ = reply.send(Err(
+                        let _ = refuse(
                             "The requested run is no longer the provider's active turn".into(),
-                        ));
+                        );
                         continue;
                     }
                     if !including_subagents {
@@ -2408,17 +2952,10 @@ impl Actor {
                             .subagents
                             .iter()
                             .filter(|agent| agent.stopped_by_interrupt(&state.capabilities))
+                            .map(super::HeldSubagent::of)
                             .collect();
                         if !affected.is_empty() {
-                            let names = affected
-                                .iter()
-                                .take(8)
-                                .map(|agent| agent.id.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let _ = reply.send(Err(format!(
-                                "Interrupt would stop {} running background subagent(s): {names}. Use --including-subagents to permit this, or stop one subagent separately.", affected.len()
-                            )));
+                            let _ = refuse(interrupt_refusal(&affected.iter().collect()));
                             continue;
                         }
                     }
@@ -2429,10 +2966,9 @@ impl Actor {
                     // A stale generation must never hide new requests, child
                     // work or pending transport. Only a proved idle actor can
                     // return the retryable generation-change receipt.
-                    if self.update_readiness(&state) != UpdateReadiness::Idle {
-                        let _ = reply.send(Err(
-                            "Provider state changed before conditional idle close".into(),
-                        ));
+                    let readiness = self.update_readiness(&state);
+                    if readiness != UpdateReadiness::Idle {
+                        let _ = refuse(idle_close_refusal(readiness, &state));
                         continue;
                     }
                     let unchanged = state.generation == generation;
@@ -2464,7 +3000,7 @@ impl Actor {
                         }
                     }
                     Err(error) => {
-                        let _ = reply.send(Err(error));
+                        let _ = refuse(error);
                         continue;
                     }
                 }
@@ -2479,9 +3015,9 @@ impl Actor {
                     || state.exited
                     || !state.ready
                 {
-                    let _ = reply.send(Err(
+                    let _ = refuse(
                         "The sign-in failure changed or the conversation is no longer idle".into(),
-                    ));
+                    );
                     continue;
                 }
                 Some(failure.clone())
@@ -2492,9 +3028,7 @@ impl Actor {
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
-                    let _ = reply.send(Err(
-                        "The provider is no longer idle for the accepted run".into()
-                    ));
+                    let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
                 }
             }
@@ -2515,14 +3049,14 @@ impl Actor {
                 && let Some(context) = &self.launch_context
                 && let Err(error) = context.verify_directory(&self.working_directory)
             {
-                let _ = reply.send(Err(error));
+                let _ = refuse(error);
                 continue;
             }
             if authorizes_work
                 && let Some(scope) = &self.launch_account_scope
                 && let Err(error) = scope.revalidate()
             {
-                let _ = reply.send(Err(error));
+                let _ = refuse(error);
                 continue;
             }
             let prepared = match run {
@@ -2545,7 +3079,7 @@ impl Actor {
                             detail: "Waiting for provider turn".into(),
                         });
                     }
-                    let _ = reply.send(result.clone());
+                    let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
                     result?;
                     if started {
                         self.publish_activity();
@@ -2556,7 +3090,7 @@ impl Actor {
                         message: message.clone(),
                         fatal: false,
                     });
-                    let _ = reply.send(Err(message));
+                    let _ = refuse(message);
                 }
             }
         }
@@ -2565,7 +3099,7 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.holds_work() {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -2588,7 +3122,7 @@ impl Actor {
         let observed = step
             .events
             .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_)));
+            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::AgentAddress(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -2728,6 +3262,12 @@ impl Actor {
                     report,
                     observed_at: observed_at().unwrap_or_default(),
                 });
+                continue;
+            }
+            if let Event::AgentAddress(address) = event {
+                if self.agent_addresses.learn(address) {
+                    (self.notify)(Update::AgentAddresses(self.agent_addresses.list()));
+                }
                 continue;
             }
             let fatal = match &event {
@@ -2881,6 +3421,44 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        // The Store consumes parent bodies. Child bodies still project here,
+        // and Claude repeats the same identity on ordinary body frames.
+        // Neither should turn hidden streaming into metadata RPCs.
+        if self.resident_changed.is_some() {
+            self.resident_dirty |= match &event {
+                Event::Item(_)
+                | Event::TextDelta { .. }
+                | Event::OutputDelta { .. }
+                | Event::SubagentItem { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentOutputDelta { .. } => false,
+                Event::Session { id, title } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let changed = state.session_id.as_deref() != Some(id.as_str())
+                        || title
+                            .as_ref()
+                            .is_some_and(|title| state.title.as_ref() != Some(title));
+                    drop(state);
+                    changed
+                        || self
+                            .confirmed_session
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_deref()
+                            != Some(id.as_str())
+                }
+                _ => true,
+            };
+        }
+        let child_changed = matches!(
+            &event,
+            Event::Subagent { .. }
+                | Event::SubagentItem { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentOutputDelta { .. }
+                | Event::SubagentItemsRemoved { .. }
+                | Event::Reset { .. }
+        );
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2899,10 +3477,22 @@ impl Actor {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
+        let mut diagnostic_store =
+            child_changed.then(|| self.store.lock().unwrap_or_else(|p| p.into_inner()));
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
+        if let Some(store) = &mut diagnostic_store {
+            let owners = store.diagnostics.owners(&state);
+            drop(state);
+            // Keep the store lock across projection and source publication so
+            // no snapshot caches this generation without its final authority.
+            // Disk pruning itself never holds the resident-state lock.
+            store.diagnostics.retain(&owners);
+            state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.diagnostics.publish(&mut state);
+        }
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -2929,6 +3519,7 @@ impl Actor {
         // Evaluate after the whole provider frame, including any children or
         // attention requests reported after the parent result.
         if self.attention.finish(&mut state, observed_at()) {
+            self.resident_dirty = true;
             state.generation = state.generation.saturating_add(1);
             self.dirty = true;
         }
@@ -2973,6 +3564,15 @@ impl Actor {
         }
         if became_available {
             (self.notify)(Update::PromptAvailable);
+        }
+        // apply_step has installed confirmed_session before reaching here.
+        self.publish_resident_metadata();
+    }
+    fn publish_resident_metadata(&mut self) {
+        if std::mem::take(&mut self.resident_dirty)
+            && let Some(changed) = &self.resident_changed
+        {
+            changed();
         }
     }
     fn touch(&mut self) {
@@ -3215,6 +3815,7 @@ fn apply_projected_event(
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.
         Event::AccountUsage(_)
+        | Event::AgentAddress(_)
         | Event::LoginRecovered { .. }
         | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,
@@ -3553,6 +4154,13 @@ fn apply_projected_event(
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            for agent in &mut state.subagents {
+                if agent.status == ToolStatus::Waiting {
+                    agent.status = ToolStatus::Stopped;
+                    agent.detail =
+                        "The provider exited before its background work reported back".to_owned();
+                }
+            }
             state.waiting = false;
             state.busy = false;
             state.ready = false;
@@ -3572,6 +4180,36 @@ fn apply_projected_event(
     child_text_copy::finish(state, child_copy_update);
 }
 
+/// Marks the steps still running or waiting as stopped, copying only those
+/// items. Nothing a provider that ended was doing outlives it; a step it left
+/// going would otherwise read as still working. A subagent waiting on its
+/// background work is ended by [`Event::Exited`], which says why.
+fn stop_snapshot_steps(state: &mut Snapshot) {
+    stop_running_steps(&mut state.items);
+    for agent in &mut state.subagents {
+        if agent.status == ToolStatus::Running {
+            agent.status = ToolStatus::Stopped;
+            agent.waiting = false;
+        }
+        stop_running_steps(&mut agent.items);
+    }
+}
+
+fn stop_running_steps(items: &mut [Arc<Item>]) {
+    let now = observed_at();
+    for item in items {
+        if item.content.status().is_some_and(ToolStatus::is_live) {
+            let item = Arc::make_mut(item);
+            if let Some(status) = item.content.status_mut() {
+                *status = ToolStatus::Stopped;
+                // It ended now, so its duration runs to the provider's exit.
+                item.started_at = item.started_at.or(item.at);
+                item.at = now;
+            }
+        }
+    }
+}
+
 /// Running task identities authorize interruption and idle waits. Retiring
 /// presentation history must never retire that ownership evidence. Keep only
 /// the newest 32 rich child transcripts, with older active entries remaining
@@ -3582,7 +4220,7 @@ fn trim_subagents(state: &mut Snapshot) {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| agent.status != ToolStatus::Running)
+            .position(|agent| !agent.status.is_live())
         else {
             break;
         };
@@ -3614,6 +4252,12 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
 fn trim_subagent(agent: &mut Subagent) {
     const MAX_BYTES: usize = 64 * 1024;
     const MAX_ITEMS: usize = 64;
+    if let Some(last) = agent.items.last_mut()
+        && last.content.byte_len() > MAX_BYTES
+        && child_diagnostics::marked(last)
+    {
+        child_diagnostics::project(Arc::make_mut(last));
+    }
     if let Some(last) = agent.items.last_mut()
         && last.content.byte_len() > MAX_BYTES
     {
@@ -3676,11 +4320,34 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     )>,
     Snapshot,
 ) {
+    let (receipts, snapshot, ()) =
+        notification_frames_with_probe_for_test(adapter, frames, fail_store, |_, _| ());
+    (receipts, snapshot)
+}
+
+#[cfg(test)]
+pub(crate) fn notification_frames_with_probe_for_test<R>(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+    probe: impl FnOnce(
+        &Snapshot,
+        &dyn Fn(&super::TextCopySource, u64) -> Result<super::TextCopyPage, String>,
+    ) -> R,
+) -> (
+    Vec<(
+        crate::notifications::Evidence,
+        crate::notifications::Content,
+    )>,
+    Snapshot,
+    R,
+) {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
         adapter: Box<dyn Adapter>,
         frames: std::collections::VecDeque<serde_json::Value>,
+        interrupted: Arc<AtomicBool>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3689,9 +4356,26 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
                 ..Default::default()
             })
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            self.adapter
-                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::Refresh => self
+                    .adapter
+                    .receive(self.frames.pop_front().ok_or("fixture frames consumed")?),
+                Command::Interrupt if self.frames.is_empty() => {
+                    // The script has no live provider work. A busy captured
+                    // snapshot still needs an explicit fixture teardown ACK;
+                    // never consume another provider frame or emit an outcome.
+                    self.interrupted.store(true, Ordering::Release);
+                    Ok(Step {
+                        events: vec![Event::Status {
+                            busy: false,
+                            detail: "Fixture interruption acknowledged".into(),
+                        }],
+                        ..Step::default()
+                    })
+                }
+                _ => Err("fixture accepts scripted Refresh and final Interrupt only".into()),
+            }
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -3699,6 +4383,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     }
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3708,9 +4393,11 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
     };
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut adapter: Box<dyn Adapter> = Box::new(Frame {
         adapter,
         frames: frames.into(),
+        interrupted: interrupted.clone(),
     });
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -3733,7 +4420,15 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
-    let snapshot = handle.0.state.lock().unwrap().clone();
+    // Parent items belong to the transcript Store, so the resident metadata
+    // alone is not a client snapshot. Hydrate through the normal read boundary
+    // before probing original-copy sources and capturing pre-teardown state.
+    let snapshot = handle.snapshot(None).unwrap();
+    // Collect observations before teardown; callers assert them only after
+    // the existing process cleanup/completion guards below have succeeded.
+    let probed = probe(&snapshot, &|source, offset| {
+        handle.text_copy(source, offset)
+    });
     // Retire the actual process before asserting any result, including the
     // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();
@@ -3750,17 +4445,81 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         }
     }
     closed.unwrap();
+    if snapshot.busy && !snapshot.exited && snapshot.error.is_none() && !fail_store {
+        assert!(
+            interrupted.load(Ordering::Acquire),
+            "a healthy busy fixture must acknowledge teardown explicitly"
+        );
+        assert!(
+            handle.failure().is_none(),
+            "fixture teardown must not wait for an interruption timeout: {:?}",
+            handle.failure()
+        );
+        let teardown_receipts: Vec<_> = receive.try_iter().collect();
+        assert!(
+            teardown_receipts.is_empty(),
+            "fixture teardown cannot invent provider attention: {teardown_receipts:?}"
+        );
+    }
     assert!(
         handle.is_completed(),
         "real fixture process teardown must still be proved"
     );
     let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
     receipts.extend(later);
-    (receipts, snapshot)
+    (receipts, snapshot, probed)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_frame_fixture_preserves_busy_capture_and_acknowledges_teardown() {
+        struct Waiting;
+        impl Adapter for Waiting {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture commands must not reach the decoder".into())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step {
+                    // TurnStarted establishes identity, not busy state. This
+                    // fixture must report work as well as its input wait.
+                    events: vec![
+                        Event::Status {
+                            busy: true,
+                            detail: "Fixture work waiting for input".into(),
+                        },
+                        Event::Waiting(true),
+                    ],
+                    ..Step::default()
+                })
+            }
+        }
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Waiting),
+            vec![serde_json::Value::Null],
+            false,
+        );
+        assert!(
+            snapshot.busy && snapshot.waiting && !snapshot.exited,
+            "captured busy={}, waiting={}, exited={}, error_present={}",
+            snapshot.busy,
+            snapshot.waiting,
+            snapshot.exited,
+            snapshot.error.is_some(),
+        );
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            receipts.len(),
+            1,
+            "teardown must not publish a turn outcome"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(receipts[0].1.request, None);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
@@ -3897,6 +4656,10 @@ mod tests {
         );
         assert_eq!(state.activity(), ActivityState::Waiting);
         assert!(state.is_working());
+        assert!(
+            !state.turn_accepted(),
+            "children at work leave a refused parent's own turn unaccepted"
+        );
         let error = state.error.clone();
         apply(
             &mut state,
@@ -4044,6 +4807,7 @@ mod tests {
         ]));
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4224,6 +4988,7 @@ mod tests {
         for known_failure in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -4375,6 +5140,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4484,6 +5250,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::History,
@@ -4615,6 +5382,111 @@ mod tests {
     }
 
     #[test]
+    fn each_check_that_finds_stopped_commands_gives_a_new_notice() {
+        use crate::daemon::process_scope::{CommandStop, Killer};
+        let oomd = |processes| CommandStop {
+            killer: Killer::Oomd,
+            processes,
+        };
+        let first = command_stop_report(&[oomd(Some(3))], 0);
+        assert_eq!(
+            first,
+            format!(
+                "{} systemd-oomd ended it (3 processes); the agent is still running.",
+                super::super::failure::COMMAND_OUT_OF_MEMORY
+            )
+        );
+        // The agent retries the command and it is stopped the same way.
+        let again = command_stop_report(&[oomd(Some(3))], 1);
+        assert_ne!(again, first, "the card for a repeat must be a new one");
+        assert!(again.ends_with("since the agent started: 2."), "{again}");
+
+        let both = command_stop_report(
+            &[
+                oomd(Some(1)),
+                CommandStop {
+                    killer: Killer::Kernel,
+                    processes: None,
+                },
+            ],
+            0,
+        );
+        assert!(
+            both.contains(
+                "systemd-oomd and the kernel's out-of-memory killer ended 2 commands; the agent"
+            ),
+            "{both}"
+        );
+        for report in [first, again, both] {
+            assert!(super::super::failure::is_notice(&report), "{report}");
+        }
+    }
+
+    #[test]
+    fn steps_left_running_by_an_ended_provider_read_as_stopped() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let tool = |id: &str, status| Item {
+            started_at: None,
+            id: id.into(),
+            role: crate::chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 6001".into(),
+                output: String::new(),
+                status,
+            },
+            at: None,
+        };
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("running", ToolStatus::Running)),
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("done", ToolStatus::Succeeded)),
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("waiting", ToolStatus::Waiting)),
+        );
+        let finished = Arc::clone(&state.items[1]);
+        let agent = subagent(&mut state, "scout");
+        agent.waiting = true;
+        agent
+            .items
+            .push(Arc::new(tool("child", ToolStatus::Running)));
+        subagent(&mut state, "builder").status = ToolStatus::Failed;
+        stop_snapshot_steps(&mut state);
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        let statuses: Vec<_> = state
+            .items
+            .iter()
+            .map(|item| item.content.status())
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                Some(ToolStatus::Stopped),
+                Some(ToolStatus::Succeeded),
+                Some(ToolStatus::Stopped)
+            ]
+        );
+        assert!(
+            Arc::ptr_eq(&finished, &state.items[1]),
+            "settled items are not copied"
+        );
+        let scout = &state.subagents[0];
+        assert_eq!(scout.status, ToolStatus::Stopped);
+        assert!(!scout.waiting);
+        assert_eq!(scout.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[1].status, ToolStatus::Failed);
+    }
+
+    #[test]
     fn read_only_history_reason_survives_exit_and_snapshot_serialization() {
         let mut state = Snapshot::default();
         let mut indices = BTreeMap::new();
@@ -4706,6 +5578,7 @@ mod tests {
         let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4798,6 +5671,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = Arc::new(ExecutionContext::default());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             unset_environment: Default::default(),
@@ -4934,6 +5808,51 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn refusals_name_a_waiting_subagent_and_how_to_let_it_go() {
+        let mut state = Snapshot::default();
+        let subagent = |id: &str, description: &str, status| super::super::Subagent {
+            id: id.into(),
+            kind: "general-purpose".into(),
+            description: description.into(),
+            status,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        };
+        state.subagents = vec![subagent(
+            "toolu_dev",
+            "Run the dev server",
+            ToolStatus::Waiting,
+        )];
+        assert_eq!(
+            idle_close_refusal(UpdateReadiness::Busy, &state),
+            "Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation to let it close."
+        );
+        state.subagents.push(subagent(
+            "toolu_audit",
+            "Audit the parser",
+            ToolStatus::Running,
+        ));
+        let hold = state.work_hold();
+        let refused = interrupt_refusal(&hold.subagents());
+        assert_eq!(
+            refused,
+            "Interrupting would also stop 1 running and 1 waiting background subagent. Background subagent \u{201c}Audit the parser\u{201d} is still running, and \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Use --including-subagents to permit this, or stop them from their tabs in the app first."
+        );
+        assert!(!refused.contains("toolu_"));
+        // A turn still under way is what holds it; its subagents are not
+        // offered as the reason.
+        state.busy = true;
+        assert_eq!(
+            idle_close_refusal(UpdateReadiness::Busy, &state),
+            "The conversation is busy or waiting for an answer, so it was left open."
+        );
+        assert!(idle_close_refusal(UpdateReadiness::Unready, &state).contains("in flight"));
+    }
+
+    #[test]
     fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
         struct GatedBackground {
             entered: crossbeam_channel::Sender<()>,
@@ -5020,6 +5939,7 @@ mod tests {
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5080,14 +6000,22 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        let refused = interrupt
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap_err();
+        let refused = String::from(
+            interrupt
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err(),
+        );
         assert!(
-            refused.contains("40 running background")
-                && refused.contains("late-background-0")
-                && refused.contains("--including-subagents")
+            refused.starts_with("Interrupting would also stop 40 running background subagents.")
+                && refused.contains("\u{201c}Started after the caller observed idle\u{201d}")
+                && refused.contains("and 37 more are still running")
+                && refused.contains("--including-subagents"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains("late-background"),
+            "transport IDs are not names: {refused}"
         );
         assert_eq!(interrupts.load(Ordering::Relaxed), 0);
         assert_eq!(handle.background_subagents().len(), 40);
@@ -5107,7 +6035,11 @@ mod tests {
             UpdateReadiness::Busy
         );
         let refused = handle.interrupt_owned(None, false).unwrap_err();
-        assert!(refused.contains("8 running background") && refused.contains("late-background-0"));
+        assert!(
+            refused.contains("8 running background subagents")
+                && refused.contains("\u{201c}Started after the caller observed idle\u{201d}"),
+            "{refused}"
+        );
         assert_eq!(interrupts.load(Ordering::Relaxed), 0);
         handle.interrupt_owned(None, true).unwrap();
         assert_eq!(interrupts.load(Ordering::Relaxed), 1);
@@ -5343,6 +6275,57 @@ mod tests {
         assert_eq!(state.generation, 0, "publication generation is independent");
     }
 
+    #[test]
+    fn the_provider_exiting_closes_an_agent_waiting_on_its_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        for (id, status) in [
+            ("waiting", ToolStatus::Waiting),
+            ("done", ToolStatus::Succeeded),
+        ] {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: id.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(status),
+                    background: Some(true),
+                    model: None,
+                    waiting: None,
+                    detail: Some("may be interim".into()),
+                },
+            );
+        }
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert!(state.subagents[0].detail.contains("provider exited"));
+        assert_eq!(state.subagents[1].status, ToolStatus::Succeeded);
+    }
+
+    #[test]
+    fn a_waiting_agent_outlives_the_finished_stamp_and_is_counted_as_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "tool".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Waiting),
+                background: Some(true),
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert!(state.subagents[0].status.is_live());
+    }
+
     /// Readiness is what a sender waits on, so it ends with the provider.
     #[test]
     fn a_snapshot_is_ready_from_its_providers_word_until_it_exits() {
@@ -5493,6 +6476,111 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("History page failed"));
         apply(&mut state, Event::HistoryRecovered);
         assert_eq!(state.error, None);
+    }
+
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Build an owned-listener spec without creating a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_child_name_survives_sparse_metadata_and_takes_a_genuine_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let hello = adapter.initialize().unwrap();
+        let initialized = adapter
+            .receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-child-name-fixture"
+            }}))
+            .unwrap();
+        let attach = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        let attached = adapter
+            .receive(json!({"id":attach["id"],"result":{
+                "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}
+            }}))
+            .unwrap();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = adapter
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
+        for event in attached.events.into_iter().chain(ready.events) {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let mut publish = |thread: Value| {
+            let mut thread = thread;
+            thread["parentThreadId"] = json!("parent-exact");
+            let step = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":thread}}))
+                .unwrap();
+            for event in step.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            state
+                .subagents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let names = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // A role is not a name: the unnamed child stays unnamed for the tabs
+        // to label, rather than showing "worker" or a provider default.
+        assert_eq!(
+            publish(json!({"id":"unnamed","agentRole":"worker"})),
+            names(&[("unnamed", "")])
+        );
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":" Scout ","agentRole":"worker"})),
+            names(&[("unnamed", ""), ("child", "Scout")])
+        );
+        for sparse in [
+            json!({"id":"child","agentRole":"explorer"}),
+            json!({"id":"child","agentNickname":null}),
+            json!({"id":"child","agentNickname":" \t\n"}),
+        ] {
+            assert_eq!(
+                publish(sparse),
+                names(&[("unnamed", ""), ("child", "Scout")]),
+                "sparse metadata keeps the known name"
+            );
+        }
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":"Pilot"})),
+            names(&[("unnamed", ""), ("child", "Pilot")]),
+            "a genuine new nickname replaces the old one"
+        );
     }
 
     #[test]
@@ -5867,6 +6955,7 @@ mod tests {
                 &std::fs::metadata(&original).unwrap(),
             );
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: if cleanup_only {
                     Some(Arc::new(super::super::protocol::ExecutionContext::default()))
                 } else {
@@ -5947,6 +7036,7 @@ mod tests {
         let context = Arc::new(super::super::protocol::ExecutionContext::restored(expected));
         assert!(context.pinned_launch_directory().is_err());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context),
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -5956,7 +7046,7 @@ mod tests {
             environment: BTreeMap::new(),
             unset_environment: Default::default(),
         };
-        assert!(spawn_provider(&spec, &AtomicBool::new(false)).is_err());
+        assert!(spawn_provider(&spec, &AtomicBool::new(false), None).is_err());
     }
 
     struct Echo;
@@ -6012,6 +7102,7 @@ mod tests {
         }
         for unrelated in [None, Some("different failure"), Some("page failed")] {
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -6150,6 +7241,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6283,6 +7375,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6398,6 +7491,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6473,6 +7567,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6542,6 +7637,7 @@ mod tests {
             ("LC_ALL".into(), "C.UTF-8".into()),
         ]);
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6568,6 +7664,7 @@ mod tests {
     #[test]
     fn selected_account_removals_win_at_the_native_child_boundary() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -6671,6 +7768,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("server").join("control.sock");
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6729,6 +7827,7 @@ mod tests {
             })
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6769,6 +7868,90 @@ mod tests {
         assert!(notified.recv_timeout(Duration::from_millis(200)).is_err());
         assert_eq!(generation(&handle), before);
         assert!(handle.snapshot(None).unwrap().items.is_empty());
+        handle.close().unwrap();
+    }
+    /// How the provider addresses a subagent reaches the surfaces as every
+    /// address known so far, once each is learned, and never the snapshot,
+    /// whose layout older peers share.
+    #[test]
+    fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
+        fn address(address: &str, subagent: &str) -> Event {
+            Event::AgentAddress(AgentAddress {
+                address: address.into(),
+                subagent: subagent.into(),
+            })
+        }
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({})],
+                    // As a reopened history says of the agents it started.
+                    events: vec![address("a1892b93e88999a7d", "toolu_relocate")],
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![
+                        // Said again, and a later agent's first word.
+                        address("a1892b93e88999a7d", "toolu_relocate"),
+                        address("a77f00d1e2b3c4d5a", "toolu_review"),
+                    ],
+                })
+            }
+        }
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Addresser);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (notify, notified) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AgentAddresses(addresses) = update {
+                let _ = notify.send(addresses);
+            }
+        })
+        .unwrap();
+        let listed = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(address, subagent)| AgentAddress {
+                    address: (*address).into(),
+                    subagent: (*subagent).into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = listed(&[("a1892b93e88999a7d", "toolu_relocate")]);
+        let both = listed(&[
+            ("a1892b93e88999a7d", "toolu_relocate"),
+            ("a77f00d1e2b3c4d5a", "toolu_review"),
+        ]);
+        let timeout = Duration::from_secs(2);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), first);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), both);
+        assert!(
+            notified.recv_timeout(Duration::from_millis(200)).is_err(),
+            "an address already known is not news"
+        );
+        assert_eq!(handle.agent_addresses(), both);
+        assert!(handle.snapshot(None).unwrap().subagents.is_empty());
         handle.close().unwrap();
     }
     /// The host records a run's outcome the moment it is announced and then
@@ -6812,6 +7995,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6850,6 +8034,7 @@ mod tests {
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6981,6 +8166,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7085,6 +8271,7 @@ mod tests {
                 Update::Presentation => panic!("hidden close must not request presentation"),
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
+                | Update::AgentAddresses(_)
                 | Update::Attention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready
@@ -7114,6 +8301,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7165,15 +8353,502 @@ mod tests {
         server.join().unwrap();
     }
 
+    // Use the real Claude adapter with a private synthetic executable. The
+    // production launcher supplies its explicit child environment; this test
+    // never changes caller authority or performs discovery or authentication.
+    fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(&provider, format!(
+            "#!/usr/bin/python3\nimport json, sys\nrequest = json.loads(sys.stdin.readline())\nassert request['type'] == 'control_request'\nassert request['request']['subtype'] == 'initialize'\n{body}"
+        )).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        (directory, handle)
+    }
+
+    fn finish_initialization_pipe(handle: &LocalHandle, timeout: Duration) -> Snapshot {
+        let deadline = Instant::now() + timeout;
+        while !handle.is_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let completed = handle.is_completed();
+        let snapshot = handle.snapshot(None).unwrap();
+        // Retire/reap the exact fixture before an assertion can fail.
+        handle.close().unwrap();
+        assert!(completed, "initialization fixture timed out: {snapshot:?}");
+        snapshot
+    }
+
+    #[test]
+    fn claude_advisories_do_not_disable_the_real_pipe_initialization_deadline() {
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'keep_alive'}), flush=True)\n\
+             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        assert!(!snapshot.ready);
+        assert!(
+            snapshot.error.as_deref().is_some_and(|error| error
+                .contains("initialization timed out before the provider reported it was ready")),
+            "{snapshot:?}"
+        );
+        assert!(handle.failure().is_some());
+    }
+
+    #[test]
+    fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() {
+        for advisory in [false, true] {
+            for noise in [0, 1, 7] {
+                let body = format!(
+                    "if {advisory}:\n    print(json.dumps({{'type': 'future_advisory'}}), flush=True)\n\
+                     for _ in range({noise}):\n    print('wrapper diagnostic', flush=True)\n",
+                    advisory = if advisory { "True" } else { "False" },
+                );
+                let (_directory, handle) = claude_initialization_pipe(&body);
+                let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+                assert!(!snapshot.ready);
+                assert!(
+                    snapshot.error.as_deref().is_some_and(
+                        |error| error.contains("exited before completing initialization")
+                    ),
+                    "{snapshot:?}"
+                );
+            }
+        }
+
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             for _ in range(7):\n    print('wrapper diagnostic', flush=True)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
+
+        let (_directory, handle) = claude_initialization_pipe("sys.stdin.read()\n");
+        handle.close().unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(!snapshot.ready);
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
+    }
+
+    // Closing a busy turn sends Claude an interrupt. When the turn's result was
+    // already on its way, it arrives before the interrupt's acknowledgement,
+    // and only that acknowledgement decides whether the turn was cancelled.
+    // Close must not return in between, or the settled turn has no outcome.
+    #[test]
+    fn claude_close_keeps_a_settled_turn_outcome_until_its_interrupt_is_acknowledged() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            r#"#!/usr/bin/python3
+import json, sys, time
+def send(value): print(json.dumps(value), flush=True)
+session = next(argument.split('=', 1)[1] for argument in sys.argv[1:]
+               if argument.startswith('--session-id='))
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame.get('type') == 'user':
+        send({'type': 'system', 'subtype': 'init', 'session_id': session})
+        send(dict(frame, session_id=session))
+        send({'type': 'assistant', 'uuid': 'answer', 'session_id': session,
+              'message': {'id': 'answer', 'role': 'assistant',
+                          'content': [{'type': 'text', 'text': 'working'}]}})
+    elif frame.get('type') == 'control_request':
+        if frame['request'].get('subtype') == 'interrupt':
+            send({'type': 'result', 'uuid': 'final', 'subtype': 'success', 'is_error': False,
+                  'session_id': session, 'usage': {'input_tokens': 1, 'output_tokens': 1}})
+            time.sleep(0.5)
+        send({'type': 'control_response', 'response': {'subtype': 'success',
+              'request_id': frame['request_id'], 'response': {}}})
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, .. } = update {
+                let _ = send.send(evidence);
+            }
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "A turn that settles as it is closed".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        until(&handle, |snapshot| {
+            snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "working")
+                })
+        });
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+        let outcomes: Vec<_> = receive.try_iter().map(|evidence| evidence.kind).collect();
+        assert_eq!(outcomes, vec![crate::notifications::Kind::Cancelled]);
+    }
+
+    #[test]
+    fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            include_str!("../../tests/fixtures/claude-unknown-frames.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "Exercise unknown frames".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. }
+                        if text == "Fixture answer arrived after unknown frames and wrapper output.")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| { !format!("{:?}", item.content).contains("fixture-private-payload") })
+        );
+        // Claude Code 2.1.296 sends `post_turn_summary` before each result.
+        handle
+            .command(Command::Prompt {
+                text: "post-turn-summary check".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "ready")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    fn json_lines_spec(arguments: Vec<String>, program: &str) -> ProcessSpec {
+        ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: program.into(),
+            arguments,
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        }
+    }
+
+    // Providers that did not opt in keep the immediate failure on non-JSON
+    // output, both when the process exits cleanly and while it stays alive.
     #[test]
     fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
+        for spec in [
+            json_lines_spec(vec!["not-json\\n".into()], "/usr/bin/printf"),
+            json_lines_spec(
+                vec!["-c".into(), "echo not-json; exec sleep 60".into()],
+                "/bin/sh",
+            ),
+        ] {
+            let mut initial = Step::default();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            let snapshot = until(&handle, |snapshot| snapshot.error.is_some());
+            assert!(
+                snapshot
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Unsupported provider stdout"),
+                "{snapshot:?}"
+            );
+            handle
+                .close()
+                .expect("failed provider can be explicitly retired");
+        }
+    }
+
+    #[test]
+    fn claude_is_the_only_provider_whose_spec_tolerates_stdout_noise() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/false".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        assert!(ProcessSpec::from(&recipe).stdout_noise.is_none());
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe,
+            session_id: None,
+        };
+        let (spec, _) = super::super::protocol::claude::create(&launch).unwrap();
+        assert!(spec.stdout_noise.is_some());
+    }
+
+    #[test]
+    fn a_backlog_beyond_the_frame_budget_drains_after_eof() {
+        // Larger than one bounded parse pass and one read, so EOF is observed
+        // while complete frames are still queued.
+        let frames = 3_000;
+        let spec = json_lines_spec(
+            vec![
+                "%s".into(),
+                format!("{}\n", json!({"text":"x"})).repeat(frames),
+            ],
+            "/usr/bin/printf",
+        );
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", &"x".repeat(frames))]
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn startup_frames_extend_the_deadline_only_within_the_overall_limit() {
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+        // No progress: the original 30 seconds.
+        assert!(!startup_expired(started, started, at(30)));
+        assert!(startup_expired(started, started, at(31)));
+        // A frame earns another 30 seconds from when it arrived.
+        assert!(!startup_expired(started, at(29), at(59)));
+        assert!(startup_expired(started, at(29), at(60)));
+        // Frames forever cannot outlast the overall limit.
+        assert!(!startup_expired(started, at(299), at(300)));
+        assert!(startup_expired(started, at(300), at(301)));
+    }
+
+    #[test]
+    fn claude_frames_keep_a_slow_startup_alive_through_the_real_pipe() {
+        let (_directory, handle) = claude_initialization_pipe(
+            "import time\n\
+             time.sleep(20)\n\
+             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             time.sleep(20)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let deadline = Instant::now() + Duration::from_secs(50);
+        let snapshot = loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if snapshot.ready || snapshot.error.is_some() || Instant::now() > deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        handle.close().unwrap();
+        assert!(snapshot.ready && snapshot.error.is_none(), "{snapshot:?}");
+    }
+
+    #[test]
+    fn claude_garbage_only_startup_still_fails_at_the_first_deadline_with_its_preview() {
+        let started = Instant::now();
+        let (_directory, handle) = claude_initialization_pipe(
+            "import time\n\
+             for _ in range(5):\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(
+            error.contains("timed out without a JSON protocol frame"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Last ignored output: wrapper diagnostic"),
+            "{error}"
+        );
+        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn claude_exit_errors_include_the_last_ignored_output() {
+        for (body, expected) in [
+            (
+                "print('wrapper diagnostic', flush=True)\n",
+                "exited before completing initialization",
+            ),
+            (
+                "print('wrapper diagnostic', flush=True)\nsys.exit(3)\n",
+                "Provider exited with",
+            ),
+            (
+                "print('wrapper diagnostic', flush=True)\nsys.stdout.write('unterminated')\n",
+                "incomplete JSON line",
+            ),
+        ] {
+            let (_directory, handle) = claude_initialization_pipe(body);
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("Last ignored output: wrapper diagnostic"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_frame_glued_to_wrapper_text_fails_immediately_with_a_preview() {
+        for line in [
+            "'wrapper diag' + json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False})",
+            "json.dumps({'type': 'control_request', 'request_id': 'r', 'request': {}}) + ' wrapper tail'",
+        ] {
+            let started = Instant::now();
+            let (_directory, handle) = claude_initialization_pipe(&format!(
+                "print({line}, flush=True)\nsys.stdin.read()\n"
+            ));
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(
+                error.contains("inside one of its conversation messages"),
+                "{error}"
+            );
+            assert!(error.contains("type"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            include_str!("../../tests/fixtures/claude-unknown-frames.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "noise-limit".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.error.is_some());
+        handle.close().unwrap();
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(
+            error.contains("8 lines in a row that are not part of the conversation"),
+            "{error}"
+        );
+        assert!(error.contains("offline wrapper diagnostic 7"), "{error}");
+    }
+
+    #[test]
+    fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
+        let mut output = String::new();
+        for text in ["hello", " world"] {
+            output.push_str(&"wrapper diagnostic\n".repeat(7));
+            output.push_str(&format!("{}\n", json!({"text":text})));
+        }
         let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
             execution: None,
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
-            arguments: vec!["not-json\\n".into()],
+            arguments: vec!["%s".into(), output],
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
@@ -7182,13 +8857,44 @@ mod tests {
         let handle =
             LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
-        assert!(
-            snapshot
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("Unsupported provider stdout")
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", "hello world")]
         );
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    #[test]
+    fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
+        let output = format!(
+            "{}\u{1b}[31m🦀{}\n",
+            "not-json\n".repeat(7),
+            "x".repeat(10_000)
+        );
+        let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), output],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.contains("8 lines in a row that are not part of the conversation"));
+        assert!(error.contains("\\u{1b}[31m🦀"));
+        assert!(error.len() < 512);
+        assert!(!error.chars().any(char::is_control));
+        assert!(snapshot.items.is_empty());
         handle
             .close()
             .expect("failed provider can be explicitly retired");
@@ -7200,8 +8906,32 @@ mod tests {
     }
 
     #[test]
+    fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
+        let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), "wrapper noise\n{}\n".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert_eq!(snapshot.error.as_deref(), Some("missing echo text"));
+        handle.close().unwrap();
+        assert!(handle.failure().is_some());
+    }
+
+    #[test]
     fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7273,7 +9003,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut provider = ChildGuard::new(original.spawn().unwrap()).unwrap();
+        let mut provider = ChildGuard::spawn(&mut original);
         let pid = provider.child.id();
         assert_eq!(pid, 200);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7404,18 +9134,17 @@ mod tests {
         for already_reaped in [false, true] {
             use std::io::{BufRead, BufReader};
             let script = "import os,signal,sys,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_DFL if sys.argv[1]=='default' else signal.SIG_IGN)\n print(os.getpid(),flush=True)\n time.sleep(30)\n os._exit(0)\nsys.stdin.readline()\nos._exit(7)\n";
-            let child = Process::new("/usr/bin/python3")
-                .args([
-                    "-c",
-                    script,
-                    if already_reaped { "default" } else { "ignore" },
-                ])
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/usr/bin/python3")
+                    .args([
+                        "-c",
+                        script,
+                        if already_reaped { "default" } else { "ignore" },
+                    ])
+                    .process_group(0)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped()),
+            );
             let mut line = String::new();
             BufReader::new(provider.child.stdout.take().unwrap())
                 .read_line(&mut line)
@@ -7525,6 +9254,7 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -7569,14 +9299,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // Close stdin before announcing it, so the next host write
+            // always meets EPIPE; exit only after that write is queued.
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "read -r init; exec 0<&-; printf '%s\\n' '{{\"text\":\"closed\"}}'; \
+                     until [ -e '{}' ]; do sleep 0.01; done; exit 75",
+                    release.display()
+                ),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| !snapshot.items.is_empty());
+        handle.command(Command::Refresh).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let failure = handle.failure();
+        handle.close().unwrap();
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|error| error.contains("Provider exited with exit status: 75")),
+            "{failure:?} {:?}",
+            snapshot.error
+        );
+    }
+
+    #[test]
     fn direct_provider_non_reaping_observation_preserves_exit_status() {
         for script in ["exit 7", "kill -TERM $$"] {
-            let child = Process::new("/bin/sh")
-                .args(["-c", script])
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/bin/sh")
+                    .args(["-c", script])
+                    .process_group(0),
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             let observed = loop {
                 if let Some(status) = provider.observed_exit_status().unwrap() {
@@ -7598,6 +9370,7 @@ mod tests {
     fn direct_provider_scope_preserves_pipes_and_process_group() {
         use std::io::{BufRead, Write};
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -7607,7 +9380,7 @@ mod tests {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let mut provider = spawn_provider(&spec, &AtomicBool::new(false))
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
             .unwrap()
             .unwrap();
         let pid = provider.child.id();
@@ -7627,6 +9400,342 @@ mod tests {
             .unwrap();
         assert_eq!(reply, "scope transport preserved\n");
         provider.terminate().unwrap();
+    }
+
+    /// The commands a direct provider starts leave its cgroup, so a memory
+    /// kill of one ends that command alone and the conversation says so; a
+    /// memory kill of the provider itself is named as one when it exits.
+    /// The kills are made the way systemd-oomd makes them: it marks the
+    /// cgroup, then kills every process in it.
+    #[test]
+    fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::process::ExitStatusExt;
+        fn cgroup(pid: u32) -> String {
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .unwrap()
+                .to_owned()
+        }
+        fn parent(pid: u32) -> u32 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let after = stat.rsplit_once(") ").unwrap().1;
+            after.split_whitespace().nth(1).unwrap().parse().unwrap()
+        }
+        fn mark_and_kill(leaf: &str) {
+            let path = std::path::Path::new("/sys/fs/cgroup").join(leaf.trim_start_matches('/'));
+            for (name, value) in [("user.oomd_ooms", "1"), ("user.oomd_kill", "1")] {
+                let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                let name = std::ffi::CString::new(name).unwrap();
+                // SAFETY: NUL-terminated path and name and a live value buffer.
+                let set = unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    )
+                };
+                assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+            }
+            std::fs::write(path.join("cgroup.kill"), "1").unwrap();
+        }
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // A one-process command, and a shell running a command of its
+            // own, as an agent's Bash tool does. That one leaves the
+            // provider's process group, as a tool may start its commands.
+            arguments: vec![
+                "-c".into(),
+                "read go; sleep 300 & echo $!; sh -c 'setsid sleep 300 & echo $!; wait' & echo $!; read done"
+                    .into(),
+            ],
+            working_directory: std::env::current_dir().unwrap(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let (wake, mut woken) = UnixStream::pair().unwrap();
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake))
+            .unwrap()
+            .unwrap();
+        let root = provider.child.id();
+        let Some(scope) = provider
+            .scope
+            .as_ref()
+            .filter(|scope| scope.keeps_commands_apart())
+        else {
+            eprintln!("command cgroups unqualified: no delegated provider scope here");
+            provider.terminate().unwrap();
+            return;
+        };
+        let provider_leaf = cgroup(root);
+        assert!(provider_leaf.ends_with("/provider"), "{provider_leaf}");
+        let scope_path = provider_leaf.trim_end_matches("/provider").to_owned();
+        let unit = scope_path.rsplit('/').next().unwrap();
+        let policy = std::process::Command::new("systemctl")
+            .args(["--user", "show", "-P", "OOMPolicy", unit])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "continue",
+            "a memory kill in one leaf must not stop the provider's scope"
+        );
+        // Commands start only after the split, as a provider's do.
+        writeln!(provider.child.stdin.as_mut().unwrap(), "go").unwrap();
+        let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
+        let mut pids = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            pids.push(line.trim().parse::<u32>().unwrap());
+        }
+        let is_shell =
+            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
+        let find = |wanted: &dyn Fn(u32) -> bool| {
+            *pids
+                .iter()
+                .find(|pid| wanted(**pid))
+                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
+        };
+        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
+        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
+        let inner = find(&|pid| parent(pid) == shell);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while [alone, shell, inner]
+            .iter()
+            .any(|pid| cgroup(*pid) == provider_leaf)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "commands stayed in the provider's cgroup"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alone_leaf = cgroup(alone);
+        let shell_leaf = cgroup(shell);
+        for leaf in [&alone_leaf, &shell_leaf] {
+            let name = leaf.strip_prefix(&format!("{scope_path}/")).unwrap();
+            assert!(name.starts_with("command-"), "{leaf}");
+        }
+        assert_ne!(alone_leaf, shell_leaf, "each command has its own cgroup");
+        assert_eq!(
+            cgroup(inner),
+            shell_leaf,
+            "a command's own commands stay with it"
+        );
+        assert_eq!(cgroup(root), provider_leaf, "the provider stays alone");
+
+        mark_and_kill(&alone_leaf);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stops = loop {
+            let stops = scope.take_command_stops();
+            if !stops.is_empty() {
+                break stops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stopped command was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            stops,
+            vec![crate::daemon::process_scope::CommandStop {
+                killer: crate::daemon::process_scope::Killer::Oomd,
+                processes: Some(1),
+            }]
+        );
+        let mut byte = [0];
+        woken
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        woken.read_exact(&mut byte).unwrap();
+        let report = command_stop_report(&stops, 0);
+        assert!(
+            report.starts_with(super::super::failure::COMMAND_OUT_OF_MEMORY),
+            "{report}"
+        );
+        assert!(
+            provider.child.try_wait().unwrap().is_none(),
+            "the provider kept running"
+        );
+        assert_eq!(cgroup(inner), shell_leaf, "the other command kept running");
+
+        // The kernel's OOM killer ends one process of a command, not all of
+        // it: here a process over a small limit on the shell's leaf, which
+        // it joins before it allocates.
+        let leaf_path =
+            std::path::Path::new("/sys/fs/cgroup").join(shell_leaf.trim_start_matches('/'));
+        std::fs::write(leaf_path.join("memory.swap.max"), "0").unwrap();
+        std::fs::write(leaf_path.join("memory.max"), "32M").unwrap();
+        let mut hog = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-c",
+                "import sys; sys.stdin.read(1); b = bytearray(256 << 20)",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::fs::write(leaf_path.join("cgroup.procs"), hog.id().to_string()).unwrap();
+        hog.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stops = loop {
+            let stops = scope.take_command_stops();
+            if !stops.is_empty() {
+                break stops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the kernel's kill was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            stops,
+            vec![crate::daemon::process_scope::CommandStop {
+                killer: crate::daemon::process_scope::Killer::Kernel,
+                processes: Some(1),
+            }],
+            "reported while the rest of the command runs on"
+        );
+        assert_eq!(cgroup(inner), shell_leaf);
+
+        // The provider's own leaf, and with it the provider.
+        mark_and_kill(&provider_leaf);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = provider.observed_exit_status().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the provider outlived its kill");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let report = exit_report(&provider, status);
+        assert!(
+            report.starts_with(super::super::failure::PROVIDER_OUT_OF_MEMORY),
+            "{report}"
+        );
+        assert!(
+            report.ends_with("Provider exited with signal: 9 (SIGKILL)"),
+            "{report}"
+        );
+        // The command in a session of its own outlived the provider's kill.
+        assert_eq!(cgroup(inner), shell_leaf);
+        let ended = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z')
+            })
+        };
+        assert!(!ended(inner));
+        // The force-stopped provider's teardown ends what it left, as
+        // nothing else would.
+        provider.terminate().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ended(inner) {
+            assert!(
+                Instant::now() < deadline,
+                "a command outlived the provider that started it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A process the agent detached, such as a dev server, outlives a chat
+    /// the user closes and a provider that finishes, as it asked to: only a
+    /// force-stopped provider's leftovers are ended, or those of a provider
+    /// whose owner decided to stop them, such as an unattended agent's.
+    #[test]
+    fn a_detached_command_outlives_a_closed_or_finished_provider() {
+        use std::io::{BufRead, Write};
+        fn ended(pid: u32) -> bool {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z')
+            })
+        }
+        for (case, before, after, stop) in [
+            ("closed", "", "", false),
+            // cagents' own escalation to SIGKILL is not a forced stop.
+            ("closed while ignoring SIGTERM", "trap '' TERM; ", "", false),
+            ("finished", "", "; exit 0", false),
+            ("closed by an owner stopping it", "", "", true),
+        ] {
+            let spec = ProcessSpec {
+                stdout_noise: None,
+                execution: None,
+                messages: None,
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    // The command reports its PID once it has left the
+                    // provider's process group, which teardown signals.
+                    format!(
+                        "read go; {before}setsid sh -c 'echo $$; exec sleep 300' & read done{after}"
+                    ),
+                ],
+                working_directory: std::env::current_dir().unwrap(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
+            let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+                .unwrap()
+                .unwrap();
+            if !provider
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.keeps_commands_apart())
+            {
+                eprintln!("command cgroups unqualified: no delegated provider scope here");
+                provider.terminate().unwrap();
+                return;
+            }
+            let mut stdin = provider.child.stdin.take().unwrap();
+            writeln!(stdin, "go").unwrap();
+            let mut line = String::new();
+            let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
+            stdout.read_line(&mut line).unwrap();
+            let detached: u32 = line.trim().parse().unwrap();
+            if case == "finished" {
+                writeln!(stdin, "done").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while provider.observed_exit_status().unwrap().is_none() {
+                    assert!(Instant::now() < deadline, "the provider never finished");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            provider.stop_detached = stop;
+            provider.terminate().unwrap();
+            let survived = if stop {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ended(detached) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                !ended(detached)
+            } else {
+                // Give a scope kill, were there one, time to land.
+                std::thread::sleep(Duration::from_millis(200));
+                !ended(detached)
+            };
+            // SAFETY: a plain signal to the test's own detached command.
+            unsafe { libc::kill(detached as i32, libc::SIGKILL) };
+            assert_eq!(
+                survived,
+                !stop,
+                "a detached command {} with a {case} provider",
+                if stop { "survived" } else { "ended" }
+            );
+        }
     }
 
     #[test]
@@ -7658,6 +9767,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7780,6 +9890,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

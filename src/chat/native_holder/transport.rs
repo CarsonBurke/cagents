@@ -7,7 +7,10 @@ use crate::{
         Session,
         protocol::{LaunchCleanup, LaunchOutcome, ProcessSpec, TransportSpec},
     },
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::HostSessionProof,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -156,7 +159,11 @@ enum Request {
         application: Option<String>,
     },
     PinnedLaunchDirectory,
+    /// Stop the provider and every child of the holder.
     Release,
+    /// Stop the provider but leave running the work it had already detached.
+    /// Sent only to a holder reporting `sparing_release`.
+    ReleaseSparing,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,6 +173,8 @@ enum Report {
         record: Record,
         #[serde(default)]
         directory_pin: bool,
+        #[serde(default)]
+        sparing_release: bool,
     },
     Confirmed,
     SourceUpdated,
@@ -177,6 +186,8 @@ enum Report {
         exited: bool,
         #[serde(default)]
         directory_pin: bool,
+        #[serde(default)]
+        sparing_release: bool,
     },
     Adopted(Recovery),
     Failed(String),
@@ -189,6 +200,8 @@ pub(crate) struct Holder {
     release_on_drop: bool,
     durable: bool,
     directory_pin: bool,
+    /// Whether the holder accepts `ReleaseSparing`.
+    sparing_release: bool,
     control_peer: Process,
     control_poisoned: bool,
     identity: super::Detached,
@@ -338,10 +351,15 @@ impl Holder {
     }
 
     pub fn close(&mut self) -> Result<(), String> {
-        self.close_inner(false)
+        self.close_inner(false, DetachedWork::Stop)
     }
 
-    pub(in crate::chat) fn close_inner(&mut self, retain: bool) -> Result<(), String> {
+    /// A holder too old to spare detached work stops it, as it always did.
+    pub(in crate::chat) fn close_inner(
+        &mut self,
+        retain: bool,
+        detached: DetachedWork,
+    ) -> Result<(), String> {
         if self.identity.receipt(retain)? {
             self.control.take();
             self.release_on_drop = false;
@@ -351,25 +369,39 @@ impl Holder {
             self.control.take();
         }
         let Some(control) = self.control.as_ref() else {
-            return if retain {
-                self.identity.close_retaining_receipt()
-            } else {
-                self.identity.close()
-            };
+            return self.identity.close_with(retain, detached);
         };
-        send(control, &Request::Release, TIMEOUT)?;
-        match receive(control, TIMEOUT)? {
-            Some(Report::Released) => {
+        let request = if detached == DetachedWork::Spare && self.sparing_release {
+            Request::ReleaseSparing
+        } else {
+            Request::Release
+        };
+        let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
+        let unanswered = match report {
+            Ok(Some(Report::Released)) => {
                 if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
                 self.release_on_drop = false;
-                Ok(())
+                return Ok(());
             }
-            Some(Report::Failed(error)) => Err(error),
-            _ => Err("Native holder did not acknowledge server teardown".into()),
+            Ok(Some(Report::Failed(error))) => return Err(error),
+            Ok(Some(_)) => {
+                return Err("Native holder did not acknowledge server teardown".into());
+            }
+            Ok(None) => "Native holder did not acknowledge server teardown".to_owned(),
+            Err(error) => error,
+        };
+        // A holder that exited with its provider closes its control connection
+        // without answering, and never will. If it wrote its receipt first,
+        // that receipt settles the close as a reply would have.
+        if !self.identity.receipt(retain)? && !self.identity.retire_exited() {
+            return Err(unanswered);
         }
+        self.control.take();
+        self.release_on_drop = false;
+        Ok(())
     }
 }
 
@@ -530,6 +562,9 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             }
         })
         .map_err(|error| error.to_string())?;
+    // Only the daemon starts holders. A process that sweeps adopted orphans
+    // would have to register this child through `adopted_orphans`.
+    debug_assert!(!crate::daemon::adopted_orphans::sweeping());
     let child = holder.spawn().map_err(|error| error.to_string())?;
     let pid = child.id() as i32;
     *owner.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
@@ -562,6 +597,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                 protocol,
                 record,
                 directory_pin,
+                sparing_release,
             }) if protocol == PROTOCOL
                 && record.holder.pid == pid
                 && record.holder.is_current() =>
@@ -570,18 +606,25 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                     record.holder.pid as u32,
                     record.root.pid as u32,
                 );
-                Ok((record, directory_pin))
+                Ok((
+                    record,
+                    Capabilities {
+                        directory_pin,
+                        sparing_release,
+                    },
+                ))
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge its server".into()),
         }
     })();
     match result {
-        Ok((record, directory_pin)) => Ok(Holder {
+        Ok((record, capabilities)) => Ok(Holder {
             control: Some(control),
             release_on_drop: true,
             durable: false,
-            directory_pin,
+            directory_pin: capabilities.directory_pin,
+            sparing_release: capabilities.sparing_release,
             control_peer,
             control_poisoned: false,
             identity: super::Detached {
@@ -626,13 +669,20 @@ pub(crate) fn inspect(
     record: &Record,
     proof: &HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
-    inspect_with_directory_pin(record, proof).map(|(recovery, exited, _)| (recovery, exited))
+    inspect_with_capabilities(record, proof).map(|(recovery, exited, _)| (recovery, exited))
 }
 
-fn inspect_with_directory_pin(
+/// What a holder reports it supports beyond its protocol version.
+#[derive(Clone, Copy)]
+struct Capabilities {
+    directory_pin: bool,
+    sparing_release: bool,
+}
+
+fn inspect_with_capabilities(
     record: &Record,
     proof: &HostSessionProof,
-) -> Result<(Recovery, bool, bool), String> {
+) -> Result<(Recovery, bool, Capabilities), String> {
     let control = connect(record)?;
     send(
         &control,
@@ -648,9 +698,17 @@ fn inspect_with_directory_pin(
             recovery,
             exited,
             directory_pin,
+            sparing_release,
         }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
             recovery.validate_original_role(&record.boot, &record.application)?;
-            Ok((recovery, exited, directory_pin))
+            Ok((
+                recovery,
+                exited,
+                Capabilities {
+                    directory_pin,
+                    sparing_release,
+                },
+            ))
         }
         Some(Report::Failed(error)) => Err(error),
         _ => Err("Native holder did not return its exact discovery evidence".into()),
@@ -665,7 +723,7 @@ pub(crate) fn adopt(
     // Inspect is read-only. A candidate role does not authorize Adopt: first
     // authenticate this live holder's complete issued source on its own lease-
     // checked channel, and retain the exact original Record through cleanup.
-    let (original, _, directory_pin) = inspect_with_directory_pin(record, proof)?;
+    let (original, _, capabilities) = inspect_with_capabilities(record, proof)?;
     if &original.source != source && !original.previous_sources.contains(source) {
         return Err("Native role transition does not recognize the exact issued source".into());
     }
@@ -678,7 +736,7 @@ pub(crate) fn adopt(
     if record.is_outdated() {
         tracing::warn!(terminal = %record.terminal, holder_pid = record.holder.pid,
             helper_version = ?record.build.as_ref().map(|build| &build.version),
-            daemon_version = crate::VERSION,
+            daemon_version = crate::version(),
             zombies = ?record.zombie_children().ok(),
             "adopting a native conversation running on an outdated helper");
     }
@@ -705,7 +763,8 @@ pub(crate) fn adopt(
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
-                    directory_pin,
+                    directory_pin: capabilities.directory_pin,
+                    sparing_release: capabilities.sparing_release,
                     control_peer: record.holder.clone(),
                     control_poisoned: false,
                     identity: super::Detached {
@@ -772,10 +831,16 @@ struct Residence {
     _working_directory: Option<std::fs::File>,
     provider_pidfd: std::fs::File,
     owner_application: String,
+    /// This holder's divided cgroup scope, when the user manager gave one.
+    /// The commands of the confirmed server are kept apart from it.
+    scope: Option<crate::daemon::process_scope::ProviderScope>,
 }
 
 impl Residence {
-    fn start(spawn: Spawn) -> Result<Self, String> {
+    fn start(
+        spawn: Spawn,
+        scope: Option<crate::daemon::process_scope::ProviderScope>,
+    ) -> Result<Self, String> {
         // Block before creating children so even a very short-lived tool cannot
         // disappear between the initial reap and the blocking poll.
         let child_events = ChildEvents::new().map_err(|error| error.to_string())?;
@@ -822,6 +887,7 @@ impl Residence {
         };
         let provider_pidfd = pin_provider_process(&record.root)?;
         let residence = Self {
+            scope,
             provider_pidfd,
             owner_application: crate::instance::APPLICATION_ID.into(),
             directory,
@@ -937,13 +1003,28 @@ impl Residence {
                 continue;
             }
             let response = match request {
-                Request::Release => match self.release() {
-                    Ok(()) => {
-                        let _ = send(&control, &Report::Released, TIMEOUT);
-                        return false;
+                Request::Release | Request::ReleaseSparing => {
+                    let detached = if matches!(request, Request::ReleaseSparing) {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                    // A server its launcher started is the provider's own.
+                    let server: Vec<Process> =
+                        self.recovery.server_process.iter().cloned().collect();
+                    match self
+                        .child
+                        .decide_detached(detached, &server)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| self.release())
+                    {
+                        Ok(()) => {
+                            let _ = send(&control, &Report::Released, TIMEOUT);
+                            return false;
+                        }
+                        Err(error) => Report::Failed(error),
                     }
-                    Err(error) => Report::Failed(error),
-                },
+                }
                 Request::Confirm {
                     thread,
                     identity,
@@ -953,8 +1034,12 @@ impl Residence {
                         .verify_server(&process)
                         .and_then(|()| pin_provider_process(&process))
                         .and_then(|pidfd| {
+                            let server = process.pid as u32;
+                            let watched = process.clone();
                             self.recovery.confirm(thread, identity, process)?;
+                            self.child.watch_server(watched);
                             self.provider_pidfd = pidfd;
+                            self.keep_commands_apart(server);
                             Ok(())
                         }) {
                         Ok(()) => Report::Confirmed,
@@ -979,6 +1064,17 @@ impl Residence {
             if send(&control, &response, TIMEOUT).is_err() {
                 return self.recovery.is_durable();
             }
+        }
+    }
+
+    /// Give each command the confirmed server starts a cgroup of its own, so
+    /// a memory kill ends the command rather than the conversation. The
+    /// server is only known here: a launcher may have spawned it. Without a
+    /// divided scope its commands stay with it, as before.
+    fn keep_commands_apart(&mut self, server: u32) {
+        if let Some(scope) = &mut self.scope {
+            let launcher = self.record.root.pid as u32;
+            let _ = scope.keep_commands_apart(server, vec![std::process::id(), launcher], None);
         }
     }
 
@@ -1059,6 +1155,7 @@ impl Residence {
                             recovery: self.recovery.clone(),
                             exited: self.exited(),
                             directory_pin: true,
+                            sparing_release: true,
                         },
                         TIMEOUT,
                     );
@@ -1109,8 +1206,9 @@ struct ChildEvents {
 
 impl ChildEvents {
     fn new() -> io::Result<Self> {
-        // SAFETY: both signal sets are live writable objects; this helper is
-        // single-threaded and is the sole owner of child wait statuses.
+        // SAFETY: both signal sets are live writable objects. This runs before
+        // the holder starts any thread, so every later thread inherits the
+        // blocked mask, and this helper is the sole owner of child statuses.
         unsafe {
             let mut mask = std::mem::zeroed();
             let mut previous = std::mem::zeroed();
@@ -1434,6 +1532,12 @@ extern "C" fn serve_if_requested() {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
         std::process::exit(2);
     }
+    // Nothing this holder was handed may outlive it in its provider: a
+    // provider holding the daemon's end of this channel open would hide the
+    // holder's death from the daemon, which then waits on it forever.
+    if crate::daemon::seal_inherited_descriptors().is_err() {
+        std::process::exit(2);
+    }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
     let _result = (|| {
         let Some(Request::Spawn {
@@ -1445,8 +1549,12 @@ extern "C" fn serve_if_requested() {
         };
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
-        let _ = crate::daemon::process_scope::enroll_holder();
-        let mut residence = match Residence::start(spawn) {
+        // Divided, so the commands the provider starts can get cgroups of
+        // their own once its server is confirmed.
+        let scope = crate::daemon::process_scope::enroll_dividing_holder()
+            .ok()
+            .flatten();
+        let mut residence = match Residence::start(spawn, scope) {
             Ok(residence) => residence,
             Err(error) => {
                 // Only startup has no Started response yet. Preserve the
@@ -1466,6 +1574,7 @@ extern "C" fn serve_if_requested() {
                 protocol: PROTOCOL,
                 record: residence.record.clone(),
                 directory_pin: true,
+                sparing_release: true,
             },
             START_TIMEOUT,
         )?;
@@ -1645,6 +1754,43 @@ mod tests {
         }
     }
 
+    fn assert_live_adopted_fixture_process(process: &Process) {
+        assert!(process.is_current(), "fixture child identity changed");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
+        let parent = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        assert_eq!(
+            parent.parse::<u32>().unwrap(),
+            std::process::id(),
+            "fixture child was not adopted"
+        );
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process.pid as u32,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "fixture child observation failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { status.si_pid() },
+            0,
+            "fixture child exited before gate release"
+        );
+    }
+
     #[test]
     fn idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LIVE_REAPER_TEST";
@@ -1687,9 +1833,10 @@ while IFS=: read -r field value; do
     if [ "$field" = SigBlk ]; then printf '%s\n' "$value" > "$1/provider-mask"; fi
 done < "/proc/$$/status"
 /bin/sh -c '
-    /bin/sleep 60 </dev/null &
+    exec 3<&0
+    /bin/sleep 60 </dev/null 3<&- &
     echo $! > "$1/live"
-    /bin/sh -c "read -r token" <&0 &
+    /bin/sh -c "echo ready > \"\$1/tool-ready\"; read -r token" fixture "$1" <&3 3<&- &
     echo $! > "$1/tool"
 ' fixture "$1"
 echo ready > "$1/ready"
@@ -1716,7 +1863,9 @@ exec /bin/sleep 60
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
             let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !directory.path().join("ready").exists() {
+            while !directory.path().join("ready").exists()
+                || !directory.path().join("tool-ready").exists()
+            {
                 assert!(!server.exited(), "provider exited during fixture startup");
                 assert!(Instant::now() < deadline, "provider fixture did not start");
                 std::thread::sleep(Duration::from_millis(5));
@@ -1731,15 +1880,7 @@ exec /bin/sleep 60
             let tool = Process::read(read_pid("tool")).unwrap();
             let live = Process::read(read_pid("live")).unwrap();
             for process in [&tool, &live] {
-                let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
-                let parent = stat
-                    .rsplit_once(')')
-                    .unwrap()
-                    .1
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap();
-                assert_eq!(parent.parse::<u32>().unwrap(), std::process::id());
+                assert_live_adopted_fixture_process(process);
             }
             let mask = std::fs::read_to_string(directory.path().join("provider-mask")).unwrap();
             let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
@@ -1862,8 +2003,9 @@ exec /bin/sleep 60
                 arguments: vec![
                     "-c".into(),
                     r#"/bin/sh -c '
-                        /bin/sleep 60 </dev/null & echo $! > "$1/live"
-                        /bin/sh -c "read -r token" <&0 & echo $! > "$1/tool"
+                        exec 3<&0
+                        /bin/sleep 60 </dev/null 3<&- & echo $! > "$1/live"
+                        /bin/sh -c "echo ready > \"\$1/tool-ready\"; read -r token" fixture "$1" <&3 3<&- & echo $! > "$1/tool"
                     ' fixture "$1"
                     echo ready > "$1/ready"
                     exec /bin/sleep 60"#
@@ -1881,7 +2023,9 @@ exec /bin/sleep 60
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
             let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !directory.path().join("ready").exists() {
+            while !directory.path().join("ready").exists()
+                || !directory.path().join("tool-ready").exists()
+            {
                 assert!(!server.exited());
                 assert!(Instant::now() < deadline, "provider fixture did not start");
                 std::thread::sleep(Duration::from_millis(5));
@@ -1896,6 +2040,9 @@ exec /bin/sleep 60
             };
             let tool = identity("tool");
             let live = identity("live");
+            for process in [&tool, &live] {
+                assert_live_adopted_fixture_process(process);
+            }
             // Clear setup notifications before inducing the exact child-exit
             // boundary. The short tool still waits for this original pipe.
             child_events.drain().unwrap();
@@ -1926,13 +2073,18 @@ exec /bin/sleep 60
             let mut calls = 0;
             let mut released = false;
             let mut observed_exit = false;
+            let mut release_error = None;
+            let mut observation_error = None;
             let mut gate = Some(gate);
             let waited = wait_for_control_with_reaper(fd, &child_events, || {
                 calls += 1;
                 if calls == 1 {
                     server.reap_exited_descendants()?;
                     let mut original = gate.take().unwrap();
-                    released = original.write_all(b"exit\n").is_ok();
+                    match original.write_all(b"exit\n") {
+                        Ok(()) => released = true,
+                        Err(error) => release_error = Some(error),
+                    }
                     drop(original);
                     let deadline = Instant::now() + Duration::from_secs(3);
                     while released && Instant::now() < deadline {
@@ -1946,6 +2098,7 @@ exec /bin/sleep 60
                             )
                         };
                         if result != 0 {
+                            observation_error = Some(io::Error::last_os_error());
                             break;
                         }
                         if unsafe { status.si_pid() } == tool.pid {
@@ -1967,7 +2120,14 @@ exec /bin/sleep 60
                 waited.is_ok(),
                 "inspection failure abandoned control: {waited:?}"
             );
-            assert!(released && observed_exit);
+            assert!(
+                released,
+                "original tool gate write failed: {release_error:?}"
+            );
+            assert!(
+                observed_exit,
+                "gated tool exit was not observed: {observation_error:?}"
+            );
             assert_eq!(calls, 2, "fault must occur after the real SIGCHLD wake");
             let control = if let Some(listener) = listener {
                 listener.accept().unwrap().0
@@ -2075,11 +2235,14 @@ exec /bin/sleep 60
             std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
         )));
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
-            program: "/bin/sleep".into(),
-            arguments: vec!["60".into()],
+            // A provider running one command, so its cgroup and release
+            // cover the commands a provider starts.
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "/bin/sleep 60 & exec /bin/sleep 60".into()],
             working_directory: working.path().to_owned(),
             environment: Default::default(),
             unset_environment: Default::default(),
@@ -2134,6 +2297,8 @@ exec /bin/sleep 60
                 record.root.clone(),
             )
             .unwrap();
+        // The confirmed server's commands get cgroups of their own.
+        crate::daemon::process_scope::tests::assert_commands_apart(record.root.pid as u32);
         holder.preserve();
         drop(lease);
         let mut successor = first;
@@ -2282,6 +2447,7 @@ exec /bin/sleep 60
         stripped.launch.recipe.arguments.clear();
         assert!(!stripped.owns_codex_listener());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2320,16 +2486,17 @@ exec /bin/sleep 60
             protocol: PROTOCOL,
             record: record.clone(),
             directory_pin: true,
+            sparing_release: true,
         })
         .unwrap();
-        legacy["Started"]
-            .as_object_mut()
-            .unwrap()
-            .remove("directory_pin");
+        let started = legacy["Started"].as_object_mut().unwrap();
+        started.remove("directory_pin");
+        started.remove("sparing_release");
         assert!(matches!(
             serde_json::from_value::<Report>(legacy).unwrap(),
             Report::Started {
                 directory_pin: false,
+                sparing_release: false,
                 ..
             }
         ));
@@ -2485,6 +2652,7 @@ exec /bin/sleep 60
             .allocator
             .boot_id = boot;
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2599,6 +2767,7 @@ exec /bin/sleep 60
         let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::default());
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2667,6 +2836,167 @@ exec /bin/sleep 60
                 .unwrap()
                 .contains("length")
         );
+    }
+
+    /// A holder killed without its receipt, and so never able to answer a
+    /// Release, settles its close once its provider is gone too (#2426).
+    /// While the provider outlives it, the provider may still be running a
+    /// turn, and the close keeps refusing.
+    #[test]
+    fn a_holder_lost_with_its_provider_settles_its_close() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LOST_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::a_holder_lost_with_its_provider_settles_its_close", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        context.installed();
+        let record = holder.identity.record.clone();
+        let kill = |process: &Process| {
+            unsafe { libc::kill(process.pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while process.is_current() {
+                assert!(Instant::now() < deadline, "the killed process never exited");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let evidence = || {
+            registry::evidence(
+                &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
+                Kind::Native,
+            )
+            .unwrap()
+        };
+        kill(&record.holder);
+        assert!(record.root.is_current(), "the provider outlived its holder");
+        holder.close_inner(false, DetachedWork::Stop).unwrap_err();
+        assert_eq!(evidence(), Some(record.clone()));
+        kill(&record.root);
+        holder.close_inner(false, DetachedWork::Stop).unwrap();
+        assert_eq!(evidence(), None, "its record is retired as discovery would");
+        // Nothing is left to release when the Holder is dropped.
+        drop(holder);
+    }
+
+    #[test]
+    fn an_ordinary_release_leaves_what_the_provider_leaves() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SPARING_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::an_ordinary_release_leaves_what_the_provider_leaves", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let fixture =
+            crate::daemon::owned_children::tests::provider_with_detached_work(working.path());
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: fixture.get_program().to_str().unwrap().into(),
+            arguments: fixture
+                .get_args()
+                .map(|argument| argument.to_str().unwrap().into())
+                .collect(),
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut holder = spawn(spec, source).unwrap();
+        context.installed();
+        assert!(holder.sparing_release);
+        let holder_pid = holder.identity.record.holder.pid;
+        let work =
+            crate::daemon::owned_children::tests::detached_work_under(working.path(), holder_pid);
+        let (detached, running, left) = (work.detached, work.running, work.left);
+        let detached = Process::read(detached).unwrap();
+        let running = Process::read(running).unwrap();
+        let left = Process::read(left).unwrap();
+        let holder_process = holder.identity.record.holder.clone();
+        holder.close_inner(false, DetachedWork::Spare).unwrap();
+        // Through the holder's own exit, after its last teardown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while holder_process.is_current() {
+            assert!(Instant::now() < deadline, "the holder did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            running.reaped(),
+            "the provider stopped its own command as it quit"
+        );
+        assert!(
+            [&detached, &left].into_iter().all(|process| {
+                process.is_current() && crate::daemon::owned_children::tests::alive(process.pid)
+            }),
+            "what the provider leaves running keeps running"
+        );
+        for process in [detached, left] {
+            unsafe { libc::kill(process.pid, libc::SIGKILL) };
+        }
     }
 
     #[test]

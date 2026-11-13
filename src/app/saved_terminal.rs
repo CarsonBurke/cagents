@@ -97,7 +97,7 @@ fn candidate(session: &TerminalSession) -> bool {
 
 /// Only the issued descriptor may select an existing attachment. No matching
 /// descriptor means disconnected saved data, not evidence that a process ended.
-fn attachment(
+pub(super) fn attachment(
     source: &TerminalSession,
     terminals: &[crate::terminal::ipc::TerminalDescriptor],
     proof: &HostSessionProof,
@@ -226,7 +226,7 @@ fn inspect_inventory(
 /// Keep the captured endpoint through the actual attachment, not just its
 /// inventory lookup. The normal constructor may resolve the selected device
 /// again; this saved-source operation must not follow a later device switch.
-fn attach_existing(
+pub(super) fn attach_existing(
     card: CardId,
     recovered: daemon_recovery::RecoveredTerminal,
     socket: PathBuf,
@@ -292,6 +292,17 @@ impl Cagents {
                 && !self.shared_views.attached.contains(&card)
                 && matches!(self.cards.get(&card), Some(CardRuntime::Loading))
         })
+    }
+
+    /// Whether an inspection settled without attaching or proving absence.
+    /// Several of those refusals are races that a later check resolves, and
+    /// one is re-inspected only when a related owner is observed or someone
+    /// reconnects, so a startup gate checks it again itself.
+    pub(super) fn saved_terminal_unavailable(&self, card: CardId) -> bool {
+        !self.terminal_start_in_flight(card)
+            && self
+                .saved_terminal_current(card)
+                .is_some_and(|entry| matches!(entry.disposition, Disposition::Unavailable))
     }
 
     /// Diagnostics must not reopen a User control connection for an inherited
@@ -364,13 +375,8 @@ impl Cagents {
         // Inspection is metadata-only. Keep unopened panes hibernated while
         // the exact owner is checked; the saved-entry fence prevents a
         // visibility transition from starting a replacement in the meantime.
-        let exposure = self.card_state(card).map(|state| state.exposure);
-        if let Some(exposure) = exposure {
-            self.lifecycle
-                .register(card, exposure, Residency::Hibernated, Instant::now());
-            if let Some(state) = self.card_state_mut(card) {
-                state.residency = Residency::Hibernated;
-            }
+        if self.card_state(card).is_some() {
+            self.register_presence(card, self.exposure(card), Residency::Hibernated);
         }
         self.cards.insert(card, CardRuntime::Loading);
         true
@@ -673,16 +679,18 @@ impl Cagents {
                 && entry.request == request
             {
                 entry.disposition = Disposition::Unavailable;
+                self.startup_attach_failed(
+                    card,
+                    source.id,
+                    "it changed while it was being checked".into(),
+                );
             }
             return self.finish_terminal_start(card);
         }
         match result {
             Ok(Some(started)) => {
                 self.saved_terminals.entries.remove(&card);
-                let exposure = self
-                    .card_state(card)
-                    .map(|state| state.exposure)
-                    .unwrap_or(Exposure::Offscreen);
+                let exposure = self.exposure(card);
                 let residency = if exposure == Exposure::Offscreen {
                     Residency::Hibernated
                 } else {
@@ -690,25 +698,21 @@ impl Cagents {
                         epoch: unix_millis().max(1) as u64,
                     }
                 };
-                self.lifecycle
-                    .register(card, exposure, residency.clone(), Instant::now());
-                if let Some(state) = self.card_state_mut(card) {
-                    state.residency = residency;
-                }
+                self.register_presence(card, exposure, residency);
                 self.terminal_started(card, source.id, Ok(started))
             }
             result => {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
                 entry.directory = directory;
                 let absent = result.is_ok();
-                if let Err(error) = &result {
-                    tracing::debug!(?card, %error, "saved terminal inspection refused");
-                }
                 entry.disposition = if absent {
                     Disposition::Dormant
                 } else {
                     Disposition::Unavailable
                 };
+                if let Err(error) = result {
+                    self.startup_attach_failed(card, source.id, error);
+                }
                 self.lifecycle.remove(card);
                 let finished = self.finish_terminal_start(card);
                 if absent
@@ -800,11 +804,13 @@ impl Cagents {
             crate::ui_controls::button::primary(if pending { "Checking…" } else { "Reconnect" })
                 .id(control_id("reconnect"))
                 .name("Reconnect saved terminal");
-        let reconnect = if pending || !allows_command(&entry.authority, Command::Reconnect) {
-            reconnect
-        } else {
-            reconnect.on_press(action(Command::Reconnect))
-        };
+        let closing = self.terminal_close_in_progress(card);
+        let reconnect =
+            if pending || closing || !allows_command(&entry.authority, Command::Reconnect) {
+                reconnect
+            } else {
+                reconnect.on_press(action(Command::Reconnect))
+            };
         let mut controls = vec![reconnect.into()];
         if dormant {
             let label = if entry.source.agent_resume_recipe().is_some() {
@@ -816,7 +822,9 @@ impl Cagents {
                 crate::ui_controls::button::secondary(label)
                     .id(control_id("relaunch"))
                     .name("Explicitly relaunch the saved terminal")
-                    .on_press_maybe(relaunch_available.then(|| action(Command::Relaunch)))
+                    .on_press_maybe(
+                        (relaunch_available && !closing).then(|| action(Command::Relaunch)),
+                    )
                     .into(),
             );
         }
@@ -837,11 +845,11 @@ impl Cagents {
                         .then(|| action(Command::NewTerminal)),
                 )
                 .into(),
-            crate::ui_controls::button::secondary("Close")
+            crate::ui_controls::button::secondary(if closing { "Checking…" } else { "Close" })
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
                 .on_press_maybe(
-                    allows_command(&entry.authority, Command::Close)
+                    (!closing && allows_command(&entry.authority, Command::Close))
                         .then(|| action(Command::Close)),
                 )
                 .into(),

@@ -894,6 +894,192 @@ fn report_close(app: &mut Cagents, outcome: terminal_close::CloseOutcome) {
     });
 }
 
+/// Reopening a closed pane runs its saved command again without asking. That
+/// is an undo for a pane someone just stopped, but a dead one has nothing to
+/// undo, and clearing many of them mustn't leave a stack of launches behind.
+#[test]
+fn only_a_terminal_that_was_running_can_be_reopened() {
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert!(app.recently_closed.is_empty());
+    assert!(app.proven_gone_cards.is_empty());
+
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(&mut app, terminal_close::CloseOutcome::Closed);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(app.recently_closed.len(), 1);
+}
+
+#[test]
+fn a_terminal_proven_gone_leaves_through_ordinary_removal() {
+    let (mut app, card, terminal, _) = live_app();
+    app.set_residency(card, Residency::Hot);
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(app.terminal_close.as_ref().unwrap().pending);
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(app.terminal_close.is_none());
+    assert!(!app.terminal_close_attempts.contains(&terminal));
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+}
+
+#[test]
+fn a_proof_of_absence_cannot_retire_a_pane_that_changed_or_is_starting() {
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    // Any change, even one keeping the identity and proof, means the proof was
+    // about a pane that no longer exists.
+    let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    session.resume_hint = Some("changed while closing".into());
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(app.workspace.pending_close().is_none());
+
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    app.begin_terminal_start(card);
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(
+        app.terminal_close
+            .as_ref()
+            .unwrap()
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("starting")
+    );
+    assert!(app.workspace.pending_close().is_none());
+}
+
+#[test]
+fn a_kept_terminal_says_why_and_allows_a_fresh_explicit_close() {
+    let (mut app, card, terminal, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("the reason to keep it".into()),
+    );
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert_eq!(intent.detail.as_deref(), Some("the reason to keep it"));
+    assert!(!intent.pending);
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(!app.terminal_close_attempts.contains(&terminal));
+    let _ = app.update(Message::CancelTerminalClose);
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.terminal_close.as_ref().unwrap().pending);
+}
+
+/// #2365: a pane kept only by processes Close couldn't read offers to close
+/// anyway. Keeping it stays the focused choice; closing proves everything again
+/// and passes over exactly the processes the dialog named.
+#[test]
+fn a_pane_kept_by_unreadable_processes_can_be_closed_beside_them() {
+    use crate::upgrade::UnreadableProcess;
+    let (mut app, card, terminal, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    let agent = UnreadableProcess::fixture(4242, 100, "ssh-agent");
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept(super::daemon_recovery::KeptPane {
+            reason: "ssh-agent (PID 4242) can't be read".into(),
+            unreadable: vec![agent.clone()],
+        }),
+    );
+    assert!(app.terminal_close_dialog_visible());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+
+    let _ = app.update(Message::ConfirmTerminalClose);
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(intent.pending, "Close anyway starts a fresh close");
+    assert!(intent.detail.is_none());
+    assert!(
+        app.terminal_close_dialog_visible(),
+        "the dialog shows the check"
+    );
+    assert!(app.terminal_close_attempts.contains(&terminal));
+    // A second press while it checks does nothing.
+    let _ = app.update(Message::ConfirmTerminalClose);
+
+    // Something else turns up: that is reported, and nothing else is offered.
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("A process started by this terminal".into()),
+    );
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(!intent.pending);
+    assert_eq!(
+        intent.detail.as_deref(),
+        Some("A process started by this terminal")
+    );
+    let _ = app.update(Message::ConfirmTerminalClose);
+    assert!(
+        !app.terminal_close.as_ref().unwrap().pending,
+        "a refusal that names no unreadable process can't be closed anyway"
+    );
+
+    // Without the choice, a kept pane is only dismissed.
+    let _ = app.update(Message::CancelTerminalClose);
+    assert!(app.terminal_close.is_none());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+}
+
+/// A refusal takes over from the wait, and the pane can be closed again.
+#[test]
+fn a_pane_says_its_close_is_being_checked_only_until_the_answer() {
+    let (mut app, card, _, _) = live_app();
+    assert!(!app.terminal_close_in_progress(card));
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.terminal_close_in_progress(card));
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("The pane was kept.".into()),
+    );
+    assert!(!app.terminal_close_in_progress(card));
+}
+
+/// A lost connection used to stop Close before it asked anything, so a pane
+/// whose daemon came back without its terminal could never be removed.
+#[test]
+fn a_lost_connection_only_asks_whether_the_terminal_is_gone() {
+    let (mut app, card, _, proof) = live_app();
+    app.uncertain_terminal_proofs.insert(card, proof);
+    let _ = app.update(Message::CloseCard(card));
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(intent.pending);
+    assert!(intent.is_probe_only());
+    assert!(intent.detail.is_none());
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+
+    // Without a saved identity there is nothing to ask about.
+    let (mut app, card, _, proof) = live_app();
+    app.uncertain_terminal_proofs.insert(card, proof);
+    let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    session.continuity = TerminalContinuity::Failed {
+        typed_error: crate::model::RuntimeError {
+            code: "runtime_failed".into(),
+            message: "failed".into(),
+        },
+        retryable: true,
+    };
+    let _ = app.update(Message::CloseCard(card));
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(!intent.pending);
+    assert!(intent.detail.as_deref().unwrap().contains("Reconnect"));
+}
+
 fn request_active_close(app: &mut Cagents, card: CardId) {
     let _ = app.update(Message::CloseCard(card));
     report_close(app, terminal_close::CloseOutcome::Active);
@@ -921,33 +1107,37 @@ fn pointer_and_keyboard_close_preserve_live_card_until_confirmation() {
     }
 }
 
+/// Escape keeps the terminal, even when the terminal the question opened over
+/// still has focus and captured the key.
 #[test]
 fn escape_consumes_terminal_confirmation_without_closing_context() {
-    let (mut app, card, _, _) = live_app();
-    request_active_close(&mut app, card);
-    let key = keyboard::Key::Named(keyboard::key::Named::Escape);
-    let _ = app.update(Message::KeyEvent {
-        event: keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        },
-        captured: false,
-    });
-    assert!(app.terminal_close.is_none());
-    assert!(app.card_state(card).unwrap().existence.is_open());
-    assert!(app.terminal_close_attempts.is_empty());
-    assert_eq!(app.workspace.focused(), Some(card));
+    for captured in [false, true] {
+        let (mut app, card, _, _) = live_app();
+        request_active_close(&mut app, card);
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        let _ = app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured,
+        });
+        assert!(app.terminal_close.is_none(), "captured={captured}");
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.terminal_close_attempts.is_empty());
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
 }
 
 #[test]
 fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_card() {
     let (mut app, card, _, _) = live_app();
-    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    app.set_residency(card, Residency::Hot);
     request_active_close(&mut app, card);
     let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
         unreachable!()
@@ -1364,4 +1554,84 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     });
     tests::settle_settings_task(&mut app, enable);
     assert!(settings::load(&path).unwrap().confirm_terminal_close);
+}
+
+#[test]
+fn enter_on_a_focused_button_leaves_the_next_click_to_the_control_under_the_pointer() {
+    use iced::{
+        Point, Size,
+        advanced::{clipboard, widget::operation},
+        keyboard, mouse,
+        runtime::user_interface::{Cache, UserInterface},
+    };
+
+    // The Enter-activated button comes first: a row offers each event to its
+    // children in order, so a latched button would take the click's release
+    // before the button under the pointer sees it.
+    let keyboard_id = widget::Id::new("enter.contract.keyboard");
+    let pointer_id = widget::Id::new("enter.contract.pointer");
+    let element: Element<'static, u8> = widget::row([
+        widget::button::custom(design::caption("Keyboard action"))
+            .id(keyboard_id.clone())
+            .width(Length::Fixed(100.0))
+            .height(Length::Fixed(40.0))
+            .on_press(1)
+            .into(),
+        widget::button::custom(design::caption("Pointer action"))
+            .id(pointer_id)
+            .width(Length::Fixed(100.0))
+            .height(Length::Fixed(40.0))
+            .on_press(2)
+            .into(),
+    ])
+    .spacing(20)
+    .into();
+    let mut renderer = tests::headless_renderer();
+    let mut ui = UserInterface::build(
+        element,
+        Size::new(400.0, 100.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(keyboard_id),
+    );
+    let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+    let enter = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    });
+    let mut messages = Vec::new();
+    ui.update(
+        &[enter],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(messages, vec![1], "Enter activates the focused button");
+
+    let pointer = Point::new(170.0, 20.0);
+    ui.update(
+        &[
+            iced::Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ],
+        mouse::Cursor::Available(pointer),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(
+        messages,
+        vec![1, 2],
+        "the first click after Enter reaches the button under the pointer"
+    );
 }

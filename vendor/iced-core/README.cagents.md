@@ -32,3 +32,13 @@ cargo test --manifest-path vendor/iced-core/Cargo.toml \
 ## Custom ID hashing
 
 Custom widget IDs now hash their names, matching their existing equality comparison. Regression tests cover rebuilt named IDs, unique IDs, and sets. This implementation is selected without accessibility; the corresponding accessibility ID implementation is patched in `vendor/iced-accessibility`.
+
+## Drag destination registration order
+
+`DndDestinationRectangles::into_rectangles` retains insertion order for internal
+widget traversal. Scrollable and scale wrappers extract, transform, and append
+these lists; reversing on each extraction made overlapping target priority
+depend on the number of enclosing wrappers. The patched Winit consumer uses
+`into_native_rectangles` to reverse once when registering the final native list.
+App regressions cover plain, nested surface, real Scrollable, file-drop scaling,
+and combined wrappers with a preceding root sibling.

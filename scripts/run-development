@@ -10,13 +10,66 @@ debug=false
 fresh_daemon=false
 hot=false
 log_file=
+daemon_log=
+instance=
+in_session=false
+stop_instance=false
+list_instances=false
+keep_instance=false
+instance_ttl=
+collect_garbage=false
+storage_days=
+watch_instance=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        # Internal: the watcher an instance's launch leaves behind.
+        __watch-instance) watch_instance=true; shift; break ;;
         --browserless) browserless=true ;;
         --debug) debug=true ;;
         --fresh-daemon) fresh_daemon=true ;;
         --hot) hot=true; browserless=true ;;
         --hot-integrated) hot=true; browserless=false ;;
+        --instance|--stop-instance)
+            if [ "$1" = --stop-instance ]; then stop_instance=true; else stop_instance=false; fi
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "$1 requires a name" >&2
+                exit 2
+            fi
+            shift
+            instance=$1
+            # Matches the application's own check, which also keeps the daemon
+            # socket path inside the session's runtime within 108 bytes.
+            case $instance in
+                [!A-Za-z0-9]*|*[!A-Za-z0-9-]*)
+                    printf '%s\n' "instance names use ASCII letters, digits and hyphens, starting with a letter or digit" >&2
+                    exit 2
+                    ;;
+            esac
+            [ "${#instance}" -le 24 ] || {
+                printf '%s\n' "instance names are at most 24 characters" >&2
+                exit 2
+            }
+            ;;
+        --in-session) in_session=true ;;
+        --list-instances) list_instances=true ;;
+        --keep) keep_instance=true ;;
+        --ttl)
+            if [ "$#" -lt 2 ] || ! printf '%s' "$2" | grep -Eqx '[1-9][0-9]*'; then
+                printf '%s\n' "--ttl requires a whole number of seconds" >&2
+                exit 2
+            fi
+            shift
+            instance_ttl=$1
+            ;;
+        --gc) collect_garbage=true ;;
+        --storage)
+            if [ "$#" -lt 2 ] || ! printf '%s' "$2" | grep -Eqx '[1-9][0-9]*'; then
+                printf '%s\n' "--storage requires a whole number of days, at least 1" >&2
+                exit 2
+            fi
+            shift
+            storage_days=$1
+            ;;
         --log-file)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "--log-file requires a path" >&2
@@ -29,6 +82,19 @@ while [ "$#" -gt 0 ]; do
                 *) log_file=$caller_cwd/$log_file ;;
             esac
             ;;
+        --daemon-log)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "--daemon-log requires a path" >&2
+                exit 2
+            fi
+            shift
+            daemon_log=$1
+            case $daemon_log in
+                /*) ;;
+                *) daemon_log=$caller_cwd/$daemon_log ;;
+            esac
+            debug=true
+            ;;
         --help)
             cat <<'USAGE'
 Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
@@ -40,7 +106,44 @@ Options:
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
   --hot-integrated  Explicit embedded-browser hot reload
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
+  --daemon-log PATH
+                   Append the development daemon's tracing output to PATH
+                   (relative to caller); implies --debug. Works with --instance.
+                   Takes effect when the daemon next starts, as with
+                   --fresh-daemon
+  --instance NAME  Run an isolated instance, with its own storage and daemon, in
+                   a headless niri-harness session named cagents-NAME. Returns
+                   once its window maps; --fresh-daemon replaces a running one
+  --in-session     With --instance, stay in the current private niri-harness
+                   session in the foreground; the caller owns its lifetime
+  --stop-instance NAME
+                   Stop that instance's daemon, its jobs and its session; keep
+                   its storage
+  --keep           With --instance: keep it running after the session that
+                   started it ends. Without it, the instance stops 10 minutes
+                   (CAGENTS_INSTANCE_GRACE_SECONDS) after that session ends
+  --ttl SECONDS    With --instance: stop it this long after it starts, whoever
+                   started it
+  --list-instances List the development daemons running on this computer: their
+                   checkout, age, instance, who started them, when they stop
+                   and how to stop them
+  --gc             Stop instances whose starter has ended, other than kept ones,
+                   and clear what dead sessions left behind
+  --storage DAYS   With --gc: also delete the storage of instances not used for
+                   DAYS days and not running
   --help           Show this help
+
+A session hosted by cagents may stop or replace an instance it started, or any
+development daemon with a runtime directory of its own. It may not stop the
+daemon that hosts it or a session it descends from, nor the default development
+daemon in the login session.
+
+Environment:
+  CAGENTS_ZIG      Absolute Zig path; zig env must report an executable named zig
+  CAGENTS_DEVELOPMENT_NESTED_ONLY=1
+                   Refuse to start a UI on the caller's own desktop: start it
+                   with --instance, or inside a session through niri-harness exec,
+                   which provides a private runtime and no DISPLAY
 USAGE
             exit 0
             ;;
@@ -56,8 +159,633 @@ USAGE
     shift
 done
 
+if [ "$in_session" = true ]; then
+    if [ -z "$instance" ] || [ "$stop_instance" = true ] || [ "$keep_instance" = true ] ||
+        [ -n "$instance_ttl" ] || [ "$fresh_daemon" = true ] || [ "$hot" = true ] ||
+        [ "$list_instances" = true ] || [ "$collect_garbage" = true ]; then
+        printf '%s\n' "--in-session requires --instance and cannot manage a session's lifetime" >&2
+        exit 2
+    fi
+    private_session=false
+    case ${XDG_RUNTIME_DIR:-}:${DISPLAY:-}:${NIRI_SOCKET:-} in
+        */nh-?*::?*) private_session=true ;;
+        /*::?*)
+            # native-evidence keeps its app runtime beside the compositor's.
+            if [ -n "${CAGENTS_EVIDENCE_FIXTURE:-}" ] &&
+                [ "$XDG_RUNTIME_DIR" = "${CAGENTS_EVIDENCE_FIXTURE%/fixture}/rt" ] &&
+                [ -f "${CAGENTS_EVIDENCE_FIXTURE%/fixture}/.native-evidence" ]; then
+                private_session=true
+            fi
+            ;;
+    esac
+    if [ "$private_session" = false ]; then
+        printf '%s\n' "--in-session requires a private niri-harness session" >&2
+        exit 2
+    fi
+fi
+
+if [ -n "$storage_days" ] && [ "$collect_garbage" = false ]; then
+    printf '%s\n' "--storage only goes with --gc" >&2
+    exit 2
+fi
+if { [ "$keep_instance" = true ] || [ -n "$instance_ttl" ]; } &&
+    { [ -z "$instance" ] || [ "$stop_instance" = true ]; }; then
+    printf '%s\n' "--keep and --ttl go with --instance NAME" >&2
+    exit 2
+fi
+
+# What a process was started as and when, which tells it from a later process
+# given the same ID. The command name in parentheses may contain spaces.
+process_parent() {
+    sed 's/.*) [^ ]* \([0-9]*\) .*/\1/' "/proc/$1/stat" 2>/dev/null
+}
+process_start() {
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+runs_daemon() {
+    case $(readlink "/proc/$1/exe" 2>/dev/null) in
+        */cagentsd | */cagentsd' (deleted)') return 0 ;;
+    esac
+    return 1
+}
+process_variable() {
+    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null | sed -n "s/^$2=//p" | head -n 1
+}
+process_hosted_by() {
+    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null |
+        awk 'found && /^[A-Za-z_][A-Za-z0-9_]*=/ { exit }
+            /^CAGENTS_DEVELOPMENT_HOSTED_BY=/ { sub(/^[^=]*=/, ""); found = 1 }
+            found && /^\// { print }'
+}
+
+# The runtime directories of every daemon above this process, one per line,
+# as the CLI's hosted stop check finds them: each directory a daemon's
+# environment could select, and those of the daemons above the session that
+# started its instance, which the harness detached from that session. A
+# daemon whose runtime can't be read is a line with a single "?".
+caller_host_runtimes() {
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        if runs_daemon "$process"; then
+            base=$(process_variable "$process" XDG_RUNTIME_DIR)
+            case $base in
+                /*)
+                    printf '%s/cagents\n%s/cagents-development\n' "$base" "$base"
+                    name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE)
+                    [ -z "$name" ] || printf '%s/cagents-development-%s\n' "$base" "$name"
+                    ;;
+                *) printf '%s\n' '?' ;;
+            esac
+            process_hosted_by "$process"
+        fi
+        process=$(process_parent "$process") && [ -n "$process" ] || {
+            printf '%s\n' '?'
+            break
+        }
+    done | awk '!seen[$0]++'
+}
+
+# Whether a hosted caller's hosts, as caller_host_runtimes lists them, can't be
+# told. Like the CLI, a session cagents hosts then stops nothing.
+hosts_unknown() {
+    [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ] || return 1
+    [ -z "$1" ] || printf '%s\n' "$1" | grep -qxF '?'
+}
+
+# Who an instance belongs to: in a session cagents hosts, the process that
+# session runs, whose parent is one of the daemon's own processes; otherwise
+# the shell that ran this.
+owner_process() {
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        parent=$(process_parent "$process") || break
+        if runs_daemon "$parent"; then
+            printf '%s\n' "$process"
+            return
+        fi
+        process=$parent
+    done
+    printf '%s\n' "$PPID"
+}
+
+# Kept in the session's runtime directory, which ends with it.
+owner_record=cagents-run-development.owner
+record_owner() {
+    [ -n "$1" ] || return 0
+    owner=$(owner_process)
+    {
+        printf 'checkout=%s\n' "$root"
+        printf 'owner=%s\n' "$owner"
+        printf 'owner_start=%s\n' "$(process_start "$owner")"
+        printf 'owner_name=%s\n' "$(cat "/proc/$owner/comm" 2>/dev/null)"
+        if [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+            printf 'hosted=true\n'
+        fi
+        if [ "$keep_instance" = true ]; then
+            printf 'lifetime=kept\n'
+        else
+            printf 'lifetime=owner\n'
+        fi
+        printf 'grace=%s\n' "$(instance_grace)"
+        printf 'started_at=%s\n' "$(date +%s)"
+        [ -z "$instance_ttl" ] || printf 'ttl=%s\n' "$instance_ttl"
+    } >"$1/$owner_record"
+}
+
+# How long an instance outlives the session that started it: long enough to
+# survive that session restarting, short enough that nothing piles up.
+instance_grace() {
+    grace=${CAGENTS_INSTANCE_GRACE_SECONDS:-600}
+    case $grace in
+        '' | *[!0-9]*) grace=600 ;;
+    esac
+    printf '%s\n' "$grace"
+}
+
+record_value() {
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
+
+# Whether a record's starter still runs: the same process ID started at the
+# same moment, so a later process given that ID does not count.
+owner_alive() {
+    owner=$(record_value "$1" owner)
+    owner_start=$(record_value "$1" owner_start)
+    [ -n "$owner" ] && [ -n "$owner_start" ] && [ "$(process_start "$owner")" = "$owner_start" ]
+}
+
+# Why the instance whose record this is should stop now, if it should. A
+# starter that has ended starts its grace period; owner_gone keeps when the
+# watcher first saw it gone, or the record's age when nothing watched.
+reap_reason() {
+    record=$1
+    now=$(date +%s)
+    started_at=$(record_value "$record" started_at)
+    ttl=$(record_value "$record" ttl)
+    if [ -n "$ttl" ] && [ -n "$started_at" ] && [ $((now - started_at)) -ge "$ttl" ]; then
+        printf 'its --ttl of %s seconds passed\n' "$ttl"
+        return 0
+    fi
+    [ "$(record_value "$record" lifetime)" != kept ] || return 1
+    ! owner_alive "$record" || return 1
+    grace=$(record_value "$record" grace)
+    grace=${grace:-$(instance_grace)}
+    if [ -n "${2-}" ]; then
+        [ $((now - $2)) -ge "$grace" ] || return 1
+        printf '%s (pid %s), which started it, ended over %s seconds ago\n' \
+            "$(record_value "$record" owner_name)" "$(record_value "$record" owner)" "$grace"
+    elif [ -n "$started_at" ]; then
+        # Nothing saw when it ended, only that the instance is older than that.
+        [ $((now - started_at)) -ge "$grace" ] || return 1
+        printf '%s (pid %s), which started it, has ended, and it started over %s seconds ago\n' \
+            "$(record_value "$record" owner_name)" "$(record_value "$record" owner)" "$grace"
+    else
+        printf '%s (pid %s), which started it, has ended\n' \
+            "$(record_value "$record" owner_name)" "$(record_value "$record" owner)"
+    fi
+}
+
+# A harness session's state in `niri-harness list`: live, asleep or dead, or
+# nothing for no such session. `env` also answers for a dead session, and
+# `exec` would wake a sleeping one.
+session_state() {
+    listing=$(niri-harness list 2>/dev/null) || {
+        printf '%s\n' unknown
+        return 0
+    }
+    printf '%s\n' "$listing" | awk -v session="$1" '$1 == session { print $2; exit }'
+}
+
+session_live() {
+    case $(session_state "$1") in
+        live | asleep) return 0 ;;
+    esac
+    return 1
+}
+
+# Whether a dead session's files changed within the last minute, as
+# `niri-harness gc` judges: a session still starting may not have recorded its
+# compositor yet, so it looks dead.
+recently_changed() {
+    [ -n "$1" ] && [ -e "$1" ] && [ -n "$(find "$1" -maxdepth 0 -newermt '-60 seconds' 2>/dev/null)" ]
+}
+
+session_runtime() {
+    harness_env=$(niri-harness --session "$1" env </dev/null 2>/dev/null) || return 1
+    (
+        unset XDG_RUNTIME_DIR
+        eval "$harness_env"
+        printf '%s' "${XDG_RUNTIME_DIR-}"
+    )
+}
+
+# Where an instance's own notes go: its state directory, which outlives its
+# runtime directory, so the next launch or listing can say what happened.
+instance_log() {
+    directory=${XDG_STATE_HOME:-$HOME/.local/state}/cagents-development-$1
+    mkdir -p -- "$directory" 2>/dev/null || return 0
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$2" >>"$directory/run-development.log" 2>/dev/null || :
+}
+
+# Bus-activated services such as the document portal and gvfs can outlive the
+# harness session, and their FUSE mounts keep the harness from removing its
+# runtime directory. Only processes started with that private directory carry
+# it in their environment. A killed FUSE server can leave its mount behind
+# until the kernel notices, so detach any that remain before removing it.
+# Whether a directory is a harness session's private runtime directory, the
+# only kind an instance is stopped or swept by: never this caller's own. A
+# caller inside another session has that session's runtime, beside the ones
+# it may stop.
+private_runtime() {
+    # From cron, or an ssh login without a user session, the variable may be
+    # unset; the user's runtime directory is where systemd puts it.
+    base=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    base=${base%/nh-*}
+    case $1 in
+        */*/nh-*/* | */..* | "${XDG_RUNTIME_DIR:-$base}") return 1 ;;
+        "$base"/nh-?*) return 0 ;;
+    esac
+    return 1
+}
+
+sweep_instance_runtime() {
+    sweep_name=$1
+    private_runtime "$2" || return 0
+    signal_runtime TERM "$2"
+    [ -d "$2" ] || return 0
+    awk -v runtime="$2" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+        /proc/self/mountinfo | while IFS= read -r mount; do
+        fusermount3 -u -z "$mount" 2>/dev/null || fusermount -u -z "$mount" 2>/dev/null || :
+    done
+    if awk -v runtime="$2" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        printf '%s\n' "instance $sweep_name runtime retained at $2: a filesystem is still mounted there" >&2
+        return 0
+    fi
+    rm -rf -- "$2"
+}
+
+# Stops an instance without its CLI: every process started with its private
+# runtime directory, the daemon among them, gets TERM, as `daemon
+# stop-for-rebuild` sends, then KILL after 10 seconds; then its harness
+# session goes and the runtime is swept. A watcher whose starter has gone may
+# no longer be able to tell its hosts, which the CLI needs.
+reap_instance() {
+    reap_name=$1 reap_runtime=$2 reason=$3
+    private_runtime "$reap_runtime" || return 1
+    instance_log "$reap_name" "stopped: $reason"
+    signal_runtime TERM "$reap_runtime"
+    deadline=$(($(date +%s) + 10))
+    while [ -n "$(runtime_processes "$reap_runtime")" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 0.5
+    done
+    signal_runtime KILL "$reap_runtime"
+    # Only the session that still has this runtime: a later launch may have
+    # given the name to another.
+    if [ "$(session_runtime "cagents-$reap_name")" = "$reap_runtime" ]; then
+        niri-harness --session "cagents-$reap_name" stop </dev/null >/dev/null 2>&1 || :
+    fi
+    sweep_instance_runtime "$reap_name" "$reap_runtime"
+}
+
+# Every process started with a runtime directory, other than this one and the
+# processes it runs under, which a stop must not end.
+runtime_processes() {
+    ancestors=" "
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        ancestors="$ancestors$process "
+        process=$(process_parent "$process") || break
+    done
+    grep -lzxF "XDG_RUNTIME_DIR=$1" /proc/[0-9]*/environ 2>/dev/null |
+        sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p' | while read -r process; do
+            case $ancestors in
+                *" $process "*) ;;
+                *) printf '%s\n' "$process" ;;
+            esac
+        done
+}
+
+signal_runtime() {
+    for process in $(runtime_processes "$2"); do
+        kill "-$1" "$process" 2>/dev/null || :
+    done
+}
+
+# Watches one instance for the life of its session, and stops it once
+# reap_reason says so. It ends with the session, however that ends.
+watch_instance_lifetime() {
+    name=$1 runtime=$2
+    for descriptor in 3 4 5 6 7 8 9; do
+        eval "exec $descriptor>&-"
+    done
+    record=$runtime/$owner_record
+    printf 'watcher=%s\nwatcher_start=%s\n' "$$" "$(process_start $$)" >>"$record"
+    : "${XDG_RUNTIME_DIR:=${runtime%/nh-*}}"
+    export XDG_RUNTIME_DIR
+    interval=${CAGENTS_INSTANCE_WATCH_SECONDS:-30}
+    if ! printf '%s' "$interval" | grep -Eqx '[0-9]+(\.[0-9]*)?|\.[0-9]+' ||
+        ! awk -v interval="$interval" 'BEGIN { exit !(interval + 0 > 0) }'; then
+        interval=30
+    fi
+    gone=
+    while sleep "$interval"; do
+        [ -f "$record" ] || exit 0
+        # A listing that fails once, such as while the harness is busy,
+        # says nothing about the session.
+        case $(session_state "cagents-$name") in
+            live | asleep | unknown) ;;
+            *) exit 0 ;;
+        esac
+        if owner_alive "$record"; then
+            gone=
+        else
+            gone=${gone:-$(date +%s)}
+        fi
+        if reason=$(reap_reason "$record" "$gone"); then
+            reap_instance "$name" "$runtime" "$reason" || :
+            exit 0
+        fi
+    done
+}
+
+# Whether an instance's watcher still runs.
+watcher_alive() {
+    watcher=$(record_value "$1" watcher)
+    [ -n "$watcher" ] && [ "$(process_start "$watcher")" = "$(record_value "$1" watcher_start)" ]
+}
+
+# Whether a process has a file open; a daemon keeps its lock open.
+holds_open() {
+    for descriptor in "/proc/$1/fd/"*; do
+        [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$2" ] || return 0
+    done
+    return 1
+}
+
+describe_lifetime() {
+    ttl=$(record_value "$1" ttl)
+    case $(record_value "$1" lifetime) in
+        kept) description='kept until stopped' ;;
+        owner) description="stops $(record_value "$1" grace) seconds after its starter ends" ;;
+        *) description='started by an older runner: runs until stopped, or scripts/run-development --gc once its starter has ended' ;;
+    esac
+    [ -z "$ttl" ] || description="$description, or $ttl seconds after it started"
+    # A kept instance without a --ttl has nothing to apply, so no watcher.
+    if [ -n "$(record_value "$1" lifetime)" ] && ! watcher_alive "$1" &&
+        { [ "$(record_value "$1" lifetime)" != kept ] || [ -n "$ttl" ]; }; then
+        description="$description; its watcher is gone, so the next launch or --gc applies this"
+    fi
+    printf '%s\n' "$description"
+}
+
+list_development_instances() {
+    found=false
+    hosts=$(caller_host_runtimes)
+    harness=false
+    ! command -v niri-harness >/dev/null 2>&1 || harness=true
+    for status in /proc/[0-9]*/status; do
+        process=${status#/proc/}
+        process=${process%/status}
+        # The daemon itself; its holders and actors run under another name.
+        [ "$(cat "/proc/$process/comm" 2>/dev/null)" = cagentsd ] || continue
+        executable=$(readlink "/proc/$process/exe" 2>/dev/null) || continue
+        name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE) || name=
+        runtime=$(process_variable "$process" XDG_RUNTIME_DIR) || runtime=
+        directory=$runtime/cagents-development${name:+-$name}
+        # A production daemon holds the lock of another directory.
+        holds_open "$process" "$directory/cagentsd.lock" || continue
+        found=true
+        case $executable in
+            */target/*)
+                checkout=${executable%%/target/*}
+                if [ ! -d "$checkout" ]; then
+                    checkout="$checkout (removed)"
+                else
+                    case $executable in
+                        *' (deleted)') checkout="$checkout, executable rebuilt since" ;;
+                    esac
+                fi
+                ;;
+            *) checkout="unknown; it runs $executable" ;;
+        esac
+        age=$(ps -o etime= -p "$process" 2>/dev/null | tr -d ' ') || age=
+        started_by='not recorded: started without --instance, or by an older runner'
+        lifetime='not recorded: it runs until stopped'
+        record=$runtime/$owner_record
+        if [ -f "$record" ]; then
+            owner=$(sed -n 's/^owner=//p' "$record" 2>/dev/null) || owner=
+            owner_name=$(sed -n 's/^owner_name=//p' "$record" 2>/dev/null) || owner_name=
+            owner_start=$(sed -n 's/^owner_start=//p' "$record" 2>/dev/null) || owner_start=
+            if [ -n "$owner" ] && [ -n "$owner_start" ] &&
+                [ "$(process_start "$owner")" = "$owner_start" ]; then
+                started_by="$owner_name (pid $owner), still running"
+            else
+                started_by="$owner_name (pid $owner), which has ended"
+            fi
+            if grep -qx 'hosted=true' "$record" 2>/dev/null; then
+                started_by="$started_by, in a cagents session"
+            fi
+            lifetime=$(describe_lifetime "$record")
+        fi
+        if printf '%s\n' "$hosts" | grep -qxF "$directory"; then
+            stop='not from here: it hosts this session, or one that started it'
+        elif hosts_unknown "$hosts"; then
+            stop='not from here: which daemons host this session can'"'"'t be told'
+        elif [ -z "$name" ] && [ "$runtime" = "/run/user/$(id -u)" ]; then
+            stop='not from a cagents session: it is the login session'"'"'s own development daemon'
+        elif [ -n "$name" ] && [ "$harness" = true ] &&
+            niri-harness --session "cagents-$name" env >/dev/null 2>&1; then
+            stop="scripts/run-development --stop-instance $name"
+        elif [ -n "$name" ] && [ "$harness" = false ]; then
+            stop="scripts/run-development --stop-instance $name, once niri-harness is installed; or kill $process"
+        else
+            stop="kill $process  (no runner session; this ends the daemon and its jobs)"
+        fi
+        printf '%s, pid %s, running %s\n' "${name:-unnamed}" "$process" "$age"
+        printf '  checkout:   %s\n' "$checkout"
+        printf '  runtime:    %s\n' "$runtime"
+        printf '  started by: %s\n' "$started_by"
+        printf '  lifetime:   %s\n' "$lifetime"
+        printf '  stop:       %s\n' "$stop"
+    done
+    [ "$found" = true ] || printf '%s\n' 'No development daemons are running.'
+}
+
+if [ "$watch_instance" = true ]; then
+    watch_instance_lifetime "$@"
+    exit 0
+fi
+
+# Instances to stop and leftovers to clear: dead harness sessions of
+# instances, which `env` still answers for and which kept a later launch of
+# that name from starting, and live ones that reap_reason says should stop,
+# when nothing watches them: one whose watcher was killed, or, with --gc, one
+# started by a runner too old to watch. Never one that hosts this caller.
+collect_instances() {
+    explicit=$1
+    command -v niri-harness >/dev/null 2>&1 || return 0
+    hosts=$(caller_host_runtimes)
+    if hosts_unknown "$hosts"; then
+        [ "$explicit" = false ] ||
+            printf '%s\n' "cannot tell which daemons host this session, so no instance can safely be stopped from it; run --gc from a terminal outside cagents" >&2
+        return 0
+    fi
+    list_errors=$(mktemp)
+    if ! listing=$(niri-harness list 2>"$list_errors"); then
+        [ "$explicit" = false ] ||
+            printf '%s\n' "niri-harness list failed, so no instance was checked: $(cat "$list_errors")" >&2
+        rm -f -- "$list_errors"
+        return 1
+    fi
+    rm -f -- "$list_errors"
+    sessions=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/')
+    while read -r session state _backend _cpu session_root; do
+        [ -n "$session" ] || continue
+        name=${session#cagents-}
+        runtime=$(session_runtime "$session") || continue
+        [ -n "$runtime" ] || continue
+        if printf '%s\n' "$hosts" |
+            awk -v prefix="$runtime/" 'index($0, prefix) == 1 { found = 1 } END { exit !found }'; then
+            continue
+        fi
+        if [ "$state" = dead ]; then
+            ! recently_changed "$session_root" || continue
+            if reap_instance "$name" "$runtime" "its session had ended without being stopped" &&
+                [ ! -e "$runtime" ]; then
+                printf '%s\n' "instance $name: its session had ended without being stopped; cleared what it left" >&2
+            fi
+            continue
+        fi
+        record=$runtime/$owner_record
+        if [ -f "$record" ]; then
+            ! watcher_alive "$record" || continue
+            [ "$explicit" = true ] || [ -n "$(record_value "$record" lifetime)" ] || continue
+            if reason=$(reap_reason "$record") && reap_instance "$name" "$runtime" "$reason"; then
+                printf '%s\n' "instance $name: stopped it because $reason" >&2
+            fi
+        elif [ "$explicit" = true ]; then
+            printf '%s\n' "instance $name: left running, since nothing records who started it; stop it with --stop-instance $name if it is unused" >&2
+        fi
+    done <<SESSIONS
+$sessions
+SESSIONS
+}
+
+# Storage of named instances that are not running and that nothing touched
+# for the given days: their cagents-development-NAME data, configuration,
+# state and cache directories, never the unnamed development storage or
+# anything else. An instance runs if its harness session does, or if any
+# process was started for it, such as a daemon outliving its session.
+collect_storage() {
+    days=$1 removed=false
+    live=
+    if command -v niri-harness >/dev/null 2>&1; then
+        listing=$(niri-harness list 2>/dev/null) || {
+            printf '%s\n' "niri-harness list failed, so no storage was removed, since which instances run can't be told" >&2
+            return 1
+        }
+        live=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/ && $2 != "dead" { print substr($1, 9) }')
+    fi
+    live=$live$(printf '\n'; cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' |
+        sed -n 's/^CAGENTS_DEVELOPMENT_INSTANCE=//p' | sort -u)
+    data_root=${XDG_DATA_HOME:-$HOME/.local/share}
+    config_root=${XDG_CONFIG_HOME:-$HOME/.config}
+    state_root=${XDG_STATE_HOME:-$HOME/.local/state}
+    cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+    names=$(for directory in "$data_root" "$config_root" "$state_root" "$cache_root"; do
+        for path in "$directory"/cagents-development-*; do
+            [ -d "$path" ] && printf '%s\n' "${path##*/cagents-development-}"
+        done
+    done | sort -u)
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        case $name in
+            [!A-Za-z0-9]* | *[!A-Za-z0-9-]*) continue ;;
+        esac
+        ! printf '%s\n' "$live" | grep -qxF "$name" || continue
+        set -- "$data_root/cagents-development-$name" "$config_root/cagents-development-$name" \
+            "$state_root/cagents-development-$name" "$cache_root/cagents-development-$name"
+        recent=
+        for directory in "$@"; do
+            [ ! -d "$directory" ] || recent=$recent$(find "$directory" -newermt "-$days days" -print -quit 2>/dev/null)
+        done
+        [ -z "$recent" ] || continue
+        size=$(du -csh -- "$@" 2>/dev/null | tail -n 1 | cut -f 1)
+        rm -rf -- "$@"
+        printf 'removed the storage of instance %s (%s), unused for %s days\n' "$name" "${size:-?}" "$days"
+        removed=true
+    done <<NAMES
+$names
+NAMES
+    [ "$removed" = true ] || printf 'no instance storage has gone unused for %s days\n' "$days"
+}
+
+if [ "$collect_garbage" = true ]; then
+    if ! collect_instances true; then
+        [ -z "$storage_days" ] ||
+            printf '%s\n' "no storage was removed either, since which instances run can't be told" >&2
+        exit 1
+    fi
+    [ -z "$storage_days" ] || collect_storage "$storage_days" || exit 1
+    exit 0
+fi
+
+if [ "$list_instances" = true ]; then
+    list_development_instances
+    exit 0
+fi
+
+if [ -n "$instance" ] && [ "$in_session" = false ]; then
+    if [ "$hot" = true ] || [ -n "$log_file" ]; then
+        printf '%s\n' "--instance runs in niri-harness, which keeps the UI log; it cannot be combined with --hot or --log-file" >&2
+        exit 2
+    fi
+    command -v niri-harness >/dev/null 2>&1 || {
+        printf '%s\n' 'required command not found: niri-harness' >&2
+        exit 1
+    }
+    harness_session=cagents-$instance
+    if [ "$stop_instance" = false ]; then
+        # What earlier sessions left: this name's dead session, which would
+        # otherwise block the launch, and expired instances nothing watches.
+        collect_instances false || :
+    fi
+    if [ "$stop_instance" = false ] && [ "$fresh_daemon" = false ] &&
+        session_live "$harness_session"; then
+        printf '%s\n' "instance $instance already has a running session; relaunch it with --fresh-daemon or stop it with --stop-instance $instance" >&2
+        exit 1
+    fi
+    export CAGENTS_DEVELOPMENT_INSTANCE="$instance"
+else
+    # The flags choose the instance, never an inherited environment.
+    if [ "$in_session" = true ]; then
+        export CAGENTS_DEVELOPMENT_INSTANCE="$instance"
+    else
+        unset CAGENTS_DEVELOPMENT_INSTANCE
+    fi
+    # Agents opt in so that a failed nested session can never put their UI on
+    # the user's desktop. niri-harness exec gives each command a session's
+    # private runtime directory and removes the caller's display variables.
+    if [ "${CAGENTS_DEVELOPMENT_NESTED_ONLY:-}" = 1 ]; then
+        case ${XDG_RUNTIME_DIR:-}:${DISPLAY:-}${WAYLAND_SOCKET:-} in
+            */nh-?*:) ;;
+            *)
+                printf '%s\n' "CAGENTS_DEVELOPMENT_NESTED_ONLY is set and this is not a niri-harness session; use --instance NAME or niri-harness --session NAME exec -- scripts/run-development ..." >&2
+                exit 2
+                ;;
+        esac
+    fi
+fi
+
 if [ "$hot" = true ]; then
     "$root/scripts/hot-development" --check
+fi
+
+# The flags choose the daemon's log, never an inherited environment.
+if [ -n "$daemon_log" ]; then
+    export CAGENTS_DEVELOPMENT_DAEMON_LOG="$daemon_log"
+else
+    unset CAGENTS_DEVELOPMENT_DAEMON_LOG
 fi
 
 if [ "$debug" = true ]; then
@@ -66,11 +794,68 @@ if [ "$debug" = true ]; then
     export RUST_LOG=${RUST_LOG:-cagents=debug,cagentsd=debug,warn}
 fi
 
-command -v zig >/dev/null 2>&1 || {
-    printf '%s\n' 'required command not found: zig' >&2
+pinned_zig_version=$(sed -n \
+    's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$root/mise.toml")
+[ -n "$pinned_zig_version" ] || {
+    printf '%s\n' 'mise.toml does not pin a Zig version' >&2
     exit 1
 }
-zig_env=$(zig env) || {
+
+if [ -n "${CAGENTS_ZIG:-}" ]; then
+    zig_command=$CAGENTS_ZIG
+    case $zig_command in
+        /*) ;;
+        *)
+            printf '%s\n' 'CAGENTS_ZIG must be an absolute executable path' >&2
+            exit 1
+            ;;
+    esac
+    [ -x "$zig_command" ] || {
+        printf '%s\n' "CAGENTS_ZIG is not executable: $zig_command" >&2
+        exit 1
+    }
+else
+    zig_command=$(command -v zig) || {
+        printf '%s\n' 'required command not found: zig' >&2
+        exit 1
+    }
+fi
+
+# Isolated HOME/XDG_DATA_HOME with a mise shim on PATH can make the shim
+# rediscover itself. Select the pinned installation directly, then give Cargo
+# its real executable on PATH without changing the caller's environment.
+case $zig_command in
+    */shims/zig)
+        if [ -L "$zig_command" ]; then
+            shim_target=$(readlink "$zig_command") || shim_target=
+            case $shim_target in
+                mise|*/mise)
+                    if [ -n "${MISE_DATA_DIR+x}" ]; then
+                        mise_data_dir=$MISE_DATA_DIR
+                    else
+                        mise_data_dir=${zig_command%/shims/zig}
+                    fi
+                    case $mise_data_dir in
+                        /*) ;;
+                        *)
+                            printf '%s\n' 'MISE_DATA_DIR must be an absolute nonempty path for the Zig shim' >&2
+                            exit 1
+                            ;;
+                    esac
+                    zig_command=$mise_data_dir/installs/zig/$pinned_zig_version/zig
+                    if [ ! -x "$zig_command" ]; then
+                        zig_command=$mise_data_dir/installs/zig/$pinned_zig_version/bin/zig
+                    fi
+                    [ -x "$zig_command" ] || {
+                        printf '%s\n' "pinned Zig $pinned_zig_version is not installed in $mise_data_dir" >&2
+                        exit 1
+                    }
+                    ;;
+            esac
+        fi
+        ;;
+esac
+zig_env=$("$zig_command" env) || {
     printf '%s\n' 'could not inspect the Zig installation' >&2
     exit 1
 }
@@ -88,10 +873,91 @@ esac
     printf '%s\n' "zig executable is not runnable: $zig_executable" >&2
     exit 1
 }
+zig_version=$(printf '%s\n' "$zig_env" | sed -n \
+    -e 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+    -e 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+[ "$zig_version" = "$pinned_zig_version" ] || {
+    printf '%s\n' "Zig version ${zig_version:-unknown} does not match mise.toml pin ${pinned_zig_version:-unknown}" >&2
+    exit 1
+}
+case ${zig_executable##*/} in
+    zig) ;;
+    *)
+        printf '%s\n' 'Zig must report an executable named zig so Cargo uses the verified installation; select its zig path with CAGENTS_ZIG' >&2
+        exit 1
+        ;;
+esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
+# Whether this launch holds the native lock, on which every other native session
+# queues. An ancestor having it open covers `flock --close`, which keeps it in the
+# parent only. niri starts a session's programs detached, so ancestry stops there:
+# a launch in a nested session while the lock is held counts as under it.
+under_native_lock() {
+    native_lock=$(readlink -f -- "${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}" 2>/dev/null) || return 1
+    [ -f "$native_lock" ] && [ -r "$native_lock" ] || return 1
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        for descriptor in "/proc/$process/fd/"*; do
+            [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$native_lock" ] || return 0
+        done
+        process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
+    done
+    in_nested_session && command -v flock >/dev/null 2>&1 && ! flock -n "$native_lock" true 2>/dev/null
+}
+
+in_nested_session() {
+    case ${XDG_RUNTIME_DIR:-} in
+        */nh-?*) return 0 ;;
+    esac
+    # niri names its socket with its process ID. One nested in another compositor
+    # inherited a display to draw on; a desktop's niri normally has none.
+    process=${NIRI_SOCKET:-}
+    process=${process%.sock}
+    process=${process##*.}
+    case $process in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$(cat "/proc/$process/comm" 2>/dev/null)" = niri ] || return 1
+    { tr '\0' '\n' <"/proc/$process/environ"; } 2>/dev/null | grep -Eq '^(WAYLAND_DISPLAY|DISPLAY)='
+}
+
+# Runs a build under the native lock, which may confirm the build is current but
+# must not compile, or queue for a build slot: a gate lock of its own takes it out
+# of the queue. Nothing else should take long, but a build script may still run and
+# Cargo may wait for another build using this target, so the time is bounded.
+# `timeout` runs in its own process group to end all of the build, which signals to
+# this launch's group then miss: it waits in the background so this shell's traps run
+# at once, and ending this shell, however that happens, sends `timeout` the TERM.
+without_compiling() {
+    seconds=${CAGENTS_NATIVE_LOCK_BUILD_SECONDS:-180}
+    case $seconds in
+        *[!0-9]* | 0 | 00*)
+            printf '%s\n' "CAGENTS_NATIVE_LOCK_BUILD_SECONDS must be a positive number of seconds: $seconds" >&2
+            return 2
+            ;;
+    esac
+    status=0
+    # The parent's death signal only covers a parent still alive when it's armed.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    setpriv --pdeathsig TERM sh -c '[ "$PPID" = "$1" ] || exit 143; shift; exec "$@"' guarded-build "$$" \
+        timeout "$seconds" env \
+        RUSTC_WRAPPER="$root/scripts/refuse-compile" CAGENTS_NATIVE_LOCK_HELD="$native_lock" \
+        CAGENTS_BUILD_LOCK="$products/.native-lock-gate" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local "$@" &
+    wait "$!" || status=$?
+    if [ "$status" -eq 124 ]; then
+        printf '%s\n' "refusing to keep waiting while holding the native lock $native_lock: confirming that nothing needs compiling took over $seconds seconds. A build script may be running, or another build may be using this target." >&2
+    fi
+    return "$status"
+}
+
 if [ "$hot" = true ]; then
+    if under_native_lock; then
+        printf '%s\n' "refusing to hot reload while holding the native lock $native_lock: hot reload always builds, and other native sessions queue behind it." >&2
+        exit 78
+    fi
     # The helper owns locked builds, sibling staging and the read-only lock mount.
     set -- -- "$@"
     [ -z "$log_file" ] || set -- --log-file "$log_file" "$@"
@@ -100,37 +966,387 @@ if [ "$hot" = true ]; then
     exec "$root/scripts/hot-development" "$@"
 fi
 
-run_cli() {
-    if [ "$browserless" = true ]; then
-        cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development --bin cagents -- "$@"
+# Only the UI differs between the lanes. The CLI and daemon are built
+# without `full`, which selects the shipped product's application ID, peer
+# package and self-update, none of which a development build uses, so both
+# lanes share one build of each.
+if [ "$browserless" = true ]; then
+    ui_features='--no-default-features --features development,ui'
+    ui_feature=ui
+else
+    ui_features='--features development,integrated-browser'
+    ui_feature=integrated-browser
+fi
+
+# Where Cargo places the dev-runtime executables. They are run directly: a
+# `cargo run` would check the build again outside any build slot.
+locate_products() {
+    [ -z "${products:-}" ] || return 0
+    metadata=$(cargo metadata --locked --format-version 1 --no-deps 2>/dev/null) || return 1
+    target=$(printf '%s\n' "$metadata" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    [ -n "$target" ] || return 1
+    products=$target/dev-runtime
+    # Build scripts run in the build directory, which defaults to the target.
+    build_dir=$(printf '%s\n' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')
+    build_dir=${build_dir:-$target}
+}
+find_products() {
+    locate_products || {
+        printf '%s\n' 'cannot find the Cargo target directory' >&2
+        exit 1
+    }
+}
+products=
+build_dir=
+under_lock=false
+
+# Builds the matched set in one slot the gate holds for the three: on the
+# build host, a single admission there, and each executable comes back; with
+# CAGENTS_BUILD_REMOTE=local, or on the build host itself, a slot here. Each
+# product is a separate Cargo invocation: features are package-wide, so a
+# single --bins invocation would reunify the UI and host graphs and make the
+# UI compile Ghostty while making the daemon compile libcosmic.
+build_products() {
+    if [ "$under_lock" = true ]; then
+        set -- without_compiling "$@"
+    fi
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    "$@" "$root/scripts/cargo-gate" exec --hold sh -ec '
+        gate=$1
+        shift
+        "$gate" build --locked --profile dev-runtime --no-default-features --features development --bin cagents
+        "$gate" build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+        "$gate" build --locked --profile dev-runtime $1 --bin cagents-ui
+        if [ -n "$2" ]; then
+            for executable in cagents cagentsd cagents-ui; do
+                stat -c "%n %i %s %.9Y" "$3/$executable"
+            done >"$2"
+        fi
+    ' build-products "$root/scripts/cargo-gate" "$ui_features" "${built:-}" "$products"
+}
+
+# A launch with nothing to build skips the build gate, whose queue can be long
+# on a shared host. The runner records what its last successful build used:
+# the lane, toolchain, commit, Zig and build environment, and the identity of
+# each executable. The set counts as current only if all of that still
+# matches and no file the build read changed since the build started. When anything is unsure, the build runs through the gate,
+# where Cargo makes the real decision; this never builds outside the gate.
+build_identity_inputs() {
+    printf 'lane %s\n' "$ui_feature"
+    rustc -vV || return 1
+    git -C "$root" rev-parse HEAD 2>/dev/null || printf '%s\n' 'no commit'
+    printf 'zig %s %s\n' "$zig_executable" "$zig_version"
+    env | grep -E '^(RUST|CARGO_|CC=|CXX=|AR=|CFLAGS=|CXXFLAGS=|LDFLAGS=|PKG_CONFIG)' |
+        grep -v -e '^CARGO_BUILD_JOBS=' -e '^CARGO_HOME=' | LC_ALL=C sort
+    # Variables a build script asked Cargo to watch, and those read at
+    # compile time through env! or option_env!.
+    watched=$({
+        build_script_watches env-changed
+        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d 2>/dev/null
+    } | LC_ALL=C sort -u)
+    env | awk -v watched="$watched" '
+        BEGIN { count = split(watched, names, "\n"); for (i = 1; i <= count; i++) seen[names[i]] }
+        { name = $0; sub(/=.*/, "", name) }
+        name in seen { print "env " $0 }
+    ' | LC_ALL=C sort
+}
+# Build variables may contain registry tokens or arbitrary credentials watched
+# by a build script. Keep the payload in memory and persist only its digest.
+# Capture the producer separately so a failed toolchain probe cannot be hidden
+# by the final command's status in a POSIX shell pipeline.
+build_identity() {
+    identity=$(build_identity_inputs) || return 1
+    fingerprint=$(printf '%s\n' "$identity" | sha256sum) || return 1
+    printf 'identity-sha256 %s\n' "${fingerprint%% *}"
+}
+# What the dev-runtime build scripts asked Cargo to watch: env-changed for
+# variable names, or changed for paths. Outputs of earlier builds count too,
+# which only makes the check stricter.
+build_script_watches() {
+    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output 2>/dev/null |
+        LC_ALL=C sort -u
+}
+# Files the build read outside the checkout scan: the executables' dependency
+# lists from Cargo, absolute paths the build scripts watch (such as Git
+# metadata in the shared repository), and every Cargo configuration file
+# Cargo would load from this checkout.
+outside_inputs() {
+    for executable in cagents cagentsd cagents-ui; do
+        dependencies=$products/$executable.d
+        [ -f "$dependencies" ] || return 1
+        # Escaped spaces would split a path; let Cargo decide instead.
+        ! grep -q '\\' "$dependencies" || return 1
+        sed 's/^[^:]*://' "$dependencies" | tr ' ' '\n' | sed '/^$/d'
+    done
+    build_script_watches changed | grep '^/' | sed 's/^/optional /'
+    directory=$root
+    while :; do
+        printf 'optional %s/.cargo/config.toml\noptional %s/.cargo/config\n' \
+            "$directory" "$directory"
+        [ "$directory" != / ] || break
+        directory=$(dirname -- "$directory")
+    done
+    cargo_home=${CARGO_HOME:-$HOME/.cargo}
+    printf 'optional %s/config.toml\noptional %s/config\n' "$cargo_home" "$cargo_home"
+}
+built_executables() {
+    for executable in cagents cagentsd cagents-ui; do
+        stat -c '%n %i %s %.9Y' "$products/$executable" || return 1
+    done
+}
+build_record() {
+    printf '%s/.run-development-%s' "$products" "$ui_feature"
+}
+# Whether the gate builds on this host, as it decides. Builds on the build
+# host leave Cargo's dependency lists and build-script outputs there, so only
+# Cargo there can tell whether the products are current, and a launch always
+# asks it.
+builds_here() {
+    offload=$root/scripts/cargo-offload
+    if [ -x "$offload" ]; then
+        where=0
+        "$offload" --host >/dev/null 2>&1 || where=$?
+        [ "$where" -eq 75 ]
     else
-        cargo run --quiet --locked --profile dev-runtime \
-            --features development --bin cagents -- "$@"
+        [ "${CAGENTS_BUILD_REMOTE-}" = local ]
+    fi
+}
+products_current() {
+    builds_here || return 1
+    locate_products || return 1
+    record=$(build_record)
+    [ -f "$record" ] || return 1
+    current=$(build_identity && built_executables 2>/dev/null) || return 1
+    [ "$(cat "$record")" = "$current" ] || return 1
+    changed=$(find "$root" \( -path "$root/target" -o -path "$root/.git" \
+        -o -path "$root/.worktrees" -o -path "$root/worktrees" -o -path "$root/dist" \
+        -o -path "$root/website" -o -name node_modules \) -prune \
+        -o -newer "$record" -print -quit 2>/dev/null) || return 1
+    [ -z "$changed" ] || return 1
+    inputs=$(outside_inputs) || return 1
+    printf '%s\n' "$inputs" | while IFS= read -r input; do
+        case $input in
+        'optional '*)
+            input=${input#optional }
+            [ -e "$input" ] || continue
+            ;;
+        *) [ -e "$input" ] || return 1 ;;
+        esac
+        # Cargo watches a directory's whole tree.
+        if [ -d "$input" ]; then
+            [ -z "$(find "$input" -newer "$record" -print -quit)" ] || return 1
+        else
+            [ ! "$input" -nt "$record" ] || return 1
+        fi
+    done
+}
+# The record's time is when this launch's build started, so a file saved
+# during the build counts as changed at the next launch. Launches from one
+# checkout build one at a time under a checkout lock, which Cargo's build
+# directory lock would impose anyway, and each notes the executables it built
+# before releasing it, so a record never describes another launch's build.
+build_and_record() {
+    built=
+    locate_products || { build_products; return; }
+    record=$(build_record)
+    mkdir -p -- "$products"
+    started=$(mktemp "$products/.run-development-started.XXXXXX")
+    built=$started.built
+    replacement=
+    trap 'rm -f -- "$started" "$replacement" "$built"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+    # mktemp creates mode 0600 even when the caller's umask permits sharing.
+    replacement=$(mktemp "$products/.run-development-record.XXXXXX")
+    rm -f -- "$record"
+    build_products flock -- "$products/.run-development.lock" || {
+        status=$?
+        rm -f -- "$started" "$replacement" "$built"
+        return "$status"
+    }
+    if build_identity >"$replacement" && cat -- "$built" >>"$replacement"; then
+        touch -r "$started" "$replacement"
+        mv -f -- "$replacement" "$record"
+    fi
+    rm -f -- "$started" "$replacement" "$built"
+    trap - EXIT HUP INT TERM
+}
+
+run_cli() {
+    find_products
+    "$products/cagents" "$@"
+}
+
+# The CLI this checkout last built, so stopping an instance does not wait for
+# a build when one exists.
+instance_cli_path() {
+    find_products
+    if [ ! -x "$products/cagents" ]; then
+        "$root/scripts/cargo-gate" build --locked --profile dev-runtime --no-default-features \
+            --features development --bin cagents >&2
+    fi
+    printf '%s\n' "$products/cagents"
+}
+
+# The instance's daemon lives in the harness session's private runtime
+# directory, which stopping the session deletes, so stop the daemon first.
+# Stopping a session ends every process left in its runtime directory, which
+# the CLI's own check does not cover, so first refuse a session whose daemon
+# hosts this process or a session it descends from.
+refuse_hosting_session() {
+    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+    runtime=$(
+        unset XDG_RUNTIME_DIR
+        eval "$harness_env"
+        printf '%s' "${XDG_RUNTIME_DIR-}"
+    )
+    [ -n "$runtime" ] || return 0
+    hosts=$(caller_host_runtimes)
+    if hosts_unknown "$hosts"; then
+        printf '%s\n' "cannot tell which daemons host this session, so instance $instance can't be told apart from them; stop it from a terminal outside cagents" >&2
+        exit 1
+    fi
+    if printf '%s\n' "$hosts" |
+        awk -v prefix="$runtime/" 'index($0, prefix) == 1 { found = 1 } END { exit !found }'; then
+        printf '%s\n' "instance $instance hosts this session, or one that started it, so stopping it would end them; stop it from a terminal outside cagents" >&2
+        exit 1
     fi
 }
 
-# Build each product boundary separately. Cargo features are package-wide, so a
-# single --bins invocation would reunify the UI and host graphs and make the UI
-# compile Ghostty while making the daemon compile libcosmic.
-if [ "$browserless" = true ]; then
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development --bin cagents
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development,ui --bin cagents-ui
+stop_instance_session() {
+    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+    runtime=$(
+        unset XDG_RUNTIME_DIR
+        eval "$harness_env"
+        printf '%s' "${XDG_RUNTIME_DIR-}"
+    )
+    socket=$runtime/cagents-development-$instance/cagentsd.sock
+    if [ -e "$socket" ]; then
+        # Through the session's own environment, never the caller's desktop.
+        # niri-harness exec refuses a session that is no longer live; the
+        # sweep below then ends its daemon with the session's other processes.
+        # The session's environment does not name the instance, and without
+        # it the CLI addresses the session's default development daemon.
+        if niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
+            cli=$(instance_cli_path)
+            if ! output=$(niri-harness exec --session "$harness_session" -- \
+                env CAGENTS_DEVELOPMENT_INSTANCE="$instance" \
+                "$cli" daemon stop-for-rebuild --including-subagents 2>&1); then
+                printf '%s\n' "$output" >&2
+                exit 1
+            fi
+            remaining=100
+            while [ -e "$socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf '%s\n' "instance $instance daemon did not stop within 5 seconds" >&2
+                    exit 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
+        fi
+    fi
+    # The harness reports a runtime it could not remove; the sweep below
+    # removes it, so only a failure that leaves it behind is worth showing.
+    harness_output=$(niri-harness --session "$harness_session" stop 2>&1 >/dev/null) || :
+    sweep_instance_runtime "$instance" "$runtime"
+    if [ -n "$harness_output" ] && [ -e "$runtime" ]; then
+        printf '%s\n' "$harness_output" >&2
+    fi
+}
+
+if [ -n "$instance" ] && { [ "$stop_instance" = true ] || [ "$fresh_daemon" = true ]; }; then
+    refuse_hosting_session
+fi
+
+if [ "$stop_instance" = true ]; then
+    if ! niri-harness --session "$harness_session" env >/dev/null 2>&1; then
+        printf '%s\n' "instance $instance is not running" >&2
+        exit 1
+    fi
+    printf '%s\n' "Stopping instance $instance stops its terminal/chat jobs and all their background subagents." >&2
+    stop_instance_session
+    instance_log "$instance" "stopped: --stop-instance from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
+    printf '%s\n' "stopped instance $instance; its storage is kept"
+    exit 0
+fi
+
+if products_current; then
+    printf '%s\n' 'The matched set is already built for this checkout; skipping the build.' >&2
 else
-    cargo build --locked --profile dev-runtime \
-        --features development --bin cagents
-    cargo build --locked --profile dev-runtime \
-        --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime \
-        --features development,integrated-browser --bin cagents-ui
+    if under_native_lock; then
+        find_products
+        under_lock=true
+        printf '%s\n' "This launch holds the native lock $native_lock, so its build may only confirm that nothing needs compiling." >&2
+    fi
+    build_and_record
+fi
+find_products
+
+# What the app is started with: the daemons hosting this session, for the
+# CLI's hosted stop check, because the app's own processes may leave this
+# session's process tree. The harness detaches an instance at once.
+hosts=$(caller_host_runtimes)
+if hosts_unknown "$hosts"; then
+    printf '%s\n' "warning: which daemons host this session can't all be told, so a session in this app could stop one of them" >&2
+fi
+hosted_by=$(printf '%s\n' "$hosts" | grep -vxF '?') || hosted_by=
+if [ -n "$hosted_by" ]; then
+    export CAGENTS_DEVELOPMENT_HOSTED_BY="$hosted_by"
+else
+    unset CAGENTS_DEVELOPMENT_HOSTED_BY
 fi
 
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
+if [ -n "$instance" ] && [ "$in_session" = false ]; then
+    if [ "$fresh_daemon" = true ]; then
+        printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
+        stop_instance_session
+    fi
+    capped=
+    [ ! -x "$root/scripts/memory-capped" ] || capped=$root/scripts/memory-capped
+    # Its own bus and runtime directory keep the instance's application ID,
+    # activation sockets and daemon apart from every other session.
+    # Without the caller's display variables, nothing in the session can fall
+    # back to the caller's desktop.
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
+        niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
+        ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@"
+    instance_runtime=$(session_runtime "$harness_session") || instance_runtime=
+    if [ -n "$instance_runtime" ] && record_owner "$instance_runtime" &&
+        { [ "$keep_instance" = false ] || [ -n "$instance_ttl" ]; }; then
+        # Detached, with nothing of this launch's files, so it outlives this
+        # shell without holding a terminal or a caller's pipe open.
+        set -- "$root/scripts/run-development" __watch-instance "$instance" "$instance_runtime"
+        if [ -x /usr/bin/python3 ]; then
+            # A shell can only close the descriptors it can name, 0 to 9.
+            # shellcheck disable=SC2016 # Python, not shell
+            set -- /usr/bin/python3 -I -c 'import os, sys
+os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+os.execv(sys.argv[1], sys.argv[1:])' "$@"
+        fi
+        # With the runtime directory sessions are made in, not this caller's:
+        # stopping a session that this caller runs in must not end it.
+        sessions_runtime=${XDG_RUNTIME_DIR-}
+        XDG_RUNTIME_DIR=${sessions_runtime%/nh-*} setsid "$@" </dev/null >/dev/null 2>&1 &
+    fi
+    instance_log "$instance" "started from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
+    if [ "$keep_instance" = true ]; then
+        lifetime_note="runs until you stop it"
+    else
+        lifetime_note="stops $(instance_grace) seconds after the session that started it ends (--keep keeps it)"
+    fi
+    [ -z "$instance_ttl" ] || lifetime_note="$lifetime_note, or $instance_ttl seconds after it started"
+    printf '%s\n' \
+        "Instance $instance is running in niri-harness session $harness_session; it $lifetime_note." \
+        "  observe: niri-harness --session $harness_session observe" \
+        "  logs:    niri-harness --session $harness_session logs" \
+        "  stop:    scripts/run-development --stop-instance $instance"
+    exit 0
+fi
+
 if [ "$fresh_daemon" = true ]; then
     printf '%s\n' "Restarting the development daemon stops its terminal/chat jobs and all their background subagents." >&2
     run_cli daemon stop-for-rebuild --including-subagents >/dev/null
@@ -146,17 +1362,14 @@ if [ "$fresh_daemon" = true ]; then
     done
 fi
 
-run_ui() {
-    if [ "$browserless" = true ]; then
-        exec cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development,ui --bin cagents-ui -- "$@"
-    fi
-    exec cargo run --quiet --locked --profile dev-runtime \
-        --features development,integrated-browser --bin cagents-ui -- "$@"
-}
-
 if [ -n "$log_file" ]; then
     printf '%s\n' "writing UI diagnostics to $log_file"
-    run_ui "$@" >"$log_file" 2>&1
+    # Only the app's output goes there: a person watching this terminal needs to
+    # hear from the memory limit if it stops the app.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    set -- sh -c 'log_file=$1; shift; exec "$@" >"$log_file" 2>&1' run-ui "$log_file" "$products/cagents-ui" "$@"
+else
+    set -- "$products/cagents-ui" "$@"
 fi
-run_ui "$@"
+[ ! -x "$root/scripts/memory-capped" ] || set -- "$root/scripts/memory-capped" --name cagents-ui "$@"
+exec "$@"

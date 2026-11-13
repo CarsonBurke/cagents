@@ -1402,7 +1402,10 @@ mod tests {
         println!("SETUP_ACL_COPY_VERIFIED");
     }
 
+    // Capability qualification, separate from the ordinary same-group control:
+    // cargo test --locked --no-default-features --features host --lib worktree_setup::tests::copy_preserves_source_group_in_setgid_destination -- --exact --ignored --test-threads=1
     #[test]
+    #[ignore = "requires an assignable distinct supplementary group and setgid/O_TMPFILE inheritance"]
     fn copy_preserves_source_group_in_setgid_destination() {
         use std::os::unix::fs::MetadataExt;
         let fixture = Fixture::new();
@@ -1415,19 +1418,66 @@ mod tests {
         let source_group = fs::metadata(fixture.primary.join(".env")).unwrap().gid();
         // SAFETY: null/zero queries the supplementary group count.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-        assert!(count >= 0);
+        assert!(count >= 0, "getgroups: {}", std::io::Error::last_os_error());
         let mut groups = vec![0 as libc::gid_t; count as usize];
         // SAFETY: groups is writable for count gid_t values.
-        assert!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0);
-        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group)
-        else {
-            eprintln!("SETUP_GROUP_FIXTURE_NO_ALTERNATE_GROUP");
-            return;
-        };
-        std::os::unix::fs::chown(&fixture.destination, None, Some(destination_group)).unwrap();
-        fs::set_permissions(&fixture.destination, fs::Permissions::from_mode(0o2770)).unwrap();
+        let actual_count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        assert!(
+            actual_count >= 0,
+            "getgroups: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            actual_count as usize <= groups.len(),
+            "supplementary groups changed"
+        );
+        groups.truncate(actual_count as usize);
+        groups.sort_unstable();
+        groups.dedup();
+        let destination = fs::File::open(&fixture.destination).unwrap();
+        let destination_owner = destination.metadata().unwrap().uid();
+        let mut destination_group = None;
+        for group in groups.into_iter().filter(|group| *group != source_group) {
+            // Membership can survive a namespace mapping that prevents actual
+            // assignment. Probe only this owned fixture, never process groups.
+            // SAFETY: the directory descriptor is live; MAX keeps its owner.
+            if unsafe { libc::fchown(destination.as_raw_fd(), libc::uid_t::MAX, group) } == 0 {
+                let installed = destination.metadata().unwrap();
+                assert_eq!(installed.uid(), destination_owner);
+                assert_eq!(installed.gid(), group);
+                destination_group = Some(group);
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)),
+                "unexpected group-assignment failure: {error}"
+            );
+        }
+        let destination_group = destination_group.expect(
+            "SETUP_GROUP_CONTRAST_UNQUALIFIED: no assignable actual supplementary group distinct from the source",
+        );
+        assert_ne!(source_group, destination_group);
+        destination
+            .set_permissions(fs::Permissions::from_mode(0o2770))
+            .unwrap();
+        let metadata = destination.metadata().unwrap();
+        assert_eq!(metadata.gid(), destination_group);
+        assert_ne!(metadata.mode() & 0o2000, 0, "destination lost setgid");
+        {
+            // Match the production anonymous-copy creation, proving the group
+            // that preserve_group must actually replace before publication.
+            let root = fs_safety::Root::open(&fixture.destination).unwrap();
+            let inherited = fs_safety::create_anonymous_in(&root, 0o600).unwrap();
+            let inherited_group = inherited.metadata().unwrap().gid();
+            assert_eq!(inherited_group, destination_group);
+            assert_ne!(inherited_group, source_group);
+        }
         let plan = fixture.config("copy = ['.env']");
-        fixture.prepare(&plan).unwrap();
+        assert_eq!(
+            fixture.prepare(&plan).unwrap().copied,
+            vec![PathBuf::from(".env")]
+        );
         let copied = fs::metadata(fixture.destination.join(".env")).unwrap();
         assert_eq!(copied.gid(), source_group);
         assert_eq!(copied.permissions().mode() & 0o777, 0o640);
@@ -1439,7 +1489,48 @@ mod tests {
             fs::read(fixture.destination.join(".env")).unwrap(),
             b"private source group"
         );
+        assert_ne!(destination.metadata().unwrap().mode() & 0o2000, 0);
+        assert_eq!(
+            fs::metadata(fixture.primary.join(".env")).unwrap().gid(),
+            source_group
+        );
         println!("SETUP_GROUP_COPY_VERIFIED");
+    }
+
+    #[test]
+    fn copy_preserves_bytes_mode_and_matching_source_group() {
+        // This ordinary copy control does not exercise group restoration:
+        // preserve_group returns before fchown when both groups already match.
+        let fixture = Fixture::new();
+        fs::write(fixture.primary.join(".env"), "private source group").unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let source_group = fs::metadata(fixture.primary.join(".env")).unwrap().gid();
+        let destination_group = fs::metadata(&fixture.destination).unwrap().gid();
+        assert_eq!(source_group, destination_group);
+        let plan = fixture.config("copy = ['.env']");
+        assert_eq!(
+            fixture.prepare(&plan).unwrap().copied,
+            vec![PathBuf::from(".env")]
+        );
+        let copied = fs::metadata(fixture.destination.join(".env")).unwrap();
+        assert_eq!(copied.gid(), source_group);
+        assert_eq!(copied.permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"private source group"
+        );
+        assert_eq!(
+            fs::metadata(fixture.primary.join(".env")).unwrap().gid(),
+            source_group
+        );
+        assert_eq!(
+            fs::metadata(&fixture.destination).unwrap().gid(),
+            destination_group
+        );
     }
 
     #[test]

@@ -22,7 +22,11 @@ impl Runtime {
     }
     pub(super) fn active_auth_notice(&self, anchor: &Option<String>, message: &str) -> bool {
         self.auth_error().is_some()
-            && anchor.as_deref() == self.turns.last().map(|turn| turn.key.as_str())
+            && failure::same_prompt(
+                self.session.launch.provider,
+                anchor.as_deref(),
+                self.notice_anchor(&self.snapshot, &self.turns),
+            )
             && chat::requires_sign_in(self.session.launch.provider, message)
     }
     fn recovery_available(&self) -> bool {
@@ -38,13 +42,16 @@ impl Cagents {
         let launch = &runtime.session.launch;
         let recipe = &launch.recipe;
         let variable = account::home_variable(launch.provider)?;
-        // ProcessSpec removes explicitly unset bindings before spawning.
-        // A recipe with no bound provider home inherits HOME; it must name
-        // the same home as this window's known system account.
-        if recipe.unset_environment.contains(variable) {
-            return None;
-        }
-        match recipe.environment.get(variable) {
+        // ProcessSpec removes explicitly unset bindings before spawning, so
+        // an unset home is no home: the CLI resolves its default from HOME,
+        // as the system Claude login launches it. A recipe with no bound
+        // provider home must name the same HOME as this window's known
+        // system account, which `chat_account` then requires to resolve
+        // that default too.
+        let bound = (!recipe.unset_environment.contains(variable))
+            .then(|| recipe.environment.get(variable))
+            .flatten();
+        match bound {
             Some(home) if home.is_empty() => return None,
             Some(_) => {}
             None => {

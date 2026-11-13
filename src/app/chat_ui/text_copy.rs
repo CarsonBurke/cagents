@@ -66,6 +66,34 @@ pub struct Request {
     conversation_revision: u64,
 }
 
+#[derive(Clone)]
+pub struct FailureRequest {
+    context: ClipboardContext,
+    intent: u64,
+    handle: Arc<ClientHandle>,
+    scope: Option<String>,
+    plan: failure::CopyPlan,
+}
+
+#[cfg(test)]
+impl FailureRequest {
+    pub(super) fn for_test(
+        handle: Arc<ClientHandle>,
+        scope: Option<String>,
+        plan: failure::CopyPlan,
+    ) -> Self {
+        let context = current_context();
+        let intent = context.advance();
+        Self {
+            context,
+            intent,
+            handle,
+            scope,
+            plan,
+        }
+    }
+}
+
 impl Request {
     fn snapshot_is_current(&self, snapshot: &Snapshot) -> bool {
         match &self.source.scope {
@@ -152,6 +180,98 @@ impl Runtime {
 }
 
 impl Cagents {
+    pub(super) fn start_failure_copy(&mut self, target: Target, key: String) -> Task<Message> {
+        let context = current_context();
+        let intent = context.advance();
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let plan = match runtime.failure_copy_plan(&key) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Task::none(),
+            Err(error) => {
+                runtime.error = Some(error);
+                return Task::none();
+            }
+        };
+        let Some(handle) = runtime.handle().cloned() else {
+            runtime.error = Some(
+                "Original diagnostic unavailable: reconnect this conversation before copying"
+                    .into(),
+            );
+            return Task::none();
+        };
+        let request = FailureRequest {
+            context: context.clone(),
+            intent,
+            handle: handle.clone(),
+            scope: runtime.selected_subagent.clone(),
+            plan: plan.clone(),
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                plan.read(&handle, || context.is_current(intent))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::ChatUi(Action::FailureCopied(target, key, request, result))
+        })
+    }
+
+    pub(super) fn finish_failure_copy(
+        &mut self,
+        target: Target,
+        key: String,
+        request: FailureRequest,
+        result: Result<String, String>,
+    ) -> Task<Message> {
+        if !request.context.is_current(request.intent)
+            || self.workspace.focused() != Some(target.card)
+        {
+            return Task::none();
+        }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.selected_subagent != request.scope
+            || !runtime
+                .handle()
+                .is_some_and(|handle| Arc::ptr_eq(handle, &request.handle))
+        {
+            return Task::none();
+        }
+        match result {
+            Ok(text) => {
+                if runtime.failure_copy_plan(&key).ok().flatten().as_ref() != Some(&request.plan)
+                    || !request.plan.is_current(&request.handle.snapshot())
+                {
+                    return Task::none();
+                }
+                let context = request.context.clone();
+                let intent = request.intent;
+                clipboard_write(context, intent, text, move || {
+                    request.plan.is_current(&request.handle.snapshot())
+                })
+            }
+            Err(error) => {
+                if runtime.failure_plan_still_shown(&key, &request.plan)
+                    && request
+                        .plan
+                        .is_current_or_withdrawn(&request.handle.snapshot())
+                {
+                    const PREFIX: &str = "Original diagnostic unavailable: ";
+                    runtime.error = Some(if error.starts_with(PREFIX) {
+                        error
+                    } else {
+                        format!("{PREFIX}{error}")
+                    });
+                }
+                Task::none()
+            }
+        }
+    }
+
     pub(super) fn start_message_copy(
         &mut self,
         target: Target,
@@ -255,6 +375,41 @@ pub(super) fn write_shared_literal(text: Arc<str>) -> Task<Message> {
             Task::none()
         }
     })
+}
+
+/// A copy whose clipboard contents are produced later, off the UI thread. It
+/// joins the shared intent order: starting one supersedes older copies, and
+/// any newer copy (including a widget's own selection copy) supersedes it.
+#[derive(Clone)]
+pub(super) struct Intent {
+    context: ClipboardContext,
+    intent: u64,
+}
+
+impl Intent {
+    pub(super) fn begin() -> Self {
+        let context = current_context();
+        let intent = context.advance();
+        Self { context, intent }
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.context.is_current(self.intent)
+    }
+
+    /// Like [`clipboard_write`], the gate runs when the effect is polled.
+    pub(super) fn write_data(
+        self,
+        contents: impl iced::clipboard::mime::AsMimeTypes + Send + Sync + 'static,
+    ) -> Task<Message> {
+        let mut contents = Some(contents);
+        iced::Task::done(()).then(move |_| match contents.take() {
+            Some(contents) if self.is_current() => {
+                iced::clipboard::write_data(contents).map(cosmic::Action::App)
+            }
+            _ => Task::none(),
+        })
+    }
 }
 
 /// Check again when the returned task is polled, not just when completion is

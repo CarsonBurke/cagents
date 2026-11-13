@@ -23,6 +23,8 @@ const GENERATIONS: usize = 5;
 const FILE_BYTES: u64 = 2 * 1024 * 1024;
 const RECORD_BYTES: usize = 1024;
 const RECENT_RECORDS: usize = 256;
+/// How many distinct storage refusals the human report lists per product.
+const REPORTED_REFUSALS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +71,102 @@ pub enum Failure {
     Unknown,
 }
 
+/// What a write storage refused by construction would have saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedWrite {
+    /// The window's layout and panes.
+    Workspace,
+    /// The latest changes to one open pane.
+    Pane,
+    /// The fresh identity of a relaunched terminal.
+    RelaunchedTerminal,
+    /// A new conversation started in a chat pane.
+    NewConversation,
+    Project,
+    Worktree,
+    /// A reviewed repair of which pane owns a terminal.
+    TerminalRepair,
+    /// The read-only copy of a chat kept when its pane moves on.
+    RetainedChatCopy,
+    /// A chat pane's move to a recovered or upgraded conversation.
+    ConversationRecovery,
+}
+
+impl RefusedWrite {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "the window's layout and panes",
+            Self::Pane => "the latest changes to pane",
+            Self::RelaunchedTerminal => "the relaunched terminal in pane",
+            Self::NewConversation => "the new conversation in pane",
+            Self::Project => "project",
+            Self::Worktree => "worktree",
+            Self::TerminalRepair => "the terminal ownership repair of pane",
+            Self::RetainedChatCopy => "the retained chat copy",
+            Self::ConversationRecovery => "the conversation recovery in pane",
+        }
+    }
+}
+
+/// The rule storage refused a write for, such as `chat card … changed
+/// conversation identity (identity)`.
+///
+/// It is text written into cagents or its database schema - never the write's
+/// content - and is bounded: longer text is cut at `CHECK_BYTES`, and a record
+/// read back with more, or with control characters, is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Check(String);
+
+const CHECK_BYTES: usize = 160;
+
+impl Check {
+    /// Only storage names a rule; it makes one from a
+    /// [`crate::persistence::RefusedCheck`], which never holds content.
+    pub(crate) fn new(rule: &str) -> Self {
+        let mut text = rule.replace(char::is_control, " ");
+        if text.len() > CHECK_BYTES {
+            let mut end = CHECK_BYTES - '…'.len_utf8();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push('…');
+        }
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Check {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text.len() > CHECK_BYTES || text.contains(char::is_control) {
+            Err("invalid refusal check")
+        } else {
+            Ok(Self(text))
+        }
+    }
+}
+
+impl std::fmt::Display for Check {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl From<Check> for String {
+    fn from(check: Check) -> Self {
+        check.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Startup,
@@ -96,6 +193,15 @@ pub enum Event {
     },
     SettingsFailed {
         category: Failure,
+    },
+    /// Storage refused a write by construction and set it aside. Recorded
+    /// when it first refuses the subject, and again only when it refuses a
+    /// newer write of it for a different reason.
+    StorageRefused {
+        write: RefusedWrite,
+        /// The pane, project or worktree, when the write concerns one.
+        id: Option<Uuid>,
+        check: Check,
     },
     ProtocolMismatch,
     EventsSkipped {
@@ -173,7 +279,9 @@ pub fn state_path() -> io::Result<PathBuf> {
                 .map(|p| p.join(".local/state"))
         })
         .ok_or_else(|| io::Error::other("state directory unavailable"))?;
-    Ok(base.join(crate::instance::STORAGE_NAME).join("diagnostics"))
+    Ok(base
+        .join(crate::instance::storage_name())
+        .join("diagnostics"))
 }
 
 pub fn initialize(product: Product, version: &'static str) {
@@ -370,7 +478,7 @@ struct Recorder {
 impl Recorder {
     #[cfg(test)]
     fn open(path: &Path, product: Product) -> io::Result<Self> {
-        Self::open_version(path, product, crate::VERSION)
+        Self::open_version(path, product, crate::version())
     }
     fn open_version(path: &Path, product: Product, version: &'static str) -> io::Result<Self> {
         if version.len() > 128
@@ -545,7 +653,7 @@ impl ProductReport {
             let mut settings_failed = false;
             let mut unrecovered_failure = false;
             for record in records.iter().filter(|record| record.run == last.run) {
-                match record.event {
+                match &record.event {
                     Event::Startup => {
                         started = true;
                         observed.lifecycle = Lifecycle::Started;
@@ -564,7 +672,7 @@ impl ProductReport {
                     }
                     Event::Exit { success } => {
                         observed.lifecycle = Lifecycle::Exited;
-                        observed.clean_shutdown = Some(success);
+                        observed.clean_shutdown = Some(*success);
                     }
                     Event::PersistenceStarted => {
                         writer_seen = true;
@@ -581,16 +689,16 @@ impl ProductReport {
                     }
                     event @ Event::FinalFlush { complete, .. } => {
                         writer_seen = true;
-                        observed.persistence = if complete {
+                        observed.persistence = if *complete {
                             Persistence::Complete
                         } else {
                             Persistence::Failed
                         };
-                        observed.final_flush = Some(event);
+                        observed.final_flush = Some(event.clone());
                     }
                     Event::SettingsFailed { .. } => settings_failed = true,
                     Event::EventsSkipped { count } => {
-                        observed.skipped_events = observed.skipped_events.saturating_add(count)
+                        observed.skipped_events = observed.skipped_events.saturating_add(*count)
                     }
                     _ => {}
                 }
@@ -671,6 +779,7 @@ pub struct Report {
     pub cli_protocol: u16,
     pub path: PathBuf,
     pub products: Vec<ProductReport>,
+    pub transcript_caches: Option<crate::transcript_cache::Usage>,
     pub holders_readable: bool,
     pub holders: Vec<HolderReport>,
 }
@@ -686,6 +795,13 @@ impl Report {
         let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
             format!("Private diagnostics: {}", self.path.display()),
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
+        match &self.transcript_caches {
+            Some(usage) => lines.push(format!(
+                "Transcript caches: {} ({} bytes)",
+                usage.count, usage.bytes
+            )),
+            None => lines.push("Transcript caches: unavailable".into()),
+        }
         for product in &self.products {
             match &product.last_observed {
                 Some(last) => lines.push(format!("{}: last observed {} (protocol {}), {}; lifecycle {}; clean shutdown {}; persistence {}; skipped events {}; run {}", product.product.name(), last.version, last.protocol, relative_time(last.at_unix_ms, now), lifecycle_label(last.lifecycle), match last.clean_shutdown { Some(true) => "yes", Some(false) => "no", None => "unknown" }, persistence_label(last.persistence), last.skipped_events, last.run)),
@@ -709,7 +825,42 @@ impl Report {
             }) {
                 lines.push(format!(
                     "{}: latest retained failure {}, run {}, {} (historical record; may have recovered)",
-                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(failure.event)
+                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(&failure.event)
+                ));
+            }
+            // The final flush of a window that ends with refused writes counts
+            // them, which says nothing about why; each refusal said why.
+            let mut refusals: Vec<(&Record, usize)> = Vec::new();
+            for record in product.records.iter().rev() {
+                if !matches!(record.event, Event::StorageRefused { .. }) {
+                    continue;
+                }
+                match refusals
+                    .iter_mut()
+                    .find(|(newest, _)| newest.event == record.event)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => refusals.push((record, 1)),
+                }
+            }
+            for (record, count) in refusals.iter().take(REPORTED_REFUSALS) {
+                lines.push(format!(
+                    "{}: {}, {}, run {}{} (historical record; may have been saved since)",
+                    product.product.name(),
+                    event_label(&record.event),
+                    relative_time(record.at_unix_ms, now),
+                    record.run,
+                    match count {
+                        1 => String::new(),
+                        count => format!("; recorded {count} times"),
+                    }
+                ));
+            }
+            if refusals.len() > REPORTED_REFUSALS {
+                lines.push(format!(
+                    "{}: {} earlier storage refusals not listed",
+                    product.product.name(),
+                    refusals.len() - REPORTED_REFUSALS
                 ));
             }
         }
@@ -800,8 +951,8 @@ fn failure_label(value: Failure) -> &'static str {
     }
 }
 
-fn event_label(value: Event) -> String {
-    match value {
+fn event_label(value: &Event) -> String {
+    match *value {
         Event::Startup => "startup".into(),
         Event::Ready => "ready".into(),
         Event::StartupFailed => "startup failed".into(),
@@ -845,19 +996,38 @@ fn event_label(value: Event) -> String {
         Event::SettingsFailed { category } => {
             format!("settings failed: {}", failure_label(category))
         }
+        Event::StorageRefused {
+            write,
+            id,
+            ref check,
+        } => match id {
+            Some(id) => format!("storage refused {} {id}: {}", write.label(), check.as_str()),
+            None => format!("storage refused {}: {}", write.label(), check.as_str()),
+        },
         Event::ProtocolMismatch => "protocol mismatch".into(),
         Event::EventsSkipped { count } => format!("{count} skipped events"),
     }
 }
 
-/// Reads recorded lifecycle evidence and a read-only procfs snapshot of live
-/// holders. It never starts services or connects to runtime sockets. Absence
-/// of recorded evidence is not proof of a clean shutdown.
+/// Reads recorded lifecycle evidence, transcript-cache file metadata and a
+/// read-only procfs snapshot of live holders. It never starts services or
+/// connects to runtime sockets. Missing evidence does not prove a clean shutdown.
 pub fn inspect() -> io::Result<Report> {
-    let mut report = inspect_at(state_path()?)?;
+    let runtime = crate::daemon::RuntimePaths::discover().ok();
+    let mut report = inspect_at_with_runtime(
+        state_path()?,
+        runtime.as_ref().map(|paths| paths.directory.as_path()),
+    )?;
     (report.holders_readable, report.holders) = observe_holders();
     Ok(report)
 }
+fn inspect_at_with_runtime(path: PathBuf, runtime_root: Option<&Path>) -> io::Result<Report> {
+    let mut report = inspect_at(path)?;
+    report.transcript_caches =
+        runtime_root.and_then(|root| crate::transcript_cache::usage(root).ok());
+    Ok(report)
+}
+
 fn inspect_at(path: PathBuf) -> io::Result<Report> {
     let (dir, readable) = match directory(&path, false) {
         Ok(dir) => (Some(dir), true),
@@ -876,13 +1046,53 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         .collect();
     Ok(Report {
         schema_version: SCHEMA_VERSION,
-        cli_version: crate::VERSION,
+        cli_version: crate::version(),
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
+        transcript_caches: None,
         holders_readable: true,
         holders: Vec::new(),
     })
+}
+
+/// Whether UI process `pid` recorded a complete final flush at or after
+/// `since_unix_ms`, with no later persistence restart. The caller pins `pid`
+/// from before `since_unix_ms`, so its records cannot belong to a reused PID.
+pub(crate) fn ui_final_flush_complete(pid: u32, since_unix_ms: u64) -> io::Result<bool> {
+    final_flush_complete_at(&state_path()?, pid, since_unix_ms)
+}
+
+fn final_flush_complete_at(path: &Path, pid: u32, since_unix_ms: u64) -> io::Result<bool> {
+    // The window being proven may be the writer: one stopped mid-append keeps
+    // the lock forever, so this proof must not wait for it.
+    let records = read_product_snapshot(&directory(path, false)?, Product::Ui)?;
+    let mut complete = false;
+    for record in records
+        .iter()
+        .filter(|record| record.pid == pid && record.at_unix_ms >= since_unix_ms)
+    {
+        match record.event {
+            Event::FinalFlush {
+                complete: flushed, ..
+            } => complete = flushed,
+            Event::PersistenceStarted
+            | Event::PersistenceFailed { .. }
+            | Event::WriterUnavailable
+            // Its dropped events may have restarted persistence.
+            | Event::EventsSkipped { .. } => complete = false,
+            _ => {}
+        }
+    }
+    Ok(complete)
+}
+
+/// Whether a generation's bytes must end at a record boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    Complete,
+    /// An unfinished append may follow the last complete record.
+    Appending,
 }
 
 fn read_product(dir: &File, product: Product) -> io::Result<Vec<Record>> {
@@ -891,44 +1101,110 @@ fn read_product(dir: &File, product: Product) -> io::Result<Vec<Record>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+    let generations = open_generations(dir, product)?;
+    if lock.is_none() && !generations.is_empty() {
+        return Err(unsafe_path());
+    }
     let mut records = std::collections::VecDeque::new();
-    for generation in (0..GENERATIONS).rev() {
-        let file = match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        if lock.is_none() || file.metadata()?.len() > FILE_BYTES {
-            return Err(unsafe_path());
-        }
-        let mut bytes = Vec::new();
-        file.take(FILE_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > FILE_BYTES || bytes.last() != Some(&b'\n') {
-            return Err(unsafe_path());
-        }
-        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-            if line.len() > RECORD_BYTES {
-                return Err(unsafe_path());
-            }
-            let record: Record = serde_json::from_slice(line).map_err(|_| unsafe_path())?;
-            if record.schema_version != SCHEMA_VERSION
-                || record.product != product
-                || semver::Version::parse(&record.version).is_err()
-                || record.version.len() > 128
-                || !record
-                    .version
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
-            {
-                return Err(unsafe_path());
-            }
-            if records.len() == RECENT_RECORDS {
-                records.pop_front();
-            }
-            records.push_back(record);
-        }
+    for (_, file) in &generations {
+        parse_generation(file, product, Tail::Complete, &mut records)?;
     }
     Ok(records.into())
+}
+
+/// Reads `product`'s records without its writer lock. Appends never rewrite a
+/// complete record, and only rotation renames a generation, so a read during
+/// which every opened generation kept its name is a consistent snapshot. A
+/// rotation can only make the read fail, never supply records it lacked.
+fn read_product_snapshot(dir: &File, product: Product) -> io::Result<Vec<Record>> {
+    for _ in 0..3 {
+        let generations = open_generations(dir, product)?;
+        let mut records = std::collections::VecDeque::new();
+        for (generation, file) in &generations {
+            let tail = if *generation == 0 {
+                Tail::Appending
+            } else {
+                Tail::Complete
+            };
+            parse_generation(file, product, tail, &mut records)?;
+        }
+        // Each file stays open, so its inode cannot be reused by another
+        // file that a rotation moved to the same name.
+        let mut unmoved = true;
+        for (generation, opened) in &generations {
+            match private_file(dir, &product.filename(*generation), libc::O_RDONLY) {
+                Ok(current) => {
+                    let (opened, current) = (opened.metadata()?, current.metadata()?);
+                    unmoved &= (opened.dev(), opened.ino()) == (current.dev(), current.ino());
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => unmoved = false,
+                Err(e) => return Err(e),
+            }
+        }
+        if unmoved {
+            return Ok(records.into());
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::WouldBlock, LockBusy))
+}
+
+/// The existing generations, oldest first.
+fn open_generations(dir: &File, product: Product) -> io::Result<Vec<(usize, File)>> {
+    let mut generations = Vec::new();
+    for generation in (0..GENERATIONS).rev() {
+        match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
+            Ok(file) => generations.push((generation, file)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(generations)
+}
+
+fn parse_generation(
+    file: &File,
+    product: Product,
+    tail: Tail,
+    records: &mut std::collections::VecDeque<Record>,
+) -> io::Result<()> {
+    if file.metadata()?.len() > FILE_BYTES {
+        return Err(unsafe_path());
+    }
+    let mut bytes = Vec::new();
+    file.take(FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > FILE_BYTES {
+        return Err(unsafe_path());
+    }
+    let complete = match tail {
+        Tail::Complete if bytes.last() != Some(&b'\n') => return Err(unsafe_path()),
+        Tail::Complete => &bytes[..],
+        Tail::Appending => {
+            let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            &bytes[..end]
+        }
+    };
+    for line in complete.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        if line.len() > RECORD_BYTES {
+            return Err(unsafe_path());
+        }
+        let record: Record = serde_json::from_slice(line).map_err(|_| unsafe_path())?;
+        if record.schema_version != SCHEMA_VERSION
+            || record.product != product
+            || semver::Version::parse(&record.version).is_err()
+            || record.version.len() > 128
+            || !record
+                .version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+        {
+            return Err(unsafe_path());
+        }
+        if records.len() == RECENT_RECORDS {
+            records.pop_front();
+        }
+        records.push_back(record);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -954,6 +1230,145 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
+    #[test]
+    fn transcript_cache_usage_reports_counts_zero_when_missing_and_null_on_failure() {
+        let (root, path) = fixture();
+        let runtime = root.path().join("runtime");
+        let missing = inspect_at_with_runtime(path.clone(), Some(&runtime)).unwrap();
+        assert!(missing.human().contains("Transcript caches: 0 (0 bytes)"));
+        assert!(!runtime.exists());
+
+        let cache = runtime.join(format!("chat-{}", Uuid::from_u128(1)));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir(runtime.join(format!("chat-{}", Uuid::from_u128(2)))).unwrap();
+        std::fs::write(cache.join("transcript.sqlite"), b"private-payload").unwrap();
+        std::fs::write(cache.join("transcript.sqlite-wal"), [1, 2, 3]).unwrap();
+        let report = inspect_at_with_runtime(path.clone(), Some(&runtime)).unwrap();
+        assert!(report.human().contains("Transcript caches: 2 (18 bytes)"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(r#""transcript_caches":{"count":2,"bytes":18}"#));
+        assert!(!json.contains("private-payload"));
+
+        let not_directory = root.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"").unwrap();
+        for failed in [
+            inspect_at_with_runtime(path.clone(), None).unwrap(),
+            inspect_at_with_runtime(path.clone(), Some(&not_directory)).unwrap(),
+        ] {
+            assert!(serde_json::to_value(&failed).unwrap()["transcript_caches"].is_null());
+            assert!(failed.human().contains("Transcript caches: unavailable"));
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn only_a_later_complete_final_flush_of_that_process_proves_it_saved() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        let flush = |complete| Event::FinalFlush {
+            complete,
+            unsaved: u32::from(!complete),
+            refused: 0,
+            category: (!complete).then_some(Failure::Unknown),
+        };
+        recorder.append(flush(false)).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        recorder.append(flush(true)).unwrap();
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
+        // Another process's evidence, or a save before the commit, is no proof.
+        assert!(!final_flush_complete_at(&path, pid + 1, 0).unwrap());
+        assert!(!final_flush_complete_at(&path, pid, u64::MAX).unwrap());
+        // A writer that started again has unsaved state once more.
+        recorder.append(Event::PersistenceStarted).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        // Neither is a save followed by events that were dropped unseen.
+        recorder.append(flush(true)).unwrap();
+        recorder.append(Event::EventsSkipped { count: 1 }).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+    }
+
+    #[test]
+    fn a_window_stopped_inside_its_append_cannot_hide_its_saved_proof() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        recorder
+            .append(Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            })
+            .unwrap();
+        // The window stalls holding its writer lock, mid-way through the next
+        // record. flock belongs to the open description, so this blocks the
+        // locked reader exactly as a stopped window's lock would.
+        let dir = directory(&path, false).unwrap();
+        let _held = Lock::acquire(
+            private_file(&dir, &format!("{}.lock", Product::Ui.name()), libc::O_RDWR).unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut partial = private_file(
+            &dir,
+            &Product::Ui.filename(0),
+            libc::O_WRONLY | libc::O_APPEND,
+        )
+        .unwrap();
+        partial
+            .write_all(br#"{"schema_version":1,"product":"ui""#)
+            .unwrap();
+        assert!(
+            read_product(&dir, Product::Ui).is_err(),
+            "inspection still waits for the writer"
+        );
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
+        assert!(!final_flush_complete_at(&path, pid + 1, 0).unwrap());
+    }
+
+    #[test]
+    fn an_unfinished_record_is_never_read_as_evidence() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        let dir = directory(&path, false).unwrap();
+        // A complete final flush, cut before its newline, proves nothing yet.
+        let mut line = serde_json::to_vec(&Record {
+            schema_version: SCHEMA_VERSION,
+            product: Product::Ui,
+            run: Uuid::new_v4(),
+            pid,
+            at_unix_ms: 1,
+            version: "1.0.0".into(),
+            protocol: crate::terminal::ipc::PROTOCOL_VERSION,
+            event: Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            },
+        })
+        .unwrap();
+        let mut file = private_file(
+            &dir,
+            &Product::Ui.filename(0),
+            libc::O_WRONLY | libc::O_APPEND,
+        )
+        .unwrap();
+        file.write_all(&line).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        line.clear();
+        line.push(b'\n');
+        file.write_all(&line).unwrap();
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
+    }
+
     #[test]
     fn after_exit_evidence_and_restart_do_not_invent_health() {
         let (_root, path) = fixture();
@@ -982,7 +1397,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(previous.version, crate::VERSION);
+        assert_eq!(previous.version, crate::version());
         let run = previous.run;
         let mut next = Recorder::open(&path, Product::Ui).unwrap();
         next.append(Event::Startup).unwrap();
@@ -1361,6 +1776,124 @@ mod tests {
             assert_eq!(std::fs::read(current).unwrap(), before);
         }
     }
+
+    #[test]
+    fn a_storage_refusal_names_its_subject_and_rule_in_the_report() {
+        let (_root, path) = fixture();
+        let pane = Uuid::from_u128(0x5e71);
+        let project = Uuid::from_u128(0x9c1b);
+        let refused = |write, id, check| Event::StorageRefused {
+            write,
+            id,
+            check: Check::new(check),
+        };
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        let identity = "chat card … changed conversation identity (identity)";
+        recorder
+            .append(refused(RefusedWrite::Pane, Some(pane), identity))
+            .unwrap();
+        recorder
+            .append(refused(
+                RefusedWrite::Project,
+                Some(project),
+                "tombstoned project … cannot be resurrected",
+            ))
+            .unwrap();
+        recorder
+            .append(refused(
+                RefusedWrite::Workspace,
+                None,
+                "invalid card ordinal",
+            ))
+            .unwrap();
+        // A later run refuses the same pane for the same rule again.
+        drop(recorder);
+        let mut later = Recorder::open(&path, Product::Ui).unwrap();
+        later
+            .append(refused(RefusedWrite::Pane, Some(pane), identity))
+            .unwrap();
+        later
+            .append(Event::FinalFlush {
+                complete: false,
+                unsaved: 0,
+                refused: 1,
+                category: Some(Failure::InvalidData),
+            })
+            .unwrap();
+
+        let human = inspect_at(path).unwrap().human_at(u64::MAX);
+        assert!(
+            human.contains("final flush incomplete: 0 unsaved, 1 refused; invalid data"),
+            "{human}"
+        );
+        let pane_line =
+            format!("cagents-ui: storage refused the latest changes to pane {pane}: {identity}, ");
+        let lines = human
+            .lines()
+            .filter(|line| line.contains("storage refused"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{human}");
+        assert!(lines[0].starts_with(&pane_line), "{human}");
+        assert!(lines[0].contains("; recorded 2 times"), "{human}");
+        assert!(
+            lines[1].starts_with(
+                "cagents-ui: storage refused the window's layout and panes: invalid card ordinal, "
+            ),
+            "{human}"
+        );
+        assert!(
+            lines[2].starts_with(&format!(
+                "cagents-ui: storage refused project {project}: tombstoned project … cannot be resurrected, "
+            )),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_check_is_bounded_and_fits_a_record() {
+        let long = format!("{}\u{1b}[31m{}", "é".repeat(100), "x".repeat(400));
+        let check = Check::new(&long);
+        assert!(check.as_str().len() <= CHECK_BYTES);
+        assert!(check.as_str().ends_with('…'));
+        assert!(!check.as_str().contains(char::is_control));
+
+        // JSON escapes a quote to two bytes, so a check of nothing else is
+        // the longest one a record can hold.
+        let quotes = Check::new(&"\"".repeat(CHECK_BYTES));
+        assert_eq!(quotes.as_str().len(), CHECK_BYTES);
+
+        let (_root, path) = fixture();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        for check in [&quotes, &check] {
+            recorder
+                .append(Event::StorageRefused {
+                    write: RefusedWrite::RelaunchedTerminal,
+                    id: Some(Uuid::from_u128(u128::MAX)),
+                    check: check.clone(),
+                })
+                .unwrap();
+        }
+        let report = inspect_at(path.clone()).unwrap();
+        assert!(report.products[0].readable);
+        let checks = report.products[0]
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::StorageRefused { check, .. } => Some(check),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks, [&quotes, &check]);
+
+        // A record that holds more than a check can is not evidence.
+        let file = path.join(Product::Ui.filename(0));
+        let mut line = std::fs::read_to_string(&file).unwrap();
+        line = line.replace(check.as_str(), &"x".repeat(CHECK_BYTES + 1));
+        std::fs::write(&file, line).unwrap();
+        assert!(!inspect_at(path).unwrap().products[0].readable);
+    }
 }
 
 #[cfg(test)]
@@ -1396,7 +1929,7 @@ mod process_tests {
             return;
         }
         let file = PathBuf::from(path)
-            .join(crate::instance::STORAGE_NAME)
+            .join(crate::instance::storage_name())
             .join("diagnostics")
             .join(Product::Ui.filename(0));
         use std::os::unix::fs::PermissionsExt;
@@ -1527,7 +2060,7 @@ mod process_tests {
         );
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();
@@ -1646,7 +2179,7 @@ mod process_tests {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("RECOVERED_SECRET"));
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();
@@ -1686,7 +2219,7 @@ mod process_tests {
         assert!(!output.status.success());
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();

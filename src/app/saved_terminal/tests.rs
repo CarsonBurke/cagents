@@ -96,7 +96,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
     ] {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, card, source) = fixture();
-        app.card_state_mut(card).unwrap().exposure = initial;
+        app.set_exposure(card, initial);
         assert!(app.prepare_saved_terminal(card, &source));
         drop(app.inspect_saved_terminal(card));
         assert!(matches!(
@@ -106,7 +106,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
         // Revealing while inspection is pending cannot launch a duplicate.
         drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 1);
-        app.card_state_mut(card).unwrap().exposure = current;
+        app.set_exposure(card, current);
         let surface = crate::app::tests::unconnected_surface(directory.path(), source.id);
         complete_inspection(
             &mut app,
@@ -128,10 +128,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
             current == Exposure::Offscreen
         );
         assert_eq!(
-            matches!(
-                app.card_state(card).unwrap().residency,
-                Residency::Hibernated
-            ),
+            matches!(*app.residency(card), Residency::Hibernated),
             current == Exposure::Offscreen
         );
         assert!(!surface.is_unsized_spawn());
@@ -221,10 +218,6 @@ fn pending_then_exact_absence_keeps_the_original_descriptor_and_clears_start_sta
     drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
     assert!(app.saved_terminal_ready(card));
     assert_eq!(app.saved_terminal_status(card), None);
-    assert_eq!(
-        app.inspector_runtime_status(card),
-        InspectorRuntimeStatus::Unavailable
-    );
     assert_eq!(
         app.card_state(card).unwrap().kind,
         CardKind::Terminal(source.clone())
@@ -812,4 +805,61 @@ fn startup_qualification_keeps_saved_readiness_separate_from_unresolved_and_live
         app.card_state(card).unwrap().kind,
         CardKind::Terminal(source)
     );
+}
+
+/// A saved check that raced an owner being published is not a verdict on the
+/// terminal. A waiting startup gate checks it again the way Reconnect does,
+/// and the next check can settle it.
+#[test]
+fn a_startup_gate_checks_a_raced_saved_terminal_again() {
+    let (mut app, card, source) = fixture();
+    app.startup_gate = crate::app::startup_gate::State::fixture_opened();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(
+        card,
+        source,
+        request,
+        Err("Terminal ownership changed while checking recovery; reconnect again".into()),
+    )));
+    assert_eq!(
+        app.saved_terminal_status(card),
+        Some(("Reconnect unavailable", false))
+    );
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "a race is not a final refusal"
+    );
+    drop(app.qualify_startup_terminals());
+    assert!(!app.terminal_start_in_flight(card), "paced, not spun");
+    app.startup_gate.retries.expire_delay();
+    drop(app.qualify_startup_terminals());
+    complete_inspection(&mut app, card, Ok(None));
+    assert!(app.saved_terminal_ready(card));
+    assert_eq!(app.startup_pane_check(), Ok(true));
+}
+
+/// A refusal that stays the same across checks is reported once its window
+/// has passed, with its reason.
+#[test]
+fn a_startup_gate_reports_a_saved_terminal_that_keeps_refusing() {
+    const REFUSAL: &str = "The existing terminal has different saved source evidence";
+    let (mut app, card, source) = fixture();
+    app.startup_gate = crate::app::startup_gate::State::fixture_opened();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source, request, Err(REFUSAL.into()))));
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    app.startup_gate.retries.expire_delay();
+    drop(app.qualify_startup_terminals());
+    complete_inspection(&mut app, card, Err(REFUSAL.into()));
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "not reported within seconds of the first refusal"
+    );
+    app.startup_gate.retries.expire_window();
+    let report = app.startup_pane_check().unwrap_err();
+    assert!(report.contains(REFUSAL), "{report}");
+    drop(app.qualify_startup_terminals());
+    assert!(!app.terminal_start_in_flight(card), "reported, not retried");
 }

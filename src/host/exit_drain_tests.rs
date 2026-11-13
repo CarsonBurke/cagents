@@ -22,6 +22,67 @@ const ROOT: &str = "CAGENTS_EXIT_DRAIN_TEST_ROOT";
 const TEST: &str = "CAGENTS_EXIT_DRAIN_TEST_NAME";
 const SCOPE: &str = "CAGENTS_EXIT_DRAIN_INHERITED_SCOPE";
 static READY: OnceLock<mpsc::Sender<Result<SharedHost, String>>> = OnceLock::new();
+static STARTUP: OnceLock<std::sync::Mutex<StartupObservation>> = OnceLock::new();
+
+struct StartupObservation {
+    began: Instant,
+    phase: &'static str,
+    changed: Instant,
+    executable_bytes: Option<u64>,
+    error: Option<String>,
+}
+
+pub(super) fn observe_startup(phase: &'static str, error: Option<&str>) {
+    let Some(observation) = STARTUP.get() else {
+        return;
+    };
+    let mut observation = observation.lock().unwrap_or_else(|p| p.into_inner());
+    observation.phase = phase;
+    observation.changed = Instant::now();
+    if let Some(error) = error {
+        observation.error = Some(error.chars().take(4096).collect());
+    }
+}
+
+fn startup_diagnostic() -> String {
+    let mut diagnostic = match STARTUP.get() {
+        Some(observation) => {
+            let observation = observation.lock().unwrap_or_else(|p| p.into_inner());
+            format!(
+                "startup phase={} total={:?} phase_elapsed={:?} executable_bytes={:?} error_before_cleanup={:?}\n",
+                observation.phase,
+                observation.began.elapsed(),
+                observation.changed.elapsed(),
+                observation.executable_bytes,
+                observation.error,
+            )
+        }
+        None => "startup observer not registered\n".into(),
+    };
+    // Only this private fixture process is inspected. Bound diagnostics even
+    // if a failing service unexpectedly creates many threads.
+    if let Ok(tasks) = fs::read_dir("/proc/self/task") {
+        let mut tasks = tasks.filter_map(Result::ok).take(128).collect::<Vec<_>>();
+        tasks.sort_by_key(|entry| entry.file_name());
+        for task in tasks {
+            let read = |name| {
+                fs::read_to_string(task.path().join(name))
+                    .unwrap_or_else(|error| error.to_string())
+                    .trim()
+                    .chars()
+                    .take(128)
+                    .collect::<String>()
+            };
+            diagnostic.push_str(&format!(
+                "thread={} comm={} wchan={}\n",
+                task.file_name().to_string_lossy(),
+                read("comm"),
+                read("wchan"),
+            ));
+        }
+    }
+    diagnostic
+}
 
 pub(super) fn observe_ready(host: &SharedHost) {
     if let Some(ready) = READY.get() {
@@ -327,10 +388,25 @@ fn run_host() -> (
 ) {
     let (ready, observed) = mpsc::channel();
     READY.set(ready.clone()).unwrap();
+    let now = Instant::now();
+    STARTUP
+        .set(std::sync::Mutex::new(StartupObservation {
+            began: now,
+            phase: "acquire daemon admission",
+            changed: now,
+            executable_bytes: std::env::current_exe()
+                .and_then(fs::metadata)
+                .ok()
+                .map(|metadata| metadata.len()),
+            error: None,
+        }))
+        .unwrap_or_else(|_| panic!("startup observer already registered"));
     // A real private launch fence/HostLease is acquired; no daemon guard is
     // fabricated and no process-wide authority marker is removed or changed.
     let admission = DaemonAdmission {
+        lease: None,
         _guard: crate::instance::DaemonAdmissionGuard::acquire().unwrap(),
+        retirement_owned_by_updater: false,
     };
     let (complete, completion) = mpsc::channel();
     let thread = thread::spawn(move || {
@@ -346,7 +422,13 @@ fn run_host() -> (
     });
     let host = observed
         .recv_timeout(Duration::from_secs(8))
-        .expect("actual host::run ready");
+        .unwrap_or_else(|error| {
+            let diagnostic = startup_diagnostic();
+            if let Some(root) = std::env::var_os(ROOT) {
+                let _ = fs::write(PathBuf::from(root).join("startup-timeout.txt"), &diagnostic);
+            }
+            panic!("actual host::run ready: {error}; {diagnostic}");
+        });
     let host = match host {
         Ok(host) => host,
         Err(error) => {
@@ -545,22 +627,41 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     let lease = HostLease::acquire(&paths, &proof).unwrap();
     let mut state = HostState::new(proof);
     state.enable_holder_recovery();
+    state.install_model(model::Registry::open().unwrap());
     let host = Arc::new(state::HostLock::new(state));
     let (peer, server) = UnixStream::pair().unwrap();
     let serve_host = host.clone();
     let serving = thread::spawn(move || client::serve(server, 1, serve_host));
     let mut rpc = Rpc::from_stream(peer);
     let source = session(&root);
-    rpc.request(ClientRequest::Spawn {
-        session: source.clone(),
-        options: TerminalSpawnOptions::default(),
-    })
-    .unwrap();
-    let owner = host.lock().unwrap().terminals[&source.id]
-        .handle
-        .holder_identity()
+    assert!(source.continuity.live_proof().is_none());
+    let ServerResponse::Spawned { terminal } = rpc
+        .request(ClientRequest::Spawn {
+            session: source.clone(),
+            options: TerminalSpawnOptions::default(),
+        })
         .unwrap()
-        .clone();
+    else {
+        panic!("actual Spawn must return its original terminal");
+    };
+    let (owner, registered, current_proof) = {
+        let state = host.lock().unwrap();
+        let record = &state.terminals[&source.id];
+        (
+            record.handle.holder_identity().unwrap().clone(),
+            record.session.clone(),
+            state.proof().clone(),
+        )
+    };
+    assert_eq!(terminal.session.id, source.id);
+    assert_eq!(
+        terminal.session.continuity.live_proof(),
+        Some(current_proof.clone())
+    );
+    assert_eq!(
+        registered.continuity.live_proof(),
+        Some(current_proof.clone())
+    );
     let mut root_pin = OriginalPin::new(owner.root.pid as u32);
     let mut holder_pin = OriginalPin::new(owner.holder.pid as u32);
     let drain = begin_ordinary_exit(&host).expect("ordinary fixture, no committed successor");
@@ -592,6 +693,21 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
             ..
         }
     ));
+    // Before Close this worker owns the holder connection; Inspect is orphan-only.
+    // Real checked Close publishes its authenticated original-source receipt.
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&registered, &owner, &current_proof).unwrap()
+    );
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&source, &owner, &current_proof).is_err(),
+        "a proofless caller projection must not authenticate the real receipt"
+    );
+    let mut unissued = registered.clone();
+    unissued.launch.arguments.push("unissued-source".into());
+    assert!(
+        !crate::terminal::holder::cleanup::confirmed(&unissued, &owner, &current_proof).unwrap(),
+        "the original receipt must refuse a different source with the same proof"
+    );
     wait_for(|| drain.try_seal_absence());
     root_pin.prove_reaped();
     holder_pin.prove_reaped();
@@ -613,4 +729,5 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     drop(lease);
 }
 
+pub(super) mod lifecycle_retention_tests;
 mod startup_recovery_tests;

@@ -87,6 +87,21 @@ impl StickyParent {
             || (metadata.uid() != 0 && metadata.uid() != euid)
             || metadata.mode() & 0o1000 == 0
         {
+            #[cfg(test)]
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "retained-save diagnostic: stage=sticky-parent-acquire-guard; parent_is_dir={}; \
+                     parent_uid={}; effective_uid={euid}; parent_mode={:#o}; \
+                     parent_dev={}; parent_ino={}",
+                    metadata.is_dir(),
+                    metadata.uid(),
+                    metadata.mode() & 0o7777,
+                    metadata.dev(),
+                    metadata.ino()
+                );
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Private sibling creation requires a root- or user-owned sticky parent",

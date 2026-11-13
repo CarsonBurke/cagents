@@ -4,8 +4,8 @@
 //! it, `<data dir>/accounts/<provider>/<key>`, through the CLI's own variable
 //! (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The CLI owns everything inside: its
 //! login, its history, its caches. cagents creates the directory, links the
-//! reader's own instructions and extensions into it, and deletes it when the
-//! account is removed - and never opens a file the CLI wrote there.
+//! reader's own instructions and extensions into it, and preserves it when
+//! a pending sign-in is abandoned. Managed account deletion is unsupported.
 //!
 //! # What a managed home shares with the system home
 //!
@@ -36,19 +36,11 @@
 //!
 //! # Removal
 //!
-//! The current host admission foundation retains managed files until the
-//! complete ownership/deletion permit is composed. Existing local UI cleanup
-//! APIs below are outside this daemon admission cut; discovery grants no new
-//! cleanup authority.
-//!
-//! A home is removed by renaming it aside within its provider directory and
-//! then deleting the renamed tree. Nothing is followed on the way:
-//! the path is rebuilt from the account's key rather than taken from
-//! anywhere, every component of it is checked not to be a link, the directory
-//! must be a real one owned by this user, and the standard library's
-//! `remove_dir_all` unlinks symbolic links inside the tree rather than
-//! descending into them - so the shared entries above are unlinked, not
-//! emptied.
+//! Product lifecycle operations retain managed homes and old parked removal
+//! evidence. Discovery and registry absence never grant cleanup authority.
+//! Linked homes are only forgotten through the daemon's scoped admission;
+//! their files remain untouched. The legacy rename/delete helpers below are
+//! compiled only for historical destructive fixtures, not production paths.
 
 use std::{
     fs, io,
@@ -64,9 +56,9 @@ use crate::agent::Provider;
 mod creation;
 pub(crate) use creation::NewHomeCreationReceipt;
 
-/// Where a removal parks a home while it is deleted, so a removal that is
-/// interrupted leaves a name nothing else uses, and the next start finishes
-/// it.
+// Legacy destructive fixtures only. Product discovery preserves old parked
+// homes; their names grant no authority to finish a deletion.
+#[cfg(test)]
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -142,6 +134,75 @@ impl Homes {
     pub fn path(&self, provider: Provider, key: Uuid) -> PathBuf {
         self.provider_directory(provider)
             .join(key.hyphenated().to_string())
+    }
+
+    /// Whether `key` names a home of `provider` that exists as this user's
+    /// own real directory, reached through no link. A removed home is parked
+    /// and then deleted, so it never is.
+    pub(crate) fn is_kept(&self, provider: Provider, key: Uuid) -> bool {
+        let path = self.path(provider, key);
+        crate::secure_file::reject_symlink_components(&path).is_ok()
+            && crate::secure_file::validate_owned_directory(&path).is_ok()
+    }
+
+    /// Whether `key` names a kept home of `provider` that `registry` does not
+    /// name. Only such a home can be restored to the registry.
+    pub(crate) fn is_unregistered(
+        &self,
+        registry: &super::registry::Registry,
+        provider: Provider,
+        key: Uuid,
+    ) -> bool {
+        !registry.contains_managed_home(self, provider, key) && self.is_kept(provider, key)
+    }
+
+    /// The managed homes `registry` does not name, oldest first, with when
+    /// each directory was created where the filesystem records it.
+    ///
+    /// A registry that was lost or reset leaves its homes here with their
+    /// logins and histories. Only directories named exactly by a key are
+    /// candidates: a parked removal (`.removing-<key>`) is on its way out,
+    /// and anything else in the directory is not a home cagents made.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn unregistered(
+        &self,
+        registry: &super::registry::Registry,
+    ) -> Vec<(Provider, Uuid, Option<std::time::SystemTime>)> {
+        let mut found = Vec::new();
+        for provider in super::Account::PROVIDERS {
+            let directory = self.provider_directory(provider);
+            if crate::secure_file::reject_symlink_components(&directory).is_err()
+                || crate::secure_file::validate_owned_directory(&directory).is_err()
+            {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(key) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| Uuid::parse_str(name).ok())
+                else {
+                    continue;
+                };
+                // `parse_str` also accepts braced, simple and URN spellings,
+                // which are not the name cagents gives a home.
+                if entry.path() != self.path(provider, key)
+                    || !self.is_unregistered(registry, provider, key)
+                {
+                    continue;
+                }
+                let created = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.created())
+                    .ok();
+                found.push((provider, key, created));
+            }
+        }
+        found.sort_by_key(|(provider, key, created)| (*created, *provider, *key));
+        found
     }
 
     /// Creates a new, empty home for `provider`, private to this user, and
@@ -228,14 +289,15 @@ impl Homes {
                     path.display()
                 )));
             }
-            link_shared(provider, system_home, &path);
+            link_shared(provider, system_home, &path, codex_config);
         }
         created.revalidate()?;
         Ok((key, path))
     }
 
-    /// Deletes the home of account `key`. A home that is already gone is not
-    /// an error: removing an account twice leaves it just as removed.
+    // Legacy destructive fixture support. Product callers must use scoped
+    // daemon lifecycle operations, which retain managed and pending homes.
+    #[cfg(test)]
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
             remove_parked(&parked)?;
@@ -243,8 +305,7 @@ impl Homes {
         Ok(())
     }
 
-    /// Rename under the lifecycle/registry locks; delete the parked tree only
-    /// after releasing them, since provider caches can be large.
+    #[cfg(test)]
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
@@ -303,13 +364,9 @@ impl Homes {
         Ok(())
     }
 
-    /// Finishes removals an earlier run was interrupted in.
-    ///
-    /// Nothing else here is ever deleted on its own: a home the registry
-    /// does not name may belong to a registry this run cannot read - a newer
-    /// cagents, a reset configuration directory - and holds a login and its
-    /// history. Sign-ins that never finished are the registry's pending
-    /// entries, which the accounts view verifies before removing anything.
+    // Legacy destructive fixture support only. Never sweep parked evidence
+    // from discovery, sign-in cleanup, or any product lifecycle request.
+    #[cfg(test)]
     pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -449,6 +506,7 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
 
 /// Deletes a home that has been renamed aside, after checking it is still a
 /// real directory of this user's.
+#[cfg(test)]
 fn remove_parked(parked: &Path) -> io::Result<()> {
     crate::secure_file::reject_symlink_components(parked)?;
     crate::secure_file::validate_owned_directory(parked)?;
@@ -459,11 +517,19 @@ fn remove_parked(parked: &Path) -> io::Result<()> {
 /// `home` does not. Best effort: an entry that cannot be linked leaves the
 /// account without it, which is how every managed home started before, and
 /// is not worth refusing the account over.
-fn link_shared(provider: Provider, system_home: &Path, home: &Path) {
+fn link_shared(provider: Provider, system_home: &Path, home: &Path, codex_config: CodexConfig) {
     if system_home == home {
         return;
     }
     for name in shared_entries(provider) {
+        // Copy is a policy choice, including when the source was absent or
+        // changed after seeding. Never fall back to a shared configuration.
+        if provider == Provider::Codex
+            && codex_config == CodexConfig::Copy
+            && *name == "config.toml"
+        {
+            continue;
+        }
         let source = system_home.join(name);
         if fs::symlink_metadata(&source).is_err() {
             continue;
@@ -613,6 +679,105 @@ mod tests {
             fs::canonicalize(shared).unwrap(),
             "Codex derives its keyring key from each canonical home"
         );
+    }
+
+    #[test]
+    fn codex_copy_never_links_a_dangling_configuration_or_its_later_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir_all(system.join("skills")).unwrap();
+        fs::write(system.join("AGENTS.md"), "fixture instructions").unwrap();
+        let target = directory.path().join("later-config.toml");
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let (_, shared) = homes.create(Provider::Codex, Some(&system)).unwrap();
+        let config = copied.join("config.toml");
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_link(copied.join("AGENTS.md")).unwrap(),
+            system.join("AGENTS.md")
+        );
+        assert_eq!(
+            fs::read_link(copied.join("skills")).unwrap(),
+            system.join("skills")
+        );
+        assert_eq!(
+            fs::read_link(shared.join("config.toml")).unwrap(),
+            system.join("config.toml")
+        );
+
+        let original = b"approval_policy = \"on-request\"\n";
+        fs::write(&target, original).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(shared.join("config.toml")).unwrap(), original);
+        write_configuration(&config, b"model = \"managed-fixture\"\n").unwrap();
+        assert!(fs::symlink_metadata(&config).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::read_link(system.join("config.toml")).unwrap(), target);
+    }
+
+    #[test]
+    fn codex_copy_policy_survives_changes_between_seeding_and_linking() {
+        for remove_copy in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let system = directory.path().join("system");
+            let copied = directory.path().join("copied");
+            let shared = directory.path().join("shared");
+            for path in [&system, &copied, &shared] {
+                fs::create_dir(path).unwrap();
+            }
+            let source = system.join("config.toml");
+            let destination = copied.join("config.toml");
+            if remove_copy {
+                fs::write(&source, b"fixture original").unwrap();
+            }
+            copy_configuration(&source, &destination).unwrap();
+            if remove_copy {
+                fs::remove_file(&destination).unwrap();
+            } else {
+                fs::write(&source, b"fixture arrived after copy").unwrap();
+            }
+            // Exercise the actual phase boundary without sleeps or a race hook.
+            link_shared(Provider::Codex, &system, &copied, CodexConfig::Copy);
+            assert_eq!(
+                fs::symlink_metadata(&destination).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            link_shared(Provider::Codex, &system, &shared, CodexConfig::Shared);
+            assert_eq!(fs::read_link(shared.join("config.toml")).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn codex_copy_of_a_source_symlink_preserves_private_opaque_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir(&system).unwrap();
+        let target = directory.path().join("source-config.toml");
+        let original = b"# opaque fixture\n\xff\x00\r\n";
+        fs::write(&target, original).unwrap();
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let config = copied.join("config.toml");
+        let metadata = fs::symlink_metadata(&config).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_ne!(metadata.ino(), fs::metadata(&target).unwrap().ino());
+        assert_eq!(fs::read(&config).unwrap(), original);
+        fs::write(&config, b"independent fixture edit").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), original);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Qualify owned source/stamp freshness across worktrees sharing a Cargo cache.
 
 The tiny workspace uses this repository's actual Cargo config and build script.
@@ -147,12 +147,12 @@ qualification-dependency={path="../dependency"}
         build = build.replace(f'    println!("cargo:rerun-if-env-changed={IDENTITY}");\n', "")
     # Vary the actual stamp-producing script body independently of its runtime
     # Git lookup. A rerun in B can report B's dirty state using A's stale body.
-    directive = 'println!("cargo:rustc-env=CAGENTS_VERSION={version}");'
+    directive = 'println!("cargo:rustc-env=CAGENTS_CHECKOUT_METADATA={metadata}");'
     assert build.count(directive) == 1
-    build = build.replace(directive, directive.replace("{version}", "{version}.body-A"))
+    build = build.replace(directive, directive.replace("{metadata}", "{metadata}.body-A"))
     write(checkout_a / "build.rs", build)
     anchor = ANCHOR if fixed else ""
-    write(checkout_a / "src/lib.rs", anchor + '''pub const VERSION: &str = env!("CAGENTS_VERSION");
+    write(checkout_a / "src/lib.rs", anchor + '''pub const VERSION: &str = concat!("0.1.3+", env!("CAGENTS_CHECKOUT_METADATA"));
 pub fn value() -> &'static str { "root-A" }
 ''')
     write(checkout_a / "src/main.rs", '''fn main() {
@@ -230,6 +230,7 @@ pub fn generated() -> &'static str { GENERATED }
         run("git", "status", "--porcelain", "--untracked-files=no", cwd=checkout)
     env = os.environ.copy()
     env.pop("CAGENTS_BUILD_METADATA", None)
+    env.pop("CAGENTS_BUILD_METADATA_SUPPLIED", None)
     env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(lane / "build"), CARGO_BUILD_JOBS="2")
     # The configured force=true must defeat an inherited checkout identity.
     env[IDENTITY] = "deliberately-stale-inherited-value"
