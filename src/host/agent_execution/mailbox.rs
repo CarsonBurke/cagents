@@ -67,6 +67,20 @@ pub(in crate::host) fn post(
     Ok(delivery)
 }
 
+/// Runs `work` holding the shared side of the upgrade checkpoint's barrier,
+/// which must see every prompt its readiness check admitted. `None`, without
+/// running it, once the daemon no longer takes work.
+pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Option<T> {
+    let gate = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .control_gate
+        .clone();
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    crate::host::client::ensure_control_open(host).ok()?;
+    Some(work())
+}
+
 /// Leaves a message as `post` does, and has an agent cagents hosts take it as
 /// its next run: now, reopening its conversation if its process ended, or
 /// once its current work ends.
@@ -180,7 +194,7 @@ pub(super) fn to_agent(
     let Some(lineage) = message.to.lineage else {
         return Ok(None);
     };
-    let (agent, request, previous, interactive, ahead) = {
+    let (agent, request, previous, interactive, unverified, ahead) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
         let Some(agent) = store.lineage_agent(lineage)? else {
             return Ok(None);
@@ -188,11 +202,12 @@ pub(super) fn to_agent(
         let request = message_run(agent.id, message, seal);
         let previous = store.previous_agent_acceptance(&agent.origin, &request)?;
         let interactive = store.agent_is_interactive(agent.id)?;
+        let unverified = store.agent_has_unverified_run(agent.id)?;
         let ahead = store
             .unfinished_agent_runs(agent.id)?
             .first()
             .map(|run| run.id);
-        (agent, request, previous, interactive, ahead)
+        (agent, request, previous, interactive, unverified, ahead)
     };
     let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
         return Ok(None);
@@ -203,6 +218,12 @@ pub(super) fn to_agent(
         || previous.is_some()
     {
         return Ok(None);
+    }
+    if unverified {
+        return Ok(Some(Handoff::Held {
+            agent: agent.id,
+            reason: "A run of it was interrupted without proof of what it did, so cagents starts no more runs for it".into(),
+        }));
     }
     if limited {
         return Ok(Some(Handoff::Held {
@@ -248,7 +269,8 @@ pub(super) fn to_agent(
             run: accepted.run.id,
             start,
         })),
-        // Its run is recorded failed and the message waits again.
+        // Its run is recorded failed, and the message waits again to reach
+        // the conversation as a message.
         Err(reason) => Ok(Some(Handoff::Held {
             agent: agent.id,
             reason,
@@ -946,16 +968,6 @@ impl Handle {
 
     /// Starts the prompts agents hold behind work that has since ended.
     fn start_queued(&self, host: &SharedHost) {
-        // As for a message, an upgrade checkpoint must see each prompt sent.
-        let gate = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .control_gate
-            .clone();
-        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-        if crate::host::client::ensure_control_open(host).is_err() {
-            return;
-        }
         if let Err(error) = super::start_queued(host) {
             tracing::warn!(%error, "cannot start queued agent prompts");
         }
@@ -994,17 +1006,6 @@ impl Handle {
         if pending.is_empty() {
             return Ok(released);
         }
-        // An upgrade checkpoint must see every prompt its readiness check
-        // admitted; hold the shared side of its barrier while delivering.
-        let gate = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .control_gate
-            .clone();
-        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-        if crate::host::client::ensure_control_open(host).is_err() {
-            return Ok(released);
-        }
         let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             state
@@ -1027,25 +1028,54 @@ impl Handle {
             let limited = chats
                 .iter()
                 .any(|(id, _, _)| lineages.get(id) == Some(&recipient) && limits.contains_key(id));
-            match to_agent(host, &self.0.registry, &self.0.seal, &message, limited) {
-                Ok(Some(Handoff::Run { .. } | Handoff::Waiting { .. })) => continue,
+            // One message at a time, as reopening an agent's conversation for
+            // one can take a while and must not hold off an upgrade for all.
+            let Some(delivered) = with_control(host, || {
+                self.deliver_message(
+                    host, &message, recipient, limited, &chats, &lineages, limits,
+                )
+            }) else {
+                return Ok(released);
+            };
+            delivered?;
+        }
+        Ok(released)
+    }
+
+    /// Gives one pending message to its recipient: as a run of the agent
+    /// cagents hosts for it, or into its idle conversation.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_message(
+        &self,
+        host: &SharedHost,
+        message: &Message,
+        recipient: crate::agent_execution::Lineage,
+        limited: bool,
+        chats: &[(TerminalId, crate::agent::Provider, chat::runtime::Handle)],
+        lineages: &BTreeMap<TerminalId, crate::agent_execution::Lineage>,
+        limits: &BTreeMap<TerminalId, UsageLimit>,
+    ) -> Result<(), String> {
+        {
+            match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
+                Ok(Some(Handoff::Run { .. } | Handoff::Waiting { .. })) => return Ok(()),
+                // Not as a run, but as a message, as a person's conversation
+                // takes one.
                 Ok(Some(Handoff::Held { reason, .. })) => {
-                    tracing::debug!(%reason, message = %message.id, "an agent holds a message");
+                    tracing::debug!(%reason, message = %message.id, "an agent takes a message as a message");
                 }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
-                    continue;
+                    return Ok(());
                 }
             }
-            let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
-                lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
-            }) else {
-                continue;
-            };
-            self.hand_over(&message, *session, handle)?;
         }
-        Ok(released)
+        let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
+            lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
+        }) else {
+            return Ok(());
+        };
+        self.hand_over(message, *session, handle)
     }
 
     /// Claims the message for `session` before prompting, so that an inbox

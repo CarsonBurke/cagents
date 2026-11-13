@@ -6094,4 +6094,22 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
             .id,
         latest.id
     );
+
+    // A follow-up fails the same way, and retrying it reports that failure
+    // again rather than that it was sent.
+    let follow_up = Submit {
+        name: None,
+        destination: Destination::Existing(accepted.agent.id),
+        prompt: "Carry on".into(),
+        idempotency_key: "follow-up".into(),
+    };
+    for attempt in ["first", "retry"] {
+        let error = super::prompt(&host, &Authority::default(), follow_up.clone(), false)
+            .expect_err(attempt);
+        assert!(error.contains("was not sent"), "{attempt}: {error}");
+        assert!(
+            error.contains("Resume it from its pane"),
+            "{attempt}: {error}"
+        );
+    }
 }

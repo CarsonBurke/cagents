@@ -294,8 +294,9 @@ fn provider(
 /// conversation first when its process has ended. Otherwise the prompt waits
 /// unsent, and the mailbox courier starts it once the agent's work ends.
 ///
-/// A prompt that a reopening fails for is recorded failed, with why, rather
-/// than retried: the next prompt tries again.
+/// A prompt that cannot go now or later is recorded failed, with why, rather
+/// than retried: a reopening that failed, or work ahead whose outcome is
+/// unknown. The next prompt tries again.
 pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, String> {
     let registry = registry(host)?;
     let id = accepted.run.id;
@@ -311,8 +312,15 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
         )
     };
     if !queued {
-        // Another starter sent it, or it ended, while this one waited.
-        return Ok(Start::Sent { resumed: false });
+        // Another starter sent it, or it ended, while this one waited, or
+        // this is a retry of a run that already ended.
+        return match run.state {
+            State::Failed | State::Cancelled | State::Interrupted => Err(run
+                .result
+                .diagnostic
+                .unwrap_or_else(|| format!("The run ended {:?}", run.state))),
+            _ => Ok(Start::Sent { resumed: false }),
+        };
     }
     if let Some(behind) = behind {
         return Ok(Start::Queued {
@@ -321,6 +329,19 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
     }
     if agent.closed {
         return Err("The agent is closed".into());
+    }
+    // Work ahead of it ended without proof of what it did, as at a restart
+    // during that run, so nothing more goes until someone has looked.
+    if registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_has_unverified_run(agent.id)?
+    {
+        let refusal = crate::host::model::UNVERIFIED_BEHIND.to_owned();
+        if finish_failure_registry(&registry, id, State::Failed, refusal.clone()) {
+            announce(host, &registry);
+        }
+        return Err(refusal);
     }
     let current = |agent| Accepted {
         agent,
@@ -351,14 +372,19 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
 }
 
 /// Starts each agent's next waiting prompt that its agent can now take.
-/// Called by the mailbox courier whenever a conversation or a run changes.
+/// Called by the mailbox courier whenever a conversation or a run changes,
+/// outside any client request, so it takes the upgrade barrier itself, one
+/// prompt at a time.
 pub(super) fn start_queued(host: &SharedHost) -> Result<(), String> {
     let queued = registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .queued_agent_runs()?;
     for accepted in queued {
-        if let Err(error) = start(host, &accepted) {
+        let Some(started) = mailbox::with_control(host, || start(host, &accepted)) else {
+            break;
+        };
+        if let Err(error) = started {
             tracing::warn!(%error, run = %accepted.run.id, "cannot start a queued agent prompt");
         }
     }
@@ -379,7 +405,7 @@ fn resume(
         chat::NativeContinuity::RetainedClaudeActor { .. }
     ) {
         return Err(
-            "This agent's provider stopped, and only a Claude conversation reopens by itself. Resume it from its pane, then send again"
+            "This agent's provider stopped, and only a Claude conversation reopens by itself. Resume it from its pane"
                 .into(),
         );
     }
@@ -463,8 +489,10 @@ fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> 
     {
         return Ok(());
     }
+    let not_running =
+        || "The agent's provider is not running, so there was nothing to interrupt".to_owned();
     let Some(HostedSession::Chat(session)) = &record.session else {
-        return Ok(());
+        return Err(not_running());
     };
     let handle = host
         .lock()
@@ -474,7 +502,7 @@ fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> 
         .filter(|record| !record.handle.is_completed())
         .map(|record| record.handle.clone());
     let Some(handle) = handle else {
-        return Ok(());
+        return Err(not_running());
     };
     // A head that is itself waiting unsent stays first; the turn it waits on
     // is what stops.
@@ -981,8 +1009,9 @@ fn dispatch(
             .release_agent_dispatch(accepted.run.id)
             .map_err(before)?
     {
+        // The courier's next pass starts it. Waking it now could repeat this
+        // at once while the provider and its retained state disagree.
         drop(dispatch);
-        mailbox::wake(host);
         return Ok(());
     }
     ready?;
@@ -1125,11 +1154,6 @@ fn finish_failure_registry(
             },
             now(),
         )?;
-        // A run fails only before its prompt reached the provider, so a
-        // message it carried has not been received and waits again.
-        if state == State::Failed {
-            registry.return_run_message(run)?;
-        }
         Ok(true)
     });
     result.unwrap_or_else(|error| {
@@ -1825,31 +1849,42 @@ fn control(
                 (unfinished, queued)
             };
             let mut active = None;
-            let mut withdrawn = false;
+            let mut withdrawn = 0;
             for (run, queued) in unfinished.iter().zip(queued) {
                 if queued {
-                    withdrawn |= finish_failure_registry(
+                    withdrawn += usize::from(finish_failure_registry(
                         &registry,
                         run.id,
                         State::Cancelled,
                         WITHDRAWN.into(),
-                    );
+                    ));
                 } else {
                     active.get_or_insert(run.id);
                 }
             }
-            if withdrawn {
+            if withdrawn > 0 {
                 announce(host, &registry);
             }
+            // The queue is already withdrawn, so a failure says so too.
+            let stopped = |error: String| match withdrawn {
+                0 => error,
+                count => format!(
+                    "{error}. The {count} prompt(s) waiting behind it were withdrawn unsent"
+                ),
+            };
             match active {
                 Some(active) => {
                     if !withdraw_undelivered(host, &mut dispatch, Some(active))? {
-                        handle.interrupt_owned(Some(active), including_subagents)?;
+                        handle
+                            .interrupt_owned(Some(active), including_subagents)
+                            .map_err(stopped)?;
                     }
                 }
                 // The withdrawn prompts waited on a turn no run started.
                 None if !handle.is_idle() => {
-                    handle.interrupt_owned(None, including_subagents)?;
+                    handle
+                        .interrupt_owned(None, including_subagents)
+                        .map_err(stopped)?;
                 }
                 None => {}
             }

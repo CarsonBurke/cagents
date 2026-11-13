@@ -1193,15 +1193,7 @@ impl Registry {
                 }
                 // An interrupted run's effects are unknown; more work waits
                 // until someone has looked. Unfinished runs only queue it.
-                let unverified: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1
-                     AND state = 'interrupted')",
-                        [id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if unverified {
+                if has_unverified_run(&tx, *id)? {
                     return Err(UNVERIFIED_REFUSAL.into());
                 }
                 // An automation's schedule decides when it runs; nothing waits
@@ -1405,6 +1397,12 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())
+    }
+
+    /// Whether one of the agent's runs was interrupted without proof of its
+    /// outcome, so the agent takes no more work.
+    pub(crate) fn agent_has_unverified_run(&self, agent: AgentId) -> Result<bool, String> {
+        has_unverified_run(&self.db, agent)
     }
 
     /// The agent's unfinished runs, earliest first.
@@ -1771,24 +1769,31 @@ impl Registry {
                 } else {
                     end
                 };
-                // A stop leaves unsent queued prompts for the resumed successor;
-                // closing the agent withdraws them with everything else.
-                let kept = if end == ProcessEnd::Stopped {
-                    format!(" AND NOT ({UNSENT})")
-                } else {
-                    String::new()
-                };
-                let records = tx.prepare(&format!("SELECT r.record FROM agent_runs r WHERE r.agent = ?1 AND r.state IN ('accepted', 'running', 'waiting'){kept}"))
-                    .map_err(|e| e.to_string())?.query_map([agent.id.to_string()], |row| row.get::<_, String>(0))
+                let records = tx.prepare(&format!("SELECT r.record, ({UNSENT}) FROM agent_runs r WHERE r.agent = ?1 AND r.state IN ('accepted', 'running', 'waiting')"))
+                    .map_err(|e| e.to_string())?.query_map([agent.id.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))
                     .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| e.to_string())?;
-                for record in records {
+                // A stop leaves unsent queued prompts for the resumed
+                // successor, unless it cut short the work they wait on: what
+                // that did is unknown, so nothing more goes until someone has
+                // looked. Closing the agent withdraws them with everything else.
+                let cut_short = records.iter().any(|(_, unsent)| !unsent);
+                for (record, unsent) in records {
+                    if unsent && end == ProcessEnd::Stopped && pending.is_none() && !cut_short {
+                        continue;
+                    }
                     let mut run: Run = decode(&record)?;
+                    if run.state == State::Accepted {
+                        super::mailbox::return_run_message_in(&tx, run.id)?;
+                    }
                     // Teardown was confirmed, so this is a deliberate stop, not
                     // lost evidence (`Interrupted`). Cancelled leaves the agent
                     // free to take new work; nothing resends this prompt.
                     run.state = State::Cancelled;
                     if pending.is_some() {
                         run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
+                    } else if end == ProcessEnd::Stopped && unsent {
+                        changed = true;
+                        run.result.diagnostic = Some(STOPPED_BEHIND.into());
                     } else if end == ProcessEnd::Stopped {
                         changed = true;
                         run.result.diagnostic = Some("The agent's process stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
@@ -2238,6 +2243,12 @@ pub(super) fn update_agent_run_in(
             if state == State::Succeeded && run.provider_key.is_none() {
                 return Err("An unconfirmed provider turn cannot succeed".into());
             }
+            // A run that fails or is cancelled before its provider started
+            // the turn never gave the provider its prompt. An interrupted one
+            // may have, so its message stays given.
+            if run.state == State::Accepted && matches!(state, State::Failed | State::Cancelled) {
+                super::mailbox::return_run_message_in(tx, id)?;
+            }
             result.bound();
             run.result = result;
             run.state = state;
@@ -2354,6 +2365,22 @@ const UNSENT: &str = "r.state = 'accepted'
 pub(crate) const MAX_QUEUED: usize = 8;
 
 /// Why an agent whose latest outcome is unknown takes no more work.
+fn has_unverified_run(db: &Connection, agent: AgentId) -> Result<bool, String> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1 AND state = 'interrupted')",
+        [agent.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Why a prompt waiting behind a run that a stop cut short was not sent.
+const STOPPED_BEHIND: &str = "Not sent: the agent's process stopped during the run ahead of it, whose effects may be incomplete. Inspect the conversation, then send it again";
+
+/// Why a prompt waiting behind a run interrupted without proof of its outcome
+/// was not sent.
+pub(crate) const UNVERIFIED_BEHIND: &str = "Not sent: the run ahead of it was interrupted without proof of its outcome. Inspect the agent's conversation; the agent takes no more runs until it is closed";
+
 pub(crate) const UNVERIFIED_REFUSAL: &str = "The agent has unverified work: a run was interrupted without proof of its outcome. Inspect its conversation, then close the agent before giving it more work";
 
 /// The earliest of `agent`'s runs that has not finished, if any.
@@ -3301,6 +3328,189 @@ mod tests {
     /// A daemon stop ends the exact provider's authority and turn but keeps
     /// the agent, its pane and its channel, so the conversation resumes in
     /// place; an explicit Close of the same state still retires all three.
+    /// A message to `agent`, bound to `source`, and the run it becomes.
+    fn message_run(
+        registry: &mut Registry,
+        agent: &Agent,
+        source: &HostedSession,
+        now: u64,
+    ) -> (crate::agent_execution::mailbox::Message, Accepted) {
+        use crate::agent_execution::mailbox::{Message, Party, State as Mail};
+        let lineage = crate::agent_execution::Lineage(source.id());
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: Some(lineage),
+                session: Some(source.id()),
+                title: None,
+            },
+            reply_to: None,
+            body: "Check the tests too".into(),
+            wait_until_ms: None,
+            state: Mail::Pending,
+            created_ms: now,
+        };
+        registry.post_message(&message).unwrap();
+        let request = Submit {
+            name: None,
+            destination: Destination::Existing(agent.id),
+            prompt: message.body.clone(),
+            idempotency_key: format!("{}{}", super::super::MESSAGE_RUN_KEY, message.id),
+        };
+        let accepted = registry
+            .hand_message_to_agent(message.id, source.id(), &agent.origin, &request, now)
+            .unwrap()
+            .expect("the pending message becomes a run");
+        (message, accepted)
+    }
+
+    fn message_state(
+        registry: &Registry,
+        message: &crate::agent_execution::mailbox::Message,
+    ) -> crate::agent_execution::mailbox::State {
+        registry.message(message.id).unwrap().unwrap().state
+    }
+
+    #[test]
+    fn a_message_run_that_ends_unsent_gives_its_message_back() {
+        use crate::agent_execution::mailbox::State as Mail;
+        for (end, cut_short) in [
+            (ProcessEnd::Stopped, true),
+            (ProcessEnd::Stopped, false),
+            (ProcessEnd::Closed, true),
+        ] {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let source = source();
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            registry.register_agent_authority(&source).unwrap();
+            let first = registry
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "turn".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            if !cut_short {
+                registry
+                    .update_agent_run(
+                        first.id,
+                        first.revision,
+                        Update::Finished {
+                            state: State::Succeeded,
+                            result: Default::default(),
+                        },
+                        3,
+                    )
+                    .unwrap();
+            }
+            // Behind a running turn the message waits as an unsent run; with
+            // none ahead, nothing has claimed it yet either.
+            let (message, queued) = message_run(&mut registry, &accepted.agent, &source, 4);
+            assert!(registry.agent_run_is_queued(queued.run.id).unwrap());
+            assert_eq!(message_state(&registry, &message), Mail::Delivered);
+
+            assert!(registry.end_agent_process(&source, 5, end, None).unwrap());
+            let run = registry.agent_run(queued.run.id).unwrap();
+            if end == ProcessEnd::Stopped && !cut_short {
+                // Nothing was cut short, so it waits for the resumed process.
+                assert_eq!(run.state, State::Accepted);
+                assert_eq!(message_state(&registry, &message), Mail::Delivered);
+                continue;
+            }
+            assert_eq!(run.state, State::Cancelled, "{end:?}");
+            if end == ProcessEnd::Stopped {
+                assert_eq!(run.result.diagnostic.as_deref(), Some(STOPPED_BEHIND));
+            }
+            assert_eq!(
+                message_state(&registry, &message),
+                Mail::Pending,
+                "{end:?}: a message whose run never reached the provider waits again"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_run_the_provider_started_keeps_its_message_given() {
+        use crate::agent_execution::mailbox::State as Mail;
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let source = source();
+        registry
+            .bind_agent(accepted.agent.id, None, source.clone())
+            .unwrap();
+        let first = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "turn".into(),
+                },
+                2,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                first.id,
+                first.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                3,
+            )
+            .unwrap();
+        let (message, run) = message_run(&mut registry, &accepted.agent, &source, 4);
+        let started = registry
+            .update_agent_run(
+                run.run.id,
+                run.run.revision,
+                Update::Started {
+                    provider_key: "message-turn".into(),
+                },
+                5,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                started.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Failed,
+                    result: Default::default(),
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(
+            message_state(&registry, &message),
+            Mail::Delivered,
+            "the provider had the prompt, so giving the message again would repeat it"
+        );
+
+        // A run that fails before its provider starts it gives the message
+        // back, as a failed reopening does.
+        let (message, run) = message_run(&mut registry, &accepted.agent, &source, 7);
+        registry
+            .update_agent_run(
+                run.run.id,
+                run.run.revision,
+                Update::Finished {
+                    state: State::Failed,
+                    result: Default::default(),
+                },
+                8,
+            )
+            .unwrap();
+        assert_eq!(message_state(&registry, &message), Mail::Pending);
+    }
+
     #[test]
     fn daemon_stop_keeps_the_agent_pane_and_channel_that_close_retires() {
         use crate::workspace_model::views::Scope;

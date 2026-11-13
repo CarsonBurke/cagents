@@ -244,6 +244,13 @@ anything: the number of seconds on the file's first line, such as `1.5`, or
 starting state, or to check what the app does when a prompt is sent before
 the provider answers.
 
+To have the first turn finish by itself, as real work does, write a whole
+number of seconds, such as `8`, to `home/.claude/fixture-first-turn-seconds`.
+The first turn then stays busy that long, unless it is interrupted first, and
+ends successfully. Anything else makes the provider exit with status 2 and say so.
+Use this to check what happens to prompts and messages that wait behind an
+agent's run once that run ends.
+
 To run a real command, write it as the first line of
 `home/.claude/fixture-run-command`, such as `sleep 6001`. Every turn then runs
 it as a Bash call in a child of the provider, as Claude's Bash tool does, and

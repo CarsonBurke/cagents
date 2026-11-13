@@ -250,7 +250,11 @@ fn delivery_lines(handed: &Handed) -> String {
                 "Its conversation had stopped, so cagents reopened it to take the message.".into(),
             );
         }
-        lines.push(format!("It runs as run {run} of agent {}.", short(*agent)));
+        lines.push(format!(
+            "It runs as run {} of agent {}.",
+            short(*run),
+            short(*agent)
+        ));
     }
     if let Some(notice) = notice(handed) {
         lines.push(format!("But {notice}"));
@@ -259,11 +263,12 @@ fn delivery_lines(handed: &Handed) -> String {
 }
 
 /// Why the recipient cannot act on a message now, when it cannot: its usage
-/// limit, or what keeps an agent recipient from taking it as a run.
+/// limit; or why the agent cagents hosts for it did not take it as a run, so
+/// it arrives as the sent line says a message to any session does.
 fn notice(handed: &Handed) -> Option<String> {
     recipient_notice(&handed.delivery).or_else(|| match &handed.agent {
         Some(Handoff::Held { reason, .. }) => Some(format!(
-            "that agent cannot take it as a run now: {}",
+            "cagents did not start a run of that agent with it: {}.",
             reason.trim_end_matches('.')
         )),
         _ => None,
@@ -853,7 +858,7 @@ mod tests {
         );
         assert_eq!(
             lines[1],
-            format!("It runs as run {run} of agent {}.", short(agent))
+            format!("It runs as run {} of agent {}.", short(run), short(agent))
         );
         assert_eq!(lines.len(), 2);
 
@@ -893,8 +898,7 @@ mod tests {
         // message waits where the session-level line says it does.
         let held = handed(Some(Handoff::Held {
             agent,
-            reason: "This agent's provider stopped. Resume it from its pane, then send again."
-                .into(),
+            reason: "This agent's provider stopped. Resume it from its pane.".into(),
         }));
         let lines = delivery_lines(&held);
         let (first, notice) = lines.split_once('\n').unwrap();
@@ -904,7 +908,7 @@ mod tests {
         );
         assert_eq!(
             notice,
-            "But that agent cannot take it as a run now: This agent's provider stopped. Resume it from its pane, then send again"
+            "But cagents did not start a run of that agent with it: This agent's provider stopped. Resume it from its pane."
         );
         let value = delivery_json(&held);
         assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());

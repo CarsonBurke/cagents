@@ -17,6 +17,25 @@ use rusqlite::{
 
 pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
 
+/// Returns the message `run` was made of to its recipient's queue, in the
+/// transaction that ends the run unsent: its prompt never reached the
+/// provider, so the message has not been received. The courier then gives it
+/// to the conversation as a message, as it would to a person's.
+pub(super) fn return_run_message_in(
+    db: &Connection,
+    run: crate::model::RunId,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE messages SET state = 'pending', delivered_session = NULL, settled_ms = NULL
+         WHERE state = 'delivered' AND id = (
+             SELECT substr(idempotency_key, length(?2) + 1) FROM agent_runs
+             WHERE id = ?1 AND substr(idempotency_key, 1, length(?2)) = ?2)",
+        params![run.to_string(), MESSAGE_RUN_KEY],
+    )
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
 /// How many messages `cagents inbox --all` lists.
 const RECENT: usize = 50;
 
@@ -461,22 +480,6 @@ impl Registry {
         let accepted = Self::submit_agent_in(&tx, origin, request, now)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Some(accepted))
-    }
-
-    /// Returns the message `run` was made of to its recipient's queue: the
-    /// run ended before its prompt reached the provider, so the message has
-    /// not been received.
-    pub(crate) fn return_run_message(&mut self, run: crate::model::RunId) -> Result<bool, String> {
-        self.db
-            .execute(
-                "UPDATE messages SET state = 'pending', delivered_session = NULL, settled_ms = NULL
-                 WHERE state = 'delivered' AND id = (
-                     SELECT substr(idempotency_key, length(?2) + 1) FROM agent_runs
-                     WHERE id = ?1 AND substr(idempotency_key, 1, length(?2)) = ?2)",
-                params![run.to_string(), MESSAGE_RUN_KEY],
-            )
-            .map(|changed| changed == 1)
-            .map_err(|error| error.to_string())
     }
 
     /// Returns a message `session` refused to the queue it was claimed from.
