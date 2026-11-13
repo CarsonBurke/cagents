@@ -35,7 +35,10 @@ impl Runtime {
             [
                 header.into(),
                 design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into(),
-                widget::scrollable(draft).height(Length::Fill).into(),
+                crate::interaction::overflow_fade_y(
+                    widget::scrollable(draft).height(Length::Fill),
+                    design::base,
+                ),
             ]
             .into_iter()
             .chain((!attached.is_empty()).then(|| {

@@ -418,7 +418,9 @@ impl Runtime {
             );
         }
         let list_epoch = self.changes.list_epoch;
-        let list: Element<'_, Message> =
+        // Both lists stop at the card's inset; what passes that edge fades
+        // into the card rather than being cut there.
+        let list = crate::interaction::overflow_fade_y(
             widget::scrollable(widget::column::with_children(files).spacing(2))
                 .id(card_control_id(target.card, "chat-changes-files"))
                 .on_scroll(move |viewport| {
@@ -430,8 +432,9 @@ impl Runtime {
                         viewport.absolute_offset().y,
                     ))
                 })
-                .height(Length::Fill)
-                .into();
+                .height(Length::Fill),
+            design::component_base,
+        );
         let list = scroll_restore::on_mount(
             list,
             card_control_id(target.card, "chat-changes-files"),
@@ -593,10 +596,12 @@ impl Runtime {
             .spacing(space::XS)
             .into(),
         );
-        widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
-            .id(card_control_id(target.card, "chat-changes-detail"))
-            .height(Length::Fill)
-            .into()
+        crate::interaction::overflow_fade_y(
+            widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
+                .id(card_control_id(target.card, "chat-changes-detail"))
+                .height(Length::Fill),
+            design::component_base,
+        )
     }
 }
 

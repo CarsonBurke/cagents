@@ -1208,9 +1208,11 @@ fn settings_layout<'a>(
     .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
     .height(Length::Fill);
-    // The title and save state stay put while the page scrolls under them.
+    // The title and save state stay put while the page scrolls under them,
+    // fading out beneath the title rather than being cut at its foot.
+    let scroll = crate::interaction::overflow_fade_y(scroll, design::base);
     let content: Element<'a, Message> =
-        widget::column::with_children(header.map(Element::from).into_iter().chain([scroll.into()]))
+        widget::column::with_children(header.map(Element::from).into_iter().chain([scroll]))
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
