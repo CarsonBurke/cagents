@@ -166,3 +166,74 @@ fn canonical_empty_retirement_accepts_only_the_captured_empty_view_and_no_work()
     assert_eq!(retained.lifecycle, HomeLifecycle::Deleted);
     assert!(retained.entries.is_empty() && retained.history.is_empty());
 }
+
+/// An open agent placed in an empty channel is a session waiting for a window
+/// to show it, whether its adoption is still to come or a restore left it
+/// undone. Retiring the channel would hide it. One whose pane was closed there
+/// is what the person chose to end, and leaves the channel empty.
+#[test]
+fn canonical_empty_retirement_keeps_a_channel_holding_a_detached_agent() {
+    let (mut registry, _directory, home, _repository) = fixture();
+    let agent = crate::agent_execution::Agent::fixture_placed_in(home.channel);
+    registry
+        .db
+        .execute(
+            "INSERT INTO agents(id, origin, record, closed) VALUES (?1, '\"User\"', ?2, 0)",
+            params![agent.id.to_string(), serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    let retire = ModelEdit::RetireEmptyChannel {
+        home,
+        expected_view_revision: 0,
+    };
+    let kept = registry.apply(&retire).unwrap();
+    assert!(!kept.changed);
+    assert!(kept.model.channel(home.channel).is_some());
+
+    // Another channel's agent says nothing about this one.
+    let mut elsewhere = agent.clone();
+    elsewhere.placement = crate::agent_execution::Placement::Channel(ChannelId::new());
+    registry
+        .db
+        .execute(
+            "UPDATE agents SET record = ?2 WHERE id = ?1",
+            params![
+                agent.id.to_string(),
+                serde_json::to_string(&elsewhere).unwrap()
+            ],
+        )
+        .unwrap();
+    // Its record names this channel only in its spec, which the exact
+    // placement check sees past.
+    assert!(registry.apply(&retire).unwrap().changed);
+}
+
+#[test]
+fn canonical_empty_retirement_accepts_an_agent_whose_pane_was_closed_there() {
+    let (mut registry, _directory, home, _repository) = fixture();
+    let agent = crate::agent_execution::Agent::fixture_placed_in(home.channel);
+    registry
+        .db
+        .execute(
+            "INSERT INTO agents(id, origin, record, closed) VALUES (?1, '\"User\"', ?2, 0)",
+            params![agent.id.to_string(), serde_json::to_string(&agent).unwrap()],
+        )
+        .unwrap();
+    let inserted = registry
+        .db
+        .execute(
+            "INSERT INTO retired_panes(scope, pane, ordinal, retired_at_unix_ms)
+             SELECT id, ?1, 1, 0 FROM view_scopes WHERE channel = ?2",
+            params![agent.id.to_string(), home.channel.to_string()],
+        )
+        .unwrap();
+    assert_eq!(inserted, 1);
+    let applied = registry
+        .apply(&ModelEdit::RetireEmptyChannel {
+            home,
+            expected_view_revision: 0,
+        })
+        .unwrap();
+    assert!(applied.changed);
+    assert!(applied.model.channel(home.channel).is_none());
+}
