@@ -961,7 +961,8 @@ impl Cagents {
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                        design::dialog_base,
+                        // The chooser is a popover, on the elevated surface.
+                        design::component_base,
                     ))
                     .max_height(280)
                     .into(),

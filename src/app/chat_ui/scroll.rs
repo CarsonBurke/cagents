@@ -873,7 +873,11 @@ pub(super) fn find_anchor(
                 intent: self.intent.clone(),
                 document: None,
                 location: LogicalLocation {
-                    offset: travel - (found.y - content.y).clamp(0.0, travel),
+                    // The anchor lands a fade's depth below the top, so the
+                    // line jumped to is not the one dissolving into the edge.
+                    offset: travel
+                        - (found.y - content.y - crate::interaction::OVERFLOW_FADE)
+                            .clamp(0.0, travel),
                     exact: false,
                     stage: 0,
                     shape_pending: None,

@@ -2259,13 +2259,17 @@ impl State {
                     .push(crate::design::heading("This exact receipt is unavailable"))
                     .push(crate::design::body("It may have expired from retained history or no longer be available on this backend. The original notice remains in Attention."));
             }
-            return widget::scrollable(content.padding(space::L))
+            return crate::interaction::overflow_fade_y(
+                widget::scrollable(content.padding(crate::design::with_vertical_rail(
+                    cosmic::iced::Padding::from(space::L),
+                )))
                 .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
                     crate::design::scrollbar(),
                 ))
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+                .height(Length::Fill),
+                crate::design::base,
+            );
         }
 
         let width = size.width;
@@ -2761,13 +2765,15 @@ impl State {
         let vertical =
             || cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar());
         let content: Element<'_, Action> = if scrolls {
-            widget::scrollable(content.padding(crate::design::with_vertical_rail(
-                cosmic::iced::Padding::from(space::L),
-            )))
-            .direction(vertical())
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(content.padding(crate::design::with_vertical_rail(
+                    cosmic::iced::Padding::from(space::L),
+                )))
+                .direction(vertical())
+                .height(Length::Fill)
+                .width(Length::Fill),
+                crate::design::base,
+            )
         } else {
             content.padding(space::L).height(Length::Fill).into()
         };

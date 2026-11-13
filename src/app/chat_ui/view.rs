@@ -2841,7 +2841,7 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>();
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(widget::column::with_children(rows).padding(
                         design::with_vertical_rail(iced::Padding::new(COMPLETION_INSET)),
                     ))
@@ -2856,7 +2856,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Fixed(viewport)),
-                )
+                    design::raised,
+                ))
                 .class(design::surface(
                     Some(design::raised),
                     [design::RADIUS_M; 4],

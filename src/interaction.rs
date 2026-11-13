@@ -20,7 +20,7 @@ pub use composer_popover::composer_popover;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;
-pub use list_navigation::reveal_list_selection;
+pub use list_navigation::{reveal_list_selection, selection_offset};
 
 use crate::design::space;
 
@@ -1231,8 +1231,9 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
 }
 
 /// How far an overflow fade reaches into a scrolling strip: about one line
-/// of body text, or the end of a tab label.
-const OVERFLOW_FADE: f32 = 24.0;
+/// of body text, or the end of a tab label. Code that scrolls something into
+/// view keeps it this far from an edge that may be fading.
+pub(crate) const OVERFLOW_FADE: f32 = 24.0;
 
 /// How far each edge's fade reaches, given how far the content has scrolled
 /// from its start and how much of it lies past the viewport's end.

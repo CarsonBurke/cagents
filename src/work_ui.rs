@@ -690,26 +690,31 @@ impl State {
         if items.is_empty() {
             return self.no_match();
         }
-        crate::ui_controls::keep_in_place(
-            widget::scrollable(
-                widget::container(
-                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
-                        self.row(items[index])
-                    })
-                    .spacing(space::XS)
-                    .estimate(ROW_ESTIMATE)
-                    .keep_built(self.open_menu_key()),
+        // As in a lane: a row crossing either edge fades into the pane
+        // rather than being sliced there.
+        crate::interaction::overflow_fade_y(
+            crate::ui_controls::keep_in_place(
+                widget::scrollable(
+                    widget::container(
+                        crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                            self.row(items[index])
+                        })
+                        .spacing(space::XS)
+                        .estimate(ROW_ESTIMATE)
+                        .keep_built(self.open_menu_key()),
+                    )
+                    .padding(design::with_vertical_rail(Padding::from([
+                        space::M,
+                        space::L,
+                    ]))),
                 )
-                .padding(design::with_vertical_rail(Padding::from([
-                    space::M,
-                    space::L,
-                ]))),
-            )
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .width(Length::Fill)
-            .height(Length::Fill),
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            ),
+            design::base,
         )
     }
 

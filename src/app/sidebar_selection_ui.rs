@@ -777,7 +777,12 @@ impl Cagents {
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title(title).into(),
             widget::container(crate::interaction::overflow_fade_y(
-                widget::scrollable(members),
+                widget::scrollable(
+                    members.padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                )),
                 design::dialog_base,
             ))
             .max_height(240)

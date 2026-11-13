@@ -725,7 +725,8 @@ impl State {
 
     /// Moves the highlight one row among `count`, wrapping at either end, and
     /// returns the offset that brings its row into a `viewport` of rows
-    /// `row` tall when the list has to scroll for it.
+    /// `row` tall when the list has to scroll for it, clear of the list's
+    /// overflow fade.
     pub fn step(
         &mut self,
         down: bool,
@@ -745,14 +746,11 @@ impl State {
             (current + count - 1) % count
         };
         let top = inset + self.highlighted as f32 * row;
-        let bottom = top + row;
-        let offset = if top < self.offset {
-            top
-        } else if bottom > self.offset + viewport {
-            bottom - viewport
-        } else {
+        let content = count as f32 * row + 2.0 * inset;
+        let offset = crate::interaction::selection_offset(top, row, viewport, content, self.offset);
+        if offset == self.offset {
             return None;
-        };
+        }
         self.offset = offset;
         Some(offset)
     }
@@ -1134,8 +1132,10 @@ mod tests {
     #[test]
     fn highlight_reveal_accounts_for_scrolling_padding() {
         let mut state = State::default();
-        assert_eq!(state.step(false, 10, 28.0, 92.0, 4.0), Some(192.0));
-        assert_eq!(state.step(true, 10, 28.0, 92.0, 4.0), Some(4.0));
+        // The last row and the first reveal their end of the list, inset and
+        // all: nothing lies beyond them to fade.
+        assert_eq!(state.step(false, 10, 28.0, 92.0, 4.0), Some(196.0));
+        assert_eq!(state.step(true, 10, 28.0, 92.0, 4.0), Some(0.0));
         assert_eq!(state.step(true, 10, 28.0, 92.0, 4.0), None);
     }
 
@@ -1148,10 +1148,12 @@ mod tests {
         // Down from the last wraps to the first, back at the top.
         assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(0.0));
         assert_eq!(state.highlighted, 0);
-        // Moving within the visible rows does not scroll.
+        // Moving within the rows clear of the fade does not scroll.
         assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), None);
-        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), None);
-        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(28.0));
+        // A row reaching the faded bottom edge scrolls up with it, keeping the
+        // fade's depth of the next row in view below.
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(24.0));
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(52.0));
         assert_eq!(state.highlighted, 3);
 
         state.dismissed = Some((0, 0));

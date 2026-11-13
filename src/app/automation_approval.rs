@@ -549,7 +549,13 @@ impl Cagents {
         );
         let surface = widget::column::with_children(vec![
             crate::interaction::overflow_fade_y(
-                widget::scrollable(content).height(Length::Fixed(440.0)),
+                widget::scrollable(
+                    content.padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Fixed(440.0)),
                 design::dialog_base,
             ),
             controls,

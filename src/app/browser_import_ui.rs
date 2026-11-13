@@ -705,8 +705,15 @@ impl Cagents {
                         .into(),
                     );
                     content.push(crate::interaction::overflow_fade_y(
-                        widget::scrollable(widget::column::with_children(rows).spacing(space::S))
-                            .height(Length::Fixed(360.0)),
+                        widget::scrollable(
+                            widget::column::with_children(rows)
+                                .spacing(space::S)
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(Length::Fixed(360.0)),
                         design::dialog_base,
                     ));
                     content.push(

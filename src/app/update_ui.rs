@@ -374,7 +374,10 @@ impl Cagents {
                         widget::column::with_children(rows)
                             .spacing(space::M)
                             .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                    ),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    )),
                     design::dialog_base,
                 ))
                 .max_height(320)
