@@ -1064,7 +1064,9 @@ pub(crate) fn ui_final_flush_complete(pid: u32, since_unix_ms: u64) -> io::Resul
 }
 
 fn final_flush_complete_at(path: &Path, pid: u32, since_unix_ms: u64) -> io::Result<bool> {
-    let records = read_product(&directory(path, false)?, Product::Ui)?;
+    // The window being proven may be the writer: one stopped mid-append keeps
+    // the lock forever, so this proof must not wait for it.
+    let records = read_product_snapshot(&directory(path, false)?, Product::Ui)?;
     let mut complete = false;
     for record in records
         .iter()
@@ -1083,50 +1085,125 @@ fn final_flush_complete_at(path: &Path, pid: u32, since_unix_ms: u64) -> io::Res
     Ok(complete)
 }
 
+/// Whether a generation's bytes must end at a record boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    Complete,
+    /// An unfinished append may follow the last complete record.
+    Appending,
+}
+
 fn read_product(dir: &File, product: Product) -> io::Result<Vec<Record>> {
     let lock = match private_file(dir, &format!("{}.lock", product.name()), libc::O_RDONLY) {
         Ok(file) => Some(Lock::acquire(file, false)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+    let generations = open_generations(dir, product)?;
+    if lock.is_none() && !generations.is_empty() {
+        return Err(unsafe_path());
+    }
     let mut records = std::collections::VecDeque::new();
-    for generation in (0..GENERATIONS).rev() {
-        let file = match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        if lock.is_none() || file.metadata()?.len() > FILE_BYTES {
-            return Err(unsafe_path());
-        }
-        let mut bytes = Vec::new();
-        file.take(FILE_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > FILE_BYTES || bytes.last() != Some(&b'\n') {
-            return Err(unsafe_path());
-        }
-        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-            if line.len() > RECORD_BYTES {
-                return Err(unsafe_path());
-            }
-            let record: Record = serde_json::from_slice(line).map_err(|_| unsafe_path())?;
-            if record.schema_version != SCHEMA_VERSION
-                || record.product != product
-                || semver::Version::parse(&record.version).is_err()
-                || record.version.len() > 128
-                || !record
-                    .version
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
-            {
-                return Err(unsafe_path());
-            }
-            if records.len() == RECENT_RECORDS {
-                records.pop_front();
-            }
-            records.push_back(record);
-        }
+    for (_, file) in generations {
+        parse_generation(file, product, Tail::Complete, &mut records)?;
     }
     Ok(records.into())
+}
+
+/// Reads `product`'s records without its writer lock. Appends never rewrite a
+/// complete record, and only rotation renames a generation, so a read during
+/// which every opened generation kept its name is a consistent snapshot. A
+/// rotation can only make the read fail, never supply records it lacked.
+fn read_product_snapshot(dir: &File, product: Product) -> io::Result<Vec<Record>> {
+    for _ in 0..3 {
+        let generations = open_generations(dir, product)?;
+        let mut records = std::collections::VecDeque::new();
+        let mut identities = Vec::with_capacity(generations.len());
+        for (generation, file) in generations {
+            let metadata = file.metadata()?;
+            identities.push((generation, metadata.dev(), metadata.ino()));
+            let tail = if generation == 0 {
+                Tail::Appending
+            } else {
+                Tail::Complete
+            };
+            parse_generation(file, product, tail, &mut records)?;
+        }
+        let mut unmoved = true;
+        for (generation, dev, ino) in identities {
+            match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    unmoved &= (metadata.dev(), metadata.ino()) == (dev, ino);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => unmoved = false,
+                Err(e) => return Err(e),
+            }
+        }
+        if unmoved {
+            return Ok(records.into());
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::WouldBlock, LockBusy))
+}
+
+/// The existing generations, oldest first.
+fn open_generations(dir: &File, product: Product) -> io::Result<Vec<(usize, File)>> {
+    let mut generations = Vec::new();
+    for generation in (0..GENERATIONS).rev() {
+        match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
+            Ok(file) => generations.push((generation, file)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(generations)
+}
+
+fn parse_generation(
+    file: File,
+    product: Product,
+    tail: Tail,
+    records: &mut std::collections::VecDeque<Record>,
+) -> io::Result<()> {
+    if file.metadata()?.len() > FILE_BYTES {
+        return Err(unsafe_path());
+    }
+    let mut bytes = Vec::new();
+    file.take(FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > FILE_BYTES {
+        return Err(unsafe_path());
+    }
+    let complete = match tail {
+        Tail::Complete if bytes.last() != Some(&b'\n') => return Err(unsafe_path()),
+        Tail::Complete => &bytes[..],
+        Tail::Appending => {
+            let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            &bytes[..end]
+        }
+    };
+    for line in complete.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        if line.len() > RECORD_BYTES {
+            return Err(unsafe_path());
+        }
+        let record: Record = serde_json::from_slice(line).map_err(|_| unsafe_path())?;
+        if record.schema_version != SCHEMA_VERSION
+            || record.product != product
+            || semver::Version::parse(&record.version).is_err()
+            || record.version.len() > 128
+            || !record
+                .version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+        {
+            return Err(unsafe_path());
+        }
+        if records.len() == RECENT_RECORDS {
+            records.pop_front();
+        }
+        records.push_back(record);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1207,6 +1284,84 @@ mod tests {
         // A writer that started again has unsaved state once more.
         recorder.append(Event::PersistenceStarted).unwrap();
         assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+    }
+
+    #[test]
+    fn a_window_stopped_inside_its_append_cannot_hide_its_saved_proof() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        recorder
+            .append(Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            })
+            .unwrap();
+        // The window stalls holding its writer lock, mid-way through the next
+        // record. flock belongs to the open description, so this blocks the
+        // locked reader exactly as a stopped window's lock would.
+        let dir = directory(&path, false).unwrap();
+        let _held = Lock::acquire(
+            private_file(&dir, &format!("{}.lock", Product::Ui.name()), libc::O_RDWR).unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut partial = private_file(
+            &dir,
+            &Product::Ui.filename(0),
+            libc::O_WRONLY | libc::O_APPEND,
+        )
+        .unwrap();
+        partial
+            .write_all(br#"{"schema_version":1,"product":"ui""#)
+            .unwrap();
+        assert!(
+            read_product(&dir, Product::Ui).is_err(),
+            "inspection still waits for the writer"
+        );
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
+        assert!(!final_flush_complete_at(&path, pid + 1, 0).unwrap());
+    }
+
+    #[test]
+    fn an_unfinished_record_is_never_read_as_evidence() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        let dir = directory(&path, false).unwrap();
+        // A complete final flush, cut before its newline, proves nothing yet.
+        let mut line = serde_json::to_vec(&Record {
+            schema_version: SCHEMA_VERSION,
+            product: Product::Ui,
+            run: Uuid::new_v4(),
+            pid,
+            at_unix_ms: 1,
+            version: "1.0.0".into(),
+            protocol: crate::terminal::ipc::PROTOCOL_VERSION,
+            event: Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            },
+        })
+        .unwrap();
+        let mut file = private_file(
+            &dir,
+            &Product::Ui.filename(0),
+            libc::O_WRONLY | libc::O_APPEND,
+        )
+        .unwrap();
+        file.write_all(&line).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        line.clear();
+        line.push(b'\n');
+        file.write_all(&line).unwrap();
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
     }
 
     #[test]
