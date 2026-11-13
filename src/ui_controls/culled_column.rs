@@ -148,9 +148,13 @@ struct State {
 impl State {
     /// Notes the visible span, from the column's top, of a column `height`
     /// tall, and what the user is now reading if they moved the viewport.
-    fn observe(&self, span: (f32, f32), height: f32, screen: f32) {
+    /// `screen` is the scrollable's viewport height, which only `update`
+    /// is given whole; `draw`'s viewport is clipped by any parent.
+    fn observe(&self, span: (f32, f32), height: f32, screen: Option<f32>) {
         let (top, shown) = span;
-        self.screen.set(screen);
+        if let Some(screen) = screen {
+            self.screen.set(screen);
+        }
         let last = self.viewport.replace(Some(span));
         // The scrollable draws at a whole-pixel offset, so a view that
         // followed its target is within half a pixel of it.
@@ -504,7 +508,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         // half the overscan is still in hand.
         let state = tree.state.downcast_ref::<State>();
         if let Some(span) = visible_span(layout.bounds(), viewport) {
-            state.observe(span, layout.bounds().height, viewport.height);
+            state.observe(span, layout.bounds().height, Some(viewport.height));
             let needs = wanted(span, OVERSCAN / 2.0);
             // Focus that moved to another row needs its neighbours built.
             if needs.start < state.covered.start
@@ -533,7 +537,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         if let Some(span) = visible_span(layout.bounds(), viewport)
             && state.follow.is_none()
         {
-            state.observe(span, layout.bounds().height, viewport.height);
+            state.observe(span, layout.bounds().height, None);
         }
         for (row, child, child_layout) in self.children(tree, layout) {
             if child_layout.bounds().intersects(viewport) {
