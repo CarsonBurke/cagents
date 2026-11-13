@@ -390,6 +390,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     // into iced. Build the daemon through the public shell API so interface
     // scaling changes the actual viewport, not only Core's preference.
     type Shell = Cosmic<cagents::app::Cagents>;
+    cagents::performance::ui_trace::install();
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     let settings = iced::Settings {
         id: Some(cagents::instance::APPLICATION_ID.to_owned()),

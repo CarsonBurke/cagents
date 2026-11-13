@@ -64,6 +64,12 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Reads the setting before the shell starts, so that its frame clock finds
+/// the observer whichever traced call comes first.
+pub fn install() {
+    let _ = enabled();
+}
+
 /// Times one call until it is dropped.
 #[must_use]
 pub struct Scope(Option<Entry>);
