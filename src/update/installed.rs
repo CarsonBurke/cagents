@@ -252,6 +252,7 @@ pub(super) fn perform(
         confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)?;
         survivors.verify_successor(&root.join("bin/cagentsd"))
     })();
+    announce_primary_failure(&result);
     let mut restored_previous = false;
     if result.is_err()
         && recovery.shutdown_requested
@@ -290,6 +291,9 @@ pub(super) fn perform(
     } else {
         previous.unwrap_or_else(|| root.to_owned())
     };
+    // Any reopen, including the guard's own after a failed recovery, uses
+    // the UI matched to the daemon chosen above, never this worker's own.
+    guard.set_fallback_executable(reopen.join("bin/cagents-ui"));
     let recovery_result = finish_handoff(
         installation,
         state,

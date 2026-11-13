@@ -6321,6 +6321,13 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
     frame_cost::live_runtime(items)
 }
 
+/// A prepared live chat whose `turns` answers each link to three pull
+/// requests, from #1000 up in `acme/widgets`.
+#[cfg(test)]
+pub(super) fn linked_runtime_for_test(turns: usize) -> Runtime {
+    frame_cost::live_runtime(&frame_cost::linked_transcript(turns)).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

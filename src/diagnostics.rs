@@ -1056,6 +1056,33 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
     })
 }
 
+/// Whether UI process `pid` recorded a complete final flush at or after
+/// `since_unix_ms`, with no later persistence restart. The caller pins `pid`
+/// from before `since_unix_ms`, so its records cannot belong to a reused PID.
+pub(crate) fn ui_final_flush_complete(pid: u32, since_unix_ms: u64) -> io::Result<bool> {
+    final_flush_complete_at(&state_path()?, pid, since_unix_ms)
+}
+
+fn final_flush_complete_at(path: &Path, pid: u32, since_unix_ms: u64) -> io::Result<bool> {
+    let records = read_product(&directory(path, false)?, Product::Ui)?;
+    let mut complete = false;
+    for record in records
+        .iter()
+        .filter(|record| record.pid == pid && record.at_unix_ms >= since_unix_ms)
+    {
+        match record.event {
+            Event::FinalFlush {
+                complete: flushed, ..
+            } => complete = flushed,
+            Event::PersistenceStarted
+            | Event::PersistenceFailed { .. }
+            | Event::WriterUnavailable => complete = false,
+            _ => {}
+        }
+    }
+    Ok(complete)
+}
+
 fn read_product(dir: &File, product: Product) -> io::Result<Vec<Record>> {
     let lock = match private_file(dir, &format!("{}.lock", product.name()), libc::O_RDONLY) {
         Ok(file) => Some(Lock::acquire(file, false)?),
@@ -1154,6 +1181,32 @@ mod tests {
             assert!(failed.human().contains("Transcript caches: unavailable"));
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn only_a_later_complete_final_flush_of_that_process_proves_it_saved() {
+        let (_root, path) = fixture();
+        let pid = std::process::id();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        let flush = |complete| Event::FinalFlush {
+            complete,
+            unsaved: u32::from(!complete),
+            refused: 0,
+            category: (!complete).then_some(Failure::Unknown),
+        };
+        recorder.append(flush(false)).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        recorder.append(flush(true)).unwrap();
+        assert!(final_flush_complete_at(&path, pid, 0).unwrap());
+        // Another process's evidence, or a save before the commit, is no proof.
+        assert!(!final_flush_complete_at(&path, pid + 1, 0).unwrap());
+        assert!(!final_flush_complete_at(&path, pid, u64::MAX).unwrap());
+        // A writer that started again has unsaved state once more.
+        recorder.append(Event::PersistenceStarted).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
     }
 
     #[test]

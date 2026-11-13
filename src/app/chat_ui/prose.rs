@@ -1362,8 +1362,9 @@ pub(super) fn paragraph(
             flow,
         );
     }
-    leaf_text(
+    selectable_prose::labelled_text(
         text.spans(settings.style),
+        text.inlines(),
         settings.text_size,
         settings.style.font,
         target,

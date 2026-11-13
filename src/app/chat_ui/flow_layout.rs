@@ -193,6 +193,12 @@ impl SourceData {
     fn unwrapped(&self) -> bool {
         matches!(self, Self::Code { .. })
     }
+    fn inlines(&self) -> Option<Arc<markdown::Inlines>> {
+        match self {
+            Self::Markdown { text, .. } => text.inlines(),
+            Self::Styled(_) | Self::Code { .. } => None,
+        }
+    }
     fn presentation_changed(&self, previous: &Self) -> bool {
         match (self, previous) {
             (
@@ -716,7 +722,7 @@ fn run_with_slots(
             );
             let mut system = fonts.system();
             let (spans, plain) = work.source.materialize();
-            let prepared = Prepared::with_fonts(
+            let mut prepared = Prepared::with_fonts(
                 spans,
                 plain,
                 work.key.size,
@@ -730,6 +736,9 @@ fn run_with_slots(
                 &mut system,
             );
             fonts.keep(system);
+            if let Some(geometry) = prepared.owned.as_deref_mut() {
+                geometry.inlines = work.source.inlines();
+            }
             *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = work.admission.clone();
             #[cfg(test)]
             if work.outcome == Some(WorkerOutcome::CancelAfterShape) {
@@ -852,6 +861,8 @@ pub(super) struct Geometry {
     pub(super) bounds: iced::Size,
     pub(super) spans: Arc<[Span<'static, markdown::Uri>]>,
     pub(super) plain: Arc<str>,
+    /// The glyphs and copies of the pull request links in `spans`.
+    pub(super) inlines: Option<Arc<markdown::Inlines>>,
     unwrapped: bool,
 }
 #[cfg(test)]
@@ -946,6 +957,7 @@ impl Prepared {
                 bounds,
                 spans,
                 plain,
+                inlines: None,
                 unwrapped: wrapping == iced::widget::text::Wrapping::None,
             })),
         }
@@ -1366,6 +1378,7 @@ pub(super) fn paint(
     renderer: &mut cosmic::Renderer,
     projection: &Projection,
     spans: &[Span<'static, markdown::Uri>],
+    inlines: Option<&markdown::Inlines>,
     matches: &[std::ops::Range<usize>],
     selection: std::ops::Range<usize>,
     size: iced::Pixels,
@@ -1443,6 +1456,32 @@ pub(super) fn paint(
             }
         }
     });
+    if let Some(inlines) = inlines.filter(|inlines| !inlines.glyphs.is_empty()) {
+        // Spans are visited in order, so a span seen again is a split one.
+        let mut drawn = None;
+        visit_span_bounds(projection, |index, bounds| {
+            let Ok(found) = inlines
+                .glyphs
+                .binary_search_by_key(&index, |(span, _)| *span)
+            else {
+                return;
+            };
+            let span = &spans[index];
+            // A label wider than the line can be split even inside its
+            // glyph's room; the glyph goes once, where the label starts.
+            if drawn.replace(index) == Some(index) {
+                return;
+            }
+            pull_request_links::draw_glyph(
+                renderer,
+                inlines.glyphs[found].1,
+                bounds + translation,
+                span.size.unwrap_or(size).0,
+                theme,
+                *viewport,
+            );
+        });
+    }
     renderer.fill_raw(graphics_text::Raw {
         buffer: Arc::downgrade(&projection.buffer),
         position: position + iced::Vector::new(0.0, projection.top),
@@ -1955,6 +1994,7 @@ fn projected_selection_and_find_keep_native_ligature_caret_regions() {
                 &mut renderer,
                 &projection,
                 &prepared.spans,
+                None,
                 if find { &ranges } else { &[] },
                 if find { 0..0 } else { start..end },
                 iced::Pixels(32.0),
@@ -2028,6 +2068,7 @@ fn projected_decorations_stay_above_selection_and_find() {
                 &mut renderer,
                 &projection,
                 &prepared.spans,
+                None,
                 if mode == 2 { &ranges } else { &[] },
                 if mode == 1 {
                     0..prepared.plain.len()

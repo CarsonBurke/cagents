@@ -24,6 +24,8 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
+use super::pull_request_links;
+use crate::ui_controls::WorktreePullRequestState;
 use cosmic::iced::widget::{span, text};
 use cosmic::iced::{Font, font};
 pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
@@ -96,9 +98,26 @@ impl Content {
 
     /// Creates some new [`Content`] by parsing the given Markdown.
     pub fn parse(markdown: &str) -> Self {
+        Self::parse_labelled(markdown, Arc::default())
+    }
+
+    /// Parses `markdown` with its pull request links read as `labels` say.
+    pub(super) fn parse_labelled(markdown: &str, labels: Arc<pull_request_links::Labels>) -> Self {
         let mut content = Self::new();
+        content.state.labels = labels;
         content.push_str(markdown);
         content
+    }
+
+    /// How text parsed from now on reads its pull request links. What was
+    /// parsed already keeps its labels; a caller whose labels changed for
+    /// what it holds parses it again.
+    pub(super) fn set_labels(&mut self, labels: Arc<pull_request_links::Labels>) {
+        self.state.labels = labels;
+    }
+
+    pub(super) fn labels(&self) -> &Arc<pull_request_links::Labels> {
+        &self.state.labels
     }
 
     /// Append source while retaining completed parsed blocks. The unfinished
@@ -289,6 +308,7 @@ impl Content {
                     }
                     let mut state = State {
                         references: self.state.references.clone(),
+                        labels: self.state.labels.clone(),
                         ..State::default()
                     };
                     let before = rebuilt.len();
@@ -666,12 +686,73 @@ struct Run {
     end: usize,
     link: Option<Uri>,
     attributes: Attributes,
+    /// What this run is of a pull request link shown by its label.
+    inline: Option<Inline>,
 }
+
+/// The parts of a pull request link that its label replaces the address
+/// with. See [`super::pull_request_links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inline {
+    /// The room the link's state glyph is drawn in, when its state is known.
+    Glyph(WorktreePullRequestState),
+    /// The reference and title that stand for the address.
+    Label,
+}
+
+/// Where a paragraph's pull request links put their glyphs, and what Copy
+/// gives for the text that stands in for their addresses.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Inlines {
+    /// The span each glyph is drawn over, in span order.
+    pub(super) glyphs: Box<[(usize, WorktreePullRequestState)]>,
+    /// Shown text that copies as something else, in text order: a label
+    /// copies as its address, and a glyph's room as nothing.
+    pub(super) copies: Box<[(Range<usize>, Uri)]>,
+    /// The spans of each link and what hovering it says, in span order.
+    pub(super) tips: Box<[(Range<usize>, Arc<str>)]>,
+}
+
+impl Inlines {
+    /// What hovering the link drawn by span `index` says.
+    pub(super) fn tip(&self, index: usize) -> Option<&Arc<str>> {
+        let at = self.tips.partition_point(|(spans, _)| spans.end <= index);
+        self.tips
+            .get(at)
+            .filter(|(spans, _)| spans.contains(&index))
+            .map(|(_, tip)| tip)
+    }
+    /// `plain[range]` as Copy gives it. A label any part of which is
+    /// selected copies whole, as its address, since a part of it names no
+    /// pull request.
+    pub(super) fn copy(&self, plain: &str, range: Range<usize>) -> String {
+        let first = self.copies.partition_point(|(at, _)| at.end <= range.start);
+        let mut copied = String::with_capacity(range.len());
+        let mut from = range.start;
+        for (at, copy) in self.copies[first..]
+            .iter()
+            .take_while(|(at, _)| at.start < range.end)
+        {
+            if from < at.start {
+                copied.push_str(&plain[from..at.start]);
+            }
+            copied.push_str(copy);
+            from = at.end;
+        }
+        if from < range.end {
+            copied.push_str(&plain[from..range.end]);
+        }
+        copied
+    }
+}
+
 #[derive(Debug)]
 struct Spans {
     // Keep this growable: syntax-free streaming appends to this buffer.
     text: String,
     runs: Box<[Run]>,
+    /// Present when a pull request link is shown by its label.
+    inlines: Option<Arc<Inlines>>,
     #[cfg(test)]
     disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
 }
@@ -680,6 +761,7 @@ impl Clone for Spans {
         Self {
             text: self.text.clone(),
             runs: self.runs.clone(),
+            inlines: self.inlines.clone(),
             #[cfg(test)]
             disposed: None,
         }
@@ -711,6 +793,7 @@ impl Spans {
                     emphasis,
                     code,
                 },
+                inline: None,
             });
         }
         for Span::Standard {
@@ -732,11 +815,13 @@ impl Spans {
                     emphasis,
                     code,
                 },
+                inline: None,
             });
         }
         Self {
             text,
             runs: runs.into_boxed_slice(),
+            inlines: None,
             #[cfg(test)]
             disposed: None,
         }
@@ -807,6 +892,9 @@ struct FlowCaches {
 impl FlowText {
     pub(super) fn len(&self) -> usize {
         self.spans.text.len()
+    }
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
     }
     pub(super) fn append_proven(&self, previous: &Self) -> bool {
         append_proven(
@@ -1024,6 +1112,12 @@ impl Text {
         self.spans.text.len()
     }
 
+    /// Where this text's pull request links draw their glyphs, and what
+    /// their labels copy as; `None` when it shows none.
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
+    }
+
     /// Style just a bounded rendered byte range; hidden chunks never populate
     /// the AST's whole-paragraph styled-spans cache.
     pub fn spans_range(
@@ -1096,6 +1190,7 @@ impl SpanRef<'_> {
     fn prefix_of(&self, new: &Self, last: bool) -> bool {
         self.run.attributes == new.run.attributes
             && self.run.link == new.run.link
+            && self.run.inline == new.run.inline
             && if last {
                 new.text.starts_with(self.text)
             } else {
@@ -1192,6 +1287,8 @@ struct State {
     leftover_origin: usize,
     references: Arc<HashMap<ReferenceLabel, Reference>>,
     images: HashSet<Uri>,
+    /// How pull request links read; see [`super::pull_request_links`].
+    labels: Arc<pull_request_links::Labels>,
 }
 
 fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
@@ -1227,6 +1324,7 @@ fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
 struct SpanBuffer {
     text: String,
     runs: Vec<Run>,
+    labels: Arc<pull_request_links::Labels>,
 }
 
 impl SpanBuffer {
@@ -1249,6 +1347,7 @@ impl SpanBuffer {
             end: self.text.len(),
             link,
             attributes,
+            inline: None,
         });
     }
 
@@ -1301,12 +1400,14 @@ impl SpanBuffer {
                                     end: start + from,
                                     link: None,
                                     attributes: run.attributes,
+                                    inline: None,
                                 });
                             }
                             linked.push(Run {
                                 end: start + to,
                                 link: Some(destination),
                                 attributes: run.attributes,
+                                inline: None,
                             });
                             copied = to;
                         }
@@ -1315,6 +1416,7 @@ impl SpanBuffer {
                                 end,
                                 link: None,
                                 attributes: run.attributes,
+                                inline: None,
                             });
                         }
                     } else {
@@ -1325,13 +1427,129 @@ impl SpanBuffer {
                 runs = linked;
             }
         }
+        let (text, runs, inlines) = if linkify {
+            labelled(text, runs, &self.labels)
+        } else {
+            (text, runs, None)
+        };
         Text::from_spans(Spans {
             text,
             runs: runs.into_boxed_slice(),
+            inlines,
             #[cfg(test)]
             disposed: None,
         })
     }
+}
+
+/// A paragraph's pull request links as their labels show them.
+///
+/// A link whose text is its own address, which is how a bare address, an
+/// autolink and `[address](address)` all arrive, is shown by its pull
+/// request's glyph and label instead. A link with words of its own keeps
+/// them and gains the glyph before them, which says what it opens and in
+/// what state without rewording the author's sentence. A pull request
+/// address set in code is the author's literal text and stays as written.
+fn labelled(
+    text: String,
+    runs: Vec<Run>,
+    labels: &pull_request_links::Labels,
+) -> (String, Vec<Run>, Option<Arc<Inlines>>) {
+    // A link's own words need not name the pull request it opens, so its
+    // destination is what is looked at.
+    if !runs.iter().any(|run| {
+        !run.attributes.code
+            && run
+                .link
+                .as_deref()
+                .and_then(pull_request_links::pull_request)
+                .is_some()
+    }) {
+        return (text, runs, None);
+    }
+    let mut shown = String::with_capacity(text.len());
+    let mut out: Vec<Run> = Vec::with_capacity(runs.len() + 2);
+    let mut glyphs = Vec::new();
+    let mut copies = Vec::new();
+    let mut tips = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < runs.len() {
+        let run = &runs[index];
+        // The link's runs: one per style its words change through.
+        let last = index
+            + runs[index + 1..]
+                .iter()
+                .take_while(|next| next.link.is_some() && next.link == run.link)
+                .count();
+        // A link set wholly in code is the author's literal text.
+        let key = run
+            .link
+            .as_deref()
+            .filter(|_| runs[index..=last].iter().any(|run| !run.attributes.code))
+            .and_then(pull_request_links::pull_request);
+        let Some(key) = key else {
+            shown.push_str(&text[start..run.end]);
+            out.push(Run {
+                end: shown.len(),
+                ..run.clone()
+            });
+            start = run.end;
+            index += 1;
+            continue;
+        };
+        let end = runs[last].end;
+        let destination = run.link.clone().expect("a pull request link");
+        let label = labels.label(&key);
+        let first = out.len();
+        let glyph_start = shown.len();
+        // A pull request whose state is unknown has no glyph: a neutral one
+        // would look like a state of its own.
+        if let Some(state) = label.glyph {
+            shown.push_str(pull_request_links::GLYPH_SPACE);
+            glyphs.push((out.len(), state));
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                // The glyph takes the link's color, not its words' decoration.
+                attributes: Attributes {
+                    strikethrough: false,
+                    code: false,
+                    ..run.attributes
+                },
+                inline: Some(Inline::Glyph(state)),
+            });
+        }
+        if text[start..end].trim_end_matches('/') == destination.trim_end_matches('/') {
+            shown.push_str(&label.text);
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                attributes: run.attributes,
+                inline: Some(Inline::Label),
+            });
+            copies.push((glyph_start..shown.len(), destination.clone()));
+        } else {
+            copies.push((glyph_start..shown.len(), Uri::from("")));
+            for run in &runs[index..=last] {
+                shown.push_str(&text[start..run.end]);
+                out.push(Run {
+                    end: shown.len(),
+                    ..run.clone()
+                });
+                start = run.end;
+            }
+        }
+        tips.push((first..out.len(), Arc::from(label.tip(&destination))));
+        start = end;
+        index = last + 1;
+    }
+    let inlines = Inlines {
+        glyphs: glyphs.into_boxed_slice(),
+        copies: copies.into_boxed_slice(),
+        tips: tips.into_boxed_slice(),
+    };
+    (shown, out, Some(Arc::new(inlines)))
 }
 
 fn parse_with<'a>(
@@ -1357,7 +1575,10 @@ fn parse_with<'a>(
 
     let reference_labels = Rc::new(RefCell::new(HashSet::new()));
 
-    let mut spans = SpanBuffer::default();
+    let mut spans = SpanBuffer {
+        labels: state.borrow().labels.clone(),
+        ..SpanBuffer::default()
+    };
     let mut code = String::new();
     let mut code_language = None;
     let mut code_lines = Vec::new();
