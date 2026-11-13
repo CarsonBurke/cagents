@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: script-contracts-${{ github.ref }}
-  # A newer push supersedes a pull request's run; every main commit keeps its own.
+  # A newer push supersedes a pull request's run. A started main run finishes;
+  # GitHub still replaces a main run that is only queued with the newest one.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -42,7 +43,9 @@ jobs:
 
       - name: Plan suite jobs
         id: plan
-        run: printf 'matrix=%s\n' "$(python3 -I -B scripts/script-contracts plan)" >> "$GITHUB_OUTPUT"
+        run: |
+          matrix=$(python3 -I -B scripts/script-contracts plan)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
 
   source:
     name: Formatting and protocol
@@ -67,18 +70,7 @@ jobs:
         env:
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          # Compare against what this commit changes: a merge result's base
-          # parent, or the main commit this push replaced.
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            base=$(git rev-parse HEAD^1)
-          else
-            base=$PUSH_BEFORE
-            case "$base" in
-              *[!0-9a-f]* | "" | 0000000000000000000000000000000000000000)
-                echo 'A trusted comparison base is required for the protocol contract' >&2; exit 2 ;;
-            esac
-            git cat-file -e "$base^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$base"
-          fi
+          base=$(python3 -I -B scripts/script-contracts protocol-base --event "$GITHUB_EVENT_NAME" --before "$PUSH_BEFORE")
           sha256sum scripts/check-protocol-contract scripts/protocol_contract_source.py tests/protocol_contract.py
           python3 -I -B tests/protocol_contract.py -v
           python3 -I -B scripts/check-protocol-contract --base-ref "$base"

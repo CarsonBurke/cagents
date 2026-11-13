@@ -1,7 +1,7 @@
 """Contracts for scripts/script-contracts, the CI suite manifest and runner.
 
-Synthetic suites run in private temporary roots; nothing here executes another
-repository suite, Git, Cargo or the network.
+Synthetic suites and Git repositories live in private temporary roots; nothing
+here executes another repository suite, Cargo or the network.
 """
 
 import contextlib
@@ -11,9 +11,11 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/script-contracts"
@@ -194,13 +196,17 @@ class Verification(Tree):
 
     def test_an_unlisted_unittest_suite_is_refused_until_scheduled_or_excluded(self):
         self.complete()
-        self.write("tests/forgotten.py", "import unittest\nunittest.main()\n")
+        self.write("tests/forgotten.py", "import unittest\nunittest.main(verbosity=2)\n")
+        self.write("tests/qualification/also_forgotten.py", "from unittest import TestCase, main\nmain()\n")
         self.write("tests/fixtures/helper.py", "import unittest\nunittest.main()\n")
+        self.write("tests/helper.py", "VALUE = 'mentions import unittest only in a string'\n")
         jobs = (Job("job", (self.suite(),)),)
         problems = self.verify(jobs)
-        self.assertEqual(len(problems), 1, problems)
+        self.assertEqual(len(problems), 2, problems)
         self.assertIn("tests/forgotten.py: unlisted unittest suite", problems[0])
-        self.assertEqual(self.verify(jobs, unscheduled=("tests/forgotten.py",)), [])
+        self.assertIn("tests/qualification/also_forgotten.py: unlisted unittest suite", problems[1])
+        unscheduled = ("tests/forgotten.py", "tests/qualification/also_forgotten.py")
+        self.assertEqual(self.verify(jobs, unscheduled=unscheduled), [])
 
     def test_inconsistent_manifests_are_refused(self):
         one = Suite("one", "tests/one.py")
@@ -298,15 +304,88 @@ class Sharding(Tree):
                 self.write("tests/plain.py", source)
                 self.assertEqual(self.run_job(jobs, "job", "1/2"), status)
 
-    def test_a_sharded_fixture_imports_its_sibling_modules(self):
-        self.write("tests/helper_module.py", "VALUE = 3\n")
-        self.write("tests/sibling.py", "import unittest\nimport helper_module\n\n"
-                                       "class Sibling(unittest.TestCase):\n"
-                                       "    def test_value(self): self.assertEqual(helper_module.VALUE, 3)\n"
-                                       "    def test_other(self): pass\n\nunittest.main()\n")
-        jobs = (Job("job", (Suite("sibling", "tests/sibling.py"),), shards=2),)
-        self.assertEqual([self.run_job(jobs, "job", f"{index}/2") for index in (1, 2)], [0, 0])
+    def test_sharded_and_whole_runs_see_the_same_file_and_import_path(self):
+        self.write("tests/where.py", "import json, sys, unittest\nfrom pathlib import Path\n\n"
+                                     "class Where(unittest.TestCase):\n"
+                                     "    def test_where(self):\n"
+                                     "        with Path('where.jsonl').open('a') as output:\n"
+                                     "            output.write(json.dumps([__file__, sys.path[0]]) + '\\n')\n"
+                                     "    def test_other(self): pass\n\nunittest.main()\n")
+        for isolated in (True, False):
+            with self.subTest(isolated=isolated):
+                (self.root / "where.jsonl").unlink(missing_ok=True)
+                suite = Suite("where", "tests/where.py", isolated=isolated)
+                self.assertEqual(self.run_job((Job("whole", (suite,)),), "whole"), 0)
+                for index in (1, 2):
+                    self.assertEqual(self.run_job((Job("split", (suite,), shards=2),), "split", f"{index}/2"), 0)
+                whole, sharded = [json.loads(line) for line in (self.root / "where.jsonl").read_text().splitlines()]
+                self.assertEqual(sharded, whole)
+                self.assertEqual(whole[0], str((self.root / "tests/where.py").resolve()))
+                self.assertEqual(whole[1] == str((self.root / "tests").resolve()), not isolated)
 
+
+class ProtocolBase(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="script-contracts-git-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        environment = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@invalid",
+                       "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@invalid"}
+        patch = unittest.mock.patch.dict(os.environ, environment)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def git(self, repository, *arguments):
+        return subprocess.run(["git", "-C", str(repository), *arguments], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def repository(self, name):
+        repository = self.root / name
+        repository.mkdir()
+        self.git(repository, "init", "-q", "-b", "main")
+        return repository
+
+    def commit(self, repository, message):
+        self.git(repository, "commit", "-q", "--allow-empty", "-m", message)
+        return self.git(repository, "rev-parse", "HEAD")
+
+    def test_a_pull_request_compares_its_merge_result_with_the_base_parent(self):
+        repository = self.repository("merge")
+        self.commit(repository, "root")
+        self.git(repository, "checkout", "-q", "-b", "topic")
+        self.commit(repository, "topic")
+        self.git(repository, "checkout", "-q", "main")
+        base = self.commit(repository, "main")
+        self.git(repository, "merge", "-q", "--no-ff", "-m", "merge", "topic")
+        self.assertEqual(contracts.protocol_base(repository, "pull_request"), base)
+        self.git(repository, "checkout", "-q", "topic")
+        with self.assertRaisesRegex(contracts.ContractError, "two-parent merge result"):
+            contracts.protocol_base(repository, "pull_request")
+
+    def test_a_push_requires_a_full_nonzero_object_name(self):
+        repository = self.repository("push")
+        before = self.commit(repository, "before")
+        self.commit(repository, "after")
+        self.assertEqual(contracts.protocol_base(repository, "push", before), before)
+        for invalid in (None, "", "0" * 40, before[:12], before.upper(), before + "0"):
+            with self.subTest(before=invalid):
+                with self.assertRaisesRegex(contracts.ContractError, "trusted comparison base"):
+                    contracts.protocol_base(repository, "push", invalid, fetch=False)
+        with self.assertRaisesRegex(contracts.ContractError, "No protocol comparison base"):
+            contracts.protocol_base(repository, "workflow_dispatch", before)
+
+    def test_a_shallow_push_checkout_fetches_exactly_the_replaced_commit(self):
+        origin = self.repository("origin")
+        before = self.commit(origin, "before")
+        self.commit(origin, "after")
+        self.git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.git(self.root, "clone", "-q", "--depth=1", f"file://{origin}", "clone")
+        clone = self.root / "clone"
+        self.assertEqual(contracts.protocol_base(clone, "push", before), before)
+        self.git(clone, "cat-file", "-e", f"{before}^{{commit}}")
+        with self.assertRaisesRegex(contracts.ContractError, "Cannot fetch"):
+            contracts.protocol_base(clone, "push", "1" * 40)
 
 if __name__ == "__main__":
     unittest.main()

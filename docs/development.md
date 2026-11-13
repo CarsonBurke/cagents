@@ -1432,7 +1432,8 @@ GitHub's script contracts run the Python suites listed in
 request's merge result, which is also where GitHub reads the workflow from, so
 the suite list and the files it tests always come from the same tree. A
 structure job refuses missing, symlinked or unlisted suites and shell syntax
-errors in seconds, then the suites run as parallel jobs; a long suite is split
+errors in seconds, then the suites run as parallel jobs beside formatting and
+the protocol contract; a long suite is split
 into shards that partition its tests. The `Script contracts` check passes only
 when every job passed. Run the same steps locally:
 
@@ -1443,7 +1444,7 @@ python3 -I -B scripts/script-contracts run tooling
 python3 -I -B scripts/script-contracts run "native evidence" 2/3
 ```
 
-A new `tests/` file that calls `unittest.main()` must be added to a job, or to
+A new `tests/` file that imports `unittest` must be added to a job, or to
 `UNSCHEDULED` when CI deliberately does not run it; `verify` refuses it
 otherwise. Keep each job to a few minutes on a hosted runner, and raise a
 job's shard count rather than its timeout.
