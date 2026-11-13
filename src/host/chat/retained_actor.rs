@@ -731,15 +731,20 @@ pub(super) fn publish_authenticated_source(
     }
     if install {
         let registry = super::super::agent_execution::registry(host)?;
-        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let successor = crate::agent_execution::HostedSession::Chat(source.clone());
-        match publication {
-            Publication::Console(intent) => {
-                registry.adopt_authenticated_console_session(retained, &successor, intent)?;
+        let adopted = {
+            let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            match publication {
+                Publication::Console(intent) => {
+                    registry.adopt_authenticated_console_session(retained, &successor, intent)?
+                }
+                _ => registry.adopt_authenticated_agent_session(retained, &successor)?,
             }
-            _ => {
-                registry.adopt_authenticated_agent_session(retained, &successor)?;
-            }
+        };
+        // The agent's record, and possibly its pane, now name the successor;
+        // watching windows learn it from the edge.
+        if adopted {
+            super::super::agent_execution::announce(host, &registry);
         }
     }
     if install {

@@ -179,6 +179,9 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
             | ClientRequest::ReadWorkspaceModel
+            | ClientRequest::ReadWorkspaceView { .. }
+            | ClientRequest::ReadWorkspaceSnapshot
+            | ClientRequest::ReadWorkspaceMetadata { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -1654,12 +1657,45 @@ fn process_admitted_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = super::workspace::snapshot(host, Some(client_id))?;
-            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+            let (model, closed) = super::workspace::subscriber_snapshot(host, Some(client_id))?;
+            Ok((
+                ServerResponse::WorkspaceSnapshot { model, closed },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::ReadWorkspaceModel => {
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReadWorkspaceMetadata { query } => {
+            let metadata = super::workspace::metadata(host, query)?;
+            Ok((
+                ServerResponse::WorkspaceMetadata(metadata),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ReadWorkspaceSnapshot => {
+            let (model, closed) = super::workspace::subscriber_snapshot(host, None)?;
+            Ok((
+                ServerResponse::WorkspaceSnapshot { model, closed },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ReadWorkspaceView { scope } => {
+            let (view, sequence) = super::workspace::view(host, &scope)?;
+            Ok((
+                ServerResponse::WorkspaceView { view, sequence },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ApplyWorkspaceEdit { edit } => {
+            let receipt = super::workspace::edit_delta(host, client_id, edit)?;
+            crate::daemon::wake();
+            Ok((ServerResponse::WorkspaceEdit(receipt), Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
             let model = super::workspace::edit(host, client_id, edit)?;
@@ -5494,96 +5530,252 @@ pub(in crate::host) mod tests {
         assert_eq!(read(), before);
     }
 
-    /// A shared-model edit reaches every window watching the model and never
-    /// its originator, which already has the model the edit returned. A client
-    /// that only reads - every CLI invocation - receives nothing at all.
+    /// Current windows receive an atomic subscription snapshot and canonical
+    /// delta edges. An originator that also watches gets only its correlated
+    /// reply; a read-only client receives no unsolicited model notification.
     #[test]
     fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
-        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        use crate::{
+            model::{
+                BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind,
+                HostIncarnation, HostSessionId,
+            },
+            workspace_model::{
+                ModelEdit,
+                delta::{EditEffects, EditReceipt},
+                views::{Change, Pane, Scope},
+            },
+        };
+
+        struct ModelSocket {
+            stream: UnixStream,
+            codec: FrameCodec,
+            proof: HostSessionProof,
+            next_request: u64,
+            server: Option<thread::JoinHandle<()>>,
+        }
+
+        impl ModelSocket {
+            fn connect(host: &SharedHost, id: ClientId) -> Self {
+                let proof = current_proof(host);
+                let (stream, peer) = UnixStream::pair().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let host = Arc::clone(host);
+                let server = thread::spawn(move || serve(peer, id, host));
+                let mut socket = Self {
+                    stream,
+                    codec: FrameCodec::new(MAX_FRAME_BYTES),
+                    proof: proof.clone(),
+                    next_request: 1,
+                    server: Some(server),
+                };
+                assert!(matches!(
+                    socket.request(ClientRequest::Connect {
+                        expected_host: Some(proof.clone()),
+                        resume: Vec::new(),
+                    }),
+                    ServerResponse::Connected { proof: connected, .. } if connected == proof
+                ));
+                socket
+            }
+
+            fn read(&mut self) -> ServerEnvelope {
+                let envelope = self
+                    .codec
+                    .read::<ServerEnvelope>(&mut self.stream)
+                    .unwrap()
+                    .expect("the fixture connection must remain open");
+                assert_eq!(envelope.version, PROTOCOL_VERSION);
+                assert_eq!(envelope.proof, self.proof);
+                envelope
+            }
+
+            fn request(&mut self, request: ClientRequest) -> ServerResponse {
+                let request_id = self.next_request;
+                self.next_request += 1;
+                self.codec
+                    .write(
+                        &mut self.stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(self.proof.clone()),
+                            request,
+                        },
+                    )
+                    .unwrap();
+                let envelope = self.read();
+                assert_eq!(
+                    envelope.request_id,
+                    Some(request_id),
+                    "an originator or unsubscribed reader must not receive an unsolicited edge"
+                );
+                match envelope.message {
+                    ServerMessage::Response { response } => response,
+                    message => panic!("expected a correlated response, got {message:?}"),
+                }
+            }
+
+            fn apply(&mut self, edit: ModelEdit) -> EditReceipt {
+                match self.request(ClientRequest::ApplyWorkspaceEdit { edit }) {
+                    ServerResponse::WorkspaceEdit(receipt) => receipt,
+                    response => panic!("expected a delta receipt, got {response:?}"),
+                }
+            }
+
+            fn edge(&mut self) -> (u64, ModelEdit, EditEffects) {
+                let envelope = self.read();
+                assert_eq!(envelope.request_id, None);
+                match envelope.message {
+                    ServerMessage::WorkspaceModelEdited {
+                        sequence,
+                        edit,
+                        effects,
+                    } => (sequence, edit, effects),
+                    message => panic!("expected an unsolicited delta edge, got {message:?}"),
+                }
+            }
+        }
+
+        impl Drop for ModelSocket {
+            fn drop(&mut self) {
+                let _ = self.stream.shutdown(Shutdown::Both);
+                if let Some(server) = self.server.take() {
+                    server.join().unwrap();
+                }
+            }
+        }
 
         let directory = tempfile::tempdir().unwrap();
-        let host = Arc::new(crate::host::state::HostLock::new(
-            super::super::state::HostState::new(HostSessionProof {
-                host_session_id: HostSessionId::new("model-session"),
-                boot_id: BootId::new("boot"),
-                host_incarnation: HostIncarnation::new("incarnation"),
-            }),
-        ));
-        let (editor, watcher, unsubscribed) = {
-            let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.install_model(
-                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
-            );
-            let editor = state.register_client(1);
-            let watcher = state.register_client(2);
-            let unsubscribed = state.register_client(3);
-            (editor, watcher, unsubscribed)
-        };
-        // Subscribing returns the model in the same response, so the watcher
-        // cannot miss an edit applied between subscribing and reading.
-        let (subscribed, _, _) =
-            process_request(&host, 2, ClientRequest::WatchWorkspaceModel).unwrap();
-        let ServerResponse::WorkspaceModel { model } = subscribed else {
-            panic!("subscribing must answer with the model");
-        };
-        assert_eq!(model.sequence, 0);
+        let mut state = super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("model-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        state.install_model(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        );
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        let mut editor = ModelSocket::connect(&host, 1);
+        let mut watcher = ModelSocket::connect(&host, 2);
+        let mut unsubscribed = ModelSocket::connect(&host, 3);
+        // Both windows watch, so the origin exclusion is exercised independently
+        // of subscription. Each reply is the new atomic snapshot with closed ids.
+        let mut identity = None;
+        for window in [&mut editor, &mut watcher] {
+            let ServerResponse::WorkspaceSnapshot { model, closed } =
+                window.request(ClientRequest::WatchWorkspaceModel)
+            else {
+                panic!("subscribing must answer with the model and closed identities");
+            };
+            assert_eq!(model.sequence, 0);
+            assert!(closed.is_empty());
+            assert_eq!(*identity.get_or_insert(model.identity), model.identity);
+        }
 
         let repository = directory.path().join("repo");
         std::fs::create_dir(&repository).unwrap();
-        let opened = process_request(
-            &host,
-            1,
-            ClientRequest::EditWorkspaceModel {
-                edit: crate::workspace_model::ModelEdit::OpenProject {
-                    kind: Default::default(),
-                    repository: repository.clone(),
-                    name: "repo".into(),
-                },
-            },
-        )
-        .unwrap();
-        assert!(matches!(opened.0, ServerResponse::WorkspaceModel { .. }));
-        let channel = crate::model::ChannelId::new();
-        process_request(
-            &host,
-            1,
-            ClientRequest::EditWorkspaceModel {
-                edit: crate::workspace_model::ModelEdit::CreateChannel {
-                    title_source: Default::default(),
-                    id: channel,
-                    repository,
-                    title: "shared".into(),
-                },
-            },
-        )
-        .unwrap();
-
-        let edges = |delivery: &Arc<DeliveryQueue>| {
-            delivery.close_after_drain();
-            std::iter::from_fn(|| delivery.pop())
-                .filter_map(|queued| match queued.message {
-                    ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                        Some((sequence, edit))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
+        let open = ModelEdit::OpenProject {
+            kind: Default::default(),
+            repository: repository.clone(),
+            name: "repo".into(),
         };
-        let observed = edges(&watcher);
-        assert_eq!(observed.len(), 2, "both edits are edges");
-        assert_eq!(observed[0].0, 1);
-        assert_eq!(observed[1].0, 2, "the sequence advances once per edit");
-        assert!(matches!(
-            &observed[1].1,
-            crate::workspace_model::ModelEdit::CreateChannel { id, .. } if *id == channel
-        ));
-        assert!(
-            edges(&editor).is_empty(),
-            "an editing client already holds the model its own edit returned"
+        // The explicit legacy edit retains its full reply while current writes
+        // use delta receipts. Both routes publish the same canonical edge shape.
+        let ServerResponse::WorkspaceModel { model: opened } =
+            editor.request(ClientRequest::EditWorkspaceModel { edit: open.clone() })
+        else {
+            panic!("the legacy edit must retain its full-model response");
+        };
+        let channel = crate::model::ChannelId::new();
+        let create = ModelEdit::CreateChannel {
+            title_source: Default::default(),
+            id: channel,
+            repository,
+            title: "shared".into(),
+        };
+        let created = editor.apply(create.clone());
+        assert_eq!(created.identity, identity.unwrap());
+        assert_eq!(created.effects.channels.len(), 1);
+        assert_eq!(created.effects.channels[0].id, channel);
+        assert_ne!(
+            created.effects.channels[0].ordinal,
+            crate::workspace_model::PENDING_ORDINAL
         );
-        assert!(
-            edges(&unsubscribed).is_empty(),
-            "a client that never asked for model edges must not receive one"
-        );
+
+        let scope = Scope::Channel(channel);
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Fixture browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: Vec::new(),
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let seed = ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: Vec::new(),
+        };
+        let seeded = editor.apply(seed.clone());
+        assert_eq!(seeded.effects.views.len(), 1);
+        assert_eq!(seeded.effects.views[0].scope, scope);
+        assert_eq!(seeded.effects.views[0].before, None);
+        let revision = seeded.effects.views[0].after.unwrap();
+        let remove = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Remove { id: pane.id },
+        };
+        let removed = editor.apply(remove.clone());
+        assert_eq!(removed.effects.views.len(), 1);
+        assert_eq!(removed.effects.views[0].scope, scope);
+        assert_eq!(removed.effects.views[0].before, Some(revision));
+        assert!(removed.effects.views[0].after.unwrap() > revision);
+        assert_eq!(removed.effects.closed, [pane.id]);
+
+        let observed = (0..4).map(|_| watcher.edge()).collect::<Vec<_>>();
+        assert_eq!(observed[0].0, opened.sequence);
+        assert_eq!(observed[0].1, open);
+        assert_eq!(observed[0].2.projects, opened.projects);
+        for ((sequence, edit, effects), (expected_edit, receipt)) in
+            observed[1..]
+                .iter()
+                .zip([(create, created), (seed, seeded), (remove, removed)])
+        {
+            assert_eq!(*sequence, receipt.sequence);
+            assert_eq!(edit, &expected_edit);
+            assert_eq!(effects, &receipt.effects);
+        }
+        assert!(observed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        // These correlated reads are ordered after every publication above.
+        // An unwanted origin/read-only echo would precede the response and fail
+        // ModelSocket::request instead of being silently discarded by a client.
+        for client in [&mut editor, &mut unsubscribed] {
+            let ServerResponse::WorkspaceModel { model } =
+                client.request(ClientRequest::ReadWorkspaceModel)
+            else {
+                panic!("an explicit model read must retain its full response");
+            };
+            let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+            assert!(view.panes.is_empty());
+            assert_eq!(view.retired, [pane.id]);
+        }
     }
 }

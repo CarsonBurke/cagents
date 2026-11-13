@@ -171,9 +171,11 @@ fn observe_with_client(
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
     loop {
-        let (sequence, edit) = client
-            .next_workspace_model_edit()
-            .map_err(|error| error.to_string())?;
+        // The edit's effects are applied in a later change; the model is read.
+        let crate::control::ModelEdge { sequence, edit, .. } =
+            client
+                .next_workspace_model_edit()
+                .map_err(|error| error.to_string())?;
         // View edits and proof-dependent title suggestions need complete
         // authoritative pane data: the cached view may precede their revision.
         // Navigation also reads its settled registry ordering, and an agent
@@ -2325,8 +2327,9 @@ mod tests {
                         request_id: Some(watch.request_id),
                         proof: proof.clone(),
                         message: ServerMessage::Response {
-                            response: ServerResponse::WorkspaceModel {
+                            response: ServerResponse::WorkspaceSnapshot {
                                 model: model.clone(),
+                                closed: Vec::new(),
                             },
                         },
                     },
@@ -2342,6 +2345,7 @@ mod tests {
                             message: ServerMessage::WorkspaceModelEdited {
                                 sequence,
                                 edit: edit.clone(),
+                                effects: Default::default(),
                             },
                         },
                     )
