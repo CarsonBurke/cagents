@@ -759,6 +759,30 @@ pub(crate) fn lease_owner(
     lock_path: &Path,
     proof: &HostSessionProof,
 ) -> Result<u32, PlatformError> {
+    lease_owner_process(lock_path, proof).map(|(pid, _)| pid)
+}
+
+/// Pin the authenticated serving owner before requesting shutdown. The pidfd
+/// survives lease release and cannot follow a replacement or a reused PID.
+pub(crate) struct ShutdownTarget {
+    process: File,
+}
+
+impl ShutdownTarget {
+    pub(crate) fn pin(socket: &Path, proof: &HostSessionProof) -> Result<Self, PlatformError> {
+        let (_, process) = lease_owner_process(&socket.with_file_name("cagentsd.lock"), proof)?;
+        Ok(Self { process })
+    }
+
+    pub(crate) fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        wait_process(&self.process, timeout)
+    }
+}
+
+fn lease_owner_process(
+    lock_path: &Path,
+    proof: &HostSessionProof,
+) -> Result<(u32, File), PlatformError> {
     #[derive(Deserialize)]
     struct RecoveryMetadata {
         pid: u32,
@@ -784,8 +808,8 @@ pub(crate) fn lease_owner(
     if !proof.is_complete() || metadata.proof != *proof || read_boot_id()? != proof.boot_id {
         return Err(io::Error::other("daemon lease does not match its discovery proof").into());
     }
-    let _pidfd = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
-    Ok(metadata.pid)
+    let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    Ok((metadata.pid, process))
 }
 
 /// Sends SIGTERM to the daemon identified by the current instance's lock.
@@ -938,7 +962,6 @@ fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "ui")]
 fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -954,7 +977,10 @@ fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<boo
             libc::poll(
                 &mut poll,
                 1,
-                remaining.as_millis().min(i32::MAX as u128) as i32,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as i32,
             )
         };
         if result > 0 {

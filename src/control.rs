@@ -38,6 +38,8 @@ pub use gh::GhCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
+#[cfg(all(test, feature = "host"))]
+mod daemon_stop_tests;
 mod sessions;
 mod terminal_list;
 #[cfg(test)]
@@ -79,6 +81,7 @@ use crate::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -377,7 +380,7 @@ pub enum DaemonCommand {
         #[arg(long)]
         interrupt: bool,
     },
-    /// Request daemon termination (use --confirm for a counted confirmation).
+    /// Stop the daemon and wait up to 30 seconds for exit (use --confirm for counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
         #[arg(help = "Refuse shutdown while hosted sessions remain.")]
@@ -391,6 +394,9 @@ pub enum DaemonCommand {
         /// same counted authority `cagents-ui --confirm-daemon-stop` uses.
         #[arg(long, value_name = "CAPABILITY_JSON", num_args = 0..=1)]
         confirm: Option<Option<String>>,
+        /// Return when shutdown is accepted, before the daemon has exited.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Print a short-lived shutdown capability for `daemon stop --confirm`.
     Preflight,
@@ -4018,71 +4024,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             require_empty,
             expected_generation,
             confirm,
+            no_wait,
         } => {
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = match ControlClient::connect(&socket) {
-                Ok(client) => client,
-                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
-                    confirm_daemon_absent(&socket)?;
-                    return Ok(already_stopped());
-                }
-                Err(error) => return Err(protocol_error(error)),
-            };
-            let outcome = match confirm {
-                // A capability is already a counted, daemon-bound, expiring
-                // authority over one observed inventory, so a script that
-                // obtained one has confirmed exactly what a prompt would.
-                Some(Some(capability)) => {
-                    let capability: ShutdownCapability = serde_json::from_str(&capability)
-                        .map_err(|error| {
-                            AppError::new(
-                                "invalid_capability",
-                                format!(
-                                    "--confirm value is not a capability from `cagents daemon preflight`: {error}"
-                                ),
-                            )
-                        })?;
-                    client
-                        .confirm_shutdown(capability)
-                        .map_err(protocol_error)?
-                }
-                Some(None) => {
-                    if !io::stdin().is_terminal() {
-                        return Err(AppError::new(
-                            "confirmation_required",
-                            "interactive confirmation requires a terminal; pass a capability from `cagents daemon preflight` to --confirm, or use --require-empty",
-                        ));
-                    }
-                    let preflight = client.shutdown_preflight().map_err(protocol_error)?;
-                    eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
-                        preflight.capability.live_terminals,
-                        preflight.capability.background_subagents
-                    );
-                    io::stderr()
-                        .flush()
-                        .map_err(|error| AppError::new("confirmation_input", error))?;
-                    let mut answer = String::new();
-                    io::stdin()
-                        .read_line(&mut answer)
-                        .map_err(|error| AppError::new("confirmation_input", error))?;
-                    if answer.trim() != "yes" {
-                        return Ok(CommandOutput {
-                            command: "daemon.stop",
-                            data: json!({ "outcome": "cancelled", "termination_requested": false }),
-                            human: "Shutdown cancelled; no termination requested".into(),
-                        });
-                    }
-                    client
-                        .confirm_shutdown(preflight.capability)
-                        .map_err(protocol_error)?
-                }
-                None => client
-                    .shutdown_with_policy(require_empty, expected_generation)
-                    .map_err(protocol_error)?,
-            };
-            shutdown_output(outcome)
+            stop_daemon_at(
+                &socket,
+                require_empty,
+                expected_generation,
+                confirm,
+                no_wait,
+                DAEMON_STOP_TIMEOUT,
+            )
         }
         DaemonCommand::Preflight => {
             let socket =
@@ -4218,6 +4171,123 @@ fn run_store_maintenance_at(daemon: &Path, arguments: &[&str]) -> Result<String,
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn stop_daemon_at(
+    socket: &Path,
+    require_empty: bool,
+    expected_generation: Option<u64>,
+    confirm: Option<Option<String>>,
+    no_wait: bool,
+    timeout: Duration,
+) -> Result<CommandOutput, AppError> {
+    let mut client = match ControlClient::connect(socket) {
+        Ok(client) => client,
+        Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+            confirm_daemon_absent(socket)?;
+            return Ok(already_stopped());
+        }
+        Err(error) => return Err(protocol_error(error)),
+    };
+    // Pin before sending any termination request. Neither a closed
+    // socket nor an unlocked lease proves this exact process exited.
+    let target = if no_wait {
+        None
+    } else {
+        Some(
+            crate::daemon::ShutdownTarget::pin(socket, client.proof())
+                .map_err(|error| AppError::new("daemon_process", error))?,
+        )
+    };
+    let outcome = match confirm {
+        // A capability is already a counted, daemon-bound, expiring
+        // authority over one observed inventory, so a script that
+        // obtained one has confirmed exactly what a prompt would.
+        Some(Some(capability)) => {
+            let capability: ShutdownCapability = serde_json::from_str(&capability)
+                .map_err(|error| {
+                    AppError::new(
+                        "invalid_capability",
+                        format!(
+                            "--confirm value is not a capability from `cagents daemon preflight`: {error}"
+                        ),
+                    )
+                })?;
+            client
+                .confirm_shutdown(capability)
+                .map_err(protocol_error)?
+        }
+        Some(None) => {
+            if !io::stdin().is_terminal() {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "interactive confirmation requires a terminal; pass a capability from `cagents daemon preflight` to --confirm, or use --require-empty",
+                ));
+            }
+            let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+            eprint!(
+                "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                preflight.capability.live_terminals, preflight.capability.background_subagents
+            );
+            io::stderr()
+                .flush()
+                .map_err(|error| AppError::new("confirmation_input", error))?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| AppError::new("confirmation_input", error))?;
+            if answer.trim() != "yes" {
+                return Ok(CommandOutput {
+                    command: "daemon.stop",
+                    data: json!({ "outcome": "cancelled", "termination_requested": false }),
+                    human: "Shutdown cancelled; no termination requested".into(),
+                });
+            }
+            client
+                .confirm_shutdown(preflight.capability)
+                .map_err(protocol_error)?
+        }
+        None => client
+            .shutdown_with_policy(require_empty, expected_generation)
+            .map_err(protocol_error)?,
+    };
+    drop(client);
+    finish_daemon_stop(outcome, target, timeout)
+}
+
+fn finish_daemon_stop(
+    outcome: ShutdownOutcome,
+    target: Option<crate::daemon::ShutdownTarget>,
+    timeout: Duration,
+) -> Result<CommandOutput, AppError> {
+    let mut output = shutdown_output(outcome)?;
+    if let Some(target) = target {
+        if io::stderr().is_terminal() {
+            eprintln!(
+                "Shutdown accepted; waiting up to {} seconds for the daemon to exit…",
+                timeout.as_secs()
+            );
+        }
+        let stopped = target
+            .wait(timeout)
+            .map_err(|error| AppError::new("daemon_process", error))?;
+        output.data["stopped"] = json!(stopped);
+        if !stopped {
+            return Err(AppError {
+                kind: "shutdown_timeout",
+                message: format!(
+                    "Shutdown was accepted, but the daemon did not exit within {} seconds; it may still be draining. Check `cagents daemon status` before restarting.",
+                    timeout.as_secs()
+                ),
+                details: Some(output.data),
+            });
+        }
+        output.human = format!(
+            "Daemon stopped: live_terminals_before={}, termination_requested={}",
+            output.data["live_terminals_before"], output.data["termination_requested"]
+        );
+    }
+    Ok(output)
 }
 
 fn shutdown_output(outcome: ShutdownOutcome) -> Result<CommandOutput, AppError> {
@@ -6183,7 +6253,7 @@ mod tests {
         for command in [
             vec!["preflight"],
             vec!["prepare-upgrade", "--yes", "--no-relaunch-agents"],
-            vec!["stop", "--require-empty"],
+            vec!["stop", "--require-empty", "--no-wait"],
         ] {
             let mut argv = vec!["cagents", "--json", "--no-start", "daemon"];
             argv.extend(command);
@@ -6540,7 +6610,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_cli_policies_and_results_preserve_acceptance_not_completion() {
+    fn shutdown_cli_policies_and_no_wait_results_preserve_acceptance_not_completion() {
         let cli = Cli::try_parse_from([
             "cagents",
             "daemon",
@@ -6556,7 +6626,8 @@ mod tests {
                 command: DaemonCommand::Stop {
                     require_empty: true,
                     expected_generation: Some(9),
-                    confirm: None
+                    confirm: None,
+                    no_wait: false,
                 }
             }
         ));
@@ -6575,6 +6646,13 @@ mod tests {
             Some(None)
         );
         assert_eq!(parsed_confirm(["cagents", "daemon", "stop"]), None);
+        let cli = Cli::try_parse_from(["cagents", "daemon", "stop", "--no-wait"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Stop { no_wait: true, .. }
+            }
+        ));
         let output = shutdown_output(ShutdownOutcome::Accepted {
             live_terminals_before: 7,
             termination_requested: true,

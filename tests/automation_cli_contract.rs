@@ -185,6 +185,26 @@ impl Fixture {
 }
 
 #[test]
+fn daemon_stop_then_start_waits_for_the_original_process_to_exit() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let stopped = fixture.cli(&["daemon", "stop", "--require-empty"]);
+    assert_eq!(stopped["stopped"], true, "{stopped}");
+    assert!(
+        fixture.daemon.try_wait().unwrap().is_some(),
+        "successful stop returned before the original daemon exited"
+    );
+    // Use the public start immediately, with no sleep, status poll or lease wait.
+    fixture.cli(&["daemon", "start"]);
+    let after = fixture.cli(&["daemon", "status"]);
+    assert_eq!(after["running"], true, "{after}");
+    let stopped = fixture.cli(&["daemon", "stop", "--require-empty"]);
+    assert_eq!(stopped["stopped"], true, "{stopped}");
+}
+
+#[test]
 fn a_live_process_without_a_control_reply_is_not_ready() {
     // This is the status response during the real pre-bind startup window.
     let mut status = json!({"ok":true,"data":{"running":true,"daemon_version":null}});
