@@ -1810,7 +1810,13 @@ fn spawn_provider(
         .args(&spec.arguments)
         .current_dir(&spec.working_directory)
         .env_clear()
-        .envs(&spec.environment)
+        // Callers withhold these already; no path may hand a provider the
+        // session its daemon or a saved recipe came from.
+        .envs(
+            spec.environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
@@ -9362,6 +9368,50 @@ for line in sys.stdin:
                 provider.child.try_wait().unwrap().unwrap(),
                 observed,
                 "non-reaping observation must match the real Child exit status for {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_is_never_handed_a_parent_session() {
+        use std::io::Read;
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/env".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
+            environment: [
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+            ]
+            .into(),
+            unset_environment: Default::default(),
+        };
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+            .unwrap()
+            .unwrap();
+        let mut output = String::new();
+        provider
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        provider.terminate().unwrap();
+        let received = output.lines().collect::<Vec<_>>();
+        assert!(received.contains(&"CLAUDE_CONFIG_DIR=/home/a/.claude"));
+        for name in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_SOCKET="] {
+            assert!(
+                !received.iter().any(|line| line.starts_with(name)),
+                "{name} reached the provider"
             );
         }
     }

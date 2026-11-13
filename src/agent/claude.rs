@@ -31,7 +31,9 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     activity_from_title: |_| None,
     identity_options: &["--resume", "-r", "--session-id"],
     // What Claude Code exports to the commands and subagents a session runs,
-    // and the socket through which other sessions message that session.
+    // and the socket through which other sessions message that session. Its
+    // job directory is where that session writes without asking, so another
+    // session must never be handed it.
     session_environment: |name| {
         matches!(
             name,
@@ -44,7 +46,10 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
                 | "CLAUDE_CODE_MESSAGING_TOKEN"
                 | "CLAUDE_CODE_SSE_PORT"
                 | "CLAUDE_CODE_EXECPATH"
-                | "CLAUDE_CODE_TMPDIR"
+                | "CLAUDE_CODE_BRIDGE_SESSION_ID"
+                | "CLAUDE_CODE_REMOTE"
+                | "CLAUDE_CODE_REMOTE_SESSION_ID"
+                | "CLAUDE_JOB_DIR"
                 | "CLAUDE_CODE_INVOKED_SKILLS"
                 | "CLAUDE_PID"
                 | "CLAUDE_EFFORT"

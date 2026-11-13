@@ -4790,6 +4790,14 @@ fn prepare_native_process_launch(
 ) -> Result<chat::Launch, ProtocolError> {
     let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
     if let Some(daemon) = daemon {
+        // A client older than this daemon, started inside another agent's
+        // session, still sends that session along. Withhold it rather than
+        // refuse the conversation.
+        let selected = selected
+            .iter()
+            .filter(|(name, _)| !crate::agent::is_session_variable(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         if selected.iter().any(|(name, value)| {
             !crate::model::agent_recovery::fresh_environment_key(
                 launch.provider,
@@ -4802,7 +4810,7 @@ fn prepare_native_process_launch(
                 "Native execution environment contains an unrelated or private variable",
             ));
         }
-        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+        spec.environment = sourceless_environment(daemon, selected, spec.environment);
     }
     if let Some(source) = source {
         spec.environment = source.clone();
@@ -5780,6 +5788,31 @@ IFS= read -r finish < finish
                     None
                 )
                 .is_err()
+            );
+            // An older client started inside another agent's session still
+            // sends it; the conversation starts without it.
+            let prepared = prepare_native_process_launch(
+                &launch,
+                Some(BTreeMap::new()),
+                &[
+                    ("PATH".into(), "/selected/bin".into()),
+                    ("CLAUDECODE".into(), "1".into()),
+                    (
+                        "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                        "/run/parent.sock".into(),
+                    ),
+                ]
+                .into(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/selected/bin");
+            assert!(!prepared.recipe.environment.contains_key("CLAUDECODE"));
+            assert!(
+                !prepared
+                    .recipe
+                    .environment
+                    .contains_key("CLAUDE_CODE_MESSAGING_SOCKET")
             );
         }
     }

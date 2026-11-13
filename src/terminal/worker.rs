@@ -2913,22 +2913,7 @@ impl Worker {
 
         let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
-            Some(environment) => {
-                let mut command = CommandBuilder::new(&execution.program);
-                command.args(&execution.arguments);
-                command.cwd(&execution.working_directory);
-                command.env_clear();
-                for (name, value) in &environment.0 {
-                    if !execution.unset_environment.contains(name)
-                        && !crate::agent::is_session_variable(name)
-                    {
-                        command.env(name, value);
-                    }
-                }
-                scrub_inherited_markers(&mut command);
-                terminal_environment(&mut command);
-                command
-            }
+            Some(environment) => command_from_execution(&execution, environment),
             None => command_from_recipe(&execution),
         };
         for name in crate::account::launch_credential_overrides(&execution) {
@@ -5794,6 +5779,26 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     for name in crate::account::launch_credential_overrides(recipe) {
         command.env_remove(name);
     }
+    command
+}
+
+/// A returned conversation's exact execution environment, in place of the
+/// host's own.
+fn command_from_execution(
+    execution: &LaunchRecipe,
+    environment: &crate::terminal_ipc::ChatExecutionEnvironment,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::new(&execution.program);
+    command.args(&execution.arguments);
+    command.cwd(&execution.working_directory);
+    command.env_clear();
+    for (name, value) in &environment.0 {
+        if !execution.unset_environment.contains(name) {
+            command.env(name, value);
+        }
+    }
+    scrub_inherited_markers(&mut command);
+    terminal_environment(&mut command);
     command
 }
 
@@ -9667,6 +9672,35 @@ mod tests {
             "CLAUDECODE",
             "CLAUDE_CODE_MESSAGING_SOCKET",
             "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert_eq!(command.get_env(name), None, "{name} reached the child");
+        }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
+    }
+
+    #[test]
+    fn a_returned_conversation_does_not_hand_the_child_a_parent_session() {
+        let mut recipe = env_recipe(BTreeMap::new());
+        recipe.unset_environment = ["ANTHROPIC_API_KEY".to_owned()].into();
+        let command = command_from_execution(
+            &recipe,
+            &crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                ("CLAUDECODE".to_owned(), "1".to_owned()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".to_owned(),
+                    "/run/parent.sock".to_owned(),
+                ),
+                ("ANTHROPIC_API_KEY".to_owned(), "removed".to_owned()),
+                ("CLAUDE_CONFIG_DIR".to_owned(), "/home/a/.claude".to_owned()),
+            ])),
+        );
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "ANTHROPIC_API_KEY",
         ] {
             assert_eq!(command.get_env(name), None, "{name} reached the child");
         }

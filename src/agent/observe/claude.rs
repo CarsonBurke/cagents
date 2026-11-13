@@ -71,7 +71,12 @@ fn listing(recipe: &LaunchRecipe) -> ProbeResult<Vec<Value>> {
     command
         .args(["agents", "--json"])
         .env_clear()
-        .envs(&recipe.environment)
+        .envs(
+            recipe
+                .environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .current_dir(&recipe.working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

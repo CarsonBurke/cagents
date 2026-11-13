@@ -1514,6 +1514,41 @@ mod tests {
         }
     }
 
+    /// A window started inside an agent's session must not probe as that
+    /// session's child, nor hand the CLI its messaging socket.
+    #[tokio::test]
+    async fn a_probe_never_runs_inside_the_session_cagents_was_started_from() {
+        const CHILD: &str = "CAGENTS_PROBE_SESSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::a_probe_never_runs_inside_the_session_cagents_was_started_from",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", directory.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("CLAUDECODE", "1")
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", "/run/parent.sock")
+                .env("CODEX_ESCALATE_SOCKET", "/run/parent-escalate.sock")
+                .env("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION", "10")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let script = "[ -z \"${CLAUDECODE+x}${CLAUDE_CODE_MESSAGING_SOCKET+x}${CODEX_ESCALATE_SOCKET+x}\" ] || exit 17\n\
+                      [ \"$CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION\" = 10 ] || exit 18";
+        let output = command(&Account::system(Provider::Claude), Path::new("/bin/sh"))
+            .args(["-c", script])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+    }
+
     #[test]
     fn only_the_matching_control_response_answers() {
         let success = json!({"type": "control_response", "response": {
