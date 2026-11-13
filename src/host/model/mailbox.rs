@@ -16,6 +16,25 @@ use rusqlite::{
 };
 
 pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
+const _: () = assert!(
+    const_str_eq(MESSAGE_RUN_KEY, "cagents-message:"),
+    "RETURNED and IN_LINE spell out the message run key"
+);
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 /// Returns the message `run` was made of to its recipient's queue, in the
 /// transaction that ends the run unsent: its prompt never reached the
@@ -34,6 +53,74 @@ pub(super) fn return_run_message_in(
     )
     .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
+}
+
+/// Whether message `m` already became an agent run once, which ended unsent
+/// and gave it back: it then arrives as a message, out of the order runs keep.
+const RETURNED: &str = "EXISTS(SELECT 1 FROM agent_runs given
+    WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+
+/// Pending messages that take their place in a recipient agent's order of
+/// runs, as `deliverable_messages` offers them: a reply held for its
+/// question's asker waits out of line, and so does a returned message.
+/// Expects the message alias `m` and the parameter `:now`.
+const IN_LINE: &str = "m.state = 'pending'
+    AND NOT EXISTS(SELECT 1 FROM messages asked WHERE asked.id = m.reply_to
+        AND asked.wait_until_ms > :now)
+    AND NOT EXISTS(SELECT 1 FROM agent_runs given
+        WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+
+/// Whether a message to `agent`'s conversation waits to be delivered. A
+/// follow-up given to that agent then goes behind it, so messages and
+/// prompts reach the agent in the order they were accepted.
+pub(super) fn messages_wait_for_agent(
+    db: &Connection,
+    agent: crate::model::AgentId,
+    now: u64,
+) -> Result<bool, String> {
+    db.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM agents a JOIN messages m
+                 ON m.recipient_lineage = coalesce(
+                     (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
+                     a.session_id)
+             WHERE a.id = :agent AND {IN_LINE})"
+        ),
+        rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Whether a message to the same recipient, sent before `id`, waits to be
+/// delivered: `id` then waits behind it.
+fn earlier_message_waits(db: &Connection, id: MessageId, now: u64) -> Result<bool, String> {
+    db.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM messages later JOIN messages m
+                 ON m.recipient_lineage = later.recipient_lineage
+                 AND (m.created_ms, m.rowid) < (later.created_ms, later.rowid)
+             WHERE later.id = :id AND {IN_LINE})"
+        ),
+        rusqlite::named_params! {":id": id.to_string(), ":now": now as i64},
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// How handing a pending message to its recipient agent fared.
+#[derive(Debug)]
+pub(crate) enum MessageHandoff {
+    /// The message is settled and `Accepted` is the run it became.
+    Accepted(crate::agent_execution::Accepted),
+    /// It was already settled, by another delivery or its recipient.
+    Settled,
+    /// An earlier message to the same recipient has not reached it yet.
+    Behind,
+    /// Every agent slot is taken.
+    NoSlot,
+    /// The agent's queue of waiting prompts is full.
+    QueueFull,
 }
 
 /// How many messages `cagents inbox --all` lists.
@@ -404,7 +491,8 @@ impl Registry {
                 "SELECT {COLUMNS} FROM messages WHERE rowid IN (
                      SELECT message_rowid FROM (
                          SELECT m.rowid AS message_rowid, row_number() OVER (
-                             PARTITION BY m.recipient_lineage ORDER BY m.created_ms, m.rowid
+                             PARTITION BY m.recipient_lineage, {RETURNED}
+                             ORDER BY m.created_ms, m.rowid
                          ) AS position
                          FROM messages m
                          LEFT JOIN messages asked ON asked.id = m.reply_to
@@ -432,6 +520,32 @@ impl Registry {
         Ok((messages, released.map(|ms| ms as u64)))
     }
 
+    /// The oldest message to `agent`'s conversation that waits to become one
+    /// of its runs, as `messages_wait_for_agent` finds them.
+    pub(crate) fn next_message_in_line(
+        &self,
+        agent: crate::model::AgentId,
+        now: u64,
+    ) -> Result<Option<Message>, String> {
+        use rusqlite::OptionalExtension;
+        self.db
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM messages WHERE rowid = (
+                         SELECT m.rowid FROM agents a JOIN messages m
+                             ON m.recipient_lineage = coalesce(
+                                 (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
+                                 a.session_id)
+                         WHERE a.id = :agent AND {IN_LINE}
+                         ORDER BY m.created_ms, m.rowid LIMIT 1)"
+                ),
+                rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
+                message,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// Settles a message as given to `session`. False when it was already
     /// settled, by another delivery or by its recipient reading it.
     pub(crate) fn deliver_message(
@@ -453,7 +567,8 @@ impl Registry {
     /// Settles a pending message as given to its recipient agent and accepts
     /// `request`, the message's prompt, as that agent's next run, in one
     /// transaction: neither the message nor the run exists without the other.
-    /// `None` when the message was already settled.
+    /// A message that must wait, behind an earlier one or for room, stays
+    /// pending.
     pub(crate) fn hand_message_to_agent(
         &mut self,
         id: MessageId,
@@ -461,11 +576,15 @@ impl Registry {
         origin: &crate::agent_execution::Origin,
         request: &crate::agent_execution::Submit,
         now: u64,
-    ) -> Result<Option<crate::agent_execution::Accepted>, String> {
+    ) -> Result<MessageHandoff, String> {
+        use super::execution::{CONCURRENCY_REFUSAL, QUEUE_FULL};
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if earlier_message_waits(&tx, id, now)? {
+            return Ok(MessageHandoff::Behind);
+        }
         let claimed = tx
             .execute(
                 "UPDATE messages SET state = 'delivered', delivered_session = ?2, settled_ms = ?3
@@ -475,11 +594,18 @@ impl Registry {
             .map_err(|error| error.to_string())?
             == 1;
         if !claimed {
-            return Ok(None);
+            return Ok(MessageHandoff::Settled);
         }
-        let accepted = Self::submit_agent_in(&tx, origin, request, now)?;
+        // Dropping the transaction returns a message that cannot become a run
+        // yet to its queue.
+        let accepted = match Self::submit_agent_in(&tx, origin, request, now) {
+            Ok(accepted) => accepted,
+            Err(error) if error == CONCURRENCY_REFUSAL => return Ok(MessageHandoff::NoSlot),
+            Err(error) if error.starts_with(QUEUE_FULL) => return Ok(MessageHandoff::QueueFull),
+            Err(error) => return Err(error),
+        };
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(Some(accepted))
+        Ok(MessageHandoff::Accepted(accepted))
     }
 
     /// Returns a message `session` refused to the queue it was claimed from.

@@ -2186,6 +2186,47 @@
           }
         ],
         [
+          "Behind",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ]
+            ]
+          }
+        ],
+        [
+          "NoSlot",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ]
+            ]
+          }
+        ],
+        [
+          "Ended",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "run",
+                "Bytes"
+              ],
+              [
+                "reason",
+                "Str"
+              ]
+            ]
+          }
+        ],
+        [
           "Unknown",
           {
             "Struct": [

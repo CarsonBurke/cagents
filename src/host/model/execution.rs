@@ -733,15 +733,7 @@ impl Registry {
     }
 
     pub(crate) fn agent_is_interactive(&self, id: AgentId) -> Result<bool, String> {
-        self.db
-            .query_row(
-                "SELECT interactive FROM agent_policies WHERE agent = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map(|value| value.unwrap_or(false))
-            .map_err(|error| error.to_string())
+        agent_is_interactive_in(&self.db, id)
     }
 
     pub(crate) fn agent_dispatch_is_authorized(
@@ -1177,9 +1169,7 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
             if running >= MAX_RUNNING || owned >= MAX_PARENT_RUNNING {
-                return Err(
-                    "Agent concurrency limit reached; wait for or close existing work".into(),
-                );
+                return Err(CONCURRENCY_REFUSAL.into());
             }
         }
         let agent = match &request.destination {
@@ -1217,8 +1207,21 @@ impl Registry {
                     .map_err(|error| error.to_string())?;
                 if queued >= MAX_QUEUED {
                     return Err(format!(
-                        "The agent already has {MAX_QUEUED} prompts waiting for its current run; wait for them or close the agent"
+                        "{QUEUE_FULL}{MAX_QUEUED} prompts waiting for its current run; wait for them or close the agent"
                     ));
+                }
+                // A client's follow-up goes behind messages to the agent
+                // that have not reached it, as a later message would. A
+                // person's conversation takes messages, not runs, so they
+                // keep no order with its prompts.
+                if !matches!(agent.origin, Origin::Automation { .. })
+                    && !request
+                        .idempotency_key
+                        .starts_with(crate::agent_execution::MESSAGE_RUN_KEY)
+                    && !agent_is_interactive_in(tx, *id)?
+                    && super::mailbox::messages_wait_for_agent(tx, *id, now_ms)?
+                {
+                    return Err(EARLIER_MESSAGES.into());
                 }
                 // A removed channel must never be resurrected by a follow-up.
                 require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
@@ -1778,9 +1781,7 @@ impl Registry {
                     let mut run: Run = decode(&record)?;
                     // A claimed prompt may be with the provider, awaiting its
                     // acknowledgement, so only a queued one is proved unsent.
-                    if unsent {
-                        super::mailbox::return_run_message_in(&tx, run.id)?;
-                    }
+                    let returned = unsent && super::mailbox::return_run_message_in(&tx, run.id)?;
                     // Teardown was confirmed, so this is a deliberate stop, not
                     // lost evidence (`Interrupted`). Cancelled leaves the agent
                     // free to take new work; nothing resends this prompt.
@@ -1789,7 +1790,14 @@ impl Registry {
                         run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
                     } else if end == ProcessEnd::Stopped && unsent {
                         changed = true;
-                        run.result.diagnostic = Some(STOPPED_BEHIND.into());
+                        run.result.diagnostic = Some(
+                            if returned {
+                                STOPPED_BEHIND_MESSAGE
+                            } else {
+                                STOPPED_BEHIND
+                            }
+                            .into(),
+                        );
                     } else if end == ProcessEnd::Stopped {
                         changed = true;
                         run.result.diagnostic = Some("The agent's process stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
@@ -2423,6 +2431,27 @@ fn run_is_unsent(db: &Connection, run: RunId) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Whether a person has prompted `id` in its pane, taking it over.
+fn agent_is_interactive_in(db: &Connection, id: AgentId) -> Result<bool, String> {
+    db.query_row(
+        "SELECT interactive FROM agent_policies WHERE agent = ?1",
+        [id.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|error| error.to_string())
+}
+
+/// How a submission refuses work when every agent slot is taken.
+pub(crate) const CONCURRENCY_REFUSAL: &str =
+    "Agent concurrency limit reached; wait for or close existing work";
+/// How a follow-up is refused when its agent's queue is full.
+pub(crate) const QUEUE_FULL: &str = "The agent already has ";
+/// How a client's follow-up is refused while messages to its agent wait.
+pub(crate) const EARLIER_MESSAGES: &str =
+    "Messages sent to this agent earlier have not reached it yet";
+
 /// The most prompts an agent holds while its current run continues.
 pub(crate) const MAX_QUEUED: usize = 8;
 
@@ -2438,6 +2467,9 @@ fn has_unverified_run(db: &Connection, agent: AgentId) -> Result<bool, String> {
 
 /// Why a prompt waiting behind a run that a stop cut short was not sent.
 const STOPPED_BEHIND: &str = "Not sent: the agent's process stopped during the run ahead of it, whose effects may be incomplete. Inspect the conversation, then send it again";
+/// The same for a run made of a message, which goes back to wait for the
+/// conversation, so sending it again would repeat it.
+const STOPPED_BEHIND_MESSAGE: &str = "Not run: the agent's process stopped during the run ahead of it, whose effects may be incomplete. The message waits for the conversation and arrives there once it runs again; do not send it again";
 
 /// Why a prompt waiting behind a run interrupted without proof of its outcome
 /// was not sent.
@@ -2537,6 +2569,7 @@ pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, S
 
 #[cfg(test)]
 mod tests {
+    use super::super::MessageHandoff;
     use super::*;
     use crate::{
         agent::Provider,
@@ -3411,17 +3444,247 @@ mod tests {
             created_ms: now,
         };
         registry.post_message(&message).unwrap();
+        let handoff = hand_message(registry, agent, source, &message, now);
+        let MessageHandoff::Accepted(accepted) = handoff else {
+            panic!("the pending message becomes a run: {handoff:?}");
+        };
+        (message, accepted)
+    }
+
+    /// A pending message to `agent`, bound to `source`, as `message_run`
+    /// leaves it, without handing it over.
+    fn pending_message(
+        registry: &mut Registry,
+        source: &HostedSession,
+        body: &str,
+        now: u64,
+    ) -> crate::agent_execution::mailbox::Message {
+        use crate::agent_execution::mailbox::{Message, Party, State as Mail};
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: Some(crate::agent_execution::Lineage(source.id())),
+                session: Some(source.id()),
+                title: None,
+            },
+            reply_to: None,
+            body: body.into(),
+            wait_until_ms: None,
+            state: Mail::Pending,
+            created_ms: now,
+        };
+        registry.post_message(&message).unwrap();
+        message
+    }
+
+    /// Hands `message` to `agent` as the courier does.
+    fn hand_message(
+        registry: &mut Registry,
+        agent: &Agent,
+        source: &HostedSession,
+        message: &crate::agent_execution::mailbox::Message,
+        now: u64,
+    ) -> MessageHandoff {
         let request = Submit {
             name: None,
             destination: Destination::Existing(agent.id),
             prompt: message.body.clone(),
             idempotency_key: format!("{}{}", super::super::MESSAGE_RUN_KEY, message.id),
         };
-        let accepted = registry
+        registry
             .hand_message_to_agent(message.id, source.id(), &agent.origin, &request, now)
             .unwrap()
-            .expect("the pending message becomes a run");
-        (message, accepted)
+    }
+
+    /// An agent bound to a provider, whose first run is in a turn.
+    fn agent_in_a_turn(registry: &mut Registry, request: &Submit) -> (Accepted, HostedSession) {
+        let accepted = registry.submit_agent(&Origin::User, request, 1).unwrap();
+        let source = source();
+        registry
+            .bind_agent(accepted.agent.id, None, source.clone())
+            .unwrap();
+        registry.register_agent_authority(&source).unwrap();
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "turn".into(),
+                },
+                2,
+            )
+            .unwrap();
+        (accepted, source)
+    }
+
+    fn follow_up(agent: AgentId, key: &str) -> Submit {
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: format!("Follow up {key}"),
+            idempotency_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn messages_and_follow_ups_become_runs_in_the_order_they_were_accepted() {
+        use crate::agent_execution::mailbox::State as Mail;
+        let (mut registry, _directory, request) = fixture();
+        let (first, source) = agent_in_a_turn(&mut registry, &request);
+        let agent = &first.agent;
+        // Two messages wait to be handed over, as when the courier has not
+        // reached them yet.
+        let earlier = pending_message(&mut registry, &source, "First", 3);
+        let later = pending_message(&mut registry, &source, "Second", 3);
+
+        // The later message waits behind the earlier one.
+        assert!(matches!(
+            hand_message(&mut registry, agent, &source, &later, 4),
+            MessageHandoff::Behind
+        ));
+        assert_eq!(message_state(&registry, &later), Mail::Pending);
+        // So does a client's follow-up accepted after both, unaccepted.
+        let before = registry.model().unwrap();
+        assert_eq!(
+            registry
+                .submit_agent(&Origin::User, &follow_up(agent.id, "after"), 4)
+                .unwrap_err(),
+            EARLIER_MESSAGES
+        );
+        assert_eq!(registry.model().unwrap(), before);
+
+        let MessageHandoff::Accepted(m1) = hand_message(&mut registry, agent, &source, &earlier, 5)
+        else {
+            panic!("the earlier message goes first");
+        };
+        let MessageHandoff::Accepted(m2) = hand_message(&mut registry, agent, &source, &later, 6)
+        else {
+            panic!("then the later one");
+        };
+        let prompt = registry
+            .submit_agent(&Origin::User, &follow_up(agent.id, "after"), 7)
+            .unwrap();
+        let order: Vec<_> = registry
+            .unfinished_agent_runs(agent.id)
+            .unwrap()
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        // Each starts only once every run accepted before it has ended.
+        assert_eq!(order, [first.run.id, m1.run.id, m2.run.id, prompt.run.id]);
+    }
+
+    #[test]
+    fn a_withdrawn_message_run_gives_its_message_back() {
+        use crate::agent_execution::mailbox::State as Mail;
+        let (mut registry, _directory, request) = fixture();
+        let (first, source) = agent_in_a_turn(&mut registry, &request);
+        let (message, queued) = message_run(&mut registry, &first.agent, &source, 3);
+        assert_eq!(message_state(&registry, &message), Mail::Delivered);
+        // As an interrupt withdraws the prompts waiting behind the run.
+        registry
+            .update_agent_run(
+                queued.run.id,
+                queued.run.revision,
+                Update::Finished {
+                    state: State::Cancelled,
+                    result: Default::default(),
+                },
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            message_state(&registry, &message),
+            Mail::Pending,
+            "the message was never sent, so it still arrives"
+        );
+    }
+
+    #[test]
+    fn a_message_waits_for_a_free_agent_slot_then_becomes_a_run() {
+        use crate::agent_execution::mailbox::State as Mail;
+        let (mut registry, _directory, mut request) = fixture();
+        let (accepted, source) = agent_in_a_turn(&mut registry, &request);
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        registry
+            .update_agent_run(
+                run.id,
+                run.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                2,
+            )
+            .unwrap();
+        // Other agents of the same owner take every slot.
+        let mut others = Vec::new();
+        for index in 0..MAX_PARENT_RUNNING {
+            request.idempotency_key = format!("other-{index}");
+            others.push(registry.submit_agent(&Origin::User, &request, 3).unwrap());
+        }
+
+        let message = pending_message(&mut registry, &source, "When you can", 4);
+        let before = registry.model().unwrap();
+        assert!(matches!(
+            hand_message(&mut registry, &accepted.agent, &source, &message, 5),
+            MessageHandoff::NoSlot
+        ));
+        assert_eq!(message_state(&registry, &message), Mail::Pending);
+        assert_eq!(registry.model().unwrap(), before, "nothing was accepted");
+
+        let other = &others[0];
+        registry
+            .update_agent_run(
+                other.run.id,
+                other.run.revision,
+                Update::Finished {
+                    state: State::Cancelled,
+                    result: Default::default(),
+                },
+                6,
+            )
+            .unwrap();
+        let MessageHandoff::Accepted(run) =
+            hand_message(&mut registry, &accepted.agent, &source, &message, 7)
+        else {
+            panic!("a freed slot takes the message");
+        };
+        assert_eq!(run.agent.id, accepted.agent.id);
+        assert_eq!(message_state(&registry, &message), Mail::Delivered);
+    }
+
+    #[test]
+    fn an_agent_holds_at_most_max_queued_prompts_behind_its_run() {
+        use crate::agent_execution::mailbox::State as Mail;
+        let (mut registry, _directory, request) = fixture();
+        let (first, source) = agent_in_a_turn(&mut registry, &request);
+        for index in 0..MAX_QUEUED {
+            let queued = registry
+                .submit_agent(
+                    &Origin::User,
+                    &follow_up(first.agent.id, &format!("q{index}")),
+                    3,
+                )
+                .unwrap();
+            assert!(registry.agent_run_is_queued(queued.run.id).unwrap());
+        }
+        let before = registry.model().unwrap();
+        let refusal = registry
+            .submit_agent(&Origin::User, &follow_up(first.agent.id, "one-too-many"), 4)
+            .unwrap_err();
+        assert!(refusal.starts_with(QUEUE_FULL), "{refusal}");
+        assert!(refusal.contains(&MAX_QUEUED.to_string()), "{refusal}");
+        assert_eq!(registry.model().unwrap(), before);
+
+        // A message waits for room rather than being refused.
+        let message = pending_message(&mut registry, &source, "Later", 5);
+        assert!(matches!(
+            hand_message(&mut registry, &first.agent, &source, &message, 6),
+            MessageHandoff::QueueFull
+        ));
+        assert_eq!(message_state(&registry, &message), Mail::Pending);
     }
 
     fn message_state(
@@ -3485,7 +3748,10 @@ mod tests {
             }
             assert_eq!(run.state, State::Cancelled, "{end:?}");
             if end == ProcessEnd::Stopped {
-                assert_eq!(run.result.diagnostic.as_deref(), Some(STOPPED_BEHIND));
+                assert_eq!(
+                    run.result.diagnostic.as_deref(),
+                    Some(STOPPED_BEHIND_MESSAGE)
+                );
             }
             assert_eq!(
                 message_state(&registry, &message),

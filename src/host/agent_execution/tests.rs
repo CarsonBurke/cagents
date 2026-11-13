@@ -4477,7 +4477,16 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
     };
     let courier = mailbox::Courier::start(&host).unwrap();
     courier.wait_for_scan(0); // Completes before result; never wakes the courier.
-    assert_eq!(stored().state, Delivery::Pending);
+    // The busy agent takes the message as a run that waits, unsent, for the
+    // parent's turn to end.
+    assert_eq!(stored().state, Delivery::Delivered);
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     assert_eq!(handle.activity(), crate::agent::ActivityState::Working);
     std::fs::write(&release.0, "release").unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -5886,7 +5895,10 @@ fn a_message_to_a_settled_agent_starts_a_run_with_it() {
 
 #[test]
 fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
-    use crate::agent_execution::mailbox::{Handoff, State as Delivery};
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
     if isolated("a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles").is_some() {
         return;
     }
@@ -5896,13 +5908,17 @@ fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
     let courier = mailbox::Courier::start(&host).unwrap();
 
     let handed = deliver(&host, first.agent.id.to_string(), "After your run");
-    assert_eq!(
-        handed.agent,
-        Some(Handoff::Waiting {
-            agent: first.agent.id,
-            behind: Some(first.run.id),
-        })
-    );
+    let Some(Handoff::Run {
+        agent,
+        run: queued,
+        start: Start::Queued {
+            behind: Some(behind),
+        },
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message as its next run: {handed:?}");
+    };
+    assert_eq!((agent, behind), (first.agent.id, first.run.id));
     let message = |host: &SharedHost| {
         registry(host)
             .unwrap()
@@ -5912,32 +5928,129 @@ fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
             .unwrap()
             .unwrap()
     };
+    // The run has the message; it waits unsent, interrupting nothing.
+    assert_eq!(message(&host).state, Delivery::Delivered);
     courier.wake_and_wait_for_scan();
-    assert_eq!(
-        message(&host).state,
-        Delivery::Pending,
-        "nothing interrupts"
-    );
-    assert_eq!(prompts(root), 1);
-
-    std::fs::write(root.join("cleanup-release"), "").unwrap();
-    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
-    let latest = || {
+    assert!(
         registry(&host)
             .unwrap()
             .lock()
             .unwrap()
-            .latest_agent_run(first.agent.id)
+            .agent_run_is_queued(queued)
             .unwrap()
-    };
-    eventually(
-        || latest().id != first.run.id,
-        "the message never became a run",
     );
-    let next = settled(&host, latest().id);
+    assert_eq!(prompts(root), 1, "nothing interrupts");
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued);
     assert_eq!(next.state, State::Succeeded, "{next:?}");
-    assert_eq!(message(&host).state, Delivery::Delivered);
     assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn messages_and_follow_ups_reach_an_agent_in_the_order_they_were_accepted() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, Outgoing, State as Delivery, To},
+    };
+    if isolated("messages_and_follow_ups_reach_an_agent_in_the_order_they_were_accepted").is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let agent = first.agent.id;
+
+    // A message left without being handed over, as when the courier has not
+    // reached it yet.
+    let Reply::Delivered(earlier) = process(
+        &host,
+        Authority::default(),
+        Operation::Send(Outgoing {
+            to: To::Session(agent.to_string()),
+            body: "First".into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("expected a sent receipt");
+    };
+    let earlier = earlier.sent.message.id;
+    // A later one waits behind it, rather than overtaking it.
+    let later = deliver(&host, agent.to_string(), "Second");
+    assert_eq!(later.agent, Some(Handoff::Behind { agent }));
+    let message = |id| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(id)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(message(later.delivery.sent.message.id), Delivery::Pending);
+
+    // A follow-up accepted after both hands them over first, in order, and
+    // waits behind them.
+    let Reply::Prompted { accepted, start } = process(
+        &host,
+        Authority::default(),
+        Operation::Prompt {
+            request: Submit {
+                destination: Destination::Existing(agent),
+                prompt: "Third".into(),
+                idempotency_key: "ordered-follow-up".into(),
+                ..request
+            },
+            interrupt: false,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a prompted receipt");
+    };
+    assert_eq!(
+        start,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    for id in [earlier, later.delivery.sent.message.id] {
+        assert_eq!(message(id), Delivery::Delivered);
+    }
+    let store = registry(&host).unwrap();
+    let keys = |runs: &[crate::agent_execution::Run]| -> Vec<String> {
+        let store = store.lock().unwrap();
+        runs.iter()
+            .map(|run| store.agent_request(run.id).unwrap().idempotency_key)
+            .collect()
+    };
+    let queue = store.lock().unwrap().unfinished_agent_runs(agent).unwrap();
+    let key = crate::host::model::MESSAGE_RUN_KEY;
+    assert_eq!(
+        keys(&queue[1..]),
+        [
+            format!("{key}{earlier}"),
+            format!("{key}{}", later.delivery.sent.message.id),
+            "ordered-follow-up".into(),
+        ]
+    );
+
+    // They run in that order once the current run ends.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let ran: Vec<_> = queue.iter().map(|run| settled(&host, run.id)).collect();
+    assert!(
+        ran.iter().all(|run| run.state == State::Succeeded),
+        "{ran:?}"
+    );
+    assert_eq!(ran.last().unwrap().id, accepted.run.id);
+    let started: Vec<_> = ran.iter().map(|run| run.started_ms.unwrap()).collect();
+    assert!(started.is_sorted(), "{started:?}");
+    assert_eq!(prompts(root), 4);
     drop(courier);
 }
 

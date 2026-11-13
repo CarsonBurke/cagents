@@ -25,6 +25,7 @@ use crate::{
         },
     },
     chat::{self, runtime::Rejection},
+    host::model::MessageHandoff,
     model::{MessageId, TerminalId},
 };
 use std::{
@@ -166,7 +167,7 @@ fn message_run(
     crate::agent_execution::Submit {
         name: None,
         destination: crate::agent_execution::Destination::Existing(agent),
-        prompt: seal.seal(message, message.created_ms),
+        prompt: seal.seal_run(message),
         idempotency_key: format!("{}{}", crate::host::model::MESSAGE_RUN_KEY, message.id),
     }
 }
@@ -226,18 +227,9 @@ pub(super) fn to_agent(
             reason: "A usage limit stops its conversation; it receives the message once the limit resets".into(),
         }));
     }
-    if ahead.is_some()
-        || matches!(
-            super::provider(host, registry, &agent)?,
-            Some(super::Provider::Busy)
-        )
-    {
-        return Ok(Some(Handoff::Waiting {
-            agent: agent.id,
-            behind: ahead,
-        }));
-    }
-    let accepted = registry
+    // A busy agent takes it too, as a run that waits behind its current work:
+    // the order of its runs is then the order they were accepted in.
+    let handoff = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .hand_message_to_agent(
@@ -247,9 +239,17 @@ pub(super) fn to_agent(
             &request,
             super::now(),
         );
-    let accepted = match accepted {
-        Ok(Some(accepted)) => accepted,
-        Ok(None) => return Ok(None),
+    let accepted = match handoff {
+        Ok(MessageHandoff::Accepted(accepted)) => accepted,
+        Ok(MessageHandoff::Settled) => return Ok(None),
+        Ok(MessageHandoff::Behind) => return Ok(Some(Handoff::Behind { agent: agent.id })),
+        Ok(MessageHandoff::NoSlot) => return Ok(Some(Handoff::NoSlot { agent: agent.id })),
+        Ok(MessageHandoff::QueueFull) => {
+            return Ok(Some(Handoff::Waiting {
+                agent: agent.id,
+                behind: ahead,
+            }));
+        }
         Err(reason) => {
             return Ok(Some(Handoff::Held {
                 agent: agent.id,
@@ -261,6 +261,51 @@ pub(super) fn to_agent(
     Ok(Some(started(host, registry, &accepted, message.id)))
 }
 
+/// Has every message to `agent` that waits to become one of its runs take
+/// its place, before a follow-up accepted after them. An error says why one
+/// cannot yet.
+pub(super) fn hand_earlier(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: crate::model::AgentId,
+) -> Result<(), String> {
+    let seal = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox_seal
+        .clone()
+        .ok_or("The mailbox key is unavailable")?;
+    // Each pass settles the oldest one, or stops; the bound only guards
+    // against a message that settles without leaving the line.
+    for _ in 0..=crate::agent_execution::mailbox::MAX_PENDING {
+        let Some(message) = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_message_in_line(agent, super::now())?
+        else {
+            return Ok(());
+        };
+        let why = match to_agent(host, registry, &seal, &message, false)? {
+            Some(Handoff::Run { .. } | Handoff::Ended { .. } | Handoff::Unknown { .. }) => continue,
+            // Settled meanwhile, or not the agent's to take as a run, which
+            // the follow-up's own acceptance then decides.
+            None => return Ok(()),
+            Some(Handoff::NoSlot { .. }) => "every agent slot is taken".to_owned(),
+            Some(Handoff::Waiting { .. }) => "the agent's queue of waiting prompts is full".into(),
+            Some(Handoff::Behind { .. }) => "an earlier one waits".into(),
+            Some(Handoff::Held { reason, .. }) => reason,
+        };
+        return Err(format!(
+            "{}{EARLIER}: {why}. Send this once it has",
+            crate::agent_execution::NOT_SENT
+        ));
+    }
+    Ok(())
+}
+
+/// Why `hand_earlier` refuses a follow-up.
+const EARLIER: &str = "a message sent to this agent earlier has not reached it yet";
+
 /// How the agent takes a message as `accepted`, once cagents tried to start
 /// it.
 fn started(
@@ -269,6 +314,7 @@ fn started(
     accepted: &Accepted,
     message: MessageId,
 ) -> Handoff {
+    use crate::agent_execution::State as Run;
     let (agent, run) = (accepted.agent.id, accepted.run.id);
     let reason = match super::start(host, accepted) {
         Ok(start) => return Handoff::Run { agent, run, start },
@@ -287,16 +333,9 @@ fn started(
         // Only a run proved never to have reached the provider gives its
         // message back, which then reaches the conversation as a message.
         Ok((_, false, true)) => Handoff::Held { agent, reason },
-        // The provider may have the message, so it stays given.
-        // The provider acknowledged the turn: the agent took the message
-        // as this run, which has since ended.
-        Ok((state, true, _)) if state != crate::agent_execution::State::Interrupted => {
-            Handoff::Run {
-                agent,
-                run,
-                start: crate::agent_execution::Start::Sent { resumed: false },
-            }
-        }
+        // The provider acknowledged the turn, so the agent took the message
+        // as this run, which has since ended without finishing.
+        Ok((Run::Failed | Run::Cancelled, true, _)) => Handoff::Ended { agent, run, reason },
         // Interrupted, or ended with its prompt perhaps written but not
         // acknowledged: the provider may have the message, so it stays given.
         Ok(_) => Handoff::Unknown { agent, run, reason },
@@ -1083,10 +1122,20 @@ impl Handle {
     ) -> Result<(), String> {
         {
             match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
-                Ok(Some(Handoff::Run { .. } | Handoff::Waiting { .. })) => return Ok(()),
+                // Its run has it, or it waits its turn to become one.
+                Ok(Some(
+                    Handoff::Run { .. }
+                    | Handoff::Waiting { .. }
+                    | Handoff::Behind { .. }
+                    | Handoff::NoSlot { .. },
+                )) => return Ok(()),
+                Ok(Some(Handoff::Ended { reason, run, .. })) => {
+                    tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
+                    return Ok(());
+                }
                 // Its run has it, perhaps already with the provider.
                 Ok(Some(Handoff::Unknown { reason, run, .. })) => {
-                    tracing::warn!(%reason, %run, message = %message.id, "a message's run was interrupted");
+                    tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
                     return Ok(());
                 }
                 // Not as a run, but as a message, as a person's conversation

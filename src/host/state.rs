@@ -313,6 +313,10 @@ pub(crate) struct HostState {
     /// its conversation. Kept apart from `execution_gates`: reopening adopts
     /// the successor under that gate.
     pub(super) execution_starts: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
+    /// The latest runs that went out once their agent's conversation was
+    /// reopened for them, so a retry or a racing delivery still reports the
+    /// reopening. Bounded, and lost with the daemon.
+    pub(super) reopened_runs: std::collections::VecDeque<crate::model::RunId>,
     /// Resume successors that took over their agent when they started and
     /// have been given no work since. Ending one gives the agent back stopped,
     /// for the next resume to take over, rather than retiring it: until then
@@ -467,6 +471,7 @@ impl HostState {
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
             execution_starts: BTreeMap::new(),
+            reopened_runs: std::collections::VecDeque::new(),
             idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),

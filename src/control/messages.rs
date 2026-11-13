@@ -256,9 +256,17 @@ fn delivery_lines(handed: &Handed) -> String {
             short(*agent)
         ));
     }
+    if let Some(Handoff::Ended { agent, run, reason }) = &handed.agent {
+        lines.push(format!(
+            "It ran as run {} of agent {}, which ended without finishing: {}.",
+            short(*run),
+            short(*agent),
+            reason.trim_end_matches('.')
+        ));
+    }
     if let Some(Handoff::Unknown { agent, run, reason }) = &handed.agent {
         lines.push(format!(
-            "It went to agent {} as run {}, which was interrupted: {}. Inspect that conversation before sending it again.",
+            "It went to agent {} as run {}, which ended without proof of whether the agent received it: {}. Inspect that conversation before sending it again.",
             short(*agent),
             short(*run),
             reason.trim_end_matches('.')
@@ -327,8 +335,15 @@ pub enum Arrival {
     Started,
     /// That agent takes it as its next run once its current work ends.
     Queued,
-    /// That agent took it as a run, which was interrupted with no proof of
-    /// whether the agent received it.
+    /// That agent takes it as a run once the messages sent to it earlier have
+    /// become runs.
+    Behind,
+    /// Every agent slot is taken; that agent takes it as a run once one frees.
+    NoSlot,
+    /// That agent received it as a run, which ended without finishing.
+    Ended,
+    /// That agent took it as a run, which ended with no proof of whether the
+    /// agent received it.
     Unknown,
 }
 
@@ -354,6 +369,9 @@ impl Arrival {
                 ),
                 ..,
             ) => Arrival::Queued,
+            (Some(Handoff::Behind { .. }), ..) => Arrival::Behind,
+            (Some(Handoff::NoSlot { .. }), ..) => Arrival::NoSlot,
+            (Some(Handoff::Ended { .. }), ..) => Arrival::Ended,
             (Some(Handoff::Unknown { .. }), ..) => Arrival::Unknown,
             (_, _, None) => Arrival::User,
             (_, Reach::Conversation, _) => Arrival::WhenIdle,
@@ -379,7 +397,7 @@ fn sent_line(sent: &Sent, agent: Option<&Handoff>) -> String {
 }
 
 /// How a sent line says a message will arrive, which is also how a
-/// transcript reading the line back tells the four apart.
+/// transcript reading the line back tells them apart.
 fn arrival_phrase(arrival: Arrival) -> &'static str {
     match arrival {
         Arrival::User => "the user reads it with `cagents inbox`",
@@ -388,6 +406,9 @@ fn arrival_phrase(arrival: Arrival) -> &'static str {
         Arrival::NextSession => "no session of it runs now; the next one to start receives it",
         Arrival::Started => "that agent started a run with it now",
         Arrival::Queued => "that agent takes it as its next run once its current work ends",
+        Arrival::Behind => "that agent takes it as a run after the messages sent to it earlier",
+        Arrival::NoSlot => "every agent slot is taken; that agent takes it as a run once one frees",
+        Arrival::Ended => "that agent received it as a run, which has ended",
         Arrival::Unknown => "whether that agent received it is unknown",
     }
 }
@@ -408,6 +429,9 @@ pub(super) fn read_sent_line(line: &str) -> Option<Receipt> {
         Arrival::User,
         Arrival::Started,
         Arrival::Queued,
+        Arrival::Behind,
+        Arrival::NoSlot,
+        Arrival::Ended,
         Arrival::Unknown,
     ]
     .into_iter()
@@ -943,12 +967,50 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "It went to agent {} as run {}, which was interrupted: The provider restarted during the turn. Inspect that conversation before sending it again.",
+                "It went to agent {} as run {}, which ended without proof of whether the agent received it: The provider restarted during the turn. Inspect that conversation before sending it again.",
                 short(agent),
                 short(run)
             )
         );
         assert_eq!(lines.len(), 2);
+
+        // A run the agent received that has already ended says so, rather
+        // than that it started.
+        let lines = delivery_lines(&handed(Some(Handoff::Ended {
+            agent,
+            run,
+            reason: "The run ended Cancelled".into(),
+        })));
+        let lines: Vec<_> = lines.lines().collect();
+        assert!(
+            lines[0].ends_with("\"Fix login\"; that agent received it as a run, which has ended"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "It ran as run {} of agent {}, which ended without finishing: The run ended Cancelled.",
+                short(run),
+                short(agent)
+            )
+        );
+        assert_eq!(lines.len(), 2);
+
+        // A message that waits its turn to become a run says what for.
+        for (handoff, phrase) in [
+            (
+                Handoff::Behind { agent },
+                "that agent takes it as a run after the messages sent to it earlier",
+            ),
+            (
+                Handoff::NoSlot { agent },
+                "every agent slot is taken; that agent takes it as a run once one frees",
+            ),
+        ] {
+            let lines = delivery_lines(&handed(Some(handoff)));
+            assert!(lines.ends_with(phrase), "{lines}");
+            assert_eq!(lines.lines().count(), 1, "{lines}");
+        }
     }
 
     #[cfg(feature = "ui")]
@@ -977,6 +1039,26 @@ mod tests {
                     reason: "The provider restarted".into(),
                 },
                 Arrival::Unknown,
+            ),
+            (
+                Handoff::Ended {
+                    agent: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    reason: "The run ended Failed".into(),
+                },
+                Arrival::Ended,
+            ),
+            (
+                Handoff::Behind {
+                    agent: crate::model::AgentId::new(),
+                },
+                Arrival::Behind,
+            ),
+            (
+                Handoff::NoSlot {
+                    agent: crate::model::AgentId::new(),
+                },
+                Arrival::NoSlot,
             ),
         ] {
             let sent = Sent {

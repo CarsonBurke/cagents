@@ -224,10 +224,24 @@ fn accept(
     } else {
         None
     };
-    let accepted = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+    // Messages sent to the agent earlier go first, so its runs keep the
+    // order they were accepted in. One sent meanwhile is handed over too.
+    let mut attempts = 0;
+    let accepted = loop {
+        if let Destination::Existing(agent) = &request.destination {
+            mailbox::hand_earlier(host, &registry, *agent)?;
+        }
+        match registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())
+        {
+            Err(error) if error == crate::host::model::EARLIER_MESSAGES && attempts < 3 => {
+                attempts += 1;
+            }
+            accepted => break accepted?,
+        }
+    };
     announce(host, &registry);
     let start = match &request.destination {
         Destination::Existing(_) => start(host, &accepted),
@@ -289,16 +303,10 @@ fn provider(
     }))
 }
 
-/// Sends an accepted prompt for an existing agent to its provider if nothing
-/// is ahead of it and the provider can take it, reopening the agent's
-/// conversation first when its process has ended. Otherwise the prompt waits
-/// unsent, and the mailbox courier starts it once the agent's work ends.
-///
-/// A prompt that cannot go now or later is recorded failed, with why, rather
-/// than retried: a reopening that failed, or work ahead whose outcome is
-/// unknown. The next prompt tries again.
 /// How `start` reports a run that ended with no diagnostic.
 const RUN_ENDED: &str = "The run ended ";
+/// How many reopened runs `start` remembers; see `reopened_runs`.
+const REOPENED_KEPT: usize = 64;
 
 /// Why `accepted` did not start, beginning with what its run's end proves
 /// about its prompt, so the CLI knows whether retrying its key can help.
@@ -343,6 +351,14 @@ fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
     }
 }
 
+/// Sends an accepted prompt for an existing agent to its provider if nothing
+/// is ahead of it and the provider can take it, reopening the agent's
+/// conversation first when its process has ended. Otherwise the prompt waits
+/// unsent, and the mailbox courier starts it once the agent's work ends.
+///
+/// A prompt that cannot go now or later is recorded failed, with why, rather
+/// than retried: a reopening that failed, or work ahead whose outcome is
+/// unknown. The next prompt tries again.
 pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, String> {
     let registry = registry(host)?;
     let id = accepted.run.id;
@@ -365,7 +381,13 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
                 .result
                 .diagnostic
                 .unwrap_or_else(|| format!("{RUN_ENDED}{:?}", run.state))),
-            _ => Ok(Start::Sent { resumed: false }),
+            _ => Ok(Start::Sent {
+                resumed: host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .reopened_runs
+                    .contains(&id),
+            }),
         };
     }
     if let Some(behind) = behind {
@@ -412,6 +434,11 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
                 .unwrap_or_else(|p| p.into_inner())
                 .agent(agent.id)?;
             dispatch_accepted(host, current(agent))?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.reopened_runs.len() == REOPENED_KEPT {
+                state.reopened_runs.pop_front();
+            }
+            state.reopened_runs.push_back(id);
             Ok(Start::Sent { resumed: true })
         }
     }
