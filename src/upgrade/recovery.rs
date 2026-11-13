@@ -925,8 +925,8 @@ impl PendingRecovery {
         if !(1..=5).contains(&checkpoint.version)
             || checkpoint.phase != "Prepared"
             || !checkpoint.proof.is_complete()
-            || checkpoint.terminals.len() + checkpoint.carried.len() > 1024
-            || checkpoint.chats.len() > 128
+            || checkpoint.terminals.len() + checkpoint.carried.len() > super::handoff::MAX_TERMINALS
+            || checkpoint.chats.len() > super::handoff::MAX_CHATS
         {
             return Err(
                 "Retained checkpoint is not a bounded Prepared source; it was preserved".into(),
@@ -997,8 +997,8 @@ impl PendingRecovery {
         let chats: BTreeSet<_> = self.census.chats.iter().map(|item| item.id).collect();
         if terminals.len() != self.census.terminals.len()
             || chats.len() != self.census.chats.len()
-            || terminals.len() > 1024
-            || chats.len() > 128
+            || terminals.len() > super::handoff::MAX_TERMINALS
+            || chats.len() > super::handoff::MAX_CHATS
             || self
                 .census
                 .terminals
@@ -4518,6 +4518,24 @@ mod tests {
             pending.has_recovery_claim().is_err(),
             "unsafe evidence must not be mistaken for claim absence"
         );
+    }
+
+    #[test]
+    fn a_prepared_checkpoint_of_more_than_128_chats_stays_inspectable() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let path = &preparation.authority.checkpoint_path;
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+        index["chats"] = (0..300)
+            .map(|chat| {
+                let (source, ..) = scale_chat(&preparation, chat, 0, 0);
+                serde_json::json!({"source": source, "launch": source.launch})
+            })
+            .collect();
+        save(path, &serde_json::to_vec(&index).unwrap());
+        let pending = PendingRecovery::inspect_at(path).unwrap().unwrap();
+        assert_eq!(pending.census.chats.len(), 300);
     }
 
     #[test]
