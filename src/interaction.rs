@@ -1467,17 +1467,14 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
         // The fill keeps its own alpha: on a translucent theme the fade
         // matches the composited surface instead of painting an opaque band.
         let color = (self.fill)(theme);
-        let clear = Color { a: 0.0, ..color };
         renderer.with_layer(clip, |renderer| match self.axis {
             Axis::Horizontal => {
-                // π/2 runs the gradient from left to right.
-                let angle = Radians(std::f32::consts::FRAC_PI_2);
                 if state.start > 0.0 {
                     let fade = Rectangle {
                         width: state.start.min(bounds.width),
                         ..bounds
                     };
-                    fill_overflow_fade(renderer, fade, angle, color, clear);
+                    fill_overflow_fade(renderer, fade, Edge::Left, color);
                 }
                 if state.end > 0.0 {
                     let width = state.end.min(bounds.width);
@@ -1486,15 +1483,13 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
                         width,
                         ..bounds
                     };
-                    fill_overflow_fade(renderer, fade, angle, clear, color);
+                    fill_overflow_fade(renderer, fade, Edge::Right, color);
                 }
             }
             Axis::Vertical => {
-                // π runs the gradient from top to bottom. The scrollbar's
-                // rail keeps full strength: the thumb is the position
-                // indicator, and every vertical scrollable keeps its content
-                // out of the rail.
-                let angle = Radians(std::f32::consts::PI);
+                // The scrollbar's rail keeps full strength: the thumb is the
+                // position indicator, and every vertical scrollable keeps its
+                // content out of the rail.
                 let width = (bounds.width - crate::design::SCROLLBAR_GUTTER).max(0.0);
                 if state.start > 0.0 {
                     let fade = Rectangle {
@@ -1502,7 +1497,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
                         height: state.start.min(bounds.height),
                         ..bounds
                     };
-                    fill_overflow_fade(renderer, fade, angle, color, clear);
+                    fill_overflow_fade(renderer, fade, Edge::Top, color);
                 }
                 if state.end > 0.0 {
                     let height = state.end.min(bounds.height);
@@ -1512,7 +1507,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
                         height,
                         ..bounds
                     };
-                    fill_overflow_fade(renderer, fade, angle, clear, color);
+                    fill_overflow_fade(renderer, fade, Edge::Bottom, color);
                 }
             }
         });
@@ -1561,13 +1556,74 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
     }
 }
 
-fn fill_overflow_fade(
-    renderer: &mut Renderer,
-    bounds: Rectangle,
-    angle: Radians,
-    from: Color,
-    to: Color,
-) {
+/// The edge of a scrolling surface that an overflow fade is opaque at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// How far a fade's quad runs on past the edge it is opaque at.
+///
+/// iced's wgpu pipeline never snaps gradient quads to the pixel grid (its
+/// vertex layout reads the snap flag from the quad's shadow colour), while
+/// the layer clip and the scrollable's own clip are rounded out to whole
+/// pixels. At a fractional scale the fade then stops half a pixel short of
+/// the clip, and one column or row of content shows through it at half
+/// strength: the light seam at the end of the tab strip. Running the quad on
+/// past the edge, at full strength, and leaving the clip to cut it covers
+/// that pixel at any scale.
+const FADE_OVERDRAW: f32 = 1.0;
+
+/// The quad that fills `fade` from clear to `color` at `edge`, run on past
+/// that edge by [`FADE_OVERDRAW`], and where in it the colour is reached.
+fn overflow_fade_quad(fade: Rectangle, edge: Edge) -> (Rectangle, Radians, f32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    // iced treats 0 rad as upward (CSS 0deg); a gradient runs from its first
+    // stop toward the angle, so it points at the opaque edge.
+    let (quad, angle, depth) = match edge {
+        Edge::Left => (
+            Rectangle {
+                x: fade.x - FADE_OVERDRAW,
+                width: fade.width + FADE_OVERDRAW,
+                ..fade
+            },
+            Radians(3.0 * FRAC_PI_2),
+            fade.width,
+        ),
+        Edge::Right => (
+            Rectangle {
+                width: fade.width + FADE_OVERDRAW,
+                ..fade
+            },
+            Radians(FRAC_PI_2),
+            fade.width,
+        ),
+        Edge::Top => (
+            Rectangle {
+                y: fade.y - FADE_OVERDRAW,
+                height: fade.height + FADE_OVERDRAW,
+                ..fade
+            },
+            Radians(0.0),
+            fade.height,
+        ),
+        Edge::Bottom => (
+            Rectangle {
+                height: fade.height + FADE_OVERDRAW,
+                ..fade
+            },
+            Radians(PI),
+            fade.height,
+        ),
+    };
+    (quad, angle, depth / (depth + FADE_OVERDRAW))
+}
+
+fn fill_overflow_fade(renderer: &mut Renderer, fade: Rectangle, edge: Edge, color: Color) {
+    let (bounds, angle, opaque) = overflow_fade_quad(fade, edge);
     renderer.fill_quad(
         renderer::Quad {
             bounds,
@@ -1575,10 +1631,11 @@ fn fill_overflow_fade(
             shadow: Shadow::default(),
             snap: true,
         },
-        // iced treats 0 rad as upward (CSS 0deg); the first stop sits where
-        // the gradient starts.
         Background::Gradient(Gradient::Linear(
-            Linear::new(angle).add_stop(0.0, from).add_stop(1.0, to),
+            Linear::new(angle)
+                .add_stop(0.0, Color { a: 0.0, ..color })
+                .add_stop(opaque, color)
+                .add_stop(1.0, color),
         )),
     );
 }
@@ -3229,6 +3286,44 @@ mod tests {
             };
             assert_eq!(delta, expected);
         }
+    }
+
+    #[test]
+    fn a_fade_runs_on_past_its_opaque_edge_at_full_strength() {
+        let fade = Rectangle {
+            x: 10.5,
+            y: 20.25,
+            width: 24.0,
+            height: 30.0,
+        };
+        // Each quad reaches FADE_OVERDRAW beyond the edge it is opaque at and
+        // no further on the clear side, with the colour reached at the edge.
+        let right_end = |quad: Rectangle| quad.x + quad.width;
+        let bottom_end = |quad: Rectangle| quad.y + quad.height;
+        let (quad, _, opaque) = overflow_fade_quad(fade, Edge::Right);
+        assert_eq!(
+            (quad.x, right_end(quad)),
+            (fade.x, right_end(fade) + FADE_OVERDRAW)
+        );
+        assert!((quad.x + quad.width * opaque - right_end(fade)).abs() < 1e-4);
+        let (quad, _, opaque) = overflow_fade_quad(fade, Edge::Left);
+        assert_eq!(
+            (quad.x, right_end(quad)),
+            (fade.x - FADE_OVERDRAW, right_end(fade))
+        );
+        assert!((right_end(quad) - quad.width * opaque - fade.x).abs() < 1e-4);
+        let (quad, _, opaque) = overflow_fade_quad(fade, Edge::Bottom);
+        assert_eq!(
+            (quad.y, bottom_end(quad)),
+            (fade.y, bottom_end(fade) + FADE_OVERDRAW)
+        );
+        assert!((quad.y + quad.height * opaque - bottom_end(fade)).abs() < 1e-4);
+        let (quad, _, opaque) = overflow_fade_quad(fade, Edge::Top);
+        assert_eq!(
+            (quad.y, bottom_end(quad)),
+            (fade.y - FADE_OVERDRAW, bottom_end(fade))
+        );
+        assert!((bottom_end(quad) - quad.height * opaque - fade.y).abs() < 1e-4);
     }
 
     #[test]
