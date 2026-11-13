@@ -2115,12 +2115,13 @@ impl Runtime {
                 Provider::Claude => "Claude",
                 Provider::Omp => "OMP",
             };
+            // A model the provider never reported is left out rather than
+            // announced; the tooltip says so for whoever asks.
             let model = agent
                 .model
                 .as_deref()
                 .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .unwrap_or("Model not reported");
+                .filter(|model| !model.is_empty());
             let mut heading = vec![
                 widget::row::with_children(vec![
                     chat_title(self.child_label(agent, 80))
@@ -2148,10 +2149,13 @@ impl Runtime {
             }
             heading.push(
                 crate::interaction::tooltip(
-                    design::caption(format!(
-                        "Native subagent · {provider} · {}",
-                        Self::short_description(model, 80)
-                    )),
+                    design::caption(match model {
+                        Some(model) => format!(
+                            "{provider} subagent · {}",
+                            Self::short_description(model, 80)
+                        ),
+                        None => format!("{provider} subagent"),
+                    }),
                     self.native_child_identity(agent),
                 )
                 .into(),
