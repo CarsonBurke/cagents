@@ -499,9 +499,8 @@ impl InstalledIdentity {
 /// historical unsolicited chat traffic, must match in full.
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
 /// include status reads. StartupState and every nested phase are frozen for
-/// readiness checks on all admitted Current sources. Current-only ChatLimit
-/// and ChatAgentAddresses cannot arrive from historical sources; the full current-wire recording test
-/// covers that message.
+/// readiness checks on all admitted Current sources. A source sends the chat
+/// events in [`UNSOLICITED_SINCE`] unasked once its protocol has them.
 /// Keep this beside source admission so adding support always runs the proof.
 #[cfg(test)]
 pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
@@ -576,6 +575,15 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Chat events a source sends attached clients unasked, from the protocol
+/// that introduced each. The source clients accept them, so a source serving
+/// one must send it as this build reads it.
+#[cfg(test)]
+pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
+    ("ServerMessage", "chat_limit", 160),
+    ("ServerMessage", "chat_agent_addresses", 173),
+];
+
 /// One source qualification for lifecycle control and migration inspection.
 /// The bespoke families share the frozen lifecycle subset but need separate
 /// inventory decoders. Their byte proofs live beside those clients.
@@ -586,23 +594,65 @@ pub(crate) enum ClientFamily {
     V68,
 }
 
-/// Live updates are qualified only for the frozen desktop baseline and the
-/// current matched release. Historical DTO recordings do not grant admission:
-/// every source also needs the complete readiness, census and recovery flow.
-const SOURCE_CLIENTS: &[(u16, ClientFamily)] = &[
-    (156, ClientFamily::Current),
-    (crate::terminal_ipc::PROTOCOL_VERSION, ClientFamily::Current),
+/// An installed build a live update may start from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReleasedSource {
+    pub(crate) protocol: u16,
+    /// The build users run it as, which the refusal names.
+    pub(crate) release: &'static str,
+    family: ClientFamily,
+}
+
+/// The installed builds live updates start from, besides the current matched
+/// release, by the protocol their daemons serve. Each is pinned by its own
+/// number: bumping `PROTOCOL_VERSION` must not drop the build users are
+/// running, as 174 once dropped 173. Retire one only on purpose, by moving it
+/// to [`RETIRED_SOURCES`]; `scripts/check-update-sources` requires every
+/// recorded protocol from the oldest pinned one up to the current one to be
+/// in one of the two lists.
+///
+/// Historical DTO recordings do not grant admission: every source also needs
+/// the complete readiness, census and recovery flow, and a rehearsal.
+pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
+    ReleasedSource {
+        protocol: 156,
+        release: "desktop 0.1.3+local.991daa43e",
+        family: ClientFamily::Current,
+    },
+    ReleasedSource {
+        protocol: 173,
+        release: "0.1.3+local.43678f2fb",
+        family: ClientFamily::Current,
+    },
+];
+
+/// Protocols main served since the oldest pinned source that live updates
+/// deliberately do not start from, and why.
+#[cfg(test)]
+pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
+    (160, "superseded before update sources were pinned"),
+    (165, "superseded before update sources were pinned"),
+    (166, "superseded before update sources were pinned"),
+    (172, "superseded before update sources were pinned"),
+    (174, "main served it under a day; never installed"),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
-    SOURCE_CLIENTS
+    if protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+        return Some(ClientFamily::Current);
+    }
+    RELEASED_SOURCES
         .iter()
-        .find_map(|&(version, family)| (version == protocol).then_some(family))
+        .find_map(|source| (source.protocol == protocol).then_some(source.family))
 }
 
 #[cfg(test)]
 pub(crate) fn protocols() -> impl Iterator<Item = u16> {
-    SOURCE_CLIENTS.iter().map(|&(protocol, _)| protocol)
+    RELEASED_SOURCES
+        .iter()
+        .map(|source| source.protocol)
+        .filter(|&protocol| protocol != crate::terminal_ipc::PROTOCOL_VERSION)
+        .chain([crate::terminal_ipc::PROTOCOL_VERSION])
 }
 
 #[cfg(test)]
@@ -624,8 +674,13 @@ pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
     } else {
         ""
     };
+    let released = RELEASED_SOURCES
+        .iter()
+        .map(|source| format!("protocol {} ({})", source.protocol, source.release))
+        .collect::<Vec<_>>()
+        .join(", ");
     invalid(format!(
-        "The running cagents service uses protocol {protocol}; live updates support only protocol 156 (desktop 0.1.3+local.991daa43e) and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.",
+        "The running cagents service uses protocol {protocol}; live updates support only {released} and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.",
         crate::terminal_ipc::PROTOCOL_VERSION,
     ))
 }
@@ -826,16 +881,27 @@ mod admission_message_tests {
     use super::*;
 
     #[test]
-    fn live_sources_are_only_the_frozen_desktop_and_current_release() {
+    fn live_sources_are_the_pinned_releases_and_the_current_release() {
         assert_eq!(
             protocols().collect::<Vec<_>>(),
-            [156, crate::terminal_ipc::PROTOCOL_VERSION]
+            [156, 173, crate::terminal_ipc::PROTOCOL_VERSION]
         );
-        for protocol in [0, 56, 68, 77, 119, 128, 160, 165] {
+        for source in RELEASED_SOURCES {
+            assert!(source.protocol < crate::terminal_ipc::PROTOCOL_VERSION);
+            assert!(current_client_supports(source.protocol));
+        }
+        for &(protocol, _) in RETIRED_SOURCES {
+            assert!(!is_qualified_source(protocol), "protocol {protocol}");
+        }
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174] {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
             let message = unsupported_source(protocol).to_string();
             assert!(message.contains(&format!("uses protocol {protocol}")));
-            assert!(message.contains("live updates support only protocol 156"));
+            assert!(message.contains(&format!(
+                "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
+                 protocol 173 (0.1.3+local.43678f2fb) and protocol {}.",
+                crate::terminal_ipc::PROTOCOL_VERSION
+            )));
             assert!(message.contains("did not request preparation or shutdown"));
             assert!(message.contains("--no-start daemon stop --require-empty"));
             assert!(message.contains("sh /path/to/install.sh"));

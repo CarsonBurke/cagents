@@ -196,8 +196,11 @@ accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
 The candidate drives qualified source daemons through a frozen lifecycle subset:
-protocol 156 (the `991daa43e` desktop build) and the matched current protocol 166.
-Other source protocols, including 160 and 165, are refused before preparation,
+the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
+protocol 156 (the `991daa43e` desktop build) and 173 (`43678f2fb`), and the
+matched current protocol. A protocol bump never drops a pinned build; retiring
+one is a deliberate change that `scripts/check-update-sources` enforces.
+Other source protocols, including 160, 165 and 174, are refused before preparation,
 shutdown or checkpoint changes. Use a cold installation instead: finish and close
 hosted sessions, quit every window, then use the installed build's matching CLI
 to run `cagents --no-start daemon stop --require-empty`. Confirm that its
