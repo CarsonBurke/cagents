@@ -114,7 +114,7 @@ class InstallLocalHead(unittest.TestCase):
         self.assert_refused(
             result,
             f"install-local: HEAD is detached at {stale} (2 commits behind origin/main).",
-            "To build main, run: git checkout main && git pull --ff-only",
+            "To build main, run: git checkout main && git pull --ff-only origin main",
         )
 
     def test_detached_head_points_at_the_worktree_that_has_main(self):
@@ -125,7 +125,7 @@ class InstallLocalHead(unittest.TestCase):
                                 cwd=review, env=self.environment, capture_output=True,
                                 text=True, timeout=60)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"To build main, run: cd {self.checkout} && git pull --ff-only"
+        self.assertIn(f"To build main, run: cd {self.checkout} && git pull --ff-only origin main"
                       " && scripts/install-local --stage-only\n", result.stderr)
         self.assertFalse(self.builds.exists())
 
@@ -145,7 +145,7 @@ class InstallLocalHead(unittest.TestCase):
                                 cwd=review, env=self.environment, capture_output=True,
                                 text=True, timeout=60)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"To build main, run: cd {self.checkout} && git pull --ff-only"
+        self.assertIn(f"To build main, run: cd {self.checkout} && git pull --ff-only origin main"
                       " && scripts/install-local\n", result.stderr)
         self.assertFalse(self.builds.exists())
 
@@ -184,10 +184,49 @@ class InstallLocalHead(unittest.TestCase):
         self.publish("second")
         self.assert_built(self.run_script("--this-commit"))
 
-    def test_unpublished_branch_is_built_and_named(self):
+    def test_branch_without_upstream_at_published_tip_is_built(self):
+        self.git(self.checkout, "checkout", "--quiet", "-b", "integration/candidate")
+        self.assert_built(self.run_script())
+
+    def test_stale_branch_without_upstream_is_refused_after_fetching(self):
+        self.git(self.checkout, "checkout", "--quiet", "-b", "review/old")
+        stale = self.short()
+        self.publish("second")
+        self.assert_refused(
+            self.run_script(),
+            f"install-local: Branch review/old at {stale} has no upstream (1 commit behind origin/main).",
+            "To build main, run: git checkout main && git pull --ff-only origin main",
+        )
+
+    def test_main_without_upstream_has_an_executable_update_command(self):
+        self.git(self.checkout, "branch", "--unset-upstream")
+        self.publish("second")
+        self.assert_refused(
+            self.run_script(),
+            f"To build main, run: cd {self.checkout} && git pull --ff-only origin main && scripts/install-local",
+        )
+        self.git(self.checkout, "pull", "--ff-only", "origin", "main")
+        self.assert_built(self.run_script())
+
+    def test_branch_without_origin_main_is_refused(self):
+        self.git(self.checkout, "checkout", "--quiet", "-b", "review/old")
+        self.git(self.checkout, "remote", "remove", "origin")
+        self.assert_refused(
+            self.run_script(),
+            f"install-local: Branch review/old at {self.short()} has no upstream; origin/main is unavailable.",
+            "Configure the origin remote if needed, then fetch the published tip: git fetch origin main",
+        )
+
+    def test_unpublished_branch_is_refused_without_explicit_choice(self):
         self.git(self.checkout, "checkout", "--quiet", "-b", "integration/candidate")
         self.commit("candidate")
-        result = self.run_script()
+        self.assert_refused(self.run_script(),
+                            f"install-local: Branch integration/candidate at {self.short()} has no upstream.")
+
+    def test_unpublished_branch_is_built_and_named_when_chosen(self):
+        self.git(self.checkout, "checkout", "--quiet", "-b", "integration/candidate")
+        self.commit("candidate")
+        result = self.run_script("--this-commit")
         self.assert_built(result)
         self.assertIn(f"Building branch integration/candidate at {self.short()}, not main.\n",
                       result.stdout)
