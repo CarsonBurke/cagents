@@ -358,12 +358,7 @@ impl Cagents {
             label.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
-                    design::caption(scope)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .into(),
+                    crate::ui_controls::FadeText::caption(scope).into(),
                 ])
                 .spacing(space::XXS)
                 .align_y(Alignment::Center)
