@@ -345,6 +345,16 @@ pub(in crate::host::model) fn read(db: &Connection, scope: &Scope) -> Result<Vie
     read_at(db, id, scope.clone())
 }
 
+/// The stored view, or `None` when the scope has none.
+pub(in crate::host::model) fn read_stored(
+    db: &Connection,
+    scope: &Scope,
+) -> Result<Option<View>, String> {
+    scope_id(db, scope)?
+        .map(|id| read_at(db, id, scope.clone()))
+        .transpose()
+}
+
 fn read_at(db: &Connection, id: i64, scope: Scope) -> Result<View, String> {
     let revision: i64 = db
         .prepare_cached("SELECT revision FROM view_scopes WHERE id = ?1")

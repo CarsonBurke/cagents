@@ -36,6 +36,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
+        | R::ReadWorkspaceView { .. }
+        | R::ReadWorkspaceSnapshot
+        | R::ReadWorkspaceMetadata { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
@@ -77,6 +80,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::PrepareConfirmedUpgrade { .. }
         | R::ResolveUpgradeChat { .. }
         | R::EditWorkspaceModel { .. }
+        | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
         | R::WatchNotifications { .. }

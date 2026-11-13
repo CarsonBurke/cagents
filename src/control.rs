@@ -663,6 +663,15 @@ impl Hangup {
     }
 }
 
+/// One shared-model edit another client applied, as a watcher receives it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelEdge {
+    /// The registry's sequence after the edit.
+    pub sequence: u64,
+    pub edit: ModelEdit,
+    pub effects: crate::workspace_model::delta::EditEffects,
+}
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -679,7 +688,7 @@ pub struct ControlClient {
     observed: VecDeque<TerminalDescriptor>,
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
-    observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_model: VecDeque<ModelEdge>,
     observed_notifications: VecDeque<crate::notifications::Update>,
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
@@ -979,7 +988,78 @@ impl ControlClient {
     /// the subscription with the model itself, so there is no gap between
     /// subscribing and reading for an edit to fall into.
     pub fn watch_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
-        self.expect_model(ClientRequest::WatchWorkspaceModel)
+        self.watch_workspace_state().map(|(model, _)| model)
+    }
+
+    /// Subscribe and read the model and closed identities from one snapshot.
+    pub fn watch_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::WatchWorkspaceModel)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    /// Read the same coherent baseline as a subscription, without a watch.
+    pub fn read_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceSnapshot)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    pub fn workspace_registry_identity(&mut self) -> Result<uuid::Uuid, ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Identity,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Identity(identity),
+            ) => Ok(identity),
+            response => Err(unexpected_response(
+                "the workspace registry identity",
+                &response,
+            )),
+        }
+    }
+
+    pub fn read_workspace_projects(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<ModelProject>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Projects,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Projects { identity, projects },
+            ) => Ok((identity, projects)),
+            response => Err(unexpected_response("workspace projects", &response)),
+        }
+    }
+
+    pub fn read_workspace_agents(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<crate::agent_execution::Agent>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Agents { identity, agents },
+            ) => Ok((identity, agents)),
+            response => Err(unexpected_response("workspace agents", &response)),
+        }
+    }
+
+    /// Commit an edit without reading or transporting unrelated model state.
+    pub fn apply_workspace_edit(
+        &mut self,
+        edit: ModelEdit,
+    ) -> Result<crate::workspace_model::delta::EditReceipt, ControlError> {
+        match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
+            ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
+            response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
     }
 
     pub fn watch_notifications(
@@ -1097,6 +1177,21 @@ impl ControlClient {
         self.expect_model(ClientRequest::ReadWorkspaceModel)
     }
 
+    /// Reads one scope of the shared model: its view, `None` when the registry
+    /// has no such scope, and the model sequence it is consistent with.
+    pub fn read_workspace_view(
+        &mut self,
+        scope: crate::workspace_model::views::Scope,
+    ) -> Result<(Option<crate::workspace_model::views::View>, u64), ControlError> {
+        self.stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
+        match self.request_strict(ClientRequest::ReadWorkspaceView { scope })? {
+            ServerResponse::WorkspaceView { view, sequence } => Ok((view, sequence)),
+            response => Err(unexpected_response("a workspace view", &response)),
+        }
+    }
+
     /// Applies one edit and returns the resulting model, which is how the
     /// client that minted a channel learns the rank the registry gave it.
     pub fn edit_workspace_model(
@@ -1111,7 +1206,7 @@ impl ControlClient {
     /// A model edge has no deadline, so this drops the read timeout rather than
     /// polling: a timeout expiring mid-frame would desynchronize the stream, and
     /// a subscribed connection issues no further requests.
-    pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+    pub fn next_workspace_model_edit(&mut self) -> Result<ModelEdge, ControlError> {
         if let Some(edge) = self.observed_model.pop_front() {
             return Ok(edge);
         }
@@ -1122,8 +1217,16 @@ impl ControlClient {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
-                ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    return Ok((sequence, edit));
+                ServerMessage::WorkspaceModelEdited {
+                    sequence,
+                    edit,
+                    effects,
+                } => {
+                    return Ok(ModelEdge {
+                        sequence,
+                        edit,
+                        effects,
+                    });
                 }
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
@@ -2160,8 +2263,16 @@ impl ControlClient {
     fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
         match message {
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
-            ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                self.observed_model.push_back((sequence, edit));
+            ServerMessage::WorkspaceModelEdited {
+                sequence,
+                edit,
+                effects,
+            } => {
+                self.observed_model.push_back(ModelEdge {
+                    sequence,
+                    edit,
+                    effects,
+                });
             }
             ServerMessage::NotificationsChanged => {
                 if !self
@@ -2494,6 +2605,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
+        ServerResponse::WorkspaceView { .. } => "workspace_view",
+        ServerResponse::WorkspaceSnapshot { .. } => "workspace_snapshot",
+        ServerResponse::WorkspaceEdit(_) => "workspace_edit",
+        ServerResponse::WorkspaceMetadata(_) => "workspace_metadata",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",

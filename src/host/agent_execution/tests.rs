@@ -18,9 +18,26 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
 pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
+    isolated_with_process_namespace(name, false)
+}
+
+fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tempfile::TempDir> {
+    const OUTER_PID_NAMESPACE: &str = "CAGENTS_EXECUTION_OUTER_PID_NAMESPACE";
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        if private_proc {
+            let outer = std::env::var_os(OUTER_PID_NAMESPACE)
+                .expect("process-census fixture requires its outer namespace receipt");
+            let namespace = std::fs::read_link("/proc/self/ns/pid").unwrap();
+            assert_eq!(std::process::id(), 1, "fixture must be its namespace init");
+            assert_ne!(namespace, std::path::PathBuf::from(outer));
+            assert_eq!(
+                std::fs::read_link("/proc/1/ns/pid").unwrap(),
+                namespace,
+                "fixture requires procfs mounted for its private PID namespace"
+            );
+        }
         // Only this helper sets the presence marker. The separate owned-late-
         // decision controller also uses CHILD, without this helper's spawn.
         if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
@@ -55,7 +72,25 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let executable = std::env::current_exe().unwrap();
+    let mut command = if private_proc {
+        // This fixture runs the real upgrade restore's process census. Keep
+        // other host tests and the developer's processes outside its procfs;
+        // an unreadable peer must still block recovery in the product.
+        let mut command = std::process::Command::new("/usr/bin/unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+            ])
+            .arg(executable);
+        command
+    } else {
+        std::process::Command::new(executable)
+    };
     // Keep the caller's delegation and optional matched helper inherited
     // unchanged. Retained mode still requires its separate explicit opt-in;
     // ordinary service fixtures continue using the local transport.
@@ -65,6 +100,12 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         {
             command.env_remove(name);
         }
+    }
+    if private_proc {
+        command.env(
+            OUTER_PID_NAMESPACE,
+            std::fs::read_link("/proc/self/ns/pid").unwrap(),
+        );
     }
     let result = command
         .args([
@@ -2589,7 +2630,12 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
 /// every prompt as an unavailable conversation, through successive updates.
 #[test]
 fn updated_codex_agent_answers_through_its_relaunched_server() {
-    if isolated("updated_codex_agent_answers_through_its_relaunched_server").is_some() {
+    if isolated_with_process_namespace(
+        "updated_codex_agent_answers_through_its_relaunched_server",
+        true,
+    )
+    .is_some()
+    {
         return;
     }
     use serde_json::{Value, json};
@@ -3126,8 +3172,9 @@ fn edges_through(
     let queue = Arc::clone(watcher);
     std::thread::spawn(move || {
         while let Some(queued) = queue.pop() {
-            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } =
-                queued.message
+            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited {
+                sequence, edit, ..
+            } = queued.message
                 && sender.send((sequence, edit)).is_err()
             {
                 return;
@@ -3210,7 +3257,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     watcher.close_after_drain();
     let edges = std::iter::from_fn(|| watcher.pop())
         .filter_map(|queued| match queued.message {
-            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
                 Some((sequence, edit))
             }
             _ => None,

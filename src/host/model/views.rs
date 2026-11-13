@@ -1,8 +1,90 @@
 use super::*;
-use crate::workspace_model::views::{Change, Scope, View};
+use crate::workspace_model::{
+    delta::{EditEffects, ViewRevision},
+    views::{Change, Scope, View},
+};
 
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, operation_seen, read};
+
+/// What one edit changed beyond what it says, collected while it applies and
+/// resolved into [`EditEffects`] once every row is written, so a subscriber
+/// can apply the edit to its copy instead of reading the model.
+#[derive(Default)]
+pub(super) struct Recorder {
+    views: Vec<ViewRevision>,
+    closed: Vec<crate::model::CardId>,
+    channels: Vec<ChannelId>,
+    agents: Vec<crate::model::AgentId>,
+}
+
+impl Recorder {
+    fn revised(&mut self, scope: &Scope, before: Option<u64>, after: Option<u64>) {
+        self.views.push(ViewRevision {
+            scope: scope.clone(),
+            before,
+            after,
+        });
+    }
+
+    /// A channel row the edit changed in a way the edit does not say.
+    pub(super) fn retitled(&mut self, channel: ChannelId) {
+        if !self.channels.contains(&channel) {
+            self.channels.push(channel);
+        }
+    }
+
+    /// Reads the channel rows and agent records as the edit left them, inside
+    /// its transaction.
+    pub(super) fn finish(self, db: &Connection) -> Result<EditEffects, String> {
+        // A tombstone also closes an identity the daemon had never held.
+        // Resolve after all row changes: a transfer or stale seed mentioning
+        // a pane still owned elsewhere must not close that live identity.
+        let mut closed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in self.closed {
+            if !seen.insert(id) {
+                continue;
+            }
+            let active: bool = db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM panes WHERE id = ?1)")
+                .and_then(|mut statement| statement.query_row([id.to_string()], |row| row.get(0)))
+                .map_err(|error| error.to_string())?;
+            if !active {
+                closed.push(id);
+            }
+        }
+        let channels = self
+            .channels
+            .into_iter()
+            .map(|id| super::channel_row(db, id))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        let agents = self
+            .agents
+            .into_iter()
+            .map(|id| {
+                db.query_row(
+                    "SELECT record FROM agents WHERE id = ?1 AND closed = 0",
+                    [id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .map(|record| super::execution::decode(&record))
+                .transpose()
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        Ok(EditEffects {
+            views: self.views,
+            closed,
+            channels,
+            agents,
+            ..Default::default()
+        })
+    }
+}
 
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
@@ -270,6 +352,7 @@ fn transfer_agent(
     pane: &crate::workspace_model::views::Pane,
     destination: &Scope,
     repository: &Path,
+    recorder: &mut Recorder,
 ) -> Result<(), String> {
     if let Some(mut agent) = pane_agent(db, pane)? {
         if !current_agent_process(&agent, pane) {
@@ -297,6 +380,7 @@ fn transfer_agent(
             ],
         )
         .map_err(|error| error.to_string())?;
+        recorder.agents.push(agent.id);
     }
     Ok(())
 }
@@ -486,13 +570,21 @@ pub(super) fn retire_agent(
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
     view.revision = store::next_revision(db)?;
-    write(db, &view)?;
+    // The connection-local execution inventory captures this scope revision
+    // and closed identity in the same transaction as the retirement.
+    write(db, &view, &mut Recorder::default())?;
     Ok(true)
 }
 
-pub(super) fn apply(
+#[cfg(test)]
+fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
+    apply_recorded(transaction, edit, &mut Recorder::default())
+}
+
+pub(super) fn apply_recorded(
     transaction: &rusqlite::Transaction<'_>,
     edit: &ModelEdit,
+    recorder: &mut Recorder,
 ) -> Result<bool, String> {
     let scope = match edit {
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
@@ -523,7 +615,10 @@ pub(super) fn apply(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
-                changed |= view.apply(&Change::Remove { id: *id })?;
+                if view.apply(&Change::Remove { id: *id })? {
+                    changed = true;
+                    recorder.closed.push(*id);
+                }
             }
             for pane in panes {
                 if view.panes.iter().any(|existing| {
@@ -571,6 +666,8 @@ pub(super) fn apply(
                     if destination == scope {
                         false
                     } else {
+                        let destination_existed =
+                            store::scope_id(transaction, destination)?.is_some();
                         let destination_row = store::register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         let target_before = target.clone();
@@ -582,8 +679,8 @@ pub(super) fn apply(
                         target.revision = store::next_revision(transaction)?;
                         // Publish only after the source relinquishes its
                         // active placement, inside this same transaction.
-                        deferred_target = Some((target_before, target));
-                        transfer_agent(transaction, &pane, destination, &repository)?;
+                        deferred_target = Some((target_before, target, destination_existed));
+                        transfer_agent(transaction, &pane, destination, &repository, recorder)?;
                         // The row moves, so what hangs off the pane moves with it.
                         store::move_pane(transaction, *id, destination_row)?;
                         view.apply(&Change::Remove { id: *id })?
@@ -633,6 +730,13 @@ pub(super) fn apply(
                         changed
                     }
                 }
+                Change::Remove { id } => {
+                    let changed = view.apply(change)?;
+                    if changed {
+                        recorder.closed.push(*id);
+                    }
+                    changed
+                }
                 _ => view.apply(change)?,
             };
             store::record_operation(transaction, *operation, scope_row)?;
@@ -641,10 +745,22 @@ pub(super) fn apply(
     }
     if changed || !existed {
         view.revision = store::next_revision(transaction)?;
-        write_from(transaction, &stored, &view)?;
+        recorder.revised(
+            scope,
+            existed.then_some(stored.revision),
+            Some(view.revision),
+        );
+        // Remove/SeedView record closure intent while applying it. Transfers
+        // retire their source placement without closing its identity.
+        write_from(transaction, &stored, &view, recorder)?;
     }
-    if let Some((before, target)) = deferred_target {
-        write_from(transaction, &before, &target)?;
+    if let Some((before, target, existed)) = deferred_target {
+        recorder.revised(
+            &target.scope,
+            existed.then_some(before.revision),
+            Some(target.revision),
+        );
+        write_from(transaction, &before, &target, recorder)?;
     }
     Ok(changed || !existed)
 }
@@ -686,6 +802,23 @@ impl Registry {
         change: &Change,
     ) -> Result<Option<String>, String> {
         refusal(&self.db, scope, change)
+    }
+
+    /// One scope's view, or `None` when the registry has no such scope, and
+    /// the model sequence it is consistent with, read from one WAL snapshot.
+    pub(crate) fn view_snapshot(&self, scope: &Scope) -> Result<(Option<View>, u64), String> {
+        let snapshot = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let sequence = snapshot
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as u64;
+        let view = store::read_stored(&snapshot, scope)?;
+        snapshot.commit().map_err(|error| error.to_string())?;
+        Ok((view, sequence))
     }
 
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
@@ -875,36 +1008,62 @@ pub(super) fn rebind_agent_pane(
 
 /// Record removal before foreign-key cascades erase canonical membership.
 /// Like normal view writes, this must participate in the deleting transaction.
-pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
-    retire_scope_placements(db, &Scope::Channel(channel))
+///
+/// The scope's rows go with the channel through the foreign key's cascade; the
+/// recorder names the scope as deleted and its panes as closed.
+pub(super) fn retire_channel_placements(
+    db: &Connection,
+    channel: ChannelId,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
+    retire_scope_placements(db, &Scope::Channel(channel), recorder)
 }
 
-pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
+pub(super) fn retire_project_placements(
+    db: &Connection,
+    repository: &Path,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
     if db.is_autocommit() {
         return Err("Placement removal requires the canonical view transaction".into());
     }
     for scope in store::project_scopes(db, repository_key(repository)?)? {
-        retire_scope_placements(db, &scope)?;
+        retire_scope_placements(db, &scope, recorder)?;
     }
     Ok(())
 }
 
-fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
-    let before = read(db, scope)?;
+fn retire_scope_placements(
+    db: &Connection,
+    scope: &Scope,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
+    let Some(before) = store::read_stored(db, scope)? else {
+        return Ok(());
+    };
+    recorder.revised(scope, Some(before.revision), None);
+    recorder
+        .closed
+        .extend(before.panes.iter().map(|pane| pane.id));
     let mut after = before.clone();
     after.panes.clear();
     channel_work::placement::observe_view_transition(db, &before, &after)
 }
 
-fn write(db: &Connection, view: &View) -> Result<(), String> {
+fn write(db: &Connection, view: &View, recorder: &mut Recorder) -> Result<(), String> {
     let before = read(db, &view.scope)?;
-    write_from(db, &before, view)
+    write_from(db, &before, view, recorder)
 }
 
 /// [`write`] from a `before` read earlier in the transaction, for a transfer:
 /// its pane row has already moved, but each view's derived state must still
 /// observe the transition from what the view held.
-fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String> {
+fn write_from(
+    db: &Connection,
+    before: &View,
+    view: &View,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
     channel_work::placement::observe_view_transition(db, before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
@@ -921,11 +1080,16 @@ fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String>
         if primary(before) != primary(view) {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
-            db.execute(
-                "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
-                [id.to_string()],
-            )
-            .map_err(|error| error.to_string())?;
+            if db
+                .execute(
+                    "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
+                    [id.to_string()],
+                )
+                .map_err(|error| error.to_string())?
+                > 0
+            {
+                recorder.retitled(*id);
+            }
             channel_work::renamed_in(db, *id)?;
         }
     }
@@ -939,6 +1103,8 @@ mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserSession, CardId, CardKind};
     use crate::workspace_model::views::Pane;
+
+    mod effects;
     fn setup() -> (Registry, tempfile::TempDir, ChannelId, ChannelId) {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
@@ -2488,7 +2654,12 @@ mod tests {
                 "agent failure must roll back target, source, operation and sequence"
             );
             r.db.execute_batch("DROP TRIGGER fail_agent_move;").unwrap();
-            r.apply(&transfer).unwrap();
+            let moved = r.apply(&transfer).unwrap().effects.agents;
+            assert_eq!(
+                moved,
+                vec![r.agent(original.id).unwrap()],
+                "the edge carries the placement the transfer moved"
+            );
             drop(r);
             let mut r = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
             let model = r.model().unwrap();

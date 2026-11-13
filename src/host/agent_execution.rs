@@ -31,7 +31,7 @@ pub(super) use ownership::{
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
-const EXECUTION_CLIENT: u64 = 0;
+pub(super) const EXECUTION_CLIENT: u64 = 0;
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
@@ -1268,19 +1268,24 @@ fn now() -> u64 {
 }
 
 pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
-    let sequence = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_sequence();
-    if let Ok(sequence) = sequence {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(
-                EXECUTION_CLIENT,
-                sequence,
-                &crate::workspace_model::ModelEdit::AgentsChanged,
-            );
+    // Retain the connection mutex through delivery: an announcer that follows
+    // this drain cannot overtake its scope revisions on the watcher socket.
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    match registry.execution_delta() {
+        Ok((sequence, effects)) if !effects.is_empty() => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .announce_model_edit(
+                    EXECUTION_CLIENT,
+                    sequence,
+                    &crate::workspace_model::ModelEdit::AgentsChanged,
+                    &effects,
+                );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "cannot publish agent execution changes"),
     }
+    drop(registry);
     super::automations::wake(host);
     // A run that ended may let the prompt waiting behind it start.
     mailbox::wake(host);

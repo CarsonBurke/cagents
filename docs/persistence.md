@@ -319,15 +319,43 @@ one would let a diverged window copy re-insert a closed pane.
 
 ### Subscribers get deltas
 
-`ServerMessage::WorkspaceModelEdited` already carries the edit. It gains the
-resulting revision of every scope the edit changed, and the ids it closed, so
-windows keep a closed-identity set for adoption checks without loading
-history. A window applies a
-`ChangeView` delta to its in-memory model when the delta's base revision equals
-the scope's revision it holds; otherwise it reads that one scope
-(`ReadWorkspaceView { scope }`). Only a changed registry identity or a lost
-connection triggers a full model read. Model reads use one query over `panes`
-ordered by `(scope, position)`, not one query per scope.
+`ServerMessage::WorkspaceModelEdited` carries the edit and its effects
+(`workspace_model::delta::EditEffects`): every changed scope's revision before
+and after the transaction, the pane ids it closed, and canonical project,
+channel, navigation and agent rows. `None` before identifies a new scope;
+`None` after identifies a deleted one. A transfer names both scopes and closes
+nothing. Channel deletion and project close name every removed scope and pane.
+Canonical metadata includes assigned ranks, conditional title changes and the
+settled navigation order, so none requires a full-model refresh.
+
+The daemon answers the reads a window needs to apply them.
+`ReadWorkspaceView { scope }` returns one scope and the model sequence it is
+consistent with. `ApplyWorkspaceEdit` commits an edit and replies with an
+`EditReceipt` (its sequence and effects) rather than the model.
+`ReadWorkspaceMetadata` returns only the registry identity, projects or agents
+a check needs, without loading panes or retired history. Full reads scan
+`panes` once, ordered by `(scope, position, id)`. Older CLI clients retain
+`ReadWorkspaceModel` and `EditWorkspaceModel` with their original replies;
+their model watches are refused because they cannot decode the new
+notification.
+
+The initial subscription returns a `WorkspaceSnapshot` with closed identities
+from retained tombstones, excluding panes that still have an owner after a
+transfer. `ReadWorkspaceSnapshot` reads the same baseline without subscribing.
+
+Execution writes are captured by connection-private TEMP tables and SQL
+triggers. Their inventory commits or rolls back with the rows, including
+writes made by transaction helpers used by retained actors and automations.
+Draining it reads only changed identities. The tables belong to the
+connection that wrote the rows, so the workspace writer's public edits, which
+publish their own effects and clear their inventory inside their transaction,
+cannot erase an execution change still waiting to be announced. These tables
+do not change the durable schema or its downgrade contract.
+
+Windows still read the model after each notification and edit with
+`EditWorkspaceModel`. Applying effects to a held copy, reading only a scope
+whose revision does not match, and projecting only the changed scope come in
+the window half of this stage.
 
 ### Windows write only what changed
 
@@ -539,7 +567,9 @@ measurement on a realistic-size workspace.
    file's contents shrink from 31.8 MB to 25.0 MB, but the file keeps its
    high-water mark (37.7 MB) as free pages SQLite reuses until the converted
    operations age out. Closed panes and drafts move to stage 5.
-4. Deltas to subscribers and per-scope reads (protocol bump).
+4. Deltas to subscribers and per-scope reads (protocol 175). Edges carry
+   changed revisions and closed ids, and the daemon serves scope, snapshot and
+   metadata reads and edit receipts. Windows adopting them follows.
 5. Daemon-owned closed-pane history and drafts; windows become subscribers
    with per-window stores; migration from all window stores.
 6. Persistent provider history index.
