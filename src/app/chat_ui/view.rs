@@ -1295,25 +1295,13 @@ fn items_activity(items: &[Arc<chat::Item>]) -> &'static str {
     }
 }
 
-/// Thinking stops at a later answer or prompt, not at another reasoning chunk.
+/// Each item belongs to this transcript's stream; advancing it ends the thought.
 fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
     !busy
         || items
             .iter()
-            .skip_while(|item| item.id != id)
-            .skip(1)
-            .any(|item| {
-                item.role == chat::Role::User
-                    || (item.role == chat::Role::Assistant
-                        && matches!(
-                            item.content,
-                            ItemContent::Text {
-                                thinking: false,
-                                phase: chat::Phase::Final,
-                                ..
-                            }
-                        ))
-            })
+            .position(|item| item.id == id)
+            .is_some_and(|index| index + 1 < items.len())
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -1986,22 +1974,7 @@ impl Runtime {
             return;
         }
         if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
-            let selected = self
-                .selected_subagent
-                .as_ref()
-                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
-            let (items, busy) = selected.map_or(
-                (self.snapshot.items.as_slice(), self.snapshot.busy),
-                |agent| {
-                    (
-                        agent.items.as_slice(),
-                        agent.status == chat::ToolStatus::Running,
-                    )
-                },
-            );
-            if reasoning_finished(items, busy, &item.id) {
-                return;
-            }
+            return;
         }
         if matches!(
             item.content,
@@ -4480,9 +4453,17 @@ impl Runtime {
                 .hash(&mut hasher);
             if slot == Some(turn::Slot::Thinking) {
                 // A newer turn starting does not revive old reasoning that
-                // already has a final answer or later prompt after it.
+                // already has another item after it.
                 reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id)
                     .hash(&mut hasher);
+                if self
+                    .snapshot
+                    .items
+                    .last()
+                    .is_some_and(|last| last.id == item.id)
+                {
+                    self.snapshot.finished_at.hash(&mut hasher);
+                }
             }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
@@ -4549,7 +4530,16 @@ impl Runtime {
         hasher.finish()
     }
 
-    fn prose_action_footer(item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
+    fn prose_action_footer(&self, item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
+        if slot == turn::Slot::Thinking
+            && !(self.item_expanded(&item.id)
+                && cached
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|preview| !preview.first.is_empty()))
+        {
+            return 0.0;
+        }
         if matches!(item.content, ItemContent::Text { .. })
             || (slot == turn::Slot::Card && cached.coordination.is_some())
         {
@@ -4566,7 +4556,7 @@ impl Runtime {
             if let Some(item) = self.snapshot.items.get(placed.index)
                 && let Some(cached) = self.cache.get(&item.id)
             {
-                return Self::prose_action_footer(item, cached, placed.slot);
+                return self.prose_action_footer(item, cached, placed.slot);
             }
         }
         if !turn.steps.is_empty() {
@@ -4672,7 +4662,7 @@ impl Runtime {
             {
                 rows.message(
                     scroll::item(&item.id, card(item, cached, coordinated)),
-                    Self::prose_action_footer(item, cached, prose.slot),
+                    self.prose_action_footer(item, cached, prose.slot),
                 );
                 continue;
             }
@@ -4689,7 +4679,7 @@ impl Runtime {
                         _ => step(item, cached),
                     },
                 ),
-                Self::prose_action_footer(item, cached, prose.slot),
+                self.prose_action_footer(item, cached, prose.slot),
             );
         }
         widget::container(widget::column::with_children(rows.children).width(Length::Fill))
@@ -5524,69 +5514,138 @@ impl Runtime {
             .into();
         }
         if slot == turn::Slot::Thinking {
-            let (items, busy) = self
+            let (items, busy, finished_at) = self
                 .selected_subagent
                 .as_ref()
                 .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
                 .map_or(
-                    (self.snapshot.items.as_slice(), self.snapshot.busy),
+                    (
+                        self.snapshot.items.as_slice(),
+                        self.snapshot.busy,
+                        self.snapshot.finished_at,
+                    ),
                     |agent| {
                         (
                             agent.items.as_slice(),
                             agent.status == chat::ToolStatus::Running,
+                            None,
                         )
                     },
                 );
             let finished = reasoning_finished(items, busy, &item.id);
-            let expanded = self.item_expanded(&item.id);
+            let preview = cached.reasoning.as_ref();
+            let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
+            let expanded = has_text && self.item_expanded(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
                 items
                     .iter()
                     .skip_while(|candidate| candidate.id != item.id)
                     .skip(1)
                     .find_map(|candidate| candidate.started_at.or(candidate.at))
+                    .or_else(|| {
+                        items
+                            .last()
+                            .filter(|last| last.id == item.id)
+                            .and(finished_at)
+                    })
                     .map(|end| format_duration(end.saturating_sub(start)))
             });
-            let label = elapsed.filter(|_| finished).map_or_else(
-                || {
-                    if finished {
-                        "Thought process"
+            let elapsed = elapsed.filter(|_| finished);
+            let label = if has_text {
+                let preview = preview.expect("reasoning text has a prepared preview");
+                if finished {
+                    &preview.first
+                } else {
+                    &preview.latest
+                }
+                .clone()
+            } else if finished {
+                elapsed.as_ref().map_or_else(
+                    || "Thought process".to_owned(),
+                    |elapsed| format!("Thought for {elapsed}"),
+                )
+            } else {
+                "Thinking".to_owned()
+            };
+            // Keep the preview on one line with the same fade as other overflow
+            // strips. Its wheel gestures belong to the transcript, not this line.
+            let text = crate::interaction::parent_wheel(crate::interaction::overflow_fade_x(
+                widget::scrollable(
+                    design::body(label.clone())
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .direction(widget::scrollable::Direction::Horizontal(
+                    widget::scrollable::Scrollbar::new()
+                        .width(0)
+                        .scroller_width(0),
+                ))
+                .width(Length::Fill)
+                .height(design::LINE_BODY),
+            ));
+            let mut line = vec![
+                // Step headers have a disclosure before their status icon.
+                widget::Space::new().width(design::COMPACT_ICON_SIZE).into(),
+                crate::ui_controls::passive_icon(Icon::Agent, design::COMPACT_ICON_SIZE),
+                text,
+            ];
+            if !finished {
+                line.push(crate::ui_controls::activity_spinner(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::muted_color,
+                ));
+            } else if has_text && let Some(elapsed) = &elapsed {
+                line.push(design::caption(elapsed.clone()).into());
+            }
+            if has_text {
+                line.push(crate::ui_controls::passive_icon(
+                    if expanded {
+                        Icon::ChevronDown
                     } else {
-                        "Thinking…"
-                    }
-                    .to_owned()
-                },
-                |elapsed| format!("Thought for {elapsed}"),
-            );
-            let disclosure = widget::button::custom(
-                widget::row::with_children(vec![
-                    widget::icon(
-                        if expanded {
-                            Icon::PanDown
-                        } else {
-                            Icon::PanEnd
-                        }
-                        .handle(),
-                    )
-                    .size(design::COMPACT_ICON_SIZE)
-                    .into(),
-                    design::caption(label.clone()).into(),
-                ])
+                        Icon::ChevronRight
+                    },
+                    design::COMPACT_ICON_SIZE,
+                ));
+            }
+            let line = widget::row::with_children(line)
+                .width(Length::Fill)
                 .spacing(step::GAP_S)
-                .align_y(Alignment::Center),
-            )
-            .name(label)
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([step::GAP_XS as u16, step::GAP_S as u16])
-            .on_press(action(Action::Toggle(target, item.id.clone())));
-            // Preserve the disclosure's widget path across toggles so native
-            // keyboard focus and pressed state survive retained-tree diffs.
-            let mut rows = vec![disclosure.into()];
+                .align_y(Alignment::Center);
+            let name = match (&elapsed, has_text) {
+                (Some(elapsed), true) => format!("Reasoning: {label} · {elapsed}"),
+                _ => format!("Reasoning: {label}"),
+            };
+            // Empty/redacted thoughts have no hidden content and no toggle.
+            // Keep the button path stable for live text and disclosure changes.
+            let header: Element<'static, Message> = if has_text {
+                widget::button::custom(line)
+                    .name(name)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .width(Length::Fill)
+                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .on_press(action(Action::Toggle(target, item.id.clone())))
+                    .into()
+            } else {
+                widget::container(line)
+                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .into()
+            };
+            let mut rows = vec![header];
             if expanded {
-                rows.push(prose::view(cached, settings, target, self.find.as_deref()));
+                rows.push(
+                    widget::container(message_actions(
+                        prose::view(cached, settings, target, self.find.as_deref()),
+                        self.message_copy(item),
+                        Alignment::Start,
+                    ))
+                    .padding([step::GAP_S, step::GAP_M])
+                    .max_width(design::READABLE_MEASURE)
+                    .into(),
+                );
             }
             let message =
                 widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
+                    .width(Length::Fill)
                     .class(cosmic::theme::Container::custom(move |theme| {
                         widget::container::Style {
                             background: expanded.then(|| design::sunken(theme).into()),
@@ -5602,20 +5661,8 @@ impl Runtime {
                             ..Default::default()
                         }
                     }))
-                    .padding(if expanded {
-                        iced::Padding::from([step::GAP_S, step::GAP_M])
-                    } else {
-                        iced::Padding::ZERO
-                    })
-                    .max_width(design::READABLE_MEASURE)
                     .into();
-            return widget::container(message_actions(
-                message,
-                self.message_copy(item),
-                Alignment::Start,
-            ))
-            .width(Length::Fill)
-            .into();
+            return message;
         }
         // The answer is bare prose on the pane's own surface. Wrapping it in
         // a panel would put a frame around the one thing the reader came for,
@@ -13199,31 +13246,322 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_uses_its_own_transcript_and_does_not_finish_on_another_thought() {
-        let thought = |id: &str| {
+    fn reasoning_finishes_on_any_later_item_in_its_own_stream() {
+        let thought = Arc::new(chat::Item {
+            id: "thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "A thought".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        });
+        assert!(!reasoning_finished(
+            std::slice::from_ref(&thought),
+            true,
+            "thought"
+        ));
+        assert!(reasoning_finished(
+            std::slice::from_ref(&thought),
+            false,
+            "thought"
+        ));
+        let successors = [
+            thought.content.clone(),
+            ItemContent::Text {
+                text: "Progress".into(),
+                thinking: false,
+                phase: chat::Phase::Commentary,
+            },
+            ItemContent::Text {
+                text: "Answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ItemContent::Command {
+                label: "probe".into(),
+                command: "echo probe".into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+            },
+            ItemContent::Tool {
+                name: "Read".into(),
+                input: "{}".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+        ];
+        for content in successors {
+            let next = Arc::new(chat::Item {
+                id: "next".into(),
+                content,
+                ..(*thought).clone()
+            });
+            let items = vec![thought.clone(), next];
+            assert!(reasoning_finished(&items, true, "thought"));
+            assert!(!reasoning_finished(&items, true, "next"));
+        }
+        let user = Arc::new(chat::Item {
+            id: "user".into(),
+            role: chat::Role::User,
+            ..(*thought).clone()
+        });
+        assert!(reasoning_finished(
+            &[thought.clone(), user],
+            true,
+            "thought"
+        ));
+        let child = chat::Subagent {
+            items: vec![thought.clone()],
+            status: chat::ToolStatus::Running,
+            ..native_child_fixture()
+        };
+        let parent = vec![
+            thought.clone(),
             Arc::new(chat::Item {
-                id: id.into(),
-                role: chat::Role::Assistant,
-                content: ItemContent::Text {
-                    text: "Thinking".into(),
-                    thinking: true,
-                    phase: chat::Phase::Final,
-                },
-                at: None,
-                started_at: None,
-            })
+                id: "parent-command".into(),
+                ..(*thought).clone()
+            }),
+        ];
+        assert!(reasoning_finished(&parent, true, "thought"));
+        assert!(!reasoning_finished(
+            &child.items,
+            child.status.is_live(),
+            "thought"
+        ));
+        let mut child = child;
+        child.items.push(Arc::new(chat::Item {
+            id: "child-command".into(),
+            content: ItemContent::Tool {
+                name: "Read".into(),
+                input: "{}".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            ..(*thought).clone()
+        }));
+        assert!(reasoning_finished(
+            &child.items,
+            child.status.is_live(),
+            "thought"
+        ));
+    }
+
+    #[test]
+    fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        let thought = chat::Item {
+            id: "shared-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "**First thought**\nLatest line".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: Some(1_000),
+            at: Some(1_000),
         };
-        let mut items = vec![thought("one"), thought("two")];
-        assert!(!reasoning_finished(&items, true, "one"));
-        assert!(reasoning_finished(&items, false, "one"));
-        let mut answer = (*thought("answer")).clone();
-        answer.content = ItemContent::Text {
-            text: "Answer".into(),
-            thinking: false,
-            phase: chat::Phase::Final,
+        let next = chat::Item {
+            id: "command".into(),
+            content: ItemContent::Tool {
+                name: "Read".into(),
+                input: "{}".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: Some(25_000),
+            at: Some(25_000),
+            ..thought.clone()
         };
-        items.push(Arc::new(answer));
-        assert!(reasoning_finished(&items, true, "one"));
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[thought.clone(), next.clone()]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.subagents.push(chat::Subagent {
+            items: vec![Arc::new(thought.clone())],
+            status: chat::ToolStatus::Running,
+            ..native_child_fixture()
+        });
+        runtime.selected_subagent = Some("native-child".into());
+        let renderer = crate::app::tests::headless_renderer();
+        let label = |runtime: &Runtime| {
+            let mut element = runtime.text_view(
+                &thought,
+                &runtime.cache["shared-thought"],
+                turn::Slot::Thinking,
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 800.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| node.node().role() == Role::Button)
+                .unwrap()
+                .node()
+                .label()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            label(&runtime),
+            "Reasoning: Latest line",
+            "parent activity cannot finish a child thought"
+        );
+        Arc::make_mut(&mut runtime.snapshot).subagents[0]
+            .items
+            .push(Arc::new(next));
+        assert_eq!(
+            label(&runtime),
+            "Reasoning: First thought · 24s",
+            "a child's tool call finishes its previous thought while the child runs"
+        );
+        let child = &mut Arc::make_mut(&mut runtime.snapshot).subagents[0];
+        child.items.pop();
+        child.status = chat::ToolStatus::Succeeded;
+        assert_eq!(
+            label(&runtime),
+            "Reasoning: First thought",
+            "parent busy state cannot revive a completed child"
+        );
+    }
+
+    #[test]
+    fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_sizes() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        let thought = chat::Item {
+            id: "thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "**First thought**\nLatest line".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: Some(1_000),
+            at: Some(1_000),
+        };
+        let next = chat::Item {
+            id: "command".into(),
+            started_at: Some(13_000),
+            at: Some(13_000),
+            content: ItemContent::Tool {
+                name: "Read".into(),
+                input: "{}".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            ..thought.clone()
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        for source in ["**First thought**\nLatest line", "", "[Redacted thinking]"] {
+            let mut thought = thought.clone();
+            if let ItemContent::Text { text, .. } = &mut thought.content {
+                *text = source.into();
+            }
+            let (mut runtime, _handle) = frame_cost::live_runtime(&[thought.clone(), next.clone()]);
+            Arc::make_mut(&mut runtime.snapshot).busy = true;
+            if source.is_empty() {
+                // A terminal thought may have no successor. Its recorded turn
+                // finish is still a real duration, including after cancellation.
+                let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                snapshot.items.pop();
+                snapshot.busy = false;
+                snapshot.finished_at = Some(13_000);
+            }
+            for width in [200.0, 320.0, 960.0] {
+                let mut element = runtime.text_view(
+                    &thought,
+                    &runtime.cache["thought"],
+                    turn::Slot::Thinking,
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+                );
+                assert_eq!(node.size().width, width);
+                assert!(
+                    node.size().height < 40.0,
+                    "collapsed reasoning is a single compact row"
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let buttons = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .filter(|node| node.node().role() == Role::Button)
+                    .collect::<Vec<_>>();
+                if source.starts_with("**") {
+                    assert_eq!(buttons.len(), 1);
+                    assert_eq!(
+                        buttons[0].node().label(),
+                        Some("Reasoning: First thought · 12s")
+                    );
+                } else {
+                    assert!(
+                        buttons.is_empty(),
+                        "empty/redacted reasoning has nothing to expand"
+                    );
+                    assert!(
+                        accessible
+                            .root()
+                            .iter()
+                            .chain(accessible.children())
+                            .any(|node| node.node().label() == Some("Thought for 12s"))
+                    );
+                }
+            }
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        let mut element = runtime.text_view(
+            &thought,
+            &runtime.cache["thought"],
+            turn::Slot::Thinking,
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 800.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| node.node().role() == Role::Button
+                    && node.node().label() == Some("Reasoning: Latest line"))
+        );
     }
 
     #[test]

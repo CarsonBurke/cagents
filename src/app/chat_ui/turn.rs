@@ -421,12 +421,11 @@ pub(super) fn same_structure(
 /// A provider that announces a session emits a notice with no body, and the
 /// surface used to draw it as an empty rectangle at the top of every
 /// conversation - two of them, in fact, one captioned and one blank. A text
-/// item with nothing in it is also the transient state of a message that is
-/// about to stream, so it reappears as soon as its first bytes arrive rather
-/// than being dropped for good.
+/// answer with nothing in it is also the transient state of a message that is
+/// about to stream. Empty reasoning still conveys active work or elapsed time.
 fn renders(content: &ItemContent) -> bool {
     match content {
-        ItemContent::Text { text, .. } => !text.trim().is_empty(),
+        ItemContent::Text { text, thinking, .. } => *thinking || !text.trim().is_empty(),
         _ => true,
     }
 }
@@ -1339,6 +1338,27 @@ mod tests {
             [(2, Slot::Prose)],
             "only the item with a body occupies a slot"
         );
+    }
+
+    #[test]
+    fn empty_reasoning_keeps_its_place_between_step_groups() {
+        for body in ["", "  \n", "[Redacted thinking]"] {
+            let mut thought = text("thought", Role::Assistant, Phase::Commentary, true);
+            if let ItemContent::Text { text, .. } = &mut thought.content {
+                *text = body.into();
+            }
+            let items = vec![
+                command("before", ToolStatus::Succeeded),
+                thought.clone(),
+                command("after", ToolStatus::Running),
+            ];
+            let turns = group(&items, &unasked(), plain);
+            assert_eq!(turns.len(), 2);
+            assert_eq!(slots(&turns[0]), [(0, Slot::Step), (1, Slot::Thinking)]);
+            assert_eq!(slots(&turns[1]), [(2, Slot::Step)]);
+            let active = group(&[thought], &unasked(), plain);
+            assert_eq!(slots(&active[0]), [(0, Slot::Thinking)]);
+        }
     }
 
     /// The view renders prompt, tools, prose for each group. Every streaming
