@@ -677,7 +677,20 @@ def expected_refusal(root, kind, old_version):
     if kind=='interrupt' and 'did not stop in time; nothing was changed' not in status.get('message',''):
         errors.append('update did not report the interruption settlement bound')
     current = root/'home/.local/share/cagents-install/current'
-    if current.resolve().name != old_version:
+    staged = root/'staged-candidate.json'
+    if staged.exists():
+        # The installer's --stage-only already selected the candidate as current
+        # and recorded the running owner; a refusal must leave both as staged.
+        binding = json.loads(staged.read_text())
+        if str(current.resolve()) != binding['current']:
+            errors.append('refusal changed the installed current version')
+        try:
+            owner = json.loads((current.resolve()/'.deferred-owner.json').read_text())
+        except (OSError, ValueError):
+            owner = {}
+        if owner.get('owner_version') != old_version:
+            errors.append('refusal lost the deferred owner of the running service')
+    elif current.resolve().name != old_version:
         errors.append('refusal changed the installed current version')
     executable = str(root/'home/.local/share/cagents-install/versions'/old_version/'bin/cagentsd')
     def daemons(snapshot):
