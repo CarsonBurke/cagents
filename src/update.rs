@@ -54,6 +54,22 @@ const JOB_STATE_LIMIT: u64 = crate::terminal_ipc::MAX_FRAME_BYTES as u64;
 const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const WORKER_LOCK_FD: i32 = 198;
 
+/// SIGINT or SIGTERM to this process while installed, without SA_RESTART.
+pub(crate) struct WorkerInterrupt {
+    _installed: cancellation::Interrupt,
+}
+
+impl WorkerInterrupt {
+    pub(crate) fn install() -> io::Result<Self> {
+        cancellation::Interrupt::install().map(|installed| Self {
+            _installed: installed,
+        })
+    }
+    pub(crate) fn requested() -> bool {
+        cancellation::requested()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     requested: Arc<AtomicBool>,
@@ -2263,10 +2279,11 @@ fn finish_handoff(
         }
         // The restarted daemon refuses to serve beside a half-exited window.
         // Settle windows while this job still holds the startup reservation.
-        if let Err(error) = guard.settle_committed_windows() {
-            eprintln!(
-                "Restarting the terminal service while {error}; it may refuse to start until that window exits."
-            );
+        let settled = guard.settle_committed_windows();
+        if let Err(error) = &settled
+            && error.kind() != io::ErrorKind::Interrupted
+        {
+            eprintln!("Restarting the terminal service, but windows could not be checked: {error}");
         }
         let recorded = record_handoff_failure(
             state,
@@ -2278,6 +2295,14 @@ fn finish_handoff(
         );
         drop(handoff.take());
         survivors.release_recovery_reservation();
+        if let Err(error) = settled
+            && error.kind() == io::ErrorKind::Interrupted
+        {
+            if let Err(record_error) = recorded {
+                eprintln!("Could not record the update failure: {record_error}");
+            }
+            return report_recovery_failure(state, job, invalid(error.to_string()));
+        }
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
