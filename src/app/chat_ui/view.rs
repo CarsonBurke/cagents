@@ -1560,7 +1560,7 @@ impl Runtime {
         if include_failures && failed > 0 {
             parts.push(Self::agent_failure_label(&activity.failed));
         }
-        if working + waiting + on_background_work + failed > 0 {
+        if working + waiting + on_background_work + failed > 0 || failure_label.is_some() {
             return (
                 if working > 0 || snapshot.busy {
                     Some(Icon::AgentWorking)
