@@ -476,6 +476,7 @@ pub(super) fn view(
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
+        figures: cached.figures.clone(),
         item: cached
             .item
             .as_ref()
@@ -515,6 +516,7 @@ pub(super) fn content_view(
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
+        figures: cached.figures.clone(),
         item: cached
             .item
             .as_ref()
@@ -556,6 +558,7 @@ pub(super) fn items_for_test(
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
+        figures: cached.figures.clone(),
         item: cached
             .item
             .as_ref()
@@ -581,6 +584,7 @@ struct Renderer {
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
+    figures: images::figure::Shared,
     item: Arc<str>,
     path: Vec<u32>,
     find: Option<u64>,
@@ -618,6 +622,7 @@ impl Renderer {
             target: self.target,
             reader_memory: self.reader_memory.clone(),
             reader_context: self.reader_context.clone(),
+            figures: self.figures.clone(),
             blocks: self.blocks.clone(),
             revision: self.revision,
             dark: self.dark,
@@ -764,56 +769,8 @@ impl Renderer {
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
             Item::Image {
-                url,
-                title,
-                title_text,
-                alt,
-            } => {
-                let mut rows = Vec::new();
-                let image_settings = markdown::Settings {
-                    style: markdown::Style {
-                        font: iced::Font::default(),
-                        ..settings.style
-                    },
-                    ..settings
-                };
-                if alt.len() > 0 {
-                    rows.push(paragraph(
-                        image_settings,
-                        alt,
-                        self.target,
-                        self.find.map(|_| ""),
-                        Some(self.child(0).logical_identity(0)),
-                        Some(&self.flow_cache),
-                    ));
-                }
-                if !title.is_empty() {
-                    rows.push(paragraph(
-                        markdown::Settings {
-                            text_size: design::TEXT_CAPTION.into(),
-                            ..image_settings
-                        },
-                        title_text,
-                        self.target,
-                        self.find.map(|_| ""),
-                        Some(self.child(1).logical_identity(0)),
-                        Some(&self.flow_cache),
-                    ));
-                }
-                rows.push(
-                    widget::button::link("Open image source")
-                        .on_press(link(self.target, url.clone()))
-                        .into(),
-                );
-                widget::container(widget::column::with_children(rows).spacing(settings.spacing.0))
-                    .padding(settings.spacing.0)
-                    .class(design::surface(
-                        Some(design::sunken),
-                        [design::RADIUS_S; 4],
-                        true,
-                    ))
-                    .into()
-            }
+                url, title, alt, ..
+            } => self.figures.view(self.target, url, &alt.plain(), title),
         }
     }
 
@@ -2479,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
+    fn markdown_images_without_a_preview_link_their_scoped_source() {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
         use iced_accessibility::accesskit::Role;
@@ -2489,20 +2446,20 @@ mod tests {
             "image-destination".repeat(70_000)
         );
         let long_source = format!("![shared image]({long_uri})");
-        for (source, uri, alt, title) in [
+        // A local image not loaded yet, a web image without alternative text,
+        // which is named by its address, and a very long web address.
+        for (source, uri, name) in [
             (
                 "![diagram](docs/diagram.png \"Architecture\")",
                 "docs/diagram.png",
                 "diagram",
-                "Architecture",
             ),
             (
                 "![](https://example.com/image.png)",
                 "https://example.com/image.png",
-                "",
-                "",
+                "https://example.com/image.png",
             ),
-            (long_source.as_str(), long_uri.as_str(), "shared image", ""),
+            (long_source.as_str(), long_uri.as_str(), "shared image"),
         ] {
             let target = Target {
                 card: CardId::new(),
@@ -2540,19 +2497,12 @@ mod tests {
                 .iter()
                 .chain(accessible.children())
                 .collect();
-            for text in [alt, title].into_iter().filter(|text| !text.is_empty()) {
-                assert!(
-                    nodes.iter().any(|node| node.node().value() == Some(text)),
-                    "selectable image text missing: {text}"
-                );
-            }
             let button = nodes
                 .iter()
                 .find(|node| {
-                    node.node().role() == Role::Button
-                        && node.node().label() == Some("Open image source")
+                    node.node().role() == Role::Button && node.node().label() == Some(name)
                 })
-                .expect("image source has a named accessible action");
+                .expect("the image's source link is named for the image");
             let bounds = button.node().bounds().unwrap();
             let cursor = mouse::Cursor::Available(Point::new(
                 ((bounds.x0 + bounds.x1) / 2.0) as f32,

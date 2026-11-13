@@ -397,6 +397,11 @@ pub enum Action {
     OpenImage(Target, String),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
+    /// A Markdown image came near the viewport and may need loading.
+    LoadFigure(Target, u64),
+    FigureLoaded(Target, u64, u64, images::figure::Outcome),
+    /// A click or context menu entry acting on a Markdown image.
+    Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
@@ -776,6 +781,9 @@ impl Action {
             Self::OpenImage(..) => "OpenImage",
             Self::LoadImage(..) => "LoadImage",
             Self::ImageLoaded(..) => "ImageLoaded",
+            Self::LoadFigure(..) => "LoadFigure",
+            Self::FigureLoaded(..) => "FigureLoaded",
+            Self::Figure(..) => "Figure",
             Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
             Self::RetryThumbnails(..) => "RetryThumbnails",
             Self::CloseImage => "CloseImage",
@@ -892,6 +900,8 @@ impl Action {
                 | Self::ImageSaved(..)
                 | Self::AttachmentsPrepared(..)
                 | Self::ImageLoaded(..)
+                | Self::LoadFigure(..)
+                | Self::FigureLoaded(..)
                 | Self::MarkdownPrepared(..)
                 | Self::LocalPromptPrepared(..)
                 | Self::ThumbnailLoaded(..)
@@ -1743,6 +1753,8 @@ struct CachedItem {
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
+    /// The conversation's Markdown images, which this item's images draw from.
+    figures: images::figure::Shared,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
     /// palette is the runtime's, applied when the block is highlighted, so a
@@ -1835,6 +1847,15 @@ fn recorded_message_stamp(
 }
 
 impl CachedItem {
+    /// Whether this item's Markdown, or Markdown it carries, shows an image.
+    fn shows_figures(&self) -> bool {
+        !self.markdown.images().is_empty()
+            || self.coordination.as_ref().is_some_and(|coordinated| {
+                coordinated
+                    .contents()
+                    .any(|content| !content.images().is_empty())
+            })
+    }
     /// Marks this message to be prepared again with the current labels, and
     /// gives the id to forget its preparation by. What is shown stays until
     /// the worker returns the relabelled text, as when the syntax theme
@@ -2037,6 +2058,10 @@ impl CachedItem {
         let reader_context = previous
             .as_ref()
             .and_then(|cached| cached.reader_context.clone());
+        let figures = previous
+            .as_ref()
+            .map(|cached| cached.figures.clone())
+            .unwrap_or_default();
         let (
             image,
             image_source,
@@ -2191,6 +2216,7 @@ impl CachedItem {
             flow_cache,
             reader_memory,
             reader_context,
+            figures,
             blocks: retained_blocks,
             palette_views: retained_palettes,
             open: None,
@@ -2913,6 +2939,8 @@ pub(super) struct Runtime {
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
+    /// The images answers' Markdown shows, decoded as they come into view.
+    figures: images::figure::Figures,
     child_picker: Option<child_navigation::Picker>,
     /// The child whose tab holds keyboard focus. The tab strip reports it, so
     /// the next frame keeps that tab mounted wherever its state sorts it.
@@ -4037,6 +4065,7 @@ impl Runtime {
             selected_subagent: None,
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
+            figures: Default::default(),
             child_picker: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
@@ -4918,6 +4947,7 @@ impl Runtime {
                     cached.diagnostic = true;
                     cached.item = Some(item.clone());
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     cache.insert(item.id.clone(), cached);
                     presentation_changed = true;
@@ -4938,6 +4968,7 @@ impl Runtime {
                         CachedItem::updated(&item.content, theme, previous, false, false, None);
                     cached.item = Some(item.clone());
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     cache.insert(item.id.clone(), cached);
                     presentation_changed = true;
@@ -5067,6 +5098,7 @@ impl Runtime {
                         cached.placeholder |= report_reveal;
                     }
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
                         // A saved row that waits is met again at the head of
@@ -5096,6 +5128,7 @@ impl Runtime {
                 });
             if let Some(cached) = cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
+                cached.figures = self.figures.shared(context.is_some());
                 cached.reader_context.clone_from(&context);
                 if matches!(item.content, ItemContent::Image { .. }) {
                     // Snapshot items are immutable. A retained Arc makes the
@@ -5150,6 +5183,7 @@ impl Runtime {
             }
             cached.item = Some(item.clone());
             cached.reader_memory = self.scroll_memory.clone();
+            cached.figures = self.figures.shared(context.is_some());
             cached.reader_context.clone_from(&context);
             cache.insert(item.id.clone(), cached);
             presentation_changed = true;
@@ -13817,6 +13851,19 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     images::request(runtime, &id);
                 }
+            }
+            Action::LoadFigure(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    return images::figure::load(runtime, id);
+                }
+            }
+            Action::FigureLoaded(target, id, attempt, outcome) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    return images::figure::complete(runtime, id, attempt, outcome);
+                }
+            }
+            Action::Figure(target, id, command) => {
+                return self.figure_command(target, id, command);
             }
             Action::RetryThumbnails(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {

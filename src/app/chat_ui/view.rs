@@ -4507,6 +4507,15 @@ impl Runtime {
                     )
                 })
                 .hash(&mut hasher);
+            // What a Markdown image draws lives with the conversation, so a
+            // preview that finished decoding redraws the exchange showing it.
+            if self
+                .cache
+                .get(&item.id)
+                .is_some_and(CachedItem::shows_figures)
+            {
+                self.figures.version().hash(&mut hasher);
+            }
             // A coordinating step names agents by what this conversation
             // calls them, links their transcripts while it lists them, tells
             // how those it left in the background are doing, and
