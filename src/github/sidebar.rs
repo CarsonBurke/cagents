@@ -70,7 +70,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
             return Ok(resolved.clone());
         }
         let resolved = self.resolve_repository(repository, remotes, cancellation)?;
-        lock(&REPOSITORIES).insert(
+        let mut repositories = lock(&REPOSITORIES);
+        repositories.retain(|_, (at, ..)| at.elapsed() < REPOSITORY_FOR);
+        repositories.insert(
             repository.to_path_buf(),
             (Instant::now(), remotes.to_vec(), resolved.clone()),
         );
@@ -146,9 +148,15 @@ impl<E: ProcessExecutor> GitHubService<E> {
         // must not discard successfully refreshed open conversation authority,
         // but leaves nothing to keep.
         let history = self.recent_history(repository, limit, cancellation);
+        // Read as another account than it would be kept for.
+        let switched = crate::github_status::credential_fingerprint().ok() != validator.key.0;
         let mut listings = lock(&LISTINGS);
+        listings
+            .read
+            .retain(|_, listing| listing.at.elapsed() < REPOSITORY_FOR);
+        listings.refused.retain(|_, at| at.elapsed() < REFUSED_FOR);
         match history {
-            Ok(history) => {
+            Ok(history) if !switched => {
                 append_recent_history(&mut pull_requests, history);
                 listings.read.insert(
                     validator.key,
@@ -160,6 +168,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                     },
                 );
             }
+            Ok(history) => append_recent_history(&mut pull_requests, history),
             Err(_) => {
                 listings.read.remove(&validator.key);
             }
@@ -267,7 +276,8 @@ mod tests {
     struct Forge {
         etag: Mutex<&'static str>,
         checks: Mutex<&'static str>,
-        refused: std::sync::atomic::AtomicBool,
+        /// How the probe fails, if it does: a status line.
+        fails: Mutex<Option<&'static str>>,
         calls: Mutex<Vec<&'static str>>,
     }
 
@@ -322,8 +332,8 @@ mod tests {
                 arguments.last().unwrap(),
                 "repos/sidebar-probe/repo/issues?state=all&sort=updated&direction=desc&per_page=1"
             );
-            if self.refused.load(std::sync::atomic::Ordering::SeqCst) {
-                return output(false, "HTTP/2.0 410 Gone\r\n\r\n{}".into());
+            if let Some(status) = *self.fails.lock().unwrap() {
+                return output(false, format!("HTTP/2.0 {status}\r\n\r\n{{}}"));
             }
             let etag = *self.etag.lock().unwrap();
             if arguments.contains(&format!("If-None-Match: {etag}")) {
@@ -338,7 +348,7 @@ mod tests {
         let forge = Arc::new(Forge {
             etag: Mutex::new("W/\"1\""),
             checks: Mutex::new("SUCCESS"),
-            refused: false.into(),
+            fails: Mutex::default(),
             calls: Mutex::default(),
         });
         let service = GitHubService::new("gh", forge.clone());
@@ -376,11 +386,14 @@ mod tests {
         );
         lock(&LISTINGS).read.get_mut(&key).unwrap().at -= RELIST_AFTER;
         assert_eq!(read(true), ["probe", "open", "history"]);
+        // A probe that fails in passing keeps its validator for the next.
+        *forge.fails.lock().unwrap() = Some("502 Bad Gateway");
+        assert_eq!(read(true), ["probe", "open", "history"]);
+        *forge.fails.lock().unwrap() = None;
+        assert_eq!(read(true), ["probe"]);
         // A repository GitHub refuses to probe is read every time, and asked
         // again only after a while.
-        forge
-            .refused
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *forge.fails.lock().unwrap() = Some("410 Gone");
         assert_eq!(read(true), ["probe", "open", "history"]);
         assert_eq!(read(true), ["open", "history"]);
     }
