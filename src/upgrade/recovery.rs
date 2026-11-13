@@ -55,11 +55,17 @@ pub(crate) struct Census {
     pub presentations: Vec<super::floor::Presentation>,
 }
 
+/// Transcript pages captured before preparation. [`Census::fit_pages`] fits
+/// their total to the evidence; a long conversation is never refused.
 #[derive(Default)]
 pub(crate) struct SnapshotCapture {
     snapshots: Vec<super::floor::StoppedSnapshot>,
-    used: usize,
+    pages: Vec<super::floor::Page>,
 }
+
+/// Pages beyond this many bytes are shortened while capture continues, so a
+/// daemon with hundreds of long chats is never held in memory at once.
+const CAPTURE_COMPACTION: usize = 2 * SNAPSHOT_LIMIT;
 
 impl SnapshotCapture {
     pub(crate) fn push(
@@ -81,7 +87,7 @@ impl SnapshotCapture {
         {
             return Err("The captured conversation changed from its reviewed identity; the source was not prepared".into());
         }
-        snapshot.notification_preview = Default::default();
+        super::floor::retain_reader_fields(&mut snapshot);
         let continuation = if source.launch.session_id.is_some() {
             "Resume explicitly to inspect whether the recorded conversation can continue."
         } else {
@@ -94,19 +100,28 @@ impl SnapshotCapture {
                 "Paused after an incomplete update. This page was captured before preparation; later output may remain in the provider's conversation storage. The original provider could not be reattached, and no replacement was started. {continuation}"
             )),
         };
-        let size = encoded_size(&saved, SNAPSHOT_LIMIT.saturating_sub(self.used))?;
-        self.used = self
-            .used
-            .checked_add(size + 1)
-            .filter(|size| *size <= SNAPSHOT_LIMIT)
-            .ok_or("Recovery transcript capture exceeds 8 MiB; the source was not prepared")?;
+        self.pages.push(super::floor::Page::of(&saved.snapshot)?);
         self.snapshots.push(saved);
+        if self
+            .pages
+            .iter()
+            .map(super::floor::Page::bytes)
+            .sum::<usize>()
+            > CAPTURE_COMPACTION
+        {
+            // No fitting grants pages more than the whole transcript budget
+            // between them, so their fair shares of it bound what each keeps.
+            super::floor::keep_fair_shares(&mut self.snapshots, &mut self.pages, SNAPSHOT_LIMIT);
+        }
         Ok(())
     }
     pub(crate) fn finish(self) -> Vec<super::floor::StoppedSnapshot> {
         self.snapshots
     }
 }
+
+/// Bytes kept free beyond the evidence measured before preparation.
+const FIT_MARGIN: usize = 64 * 1024;
 
 fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize, String> {
     struct Count {
@@ -172,13 +187,102 @@ impl Census {
             )
             .collect()
     }
-    fn validate_capture(&self, source: &HostSessionProof) -> Result<(), String> {
-        self.validate_evidence(source)?;
-        let existing = super::floor::existing_capture_size(source)?;
-        let available = SNAPSHOT_LIMIT
-            .checked_sub(existing)
-            .ok_or("Existing recovery evidence exceeds 8 MiB")?;
-        encoded_size(self, available)?;
+    /// Fit the captured transcript pages into every bound that carries them
+    /// unshortened: this census, its stopped-pane record and the preparation
+    /// receipt. Each page keeps its newest entries within a fair share of
+    /// what the identity and ownership evidence leaves, and says when it lost
+    /// older ones. Only that evidence, which is never shortened, can refuse.
+    pub(crate) fn fit_pages(
+        &mut self,
+        source: &HostSessionProof,
+        reviewed: &DaemonImpact,
+        windows: &[String],
+    ) -> Result<(), String> {
+        let bounds = self.identity_bounds(source, reviewed, windows)?;
+        if let Some(refusal) = self.refusal(&bounds, source, reviewed, windows)? {
+            return Err(refusal);
+        }
+        let budget = bounds
+            .iter()
+            .map(|bound| bound.room())
+            .min()
+            .unwrap_or_default();
+        let mut pages = self
+            .snapshots
+            .iter()
+            .map(|saved| super::floor::Page::of(&saved.snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        super::floor::keep_fair_shares(&mut self.snapshots, &mut pages, budget);
+        Ok(())
+    }
+
+    /// What each bound needs with every page empty. The stopped-pane record
+    /// is measured beside evidence already retained for this source, as
+    /// recovery saves it; saving shortens pages around it, so it limits the
+    /// identity evidence here, never the room left for pages.
+    fn identity_bounds(
+        &self,
+        source: &HostSessionProof,
+        reviewed: &DaemonImpact,
+        windows: &[String],
+    ) -> Result<[Bound; 4], String> {
+        let mut minimal = self.clone();
+        minimal
+            .snapshots
+            .iter_mut()
+            .for_each(super::floor::empty_page);
+        let receipt = Authority::provisional(source, reviewed, windows, &minimal);
+        let record = minimal.record(source);
+        Ok([
+            Bound::pages(encoded_size(&minimal, usize::MAX)?, SNAPSHOT_LIMIT),
+            Bound::pages(encoded_size(&record, usize::MAX)?, SNAPSHOT_LIMIT),
+            Bound::pages(preparation_size(&receipt)?, PREPARATION_LIMIT),
+            Bound {
+                needed: record.retained_identity_size()?,
+                limit: super::floor::LIMIT as usize,
+                carries_pages: false,
+            },
+        ])
+    }
+
+    /// When identity evidence alone exceeds a bound, say how many chats to
+    /// close. Chats dominate that evidence, so estimate each one's share
+    /// from the same bound measured without any chat. Several bounds can
+    /// fail at once, each with its own share per chat: the advice follows
+    /// the one that needs the most chats closed, so following it is enough.
+    fn refusal(
+        &self,
+        bounds: &[Bound; 4],
+        source: &HostSessionProof,
+        reviewed: &DaemonImpact,
+        windows: &[String],
+    ) -> Result<Option<String>, String> {
+        if bounds.iter().all(Bound::fits) {
+            return Ok(None);
+        }
+        let mut without = self.clone();
+        without.chats.clear();
+        without.snapshots.clear();
+        without.aliases.clear();
+        without.presentations.clear();
+        let mut reviewed = reviewed.clone();
+        reviewed
+            .sessions
+            .retain(|session| session.kind != SessionKind::NativeChat);
+        let bases = without.identity_bounds(source, &reviewed, windows)?;
+        let chats = self.chats.len();
+        // Closing chats cannot resolve a bound (None) ranks above any count.
+        let (bound, close) = bounds
+            .iter()
+            .zip(&bases)
+            .filter(|(bound, _)| !bound.fits())
+            .map(|(bound, base)| (bound, bound.to_close(chats, base.needed)))
+            .max_by_key(|(_, close)| close.map_or(usize::MAX, |close| close))
+            .expect("a bound that does not fit");
+        Ok(Some(bound.refusal(chats, close)))
+    }
+
+    fn record(&self, source: &HostSessionProof) -> super::floor::Record {
         let mut record = super::floor::Record::new(
             source.clone(),
             self.chats.clone(),
@@ -187,7 +291,17 @@ impl Census {
         record.snapshots = self.snapshots.clone();
         record.aliases = self.aliases.clone();
         record.presentations = self.presentations.clone();
-        encoded_size(&record, available)?;
+        record
+    }
+
+    /// Recovery later saves this capture's pages beside the stopped-pane
+    /// evidence already retained for its source, shortening pages to fit.
+    /// Its identity evidence must fit there unshortened.
+    fn validate_capture(&self, source: &HostSessionProof) -> Result<(), String> {
+        self.validate_evidence(source)?;
+        if self.record(source).retained_identity_size()? > super::floor::LIMIT as usize {
+            return Err("Stopped update pane identities exceed their durable limit; the source was not prepared".into());
+        }
         Ok(())
     }
 
@@ -247,15 +361,7 @@ impl Census {
         }
         self.validate_presentations()?;
         encoded_size(self, SNAPSHOT_LIMIT)?;
-        let mut record = super::floor::Record::new(
-            source.clone(),
-            self.chats.clone(),
-            self.terminal_ids().into_iter().collect(),
-        );
-        record.snapshots = self.snapshots.clone();
-        record.aliases = self.aliases.clone();
-        record.presentations = self.presentations.clone();
-        encoded_size(&record, SNAPSHOT_LIMIT)?;
+        encoded_size(&self.record(source), SNAPSHOT_LIMIT)?;
         Ok(())
     }
 
@@ -403,15 +509,27 @@ struct ManualRequest {
     windows: Vec<String>,
 }
 
+/// A restored terminal's source/relaunch lineage is bounded by the complete
+/// checkpoint (8 MiB). Budget its published descriptor, paired sessions and
+/// current chats as well as the receipt itself before asking for shutdown.
+/// Incidental output/title/activity metadata is never retained as proof.
+const FUTURE_METADATA: usize = 1024 * 1024;
+const PREPARATION_LIMIT: usize = LIMIT as usize - SNAPSHOT_LIMIT - FUTURE_METADATA;
+
+fn preflight_preparation_size(authority: &Authority) -> Result<(), String> {
+    let size = preparation_size(authority)?;
+    if size > PREPARATION_LIMIT {
+        return Err(format!(
+            "Recovery evidence exceeds its {PREPARATION_LIMIT}-byte limit; the source was not prepared"
+        ));
+    }
+    Ok(())
+}
+
 /// Count the complete receipt plus more owner bookkeeping than any valid
 /// outcome can contain. Leave room for the two future Linux paths (including
 /// JSON escaping), hashes, successor identifiers and record field names.
-fn preflight_preparation_size(authority: &Authority) -> Result<(), String> {
-    // A restored terminal's source/relaunch lineage is bounded by the complete
-    // checkpoint (8 MiB). Budget its published descriptor, paired sessions and
-    // current chats as well as the receipt itself before asking for shutdown.
-    // Incidental output/title/activity metadata is never retained as proof.
-    const FUTURE_METADATA: usize = 1024 * 1024;
+fn preparation_size(authority: &Authority) -> Result<usize, String> {
     let terminals: Vec<_> = authority.census.terminal_ids().into_iter().collect();
     let chats: Vec<_> = authority.census.chats.iter().map(|chat| chat.id).collect();
     let sources: Vec<_> = authority
@@ -440,9 +558,115 @@ fn preflight_preparation_size(authority: &Authority) -> Result<(), String> {
             &authority.census.chats,
             &authority.census.chats,
         ),
-        LIMIT as usize - SNAPSHOT_LIMIT - FUTURE_METADATA,
-    )?;
-    Ok(())
+        usize::MAX,
+    )
+}
+
+/// The largest path a receipt can name: Linux `PATH_MAX`.
+const PATH_RESERVE: usize = 4096;
+
+impl Authority {
+    /// The receipt a preparation of `census` would write, with every path at
+    /// its largest. Only its encoded size is used, to fit pages beforehand.
+    fn provisional(
+        source: &HostSessionProof,
+        reviewed: &DaemonImpact,
+        windows: &[String],
+        census: &Census,
+    ) -> Self {
+        let path = || PathBuf::from("x".repeat(PATH_RESERVE));
+        let hash = || "0".repeat(64);
+        Self {
+            version: 1,
+            origin: Origin::AcknowledgedPrepare,
+            job: uuid::Uuid::nil().to_string(),
+            request_identity: hash(),
+            job_request_hash: hash(),
+            reviewed: Some(reviewed.clone()),
+            source: source.clone(),
+            census: census.clone(),
+            windows: windows.to_vec(),
+            expected: reviewed
+                .sessions
+                .iter()
+                .map(|item| (item.kind, item.id))
+                .collect(),
+            checkpoint_path: path(),
+            checkpoint_hash: hash(),
+            worker_path: path(),
+            fence_path: path(),
+            legacy_path: path(),
+            daemon_path: path(),
+            target: path(),
+            target_hash: hash(),
+        }
+    }
+}
+
+/// One fixed limit on evidence that carries the census: what its identity
+/// and ownership part needs with every transcript page empty.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    needed: usize,
+    limit: usize,
+    /// Whether transcript pages share this limit unshortened.
+    carries_pages: bool,
+}
+
+impl Bound {
+    fn pages(needed: usize, limit: usize) -> Self {
+        Self {
+            needed,
+            limit,
+            carries_pages: true,
+        }
+    }
+
+    /// Later JSON differences, such as the small fields a receipt gains
+    /// after acknowledgement, stay within this margin.
+    fn reserved(&self) -> usize {
+        self.needed.saturating_add(FIT_MARGIN)
+    }
+
+    fn fits(&self) -> bool {
+        self.reserved() <= self.limit
+    }
+
+    /// Bytes transcript pages may use within this bound.
+    fn room(&self) -> usize {
+        if self.carries_pages {
+            self.limit.saturating_sub(self.reserved())
+        } else {
+            usize::MAX
+        }
+    }
+
+    /// How many of `chats` to close for this bound to fit, estimated from
+    /// their average share; `base` is what it needs without any chat. None
+    /// when closing chats alone cannot make it fit.
+    fn to_close(&self, chats: usize, base: usize) -> Option<usize> {
+        let excess = self.reserved().saturating_sub(self.limit);
+        let per_chat = self.needed.saturating_sub(base) / chats.max(1);
+        (per_chat > 0 && base.saturating_add(FIT_MARGIN) <= self.limit)
+            .then(|| excess.div_ceil(per_chat).min(chats))
+    }
+
+    fn refusal(&self, chats: usize, close: Option<usize>) -> String {
+        let advice = match close {
+            Some(close) => format!("Close at least {close} of them you no longer need"),
+            None => "Close terminals and chats you no longer need".to_owned(),
+        };
+        // Approved interruptions may already have ended turns, so say only
+        // what holds either way.
+        format!(
+            "This daemon has {chats} open chats, more than an update can record safely: even with \
+             their saved transcript pages left empty, their recovery evidence needs {} KiB of its \
+             {} KiB limit. {advice}, then run the update again. Nothing was prepared and no chat \
+             was closed; the running daemon keeps serving them.",
+            self.reserved().div_ceil(1024),
+            self.limit / 1024,
+        )
+    }
 }
 
 /// Retain only the immutable allocation/lineage and serving ownership fields
@@ -4798,7 +5022,6 @@ mod tests {
                 },
             )
             .unwrap();
-        let original_used = capture.used;
         assert!(
             capture
                 .push(
@@ -4810,7 +5033,6 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(capture.used, original_used);
         let saved = capture.finish();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].source, source);
@@ -4826,7 +5048,6 @@ mod tests {
                 },
             )
             .unwrap();
-        let before = captured.used;
         for invalid in [String::new(), "x".repeat(1025)] {
             assert!(
                 captured
@@ -4839,7 +5060,6 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(captured.used, before);
         }
         let saved = captured.finish();
         assert_eq!(saved.len(), 1);
@@ -5022,48 +5242,484 @@ mod tests {
         }
     }
 
-    #[test]
-    fn oversized_snapshot_capture_fails_before_preparation_and_keeps_earlier_pages() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let preparation = preparation(root.path());
+    /// A chat as a busy daemon holds it: a launch environment and arguments
+    /// of realistic size, a pane presenting it, the alias that pane saved
+    /// before its conversation ID was confirmed, and `entries` transcript
+    /// entries of `bytes` each. Every third chat is Codex, as in a mixed
+    /// daemon of 51 Claude and 30 Codex chats.
+    fn scale_chat(
+        preparation: &Preparation,
+        index: usize,
+        entries: usize,
+        bytes: usize,
+    ) -> (
+        Session,
+        crate::chat::Snapshot,
+        Session,
+        super::super::floor::Presentation,
+    ) {
         let terminal = &preparation.authority.census.terminals[0];
+        let provider = if index % 3 == 0 {
+            crate::agent::Provider::Codex
+        } else {
+            crate::agent::Provider::Claude
+        };
+        let mut recipe = terminal.launch.clone();
+        recipe.program = format!("/home/person/.local/bin/{}", provider.executable()).into();
+        // Eight arguments each provider accepts on an exact resume.
+        recipe.arguments = match provider {
+            crate::agent::Provider::Codex => [
+                "--model",
+                "gpt-5-codex",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "--config",
+                "model_reasoning_effort=high",
+            ],
+            _ => [
+                "--model",
+                "claude-sonnet-4-5",
+                "--permission-mode",
+                "default",
+                "--effort",
+                "high",
+                "--setting-sources",
+                "user,project",
+            ],
+        }
+        .map(Into::into)
+        .to_vec();
+        recipe.environment = [("PATH".to_owned(), "/usr/local/sbin:".repeat(26))]
+            .into_iter()
+            .chain((0..10).map(|variable| {
+                (
+                    format!("PERSON_SETTING_{variable}"),
+                    format!("/home/person/.config/tool-{variable}/value"),
+                )
+            }))
+            .collect();
+        let session_id = uuid::Uuid::new_v4().to_string();
         let source = Session {
-            id: terminal.id,
+            id: TerminalId::new(),
             launch: crate::chat::Launch {
-                provider: crate::agent::Provider::Codex,
-                recipe: terminal.launch.clone(),
-                session_id: Some("thread".into()),
+                provider,
+                recipe,
+                session_id: Some(session_id.clone()),
             },
             proof: Some(preparation.authority.source.clone()),
             terminal: None,
             owned_codex_listener: None,
             native_continuity: Default::default(),
         };
+        let mut alias = source.clone();
+        alias.launch.session_id = None;
+        let agent = crate::model::AgentId::new();
+        let presentation = super::super::floor::Presentation {
+            agent,
+            session: source.clone(),
+            scope: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
+            pane: crate::workspace_model::views::Pane {
+                id: crate::model::CardId::from_uuid(agent.as_uuid()),
+                title: format!("Chat {index}"),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(alias.clone()),
+                scope: None,
+            },
+            ordinal: index,
+            restored: false,
+        };
+        let snapshot = crate::chat::Snapshot {
+            session_id: Some(session_id),
+            title: Some(format!("chat {index}")),
+            items: (0..entries)
+                .map(|entry| {
+                    std::sync::Arc::new(crate::chat::Item {
+                        id: format!("{index}-{entry}"),
+                        role: crate::chat::Role::Assistant,
+                        content: crate::chat::ItemContent::Text {
+                            text: "x".repeat(bytes),
+                            thinking: false,
+                            phase: Default::default(),
+                        },
+                        started_at: None,
+                        at: None,
+                    })
+                })
+                .collect(),
+            composer: Some("an unsent draft the paused page never shows".into()),
+            commands: vec![
+                crate::chat::SlashCommand {
+                    name: "review".into(),
+                    description: "A command the paused page never offers".into(),
+                };
+                40
+            ],
+            ..Default::default()
+        };
+        (source, snapshot, alias, presentation)
+    }
+
+    /// `chats` chats captured as the update captures them, each page shaped
+    /// by `page(index)` as (entries, bytes per entry). The reviewed impact
+    /// and expected owners of `preparation` include every chat.
+    fn scale_census(
+        preparation: &mut Preparation,
+        chats: usize,
+        page: impl Fn(usize) -> (usize, usize),
+    ) -> Census {
+        let mut census = preparation.authority.census.clone();
         let mut captured = SnapshotCapture::default();
-        captured
-            .push(
-                source.clone(),
-                crate::chat::Snapshot {
-                    title: Some("first page".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert!(
-            captured
-                .push(
-                    source,
-                    crate::chat::Snapshot {
-                        composer: Some("x".repeat(SNAPSHOT_LIMIT)),
-                        ..Default::default()
-                    }
-                )
-                .is_err()
+        let mut sessions = Vec::new();
+        for index in 0..chats {
+            let (entries, bytes) = page(index);
+            let (source, snapshot, alias, presentation) =
+                scale_chat(preparation, index, entries, bytes);
+            sessions.push(crate::update::impact::SessionImpact {
+                id: source.id,
+                kind: SessionKind::NativeChat,
+                title: format!("chat {index}"),
+                identity: "0".repeat(64),
+                disposition: crate::update::impact::Disposition::Resumes,
+                reason: String::new(),
+                interrupted_subagents: Vec::new(),
+            });
+            captured.push(source.clone(), snapshot).unwrap();
+            census.chats.push(source);
+            census.aliases.push(alias);
+            census.presentations.push(presentation);
+        }
+        census.snapshots = captured.finish();
+        let reviewed = preparation.authority.reviewed.as_mut().unwrap();
+        reviewed.sessions.extend(sessions);
+        preparation.authority.expected = reviewed
+            .sessions
+            .iter()
+            .map(|item| (item.kind, item.id))
+            .collect();
+        census
+    }
+
+    /// Long chats hold 400 entries of 1.5 KiB (600 KiB of transcript each);
+    /// every tenth chat is short and must keep its whole page.
+    fn long_or_short(index: usize) -> (usize, usize) {
+        if index % 10 == 0 {
+            (6, 200)
+        } else {
+            (400, 1536)
+        }
+    }
+
+    /// Fit `chats` long transcripts and require every bound the census
+    /// meets before shutdown to accept them, each page to keep its newest
+    /// contiguous entries, and long pages to share the room evenly. Returns
+    /// the fewest entries a long page kept.
+    fn fit_long_transcripts(chats: usize, page: fn(usize) -> (usize, usize)) -> usize {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        let mut census = scale_census(&mut preparation, chats, page);
+        let source = preparation.authority.source.clone();
+        let reviewed = preparation.authority.reviewed.clone().unwrap();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        census.validate_capture(&source).unwrap();
+        preparation.authority.census = census.clone();
+        preflight_preparation_size(&preparation.authority).unwrap();
+        // Recovery saves these pages without shortening them any further.
+        let mut record = census.record(&source);
+        serde_json::from_slice::<super::super::floor::Record>(&record.encode_capture().unwrap())
+            .unwrap()
+            .snapshots
+            .iter()
+            .zip(&census.snapshots)
+            .for_each(|(saved, fitted)| assert_eq!(saved, fitted));
+        eprintln!(
+            "{chats} chats: census {} of {SNAPSHOT_LIMIT}, preparation {} of {PREPARATION_LIMIT}; \
+             with empty pages {:?}",
+            encoded_size(&census, usize::MAX).unwrap(),
+            preparation_size(&preparation.authority).unwrap(),
+            census
+                .identity_bounds(&source, &reviewed, &[])
+                .unwrap()
+                .map(|bound| bound.needed),
         );
-        let pages = captured.finish();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].snapshot.title.as_deref(), Some("first page"));
-        assert!(!preparation.authority.checkpoint_path.exists());
+        let mut kept = Vec::new();
+        for (index, saved) in census.snapshots.iter().enumerate() {
+            assert_eq!(saved.source, census.chats[index]);
+            assert_eq!(saved.snapshot.composer, None);
+            assert!(saved.snapshot.commands.is_empty());
+            let (entries, _) = page(index);
+            let ids: Vec<_> = saved.snapshot.items.iter().map(|item| &item.id).collect();
+            let expected: Vec<_> = (entries - ids.len()..entries)
+                .map(|entry| format!("{index}-{entry}"))
+                .collect();
+            assert_eq!(
+                ids,
+                expected.iter().collect::<Vec<_>>(),
+                "chat {index} keeps its newest contiguous entries"
+            );
+            let limitation = saved.limitation.as_deref().unwrap();
+            if ids.len() == entries {
+                assert!(!saved.snapshot.has_earlier);
+                assert!(!limitation.ends_with(super::super::floor::OLDER_HISTORY_OMITTED));
+            } else {
+                assert!(saved.snapshot.has_earlier);
+                assert!(limitation.ends_with(super::super::floor::OLDER_HISTORY_OMITTED));
+            }
+            if entries < 400 {
+                assert_eq!(ids.len(), entries, "short pages keep everything");
+            } else {
+                kept.push(ids.len());
+            }
+        }
+        // Fitting is stable: a fitted census needs no further shortening.
+        let fitted = census.clone();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        assert_eq!(census, fitted);
+        let fewest = kept.iter().copied().min().unwrap_or(400);
+        let most = kept.iter().copied().max().unwrap_or(400);
+        eprintln!("{chats} chats: each long page keeps {fewest} to {most} of 400 entries");
+        assert!(
+            most - fewest <= 1,
+            "long pages share evenly: {fewest}..{most}"
+        );
+        fewest
+    }
+
+    #[test]
+    fn no_chats_fit_without_pages() {
+        assert_eq!(fit_long_transcripts(0, long_or_short), 400);
+    }
+
+    #[test]
+    fn one_long_chat_keeps_its_whole_page() {
+        assert_eq!(fit_long_transcripts(1, |_| (400, 1536)), 400);
+    }
+
+    #[test]
+    fn long_transcripts_of_81_chats_keep_their_newest_entries() {
+        // 72 long chats share about 5.5 MiB: some 50 entries (75 KiB) each.
+        assert!(fit_long_transcripts(81, long_or_short) >= 40);
+    }
+
+    #[test]
+    fn long_transcripts_of_150_chats_keep_their_newest_entries() {
+        assert!(fit_long_transcripts(150, long_or_short) >= 15);
+    }
+
+    #[test]
+    fn long_transcripts_of_300_chats_keep_their_newest_entries() {
+        assert!(fit_long_transcripts(300, long_or_short) >= 2);
+    }
+
+    /// Runs the calling test again in a process whose data directories are
+    /// private, so it can retain stopped-pane evidence. Returns true in the
+    /// caller, which then has nothing more to do.
+    fn rerun_with_private_data() -> bool {
+        const ROOT: &str = "CAGENTS_TEST_RECOVERY_PRIVATE_DATA";
+        if std::env::var_os(ROOT).is_some() {
+            return false;
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        for directory in ["home", "run", "data", "config", "cache"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let test = std::thread::current().name().unwrap().to_owned();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(ROOT, root.path())
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// Ending chats before preparation retains their final pages for this
+    /// source. Recovery replaces those pages with the census's own, so they
+    /// must not also be charged against the census's budget.
+    #[test]
+    fn pages_retained_by_ending_chats_leave_the_census_fit() {
+        if rerun_with_private_data() {
+            return;
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        let mut census = scale_census(&mut preparation, 81, long_or_short);
+        let source = preparation.authority.source.clone();
+        let reviewed = preparation.authority.reviewed.clone().unwrap();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        // Twenty long chats end through the floor with their final pages,
+        // which fill the stopped-pane record by themselves.
+        let mut ended = super::super::floor::Record::new(source.clone(), Vec::new(), Vec::new());
+        for index in (1..81).filter(|index| index % 10 != 0).take(20) {
+            let (chat, snapshot, _, _) = scale_chat(&preparation, index, 400, 1536);
+            let mut chat = chat;
+            chat.id = census.chats[index].id;
+            ended.chats.push(chat.clone());
+            ended.snapshots.push(super::super::floor::StoppedSnapshot {
+                source: chat,
+                snapshot,
+                limitation: None,
+            });
+        }
+        ended.save().unwrap();
+        let retained = super::super::floor::record_for_source(&source)
+            .unwrap()
+            .unwrap()
+            .encode_capture()
+            .unwrap()
+            .len();
+        assert!(
+            retained + encoded_size(&census, usize::MAX).unwrap() > SNAPSHOT_LIMIT,
+            "the retained pages and the census exceed one budget together"
+        );
+        census.validate_capture(&source).unwrap();
+        let fitted = census.clone();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        assert_eq!(
+            census, fitted,
+            "retained pages take nothing from the census"
+        );
+        // Saving the paused record beside them fits by shortening pages only.
+        census.record(&source).save().unwrap();
+        let saved = super::super::floor::record_for_source(&source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.chats.len(), 81);
+        assert_eq!(saved.snapshots.len(), 81);
+    }
+
+    #[test]
+    fn capture_shortens_pages_while_it_runs_without_losing_their_fair_share() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        // 60 chats of 600 KiB: 35 MiB unless capture compacts as it goes.
+        let mut census = scale_census(&mut preparation, 60, |_| (400, 1536));
+        let retained: usize = census
+            .snapshots
+            .iter()
+            .map(|saved| encoded_size(&saved.snapshot.items, usize::MAX).unwrap())
+            .sum();
+        assert!(retained <= CAPTURE_COMPACTION + 600 * 1024, "{retained}");
+        let source = preparation.authority.source.clone();
+        let reviewed = preparation.authority.reviewed.clone().unwrap();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        let kept: Vec<_> = census
+            .snapshots
+            .iter()
+            .map(|saved| saved.snapshot.items.len())
+            .collect();
+        let (fewest, most) = (kept.iter().min().unwrap(), kept.iter().max().unwrap());
+        assert!(most - fewest <= 1, "{fewest}..{most}");
+        assert!(*fewest >= 60, "{fewest}");
+    }
+
+    #[test]
+    fn one_huge_entry_does_not_starve_other_pages() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        let mut census = scale_census(&mut preparation, 40, |index| {
+            if index == 0 {
+                (1, 6 * 1024 * 1024)
+            } else {
+                (50, 1024)
+            }
+        });
+        let source = preparation.authority.source.clone();
+        let reviewed = preparation.authority.reviewed.clone().unwrap();
+        census.fit_pages(&source, &reviewed, &[]).unwrap();
+        census.validate_capture(&source).unwrap();
+        assert!(census.snapshots[0].snapshot.items.is_empty());
+        assert!(census.snapshots[0].snapshot.has_earlier);
+        assert!(
+            census.snapshots[1..]
+                .iter()
+                .all(|saved| saved.snapshot.items.len() == 50)
+        );
+    }
+
+    #[test]
+    fn identity_evidence_that_cannot_fit_says_how_many_chats_to_close() {
+        // At 16 KiB only the receipt overflows; at 48 KiB the census and the
+        // floor records do too, each with a different share per chat.
+        for (environment, failing) in [(16 * 1024, 1), (48 * 1024, 4)] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut preparation = preparation(root.path());
+            let mut census = scale_census(&mut preparation, 120, |_| (2, 64));
+            for chat in &mut census.chats {
+                chat.launch
+                    .recipe
+                    .environment
+                    .insert("LARGE_CAPTURED_ENVIRONMENT".into(), "x".repeat(environment));
+            }
+            for (saved, chat) in census.snapshots.iter_mut().zip(&census.chats) {
+                saved.source = chat.clone();
+            }
+            for (presentation, chat) in census.presentations.iter_mut().zip(&census.chats) {
+                presentation.session = chat.clone();
+            }
+            let source = preparation.authority.source.clone();
+            let bounds = census
+                .identity_bounds(
+                    &source,
+                    preparation.authority.reviewed.as_ref().unwrap(),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                bounds.iter().filter(|bound| !bound.fits()).count(),
+                failing,
+                "{bounds:?}"
+            );
+            let original = census.clone();
+            let error = census
+                .fit_pages(
+                    &source,
+                    preparation.authority.reviewed.as_ref().unwrap(),
+                    &[],
+                )
+                .unwrap_err();
+            assert!(
+                error.starts_with("This daemon has 120 open chats"),
+                "{error}"
+            );
+            let close: usize = error
+                .split("Close at least ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|count| count.parse().ok())
+                .unwrap_or_else(|| panic!("{error}"));
+            assert!(
+                error.contains("Nothing was prepared and no chat was closed"),
+                "{error}"
+            );
+            assert_eq!(census, original, "a refusal shortens nothing");
+            // Closing that many leaves a census which fits every bound.
+            let keep = 120 - close;
+            census.chats.truncate(keep);
+            census.snapshots.truncate(keep);
+            census.aliases.truncate(keep);
+            census.presentations.truncate(keep);
+            let reviewed = preparation.authority.reviewed.as_mut().unwrap();
+            let kept: BTreeSet<_> = census.chats.iter().map(|chat| chat.id).collect();
+            reviewed.sessions.retain(|session| {
+                session.kind != SessionKind::NativeChat || kept.contains(&session.id)
+            });
+            census.fit_pages(&source, reviewed, &[]).unwrap();
+            assert!(!preparation.authority.checkpoint_path.exists());
+        }
     }
 
     #[test]
