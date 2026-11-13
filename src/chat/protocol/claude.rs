@@ -5133,8 +5133,8 @@ fn recorded_notification(record: &Value) -> Option<String> {
 fn task_notification(inner: &str) -> ItemContent {
     let element = |name: &str| notification_field(inner, name);
     let mut summary = element("summary")
-        .or_else(|| element("status").map(|status| format!("Background task {status}")))
-        .unwrap_or_else(|| "Background task updated".into());
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or_else(|| background_task_heading(&element("status").unwrap_or_default(), ""));
     // A finished agent's result is its report: headless Claude Code hands a
     // background agent's final message back this way rather than as a peer's.
     let (kind, mut body) = match element("result") {
@@ -5217,6 +5217,20 @@ fn command_notification(
     Some((heading, detail))
 }
 
+/// Use the same fallback when either transport omits an informative summary.
+fn background_task_heading(status: &str, description: &str) -> String {
+    let status = if status.trim().is_empty() {
+        "updated"
+    } else {
+        status.trim()
+    };
+    if description.is_empty() {
+        format!("Background task {status}")
+    } else {
+        format!("Background task \"{description}\" {status}")
+    }
+}
+
 /// A streamed `task_notification` frame as the delivery its recorded turn
 /// reads as. The frame carries an agent's result, or a command's account of
 /// itself, as its `summary`; the agent's name is the description its task
@@ -5236,10 +5250,12 @@ fn live_notification(frame: &Value, description: &str, kind: Option<ReportTask>)
             summary: command
                 .as_ref()
                 .map(|(heading, _)| heading.clone())
-                .unwrap_or_else(|| match (summary.is_empty(), description.is_empty()) {
-                    (false, _) => summary.into(),
-                    (true, false) => format!("Background task \"{description}\" {status}"),
-                    (true, true) => format!("Background task {status}"),
+                .unwrap_or_else(|| {
+                    if summary.is_empty() {
+                        background_task_heading(status, description)
+                    } else {
+                        summary.into()
+                    }
                 }),
             body: command
                 .map(|(_, detail)| detail)
@@ -12720,6 +12736,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_notification_summaries_share_live_and_history_status_fallback() {
+        for (xml_summary, live_summary) in [
+            ("", ""),
+            ("<summary></summary>", ""),
+            ("<summary> \n </summary>", " \n "),
+            ("<summary>&#32;</summary>", " "),
+        ] {
+            for (xml_status, status, heading) in [
+                (
+                    "<status>completed</status>",
+                    "completed",
+                    "Background task completed",
+                ),
+                (
+                    "<status>failed</status>",
+                    "failed",
+                    "Background task failed",
+                ),
+                ("<status></status>", "", "Background task updated"),
+                ("", "", "Background task updated"),
+            ] {
+                let xml = format!(
+                    "<task-notification><task-id>task</task-id>{xml_status}{xml_summary}</task-notification>"
+                );
+                let recorded = json!({"type":"user","uuid":"empty-notice","message":{"role":"user","content":xml}});
+                let live = json!({"task_id":"task","status":status,"summary":live_summary});
+                let expected = live_notification(&live, "", None);
+                assert!(
+                    matches!(&expected, ItemContent::Delivery { summary, body, .. } if summary == heading && body.is_empty())
+                );
+                let read = Claude::default().receive(recorded.clone()).unwrap();
+                assert_eq!(deliveries(&read), vec![(Role::User, expected.clone())]);
+                let records = correlation_history(vec![recorded]).page().unwrap();
+                let mut restored = Step::default();
+                Claude::default()
+                    .history_message(&records[0], &mut restored)
+                    .unwrap();
+                assert_eq!(deliveries(&restored), vec![(Role::User, expected)]);
+            }
+        }
+    }
+
+    #[test]
     fn command_deliveries_have_plain_outcomes_and_match_live_and_recorded_text() {
         let command = "cd /workspace/logs && until grep -q \"^\\[rss\\]\" fast-frag1.log 2>/dev/null; do sleep 20; done; cat < fast-frag1.log > latest.log; printf '&lt;'";
         let escaped = command
@@ -12731,6 +12790,7 @@ mod tests {
             ("completed", 0, "finished"),
             ("completed", 1, "failed (exit 1)"),
             ("failed", 1, "failed (exit 1)"),
+            ("failed", 0, "failed (exit 0)"),
         ] {
             let summary = format!("Background command \"{command}\" completed (exit code {exit})");
             let xml = format!(
