@@ -893,17 +893,17 @@ impl Runtime {
                 .wrap()
                 .into(),
         );
-        // An agent's tab names it by its type, which several agents share;
-        // the task it was given tells this one apart. It sits under the
-        // heading so a long task never crowds the recipient out of it.
-        // Where no task does, the sender's own summary of the body says
-        // what the message is about.
+        // An agent named by its type, which several agents share, is told
+        // apart by the task it was given, under the heading so a long task
+        // never crowds the recipient out of it. Otherwise, as when the
+        // heading already is the task, the sender's own summary of the body
+        // says what the message is about.
         let task = match self
             .listed_subagents(coordinated)
             .collect::<Vec<_>>()
             .as_slice()
         {
-            [agent] => Some(agent.description.trim())
+            [agent] if !Self::named_by_task(agent) => Some(agent.description.trim())
                 .filter(|task| !task.is_empty() && *task != recipient.name),
             _ => None,
         };

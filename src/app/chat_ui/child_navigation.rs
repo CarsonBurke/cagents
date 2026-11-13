@@ -588,7 +588,7 @@ mod tests {
         chat::Subagent {
             id: id.into(),
             kind: format!("Agent {id}"),
-            description: "A long task description is not an agent name".into(),
+            description: "A long task description told apart from its name".into(),
             status,
             waiting,
             model: None,
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_lead_with_working_agents_by_name_and_keep_the_task_for_their_description() {
+    fn tabs_lead_with_working_agents_by_name_and_name_an_unnamed_one_by_its_task() {
         use chat::ToolStatus::*;
         let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
@@ -681,18 +681,28 @@ mod tests {
             ("asking", "Planner · Waiting · "),
             ("broken", "Builder · Failed · "),
             ("done", "Reviewer · Finished · "),
-            ("unnamed", "Subagent · Stopped · "),
         ] {
             let (_, label) = tabs.iter().find(|(tab, _)| tab == id).unwrap();
             assert!(label.starts_with(starts), "{id}: {label}");
             assert!(
-                label.ends_with("Task: A long task description is not an agent name"),
+                label.ends_with("Task: A long task description told apart from its name"),
                 "{label}"
             );
         }
+        // An agent with no name goes by its task, which its description then
+        // does not repeat; its tab cuts it short.
+        let (_, unnamed) = tabs.iter().find(|(tab, _)| tab == "unnamed").unwrap();
+        assert!(
+            unnamed.starts_with("A long task description told apart from its name · Stopped · "),
+            "{unnamed}"
+        );
+        assert!(!unnamed.contains("Task:"), "{unnamed}");
         let children = &runtime.snapshot.subagents;
         assert_eq!(runtime.child_label(&children[4], 24), "Explore 2");
-        assert_eq!(runtime.child_label(&children[5], 24), "Subagent");
+        assert_eq!(
+            runtime.child_label(&children[5], 24),
+            "A long task description…"
+        );
         assert!(
             runtime.child_cache.is_empty(),
             "naming tabs must not prepare any hidden transcript"
@@ -984,6 +994,12 @@ mod tests {
         );
         assert_eq!(Runtime::native_child_name(&children[0]), "Agent done");
         children[0].kind = " \t".into();
+        assert_eq!(
+            Runtime::native_child_name(&children[0]),
+            "A long task description told apart from its name",
+            "an unnamed agent goes by its task"
+        );
+        children[0].description = " \n".into();
         assert_eq!(Runtime::native_child_name(&children[0]), "Subagent");
     }
 

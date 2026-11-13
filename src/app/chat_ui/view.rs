@@ -1357,19 +1357,27 @@ impl Runtime {
         let mut chars = raw.chars();
         let text: String = chars.by_ref().take(limit).collect();
         if chars.next().is_some() {
-            format!("{text}…")
+            format!("{}…", text.trim_end())
         } else {
             text
         }
     }
-    /// The agent's own name: Codex's nickname, the name Claude was asked to
-    /// give an agent, else its type, or OMP's agent name. The description is
-    /// the task it was given, which says what it does rather than who it is,
-    /// so it never stands in for the name.
+
+    /// What the agent goes by: the name its provider reports for it, else
+    /// the first line of the task it was given, which tells apart agents of
+    /// one type better than the type does. Claude and OMP report a name, then
+    /// a short description, then the type; Codex reports only a nickname.
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
         Some(agent.kind.trim())
             .filter(|name| !name.is_empty())
+            .or_else(|| Self::native_child_task(agent))
             .unwrap_or("Subagent")
+    }
+
+    /// Whether `agent` goes by the task it was given, which its tab and
+    /// heading then already say.
+    pub(super) fn named_by_task(agent: &chat::Subagent) -> bool {
+        Self::native_child_task(agent) == Some(Self::native_child_name(agent))
     }
 
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
@@ -1422,7 +1430,7 @@ impl Runtime {
                 None => identity.push_str(&Self::short_description(detail, 120)),
             }
         }
-        if let Some(task) = Self::native_child_task(agent) {
+        if let Some(task) = Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
             identity.push_str(" · Task: ");
             identity.push_str(&Self::short_description(task, 120));
         }

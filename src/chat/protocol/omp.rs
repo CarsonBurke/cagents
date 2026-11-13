@@ -334,7 +334,17 @@ impl Omp {
             waiting: None,
             detail: None,
             id: id.into(),
-            kind: text(payload, "agent").into(),
+            // What it goes by: its short description, which tells apart
+            // agents of one type, else that type. Its task is a whole prompt.
+            kind: [
+                text(payload, "description"),
+                text(progress, "description"),
+                text(payload, "agent"),
+            ]
+            .into_iter()
+            .find_map(|field| field.lines().map(str::trim).find(|line| !line.is_empty()))
+            .unwrap_or_default()
+            .into(),
             description: payload["task"]
                 .as_str()
                 .or_else(|| payload["description"].as_str())
@@ -2251,6 +2261,39 @@ mod tests {
         );
         let aborted = adapter.receive(json!({"type":"subagent_progress","payload":{"progress":{"id":"child","status":"aborted"}}})).unwrap();
         assert!(aborted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "child")));
+    }
+
+    /// Agents of one type are told apart by their short description; the
+    /// type names one only when it has none, and the task prompt never does.
+    #[test]
+    fn subagents_go_by_their_description_then_their_type() {
+        for (payload, label) in [
+            (
+                json!({"id":"child","agent":"explore","description":" Map the parser\nin detail","task":"Long prompt","progress":{"id":"child","status":"running"}}),
+                "Map the parser",
+            ),
+            (
+                json!({"id":"child","agent":"explore","progress":{"id":"child","status":"running","description":"Read logs"}}),
+                "Read logs",
+            ),
+            (
+                json!({"id":"child","agent":"explore","description":" \n","task":"Long prompt","progress":{"id":"child","status":"running"}}),
+                "explore",
+            ),
+        ] {
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let started = adapter
+                .receive(json!({"type":"subagent_lifecycle","payload":payload}))
+                .unwrap();
+            assert!(
+                started.events.iter().any(|event| matches!(event,
+                    Event::Subagent { id, kind, .. } if id == "child" && kind == label)),
+                "{payload}"
+            );
+        }
     }
 
     #[test]
