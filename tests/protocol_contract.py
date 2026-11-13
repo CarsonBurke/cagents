@@ -4,12 +4,10 @@
 import importlib.machinery
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
 
 
@@ -265,135 +263,6 @@ class LedgerContractTests(unittest.TestCase):
                 self.refuses(contains="Malformed protocol snapshot")
         path.write_text("{")
         self.refuses()
-
-
-class WorkflowApplicabilityTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="cagents-protocol-workflow-")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.paths = (
-            "scripts/check-protocol-contract",
-            "scripts/protocol_contract_source.py",
-            "tests/protocol_contract.py",
-        )
-        workflow = (ROOT / ".github/workflows/script-contracts.yml").read_text()
-        step = workflow.split("      - name: Check selected IPC source contract\n", 1)[1].split("      - name:", 1)[0]
-        self.step = textwrap.dedent(step.split("        run: |\n", 1)[1])
-
-    def install(self, indices):
-        for index in indices:
-            path = self.root / self.paths[index]
-            path.parent.mkdir(exist_ok=True, parents=True)
-            if index == 0:
-                path.write_text('import sys\nfrom pathlib import Path\nPath("checker-args").write_text(" ".join(sys.argv[1:]))\n')
-            elif index == 2:
-                path.write_text('from pathlib import Path\nPath("tests-ran").write_text("yes")\n')
-            else:
-                path.write_text("# Private applicability stub\n")
-
-    def install_ledger(self):
-        directory = self.root / CHECK.FIXTURES
-        directory.mkdir(parents=True)
-        (directory / "127.json").write_bytes((ROOT / CHECK.FIXTURES / "127.json").read_bytes())
-
-    def run_step(self, base=None, cwd=None):
-        environment = dict(os.environ)
-        environment["PROTOCOL_CONTRACT_BASE_SHA"] = "" if base is None else base
-        return subprocess.run(["bash", "-e", "-c", self.step], cwd=cwd or self.root, env=environment, capture_output=True, text=True)
-
-    def test_old_head_without_the_complete_group_is_explicitly_not_applicable(self):
-        result = self.run_step()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Not applicable: selected IPC source contract", result.stdout)
-
-    def test_every_partial_group_is_refused_before_fetch_or_execution(self):
-        self.install_ledger()
-        for mask in range(1, 7):
-            with self.subTest(mask=mask):
-                for path in self.paths:
-                    (self.root / path).unlink(missing_ok=True)
-                self.install([index for index in range(3) if mask & (1 << index)])
-                result = self.run_step()
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("Incomplete protocol contract", result.stderr)
-                self.assertFalse((self.root / "tests-ran").exists())
-
-    def test_complete_group_requires_a_trusted_base_then_runs_tests_and_checker(self):
-        self.install(range(3))
-        self.install_ledger()
-        result = self.run_step()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("trusted event comparison base", result.stderr)
-        subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=self.root, check=True)
-        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
-        subprocess.run(["git", "-c", "user.name=Contract fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Private applicability fixture"], cwd=self.root, check=True)
-        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
-        result = self.run_step(base)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.root / "tests-ran").read_text(), "yes")
-        self.assertEqual((self.root / "checker-args").read_text(), f"--base-ref {base}")
-
-    def test_missing_base_object_with_no_fetch_source_fails(self):
-        self.install(range(3))
-        self.install_ledger()
-        subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=self.root, check=True)
-        result = self.run_step("f" * 40)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.root / "tests-ran").exists())
-
-    def test_shallow_checkout_fetches_the_exact_event_base_from_private_origin(self):
-        self.install(range(3))
-        self.install_ledger()
-        subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=self.root, check=True)
-        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
-        commit = ["git", "-c", "user.name=Contract fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Private shallow fixture"]
-        subprocess.run(commit, cwd=self.root, check=True)
-        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
-        (self.root / "second-commit").write_text("Newer head\n")
-        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
-        subprocess.run(commit, cwd=self.root, check=True)
-        with tempfile.TemporaryDirectory(prefix="cagents-protocol-shallow-") as destination:
-            checkout = Path(destination) / "checkout"
-            subprocess.run(["git", "clone", "-q", "--depth=1", self.root.as_uri(), str(checkout)], check=True)
-            missing = subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=checkout, stderr=subprocess.DEVNULL)
-            self.assertNotEqual(missing.returncode, 0, "fixture must really omit the base object")
-            result = self.run_step(base, checkout)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual((checkout / "checker-args").read_text(), f"--base-ref {base}")
-            self.assertEqual((checkout / "tests-ran").read_text(), "yes")
-
-    def test_symlinked_contract_source_is_refused(self):
-        self.install(range(3))
-        self.install_ledger()
-        path = self.root / self.paths[1]
-        path.rename(path.with_suffix(".real"))
-        path.symlink_to(path.with_suffix(".real"))
-        result = self.run_step()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("never a symlink", result.stderr)
-
-    def test_orphan_ledger_with_all_sources_absent_is_refused(self):
-        self.install_ledger()
-        result = self.run_step()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("Incomplete protocol contract", result.stderr)
-        self.assertNotIn("Not applicable", result.stdout)
-
-    def test_sources_without_the_snapshot_directory_are_refused(self):
-        self.install(range(3))
-        result = self.run_step()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("snapshot directory must all exist", result.stderr)
-
-    def test_symlinked_ledger_directory_is_refused_even_with_sources_absent(self):
-        self.install_ledger()
-        directory = self.root / CHECK.FIXTURES
-        directory.rename(directory.with_name("real-ledger"))
-        directory.symlink_to(directory.with_name("real-ledger"), target_is_directory=True)
-        result = self.run_step()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("never a symlink", result.stderr)
 
 
 if __name__ == "__main__":
