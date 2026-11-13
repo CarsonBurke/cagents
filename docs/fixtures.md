@@ -291,19 +291,38 @@ verify its full text, then collapses it and captures the updated live preview.
 The tool results are synthetic; their shell commands are not executed. The
 scene uses the offline provider fixture and contacts no live model.
 
-In a ready native-evidence session, run it with the session's task directory:
+Run `wide` then `narrow` in the same 1200x900 native-evidence session on
+each side:
 
 ```sh
-CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-reasoning \
-    tests/fixtures/reasoning-row-scene.sh wide
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-reasoning
+scripts/native-evidence start before --width 1200 --height 900 --limit 600
+tests/fixtures/reasoning-row-scene.sh wide
+tests/fixtures/reasoning-row-scene.sh narrow
+scripts/native-evidence stop
 ```
 
-Start each side at the same 1200x900 viewport. Repeat with `narrow` at 900x900
-for the narrow pane. For a remote `pair`, the steps file can invoke
-`CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide`.
-The scene writes only the task's private provider configuration. Stop the
-session afterward: its final thinking block deliberately stays active for
-300 seconds.
+`wide` prepares the conversation and captures its active empty, expanded, and
+updated live reasoning. `narrow` reuses that conversation, opens an unsent
+blank thread with Ctrl+T, then uses Alt+1/Alt+2 to focus each pane and Alt+R
+to select one-third width preferences (three cycles on the existing chat,
+one on the new draft). They share the workspace into roughly 270px
+panes, with the inspector still docked. It captures the first conversation
+collapsed and expanded; the blank thread sends no prompt and starts no
+provider. Run `narrow` only once after `wide` in that session.
+
+Keep the native window at 1200x900: resizing below the docked inspector's
+minimum workspace width makes the inspector an overlay that hides the
+transcript. For a remote `pair`, use these two lines in its steps file:
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
+```
+
+The scene keeps provider settings and transcripts inside the task's private
+fixture. Stop the session afterward: its final thinking block deliberately
+stays active for 300 seconds.
 
 ## Adding a scene to evidence
 

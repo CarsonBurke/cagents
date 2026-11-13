@@ -4,11 +4,15 @@
 #
 #   scripts/native-evidence start before --width 1200 --height 900
 #   CAGENTS_EVIDENCE_TASK=... tests/fixtures/reasoning-row-scene.sh wide
+#   CAGENTS_EVIDENCE_TASK=... tests/fixtures/reasoning-row-scene.sh narrow
 #   scripts/native-evidence stop
 #
-# Repeat with the other side, or use narrow with a 900x900 viewport. For the
-# remote pair route, a steps file can run:
-#   CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
+# Repeat both scenes with the other side at the same 1200x900 viewport. Narrow
+# adds a blank thread beside the existing conversation and cycles both panes
+# to one third, which shares the workspace into two roughly 270px panes. The
+# inspector stays docked; no window resize or second provider is needed. For
+# the remote pair route, run wide then narrow in the same steps file with
+# CAGENTS_EVIDENCE_TASK=$task and "$tool/tests/fixtures/reasoning-row-scene.sh".
 #
 # The first turn streams two finished thoughts interleaved with command groups,
 # a finished empty thought, then a live thought whose latest line changes.
@@ -30,6 +34,67 @@ config=$fixture/home/.claude
     printf '%s\n' 'reasoning-row-scene: start native-evidence first' >&2
     exit 2
 }
+wide_ready=$fixture/state/reasoning-row-scene-wide
+narrow_done=$fixture/state/reasoning-row-scene-narrow
+
+shot() {
+    evidence drive move 1,1 >/dev/null
+    sleep 1
+    evidence shot "$1"
+}
+
+first_reasoning_row() {
+    # The baseline caption says Thinking; the new row contains its first line.
+    evidence drive --json observe | /usr/bin/python3 -c '
+import json,sys
+runs=json.load(sys.stdin)["runs"]
+matches=[r for r in runs if "thinking" in r["text"].lower() or "assuming" in r["text"].lower()]
+if not matches: raise SystemExit("reasoning-row-scene: no visible reasoning row")
+r=min(matches,key=lambda r:(r["y"],r["x"]))
+print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
+'
+}
+
+expanded_shot() {
+    local row
+    row=$(first_reasoning_row)
+    evidence drive click "$row" >/dev/null
+    evidence drive wait 'new setting' --timeout 15 >/dev/null
+    shot "$1"
+    evidence drive click "$row" >/dev/null
+    evidence drive wait 'new setting' --gone --timeout 15 >/dev/null
+}
+
+if [ "$scene" = narrow ]; then
+    [ -f "$wide_ready" ] && [ ! -e "$narrow_done" ] || {
+        printf '%s\n' 'reasoning-row-scene: run wide once in this session before narrow' >&2
+        exit 2
+    }
+    # Ctrl+T creates an unsent draft. The hosted chat stores the default half
+    # width; a new draft in this compact workspace stores a full-width choice.
+    evidence drive key ctrl+t >/dev/null
+    sleep 2
+    # While its neighbour stays full, cycling the first pane advances its
+    # stored preference: half -> two thirds -> full -> one third. The second
+    # pane then needs one cycle from full to one third; the pair fits and the
+    # strip expands their spare space equally.
+    evidence drive key alt+1 >/dev/null
+    for _ in 1 2 3; do
+        evidence drive key alt+r >/dev/null
+        sleep 1
+    done
+    evidence drive key alt+2 >/dev/null
+    evidence drive key alt+r >/dev/null
+    sleep 1
+    evidence drive key alt+1 >/dev/null
+    sleep 1
+    shot reasoning-narrow-working
+    expanded_shot reasoning-narrow-expanded
+    touch "$narrow_done"
+    printf '%s\n' 'Captured narrow working and expanded rows; stop the evidence session now.'
+    exit 0
+fi
+
 cp "$here/reasoning-row-scene/frames.jsonl" "$config/fixture-frames.jsonl"
 evidence cli project open "$fixture/project" >/dev/null
 evidence cli --json agent spawn --provider claude --model haiku --surface chat \
@@ -62,30 +127,11 @@ done
 [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: command stream did not finish' >&2; exit 1; }
 # The live thought starts empty and stays that way for 40 seconds.
 sleep 2
-prefix=
-[ "$scene" = narrow ] && prefix=narrow-
-evidence drive move 1,1 >/dev/null
-evidence shot "${prefix}reasoning-active-empty"
-# The old row is captioned Thinking; the new one contains its first line.
-# Pick the first visible thought in reading order on either revision.
-row=$(evidence drive --json observe | /usr/bin/python3 -c '
-import json,sys
-runs=json.load(sys.stdin)["runs"]
-matches=[r for r in runs if "thinking" in r["text"].lower() or "assuming" in r["text"].lower()]
-if not matches: raise SystemExit("reasoning-row-scene: no visible reasoning row")
-r=min(matches,key=lambda r:(r["y"],r["x"]))
-print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
-')
-evidence drive click "$row" >/dev/null
-evidence drive wait 'new setting' --timeout 15 >/dev/null
-evidence drive move 1,1 >/dev/null
-evidence shot "${prefix}reasoning-expanded"
-# Collapse the row while the provider remains active, then observe its later
-# text update. The baseline keeps that text hidden; the fixed row shows its
-# latest line while retaining the first line for the completed thoughts.
-evidence drive click "$row" >/dev/null
-evidence drive wait 'new setting' --gone --timeout 15 >/dev/null
+shot reasoning-active-empty
+expanded_shot reasoning-expanded
+# The baseline hides live text when collapsed. The fixed row shows the later
+# latest-line delta while keeping the first line for completed thoughts.
 sleep 44
-evidence drive move 1,1 >/dev/null
-evidence shot "${prefix}reasoning-working"
-printf '%s\n' 'Captured active-empty, expanded and working/latest rows; stop the session now.'
+shot reasoning-working
+touch "$wide_ready"
+printf '%s\n' 'Captured wide rows; run narrow in this same session, then stop it.'
