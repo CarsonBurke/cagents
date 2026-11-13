@@ -353,15 +353,26 @@ verbosity=0
 if fixture_switch "${CAGENTS_FIXTURE_VERBOSITY:-0}" fixture-verbosity; then verbosity=1; fi
 subagents=0
 if fixture_switch "${CAGENTS_FIXTURE_SUBAGENTS:-0}" fixture-subagents; then subagents=1; fi
-# The switch file may hold the delay between deltas in seconds.
+# The switch file may hold the delay between deltas in seconds on its first
+# line and the characters per delta on its second, so a provider's token rate
+# can be approximated (such as 0.03 and 24 for about 800 characters a second).
 stream_reply=0
 stream_delay=0.25
+stream_chunk=16384
 if fixture_switch "${CAGENTS_FIXTURE_STREAM_REPLY:-0}" fixture-stream-reply; then
     stream_reply=1
-    if [ -s "$config/fixture-stream-reply" ]; then stream_delay=$(head -n 1 "$config/fixture-stream-reply"); fi
+    if [ -s "$config/fixture-stream-reply" ]; then
+        stream_delay=$(sed -n 1p "$config/fixture-stream-reply")
+        stream_chunk=$(sed -n 2p "$config/fixture-stream-reply")
+        stream_chunk=${stream_chunk:-16384}
+    fi
 fi
 if ! [[ $stream_delay =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
     printf '%s\n' "fixture: fixture-stream-reply must hold seconds, such as 1 or 0.25, not '$stream_delay'" >&2
+    exit 2
+fi
+if ! [[ $stream_chunk =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "fixture: fixture-stream-reply's second line must be a positive number of characters, not '$stream_chunk'" >&2
     exit 2
 fi
 # Bash's read timeout and clock share microsecond precision.
@@ -542,10 +553,13 @@ stream_reply_turn() {
     jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
     jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
     # Keep the loop in this shell; fd 3 still reads the provider input while
-    # stdin reads the precomputed deltas. No producer survives an interruption.
-    deltas=$(jq -cn --rawfile text "$reply" '$text | range(0; length; 16384) as $at | .[$at:$at + 16384]')
+    # stdin reads the precomputed frames. No producer survives an interruption.
+    # One jq renders every frame, so token-sized deltas cost no process each.
+    deltas=$(jq -cn --rawfile text "$reply" --argjson chunk "$stream_chunk" \
+        '$text | range(0; length; $chunk) as $at
+        | {type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$text[$at:$at + $chunk]}}}')
     while IFS= read -r delta; do
-        jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$delta}}}'
+        printf '%s\n' "$delta"
         if ! wait_stream_input; then return 1; fi
     done <<< "$deltas"
     jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'

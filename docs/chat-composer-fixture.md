@@ -105,14 +105,17 @@ Each later turn answers with that file's contents instead of the default
 sentence, so replacing the file changes the next answer. A few turns with a
 long file give a transcript long enough to scroll.
 
-Create `fixture-stream-reply` to send that answer in 16,384-character text
-deltas before its final record. The file may hold the delay between deltas in
-seconds (default `0.25`). While streaming, control requests still take effect
-and additional prompts receive the usual queued lifecycle. Interrupt stops
-the stream and settles the turn without recording an answer that was never
-fully sent. Closing stdin finishes the finite reply. The fixture requires
-Bash for timed input reads; `python3 tests/chat_composer_streaming.py` checks
-this duplex protocol without the app or a live provider.
+Create `fixture-stream-reply` to send that answer in text deltas before its
+final record. Its first line may hold the delay between deltas in seconds
+(default `0.25`), and its second line the characters per delta (default
+`16384`). `0.03` and `24` approximate a live provider's streaming rate, so
+several fixture agents give a realistic concurrent load. While streaming,
+control requests still take effect and additional prompts receive the usual
+queued lifecycle. Interrupt stops the stream and settles the turn without
+recording an answer that was never fully sent. Closing stdin finishes the
+finite reply. The fixture requires Bash for timed input reads; `python3
+tests/chat_composer_streaming.py` checks this duplex protocol without the app
+or a live provider.
 
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
@@ -215,6 +218,10 @@ background work: a `task_updated` frame patching the task `killed`, with no
 further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
 this: an agent that reports it is waiting, then is resumed, finishes, fails,
 is resumed elsewhere, or is stopped from its tab.
+`tests/fixtures/message-card-scene.sh` builds another: an agent started in
+the background, then messages to it with Claude Code's `SendMessage`, one
+short, one long enough to fold, one Claude refuses and one to an agent the
+conversation does not list, each answered with the JSON Claude Code returns.
 
 To check model and usage reporting, copy a recorded `initialize` response to
 `fixture-models.json`, such as `fixtures/accounts/claude-initialize-models.json`,

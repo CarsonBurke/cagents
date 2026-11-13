@@ -302,7 +302,7 @@ pub(super) struct ResultDetails {
 /// Retain identity/status metadata, never result bodies or patches. A frame's
 /// structured result belongs to a tool only when it carries one result block.
 pub(super) fn details(frame: &super::Value) -> (Vec<AgentCall>, ResultDetails) {
-    use super::{async_launch, string, structured_result};
+    use super::{agent_address, async_launch, string, structured_result};
     let Some(blocks) = frame["message"]["content"].as_array() else {
         return Default::default();
     };
@@ -340,7 +340,20 @@ pub(super) fn details(frame: &super::Value) -> (Vec<AgentCall>, ResultDetails) {
     {
         let metadata = structured_result(frame);
         result.launched = async_launch(frame);
-        result.agent = metadata["agentId"].as_str().map(str::to_owned);
+        // As a live result is read: its structured record, else the line
+        // Claude Code writes for the model.
+        result.agent = agent_address(metadata, "").or_else(|| {
+            let content = &blocks
+                .iter()
+                .find(|block| string(block, "type") == "tool_result")?["content"];
+            match content {
+                super::Value::String(text) => agent_address(&super::Value::Null, text),
+                super::Value::Array(parts) => parts
+                    .iter()
+                    .find_map(|part| agent_address(&super::Value::Null, part["text"].as_str()?)),
+                _ => None,
+            }
+        });
         result.tasks = ["agentId", "backgroundTaskId", "taskId"]
             .into_iter()
             .filter_map(|key| {
@@ -468,6 +481,11 @@ pub(super) fn index_activity(
                     continue;
                 }
                 let stopped = ended.get(identity).copied();
+                if let Some(agent) = &node.result.agent {
+                    history
+                        .agent_addresses
+                        .insert(identity.clone(), agent.clone());
+                }
                 if node.result.launched {
                     if stopped.is_none() {
                         history.background_agent_tools.insert(identity.clone());

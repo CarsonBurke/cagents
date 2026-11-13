@@ -123,6 +123,28 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
     }
 }
 
+/// A conversation's subagents by the address their provider gives them, each
+/// with the ID the snapshot lists it under. Shared, so a surface can keep a
+/// copy for every frame without copying the addresses.
+pub type AgentAddresses = Arc<BTreeMap<String, String>>;
+
+/// Adds the addresses not yet known, which keep the agent they first named,
+/// and says whether any was.
+fn learn_addresses(known: &mut AgentAddresses, addresses: Vec<super::AgentAddress>) -> bool {
+    let new = addresses
+        .into_iter()
+        .filter(|address| !known.contains_key(&address.address))
+        .collect::<Vec<_>>();
+    if new.is_empty() {
+        return false;
+    }
+    let known = Arc::make_mut(known);
+    for address in new {
+        known.entry(address.address).or_insert(address.subagent);
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 pub enum Wake {
     Changed,
@@ -134,6 +156,9 @@ pub enum Wake {
     /// The daemon's judgement of the usage limit stopping the conversation
     /// changed; read it with `limit`.
     Limit,
+    /// The daemon said how the provider addresses more of the conversation's
+    /// subagents; read them with `agent_addresses`.
+    AgentAddresses,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -590,6 +615,7 @@ struct InnerPayload {
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
     limit: Arc<Mutex<Option<crate::agent_execution::directory::UsageLimit>>>,
+    agent_addresses: Arc<Mutex<AgentAddresses>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -1559,6 +1585,7 @@ impl ClientHandle {
                     observed: Arc::new(Mutex::new(OutputObservation::default())),
                     account_usage: Arc::default(),
                     limit: Arc::default(),
+                    agent_addresses: Arc::default(),
                     next: Arc::new(AtomicU64::new(1)),
                     alive: Arc::new(AtomicBool::new(true)),
                     visible: Arc::new(AtomicBool::new(true)),
@@ -1733,6 +1760,20 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(report, observed_at)
+    }
+
+    /// Records the subagent addresses the daemon sent as the reader thread
+    /// would on their arrival.
+    #[cfg(test)]
+    pub(crate) fn learn_agent_addresses_for_test(&self, addresses: Vec<super::AgentAddress>) {
+        learn_addresses(
+            &mut self
+                .inner
+                .agent_addresses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            addresses,
+        );
     }
 
     /// Records the daemon's judgement of a usage limit as the reader thread
@@ -2300,6 +2341,7 @@ impl ClientHandle {
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
         let mut early_limit = None;
+        let mut early_addresses = AgentAddresses::default();
         let (session, initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
@@ -2349,6 +2391,11 @@ impl ClientHandle {
                     if chat_id == id && envelope.request_id.is_none() =>
                 {
                     early_limit = limit;
+                }
+                ServerMessage::ChatAgentAddresses { chat_id, addresses }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    learn_addresses(&mut early_addresses, addresses);
                 }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
@@ -2401,6 +2448,7 @@ impl ClientHandle {
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
         let limit = Arc::new(Mutex::new(early_limit));
+        let agent_addresses = Arc::new(Mutex::new(early_addresses));
         // Attachment also serves non-UI callers that inspect the initial
         // publication directly. The UI immediately sets its actual visibility;
         // an unvisited hidden pane releases this body without preparing it.
@@ -2437,6 +2485,7 @@ impl ClientHandle {
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
                 limit: limit.clone(),
+                agent_addresses: agent_addresses.clone(),
                 next: next.clone(),
                 alive: alive.clone(),
                 wake: wake.clone(),
@@ -2617,6 +2666,13 @@ impl ClientHandle {
                             changed
                         };
                         if changed { wake(Wake::Limit); }
+                    },
+                    ServerMessage::ChatAgentAddresses { chat_id, addresses } if chat_id == id => {
+                        let learned = learn_addresses(
+                            &mut agent_addresses.lock().unwrap_or_else(|p| p.into_inner()),
+                            addresses,
+                        );
+                        if learned { wake(Wake::AgentAddresses); }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
@@ -2860,6 +2916,15 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
+    }
+    /// How the provider addresses this conversation's subagents, by address,
+    /// with the ID its snapshot lists each under.
+    pub fn agent_addresses(&self) -> AgentAddresses {
+        self.inner
+            .agent_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// The usage limit that stops this conversation, as the daemon last
     /// judged it.
@@ -3306,6 +3371,37 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon tells a surface every address it knows, as it learns one
+    /// and once on attaching, in whichever order those arrive.
+    #[test]
+    fn agent_addresses_accumulate_in_any_order_they_arrive() {
+        let address = |address: &str, subagent: &str| super::super::AgentAddress {
+            address: address.into(),
+            subagent: subagent.into(),
+        };
+        let mut known = AgentAddresses::default();
+        let shared = known.clone();
+        assert!(learn_addresses(
+            &mut known,
+            vec![
+                address("a1892b93e88999a7d", "toolu_relocate"),
+                address("a77f00d1e2b3c4d5a", "toolu_review"),
+            ]
+        ));
+        // The copy a frame holds is not changed under it.
+        assert!(shared.is_empty());
+        let learned = known.clone();
+        // An older list, sent on attaching after a newer one, adds nothing,
+        // and an address keeps the agent it first named.
+        assert!(!learn_addresses(
+            &mut known,
+            vec![address("a1892b93e88999a7d", "toolu_other")]
+        ));
+        assert!(Arc::ptr_eq(&known, &learned), "nothing new is not a change");
+        assert_eq!(known["a1892b93e88999a7d"], "toolu_relocate");
+        assert_eq!(known.len(), 2);
+    }
 
     static REPLACEMENT_GATES: Mutex<
         BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,

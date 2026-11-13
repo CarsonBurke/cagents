@@ -7,9 +7,9 @@ use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
 use crate::chat::{
-    Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction,
-    DeliveryKind, Event, Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role,
-    Skill, SkillReach, SlashCommand, ToolStatus, Usage, clock_label,
+    AgentAddress, Answer, Attachment, AttachmentRules, Capabilities, Choice, Command,
+    CommandAction, DeliveryKind, Event, Field, Item, ItemContent, Launch, Model, Phase, PromptMode,
+    Request, Role, Skill, SkillReach, SlashCommand, ToolStatus, Usage, clock_label,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -701,6 +701,9 @@ struct Claude {
     /// name the agent by this ID, and after `SendMessage` resumes it, by no
     /// tool call of its own.
     agent_calls: VecDeque<(String, String)>,
+    /// The Agent tool calls whose agent ID this conversation has reported,
+    /// so a replayed page does not report again what its history did.
+    addressed_agents: HashSet<String>,
     /// The Agent tool call each agent task Claude reported was started by,
     /// with the task, oldest first: what stopping one subagent addresses,
     /// whether it runs in the foreground or the background.
@@ -1980,6 +1983,15 @@ impl Claude {
                                 // the foreground there unasked.
                                 background: background.then_some(true),
                             });
+                            if let ItemContent::Tool { output, .. } = &item.content
+                                && let Some(address) = agent_address(structured, output)
+                                && self.addressed_agents.insert(tool_id.clone())
+                            {
+                                step.events.push(Event::AgentAddress(AgentAddress {
+                                    address,
+                                    subagent: tool_id.clone(),
+                                }));
+                            }
                         }
                         if let Some(content) = block["content"].as_array() {
                             for (index, attachment) in content
@@ -2844,6 +2856,18 @@ impl Adapter for Claude {
                     background: Some(false),
                 });
             }
+            // Every launch the full history recorded, including those before
+            // the page shown, so a later message to one still names it.
+            let mut addresses = history.agent_addresses.iter().collect::<Vec<_>>();
+            addresses.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
+            for (tool, agent) in addresses {
+                if self.addressed_agents.insert(tool.clone()) {
+                    history_step.events.push(Event::AgentAddress(AgentAddress {
+                        address: agent.clone(),
+                        subagent: tool.clone(),
+                    }));
+                }
+            }
             let mut children = history.subagent_frames().unwrap_or_default();
             // An agent's own background commands are settled by the
             // notifications its sidecar recorded, which follow their launches.
@@ -2883,6 +2907,7 @@ impl Adapter for Claude {
                 match event {
                     Event::Item(item) => items.push(item),
                     Event::Subagent { .. }
+                    | Event::AgentAddress(_)
                     | Event::SubagentItem { .. }
                     | Event::SubagentTextDelta { .. }
                     | Event::SubagentItemsRemoved { .. } => children.push(event),
@@ -4934,6 +4959,22 @@ fn task_status(status: &str, notification: bool) -> Option<ToolStatus> {
     }
 }
 
+/// The agent ID Claude Code gave the agent an `Agent` call started, which
+/// `SendMessage` and `TaskStop` name it by: the structured result's, or the
+/// `agentId: ` line its text carries for the model.
+fn agent_address(structured: &Value, output: &str) -> Option<String> {
+    structured["agentId"]
+        .as_str()
+        .or_else(|| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("agentId: "))
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+}
+
 /// What Claude Code reports about a tool's result beside its text:
 /// `tool_use_result` on the wire and `toolUseResult` in a transcript.
 fn structured_result(frame: &Value) -> &Value {
@@ -6317,6 +6358,9 @@ struct History {
     /// The agent ID Claude Code gave each background agent, which names its
     /// sidecar files.
     agent_ids: HashMap<String, String>,
+    /// The agent ID Claude Code gave each agent, in the foreground or the
+    /// background, which a later `SendMessage` or `TaskStop` addresses it by.
+    agent_addresses: HashMap<String, String>,
     /// The name each Agent call asked its agent to go by. A sidecar records
     /// only the agent's type, which must not rename it on resume.
     agent_names: HashMap<String, String>,
@@ -7207,6 +7251,7 @@ impl History {
             agent_tools: HashMap::new(),
             agent_raw_tools: HashMap::new(),
             agent_ids: HashMap::new(),
+            agent_addresses: HashMap::new(),
             agent_names: HashMap::new(),
             agent_status: HashMap::new(),
             background_agent_tools: HashSet::new(),
@@ -15815,6 +15860,70 @@ mod tests {
         let replayed = adapter.initialize().unwrap();
         assert!(!adapter.background_agents.contains("tool-agent"));
         assert!(replayed.events.iter().rev().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    fn addresses(step: &Step) -> Vec<(&str, &str)> {
+        step.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::AgentAddress(agent) => {
+                    Some((agent.subagent.as_str(), agent.address.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `SendMessage` and `TaskStop` name an agent by the agent ID Claude Code
+    /// gave it, which the conversation learns from the call's result.
+    #[test]
+    fn an_agent_call_reports_the_agent_id_it_is_addressed_by() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"description":"Relocate the repo","prompt":"Move it","run_in_background":true}}]}})).unwrap();
+        let acknowledged = adapter.receive(json!({"type":"user","uuid":"ack","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a1892b93e88999a7d"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Async agent launched successfully."}]}})).unwrap();
+        assert_eq!(
+            addresses(&acknowledged),
+            [("tool-agent", "a1892b93e88999a7d")]
+        );
+        // A result without the structured record still says it to the model.
+        adapter.receive(json!({"type":"assistant","uuid":"ask","message":{"id":"ask","content":[{"type":"tool_use","id":"tool-fore","name":"Agent","input":{"prompt":"Check"}}]}})).unwrap();
+        let answered = adapter.receive(json!({"type":"user","uuid":"answer","message":{"content":[{"type":"tool_result","tool_use_id":"tool-fore","content":"All good.\nagentId: a2b3c4d5e6f7a8b9c (use SendMessage with to: 'a2b3c4d5e6f7a8b9c')\n<usage>total_tokens: 9</usage>"}]}})).unwrap();
+        assert_eq!(addresses(&answered), [("tool-fore", "a2b3c4d5e6f7a8b9c")]);
+        let other = adapter.receive(json!({"type":"assistant","uuid":"bash","message":{"id":"bash","content":[{"type":"tool_use","id":"tool-bash","name":"Bash","input":{"command":"echo 'agentId: x'"}}]}})).unwrap();
+        assert!(addresses(&other).is_empty());
+    }
+
+    /// A reopened conversation knows how to address each agent its whole
+    /// history started, in the background or the foreground, including those
+    /// before the page it shows, and reports each once.
+    #[test]
+    fn replayed_history_reports_the_agent_ids_of_its_agents() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"assistant","uuid":"launch","parentUuid":null,"sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"description":"Relocate the repo","run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"returned","parentUuid":"launch","sessionId":session,"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a1892b93e88999a7d"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Async agent launched successfully."}]}}),
+            // A foreground agent's result names it only to the model.
+            json!({"type":"assistant","uuid":"ask","parentUuid":"returned","sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-fore","name":"Agent","input":{"description":"Check the build"}}]}}),
+            json!({"type":"user","uuid":"answered","parentUuid":"ask","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-fore","content":[{"type":"text","text":"It builds."},{"type":"text","text":"agentId: a2b3c4d5e6f7a8b9c (use SendMessage with to: 'a2b3c4d5e6f7a8b9c')"}]}]}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut adapter = Claude {
+            history: Some(History::index(file, session).unwrap()),
+            ..Claude::default()
+        };
+        let replayed = adapter.initialize().unwrap();
+        let mut reported = addresses(&replayed);
+        reported.sort();
+        assert_eq!(
+            reported,
+            [
+                ("tool-agent", "a1892b93e88999a7d"),
+                ("tool-fore", "a2b3c4d5e6f7a8b9c")
+            ]
+        );
     }
 
     /// A resumed process never started the background agents its history

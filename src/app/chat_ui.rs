@@ -2533,6 +2533,9 @@ pub(super) struct Runtime {
     closed_elsewhere: bool,
     /// The usage limit stopping the conversation, as the daemon judges it.
     usage_limit: Option<crate::agent_execution::directory::UsageLimit>,
+    /// How the provider addresses this conversation's subagents, as the
+    /// daemon last said: what a message card resolves its recipient through.
+    agent_addresses: crate::chat::client::AgentAddresses,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3678,6 +3681,7 @@ impl Runtime {
             connection,
             closed_elsewhere: false,
             usage_limit: None,
+            agent_addresses: Default::default(),
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -11796,6 +11800,7 @@ impl Cagents {
                             state: handle.take_activity(),
                         };
                         runtime.usage_limit = handle.limit();
+                        runtime.agent_addresses = handle.agent_addresses();
                         let limited = runtime.usage_limit.is_some();
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
@@ -11854,6 +11859,12 @@ impl Cagents {
                         runtime.usage_limit = handle.limit();
                         let limited = runtime.usage_limit.is_some();
                         self.sidebar_state.set_card_limited(target.card, limited);
+                        return Task::none();
+                    }
+                    // A card's turn is drawn again only for what its
+                    // fingerprint holds, which counts the addresses.
+                    Wake::AgentAddresses => {
+                        runtime.agent_addresses = handle.agent_addresses();
                         return Task::none();
                     }
                     Wake::Activity => {
@@ -16364,6 +16375,44 @@ mod tests {
         snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
+    }
+
+    /// A message card names the agent it reached by the address the daemon
+    /// says the provider gave it, which arrives apart from the transcript.
+    #[test]
+    fn a_message_card_resolves_its_recipient_once_the_daemon_says_how() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.push(chat::Subagent {
+            id: "toolu_relocate".into(),
+            kind: "general-purpose".into(),
+            description: "Relocate the repo".into(),
+            status: chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        let agent = "a1892b93e88999a7d";
+        assert_eq!(chat_runtime(&app, card).listed_agent_name(agent), None);
+        handle.learn_agent_addresses_for_test(vec![chat::AgentAddress {
+            address: agent.into(),
+            subagent: "toolu_relocate".into(),
+        }]);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::AgentAddresses)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.listed_agent_name(agent).as_deref(),
+            runtime.listed_agent_name("toolu_relocate").as_deref()
+        );
+        assert!(runtime.listed_agent_name(agent).is_some());
     }
 
     #[test]
@@ -33402,6 +33451,7 @@ mod tests {
             Wake::Activity,
             Wake::AccountUsage,
             Wake::Limit,
+            Wake::AgentAddresses,
             Wake::Disconnected("old connection retired".into()),
         ] {
             late_callback(wake);

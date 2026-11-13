@@ -199,7 +199,12 @@ struct Tracked {
     polls_started: u64,
     polls: u64,
     poll_requested: bool,
+    /// A refresh asked for the next poll to read GitHub's listing, not
+    /// only to ask whether it changed.
+    fresh_requested: bool,
     last_poll: Option<Instant>,
+    /// When a poll that read the listing whatever the probe said finished.
+    last_fresh_poll: Option<Instant>,
     next_poll: Instant,
     failures: u32,
     memory: forge::Memory,
@@ -228,7 +233,9 @@ impl Tracked {
             polls_started: 0,
             polls: 0,
             poll_requested: false,
+            fresh_requested: false,
             last_poll: None,
+            last_fresh_poll: None,
             next_poll: Instant::now(),
             failures: 0,
             memory: forge::Memory::default(),
@@ -834,12 +841,16 @@ impl Handle {
                         tracked.scans + 1
                     }
                 });
-                let poll =
-                    (fresh && tracked.forge != Forge::NotGitHub && !recent(tracked.last_poll))
-                        .then(|| {
-                            tracked.poll_requested = true;
-                            tracked.polls_started + 1
-                        });
+                // A poll that only probed can miss what the probe can't see,
+                // such as a rerun check, so only a read listing answers.
+                let poll = (fresh
+                    && tracked.forge != Forge::NotGitHub
+                    && !recent(tracked.last_fresh_poll))
+                .then(|| {
+                    tracked.poll_requested = true;
+                    tracked.fresh_requested = true;
+                    tracked.polls_started + 1
+                });
                 // Unread, listings go stale for minutes; the first read in a
                 // while refreshes them without waiting for the answer.
                 if tracked.failures == 0
@@ -1243,6 +1254,7 @@ impl Handle {
         let now = Instant::now();
         let due = {
             let mut shared = self.shared();
+            let watching = shared.watching;
             shared
                 .projects
                 .iter_mut()
@@ -1273,6 +1285,13 @@ impl Handle {
                     // A request made while this poll runs wants the next one.
                     let requested = tracked.poll_requested;
                     tracked.poll_requested = false;
+                    let freshness = if std::mem::take(&mut tracked.fresh_requested) {
+                        forge::Freshness::Fresh
+                    } else if tracked.being_read(watching) {
+                        forge::Freshness::Watched
+                    } else {
+                        forge::Freshness::Unwatched
+                    };
                     tracked.polls_started += 1;
                     Some((
                         tracked.id,
@@ -1280,11 +1299,12 @@ impl Handle {
                         std::mem::take(&mut tracked.memory),
                         tracked.polls_started,
                         requested,
+                        freshness,
                     ))
                 })
                 .collect::<Vec<_>>()
         };
-        for (id, target, mut memory, sequence, requested) in due {
+        for (id, target, mut memory, sequence, requested, freshness) in due {
             if self.0.cancellation.is_cancelled() {
                 break;
             }
@@ -1305,7 +1325,7 @@ impl Handle {
                     continue;
                 }
             }
-            let outcome = forge::poll(&target, &mut memory, &self.0.cancellation);
+            let outcome = forge::poll(&target, &mut memory, freshness, &self.0.cancellation);
             let synced_at = now_unix_ms();
             // A listing is written when it changes, not every poll; until the
             // first poll after a restart its age reads as when it last did.
@@ -1337,6 +1357,9 @@ impl Handle {
             tracked.memory = memory;
             tracked.polls = sequence;
             tracked.last_poll = Some(Instant::now());
+            if freshness == forge::Freshness::Fresh {
+                tracked.last_fresh_poll = tracked.last_poll;
+            }
             match outcome {
                 forge::Outcome::Synced(snapshot) => {
                     tracked.failures = 0;

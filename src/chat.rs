@@ -1484,6 +1484,19 @@ pub struct Subagent {
     pub items: Vec<std::sync::Arc<Item>>,
 }
 
+/// A subagent as its provider's tools address it, where that is not by the ID
+/// its conversation lists it under: Claude Code names an agent to
+/// `SendMessage`, `TaskStop` and `TaskOutput` by its agent ID, not by the tool
+/// call that started it. Not part of a snapshot, whose layout older peers
+/// share; see `ServerMessage::ChatAgentAddresses`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AgentAddress {
+    /// What the provider calls the agent.
+    pub address: String,
+    /// The ID the conversation's snapshot lists the agent under.
+    pub subagent: String,
+}
+
 impl Subagent {
     /// Delegated work, running or waiting on its own background work, that
     /// cancelling the parent's turn would also stop, where the provider's
@@ -2768,6 +2781,9 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// How the provider addresses a subagent, which it says only once the
+    /// agent has started.
+    AgentAddress(AgentAddress),
 }
 
 #[cfg(test)]

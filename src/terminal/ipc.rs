@@ -224,7 +224,10 @@ use crate::{
 /// Version 172 appends the worktrees a conversation edited to
 /// `ConversationPullRequests`. 167 to 171 are reserved for parallel branches
 /// and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 172;
+/// Version 173 appends `ServerMessage::ChatAgentAddresses`, which says how a
+/// provider addresses a chat's subagents. Snapshots keep their layout, which
+/// the update sources share.
+pub const PROTOCOL_VERSION: u16 = 173;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -882,6 +885,15 @@ pub enum ServerMessage {
     ChatLimit {
         chat_id: TerminalId,
         limit: Option<crate::agent_execution::directory::UsageLimit>,
+    },
+    /// Every address the provider gave a native chat's subagents, such as the
+    /// agent IDs Claude Code's `SendMessage` names them by, with the ID its
+    /// snapshot lists each under. Addresses only accumulate, so a receiver
+    /// keeps every one it was sent. Delivered to every subscriber whatever its
+    /// visibility, whenever one is learned and once to each new subscriber.
+    ChatAgentAddresses {
+        chat_id: TerminalId,
+        addresses: Vec<crate::chat::AgentAddress>,
     },
 }
 

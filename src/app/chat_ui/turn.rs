@@ -197,18 +197,22 @@ impl Turn {
             steps => summarize_steps(steps, items, presented)
                 .unwrap_or_else(|| format!("{} steps", steps.len())),
         };
+        self.summary.push_str(self.state_suffix());
+    }
+
+    /// How the group stands, as the end of its summary line.
+    pub(super) fn state_suffix(&self) -> &'static str {
         // Still working outranks how the finished steps went, because a
         // reader deciding whether to wait needs that first.
         if self.running {
-            self.summary.push_str(" · working");
-            return;
+            return " · working";
         }
         match self.outcome {
-            Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
-            Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
-            Some(ToolStatus::Stopped) => self.summary.push_str(" · stopped"),
-            Some(ToolStatus::Waiting) => self.summary.push_str(" · waiting on background work"),
-            Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => {}
+            Some(ToolStatus::Failed) => " · failed",
+            Some(ToolStatus::Denied) => " · denied",
+            Some(ToolStatus::Stopped) => " · stopped",
+            Some(ToolStatus::Waiting) => " · waiting on background work",
+            Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => "",
         }
     }
 
@@ -757,7 +761,7 @@ const SUMMARY_LIMIT: usize = 240;
 /// A single step's summary, on one line and bounded for the strip.
 /// Text cut from it, a later line or the end of a long one, is marked with an
 /// ellipsis; the full text stays in the open step.
-fn headline(summary: String) -> String {
+pub(super) fn headline(summary: String) -> String {
     let line = first_line_of(&summary);
     let more_lines = line.len() < summary.trim().len();
     if !more_lines && line.len() == summary.len() && line.chars().count() <= SUMMARY_LIMIT {

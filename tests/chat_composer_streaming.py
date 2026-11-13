@@ -242,6 +242,49 @@ class Streaming(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("fixture-stream-reply must hold seconds", result.stderr)
 
+    def test_the_second_line_sets_the_characters_per_delta(self):
+        # Slicing is by character, so multibyte text must survive the split.
+        text = "Token-sized deltas approximate a provider's stream: é😀中. " * 20
+        self.reply.write_text(text)
+        (self.config / "fixture-stream-reply").write_text("0\n24\n")
+        result = subprocess.run(
+            [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
+            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chunks = [f["event"]["delta"]["text"]
+                  for f in map(json.loads, result.stdout.splitlines()) if delta(f)]
+        self.assertEqual("".join(chunks), text)
+        self.assertEqual({len(chunk) for chunk in chunks[:-1]}, {24})
+        self.assertEqual(len(chunks), -(-len(text) // 24))
+
+    def test_a_delay_alone_keeps_the_default_delta_size(self):
+        text = "x" * 16385
+        self.reply.write_text(text)
+        (self.config / "fixture-stream-reply").write_text("0\n")
+        result = subprocess.run(
+            [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
+            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chunks = [f["event"]["delta"]["text"]
+                  for f in map(json.loads, result.stdout.splitlines()) if delta(f)]
+        self.assertEqual([len(chunk) for chunk in chunks], [16384, 1])
+
+    def test_invalid_delta_sizes_fail_with_a_fixture_error(self):
+        for value in ("0", "-4", "many", "1.5"):
+            with self.subTest(value=value):
+                (self.config / "fixture-stream-reply").write_text("0.1\n" + value + "\n")
+                result = subprocess.run([str(SCRIPT)], cwd=self.project, input="", text=True,
+                                        capture_output=True, timeout=5,
+                                        env={"HOME": str(self.config.parent),
+                                             "CLAUDE_CONFIG_DIR": str(self.config),
+                                             "PATH": "/usr/local/bin:/usr/bin:/bin"})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("second line must be a positive number", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

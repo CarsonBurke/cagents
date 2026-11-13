@@ -1715,7 +1715,9 @@ exec(compile(code, "native-evidence copy helper", "exec"))
                 "headRepositoryOwner": {"login": "octo-org"}, "updatedAt": "2026-11-01T00:00:00Z"}
         (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
             {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
-             "author": {"login": "fixture"}, "url": "https://github.com/octo-org/app/pull/7"},
+             "author": {"login": "fixture"}, "url": "https://github.com/octo-org/app/pull/7",
+             "statusCheckRollup": [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                                    "conclusion": "SUCCESS", "workflowName": "CI"}]},
             {**pull, "number": 8, "title": "Merged", "state": "MERGED", "headRefName": "done",
              "author": {"login": "someone"}, "url": "https://github.com/octo-org/app/pull/8"},
             {**pull, "number": 9, "title": "Elsewhere", "state": "OPEN", "headRefName": "feature",
@@ -1734,6 +1736,38 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.assertEqual(numbers("--state all --head done --json number"), [8])
         self.assertEqual(numbers("--state all --author @me --json number"), [7])
         self.assertEqual(numbers("--state=all --head=done --json=number"), [8])
+        # The Work board's one document: both searches, the viewer, and each
+        # check run's workflow where GraphQL puts it.
+        authored = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query CagentsAuthoredPullRequests"
+            "($open:String!,$all:String!,$openLimit:Int!,$allLimit:Int!){viewer{login}}' "
+            "-f 'open=repo:Octo-Org/app is:pr author:@me sort:updated-desc is:open' "
+            "-f 'all=repo:Octo-Org/app is:pr author:@me sort:updated-desc' "
+            "-F openLimit=50 -F allLimit=100").stdout)["data"]
+        self.assertEqual(authored["viewer"], {"login": "fixture"})
+        self.assertEqual([node["number"] for node in authored["all"]["nodes"]], [7])
+        (opened,) = authored["open"]["nodes"]
+        self.assertEqual(opened["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"],
+                         [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                           "conclusion": "SUCCESS", "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}}])
+        # Its probe: the viewer's latest changes, free to ask again while unchanged,
+        # dated by the forge's clock as GitHub dates its answers.
+        probe = "gh api --include --hostname github.com --method GET " \
+            "'repos/Octo-Org/app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=20'"
+        first = self.fixture_shell(probe)
+        head, body = first.stdout.split("\n\n", 1)
+        self.assertEqual([(row["number"], row["updated_at"], "pull_request" in row) for row in json.loads(body)],
+                         [(7, "2026-11-01T00:00:00Z", True)])
+        self.assertRegex(head, r"(?m)^Date: \w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT$")
+        # The sidebar's and review scan's: everyone's, as many as asked for.
+        everyone = self.fixture_shell(
+            "gh api --hostname github.com --method GET "
+            "'repos/Octo-Org/app/issues?state=all&sort=updated&direction=desc&per_page=1'")
+        self.assertEqual(len(json.loads(everyone.stdout)), 1)
+        (etag,) = re.findall(r"^Etag: (.+)$", head, re.MULTILINE)
+        again = self.fixture_shell(f"{probe} -H 'If-None-Match: {etag}'", check=False)
+        self.assertEqual((again.returncode, again.stderr), (1, "gh: HTTP 304\n"))
+        self.assertTrue(again.stdout.startswith("HTTP/2.0 304 Not Modified\n"))
         # Only the requested fields, as gh prints them.
         self.assertEqual(json.loads(self.fixture_shell(
             f"gh pr view 7 {selector} --json number,headRefName").stdout),

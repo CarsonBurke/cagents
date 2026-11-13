@@ -1624,11 +1624,16 @@ fn process_admitted_request(
         | ClientRequest::ChatReleaseInspect { .. }
         | ClientRequest::ChatRelease { .. }) => {
             let response = super::chat::process(host, client_id, request)?;
-            // The courier tells a new subscriber the conversation's usage limit.
-            if matches!(response, ServerResponse::ChatAttached { .. }) {
+            let mut extras = Vec::new();
+            if let ServerResponse::ChatAttached { session, .. } = &response {
+                // The courier tells a new subscriber the conversation's usage limit.
                 super::agent_execution::mailbox::wake(host);
+                // A subscriber hears of addresses only as they are learned,
+                // so it is told those known already. They only accumulate, so
+                // this and a concurrent change may arrive in either order.
+                extras.extend(super::chat::agent_addresses(host, session.id));
             }
-            Ok((response, Vec::new(), false))
+            Ok((response, extras, false))
         }
         ClientRequest::Connect { .. } => Err(ProtocolError::new(
             ProtocolErrorCode::AlreadyConnected,
