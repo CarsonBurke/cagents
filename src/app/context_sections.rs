@@ -1,12 +1,16 @@
-//! The context inspector as vertical, collapsible sections.
+//! A pane's inspector as vertical, collapsible sections.
 //!
-//! A channel's conversation is the inspector's subject, so it leads with what
-//! that conversation produced: its Work, each pull request it worked on and
-//! each worktree it edited. Beneath it, one switch shows the changes or files
-//! of the work chosen there, and its header names that work, so the changes
-//! shown never belong to a worktree the reader has to guess at. A focused
-//! editor adds what its language server found. Each section says how much it
-//! holds in its header, so a collapsed one still reads at a glance.
+//! A chat pane's conversation is its inspector's subject, so it leads with
+//! what that conversation produced: its Work, each pull request it worked on
+//! and each worktree it edited, then the pull requests it only Mentioned.
+//! Beneath them, one switch shows the changes or files of the work chosen
+//! there, and its header names that work, so the changes shown never belong
+//! to a worktree the reader has to guess at. An editor pane adds what its
+//! language server found. Each section says how much it holds in its header,
+//! so a collapsed one still reads at a glance.
+//!
+//! Which sections are expanded is the window's, so every pane's inspector
+//! folds the same way.
 //!
 //! Expanded sections share the panel's height the way a stack of panes does:
 //! the worktree's tree takes what is left, and the short lists take only the
@@ -19,6 +23,8 @@ use super::*;
 pub enum Section {
     /// The pull requests and worktrees the inspected conversation worked on.
     Work,
+    /// The pull requests the inspected conversation only mentioned.
+    Mentioned,
     /// The active worktree's changes or files, whichever [`WorkspaceView`]
     /// is chosen.
     Workspace,
@@ -61,6 +67,7 @@ impl WorkspaceView {
 pub struct Sections {
     #[serde(alias = "pull_requests")]
     work: bool,
+    mentioned: bool,
     workspace: bool,
     problems: bool,
     locations: bool,
@@ -73,6 +80,7 @@ impl Default for Sections {
     fn default() -> Self {
         Self {
             work: true,
+            mentioned: false,
             workspace: false,
             problems: true,
             locations: true,
@@ -85,6 +93,7 @@ impl Sections {
     pub fn is_open(self, section: Section) -> bool {
         match section {
             Section::Work => self.work,
+            Section::Mentioned => self.mentioned,
             Section::Workspace => self.workspace,
             Section::Problems => self.problems,
             Section::Locations => self.locations,
@@ -94,6 +103,7 @@ impl Sections {
     pub fn set_open(&mut self, section: Section, open: bool) {
         *match section {
             Section::Work => &mut self.work,
+            Section::Mentioned => &mut self.mentioned,
             Section::Workspace => &mut self.workspace,
             Section::Problems => &mut self.problems,
             Section::Locations => &mut self.locations,
@@ -122,7 +132,8 @@ enum Height {
 /// row shows there is more.
 const LIST_ROWS_SHOWN: f32 = 5.5;
 
-/// A section header's height: a dense row and its padding.
+/// A section header's height: a dense row and its padding. Every section,
+/// expanded or not, has one, with a rule after it.
 const SECTION_HEADER_HEIGHT: f32 = design::DENSE_ROW_HEIGHT + 2.0 * space::XXS;
 
 /// The height a short list of two-line rows takes before it scrolls.
@@ -157,11 +168,11 @@ struct Pane<'a> {
 }
 
 impl Cagents {
-    /// Whether the workspace section is all the inspector has: no
+    /// Whether the workspace section is all `card`'s inspector has: no
     /// conversation's pull requests or worktrees lead it. It is then shown
     /// rather than left as a lone collapsed header over an empty panel.
-    fn workspace_alone(&self) -> bool {
-        !self.work_listed()
+    fn workspace_alone(&self, card: CardId) -> bool {
+        !self.work_listed(card) && !self.mentions_listed(card)
     }
 
     /// An estimate of the sections' height until they have been laid out:
@@ -175,14 +186,16 @@ impl Cagents {
         self.window_height - design::HEADER_HEIGHT - design::BORDER_WIDTH - status
     }
 
-    fn workspace_open(&self) -> bool {
-        self.workspace_alone() || self.context_sections.is_open(Section::Workspace)
+    fn workspace_open(&self, card: CardId) -> bool {
+        self.context_sections.is_open(Section::Workspace) || self.workspace_alone(card)
     }
 
-    /// The workspace section's view while it is expanded. A folder that is
-    /// not a Git worktree has only its files.
+    /// The workspace section's view while the inspector that draws source
+    /// control and files has it expanded. A folder that is not a Git
+    /// worktree has only its files.
     pub(super) fn workspace_view_shown(&self) -> Option<WorkspaceView> {
-        self.workspace_open().then(|| self.workspace_view())
+        let owner = self.pane_inspectors.source_control()?;
+        self.workspace_open(owner).then(|| self.workspace_view())
     }
 
     pub(super) fn workspace_view(&self) -> WorkspaceView {
@@ -196,8 +209,6 @@ impl Cagents {
     pub(super) fn handle_context_section(&mut self, action: Action) -> Task<Message> {
         let before = self.workspace_view_shown();
         match action {
-            // Shown because it is alone, it has nothing to collapse into.
-            Action::Toggle(Section::Workspace) if self.workspace_alone() => return Task::none(),
             Action::Toggle(section) => {
                 let open = !self.context_sections.is_open(section);
                 self.context_sections.set_open(section, open);
@@ -221,22 +232,44 @@ impl Cagents {
         Task::batch([save, reload])
     }
 
-    /// Expands `section` and opens the inspector, for a command that shows
-    /// its result there.
-    pub(super) fn reveal_context_section(&mut self, section: Section) {
+    /// Expands `section` and opens `card`'s inspector, for a command that
+    /// shows its result there.
+    pub(super) fn reveal_context_section(
+        &mut self,
+        card: CardId,
+        section: Section,
+    ) -> Task<Message> {
+        let expanded = !self.context_sections.is_open(section);
         self.context_sections.set_open(section, true);
-        self.context_inspector_open = true;
+        let open = self.set_pane_inspector_open(card, true);
+        if expanded {
+            Task::batch([open, self.save_settings_task(false)])
+        } else {
+            open
+        }
     }
 
-    /// The inspector's sections beneath its header.
-    pub(super) fn context_sections_view(&self, width: f32) -> Element<'_, Message> {
-        let mut panes = Vec::with_capacity(5);
-        let work = self.work_summary();
-        if self.work_listed() {
-            panes.push(self.work_pane(&work));
+    /// `card`'s inspector's sections, the first of whose headers ends with
+    /// the inspector's `toggle`.
+    pub(super) fn context_sections_view<'a>(
+        &'a self,
+        card: CardId,
+        width: f32,
+        toggle: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let mut panes = Vec::with_capacity(6);
+        let work = self.work_summary(card);
+        if self.work_listed(card) {
+            panes.push(self.work_pane(card, &work));
         }
-        panes.push(self.workspace_pane(width, work.scope.clone()));
-        panes.extend(self.language_server_panes());
+        if work.mentioned > 0 {
+            panes.push(self.mentioned_pane(card, &work));
+        }
+        panes.push(self.workspace_pane(card, width, work.scope.clone()));
+        panes.extend(self.language_server_panes(card));
+        if let Some(first) = panes.first_mut() {
+            first.controls.push(toggle);
+        }
         let shared = panes
             .iter()
             .any(|pane| pane.body.is_some() && pane.height == Height::Share);
@@ -276,6 +309,7 @@ impl Cagents {
             } = pane;
             let open = body.is_some();
             children.push(self.section_header(
+                card,
                 section,
                 title,
                 count,
@@ -316,6 +350,7 @@ impl Cagents {
 
     fn section_header<'a>(
         &self,
+        card: CardId,
         section: Section,
         title: Cow<'a, str>,
         count: Option<Count>,
@@ -326,7 +361,7 @@ impl Cagents {
     ) -> Element<'a, Message> {
         // The workspace section shown because it is alone has nothing to
         // collapse into, so it draws no disclosure.
-        let collapsible = !(section == Section::Workspace && self.workspace_alone());
+        let collapsible = !(section == Section::Workspace && self.workspace_alone(card));
         let mut name = if collapsible {
             format!(
                 "{title} section, {}",
@@ -337,8 +372,7 @@ impl Cagents {
         };
         let mut label: Vec<Element<'a, Message>> = Vec::with_capacity(4);
         label.push(
-            design::caption(title)
-                .font(design::heading_font())
+            design::section_heading(title)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         );
@@ -346,7 +380,8 @@ impl Cagents {
             name.push_str(", ");
             name.push_str(description.as_deref().unwrap_or(&count));
             label.push(
-                design::caption(count)
+                design::section_heading(count)
+                    .font(cosmic::font::default())
                     .wrapping(iced::widget::text::Wrapping::None)
                     .class(cosmic::theme::Text::Custom(style))
                     .into(),
@@ -359,6 +394,7 @@ impl Cagents {
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
                     design::caption(scope)
+                        .size(design::TEXT_DESCRIPTION)
                         .wrapping(iced::widget::text::Wrapping::None)
                         .ellipsize(iced::widget::text::Ellipsize::End(
                             iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -424,13 +460,13 @@ impl Cagents {
         .into()
     }
 
-    fn work_pane(&self, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
+    fn work_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Work);
         let count = work.count;
         Pane {
             section: Section::Work,
             title: "Work".into(),
-            count: (count > 0).then(|| (count.to_string(), design::muted_text as _)),
+            count: (count > 0).then(|| (count.to_string(), design::faint_text as _)),
             scope: None,
             description: None,
             controls: Vec::new(),
@@ -445,21 +481,59 @@ impl Cagents {
                     .min(list_height(LIST_ROWS_SHOWN) + work.height.expanded)
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| self.work_section(work)),
+            body: open.then(|| self.work_section(card, work)),
         }
     }
 
-    fn workspace_pane(&self, width: f32, scope: pull_request_ui::WorkScope) -> Pane<'_> {
-        let open = self.workspace_open();
+    fn mentioned_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
+        let open = self.context_sections.is_open(Section::Mentioned);
+        let count = work.mentioned;
+        Pane {
+            section: Section::Mentioned,
+            title: "Mentioned".into(),
+            count: Some((count.to_string(), design::faint_text as _)),
+            scope: None,
+            description: Some(format!(
+                "{count} mentioned pull request{}",
+                if count == 1 { "" } else { "s" }
+            )),
+            controls: Vec::new(),
+            height: Height::Content {
+                height: work
+                    .mentioned_height
+                    .content
+                    .min(list_height(LIST_ROWS_SHOWN) + work.mentioned_height.expanded)
+                    + 2.0 * pull_request_ui::WORK_LIST_PADDING,
+            },
+            body: open.then(|| self.mentioned_section(card, work)),
+        }
+    }
+
+    fn workspace_pane(
+        &self,
+        card: CardId,
+        width: f32,
+        scope: pull_request_ui::WorkScope,
+    ) -> Pane<'_> {
+        let open = self.workspace_open(card);
         let view = self.workspace_view();
         let git = !self.active_folder_scope();
+        // Only one inspector draws the window's source control and files;
+        // another names its own worktree's changes and offers to show them.
+        let owner = self.pane_shows_source_control(card);
         // Work this window cannot read has no changes to count; the panels'
         // figures would be the focused worktree's.
         let readable = matches!(
             scope,
             pull_request_ui::WorkScope::Focus | pull_request_ui::WorkScope::Worktree { .. }
         );
-        let indicators = (git && readable).then(|| self.context_rail_indicators());
+        let indicators = (git && readable).then(|| {
+            if owner {
+                self.context_rail_indicators()
+            } else {
+                self.pane_worktree_indicators(card, &scope)
+            }
+        });
         // Uncommitted changes are what source control lists; beside Files the
         // same figure would read as a number of files.
         let (count, description) = match indicators {
@@ -468,7 +542,7 @@ impl Cagents {
                 dirty_count: Some(count),
                 ..
             }) if view == WorkspaceView::SourceControl => (
-                Some((count.to_string(), design::warning_text as _)),
+                Some((count.to_string(), design::faint_text as _)),
                 Some(dirty.to_owned()),
             ),
             _ => (None, None),
@@ -499,7 +573,7 @@ impl Cagents {
         // Open source control names its branch in its own first row, so the
         // header names the work only where nothing beneath does. A remote
         // device's panels show the device, not this work.
-        let named_beneath = open && readable && view == WorkspaceView::SourceControl;
+        let named_beneath = open && owner && readable && view == WorkspaceView::SourceControl;
         let header = (!named_beneath && !crate::device::is_remote())
             .then(|| scope.header().map(|(icon, label)| (icon, label.to_owned())))
             .flatten();
@@ -519,6 +593,7 @@ impl Cagents {
                     ..
                 } => self.elsewhere_body(repository, number, url),
                 pull_request_ui::WorkScope::Unlisted { label } => self.unlisted_body(label),
+                _ if !owner => self.elsewhere_pane_body(card, view),
                 _ => self.workspace_body(view, width),
             }),
         }
@@ -567,6 +642,60 @@ impl Cagents {
         .padding(space::L)
         .width(Length::Fill)
         .into()
+    }
+
+    /// Another open inspector draws the window's source control and files,
+    /// which this pane's shows once it is focused.
+    fn elsewhere_pane_body(&self, card: CardId, view: WorkspaceView) -> Element<'_, Message> {
+        widget::container(
+            widget::column::with_children(vec![
+                design::description(format!(
+                    "{} show in one inspector at a time.",
+                    match view {
+                        WorkspaceView::SourceControl => "Changes",
+                        WorkspaceView::Files => "Files",
+                    }
+                ))
+                .into(),
+                crate::ui_controls::button::secondary("Show here")
+                    .name(match view {
+                        WorkspaceView::SourceControl => "Show this pane's changes here",
+                        WorkspaceView::Files => "Show this pane's files here",
+                    })
+                    .on_press_maybe((!self.modal_is_open()).then_some(Message::FocusCard(card)))
+                    .into(),
+            ])
+            .spacing(space::S)
+            .width(Length::Fill),
+        )
+        .padding(space::L)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// The indicators of the worktree `card`'s inspector speaks for when it
+    /// does not draw source control: the work it shows, else its card's own.
+    fn pane_worktree_indicators(
+        &self,
+        card: CardId,
+        scope: &pull_request_ui::WorkScope,
+    ) -> sidebar::WorktreeIndicators<'_> {
+        let path = match scope {
+            pull_request_ui::WorkScope::Worktree { path, .. } => Some(path.as_path()),
+            _ => self
+                .card_state(card)
+                .and_then(super::worktree_ui::card_directory),
+        };
+        path.and_then(|path| self.sidebar_model.worktree_at(path))
+            .and_then(|key| {
+                self.sidebar_model
+                    .project(key.project_id)?
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == key.worktree_id)
+            })
+            .map(sidebar::worktree_indicators)
+            .unwrap_or_default()
     }
 
     /// A worktree Projects does not list: this window reads only those, so
@@ -668,15 +797,13 @@ impl Cagents {
         .into()
     }
 
-    /// The focused editor's Problems and its definition or references
-    /// results, when it has them.
-    fn language_server_panes(&self) -> Vec<Pane<'_>> {
-        let Some((card, lsp)) = self.workspace.focused().and_then(|card| {
-            matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
-                .then(|| self.lsp_context(card))
-                .flatten()
-                .map(|lsp| (card, lsp))
-        }) else {
+    /// An editor pane's Problems and its definition or references results,
+    /// when it has them.
+    fn language_server_panes(&self, card: CardId) -> Vec<Pane<'_>> {
+        let Some(lsp) = matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
+            .then(|| self.lsp_context(card))
+            .flatten()
+        else {
             return Vec::new();
         };
         let dismiss = || -> Element<'_, Message> {
@@ -740,6 +867,10 @@ mod tests {
             assert!(sections.is_open(section), "{section:?} starts collapsed");
         }
         assert!(!sections.is_open(Section::Workspace));
+        assert!(
+            !sections.is_open(Section::Mentioned),
+            "mentions wait to be asked for"
+        );
         assert_eq!(sections.workspace_view, WorkspaceView::SourceControl);
     }
 
@@ -763,6 +894,7 @@ mod tests {
     fn each_section_toggles_alone() {
         for section in [
             Section::Work,
+            Section::Mentioned,
             Section::Workspace,
             Section::Problems,
             Section::Locations,
@@ -800,19 +932,16 @@ mod tests {
     #[test]
     fn a_workspace_section_with_nothing_above_it_is_shown_and_stays_shown() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = true;
+        let card = app.workspace.focused().unwrap();
         app.context_sections.set_open(Section::Workspace, false);
+        // A closed inspector draws nothing.
+        assert_eq!(app.workspace_view_shown(), None);
+        app.open_pane_inspector_now(card);
         // Left collapsed, it would be one header over an empty panel.
         assert_eq!(
             app.workspace_view_shown(),
             Some(WorkspaceView::SourceControl)
         );
-        let _ = app.update(Message::ContextSection(Action::Toggle(Section::Workspace)));
-        assert_eq!(
-            app.workspace_view_shown(),
-            Some(WorkspaceView::SourceControl)
-        );
-        assert!(!app.context_sections.is_open(Section::Workspace));
         let _ = app.update(Message::ContextSection(Action::Show(WorkspaceView::Files)));
         assert_eq!(app.workspace_view_shown(), Some(WorkspaceView::Files));
     }
@@ -820,10 +949,10 @@ mod tests {
     #[test]
     fn revealing_a_result_opens_its_section_and_the_inspector() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
         app.context_sections.set_open(Section::Problems, false);
-        app.reveal_context_section(Section::Problems);
-        assert!(app.context_inspector_open);
+        drop(app.reveal_context_section(card, Section::Problems));
+        assert!(app.pane_inspectors.is_open(card));
         assert!(app.context_sections.is_open(Section::Problems));
     }
 }

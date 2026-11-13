@@ -342,11 +342,6 @@ impl Cagents {
         key: ActiveWorktreeKey,
         open: impl FnOnce(CardId) -> RepositoryAction,
     ) -> Task<Message> {
-        let overlay = if self.context_inspector_is_overlay() {
-            self.set_context_inspector_open(false)
-        } else {
-            Task::none()
-        };
         // A historical path may be deleted, renamed, or never exist in the
         // working file list. Do not park behind or emit OpenFile/RefreshFiles.
         self.pending_panel_open = None;
@@ -363,10 +358,10 @@ impl Cagents {
             ),
         };
         let Some(card) = self.repository_card_for(&key.canonical_path) else {
-            return overlay.chain(prepare);
+            return prepare;
         };
         let open = cosmic::task::message(Message::Repository(open(card)));
-        Task::batch([overlay, prepare, open])
+        Task::batch([prepare, open])
     }
 }
 

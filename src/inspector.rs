@@ -321,7 +321,6 @@ pub fn mount_for_width(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorAction {
-    Close,
     Resize {
         width: f32,
     },

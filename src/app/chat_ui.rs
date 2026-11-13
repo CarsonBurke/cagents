@@ -6793,11 +6793,6 @@ impl Cagents {
         // A conversation counts as watched once the shown inspector holds a
         // list taken since it last turned to it, not merely while it is shown:
         // until then what a chat took earlier may no longer be true.
-        let watched = self.inspector_watched_conversation().filter(|watched| {
-            self.pull_request_inspector
-                .conversation_list()
-                .is_some_and(|(listed, _, _)| listed == *watched)
-        });
         let stale = self
             .cards
             .iter()
@@ -6808,7 +6803,11 @@ impl Cagents {
                         board,
                         worktrees,
                         conversation,
-                        watched: watched == Some(conversation),
+                        watched: self.inspector_watches(conversation)
+                            && self
+                                .pull_request_inspector
+                                .conversation_list(conversation)
+                                .is_some(),
                     };
                     (runtime.pull_request_labels_built_from != Some(built_from))
                         .then_some((*card, built_from))
@@ -6844,9 +6843,8 @@ impl Cagents {
         }
         // A list the inspector took before this runtime existed, or while it
         // was parked, is still the latest for its conversation.
-        if let Some((conversation, revision, list)) =
-            self.pull_request_inspector.conversation_list()
-            && conversation == runtime.session.id
+        let conversation = runtime.session.id;
+        if let Some((revision, list)) = self.pull_request_inspector.conversation_list(conversation)
         {
             runtime
                 .pull_request_inspected
@@ -6882,7 +6880,7 @@ impl Cagents {
             board: self.pull_request_board.generation(),
             worktrees: self.worktree_paths.generation(),
             conversation: *conversation,
-            watched: self.inspector_watched_conversation() == Some(*conversation),
+            watched: self.inspector_watches(*conversation),
         };
         let changed = self
             .cards
@@ -8642,8 +8640,7 @@ impl Cagents {
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
-        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-            && self.workspace_surfaces_visible();
+        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
             target,
             session,
@@ -9714,8 +9711,7 @@ impl Cagents {
             runtime.capacity_refused = false;
         }
         let selection = None;
-        let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-            && self.workspace_surfaces_visible();
+        let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -11661,8 +11657,7 @@ impl Cagents {
                         };
                         handle.take_observed();
                         let visible = self.workspace.visibility(target.card)
-                            == Some(VisibilityClass::Visible)
-                            && self.workspace_surfaces_visible();
+                            == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             // A provider that ended took its queue with it,
                             // whichever daemon starts the next one.
@@ -15298,9 +15293,9 @@ mod tests {
         assert!(app.chat_ui.image_viewer.is_some());
         assert!(app.modal_is_open());
         assert!(app.dialog().is_some());
-        let before = app.context_inspector_open;
+        let before = app.pane_inspectors.visible().count();
         drop(app.update(Message::ToggleContextInspector));
-        assert_eq!(app.context_inspector_open, before);
+        assert_eq!(app.pane_inspectors.visible().count(), before);
         assert!(Action::ImageNext(true).allowed_while_modal());
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));
@@ -19573,7 +19568,7 @@ mod tests {
     fn captured_escape_closes_model_search_without_closing_the_inspector() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
-        app.context_inspector_open = true;
+        app.open_pane_inspector_now(card);
         drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
         assert!(chat_runtime(&app, card).model_picker.is_some());
         drop(app.update(Message::KeyEvent {
@@ -19589,7 +19584,7 @@ mod tests {
             captured: true,
         }));
         assert!(chat_runtime(&app, card).model_picker.is_none());
-        assert!(app.context_inspector_open);
+        assert!(app.pane_inspectors.is_open(card));
     }
 
     #[test]
@@ -22389,7 +22384,9 @@ mod tests {
     #[test]
     fn a_chat_labels_its_links_from_the_projects_and_the_inspector() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1600.0);
         let card = live_chat(&mut app, Some("session"));
+        app.open_pane_inspector_now(card);
         let project = ProjectId::new();
         let mut listed = SidebarPullRequest::new(
             project,
@@ -22472,11 +22469,11 @@ mod tests {
         // Once the inspector is closed nothing keeps its list current, so a
         // pull request only it named keeps its title but no longer claims a
         // state; what a project lists is still kept current by its poll.
-        assert_eq!(app.inspector_watched_conversation(), Some(conversation));
-        app.context_inspector_open = false;
-        app.context_inspector_transition = None;
+        assert!(app.inspector_watches(conversation));
+        drop(app.set_pane_inspector_open(card, false));
+        app.settle_pane_inspectors();
         drop(app.update(Message::ChatUi(Action::Tick)));
-        assert_eq!(app.inspector_watched_conversation(), None);
+        assert!(!app.inspector_watches(conversation));
         assert_eq!(label(&app, 21).glyph, None);
         assert!(label(&app, 21).text.len() > "#21".len(), "keeps its title");
         assert!(
@@ -22488,7 +22485,7 @@ mod tests {
             label(&app, 20).glyph,
             Some(crate::sidebar::WorktreePullRequestState::Merged)
         );
-        app.context_inspector_open = true;
+        app.open_pane_inspector_now(card);
         drop(app.update(Message::ChatUi(Action::Tick)));
         assert_eq!(
             label(&app, 21).glyph,
@@ -22496,26 +22493,22 @@ mod tests {
             "watched again"
         );
 
-        // Turning to another conversation and back starts the inspector's
-        // list afresh, so what the chat took before is no longer vouched for
-        // until the inspector lists the conversation again.
+        // Each pane's inspector watches its own conversation: focusing
+        // another pane, or opening its inspector too, leaves this one's list
+        // vouched for.
         let other = live_chat(&mut app, Some("other-session"));
+        let other_conversation = chat_runtime(&app, other).session.id;
         drop(app.update(Message::FocusCard(other)));
         drop(app.update(Message::ChatUi(Action::Tick)));
-        assert_ne!(app.inspector_watched_conversation(), Some(conversation));
-        assert_eq!(label(&app, 21).glyph, None);
-        drop(app.update(Message::FocusCard(card)));
+        assert!(app.inspector_watches(conversation));
+        assert!(!app.inspector_watches(other_conversation));
+        app.open_pane_inspector_now(other);
         drop(app.update(Message::ChatUi(Action::Tick)));
-        assert_eq!(app.inspector_watched_conversation(), Some(conversation));
-        assert_eq!(label(&app, 21).glyph, None, "not listed since");
-        assert!(label(&app, 21).text.len() > "#21".len(), "keeps its title");
-        drop(app.update(Message::PullRequestUi(
-            crate::app::pull_request_ui::Action::Conversation(watch(conversation)),
-        )));
+        assert!(app.inspector_watches(conversation) && app.inspector_watches(other_conversation));
         assert_eq!(
             label(&app, 21).glyph,
             Some(crate::sidebar::WorktreePullRequestState::Merged),
-            "listed again"
+            "still watched"
         );
     }
 
@@ -28883,7 +28876,6 @@ mod tests {
     fn attention_session_click_reveals_the_parent_before_reading_its_notice() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
-        app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         let target = chat_runtime(&app, card).target;
         let source = chat_runtime(&app, card).session.clone();
@@ -30385,7 +30377,6 @@ mod tests {
             "reported filesystem target"
         );
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         app.settings.editor_auto_save = false;
         app.workspace.resize_viewport(1200.0);
         let card = live_chat(&mut app, Some("reported-file-route"));

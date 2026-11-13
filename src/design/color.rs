@@ -234,6 +234,18 @@ pub fn muted_text(theme: &Theme) -> text::Style {
     ink(muted_color(theme))
 }
 
+/// A step quieter than [`muted_text`], for a figure beside a muted label
+/// that it qualifies, such as a section header's count. Mixed toward the
+/// surface rather than faded, so it stays legible on every theme.
+pub fn faint_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.62)
+}
+
+pub fn faint_text(theme: &Theme) -> text::Style {
+    ink(faint_color(theme))
+}
+
 /// Text that reports a failure the reader is expected to act on.
 pub fn warning_text(theme: &Theme) -> text::Style {
     ink(warning_color(theme))

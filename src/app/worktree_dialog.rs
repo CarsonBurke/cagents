@@ -436,7 +436,7 @@ impl Cagents {
                 let start = self.start_worktree_operation(project_id, request, Some(draft));
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
-                    None => self.focus_context_overlay_if_exposed(),
+                    None => Task::none(),
                 };
                 Task::batch([start, focus])
             }

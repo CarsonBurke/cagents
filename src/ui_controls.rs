@@ -12,6 +12,7 @@ pub mod field;
 mod find_options;
 pub use find_options::{FindOption, find_options};
 mod gauge;
+pub mod hover_reveal;
 mod icon;
 mod icon_button;
 mod labeled_controls;

@@ -288,8 +288,7 @@ impl Cagents {
                 tasks.push(repository_task(runtime.refresh_visible(card)));
             }
         }
-        if self.context_inspector_open
-            && self.workspace_view_shown().is_some()
+        if self.workspace_view_shown().is_some()
             && self.refresh_ui.source_cancel.is_none()
             && let Some(key) = self
                 .sidebar_model

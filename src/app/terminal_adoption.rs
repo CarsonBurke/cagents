@@ -148,7 +148,6 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for (card, session, visible) in reconnect {
-            let visible = visible && self.workspace_surfaces_visible();
             self.terminal_recovery_attempts.remove(&session.id);
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,

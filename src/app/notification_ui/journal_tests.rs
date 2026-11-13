@@ -42,7 +42,6 @@ fn notice(index: u128) -> crate::notifications::Notice {
 
 fn fixture(count: usize) -> Cagents {
     let mut app = super::super::tests::context_inspector_test_app(false);
-    app.context_inspector_open = false;
     app.settings.notifications.message_previews = false;
     app.workspace_model.identity = uuid::Uuid::new_v4();
     drop(
@@ -1027,7 +1026,6 @@ fn locally_read_session_stays_out_of_new_attention_after_stale_snapshot_without_
     let mut app = super::super::tests::context_inspector_test_app(true);
     // Current Attention requires an accepted Registry identity before opening rows.
     app.workspace_model.identity = uuid::Uuid::new_v4();
-    app.context_inspector_open = false;
     let card = app.workspace.focused().unwrap();
     let session = card_session(&app.durable.cards[0]).unwrap();
     let local = crate::notifications::Notice {

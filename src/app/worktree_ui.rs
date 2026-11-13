@@ -1476,7 +1476,6 @@ mod tests {
     #[test]
     fn the_settings_pane_follows_the_user_between_worktrees_and_channels() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
         let main = terminal("/repo");
         let nested = terminal("/repo/worktree");
@@ -1960,45 +1959,40 @@ mod tests {
     }
 
     #[test]
-    fn file_selection_focuses_its_pane_and_only_dismisses_an_overlay_sidebar() {
-        for width in [1_600.0, design::WIDE_BREAKPOINT - 1.0] {
-            let mut app = super::super::tests::context_inspector_test_app(false);
-            register_worktrees(&mut app, &["/a", "/b"]);
-            let editor = repository("/a");
-            let shell = terminal("/a");
-            app.durable = Arc::new(WorkspaceState {
-                cards: vec![editor.clone(), shell.clone()].into(),
-                focused: Some(shell.id),
-                ..WorkspaceState::default()
-            });
-            app.window_width = width;
-            app.context_sections
-                .set_open(context_sections::Section::Workspace, true);
-            let _ = app.restore_worktree_scope();
-            let key = app.sidebar_state.active_worktree().unwrap().clone();
-            let was_overlay = app.context_inspector_is_overlay();
-            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
-            assert_eq!(app.workspace.focused(), Some(editor.id));
-            assert_eq!(
-                app.workspace_view_shown(),
-                Some(context_sections::WorkspaceView::SourceControl)
-            );
-            assert_eq!(app.context_inspector_open, !was_overlay);
-            if was_overlay {
-                assert!(app.workspace_inputs_blocked());
-                let transition = app.context_inspector_transition.unwrap();
-                let _ = app.advance_context_inspector_transition(
-                    transition.started_at + transition.duration(),
-                );
-            }
-            assert!(!app.workspace_inputs_blocked());
+    fn file_selection_focuses_its_pane_and_leaves_the_inspector_showing_changes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
+        let editor = repository("/a");
+        let shell = terminal("/a");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![editor.clone(), shell.clone()].into(),
+            focused: Some(shell.id),
+            ..WorkspaceState::default()
+        });
+        app.window_width = 1_600.0;
+        app.context_sections
+            .set_open(context_sections::Section::Workspace, true);
+        let _ = app.restore_worktree_scope();
+        drop(app.workspace.resize_viewport(2_400.0));
+        app.open_pane_inspector_now(shell.id);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
+        assert_eq!(app.workspace.focused(), Some(editor.id));
+        // The shell's inspector stays open, still drawing the changes the
+        // file was chosen from, beside the editor it opened in.
+        assert!(app.pane_inspectors.is_open(shell.id));
+        assert!(app.pane_shows_source_control(shell.id));
+        assert_eq!(
+            app.workspace_view_shown(),
+            Some(context_sections::WorkspaceView::SourceControl)
+        );
+        assert!(!app.workspace_inputs_blocked());
 
-            let _ = app.select_worktree("/b".into(), false);
-            app.pending_panel_open = None;
-            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
-            assert!(app.pending_panel_open.is_none());
-            assert!(app.workspace.cards().is_empty());
-        }
+        let _ = app.select_worktree("/b".into(), false);
+        app.pending_panel_open = None;
+        let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
+        assert!(app.pending_panel_open.is_none());
+        assert!(app.workspace.cards().is_empty());
     }
 
     #[test]

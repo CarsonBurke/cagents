@@ -922,8 +922,7 @@ impl Cagents {
                 )
             })
             .collect();
-        if self.workspace_surfaces_visible()
-            && let Some(card) = self.workspace.focused()
+        if let Some(card) = self.workspace.focused()
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
         {
             for (label, chord, forward) in [
@@ -1231,11 +1230,7 @@ impl Cagents {
         command: Command,
         modifiers: keyboard::Modifiers,
     ) -> Task<Message> {
-        if self.workspace_inputs_blocked()
-            && !(command == Command::ToggleInspector
-                && self.context_inspector_is_overlay()
-                && !self.modal_is_open())
-        {
+        if self.workspace_inputs_blocked() {
             return Task::none();
         }
         match command {
@@ -1767,7 +1762,6 @@ mod tests {
 
         for dismiss in [Action::Submit, Action::Close] {
             let mut app = super::super::tests::context_inspector_test_app(true);
-            app.context_inspector_open = false;
             let card = app.workspace.focused().unwrap();
             app.cards.insert(card, CardRuntime::Settings);
             app.card_state_mut(card).unwrap().kind = CardKind::Settings;
@@ -1806,7 +1800,6 @@ mod tests {
 
     fn settings_focus_fixture() -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
@@ -1839,7 +1832,6 @@ mod tests {
         use iced::advanced::widget::Tree;
 
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let original = app.workspace.focused().unwrap();
         let renderer = super::super::tests::headless_renderer();
         let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
@@ -1895,7 +1887,6 @@ mod tests {
     fn captured_new_tab_shortcut_creates_a_thread_once_and_respects_modals() {
         for captured in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(true);
-            app.context_inspector_open = false;
             let press = |repeat| keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character("t".into()),
                 modified_key: keyboard::Key::Character("t".into()),
@@ -1951,7 +1942,6 @@ mod tests {
     #[test]
     fn palette_filters_commands_without_changing_workspace() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let before = app.workspace.order().collect::<Vec<_>>();
         let _ = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("newthr".into()));
@@ -2200,7 +2190,6 @@ mod tests {
     #[test]
     fn pane_rename_survives_runtime_title_updates() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let id = app.workspace.focused().unwrap();
         let _ = app.update_chrome(chrome_ui::Action::Rename(id));
         let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Migration agent".into()));
@@ -2939,7 +2928,6 @@ mod settings_recorder_tests {
     fn settings_palette_release_commits_recent_panes_before_modal_capture() {
         for release_key in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(true);
-            app.context_inspector_open = false;
             let first = app.durable.cards[0].clone();
             let mut second = first.clone();
             second.id = CardId::new();
@@ -3011,7 +2999,6 @@ mod settings_recorder_tests {
     fn settings_capture_yields_to_a_current_form_dialog_and_resumes_after_escape() {
         for filtering in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(true);
-            app.context_inspector_open = false;
             let field = SettingsField::ShortcutToggleProjects;
             drop(app.update_palette(if filtering {
                 Action::FilterKey

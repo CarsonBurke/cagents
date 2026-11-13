@@ -1372,47 +1372,49 @@ mod tests {
         );
         app.notices
             .record(TransientNotice::warning("A saved notice"));
-        app.context_inspector_open = true;
-        app.context_inspector_transition = None;
         app.window_width = 1600.0;
+        let card = app.workspace.focused().expect("a focused pane");
 
-        let open = custom_widget_ids(&mut app.view());
-        assert!(
-            !open.iter().any(|id| id == "update.review"),
-            "available updates stay in the toolbar instead of mounting a banner"
-        );
-        assert_eq!(
-            open.iter()
-                .filter(|id| id.as_str() == "application-update")
-                .count(),
-            1,
-            "the open inspector and the workspace header must not both mount the update icon: {open:?}"
-        );
-        let alerts = position(&open, "chrome.notices").expect("alerts are shown");
-        let update = position(&open, "application-update").expect("update is shown");
-        let toggle = position(&open, "command.toggle-context-inspector").expect("sidebar toggle");
-        assert!(
-            toggle < alerts && alerts < update,
-            "the inspector toggle leads its header, with update right of alerts: {open:?}"
-        );
-
-        app.context_inspector_open = false;
-        let closed = custom_widget_ids(&mut app.view());
-        assert_eq!(
-            closed
-                .iter()
-                .filter(|id| id.as_str() == "application-update")
-                .count(),
-            1,
-            "closing the inspector leaves exactly one update icon: {closed:?}"
-        );
-        let alerts =
-            position(&closed, "chrome.notices").expect("alerts stay on the workspace header");
-        let update = position(&closed, "application-update").expect("update follows the alerts");
-        assert!(
-            alerts < update,
-            "with the inspector closed the update icon is still to the right of the alerts: {closed:?}"
-        );
+        // The header keeps the update control beside the alerts whether the
+        // pane's inspector is open or closed: the inspector no longer takes
+        // the header's controls.
+        for open in [true, false] {
+            if open {
+                app.open_pane_inspector_now(card);
+            } else {
+                drop(app.set_pane_inspector_open(card, false));
+                app.settle_pane_inspectors();
+            }
+            let ids = custom_widget_ids(&mut app.view());
+            assert!(
+                !ids.iter().any(|id| id == "update.review"),
+                "available updates stay in the toolbar instead of mounting a banner"
+            );
+            assert_eq!(
+                ids.iter()
+                    .filter(|id| id.as_str() == "application-update")
+                    .count(),
+                1,
+                "exactly one update icon, inspector open {open}: {ids:?}"
+            );
+            assert!(
+                !ids.iter()
+                    .any(|id| id == "command.toggle-context-inspector"),
+                "the window-level inspector toggle is gone: {ids:?}"
+            );
+            let alerts = position(&ids, "chrome.notices").expect("alerts are shown");
+            let update = position(&ids, "application-update").expect("update is shown");
+            assert!(
+                alerts < update,
+                "the update icon is right of the alerts, inspector open {open}: {ids:?}"
+            );
+            let toggle = card_control_id(card, "inspector.toggle").to_string();
+            assert_eq!(
+                ids.iter().filter(|id| **id == toggle).count(),
+                1,
+                "the pane mounts its own toggle once, inspector open {open}: {ids:?}"
+            );
+        }
     }
 
     #[test]
