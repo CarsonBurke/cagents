@@ -5181,11 +5181,7 @@ fn command_notification(
         return None;
     }
     let exit = summary_exit_code(summary);
-    let outcome_text = rest.map(|text| {
-        text.rsplit_once('"')
-            .map_or(text, |(_, outcome)| outcome)
-            .trim()
-    });
+    let outcome_text = background_command_outcome(summary);
     let failed = exit.is_some_and(|exit| exit != 0)
         || matches!(status, "failed" | "error")
         || outcome_text.is_some_and(|outcome| {
@@ -5193,7 +5189,9 @@ fn command_notification(
         });
     let outcome = if failed {
         exit.map_or_else(|| "failed".into(), |exit| format!("failed (exit {exit})"))
-    } else if matches!(status, "stopped" | "killed") {
+    } else if matches!(status, "stopped" | "killed")
+        || outcome_text.is_some_and(|outcome| outcome.starts_with("was "))
+    {
         "stopped".into()
     } else {
         "finished".into()
@@ -5207,8 +5205,9 @@ fn command_notification(
         format!("{} · {outcome}", description.trim())
     };
     let detail = if command.trim().is_empty() {
-        rest.and_then(|text| text.strip_prefix('"'))
-            .and_then(|text| text.rsplit_once('"').map(|(command, _)| command))
+        rest.zip(outcome_text)
+            .and_then(|(text, outcome)| text.strip_suffix(outcome))
+            .and_then(|subject| subject.trim_end().strip_prefix('"')?.strip_suffix('"'))
             .unwrap_or_default()
             .to_owned()
     } else {
@@ -5546,15 +5545,60 @@ fn refusal(text: &str, structured: &Value) -> Option<ToolStatus> {
     }
 }
 
-/// The exit status a background command's notification gives in its
-/// summary, `Background command "…" completed (exit code 0)`.
+/// The harness's complete terminal outcome, excluding its quoted subject.
+fn background_command_outcome(summary: &str) -> Option<&str> {
+    let rest = summary.strip_prefix("Background command ")?.trim();
+    let terminal = |outcome: &str| {
+        matches!(
+            outcome,
+            "completed"
+                | "failed"
+                | "was stopped"
+                | "was stopped because the system is running low on memory"
+                | "was stopped after reaching its background time limit"
+        ) || background_outcome_exit_code(outcome).is_some()
+    };
+    let Some(quoted) = rest.strip_prefix('"') else {
+        return terminal(rest).then_some(rest);
+    };
+    quoted.rmatch_indices('"').find_map(|(at, _)| {
+        let outcome = quoted[at + 1..].trim();
+        terminal(outcome).then_some(outcome)
+    })
+}
+
+/// Parse the whole exit clause so a quoted phrase in an explanation cannot
+/// become the terminal outcome. Parentheses inside quotes are literal output.
+fn background_outcome_exit_code(outcome: &str) -> Option<i32> {
+    if let Some(code) = outcome.strip_prefix("failed with exit code ") {
+        return code.parse().ok();
+    }
+    let clause = outcome
+        .strip_prefix("completed (exit code ")
+        .or_else(|| outcome.strip_prefix("failed (exit code "))?
+        .strip_suffix(')')?;
+    let (code, explanation) = clause.split_once(": ").unwrap_or((clause, ""));
+    let code = code.parse().ok()?;
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for character in explanation.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    (depth == 0 && !quoted && !escaped).then_some(code)
+}
+
+/// The exit status in the outcome, never a phrase inside the command itself.
 fn summary_exit_code(summary: &str) -> Option<i32> {
-    let (_, rest) = summary.rsplit_once("exit code ")?;
-    let end = rest
-        .char_indices()
-        .find(|&(at, c)| !(c.is_ascii_digit() || (at == 0 && c == '-')))
-        .map_or(rest.len(), |(at, _)| at);
-    rest[..end].parse().ok()
+    background_outcome_exit_code(background_command_outcome(summary)?)
 }
 
 fn image_content(block: &Value) -> ItemContent {
@@ -12830,6 +12874,181 @@ mod tests {
         assert!(
             matches!(live_notification(&live, "echo x > y", None), ItemContent::Delivery { summary, body, .. } if summary == "Background command finished" && body == "echo x > y")
         );
+    }
+
+    #[test]
+    fn command_outcomes_ignore_exit_codes_quoted_in_the_command_or_description() {
+        let command = "grep 'exit code 1' logs";
+        for description in ["", "Search for exit code 1"] {
+            let subject = if description.is_empty() {
+                command
+            } else {
+                description
+            };
+            for (status, outcome, ended, code, ending) in [
+                (
+                    "stopped",
+                    "was stopped",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                (
+                    "killed",
+                    "was stopped",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                ("failed", "failed", ToolStatus::Failed, None, "failed"),
+                (
+                    "completed",
+                    "completed",
+                    ToolStatus::Succeeded,
+                    None,
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0)",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "failed",
+                    "failed with exit code 101",
+                    ToolStatus::Failed,
+                    Some(101),
+                    "failed (exit 101)",
+                ),
+                (
+                    "failed",
+                    "failed with exit code -9",
+                    ToolStatus::Failed,
+                    Some(-9),
+                    "failed (exit -9)",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"exit code 1\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"failed with exit code 1\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"was stopped\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"completed (exit code 1)\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"completed (exit code 1: inner)\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \")\" (matched))",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "killed",
+                    "was stopped because the system is running low on memory",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                (
+                    "killed",
+                    "was stopped after reaching its background time limit",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+            ] {
+                let summary = format!("Background command \"{subject}\" {outcome}");
+                assert_eq!(summary_exit_code(&summary), code, "{summary}");
+                let reported = TaskOutcome::new(ended, &summary);
+                assert_eq!(reported.exit_code, code);
+                let escaped = summary
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&apos;");
+                let xml = format!(
+                    "<task-notification><task-id>task</task-id><tool-use-id>bash</tool-use-id><status>{status}</status><summary>{escaped}</summary></task-notification>"
+                );
+                let live = json!({"type":"system","subtype":"task_notification","uuid":"live-outcome","task_id":"task","tool_use_id":"bash","status":status,"summary":summary});
+                let recorded = json!({"type":"user","uuid":"recorded-outcome","message":{"role":"user","content":xml}});
+                assert_eq!(
+                    task_notifications(&xml),
+                    vec![live_notification(&live, "", None)]
+                );
+                assert!(
+                    matches!(&task_notifications(&xml)[..], [ItemContent::Delivery { body, .. }] if body == subject),
+                    "an exit explanation is not part of the quoted command detail"
+                );
+                for frame in [live, recorded] {
+                    let mut adapter = Claude::default();
+                    adapter.receive(scoped_call(None, "call", "bash", "Bash", json!({"command":command,"description":description,"run_in_background":true}))).unwrap();
+                    adapter.receive(json!({"type":"user","uuid":"launch","tool_use_result":{"backgroundTaskId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"bash","content":"Command running in background with ID: task."}]}})).unwrap();
+                    adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"bash","task_type":"local_bash","description":subject})).unwrap();
+                    let finished = adapter.receive(frame).unwrap();
+                    assert!(
+                        matches!(shown_command(&finished, "bash"), Some((None, ItemContent::Command { status, exit_code, .. })) if status == ended && exit_code == code),
+                        "{summary}"
+                    );
+                    let expected = if description.is_empty() {
+                        format!("Background command {ending}")
+                    } else {
+                        format!("{description} · {ending}")
+                    };
+                    assert_eq!(notice_summaries(&finished), [expected], "{summary}");
+                    assert!(finished.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Delivery { kind: DeliveryKind::Notice, body, .. }, .. }) if body == command
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_outcomes_require_a_complete_terminal_clause() {
+        for outcome in [
+            "failed with exit code 1\")",
+            "failed with exit code 1)",
+            "completed (exit code 1)\")",
+            "completed (exit code 1: unmatched))",
+            "completed (exit code 1: \"unclosed)",
+            "was stopped\")",
+        ] {
+            assert!(
+                background_command_outcome(&format!("Background command \"grep logs\" {outcome}"))
+                    .is_none(),
+                "{outcome}"
+            );
+        }
     }
 
     #[test]
