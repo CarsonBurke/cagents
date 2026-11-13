@@ -136,6 +136,9 @@ struct State {
     covered: Range<f32>,
     /// The visible span of the column, from its top, as last drawn.
     viewport: std::cell::Cell<Option<(f32, f32)>>,
+    /// The height of the scrollable's viewport, which the visible span is
+    /// shorter than when the column is.
+    screen: std::cell::Cell<f32>,
     /// The key whose widget holds keyboard focus, as operations last found.
     focused: Option<u64>,
     /// The focused key the last layout built around.
@@ -145,9 +148,12 @@ struct State {
 impl State {
     /// Notes the visible span, from the column's top, of a column `height`
     /// tall, and what the user is now reading if they moved the viewport.
-    fn observe(&self, span: (f32, f32), height: f32) {
+    fn observe(&self, span: (f32, f32), height: f32, screen: f32) {
         let (top, shown) = span;
+        self.screen.set(screen);
         let last = self.viewport.replace(Some(span));
+        // The scrollable draws at a whole-pixel offset, so a view that
+        // followed its target is within half a pixel of it.
         let moved = last.is_none_or(|(was, _)| (was - top).abs() > 0.5);
         // Content that shrank under the viewport, as a filter makes it, pulls
         // the viewport up to its end; the user did not move.
@@ -356,7 +362,14 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
             let index = self.keys.iter().position(|row| *row == key)?;
             Some((index, offset))
         });
-        let target = |tops: &[f32]| anchor.map(|(index, offset)| tops[index] + offset);
+        // No further than the view can scroll: a row being read with too
+        // little after it to reach the top stays as far up as it can, and
+        // asks for nothing more until the user moves.
+        let screen = state.screen.get();
+        let target = |tops: &[f32]| {
+            let end = (tops[tops.len() - 1] - self.spacing - screen).max(0.0);
+            anchor.map(|(index, offset)| (tops[index] + offset).min(end))
+        };
         if (state.width - width).abs() > 0.5 {
             state.forget_heights();
             state.width = width;
@@ -417,7 +430,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         // its offset to content that shrank, as under a filter, and a
         // distance from there would land elsewhere.
         if let (Some(top), Some((was, height))) = (target(&tops), state.viewport.get())
-            && top != was
+            && (top - was).abs() > 0.5
         {
             state.viewport.set(Some((top, height)));
             state.follow = Some(top);
@@ -491,7 +504,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         // half the overscan is still in hand.
         let state = tree.state.downcast_ref::<State>();
         if let Some(span) = visible_span(layout.bounds(), viewport) {
-            state.observe(span, layout.bounds().height);
+            state.observe(span, layout.bounds().height, viewport.height);
             let needs = wanted(span, OVERSCAN / 2.0);
             // Focus that moved to another row needs its neighbours built.
             if needs.start < state.covered.start
@@ -520,7 +533,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         if let Some(span) = visible_span(layout.bounds(), viewport)
             && state.follow.is_none()
         {
-            state.observe(span, layout.bounds().height);
+            state.observe(span, layout.bounds().height, viewport.height);
         }
         for (row, child, child_layout) in self.children(tree, layout) {
             if child_layout.bounds().intersects(viewport) {
@@ -1563,5 +1576,68 @@ mod tests {
             &|k, _| k < 20,
             &|k, _| k < 5,
         ]);
+    }
+
+    #[test]
+    fn a_filter_that_leaves_the_row_being_read_last_settles_at_the_end() {
+        let mut renderer = super::super::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(
+            lane((0..3000).collect()),
+            SCREEN,
+            Cache::new(),
+            &mut renderer,
+        );
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        ui.operate(
+            &renderer,
+            &mut operation::scrollable::scroll_to(
+                Id::new("lane"),
+                AbsoluteOffset {
+                    x: None,
+                    y: Some(1500.0 * (ROW + SPACING)),
+                },
+            ),
+        );
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        let before = Positions::of(&mut ui, &renderer);
+        let (key, _) = before
+            .1
+            .iter()
+            .map(|(name, top)| (Positions::key(name), top - before.0))
+            .filter(|(key, top)| top + uneven(*key as usize) > 0.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        // The row being read is now the last listed, with nothing after it
+        // to bring it back to the top of the view.
+        let cache = ui.into_cache();
+        ui = UserInterface::build(lane((0..=key).collect()), SCREEN, cache, &mut renderer);
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        let redraw = Event::Window(window::Event::RedrawRequested(
+            cosmic::iced::time::Instant::now(),
+        ));
+        let relaid = (0..10)
+            .filter(|_| {
+                let (state, _) = ui.update(
+                    std::slice::from_ref(&redraw),
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut Vec::new(),
+                );
+                state.has_layout_changed()
+            })
+            .count();
+        assert_eq!(
+            relaid, 0,
+            "the lane laid out again on {relaid} of 10 redraws"
+        );
+        // It shows the end of the list, the row being read at the bottom.
+        let is = Positions::of(&mut ui, &renderer)
+            .on_screen(&format!("row-{key}"))
+            .unwrap();
+        assert!(
+            (is + uneven(key as usize) - SCREEN.height).abs() <= 0.5,
+            "row-{key} is at {is}"
+        );
     }
 }
