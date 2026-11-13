@@ -235,7 +235,10 @@ entry, as Claude Code's does. To give the account check figures, write a
 account check and each conversation read it whenever they ask. A live usage change is a
 `rate_limit_event` frame in `fixture-frames.jsonl`, such as
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
-reported.
+reported. The login the account check reads is `fixture@example.test` on a
+Pro plan; to report another, such as one in an organization, write the
+`auth status --json` answer to `fixture-login.json`, with `email`, `orgName`
+and `subscriptionType`.
 
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads

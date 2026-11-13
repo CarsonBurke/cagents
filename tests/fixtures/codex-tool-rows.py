@@ -329,6 +329,13 @@ class Scenario:
             result = {"data": [], "nextCursor": None}
         elif method == "account/read":
             result = {"account": {"type": "chatgpt", "email": "fixture@invalid", "planType": "free"}}
+        elif method == "account/rateLimits/read":
+            # Optional usage: CODEX_HOME/fixture-rate-limits.json holds the
+            # result, such as fixtures/accounts/codex-rate-limits-read.json's.
+            limits = Path(codex_home) / "fixture-rate-limits.json"
+            if not limits.is_file():
+                return [{"id": identifier, "error": {"code": -32601, "message": "The fixture reports no usage"}}]
+            result = json.loads(limits.read_text())
         elif method == "turn/start":
             if params.get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
@@ -428,8 +435,17 @@ def main():
     address = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--listen=")), None)
     if "--listen" in args:
         address = args[args.index("--listen") + 1]
+    if not address and "app-server" in args:
+        # The app's account check: one request per line on stdio, answered
+        # in turn, until the check closes its end.
+        scenario = Scenario()
+        for line in sys.stdin:
+            for response in scenario.request(json.loads(line), str(home)):
+                if "_sleep" not in response:
+                    print(json.dumps(response), flush=True)
+        return
     if not address or not address.startswith("unix://"):
-        raise SystemExit("fixture requires --listen unix://PATH")
+        raise SystemExit("fixture requires --listen unix://PATH or stdio app-server")
     path = Path(address[len("unix://"):])
     if not transport.private_listener(path.parent, runtime) or path.exists() or path.is_symlink():
         raise SystemExit("fixture requires a fresh socket beneath its private runtime")

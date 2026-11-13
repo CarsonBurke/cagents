@@ -12,7 +12,13 @@ if [ "${1:-}" = --version ]; then
     exit 0
 fi
 if [ "${1:-}" = auth ]; then
-    printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    # Optional login: fixture-login.json is `auth status --json`'s answer,
+    # such as one naming an organization with `orgName`.
+    if [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/fixture-login.json" ]; then
+        jq -c . "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/fixture-login.json"
+    else
+        printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    fi
     exit 0
 fi
 

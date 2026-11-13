@@ -209,8 +209,12 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-rows \
 ```
 
 The peers model the app-server protocol only: no provider, account, model or
-network is contacted, and the app's account and usage-limit handling isn't
-exercised.
+network is contacted. The `tool-rows` peer also answers the app's account
+check, `codex app-server` over stdio: with an `account/rateLimits/read`
+result in `home/.codex/fixture-rate-limits.json`, such as
+[`fixtures/accounts/codex-rate-limits-read.json`](../fixtures/accounts/codex-rate-limits-read.json)'s
+`result`, the account shows those figures; without one, it reports no usage.
+The other peers leave the app's account and usage-limit handling unexercised.
 
 ## A real Codex in the fixture
 
