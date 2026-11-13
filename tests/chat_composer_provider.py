@@ -240,6 +240,31 @@ class Provider(unittest.TestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertLess(elapsed, 1.5)
 
+    def test_long_history_replays_once_as_one_chain_and_finishes_the_first_turn(self):
+        session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        (self.config / "fixture-long-history").write_text("6 300\n")
+        (self.config / "fixture-first-turn-seconds").write_text("0\n")
+        result, output, _ = self.run_provider("--session-id", session, frames=(prompt(1), prompt(2)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replayed = [frame for frame in output if frame.get("uuid", "").startswith("fixture-history-")]
+        self.assertEqual([frame["type"] for frame in replayed], ["user", "assistant"] * 3)
+        for frame in replayed:
+            content = frame["message"]["content"]
+            text = content if isinstance(content, str) else content[0]["text"]
+            self.assertEqual(len(text), len(f"Step {frame['uuid'][-1]}: ") + 300)
+        self.assertEqual(sum(frame.get("type") == "result" for frame in output), 2)
+        history = [json.loads(line) for line in
+                   next((self.config / "projects").glob(f"*/{session}.jsonl")).read_text().splitlines()]
+        chain = [record["uuid"] for record in history]
+        self.assertEqual([record["parentUuid"] for record in history], [None, *chain[:-1]])
+        self.assertEqual(sum(uuid.startswith("fixture-history-") for uuid in chain), 6)
+
+    def test_long_history_that_is_not_a_count_and_size_is_refused(self):
+        (self.config / "fixture-long-history").write_text("many\n")
+        result, _, _ = self.run_provider("--session-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("fixture-long-history must hold a count and a size", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

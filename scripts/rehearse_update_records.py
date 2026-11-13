@@ -23,7 +23,9 @@ from typing import Any
 
 
 COLLECTIONS = ("terminals", "sessions", "channels", "projects", "agents")
-EVIDENCE_LIMIT = 8 * 1024 * 1024
+# The update recovery receipt may grow to 16 MiB (upgrade::recovery::LIMIT)
+# when many chats carry saved pages; the census stays within it.
+EVIDENCE_LIMIT = 16 * 1024 * 1024
 
 
 def trace_text(path: Path, limit: int) -> str:

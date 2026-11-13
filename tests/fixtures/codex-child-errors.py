@@ -122,6 +122,9 @@ class Scenario:
         elif method == "turn/start":
             if params.get("threadId") != self.parent:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture parent"}}]
+            if "auth-required" in json.dumps(params.get("input", [])):
+                return [{"id": identifier, "error": {
+                    "code": -32000, "message": "Not logged in. Sign in again to continue."}}]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             after = self.notifications(json.dumps(params.get("input", [])), turn)

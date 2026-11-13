@@ -8,6 +8,7 @@
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
 - [Native chat viewport](#native-chat-viewport)
+- [Idle retained actors](#idle-retained-actors)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -581,6 +582,49 @@ pressure; commands of at most 2,048 bytes can be excluded using the
 recognizer's existing program-name predicate. Full rich coordination parts are
 still reparsed on changed publications; off-thread ownership does not make this
 cost incremental.
+
+## Idle retained actors
+
+Each retained Claude agent keeps a `cagents-native --cagents-native-actor`
+process alive between turns. An idle actor should not wake: its serve loop
+reaps adopted tool orphans when a child exits, read from a signalfd, and its
+`cagents-commands` cgroup sweeper backs off from 1 s to 8 s once a provider
+that reports its own activity has been quiet.
+
+`scripts/measure-idle-wakeups` counts context switches and on-CPU time per
+thread name from `/proc` alone, without signalling anything, so it is safe to
+run against the actors of a live session:
+
+```sh
+scripts/measure-idle-wakeups --seconds 60
+```
+
+`scripts/measure-idle-actors BIN_DIR [COUNT] [SECONDS]` builds a private
+fixture (HOME, XDG directories, runtime directory and project) from a matched
+`cagents` and `cagentsd`, spawns COUNT agents with the offline fixture provider
+one at a time, waits for each to settle, and then measures only the fixture's
+actors. It removes every process and directory it created on exit. Run it from
+a genuine user shell, such as `ssh fw16`; it refuses agent authority.
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 45 idle actors,
+60 s, `0b8b9aace` (before) against `6e62e851a` (after). The host was shared
+with other builds, so treat CPU as indicative; the wakeup counts are timer
+periods and barely depend on load.
+
+| Wakeups/s | Before | After |
+| --- | --- | --- |
+| `cagents-native` (serve loop) | 188.47 | 0 |
+| `cagents-command` (cgroup sweep) | 46.30 | 5.92 |
+| `cagents-chat` | 0 | 0 |
+| Total | 234.77 | 5.92 |
+| Per actor | 5.22 | 0.13 |
+
+CPU across all 45 actors fell from 3.32% to 0.08% of one core.
+
+`/proc` truncates the `cagents-commands` thread name to `cagents-command`.
+The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
+7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
+started without an announcement.
 
 ## Reference results
 

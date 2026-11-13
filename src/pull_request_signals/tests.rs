@@ -365,6 +365,21 @@ fn prose_mentions_urls_and_hash_numbers_outside_code() {
 }
 
 #[test]
+fn a_hash_number_after_a_multibyte_character_is_read_without_panicking() {
+    // A dash, accent or ideograph right before `#` is outside any token.
+    let text = "Four PRs are finished (#1084–#1090).\n\
+        Café#12, 日本#13 and up/r#14 — #15.";
+    assert_eq!(
+        of(&prose(text)),
+        vec![
+            (key("up", "r", 14), Relation::Mentioned),
+            (Reference::Number(15), Relation::Mentioned),
+            (Reference::Number(1084), Relation::Mentioned),
+        ]
+    );
+}
+
+#[test]
 fn non_pull_request_urls_are_not_mentions() {
     let text = "See https://github.com/o/r/issues/5, https://github.com/o/r/pull/new/feat \
         and https://github.com/o/r/pulls.";

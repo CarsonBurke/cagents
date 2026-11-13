@@ -11,6 +11,8 @@ Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT=1 to acknowledge interruptions
 without completing either the interrupted turn or its delayed successful script.
 Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE=1 to keep a WebSocket connection open
 after a close frame until its peer disconnects, without changing turn settlement.
+Set CAGENTS_TOOL_ROWS_HISTORY="COUNT BYTES" to open the thread's first turn
+with COUNT earlier messages of about BYTES each, a long-running conversation.
 
 Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
@@ -35,6 +37,18 @@ transport = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(transport)
 
 PAUSE = float(os.environ.get("CAGENTS_TOOL_ROWS_PAUSE", "6"))
+
+
+def long_history():
+    """The earlier messages CAGENTS_TOOL_ROWS_HISTORY asks for, if any."""
+    setting = os.environ.get("CAGENTS_TOOL_ROWS_HISTORY")
+    if not setting:
+        return []
+    count, size = map(int, setting.split())
+    phrase = "Reviewed the failing step, its logs and the last good run. "
+    text = (phrase * (size // len(phrase) + 1))[:size]
+    return [{"id": f"history-{at}", "type": "agentMessage", "text": f"Step {at}: {text}", "phase": None}
+            for at in range(count)]
 
 
 def items(child):
@@ -99,6 +113,8 @@ class Scenario:
         self.child_latest = None
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
+        # Replayed once, by the thread's first turn.
+        self.history = long_history()
         self.interrupting = set()
         self._generation = 0
         self._generations = {}
@@ -270,7 +286,9 @@ class Scenario:
             completed.append(notify("item/completed", turnId=turn, item=end))
         diff = notify("turn/diff/updated", turnId=turn,
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
-        settled = [end for _, end in items(self.child)]
+        history, self.history = self.history, []
+        replayed = [notify("item/completed", turnId=turn, item=item) for item in history]
+        settled = [*history, *(end for _, end in items(self.child))]
         finished = {"id": turn, "status": "completed", "items": settled}
         answer = {"id": "answer", "type": "agentMessage", "text": "Done.", "phase": None}
         child_started = [notify("turn/started", threadId=self.child,
@@ -279,6 +297,7 @@ class Scenario:
                                  turn={"id": f"{turn}-child", "status": "completed", "items": []}),
                            notify("thread/status/changed", threadId=self.child, status={"type": "idle"})] if starts_child else []
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                *replayed,
                 *child_started,
                 *started, diff, {"_sleep": PAUSE}, *completed,
                 # A subAgentActivity item only renders a row. The child needs

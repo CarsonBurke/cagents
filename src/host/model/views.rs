@@ -961,6 +961,29 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     Ok(true)
 }
 
+/// The chat an agent's pane shows, unless the pane is missing or retired.
+pub(super) fn agent_pane_chat(
+    db: &Connection,
+    agent: crate::model::AgentId,
+) -> Result<Option<crate::chat::Session>, String> {
+    let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(None);
+    };
+    let view = read(db, &scope)?;
+    if view.retired.contains(&id) {
+        return Ok(None);
+    }
+    Ok(view
+        .panes
+        .into_iter()
+        .find(|pane| pane.id == id)
+        .and_then(|pane| match pane.kind {
+            crate::model::CardKind::Chat(session) => Some(session),
+            _ => None,
+        }))
+}
+
 /// Point a stopped agent's pane at the process that resumed it. Position,
 /// placement, presentation and naming are unchanged. A pane that is missing,
 /// retired or already shows another process is left alone; the agent itself
