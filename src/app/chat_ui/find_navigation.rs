@@ -825,7 +825,14 @@ fn raw_groups(runtime: &Runtime) -> Vec<(String, Vec<(usize, bool)>)> {
                     .chain(
                         turn.prose
                             .iter()
-                            .map(|placed| (placed.index, placed.slot == turn::Slot::Thinking)),
+                            // A coordination step's row opens onto its tool
+                            // call, as a thought opens onto its reasoning.
+                            .map(|placed| {
+                                (
+                                    placed.index,
+                                    matches!(placed.slot, turn::Slot::Thinking | turn::Slot::Card),
+                                )
+                            }),
                     )
                     .collect(),
             )
@@ -1199,6 +1206,7 @@ fn raw_scan_inner(
             }
             charge(item.id.len().checked_add(128)?)?;
             let mut parts = Vec::new();
+            let mut said = false;
             if let Some(reading) = &coordinated {
                 use chat::coordination::Kind;
                 let mut texts = Vec::new();
@@ -1233,11 +1241,19 @@ fn raw_scan_inner(
                 );
                 for (part, text) in texts {
                     if matches_checked(text, &pattern, current)? || labelled(text)? {
+                        // A step drawn as one row folds nothing: what it said
+                        // is drawn whole only in its tool call, which the
+                        // match opens instead.
+                        if reading.is_card() {
+                            said = true;
+                            break;
+                        }
                         charge(item.id.len().checked_add(part.len())?.checked_add(128)?)?;
                         parts.push(format!("{}#{part}", item.id));
                     }
                 }
             }
+            let matched = matched || said;
             for (identity, text) in &raw.tools {
                 if matches_checked(text, &pattern, current)? {
                     charge(item.id.len().checked_add(128)?)?;
@@ -1249,14 +1265,8 @@ fn raw_scan_inner(
                     ));
                 }
             }
-            let raw_disclosure = !matches!(&item.content, ItemContent::Delivery { .. })
-                && coordinated.as_ref().map_or(raw.raw_disclosure, |reading| {
-                    if reading.is_card() {
-                        parts.is_empty()
-                    } else {
-                        raw.raw_disclosure
-                    }
-                });
+            let raw_disclosure =
+                !matches!(&item.content, ItemContent::Delivery { .. }) && raw.raw_disclosure;
             let delivery = match &item.content {
                 ItemContent::Delivery {
                     kind: chat::DeliveryKind::Report,
@@ -2593,10 +2603,10 @@ mod tests {
         };
         let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
+        assert!(groups[0].1[0].parts.is_empty());
         assert!(
-            !groups[0].1[0].expand,
-            "matching card part owns disclosure rather than raw command"
+            groups[0].1[0].expand,
+            "a match in what a one-row step said opens its tool call, where it is drawn whole"
         );
         assert_eq!(
             tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),

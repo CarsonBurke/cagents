@@ -18883,11 +18883,14 @@ mod tests {
             }
             drop(app.handle_chat_ui(Action::FindNext(target, true)));
             last_item = item;
-            last_part = format!("{coordinated}#body");
+            last_part = coordinated;
         }
         let runtime = chat_runtime(&app, card);
-        let choices =
-            runtime.child_expanded["same-child"].len() + runtime.child_unfolded["same-child"].len();
+        let choices = runtime.child_expanded["same-child"].len()
+            + runtime
+                .child_unfolded
+                .get("same-child")
+                .map_or(0, HashSet::len);
         assert!(
             choices <= 4098,
             "the existing choice budget prunes retired windows"
@@ -18897,20 +18900,17 @@ mod tests {
             "Find ownership must follow the pruned child choice budget"
         );
         assert!(runtime.child_expanded["same-child"].contains(&last_item));
-        assert!(runtime.child_unfolded["same-child"].contains(&last_part));
+        // A step drawn as one row opens its tool call for the match.
+        assert!(runtime.child_expanded["same-child"].contains(&last_part));
         drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
         drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
-        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
-        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime.child_expanded["same-child"],
-            HashSet::from([last_item])
-        );
-        assert_eq!(
-            runtime.child_unfolded["same-child"],
-            HashSet::from([last_part])
+            HashSet::from([last_item, last_part])
         );
         assert!(runtime.child_find_disclosure.is_empty());
         assert!(!runtime.expanded.contains("same#opaque-id"));
@@ -18991,7 +18991,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_child_find_restores_coordination_parts_only_in_their_original_scope() {
+    fn selected_child_find_restores_coordination_disclosures_only_in_their_original_scope() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
         let card_item = |scope: &str| {
@@ -19012,7 +19012,7 @@ mod tests {
             presentation_child("two", card_item("two")),
         ];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
-        let part = "same#opaque-id#body";
+        let part = "same#opaque-id";
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(find_navigation::find_for_test(
@@ -19020,20 +19020,20 @@ mod tests {
             target,
             "one-only".into(),
         ));
-        assert!(chat_runtime(&app, card).child_unfolded["one"].contains(part));
-        assert!(!chat_runtime(&app, card).unfolded.contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["one"].contains(part));
+        assert!(!chat_runtime(&app, card).expanded.contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        assert!(!chat_runtime(&app, card).child_unfolded["one"].contains(part));
+        assert!(!chat_runtime(&app, card).child_expanded["one"].contains(part));
         drop(find_navigation::find_for_test(
             &mut app,
             target,
             "two-only".into(),
         ));
-        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
-        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, part.into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, part.into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
-        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["two"].contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(find_navigation::find_for_test(
@@ -19041,10 +19041,10 @@ mod tests {
             target,
             "parent-only".into(),
         ));
-        assert!(chat_runtime(&app, card).unfolded.contains(part));
+        assert!(chat_runtime(&app, card).expanded.contains(part));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
-        assert!(!chat_runtime(&app, card).unfolded.contains(part));
-        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+        assert!(!chat_runtime(&app, card).expanded.contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["two"].contains(part));
     }
 
     #[test]
@@ -19297,16 +19297,6 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        assert!(
-            chat_runtime(&app, card).cache[&item.id]
-                .coordination
-                .as_ref()
-                .unwrap()
-                .parts()
-                .iter()
-                .any(|(part, body)| part == "body" && body.lines().count() > 12),
-            "the real coordination card exposes a foldable body",
-        );
         drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
         drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
         for child in ["long-running-child", "other-child"] {
@@ -29514,7 +29504,7 @@ mod tests {
     }
 
     #[test]
-    fn retheme_preserves_completed_hidden_and_coordinated_continuation_release() {
+    fn retheme_preserves_completed_and_hidden_continuation_release() {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let next = crate::settings::EditorSyntaxTheme::Ocean;
         let body = "```rust\nlet value = 1;\n```";
@@ -29535,7 +29525,7 @@ mod tests {
             at: None,
         };
         let coordinated = chat::coordination::recognize(&item, Provider::Claude).unwrap();
-        let mut coordinated = CachedItem::updated(
+        let coordinated = CachedItem::updated(
             &item.content,
             theme,
             None,
@@ -29543,7 +29533,10 @@ mod tests {
             false,
             Some(coordination::Prepared::new(coordinated)),
         );
-        for cached in [&mut finished, &mut hidden, &mut coordinated] {
+        // A step drawn as one row shows its prompt plain: no fence of it is
+        // highlighted, so a palette change has nothing of it to redo.
+        assert!(coordinated.blocks.is_empty());
+        for cached in [&mut finished, &mut hidden] {
             assert!(!cached.blocks.is_empty());
             assert!(cached.open.is_none());
             cached.rehighlight(next);

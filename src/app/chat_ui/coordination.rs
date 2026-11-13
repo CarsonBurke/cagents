@@ -86,7 +86,12 @@ impl Prepared {
             Ok(markdown::Content::parse_labelled(text, labels.clone()))
         };
         let inline = |text: &Text| text.inline().map(parse).transpose();
+        // A step drawn as one row shows its text plain, in a line and a
+        // tooltip; only a step whose detail draws the messages it collected
+        // needs them parsed.
+        let rich = !reading.is_card();
         let prompts = match &reading.kind {
+            _ if !rich => Vec::new(),
             Kind::Message(message) => vec![inline(&message.body)?],
             Kind::Spawn(spawn) => spawn
                 .agents
@@ -96,16 +101,20 @@ impl Prepared {
             Kind::Act(_) => Vec::new(),
         };
         let brief = match &reading.kind {
-            Kind::Spawn(spawn) if !spawn.brief.trim().is_empty() => Some(parse(&spawn.brief)?),
+            Kind::Spawn(spawn) if rich && !spawn.brief.trim().is_empty() => {
+                Some(parse(&spawn.brief)?)
+            }
             _ => None,
         };
         let mut answers: Vec<markdown::Content> = reading
             .outcome
             .messages
             .iter()
+            .filter(|_| rich)
             .map(|message| parse(&message.body))
             .collect::<Result<Vec<_>, String>>()?;
         if let Some(run) = &reading.outcome.run
+            && rich
             && !run.result.is_empty()
         {
             answers.push(parse(&run.result)?);
@@ -230,44 +239,6 @@ impl Coordinated {
 
     pub(super) fn is_card(&self) -> bool {
         self.reading.is_card()
-    }
-
-    /// The text of each part the card folds, by the part's name.
-    pub(super) fn parts(&self) -> Vec<(String, &str)> {
-        let mut parts = Vec::new();
-        match &self.reading.kind {
-            Kind::Message(message) => {
-                parts.extend(message.body.inline().map(|body| ("body".to_owned(), body)))
-            }
-            Kind::Spawn(spawn) => {
-                parts.push(("brief".to_owned(), spawn.brief.as_str()));
-                parts.extend(
-                    spawn
-                        .agents
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, agent)| {
-                            Some((format!("prompt-{index}"), agent.prompt.inline()?))
-                        }),
-                );
-            }
-            Kind::Act(_) => {}
-        }
-        let outcome = &self.reading.outcome;
-        parts.extend(
-            outcome
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| (format!("answer-{index}"), message.body.as_str())),
-        );
-        parts.extend(
-            outcome
-                .run
-                .as_ref()
-                .map(|run| ("result".to_owned(), run.result.as_str())),
-        );
-        parts
     }
 
     /// What copying the card takes: the message, or the prompt.
@@ -620,8 +591,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
     details
 }
 
-/// How many characters of an agent's name a row shows.
-const LABEL_CHARS: usize = 40;
+/// How many characters of an agent's name a row shows: few enough that, in
+/// the narrowest chat pane, the status after it keeps its place.
+const LABEL_CHARS: usize = 28;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it.
 const ARROW_ROOM: f32 = 14.0 + step::GAP_S;
@@ -643,6 +615,77 @@ fn one_line_of(text: &str) -> String {
         line.push_str(word);
     }
     line
+}
+
+/// Markdown as the plain text a reader sees in it: its words, list markers
+/// and line structure, without the syntax that styles them. Only as much of
+/// it is read as a row or its tooltip can show.
+fn plain(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let source = match markdown.char_indices().nth(4 * TIP_CHARS) {
+        Some((end, _)) => &markdown[..end],
+        None => markdown,
+    };
+    let mut text = String::new();
+    // Each open list's next number, or `None` for a bulleted one.
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let break_block = |text: &mut String| {
+        let kept = text.trim_end_matches([' ', '\n']).len();
+        text.truncate(kept);
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+    };
+    for event in Parser::new(source) {
+        match event {
+            Event::Text(part) | Event::Code(part) | Event::InlineMath(part) => text.push_str(&part),
+            Event::DisplayMath(part) | Event::Html(part) | Event::InlineHtml(part) => {
+                text.push_str(&part)
+            }
+            Event::SoftBreak => text.push(' '),
+            Event::HardBreak => text.push('\n'),
+            Event::Rule => {
+                break_block(&mut text);
+                text.push_str("———");
+            }
+            Event::TaskListMarker(done) => text.push_str(if done { "☑ " } else { "☐ " }),
+            Event::Start(Tag::List(first)) => {
+                if lists.is_empty() {
+                    break_block(&mut text);
+                }
+                lists.push(first);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let kept = text.trim_end_matches(' ').len();
+                text.truncate(kept);
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let depth = lists.len().saturating_sub(1);
+                text.push_str(&"  ".repeat(depth));
+                match lists.last_mut() {
+                    Some(Some(number)) => {
+                        text.push_str(&format!("{number}. "));
+                        *number += 1;
+                    }
+                    _ => text.push_str("• "),
+                }
+            }
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::BlockQuote(_))
+            | Event::Start(Tag::CodeBlock(_) | Tag::Table(_))
+                if lists.is_empty() =>
+            {
+                break_block(&mut text)
+            }
+            Event::End(TagEnd::TableRow | TagEnd::TableHead) => text.push('\n'),
+            Event::End(TagEnd::TableCell) => text.push_str("  "),
+            _ => {}
+        }
+    }
+    text.trim().to_owned()
 }
 
 /// `text` bounded for a tooltip, which wraps at its own width.
@@ -676,6 +719,8 @@ struct Row {
     state: RowStatus,
     /// What opening the row does, where this conversation can open the agent.
     open: Option<Action>,
+    /// The menu's name for copying what the step said.
+    copy: &'static str,
 }
 
 /// A row's trailing status: a word or two, with the whole account of it in
@@ -910,7 +955,10 @@ impl Runtime {
             _ => None,
         };
         let (preview, full) = match &message.body {
-            Text::Inline(body) => (one_line_of(body), body.trim().to_owned()),
+            Text::Inline(body) => {
+                let body = plain(body);
+                (one_line_of(&body), body)
+            }
             Text::File(path) => {
                 let text = format!("The contents of {path}");
                 (text.clone(), text)
@@ -966,14 +1014,26 @@ impl Runtime {
                 (None, None) => RowStatus::plain("Delivered"),
             },
         };
+        // The agent's transcript holds what it answered; where the row cannot
+        // open one, the answer is the tooltip's to give.
+        let mut full = full;
+        if open.is_none() {
+            for answer in &reading.outcome.messages {
+                let body = plain(&answer.body);
+                if !body.is_empty() {
+                    full.push_str(&format!("\n\nFrom {}:\n{body}", answer.from));
+                }
+            }
+        }
         Row {
             glyph: Icon::Send,
             verb: message_verb(message.kind),
             label: recipient.plain(),
             preview,
-            full,
+            full: full.trim().to_owned(),
             state,
             open,
+            copy: "Copy message",
         }
     }
 
@@ -1015,7 +1075,7 @@ impl Runtime {
             .agents
             .iter()
             .filter_map(|agent| agent.prompt.inline())
-            .map(|prompt| prompt.trim().to_owned())
+            .map(plain)
             .filter(|prompt| !prompt.is_empty())
             .collect();
         let details = spawn_details(reading, spawn, observed_model);
@@ -1064,6 +1124,7 @@ impl Runtime {
             full: full.join("\n\n"),
             state,
             open: listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone()))),
+            copy: "Copy prompt",
         }
     }
 
@@ -1130,6 +1191,7 @@ impl Runtime {
         let name = [
             format!("{} {}", row.verb, row.label),
             row.state.text.to_owned(),
+            row.state.detail.clone().unwrap_or_default(),
             row.preview,
         ]
         .into_iter()
@@ -1147,7 +1209,7 @@ impl Runtime {
             _ if open_tool => "Hide tool call",
             _ => "Show tool call",
         };
-        let (target, id) = (self.target, item.id.clone());
+        let (target, id, copy) = (self.target, item.id.clone(), row.copy);
         let menu = move || {
             let command = |copy| RowCommand {
                 target,
@@ -1157,7 +1219,7 @@ impl Runtime {
             widget::menu::items(
                 &HashMap::new(),
                 vec![
-                    widget::menu::Item::Button("Copy message", None, command(true)),
+                    widget::menu::Item::Button(copy, None, command(true)),
                     widget::menu::Item::Button(source, None, command(false)),
                 ],
             )
@@ -1189,7 +1251,7 @@ impl Runtime {
                 // pointer is. It only marks the row as one that opens: the row
                 // is the control, so a click on the arrow is a click on the
                 // row, and keyboard traversal and screen readers meet it once.
-                let arrow = widget::container(muted_glyph(Icon::Jump))
+                let arrow = widget::container(muted_glyph(Icon::Open))
                     .padding(iced::Padding {
                         right: step::GAP_S,
                         ..iced::Padding::ZERO
@@ -1452,6 +1514,32 @@ mod identity_tests {
             agents_phrase(&reading(true), &agents(&["95fcd1b9e0aa"]), &listed),
             "95fcd1b9"
         );
+    }
+
+    #[test]
+    fn a_rows_text_reads_as_the_message_without_its_markdown() {
+        let message = "The checkout moved, so **a few things** need to follow it:\n\n\
+            1. The repository is now at `/srv/repos/t3code`.\n\
+            2. Re-run `pnpm install` [there](https://example.com).\n\n\
+            - keep `.env.local`\n\n\
+            ```sh\ncd /srv/repos/t3code\n```\n\nThen report back.";
+        assert_eq!(
+            plain(message),
+            "The checkout moved, so a few things need to follow it:\n\n\
+             1. The repository is now at /srv/repos/t3code.\n\
+             2. Re-run pnpm install there.\n\n\
+             • keep .env.local\n\n\
+             cd /srv/repos/t3code\n\n\
+             Then report back."
+        );
+        assert_eq!(
+            one_line_of(&plain(message)),
+            "The checkout moved, so a few things need to follow it: 1. The repository is \
+             now at /srv/repos/t3code. 2. Re-run pnpm install there. • keep .env.local cd \
+             /srv/repos/t3code Then report back."
+        );
+        // Only what a tooltip can show is read.
+        assert!(plain(&"word ".repeat(10_000)).len() <= 4 * TIP_CHARS);
     }
 
     #[test]
