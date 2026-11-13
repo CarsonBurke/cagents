@@ -5,7 +5,9 @@
 //! in `view`, `subscription`, and the window content's layout, draw, event
 //! handling, tree diff, operations, accessibility tree and overlay
 //! collection. A [`region`] of the view breaks its share of those out beneath
-//! the totals. It also logs each call over [`SLOW`] as it returns. Times are
+//! the totals. Each window also gives the work and pacing of the frames the
+//! shell presented, from the vendored runtime's frame hook. It also logs each
+//! call over [`SLOW`] as it returns. Times are
 //! wall-clock time on the UI thread. A nested `update` counts towards the
 //! outermost one. Overlays lay out and draw outside the root, as do the
 //! libcosmic chrome and the renderer, so they are not counted. Without the
@@ -48,7 +50,13 @@ pub fn enabled() -> bool {
     #[cfg(feature = "development")]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("CAGENTS_UI_TRACE").is_some())
+        *ENABLED.get_or_init(|| {
+            let enabled = std::env::var_os("CAGENTS_UI_TRACE").is_some();
+            if enabled {
+                cosmic::iced::runtime::frame::observe(frame);
+            }
+            enabled
+        })
     }
     #[cfg(not(feature = "development"))]
     {
@@ -155,6 +163,36 @@ struct Recorder {
     started: Instant,
     phases: HashMap<Phase, Stat>,
     labels: HashMap<(Phase, Box<str>), Stat>,
+    /// The shell's work for each frame it presented.
+    frames: Vec<Duration>,
+    /// The time between consecutive presented frames.
+    intervals: Vec<Duration>,
+}
+
+/// Records a frame the shell presented.
+#[cfg(feature = "development")]
+fn frame(frame: cosmic::iced::runtime::frame::Frame) {
+    RECORDER.with_borrow_mut(|recorder| {
+        recorder.frames.push(frame.work);
+        recorder.intervals.extend(frame.interval);
+        recorder.roll();
+    });
+}
+
+/// `values`' median, 95th, 99th percentile and maximum, nearest-rank.
+fn quantiles(values: &mut [Duration]) -> String {
+    values.sort_unstable();
+    let at = |quantile: f64| {
+        let rank = (quantile * values.len() as f64).ceil() as usize;
+        values[rank.clamp(1, values.len()) - 1].as_secs_f64() * 1e3
+    };
+    format!(
+        "p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} ms",
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        at(1.0)
+    )
 }
 
 impl Recorder {
@@ -163,6 +201,8 @@ impl Recorder {
             started: Instant::now(),
             phases: HashMap::new(),
             labels: HashMap::new(),
+            frames: Vec::new(),
+            intervals: Vec::new(),
         }
     }
 
@@ -185,6 +225,11 @@ impl Recorder {
         if !label.is_empty() {
             self.labels.entry((phase, label)).or_default().add(elapsed);
         }
+        self.roll();
+    }
+
+    /// Reports and starts a new window once this one is complete.
+    fn roll(&mut self) {
         let window = self.started.elapsed();
         if window >= WINDOW {
             self.report(window);
@@ -192,7 +237,7 @@ impl Recorder {
         }
     }
 
-    fn report(&self, window: Duration) {
+    fn report(&mut self, window: Duration) {
         let busy: Duration = self.phases.values().map(|stat| stat.total).sum();
         let mut line = format!(
             "ui-trace {:.1}s: busy {:.0} ms ({:.0}%)",
@@ -206,6 +251,19 @@ impl Recorder {
             let _ = write!(line, " | {phase:?} {stat}");
         }
         eprintln!("{line}");
+        if !self.frames.is_empty() {
+            eprintln!(
+                "ui-trace   Frames n={} work {}",
+                self.frames.len(),
+                quantiles(&mut self.frames)
+            );
+        }
+        if !self.intervals.is_empty() {
+            eprintln!(
+                "ui-trace   Frames interval {}",
+                quantiles(&mut self.intervals)
+            );
+        }
         let mut labels: Vec<_> = self.labels.iter().collect();
         labels.sort_by_key(|((phase, _), stat)| (*phase, std::cmp::Reverse(stat.total)));
         let mut updates = 0;
@@ -486,6 +544,56 @@ fn child(layout: Layout<'_>) -> Layout<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_quantiles_are_nearest_rank() {
+        let mut frames: Vec<_> = (1..=200).rev().map(Duration::from_millis).collect();
+        assert_eq!(
+            quantiles(&mut frames),
+            "p50 100.00 p95 190.00 p99 198.00 max 200.00 ms"
+        );
+        let mut one = vec![Duration::from_micros(2_500)];
+        assert_eq!(
+            quantiles(&mut one),
+            "p50 2.50 p95 2.50 p99 2.50 max 2.50 ms"
+        );
+    }
+
+    #[test]
+    fn a_frame_counts_event_handling_but_not_waiting() {
+        use cosmic::iced::runtime::frame::{Clock, Frame};
+        thread_local! {
+            static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+        }
+        let clock =
+            Clock::reporting_to(|frame| FRAMES.with_borrow_mut(|frames| frames.push(frame)));
+        let busy = Duration::from_millis(20);
+        let wait = Duration::from_millis(200);
+        drop(clock.handling());
+        std::thread::sleep(wait);
+        {
+            let _handling = clock.handling();
+            std::thread::sleep(busy);
+            clock.presented();
+            // The rest of this event belongs to the next frame.
+            std::thread::sleep(busy);
+        }
+        std::thread::sleep(wait);
+        let _handling = clock.handling();
+        clock.presented();
+        let frames = FRAMES.with_borrow(Clone::clone);
+        assert_eq!(frames.len(), 2);
+        // Each frame took one busy stretch; neither counts the waits.
+        for frame in &frames {
+            assert!(frame.work >= busy && frame.work < wait, "{frames:?}");
+        }
+        assert!(frames[0].interval.is_none());
+        assert!(
+            frames[1]
+                .interval
+                .is_some_and(|interval| interval >= busy + wait)
+        );
+    }
 
     #[test]
     fn a_message_is_named_by_its_outer_two_variants() {
