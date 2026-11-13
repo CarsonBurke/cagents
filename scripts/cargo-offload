@@ -3150,7 +3150,7 @@ class Offload:
         back = self.spawn(command + [f"{self.host}:{remote}", local],
                           stdin=subprocess.PIPE if files is not None else subprocess.DEVNULL)
         if files is not None:
-            back.communicate(("\0".join(files) + "\0").encode())
+            back.communicate(b"".join(os.fsencode(name) + b"\0" for name in files))
         else:
             back.wait()
         return 0 if self.cancelled else back.returncode
@@ -3174,7 +3174,7 @@ class Offload:
             differing = subprocess.run(
                 ["rsync", "-a", "-c", "-n", "--from0", "--files-from=-", "--out-format=%n",
                  "-e", shell, f"{self.host}:{source}/", top + "/"],
-                input=("\0".join(changed) + "\0").encode(), capture_output=True)
+                input=b"".join(os.fsencode(name) + b"\0" for name in changed), capture_output=True)
             if differing.returncode:
                 return differing.returncode
             changed = [name for name in os.fsdecode(differing.stdout).splitlines()
@@ -3182,7 +3182,8 @@ class Offload:
         added = written["added"]
         if added:
             ignored = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
-                                     input=("\0".join(added) + "\0").encode(), capture_output=True)
+                                     input=b"".join(os.fsencode(name) + b"\0" for name in added),
+                                     capture_output=True)
             if ignored.returncode not in (0, 1):
                 say(f"cannot tell which of the files the command added are ignored here; "
                     f"left on {self.host}: {', '.join(added)}")
