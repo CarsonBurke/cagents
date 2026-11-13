@@ -1350,7 +1350,8 @@ fn bounded_allocation() {
         result = self.gate_run("fix", "--bin", "probe", env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("    let value = 1;", main.read_text())
-        self.assertIn("applied fixes to 1 file", result.stderr)
+        self.assertIn("took back what the command wrote here: ", result.stderr)
+        self.assertIn("src/main.rs", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
 
     def test_what_a_test_writes_in_the_checkout_there_comes_back(self):
@@ -1381,6 +1382,12 @@ fn bounded_allocation() {
         (self.crate / ".gitignore").write_text("/target\n*.log\n")
         (self.crate / "notes.txt").write_text("original\n")
         (self.crate / "edited.txt").write_text("original\n")
+        # Cargo writes the lockfile it makes, as it would here.
+        result = self.gate_run("test", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("took back what the command wrote here: Cargo.lock\n", result.stderr)
+        self.assertIn("[[package]]", (self.crate / "Cargo.lock").read_text())
+        # A command that writes nothing brings nothing back.
         result = self.gate_run("test", env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("took back", result.stderr)

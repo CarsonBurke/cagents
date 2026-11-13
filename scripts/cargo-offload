@@ -3210,10 +3210,7 @@ class Offload:
             return 0
         status = self.fetch(f"{source}/", top + "/", shell, files=taken)
         if not status:
-            if self.plan.fixes:
-                say(f"applied fixes to {len(taken)} file{'s' if len(taken) != 1 else ''}")
-            else:
-                say(f"took back what the command wrote here: {', '.join(taken)}")
+            say(f"took back what the command wrote here: {', '.join(taken)}")
         return status
 
     def triple(self, plan):

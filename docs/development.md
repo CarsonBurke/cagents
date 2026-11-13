@@ -836,7 +836,8 @@ they arrive at the paths Cargo's messages, and its JSON messages
 (`--message-format=json...`), name here. `run` builds there and runs the program here, with Cargo's `CARGO_*`
 settings. `doc` copies `target/doc` back, per `--target`, and `--open` opens it
 here. `--timings` copies the report back. Whatever any command writes in the
-checkout there comes back to the same files here, whether or not it succeeds:
+checkout there, such as a lockfile Cargo updates, comes back to the same files
+here, whether or not it succeeds:
 `fix` and `clippy --fix` apply their fixes after the same uncommitted-change
 checks Cargo makes, and a test that records a fixture, such as
 `CAGENTS_RECORD_WIRE_FORMAT=1`, leaves it in this checkout. A file edited here
