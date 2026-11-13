@@ -897,6 +897,28 @@ mod tests {
         *forge.probe_fails.lock().unwrap() = None;
         assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
 
+        // Out of REST quota, the board is listed over GraphQL every poll and
+        // keeps its validator for when the quota resets.
+        crate::github::polling::with_scope("forge-probe-out-of-quota", || {
+            *forge.probe_fails.lock().unwrap() = Some(
+                "403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Reset: 4102444800",
+            );
+            assert_eq!(
+                poll(&mut memory, Freshness::Watched),
+                (true, vec!["probe", "listing"])
+            );
+            assert_eq!(
+                poll(&mut memory, Freshness::Watched),
+                (true, vec!["listing"])
+            );
+        });
+        assert!(matches!(
+            memory.listing.as_ref().unwrap().probe,
+            Probe::Validator(_)
+        ));
+        *forge.probe_fails.lock().unwrap() = None;
+        assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
+
         // A repository GitHub refuses to probe is listed every poll, and
         // asked again only after a while, even when that listing failed.
         *forge.probe_fails.lock().unwrap() = Some("410 Gone");
