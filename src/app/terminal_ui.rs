@@ -274,6 +274,7 @@ mod tests {
             mouse,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
         let card = CardId::new();
         app.terminal_find.insert(
             card,
@@ -318,6 +319,26 @@ mod tests {
             !published
                 .iter()
                 .any(|message| matches!(message, Message::TerminalFind(Action::Focus(_, false))))
+        );
+        drop(element);
+        let directory = tempfile::tempdir().unwrap();
+        let handle = super::super::tests::unconnected_surface(directory.path(), TerminalId::new());
+        app.cards
+            .insert(card, CardRuntime::Terminal(handle.clone()));
+        let task = app.update(published.pop().unwrap());
+        assert!(!app.terminal_find[&card].open);
+        assert!(!app.terminal_find[&card].focused);
+        let focused = super::super::tests::focused_element(
+            TerminalWidget::new(handle)
+                .id(workspace_widget::card_focus_id(card))
+                .model_focused(true)
+                .into(),
+            task,
+        );
+        assert_eq!(
+            focused,
+            Some(workspace_widget::card_focus_id(card)),
+            "closing find returns native focus to its terminal"
         );
     }
 
@@ -828,14 +849,27 @@ impl Cagents {
     pub(super) fn terminal_find_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let find = self.terminal_find.get(&card).filter(|find| find.open)?;
         let message = |action| Message::TerminalFind(action);
-        let input = crate::interaction::focused_escape(
+        // A foreground surface owns Enter even if a click refocuses find.
+        let can_step = !self.workspace_inputs_blocked();
+        let input = crate::interaction::focused_key(
             crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
                 .id(input_id(card))
                 .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
                 .on_focus(message(Action::Focus(card, true)))
                 .on_unfocus(message(Action::Focus(card, false)))
                 .width(Length::Fill),
-            move || Message::TerminalFind(Action::Close(card)),
+            move |event| match event {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                } => Some(Message::TerminalFind(Action::Close(card))),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modifiers,
+                    ..
+                } if can_step => Some(Message::TerminalFind(Action::Next(card, modifiers.shift()))),
+                _ => None,
+            },
         );
         let count = if find.query.is_empty() {
             String::new()
