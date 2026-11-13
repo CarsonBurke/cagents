@@ -8287,21 +8287,25 @@ impl Cagents {
             })
             .map(|(card, pending)| (*card, &pending.candidate))
             .collect::<HashMap<_, _>>();
-        if defaults.is_empty()
-            && draft_starts.is_empty()
-            && admission_sources.is_empty()
-            && chat_drafts == self.durable.chat_drafts
-            && chat_draft_attachments == self.durable.chat_draft_attachments
-            && chat_waiting_messages == self.durable.chat_waiting_messages
-            && repository_navigation == self.durable.repository_navigation
-        {
+        // Durable holds what was last saved of these too, as it does unread
+        // state: a draft written once would otherwise differ from durable at
+        // every later save, each of which then copied the whole workspace.
+        if chat_drafts != self.durable.chat_drafts {
+            Arc::make_mut(&mut self.durable).chat_drafts = chat_drafts;
+        }
+        if chat_draft_attachments != self.durable.chat_draft_attachments {
+            Arc::make_mut(&mut self.durable).chat_draft_attachments = chat_draft_attachments;
+        }
+        if chat_waiting_messages != self.durable.chat_waiting_messages {
+            Arc::make_mut(&mut self.durable).chat_waiting_messages = chat_waiting_messages;
+        }
+        if repository_navigation != self.durable.repository_navigation {
+            Arc::make_mut(&mut self.durable).repository_navigation = repository_navigation;
+        }
+        if defaults.is_empty() && draft_starts.is_empty() && admission_sources.is_empty() {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
-        saved.chat_drafts = chat_drafts;
-        saved.chat_draft_attachments = chat_draft_attachments;
-        saved.chat_waiting_messages = chat_waiting_messages;
-        saved.repository_navigation = repository_navigation;
         for card in &mut saved.cards {
             if let Some(pending) = draft_starts.get(&card.id) {
                 // Only the writer sees B before its receipt. Autosaves of A
