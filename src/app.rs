@@ -30778,6 +30778,40 @@ mod tests {
         assert!(!saved.sidebar_worktree_overrides.contains_key(&project));
     }
 
+    #[test]
+    fn another_windows_skipped_question_is_adopted_and_its_reenable_survives_a_save() {
+        use settings::Confirmation::{CloseActiveTerminal, StopWorkingChat};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.save_settings_now().unwrap();
+        // Another window stops asking both questions.
+        let mut external = settings::load(&path).unwrap();
+        external.set_asks(StopWorkingChat, false);
+        external.set_asks(CloseActiveTerminal, false);
+        settings::save(&path, &external).unwrap();
+        drop(app.update(Message::SharedPreferencesObserved(external)));
+        for question in [StopWorkingChat, CloseActiveTerminal] {
+            assert!(!app.asks(question), "{question:?} is adopted");
+            assert_eq!(
+                app.settings_draft.confirmations.get(&question),
+                Some(&false),
+                "Settings shows {question:?} off"
+            );
+        }
+        // This window turns one back on; the other's choice is kept.
+        let enable = app.update(Message::SettingsChanged {
+            field: SettingsField::Confirm(StopWorkingChat),
+            value: "true".into(),
+        });
+        settle_settings_task(&mut app, enable);
+        let saved = settings::load(&path).unwrap();
+        assert!(saved.asks(StopWorkingChat));
+        assert!(!saved.asks(CloseActiveTerminal));
+    }
+
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         let card = with_focused_card.then(terminal_card_state);
         let card_id = card.as_ref().map(|card| card.id);

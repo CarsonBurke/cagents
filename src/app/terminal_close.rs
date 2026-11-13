@@ -778,8 +778,9 @@ impl Cagents {
         let named = std::mem::take(&mut intent.unreadable);
         intent.leave.extend(named);
         intent.detail = None;
-        // An active terminal still asks, as any Close does.
-        self.start_terminal_close(false)
+        // An active terminal still asks, as any Close does, unless the
+        // person chose not to be asked.
+        self.start_terminal_close(!self.asks(QUESTION))
     }
 
     fn start_terminal_close(&mut self, allow_active: bool) -> Task<Message> {

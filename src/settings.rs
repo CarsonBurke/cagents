@@ -1006,7 +1006,10 @@ pub enum Confirmation {
 impl Confirmation {
     pub const ALL: [Self; 2] = [Self::StopWorkingChat, Self::CloseActiveTerminal];
 
-    /// The key under `[confirmations]` in the settings file.
+    /// The question's stable name: its key under `[confirmations]`, and in
+    /// widget ids. The terminal question is stored in the older top-level
+    /// `confirm_terminal_close` instead, which builds before this table
+    /// still read, so `close_active_terminal` never appears in the file.
     pub const fn key(self) -> &'static str {
         match self {
             Self::StopWorkingChat => "stop_working_chat",

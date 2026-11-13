@@ -1523,6 +1523,61 @@ fn terminal_confirmation_owns_tab_navigation_and_restores_shell_setting() {
         );
         assert!(captured);
     }
+    // Someone still typing hasn't read the question: a letter leaves every
+    // choice unfocused, so the Enter ending their line answers nothing.
+    let keyboard::Event::KeyPressed {
+        physical_key,
+        location,
+        modifiers,
+        ..
+    } = key_press(keyboard::key::Named::Enter)
+    else {
+        unreachable!()
+    };
+    let letter = keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character("l".into()),
+        modified_key: keyboard::Key::Character("l".into()),
+        physical_key,
+        location,
+        modifiers,
+        text: Some("l".into()),
+        repeat: false,
+    };
+    let (focused, captured) =
+        focus_after_key(app.terminal_close_dialog().unwrap(), close.clone(), letter);
+    assert_eq!(focused, None);
+    assert!(captured);
+    // A held Enter or Space answers nothing.
+    for held in [key_press(keyboard::key::Named::Enter), space] {
+        let keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+            text,
+            ..
+        } = held
+        else {
+            unreachable!()
+        };
+        let repeated = keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+            text,
+            repeat: true,
+        };
+        let (messages, captured) = super::dialog_ui::tests::key_control(
+            app.terminal_close_dialog().unwrap(),
+            close.clone(),
+            repeated,
+        );
+        assert!(messages.is_empty(), "a held key answers nothing");
+        assert!(captured);
+    }
     let _ = app.update(Message::CancelTerminalClose);
     assert!(app.core.keyboard_nav());
 }

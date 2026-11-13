@@ -655,6 +655,33 @@ fn scope_step(event: &Event) -> Option<bool> {
     }
 }
 
+/// A key held down long enough to repeat Enter or Space.
+fn is_held_activation(event: &Event) -> bool {
+    use cosmic::iced::keyboard::{self, key::Named};
+    matches!(
+        event,
+        Event::Keyboard(keyboard::Event::KeyPressed { key, repeat: true, .. })
+            if *key == keyboard::Key::Named(Named::Enter)
+                || *key == keyboard::Key::Character(" ".into())
+    )
+}
+
+/// A printable key other than Space, pressed without a command modifier.
+fn is_typed_text(event: &Event) -> bool {
+    use cosmic::iced::keyboard;
+    matches!(
+        event,
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(character),
+            modifiers,
+            ..
+        }) if character.as_str() != " "
+            && !modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+    )
+}
+
 /// An unmodified Space press restated as Enter, the key that presses a
 /// focused button.
 fn space_as_enter(event: &Event) -> Option<Event> {
@@ -2063,6 +2090,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             );
             return;
         }
+        if matches!(self.kind, Kind::FocusScope) && is_held_activation(event) {
+            // A held Enter or Space would answer every question it meets,
+            // including the next one a queue of closes opens.
+            shell.capture_event();
+            return;
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -2100,6 +2133,23 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                     shell.request_redraw();
                 }
                 // Even with nothing to focus, the key stays in the dialog.
+                shell.capture_event();
+            } else if !shell.is_event_captured() && is_typed_text(event) {
+                // Text no control took was meant for whatever had the
+                // keyboard before the question appeared. Whoever is still
+                // typing hasn't read it, so the Enter that ends their line
+                // must not answer it: focus leaves every choice until Tab
+                // or a click picks one.
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut FocusNth {
+                        target: usize::MAX,
+                        index: 0,
+                    },
+                );
+                shell.request_redraw();
                 shell.capture_event();
             } else if !shell.is_event_captured()
                 && let Some(enter) = space_as_enter(event)

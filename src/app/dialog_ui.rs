@@ -110,7 +110,7 @@ impl Cagents {
                 .label("Don't ask again")
                 .on_toggle_maybe(enabled.then_some(toggle)),
         )
-        .class(cosmic::theme::Button::Text)
+        .class(crate::ui_controls::button::quiet_class())
         .id(dont_ask_again_id(confirmation))
         .on_press_maybe(enabled.then_some(toggle(!ticked)))
         .into()
