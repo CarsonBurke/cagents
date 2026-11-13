@@ -828,7 +828,11 @@ pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
 
 /// The row that closes a working transcript: a small muted spinner, or the
 /// waiting glyph, beside what the agent is doing.
-fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
+fn activity_row<'a>(
+    glyph: Icon,
+    label: String,
+    failure: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
     let glyph = if glyph == Icon::AgentWorking {
         crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -837,15 +841,32 @@ fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
     } else {
         crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
     };
-    widget::row::with_children(vec![
-        glyph,
-        design::caption(label)
+    let caption = |label: String| -> Element<'a, Message> {
+        design::caption(label.replace(['\n', '\r'], " "))
             .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into(),
-    ])
-    .spacing(step::GAP_XS)
-    .align_y(Alignment::Center)
-    .into()
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    };
+    let mut parts = Vec::new();
+    if !label.is_empty() {
+        parts.push(caption(label));
+    }
+    if let Some(failure) = failure {
+        if !parts.is_empty() {
+            parts.push(caption(" · ".into()));
+        }
+        parts.push(failure);
+    }
+    let status = widget::scrollable(widget::row::with_children(parts).align_y(Alignment::Center))
+        .width(Length::Fill)
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::hidden(),
+        ));
+    widget::row::with_children(vec![glyph, crate::interaction::overflow_fade_x(status)])
+        .spacing(step::GAP_XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A one-line row of a composer list: an optional icon, a name, what it
@@ -1381,6 +1402,7 @@ impl Runtime {
             chat::ToolStatus::Failed => "Failed",
             chat::ToolStatus::Denied => "Denied",
             chat::ToolStatus::Stopped => "Stopped",
+            chat::ToolStatus::Ended => "Ended",
         }
     }
 
@@ -1442,6 +1464,14 @@ impl Runtime {
     /// Completion requires provider evidence. An unstarted conversation is a
     /// draft; an idle attached one is ready, while an attachment is connecting.
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
+        self.conversation_status_with_failures(transitioning, true)
+    }
+
+    fn conversation_status_with_failures(
+        &self,
+        transitioning: bool,
+        include_failures: bool,
+    ) -> (Option<Icon>, String) {
         let (glyph, label) = self.conversation_status_base(transitioning);
         let snapshot = &self.snapshot;
         if self.closed_elsewhere
@@ -1454,31 +1484,11 @@ impl Runtime {
         {
             return (glyph, label.to_owned());
         }
-        let working = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
-            .count();
-        let waiting = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
-            .count();
-        let on_background_work = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Waiting)
-            .count();
-        let failed = snapshot
-            .subagents
-            .iter()
-            .filter(|child| {
-                matches!(
-                    child.status,
-                    chat::ToolStatus::Failed | chat::ToolStatus::Denied
-                )
-            })
-            .count();
+        let activity = snapshot.subagent_activity();
+        let working = activity.working;
+        let waiting = activity.waiting;
+        let on_background_work = activity.on_background_work;
+        let failed = activity.failed.len();
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
@@ -1507,59 +1517,122 @@ impl Runtime {
         });
         let mut parts = Vec::new();
         if let Some(label) = limit_reset.as_deref().or(failure_label) {
-            parts.push(Self::short_description(label, 72));
+            parts.push(label.to_owned());
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0 && on_background_work == 0)
+            || (working == 0 && waiting == 0 && on_background_work == 0 && failed == 0)
         {
-            parts.push(Self::short_description(label, 72));
+            parts.push(label.to_owned());
         }
-        if failure_label.is_some()
-            || snapshot.subagents.len() > 1
-            || on_background_work > 0
-            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
-        {
-            let subagents = |count: usize| {
-                if count == 1 {
-                    "1 subagent".to_owned()
-                } else {
-                    format!("{count} subagents")
-                }
-            };
-            if working > 0 {
-                parts.push(format!("{} working", subagents(working)));
-            }
-            if waiting > 0 {
-                parts.push(format!("{} waiting", subagents(waiting)));
-            }
-            if on_background_work > 0 {
-                parts.push(format!(
-                    "{} waiting on background work",
-                    subagents(on_background_work)
-                ));
-            }
-            if failed > 0 {
-                parts.push(format!("{} failed", subagents(failed)));
-            }
-            if !parts.is_empty() {
-                return (
-                    if working > 0 || snapshot.busy {
-                        Some(Icon::AgentWorking)
-                    } else if failure_label.is_some() || failed > 0 {
-                        Some(Icon::Warning)
-                    } else if on_background_work > 0 {
-                        // Not a finished check: a subagent's background work
-                        // goes on, though nothing is asked of the reader.
-                        None
+        let mut agent_parts = Vec::new();
+        if working > 0 {
+            agent_parts.push(format!(
+                "{working} {} working",
+                if working == 1 { "agent" } else { "agents" }
+            ));
+        }
+        if waiting > 0 {
+            agent_parts.push(if agent_parts.is_empty() {
+                format!(
+                    "{waiting} {} waiting",
+                    if waiting == 1 { "agent" } else { "agents" }
+                )
+            } else {
+                format!("{waiting} waiting")
+            });
+        }
+        if on_background_work > 0 {
+            agent_parts.push(if agent_parts.is_empty() {
+                format!(
+                    "{on_background_work} {} waiting on background work",
+                    if on_background_work == 1 {
+                        "agent"
                     } else {
-                        glyph
-                    },
-                    parts.join(" · "),
-                );
-            }
+                        "agents"
+                    }
+                )
+            } else {
+                format!("{on_background_work} waiting on background work")
+            });
         }
-        (glyph, Self::short_description(label, 100))
+        parts.extend(agent_parts);
+        if include_failures && failed > 0 {
+            parts.push(Self::agent_failure_label(&activity.failed));
+        }
+        if working + waiting + on_background_work + failed > 0 {
+            return (
+                if working > 0 || snapshot.busy {
+                    Some(Icon::AgentWorking)
+                } else if failure_label.is_some() || failed > 0 {
+                    Some(Icon::Warning)
+                } else if waiting > 0 {
+                    Some(Icon::AgentWaiting)
+                } else {
+                    None
+                },
+                parts.join(" · "),
+            );
+        }
+        (glyph, parts.join(" · "))
+    }
+
+    pub(super) fn agent_failure_task(agent: &chat::Subagent) -> &str {
+        Self::native_child_task(agent).unwrap_or_else(|| Self::native_child_name(agent))
+    }
+
+    fn agent_failure_label(failed: &[&chat::Subagent]) -> String {
+        match failed {
+            [agent] => format!("1 failed: {}", Self::agent_failure_task(agent)),
+            _ => format!("{} failed", failed.len()),
+        }
+    }
+
+    fn agent_failure_control(&self) -> Option<Element<'_, Message>> {
+        let failed = self.snapshot.subagent_activity().failed;
+        if failed.is_empty() {
+            return None;
+        }
+        let (name, on_press) = match failed.as_slice() {
+            [agent] => (
+                format!("Open failed agent: {}", Self::agent_failure_task(agent)),
+                Action::SelectSubagent(self.target, Some(agent.id.clone())),
+            ),
+            _ => (
+                format!("Choose from {} failed agents", failed.len()),
+                Action::SubagentFailures(self.target),
+            ),
+        };
+        let tooltip = failed
+            .iter()
+            .map(|agent| {
+                let task = Self::agent_failure_task(agent);
+                if agent.detail.trim().is_empty() {
+                    task.to_owned()
+                } else {
+                    format!("{task}: {}", agent.detail.trim())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::hash::DefaultHasher::new();
+        for agent in &failed {
+            agent.id.hash(&mut identity);
+        }
+        let button = widget::button::custom(
+            design::caption(Self::agent_failure_label(&failed))
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .name(name)
+        .id(card_control_id(
+            self.target.card,
+            &format!("chat-agent-failures-{:x}", identity.finish()),
+        ))
+        .padding(0)
+        .class(crate::ui_controls::control_style(false, None))
+        .on_press(action(on_press));
+        Some(crate::interaction::tooltip_above(button, tooltip))
     }
 
     /// What the agent is doing now, for the row that closes the transcript:
@@ -1592,11 +1665,11 @@ impl Runtime {
             }
             return (agent.status == chat::ToolStatus::Running).then(|| {
                 if agent.waiting {
-                    (Icon::AgentWaiting, "Waiting for you".to_owned())
+                    (Icon::AgentWaiting, "Waiting".to_owned())
                 } else {
                     let activity = items_activity(&agent.items);
                     let label = if activity == "Working" && !agent.detail.trim().is_empty() {
-                        Self::short_description(agent.detail.trim(), 100)
+                        agent.detail.trim().to_owned()
                     } else {
                         activity.to_owned()
                     };
@@ -1611,15 +1684,9 @@ impl Runtime {
         let (glyph, label) = self.conversation_status(transitioning);
         match glyph {
             Some(glyph @ (Icon::AgentWorking | Icon::AgentWaiting)) => Some((glyph, label)),
-            // A failure stands in the transcript on its own; a subagent still
-            // waiting on the reader is not settled by it.
-            Some(Icon::Warning)
-                if snapshot
-                    .subagents
-                    .iter()
-                    .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
-            {
-                Some((Icon::AgentWaiting, label))
+            // A recent failed task stays actionable even after the lead finishes.
+            Some(Icon::Warning) if !snapshot.subagent_activity().failed.is_empty() => {
+                Some((Icon::Warning, label))
             }
             // Nothing is asked of the reader, but the finished stamp alone
             // would read as everything being done.
@@ -2177,7 +2244,9 @@ impl Runtime {
                     heading.into()
                 },
             );
-            if agent.items.is_empty() {
+            if agent.items.is_empty()
+                && !(agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty())
+            {
                 transcript.push(transcript_body(
                     if agent.status == chat::ToolStatus::Running {
                         "Waiting for subagent activity…"
@@ -2432,7 +2501,17 @@ impl Runtime {
         // composer, and each change redraws this one row rather than adding
         // another.
         if let Some((glyph, label)) = self.timeline_activity(transitioning, selected) {
-            transcript.push(activity_row(glyph, label));
+            let failure = selected
+                .is_none()
+                .then(|| self.agent_failure_control())
+                .flatten();
+            let label = if failure.is_some() {
+                self.conversation_status_with_failures(transitioning, false)
+                    .1
+            } else {
+                label
+            };
+            transcript.push(activity_row(glyph, label, failure));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -7452,9 +7531,9 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).error = None;
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.subagents.push(native_child_fixture());
-        assert_eq!(runtime.conversation_status(false).1, "Subagents working");
+        assert_eq!(runtime.conversation_status(false).1, "1 agent working");
         Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-        assert_eq!(runtime.conversation_status(false).1, "Subagents waiting");
+        assert_eq!(runtime.conversation_status(false).1, "1 agent waiting");
         Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Succeeded;
         assert_eq!(
             runtime.conversation_status(false).1,
@@ -7501,6 +7580,149 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_counts_only_active_states_and_identifies_the_current_failure() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        for (index, status) in [
+            chat::ToolStatus::Running,
+            chat::ToolStatus::Running,
+            chat::ToolStatus::Waiting,
+            chat::ToolStatus::Failed,
+            chat::ToolStatus::Stopped,
+            chat::ToolStatus::Ended,
+            chat::ToolStatus::Succeeded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut child = native_child_fixture();
+            child.id = format!("child-{index}");
+            child.status = status;
+            child.waiting = index == 1;
+            child.description = "Check restart safety".into();
+            snapshot.subagents.push(child);
+        }
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "1 agent working · 1 waiting · 1 waiting on background work · 1 failed: Check restart safety"
+        );
+        assert_eq!(
+            runtime.conversation_status_with_failures(false, false).1,
+            "1 agent working · 1 waiting · 1 waiting on background work"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot
+            .subagents
+            .retain(|agent| agent.status == chat::ToolStatus::Failed);
+        assert_eq!(
+            runtime.timeline_activity(false, None),
+            Some((Icon::Warning, "1 failed: Check restart safety".into()))
+        );
+    }
+
+    #[test]
+    fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a_filtered_chooser()
+     {
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        runtime.target.card = app.workspace.focused().unwrap();
+        let target = runtime.target;
+        let mut failed = native_child_fixture();
+        failed.status = chat::ToolStatus::Failed;
+        failed.description = "Check restart safety".into();
+        failed.detail = "The soak test crashed".into();
+        Arc::make_mut(&mut runtime.snapshot).subagents.push(failed);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            activity_row(
+                Icon::Warning,
+                String::new(),
+                runtime.agent_failure_control(),
+            ),
+            iced::Size::new(800.0, 36.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Open failed agent: Check restart safety"))
+            .and_then(|node| node.node().bounds())
+            .expect("an actionable named failure");
+        let pointer = iced::Point::new(
+            (bounds.x0 + bounds.x1) as f32 / 2.0,
+            (bounds.y0 + bounds.y1) as f32 / 2.0,
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ],
+            iced::mouse::Cursor::Available(pointer),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        drop(ui);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let select = messages
+            .into_iter()
+            .find_map(|message| match message {
+                Message::ChatUi(action @ Action::SelectSubagent(..)) => Some(action),
+                _ => None,
+            })
+            .expect("failure click selects a transcript");
+        drop(app.handle_chat_ui(select));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("native-child"));
+        let mut second = runtime.snapshot.subagents[0].clone();
+        second.id = "second-failure".into();
+        Arc::make_mut(&mut runtime.snapshot).subagents.push(second);
+        drop(app.handle_chat_ui(Action::SubagentFailures(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let picker = runtime.child_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, child_navigation::Filter::Failed);
+        assert_eq!(
+            picker
+                .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn long_activity_remains_one_line_in_a_narrow_pane() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut row = activity_row(
+            Icon::AgentWorking,
+            "7 agents working\n1 waiting on background work · ".repeat(20),
+            None,
+        );
+        let mut tree = Tree::new(row.as_widget());
+        let node = row.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 200.0)),
+        );
+        assert_eq!(node.size().width, 240.0);
+        assert!(
+            node.size().height < 30.0,
+            "status wrapped: {:?}",
+            node.size()
+        );
+    }
+
+    #[test]
     fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         let activity = |runtime: &Runtime| runtime.timeline_activity(false, None);
@@ -7524,21 +7746,21 @@ mod tests {
             activity(&runtime),
             Some((
                 Icon::AgentWorking,
-                "Reviewing changes · 2 subagents working".into()
+                "Reviewing changes · 2 agents working".into()
             ))
         );
         assert_eq!(runtime.snapshot.items.len(), items);
         Arc::make_mut(&mut runtime.snapshot).busy = false;
         assert_eq!(
             activity(&runtime),
-            Some((Icon::AgentWorking, "2 subagents working".into()))
+            Some((Icon::AgentWorking, "2 agents working".into()))
         );
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.subagents[0].waiting = true;
         snapshot.subagents[1].status = chat::ToolStatus::Succeeded;
         assert_eq!(
             activity(&runtime),
-            Some((Icon::AgentWaiting, "1 subagent waiting".into()))
+            Some((Icon::AgentWaiting, "1 agent waiting".into()))
         );
         Arc::make_mut(&mut runtime.snapshot).waiting = true;
         assert_eq!(
@@ -7663,7 +7885,7 @@ mod tests {
         snapshot.finished_at = Some(42);
         let (glyph, label) = runtime.conversation_status(false);
         assert!(
-            label.contains("1 subagent waiting on background work"),
+            label.contains("1 agent waiting on background work"),
             "{label}"
         );
         assert!(!label.contains("Waiting for you"), "{label}");
@@ -7676,7 +7898,7 @@ mod tests {
             runtime.timeline_activity(false, None),
             Some((
                 Icon::AgentBackground,
-                "1 subagent waiting on background work".into()
+                "1 agent waiting on background work".into()
             ))
         );
         let child = runtime.snapshot.subagents[0].clone();

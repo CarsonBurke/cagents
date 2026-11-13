@@ -2509,6 +2509,7 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
         ToolStatus::Failed => " (failed)",
         ToolStatus::Denied => " (denied)",
         ToolStatus::Stopped => " (stopped)",
+        ToolStatus::Ended => " (ended)",
         ToolStatus::Waiting => " (waiting on its own background work)",
     };
     let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();

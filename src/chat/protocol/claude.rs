@@ -712,6 +712,12 @@ struct Claude {
     /// delayed launch acknowledgement cannot reopen it and a refused result
     /// cannot turn a stop into a failure.
     ended_agents: VecDeque<(String, ToolStatus)>,
+    /// Earlier tool occurrences of an explicitly resumed provider agent.
+    /// Receipts for them must not revive or fail the current occurrence.
+    superseded_agents: VecDeque<String>,
+    /// Historical runs with no live process evidence yet. A fresh child
+    /// carrier or API stream can prove that this occurrence resumed.
+    unconfirmed_agents: HashSet<String>,
     models: Vec<Model>,
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
@@ -1613,7 +1619,10 @@ impl Claude {
                 id: parent.into(),
                 kind: String::new(),
                 description: String::new(),
-                status: None,
+                status: self
+                    .unconfirmed_agents
+                    .remove(parent)
+                    .then_some(ToolStatus::Running),
                 background: None,
                 model: None,
                 waiting: Some(false),
@@ -1955,8 +1964,17 @@ impl Claude {
                                 if ended.is_none() {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                                if let Some(agent) = frame["tool_use_result"]["agentId"].as_str() {
-                                    self.agent_call(agent, &tool_id);
+                                if !history
+                                    && let Some(agent) =
+                                        frame["tool_use_result"]["agentId"].as_str()
+                                    && let Some(previous) = self.agent_call(agent, &tool_id)
+                                {
+                                    step.events.push(subagent_status(
+                                        previous,
+                                        ToolStatus::Ended,
+                                        Some("Superseded by a later run of this agent"),
+                                        false,
+                                    ));
                                 }
                             }
                             let background = self.background_agents.contains(&tool_id);
@@ -1974,7 +1992,13 @@ impl Claude {
                             step.events.push(Event::Subagent {
                                 model: None,
                                 waiting: None,
-                                detail: None,
+                                detail: (status == ToolStatus::Failed).then(|| {
+                                    if let ItemContent::Tool { output, .. } = &item.content {
+                                        bounded_failure_detail([output.as_str()])
+                                    } else {
+                                        "The agent failed without reporting a reason".into()
+                                    }
+                                }),
                                 id: tool_id.clone(),
                                 kind: String::new(),
                                 description: String::new(),
@@ -2237,8 +2261,17 @@ impl Claude {
         }
     }
 
+    fn nested_agent_tool(&self, tool: &str) -> bool {
+        !self.tools.contains_key(&ScopedId::new(None, tool))
+            && self.tools.iter().any(|(key, item)| {
+                key.id == tool
+                    && key.parent.is_some()
+                    && matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
+            })
+    }
+
     fn agent_tool(&self, tool: &str) -> bool {
-        self.unique_tool_named(tool, "Agent")
+        self.tools.contains_key(&ScopedId::new(None, tool)) && self.unique_tool_named(tool, "Agent")
     }
 
     fn unique_tool_named(&self, tool: &str, expected: &str) -> bool {
@@ -2256,6 +2289,16 @@ impl Claude {
         reported: Option<&str>,
         started: bool,
     ) -> Result<Option<String>, ()> {
+        if reported.is_some_and(|tool| {
+            self.tools
+                .keys()
+                .any(|key| key.id == tool && key.parent.is_some())
+                && !self.tools.contains_key(&ScopedId::new(None, tool))
+        }) {
+            // An unscoped lifecycle notice for a helper of a worker cannot
+            // promote that helper into a direct child of the lead.
+            return Err(());
+        }
         let launched = self
             .agent_calls
             .iter()
@@ -2518,13 +2561,23 @@ impl Claude {
             }
             let id = format!("claude-task:{task}");
             let key = ScopedId::new(None, &id);
+            let failure_detail = (status == ToolStatus::Failed).then(|| {
+                let element = notification_elements(&content).into_iter().find(|element| {
+                    notification_tasks(element)
+                        .iter()
+                        .any(|known| known == &task)
+                });
+                element
+                    .map(notification_failure_detail)
+                    .unwrap_or_else(|| "The agent failed without reporting a reason".into())
+            });
             let status = self.update_task_agent(
                 &task,
                 Some(&owner),
                 false,
                 (!running).then_some(status),
                 status,
-                detail,
+                failure_detail.as_deref().or(detail),
                 step,
             );
             if !running {
@@ -2581,12 +2634,50 @@ impl Claude {
         }
     }
 
-    fn agent_call(&mut self, agent: &str, tool: &str) {
+    fn is_superseded(&self, tool: &str) -> bool {
+        self.superseded_agents.iter().any(|known| known == tool)
+    }
+
+    fn agent_call(&mut self, agent: &str, tool: &str) -> Option<String> {
+        if self.is_superseded(tool) {
+            return None;
+        }
+        let previous = self
+            .agent_calls
+            .iter()
+            .rev()
+            .find(|(known, old)| known == agent && old != tool)
+            .map(|(_, old)| old.clone());
+        if let Some(previous) = &previous {
+            self.superseded_agents.push_back(previous.clone());
+            if self.superseded_agents.len() > MAX_TOOLS {
+                self.superseded_agents.pop_front();
+            }
+            self.background_agents.remove(previous);
+            self.waiting_agents.remove(previous);
+            self.restarted_agents.retain(|known| known != previous);
+            self.ended_agents.retain(|(known, _)| known != previous);
+            self.ended_agents
+                .push_back((previous.clone(), ToolStatus::Ended));
+            let prior_tasks = self
+                .agent_task_calls
+                .iter()
+                .filter(|(known, _)| known == previous)
+                .map(|(_, task)| task.clone())
+                .collect::<Vec<_>>();
+            self.agent_task_calls.retain(|(known, _)| known != previous);
+            for task in prior_tasks {
+                if !self.agent_task_calls.iter().any(|(known, _)| known == tool) {
+                    self.agent_task_calls.push_back((tool.into(), task));
+                }
+            }
+        }
         self.agent_calls.retain(|(known, _)| known != agent);
         self.agent_calls.push_back((agent.into(), tool.into()));
         if self.agent_calls.len() > MAX_TOOLS {
             self.agent_calls.pop_front();
         }
+        previous
     }
     fn ended_agent(&self, tool: &str) -> Option<ToolStatus> {
         self.ended_agents
@@ -2817,11 +2908,6 @@ impl Adapter for Claude {
                 });
             }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
-            let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
-            calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
-            for (tool, agent) in calls {
-                self.agent_call(agent, tool);
-            }
             self.background_agents.extend(
                 history
                     .background_agent_tools
@@ -2834,28 +2920,17 @@ impl Adapter for Claude {
             for frame in frames {
                 self.history_message(&frame, &mut history_step)?;
             }
+            let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
+            calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
+            for (tool, agent) in calls {
+                self.agent_call(agent, tool);
+            }
             // Replayed Agent tool uses can reinsert completed background jobs.
             // The full history index is authoritative even when a sidecar is
             // absent or fell outside the bounded child-history window.
             self.background_agents
                 .retain(|id| history.agent_status.get(id) == Some(&ToolStatus::Running));
-            let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
-            statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
-            for (id, status) in statuses {
-                history_step.events.push(Event::Subagent {
-                    model: None,
-                    waiting: None,
-                    detail: None,
-                    id: id.clone(),
-                    kind: String::new(),
-                    description: String::new(),
-                    status: Some(*status),
-                    // Replayed launches say whether an agent ran in the
-                    // background, but this process never started it, so its
-                    // interrupt cannot stop it either.
-                    background: Some(false),
-                });
-            }
+            self.waiting_agents.clear();
             // Every launch the full history recorded, including those before
             // the page shown, so a later message to one still names it.
             let mut addresses = history.agent_addresses.iter().collect::<Vec<_>>();
@@ -2900,6 +2975,53 @@ impl Adapter for Claude {
                         history_step.events.extend(child_step.events);
                     }
                 }
+            }
+            let failure_details = history_step
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let Event::Subagent {
+                        id,
+                        status: Some(ToolStatus::Failed),
+                        detail: Some(detail),
+                        ..
+                    } = event
+                    {
+                        Some((id.clone(), detail.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashMap<_, _>>();
+            let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
+            statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
+            for (id, status) in statuses {
+                if *status == ToolStatus::Stopped {
+                    self.ended_agents.push_back((id.clone(), *status));
+                } else if *status == ToolStatus::Ended {
+                    self.unconfirmed_agents.insert(id.clone());
+                }
+                history_step.events.push(Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: if *status == ToolStatus::Ended {
+                        Some(
+                            "Earlier run ended; see its transcript for the recorded outcome".into(),
+                        )
+                    } else if *status == ToolStatus::Failed {
+                        failure_details.get(id).cloned()
+                    } else {
+                        None
+                    },
+                    id: id.clone(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(*status),
+                    // Replayed launches say whether an agent ran in the
+                    // background, but this process never started it, so its
+                    // interrupt cannot stop it either.
+                    background: Some(false),
+                });
             }
             let mut items = Vec::new();
             let mut children = Vec::new();
@@ -3163,6 +3285,23 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
+        for event in &mut step.events {
+            if let Event::Subagent {
+                id,
+                status,
+                waiting,
+                detail,
+                background,
+                ..
+            } = event
+                && self.is_superseded(id)
+            {
+                *status = Some(ToolStatus::Ended);
+                *waiting = Some(false);
+                *background = Some(false);
+                *detail = Some("Superseded by a later run of this agent".into());
+            }
+        }
         self.reconcile_waiting_agents(&mut step);
         Ok(step)
     }
@@ -3171,6 +3310,16 @@ impl Adapter for Claude {
 impl Claude {
     fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        if frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|parent| self.nested_agent_tool(parent))
+        {
+            // Forwarded grandchildren have no independent transcript in the
+            // lead conversation. Their launch/result tool row is retained in
+            // the direct worker's transcript; their own stream and outcome
+            // must neither create a peer nor settle that direct worker.
+            return Ok(step);
+        }
         // Reject only exact previously accepted receipts, before metadata or
         // lifecycle bookkeeping. An old child failure cannot re-block fresh
         // activity; parent result and unrelated SDK frames are untouched.
@@ -3274,6 +3423,8 @@ impl Claude {
                 self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.ended_agents.clear();
+                self.superseded_agents.clear();
+                self.unconfirmed_agents.clear();
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
@@ -4075,10 +4226,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
     let child: Vec<_> = events
         .drain(start..)
         .filter(|event| {
-            !matches!(
-                event,
-                Event::Status { .. } | Event::Usage(_) | Event::TurnStarted | Event::TurnSettled
-            )
+            // Helpers delegated by this worker are its own dependencies. Their
+            // Agent tool rows remain in its transcript, but listing them as
+            // peers double-counts the lead's direct delegated work.
+            match event {
+                Event::Subagent { id, .. } => id == parent,
+                Event::AgentAddress(_) => false,
+                Event::Status { .. }
+                | Event::Usage(_)
+                | Event::TurnStarted
+                | Event::TurnSettled => false,
+                _ => true,
+            }
         })
         .map(|event| match event {
             Event::Item(mut item) => {
@@ -4157,6 +4316,29 @@ fn slash_command_prompt(content: &str) -> Option<String> {
     } else {
         format!("{name} {args}")
     })
+}
+
+/// Only a person's new prompt advances the scope of recent failures.
+fn actual_user_prompt(frame: &Value) -> bool {
+    if string(frame, "type") != "user"
+        || model_only(frame)
+        || frame["origin"]["kind"]
+            .as_str()
+            .is_some_and(|kind| kind != "human")
+    {
+        return false;
+    }
+    let content = &frame["message"]["content"];
+    let prompt = content.is_string()
+        || content.as_array().is_some_and(|blocks| {
+            !blocks
+                .iter()
+                .any(|block| string(block, "type") == "tool_result")
+                && blocks
+                    .iter()
+                    .any(|block| matches!(string(block, "type"), "text" | "image" | "document"))
+        });
+    prompt && delivery(frame).is_empty()
 }
 
 /// What a user frame Claude Code wrote on another agent's behalf delivers,
@@ -4798,6 +4980,35 @@ fn notification_outcomes(content: &str) -> Vec<(String, String, ToolStatus)> {
         .collect()
 }
 
+fn bounded_failure_detail<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut detail = String::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() || detail == part {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push_str("\n\n");
+        }
+        let remaining = RECORDED_SUMMARY_BYTES.saturating_sub(detail.len());
+        detail.push_str(&part[..part.floor_char_boundary(remaining.min(part.len()))]);
+        if detail.len() >= RECORDED_SUMMARY_BYTES {
+            break;
+        }
+    }
+    if detail.is_empty() {
+        "The agent failed without reporting a reason".into()
+    } else {
+        detail
+    }
+}
+
+fn notification_failure_detail(element: &str) -> String {
+    let summary = notification_field(element, "summary").unwrap_or_default();
+    let result = notification_field(element, "result").unwrap_or_default();
+    bounded_failure_detail([summary.as_str(), result.as_str()])
+}
+
 /// What the tasks in a live notification are doing, as tool-use ID, task ID and
 /// notice. Only the head of the element says so: Claude Code also sends
 /// statusless check-ins for work that is still running, and a Monitor's
@@ -4953,7 +5164,7 @@ fn task_status(status: &str, notification: bool) -> Option<ToolStatus> {
     match status {
         "completed" => Some(ToolStatus::Succeeded),
         "failed" => Some(ToolStatus::Failed),
-        "killed" | "stopped" => Some(ToolStatus::Stopped),
+        "killed" | "stopped" | "cancelled" | "canceled" => Some(ToolStatus::Stopped),
         _ if notification => Some(ToolStatus::Succeeded),
         _ => None,
     }
@@ -5583,7 +5794,10 @@ impl Claude {
                         id: parent.clone(),
                         kind: String::new(),
                         description: String::new(),
-                        status: None,
+                        status: self
+                            .unconfirmed_agents
+                            .remove(&parent)
+                            .then_some(ToolStatus::Running),
                         background: None,
                         model: None,
                         waiting: Some(false),
@@ -6186,13 +6400,18 @@ impl Claude {
                 {
                     self.background_agents.insert(tool.clone());
                 }
+                let failure_detail = (ended == Some(ToolStatus::Failed)).then(|| {
+                    bounded_failure_detail([string(patch, "summary"), string(patch, "result")])
+                });
                 let status = self.update_task_agent(
                     task,
                     known_tool.as_deref(),
                     started,
                     ended,
                     item.content.status().unwrap_or(ToolStatus::Running),
-                    (ended == Some(ToolStatus::Waiting)).then_some(WAITING_ON_BACKGROUND),
+                    failure_detail.as_deref().or_else(|| {
+                        (ended == Some(ToolStatus::Waiting)).then_some(WAITING_ON_BACKGROUND)
+                    }),
                     step,
                 );
                 if let ItemContent::Tool {
@@ -6365,6 +6584,9 @@ struct History {
     /// only the agent's type, which must not rename it on resume.
     agent_names: HashMap<String, String>,
     agent_status: HashMap<String, ToolStatus>,
+    /// Latest actual user prompt on the displayed chain; provider notices and
+    /// tool-result carriers never advance the current failure scope.
+    latest_prompt: Option<u64>,
     background_agent_tools: HashSet<String>,
     /// How the background work other calls started ended, by call, as the
     /// transcript's notifications recorded it. One entry per notified call,
@@ -6760,6 +6982,7 @@ impl History {
         let mut message_offsets = HashMap::<String, usize>::new();
         let mut retracted = std::collections::HashSet::<String>::new();
         let mut task_notices = Vec::new();
+        let mut user_prompts = HashSet::new();
         let mut main_message: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
@@ -6829,6 +7052,9 @@ impl History {
                         string(&value, "subtype"),
                         "task_started" | "task_progress" | "task_notification" | "task_updated"
                     ));
+            if main && !task_notice && actual_user_prompt(&value) {
+                user_prompts.insert(record_offset);
+            }
             if main && task_notice {
                 if task_notices.len() >= 200_000 {
                     return Err(
@@ -7241,6 +7467,11 @@ impl History {
             .fold((0, 0), |(damaged, oversized), gap| {
                 (damaged + gap.damaged, oversized + gap.oversized)
             });
+        let latest_prompt = chain
+            .iter()
+            .filter_map(Link::offset)
+            .filter(|offset| user_prompts.contains(offset))
+            .max();
         let offset = chain.len();
         let mut history = Self {
             file,
@@ -7254,6 +7485,7 @@ impl History {
             agent_addresses: HashMap::new(),
             agent_names: HashMap::new(),
             agent_status: HashMap::new(),
+            latest_prompt,
             background_agent_tools: HashSet::new(),
             call_outcomes: HashMap::new(),
             result_calls,
@@ -7265,34 +7497,39 @@ impl History {
         history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
         Ok(history)
     }
-    /// Settles each agent the transcript leaves running that the user stopped,
-    /// which Claude Code records only in the agent's sidecar metadata, and each
-    /// it leaves waiting.
+    /// A transcript records what ran, not proof of a process still running.
+    /// Keep confirmed terminal outcomes; unresolved runs have ended for the
+    /// newly attached process until live frames say
+    /// otherwise. Explicit cancellation remains distinct.
     fn settle_stopped(&mut self) {
-        // The process an agent was waiting in is gone by the time history is
-        // read, and nothing is left to report on it.
-        for status in self.agent_status.values_mut() {
-            if *status == ToolStatus::Waiting {
-                *status = ToolStatus::Stopped;
-            }
-        }
-        let Some(dir) = &self.subagent_dir else {
-            return;
-        };
-        for (tool, status) in &mut self.agent_status {
-            if *status != ToolStatus::Running {
+        for tool in self.agent_tools.keys() {
+            let status = self
+                .agent_status
+                .entry(tool.clone())
+                .or_insert(ToolStatus::Ended);
+            if !status.is_live() {
                 continue;
             }
-            let Some(agent) = self.agent_ids.get(tool).filter(|agent| {
-                !agent.is_empty() && agent.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            }) else {
-                continue;
+            let stopped = self
+                .subagent_dir
+                .as_ref()
+                .and_then(|dir| {
+                    self.agent_ids
+                        .get(tool)
+                        .filter(|agent| {
+                            !agent.is_empty()
+                                && agent.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                        })
+                        .and_then(|agent| {
+                            sidecar_meta(&dir.join(format!("agent-{agent}.meta.json")))
+                        })
+                })
+                .is_some_and(|meta| meta["stoppedByUser"].as_bool() == Some(true));
+            *status = if stopped {
+                ToolStatus::Stopped
+            } else {
+                ToolStatus::Ended
             };
-            if sidecar_meta(&dir.join(format!("agent-{agent}.meta.json")))
-                .is_some_and(|meta| meta["stoppedByUser"].as_bool() == Some(true))
-            {
-                *status = ToolStatus::Stopped;
-            }
         }
     }
     /// Load only children linked by a tool-use ID in this exact parent session.
@@ -9248,10 +9485,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.status, ToolStatus::Failed);
         assert!(!child.waiting);
-        assert!(
-            child.detail.is_empty(),
-            "terminal transient-detail cleanup remains unchanged"
-        );
+        assert_eq!(child.detail, "The child task failed");
         assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
         let failures: Vec<_> = child
             .items
@@ -13260,6 +13494,310 @@ mod tests {
     }
 
     #[test]
+    fn recorded_current_agent_scene_counts_only_direct_current_work() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(include_bytes!(
+            "../../../tests/fixtures/live-agent-status-history.jsonl"
+        ))
+        .unwrap();
+        file.rewind().unwrap();
+        let history = History::index(file, "a2753000-0000-4000-8000-000000000001").unwrap();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Default::default()
+        };
+        let mut snapshot = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(
+            &mut snapshot,
+            adapter.initialize().unwrap().events,
+        );
+        let activity = snapshot.subagent_activity();
+        assert_eq!(
+            (
+                activity.working,
+                activity.waiting,
+                activity.on_background_work,
+                activity.failed.len()
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .filter(|agent| agent.id.starts_with("toolu_archive_"))
+                .all(|agent| agent.status == ToolStatus::Ended)
+        );
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .all(|agent| !agent.status.is_live())
+        );
+        for line in include_str!("../../../tests/fixtures/live-agent-status-live.jsonl").lines() {
+            let mut frame: Value = serde_json::from_str(line).unwrap();
+            if frame["_end"] == true {
+                continue;
+            }
+            frame.as_object_mut().unwrap().remove("_live");
+            crate::chat::runtime::project_events_for_test(
+                &mut snapshot,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        let activity = snapshot.subagent_activity();
+        assert_eq!(
+            (
+                activity.working,
+                activity.waiting,
+                activity.on_background_work,
+                activity.failed.len()
+            ),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(activity.failed[0].id, "toolu_failed");
+        assert!(activity.failed[0].detail.contains("rollback"));
+        assert!(
+            !snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.id == "toolu_nested")
+        );
+        let worker = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "toolu_worker_1")
+            .unwrap();
+        assert!(worker.items.iter().any(|item| item.id == "toolu_nested"));
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.status == ToolStatus::Stopped)
+        );
+        assert_eq!(snapshot.activity(), chat::ActivityState::Waiting);
+        assert!(snapshot.holds_work());
+        let failed_transcript = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "toolu_retry_old")
+            .unwrap();
+        assert_eq!(failed_transcript.status, ToolStatus::Ended);
+        crate::chat::runtime::project_events_for_test(&mut snapshot, vec![Event::TurnStarted]);
+        assert_eq!(snapshot.subagent_activity().failed.len(), 1);
+    }
+
+    #[test]
+    fn explicit_agent_resume_retires_old_failure_and_ignores_late_old_receipts() {
+        let mut adapter = Claude::default();
+        let mut snapshot = chat::Snapshot::default();
+        let frames = [
+            scoped_call(
+                None,
+                "old-call",
+                "old-agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"user","uuid":"old-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"same-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-agent","content":"Launched"}]}}),
+            json!({"type":"result","uuid":"old-failure","parent_tool_use_id":"old-agent","subtype":"error_during_execution","is_error":true,"errors":["Old attempt failed"]}),
+            scoped_call(
+                None,
+                "new-call",
+                "new-agent",
+                "Agent",
+                json!({"run_in_background":true,"resume":"same-agent"}),
+            ),
+            json!({"type":"user","uuid":"new-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"same-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"new-agent","content":"Launched"}]}}),
+            // A distinct late receipt is not an exact-frame replay; explicit
+            // supersession still prevents it becoming a current failure.
+            json!({"type":"result","uuid":"late-old-failure","parent_tool_use_id":"old-agent","subtype":"error_during_execution","is_error":true,"errors":["Old attempt failed again"]}),
+        ];
+        for frame in frames {
+            crate::chat::runtime::project_events_for_test(
+                &mut snapshot,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(snapshot.subagent_activity().working, 1);
+        assert!(snapshot.subagent_activity().failed.is_empty());
+        let old = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "old-agent")
+            .unwrap();
+        assert_eq!(old.status, ToolStatus::Ended);
+        assert!(old.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text.contains("Old attempt failed"))));
+    }
+
+    #[test]
+    fn historical_same_agent_occurrences_keep_latest_binding_and_fresh_activity() {
+        for streamed in [false, true] {
+            let mut frames = Vec::new();
+            for tool in ["old-worker", "current-worker"] {
+                frames.push(scoped_call(
+                    None,
+                    &format!("{tool}-call"),
+                    tool,
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ));
+                frames.push(json!({"type":"user","uuid":format!("{tool}-launch"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"shared-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":tool,"content":"Launched"}]}}));
+            }
+            let mut adapter = Claude {
+                history: Some(correlation_history(frames)),
+                ..Default::default()
+            };
+            let mut state = chat::Snapshot::default();
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.initialize().unwrap().events,
+            );
+            assert!(adapter.is_superseded("old-worker"));
+            assert!(!adapter.is_superseded("current-worker"));
+            assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
+            // A late old launch acknowledgement must not replace the latest
+            // authoritative binding, including when this is a distinct UUID.
+            adapter.receive(json!({"type":"user","uuid":"late-old-ack","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"shared-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-worker","content":"Launched"}]}})).unwrap();
+            let live = if streamed {
+                json!({"type":"stream_event","parent_tool_use_id":"current-worker","event":{"type":"message_start","message":{"id":"fresh-current-stream"}}})
+            } else {
+                json!({"type":"assistant","uuid":"fresh-current-carrier","parent_tool_use_id":"current-worker","message":{"id":"fresh-current-text","content":[{"type":"text","text":"Still reviewing"}]}})
+            };
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(live).unwrap().events,
+            );
+            assert_eq!(state.subagent_activity().working, 1);
+            assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
+            assert!(!adapter.is_superseded("current-worker"));
+            crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"shared-worker","task_type":"local_agent"})).unwrap().events);
+            crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"shared-worker","status":"completed"})).unwrap().events);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "current-worker")
+                    .unwrap()
+                    .status,
+                ToolStatus::Succeeded
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lifecycle_notices_never_promote_helpers_to_direct_workers() {
+        let mut adapter = Claude::default();
+        let mut state = chat::Snapshot::default();
+        for frame in [
+            scoped_call(
+                None,
+                "parent-call",
+                "parent-worker",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            scoped_call(
+                Some("parent-worker"),
+                "helper-call",
+                "nested-helper",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"system","subtype":"task_started","task_id":"nested-task","tool_use_id":"nested-helper","task_type":"local_agent","owned_by_subagent":true}),
+            json!({"type":"system","subtype":"task_progress","task_id":"nested-task","tool_use_id":"nested-helper","description":"Comparing files"}),
+            json!({"type":"system","subtype":"task_notification","task_id":"nested-task","tool_use_id":"nested-helper","status":"failed"}),
+            json!({"type":"assistant","uuid":"grandchild-answer","parent_tool_use_id":"nested-helper","message":{"id":"grandchild-answer","content":[{"type":"text","text":"Grandchild progress"}]}}),
+            json!({"type":"stream_event","parent_tool_use_id":"nested-helper","event":{"type":"message_start","message":{"id":"grandchild-stream"}}}),
+            json!({"type":"stream_event","parent_tool_use_id":"nested-helper","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"More grandchild progress"}}}),
+            json!({"type":"result","uuid":"grandchild-result","parent_tool_use_id":"nested-helper","subtype":"error_during_execution","is_error":true,"errors":["Grandchild failure"]}),
+        ] {
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].id, "parent-worker");
+        assert_eq!(state.subagent_activity().working, 1);
+        assert!(state.subagent_activity().failed.is_empty());
+        assert!(
+            state.subagents[0]
+                .items
+                .iter()
+                .any(|item| item.id == "nested-helper")
+        );
+    }
+
+    #[test]
+    fn autonomous_parent_response_does_not_retire_a_fresh_background_failure() {
+        let mut adapter = Claude::default();
+        let mut state = chat::Snapshot::default();
+        for frame in [
+            scoped_call(
+                None,
+                "worker-call",
+                "worker",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"user","uuid":"worker-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"background-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":"worker","content":"Launched"}]}}),
+            json!({"type":"result","uuid":"lead-idle","subtype":"success","is_error":false}),
+            json!({"type":"system","subtype":"task_notification","uuid":"fresh-failure","task_id":"background-worker","tool_use_id":"worker","status":"failed","summary":"Validation failed"}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"autonomous-response"}}}),
+            json!({"type":"assistant","uuid":"lead-response","message":{"id":"autonomous-response","content":[{"type":"text","text":"The validation worker needs attention."}]}}),
+            json!({"type":"result","uuid":"lead-responded","subtype":"success","is_error":false}),
+        ] {
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(state.subagent_activity().failed.len(), 1);
+        assert_eq!(state.subagent_activity().failed[0].id, "worker");
+    }
+
+    #[test]
+    fn restored_failures_are_scoped_to_the_latest_actual_user_prompt() {
+        let call = |tool: &str| {
+            scoped_call(
+                None,
+                &format!("{tool}-call"),
+                tool,
+                "Agent",
+                json!({"description":tool}),
+            )
+        };
+        let failure = |tool: &str| json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":true,"content":format!("{tool} could not validate the release")}]}});
+        let history = correlation_history(vec![
+            json!({"type":"user","message":{"content":"First actual prompt"}}),
+            call("old-failure"),
+            failure("old-failure"),
+            json!({"type":"user","message":{"content":"New actual prompt"}}),
+            call("recent-failure"),
+            failure("recent-failure"),
+            // Provider-generated user-role messages don't make a recent
+            // failure historical merely because the lead receives a report.
+            json!({"type":"user","origin":{"kind":"peer"},"message":{"content":"<peer-message>Worker report</peer-message>"}}),
+        ]);
+        assert_eq!(history.agent_status["old-failure"], ToolStatus::Ended);
+        assert_eq!(history.agent_status["recent-failure"], ToolStatus::Failed);
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Default::default()
+        };
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(
+            &mut state,
+            adapter.initialize().unwrap().events,
+        );
+        let activity = state.subagent_activity();
+        assert_eq!(activity.failed.len(), 1);
+        assert_eq!(activity.failed[0].id, "recent-failure");
+        assert!(activity.failed[0].detail.contains("could not validate"));
+    }
+
+    #[test]
     fn child_frames_stay_in_their_subagent_transcript() {
         let mut adapter = Claude::default();
         let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"subagent_type":"Explore","description":"Inspect parser"}}]}})).unwrap();
@@ -15232,7 +15770,7 @@ mod tests {
         history.settle_stopped();
         assert_eq!(
             history.agent_status.get("tool-left"),
-            Some(&ToolStatus::Stopped)
+            Some(&ToolStatus::Ended)
         );
         assert_eq!(
             history.agent_status.get("tool-settled"),
@@ -15240,7 +15778,7 @@ mod tests {
         );
         assert_eq!(
             history.agent_status.get("tool-resumed"),
-            Some(&ToolStatus::Stopped)
+            Some(&ToolStatus::Ended)
         );
     }
 
@@ -15314,7 +15852,7 @@ mod tests {
         };
         assert_eq!(read(transcript), Some(ToolStatus::Succeeded));
         // Reopened before the agent's work finished: the process it waited in
-        // is gone, so it ends stopped rather than finished.
+        // is gone, so its earlier run has ended without a confirmed outcome.
         let second = transcript
             .match_indices("\"type\": \"user\"")
             .map(|(at, _)| at)
@@ -15322,7 +15860,7 @@ mod tests {
             .last()
             .unwrap();
         let start = transcript[..second].rfind('\n').map_or(0, |at| at + 1);
-        assert_eq!(read(&transcript[..start]), Some(ToolStatus::Stopped));
+        assert_eq!(read(&transcript[..start]), Some(ToolStatus::Ended));
     }
 
     #[test]
@@ -15929,7 +16467,7 @@ mod tests {
     /// A resumed process never started the background agents its history
     /// replays, so cancelling its turn cannot be what stops them.
     #[test]
-    fn a_replayed_background_agent_is_not_stopped_by_this_interrupt() {
+    fn a_replayed_background_agent_is_ended_without_current_liveness_evidence() {
         let session = "00000000-0000-4000-8000-000000000001";
         let mut file = tempfile::tempfile().unwrap();
         for value in [
@@ -15953,7 +16491,7 @@ mod tests {
             } if id == "tool-agent" => Some((*status, *background)),
             _ => None,
         });
-        assert_eq!(last, Some((Some(ToolStatus::Running), false)));
+        assert_eq!(last, Some((Some(ToolStatus::Ended), false)));
     }
 
     /// Claude Code may run an agent in the background without being asked,
