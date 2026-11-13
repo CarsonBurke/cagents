@@ -35,6 +35,14 @@ pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
 /// What the refusal advises doing with the prompt instead.
 pub const LIMITED_ADVICE: &str =
     "Send it once the limit resets, or leave it with `cagents send`, which holds it until then.";
+/// How the daemon begins reporting a follow-up whose run ended before the
+/// agent received its prompt. Its key's acceptance is spent, so the prompt
+/// goes again only as a new send.
+pub const NOT_SENT: &str = "Not sent: ";
+/// How the daemon begins reporting a follow-up whose run was interrupted
+/// with no proof of whether the agent received its prompt. Retrying its key
+/// reports the same run.
+pub const OUTCOME_UNKNOWN: &str = "Outcome unknown: ";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 /// Ephemeral launcher proof for a console waiting for daemon startup. It is
 /// never a capability, durable launch recipe, or permission to send a prompt.

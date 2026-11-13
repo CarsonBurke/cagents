@@ -6106,7 +6106,10 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
     for attempt in ["first", "retry"] {
         let error = super::prompt(&host, &Authority::default(), follow_up.clone(), false)
             .expect_err(attempt);
-        assert!(error.contains("was not sent"), "{attempt}: {error}");
+        assert!(
+            error.starts_with(crate::agent_execution::NOT_SENT),
+            "{attempt}: {error}"
+        );
         assert!(
             error.contains("Resume it from its pane"),
             "{attempt}: {error}"

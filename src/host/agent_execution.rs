@@ -172,7 +172,7 @@ pub(super) fn prompt(
         return Err("Only an existing agent takes a follow-up prompt".into());
     };
     let (accepted, start) = accept(host, authority, request)?;
-    let start = start.map_err(|error| format!("Run {} was not sent: {error}", accepted.run.id))?;
+    let start = start.map_err(|error| unstarted(host, &accepted, error))?;
     if interrupt && let Start::Queued { behind } = start {
         interrupt_ahead(host, agent, behind).map_err(|error| {
             format!(
@@ -297,6 +297,36 @@ fn provider(
 /// A prompt that cannot go now or later is recorded failed, with why, rather
 /// than retried: a reopening that failed, or work ahead whose outcome is
 /// unknown. The next prompt tries again.
+/// Why `accepted` did not start, beginning with what its run's end proves
+/// about its prompt, so the CLI knows whether retrying its key can help.
+fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
+    use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
+    let id = accepted.run.id;
+    let state = registry(host).and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_run(id)
+            .map(|run| run.state)
+    });
+    let reason = error.strip_prefix(NOT_SENT).unwrap_or(&error);
+    let mut chars = reason.chars();
+    let reason = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+        .unwrap_or_default();
+    match state {
+        Ok(State::Failed | State::Cancelled) => {
+            format!("{NOT_SENT}run {id} ended before the agent received it. {reason}")
+        }
+        Ok(State::Interrupted) => format!(
+            "{OUTCOME_UNKNOWN}run {id} was interrupted without proof of whether the agent received it. {reason}"
+        ),
+        // Still waiting, so a retry with its key can still start it.
+        _ => format!("Run {id} has not started: {error}"),
+    }
+}
+
 pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, String> {
     let registry = registry(host)?;
     let id = accepted.run.id;
@@ -1617,15 +1647,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     // That includes every prompt still waiting behind the current run.
     let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
     for current in store.unfinished_agent_runs(id)? {
-        store.update_agent_run(
-            current.id,
-            current.revision,
-            Update::Finished {
-                state: State::Cancelled,
-                result: current.result,
-            },
-            now(),
-        )?;
+        store.cancel_agent_run_at_close(&current, now())?;
     }
     let result = store.close_agent(&origin, id)?;
     drop(store);

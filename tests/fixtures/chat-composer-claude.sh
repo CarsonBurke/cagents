@@ -327,9 +327,13 @@ frames_turn() {
 # Claude's Bash tool does, and reports its output and exit code. Checks of
 # where a provider's commands run, and of a command the system stops, use it.
 run_file=$config/fixture-run-command
+# fixture-run-once is the same for one turn: the first turn to start after it
+# is written takes it, so of several providers sharing this configuration,
+# only that one runs it.
+once_file=$config/fixture-run-once
 run_turn() {
     id="run-$turn"
-    command=$(head -n 1 "$run_file")
+    command=$(head -n 1 "$1")
     emit_record "$(jq -cn --arg id "$id" --arg command "$command" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:"Bash",input:{command:$command,description:"Run the fixture command"}}]}}')"
     status=0
     output=$(sh -c "$command" 2>&1 </dev/null) || status=$?
@@ -665,7 +669,13 @@ while next_frame; do
                     frames_turn
                     if [ "$frames_ended" = 1 ]; then continue; fi
                 fi
-                if [ -s "$run_file" ]; then run_turn; fi
+                taken=$once_file.$$
+                if mv "$once_file" "$taken" 2>/dev/null; then
+                    run_turn "$taken"
+                    rm -f "$taken"
+                elif [ -s "$run_file" ]; then
+                    run_turn "$run_file"
+                fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live

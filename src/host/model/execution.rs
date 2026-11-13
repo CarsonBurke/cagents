@@ -1390,13 +1390,7 @@ impl Registry {
 
     /// Whether `run` waits in its agent's queue, proved unsent.
     pub(crate) fn agent_run_is_queued(&self, run: RunId) -> Result<bool, String> {
-        self.db
-            .query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.id = ?1 AND {UNSENT})"),
-                [run.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())
+        run_is_unsent(&self.db, run)
     }
 
     /// Whether one of the agent's runs was interrupted without proof of its
@@ -1782,7 +1776,9 @@ impl Registry {
                         continue;
                     }
                     let mut run: Run = decode(&record)?;
-                    if run.state == State::Accepted {
+                    // A claimed prompt may be with the provider, awaiting its
+                    // acknowledgement, so only a queued one is proved unsent.
+                    if unsent {
                         super::mailbox::return_run_message_in(&tx, run.id)?;
                     }
                     // Teardown was confirmed, so this is a deliberate stop, not
@@ -2198,14 +2194,57 @@ impl Registry {
         update: Update,
         now_ms: u64,
     ) -> Result<Run, String> {
+        self.advance_agent_run(id, revision, update, now_ms, Unstarted::Unsubmitted)
+    }
+
+    /// Cancels `run` as its agent closes. Unlike its dispatcher, the close
+    /// cannot tell whether a claimed prompt reached the provider, so only a
+    /// queued one gives its message back.
+    pub(crate) fn cancel_agent_run_at_close(
+        &mut self,
+        run: &Run,
+        now_ms: u64,
+    ) -> Result<Run, String> {
+        self.advance_agent_run(
+            run.id,
+            run.revision,
+            Update::Finished {
+                state: State::Cancelled,
+                result: run.result.clone(),
+            },
+            now_ms,
+            Unstarted::Unproven,
+        )
+    }
+
+    fn advance_agent_run(
+        &mut self,
+        id: RunId,
+        revision: u64,
+        update: Update,
+        now_ms: u64,
+        unstarted: Unstarted,
+    ) -> Result<Run, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let run = update_agent_run_in(&tx, id, revision, update, now_ms)?;
+        let run = advance_agent_run_in(&tx, id, revision, update, now_ms, unstarted)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+}
+
+/// What a run that fails or is cancelled before its provider started the
+/// turn proves about its prompt, and so whether its message comes back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unstarted {
+    /// Its dispatcher, a withdrawal or a provider outcome reports it: the
+    /// provider never had the prompt.
+    Unsubmitted,
+    /// A claimed prompt may already be with the provider, awaiting its
+    /// acknowledgement; only a queued one is proved unsent.
+    Unproven,
 }
 
 /// A retained actor's semantic cursor and run transition share this transaction.
@@ -2215,6 +2254,17 @@ pub(super) fn update_agent_run_in(
     revision: u64,
     update: Update,
     now_ms: u64,
+) -> Result<Run, String> {
+    advance_agent_run_in(tx, id, revision, update, now_ms, Unstarted::Unsubmitted)
+}
+
+fn advance_agent_run_in(
+    tx: &Transaction<'_>,
+    id: RunId,
+    revision: u64,
+    update: Update,
+    now_ms: u64,
+    unstarted: Unstarted,
 ) -> Result<Run, String> {
     let record: String = tx
         .query_row(
@@ -2244,9 +2294,12 @@ pub(super) fn update_agent_run_in(
                 return Err("An unconfirmed provider turn cannot succeed".into());
             }
             // A run that fails or is cancelled before its provider started
-            // the turn never gave the provider its prompt. An interrupted one
-            // may have, so its message stays given.
-            if run.state == State::Accepted && matches!(state, State::Failed | State::Cancelled) {
+            // the turn never gave the provider its prompt, when that is
+            // proved. An interrupted one may have, so its message stays given.
+            if run.state == State::Accepted
+                && matches!(state, State::Failed | State::Cancelled)
+                && (unstarted == Unstarted::Unsubmitted || run_is_unsent(tx, id)?)
+            {
                 super::mailbox::return_run_message_in(tx, id)?;
             }
             result.bound();
@@ -2360,6 +2413,15 @@ const UNSENT: &str = "r.state = 'accepted'
     AND NOT EXISTS(SELECT 1 FROM agent_dispatches d WHERE d.run = r.id)
     AND NOT EXISTS(SELECT 1 FROM agents q WHERE q.id = r.agent
         AND json_extract(q.origin, '$.Automation') IS NOT NULL)";
+
+fn run_is_unsent(db: &Connection, run: RunId) -> Result<bool, String> {
+    db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.id = ?1 AND {UNSENT})"),
+        [run.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
 
 /// The most prompts an agent holds while its current run continues.
 pub(crate) const MAX_QUEUED: usize = 8;
@@ -3325,9 +3387,6 @@ mod tests {
         ended
     }
 
-    /// A daemon stop ends the exact provider's authority and turn but keeps
-    /// the agent, its pane and its channel, so the conversation resumes in
-    /// place; an explicit Close of the same state still retires all three.
     /// A message to `agent`, bound to `source`, and the run it becomes.
     fn message_run(
         registry: &mut Registry,
@@ -3511,6 +3570,70 @@ mod tests {
         assert_eq!(message_state(&registry, &message), Mail::Pending);
     }
 
+    #[test]
+    fn a_claimed_message_run_ended_by_a_stop_or_close_keeps_its_message_given() {
+        use crate::agent_execution::mailbox::State as Mail;
+        for end in [ProcessEnd::Stopped, ProcessEnd::Closed] {
+            for close in [false, true] {
+                if close && end == ProcessEnd::Stopped {
+                    continue;
+                }
+                let (mut registry, _directory, request) = fixture();
+                let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+                let source = source();
+                registry
+                    .bind_agent(accepted.agent.id, None, source.clone())
+                    .unwrap();
+                registry.register_agent_authority(&source).unwrap();
+                let first = registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        accepted.run.revision,
+                        Update::Started {
+                            provider_key: "turn".into(),
+                        },
+                        2,
+                    )
+                    .unwrap();
+                registry
+                    .update_agent_run(
+                        first.id,
+                        first.revision,
+                        Update::Finished {
+                            state: State::Succeeded,
+                            result: Default::default(),
+                        },
+                        3,
+                    )
+                    .unwrap();
+                // Its dispatcher claimed it and wrote the prompt; the
+                // provider has not acknowledged the turn yet.
+                let (message, run) = message_run(&mut registry, &accepted.agent, &source, 4);
+                assert!(registry.claim_agent_dispatch(&run, 5).unwrap());
+                assert!(!registry.agent_run_is_queued(run.run.id).unwrap());
+
+                if close {
+                    let current = registry.agent_run(run.run.id).unwrap();
+                    registry.cancel_agent_run_at_close(&current, 6).unwrap();
+                } else {
+                    assert!(registry.end_agent_process(&source, 6, end, None).unwrap());
+                }
+                assert_eq!(
+                    registry.agent_run(run.run.id).unwrap().state,
+                    State::Cancelled
+                );
+                assert_eq!(
+                    message_state(&registry, &message),
+                    Mail::Delivered,
+                    "{end:?} close={close}: the provider may have the prompt, so giving the message again could repeat it"
+                );
+            }
+        }
+    }
+
+    /// A daemon stop ends the exact provider's authority and turn but keeps
+    /// the agent, its pane and its channel, so the conversation resumes in
+    /// place; an explicit Close of the same state still retires all three.
     #[test]
     fn daemon_stop_keeps_the_agent_pane_and_channel_that_close_retires() {
         use crate::workspace_model::views::Scope;

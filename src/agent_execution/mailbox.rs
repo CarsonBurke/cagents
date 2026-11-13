@@ -188,6 +188,14 @@ pub enum Handoff {
     /// The agent cannot take it as a run, for this reason; the message waits
     /// as one to any other session would.
     Held { agent: AgentId, reason: String },
+    /// The message is the prompt of this run, which was interrupted, for this
+    /// reason, with no proof of whether the agent received it. It is not
+    /// sent again.
+    Unknown {
+        agent: AgentId,
+        run: RunId,
+        reason: String,
+    },
 }
 
 /// A sent message, what its recipient can do with it now, and, for an agent

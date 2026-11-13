@@ -256,6 +256,14 @@ fn delivery_lines(handed: &Handed) -> String {
             short(*agent)
         ));
     }
+    if let Some(Handoff::Unknown { agent, run, reason }) = &handed.agent {
+        lines.push(format!(
+            "It went to agent {} as run {}, which was interrupted: {}. Inspect that conversation before sending it again.",
+            short(*agent),
+            short(*run),
+            reason.trim_end_matches('.')
+        ));
+    }
     if let Some(notice) = notice(handed) {
         lines.push(format!("But {notice}"));
     }
@@ -319,6 +327,9 @@ pub enum Arrival {
     Started,
     /// That agent takes it as its next run once its current work ends.
     Queued,
+    /// That agent took it as a run, which was interrupted with no proof of
+    /// whether the agent received it.
+    Unknown,
 }
 
 impl Arrival {
@@ -343,6 +354,7 @@ impl Arrival {
                 ),
                 ..,
             ) => Arrival::Queued,
+            (Some(Handoff::Unknown { .. }), ..) => Arrival::Unknown,
             (_, _, None) => Arrival::User,
             (_, Reach::Conversation, _) => Arrival::WhenIdle,
             (_, Reach::Inbox, _) => Arrival::Inbox,
@@ -376,6 +388,7 @@ fn arrival_phrase(arrival: Arrival) -> &'static str {
         Arrival::NextSession => "no session of it runs now; the next one to start receives it",
         Arrival::Started => "that agent started a run with it now",
         Arrival::Queued => "that agent takes it as its next run once its current work ends",
+        Arrival::Unknown => "whether that agent received it is unknown",
     }
 }
 
@@ -395,6 +408,7 @@ pub(super) fn read_sent_line(line: &str) -> Option<Receipt> {
         Arrival::User,
         Arrival::Started,
         Arrival::Queued,
+        Arrival::Unknown,
     ]
     .into_iter()
     .find_map(|arrival| {
@@ -913,6 +927,28 @@ mod tests {
         let value = delivery_json(&held);
         assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
         assert!(value["agent"]["Held"]["reason"].is_string(), "{value}");
+
+        // A run interrupted with no proof of whether the agent received the
+        // message neither claims it arrives nor that nothing was sent.
+        let lines = delivery_lines(&handed(Some(Handoff::Unknown {
+            agent,
+            run,
+            reason: "The provider restarted during the turn.".into(),
+        })));
+        let lines: Vec<_> = lines.lines().collect();
+        assert!(
+            lines[0].ends_with("\"Fix login\"; whether that agent received it is unknown"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "It went to agent {} as run {}, which was interrupted: The provider restarted during the turn. Inspect that conversation before sending it again.",
+                short(agent),
+                short(run)
+            )
+        );
+        assert_eq!(lines.len(), 2);
     }
 
     #[cfg(feature = "ui")]
@@ -933,6 +969,14 @@ mod tests {
                     behind: None,
                 },
                 Arrival::Queued,
+            ),
+            (
+                Handoff::Unknown {
+                    agent: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    reason: "The provider restarted".into(),
+                },
+                Arrival::Unknown,
             ),
         ] {
             let sent = Sent {

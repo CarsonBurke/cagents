@@ -17,7 +17,7 @@
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
-        AcceptanceError, Authority, Lineage, Origin,
+        AcceptanceError, Accepted, Authority, Lineage, Origin,
         directory::{Member, Scope, UsageLimit},
         mailbox::{
             Delivery, Handed, Handoff, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent,
@@ -129,12 +129,7 @@ pub(in crate::host) fn hand(
         else {
             return Ok(None);
         };
-        let start = super::start(host, &accepted)?;
-        Ok::<_, String>(Some(Handoff::Run {
-            agent: agent.id,
-            run: accepted.run.id,
-            start,
-        }))
+        Ok::<_, String>(Some(started(host, &registry, &accepted)))
     })();
     wake(host);
     // The message is left either way; a failure to start its run is how the
@@ -263,18 +258,29 @@ pub(super) fn to_agent(
         }
     };
     super::announce(host, registry);
-    match super::start(host, &accepted) {
-        Ok(start) => Ok(Some(Handoff::Run {
-            agent: agent.id,
-            run: accepted.run.id,
-            start,
-        })),
-        // Its run is recorded failed, and the message waits again to reach
-        // the conversation as a message.
-        Err(reason) => Ok(Some(Handoff::Held {
-            agent: agent.id,
-            reason,
-        })),
+    Ok(Some(started(host, registry, &accepted)))
+}
+
+/// How the agent takes a message as `accepted`, once cagents tried to start
+/// it.
+fn started(host: &SharedHost, registry: &SharedRegistry, accepted: &Accepted) -> Handoff {
+    let (agent, run) = (accepted.agent.id, accepted.run.id);
+    let reason = match super::start(host, accepted) {
+        Ok(start) => return Handoff::Run { agent, run, start },
+        Err(reason) => reason,
+    };
+    let interrupted = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_run(run)
+        .is_ok_and(|run| run.state == crate::agent_execution::State::Interrupted);
+    if interrupted {
+        // The provider may have the message, so it stays given.
+        Handoff::Unknown { agent, run, reason }
+    } else {
+        // Its run ended unsent and gave the message back, which reaches the
+        // conversation as a message.
+        Handoff::Held { agent, reason }
     }
 }
 
@@ -1058,6 +1064,11 @@ impl Handle {
         {
             match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
                 Ok(Some(Handoff::Run { .. } | Handoff::Waiting { .. })) => return Ok(()),
+                // Its run has it, perhaps already with the provider.
+                Ok(Some(Handoff::Unknown { reason, run, .. })) => {
+                    tracing::warn!(%reason, %run, message = %message.id, "a message's run was interrupted");
+                    return Ok(());
+                }
                 // Not as a run, but as a message, as a person's conversation
                 // takes one.
                 Ok(Some(Handoff::Held { reason, .. })) => {

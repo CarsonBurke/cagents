@@ -260,6 +260,12 @@ from `scripts/native-evidence env`, find the command's cgroup in
 `/proc/PID/cgroup`, then stop it as systemd-oomd does, by setting
 `user.oomd_ooms` on the cgroup and writing `1` to its `cgroup.kill`.
 
+`home/.claude/fixture-run-once` runs its first line the same way, but only in
+the next turn to start, which removes it; that turn runs it instead of
+`fixture-run-command`. Agents sharing the fixture configuration can then act
+one at a time: write `cagents send SESSION 'Ship it'` there just before giving
+the sending agent its turn, and only that agent sends it.
+
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native
 launches drop `CAGENTS_*` variables, so the fixture reads the image from its

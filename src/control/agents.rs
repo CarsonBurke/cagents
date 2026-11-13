@@ -1270,6 +1270,34 @@ fn is_limited_refusal(error: &AppError) -> bool {
         .starts_with(crate::agent_execution::LIMITED_REFUSAL)
 }
 
+/// `error` with the key that makes retrying its submission safe, when a
+/// retry could still start the work.
+fn with_retry_key(mut error: AppError, key: &str) -> AppError {
+    // A limit's refusal is definite: nothing was accepted to retry. A run
+    // that ended has spent its key: retrying reports the same end.
+    if is_limited_refusal(&error) || ended_run(&error) {
+        return error;
+    }
+    error.message = format!(
+        "{}; retry with --idempotency-key {key} to avoid starting the work twice",
+        error.message
+    );
+    let mut details = match error.details.take() {
+        Some(Value::Object(details)) => details,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("idempotency_key".into(), json!(key));
+    error.details = Some(Value::Object(details));
+    error
+}
+
+/// Whether the daemon reports the run a follow-up was accepted as having
+/// ended, sent or not, so its key can no longer start it.
+fn ended_run(error: &AppError) -> bool {
+    use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
+    error.message.starts_with(NOT_SENT) || error.message.starts_with(OUTCOME_UNKNOWN)
+}
+
 /// How a follow-up's acceptance line ends: whether the prompt went to the
 /// agent now or waits, and for what.
 fn start_phrase(start: &crate::agent_execution::Start, interrupted: bool) -> String {
@@ -1318,23 +1346,9 @@ fn submitted(
         Some(interrupt) => Operation::Prompt { request, interrupt },
         None => Operation::Submit(request),
     };
-    let (reply, retried) = session.submit(request, operation).map_err(|mut error| {
-        // A limit's refusal is definite: nothing was accepted to retry.
-        if is_limited_refusal(&error) {
-            return error;
-        }
-        error.message = format!(
-            "{}; retry with --idempotency-key {key} to avoid starting the work twice",
-            error.message
-        );
-        let mut details = match error.details.take() {
-            Some(Value::Object(details)) => details,
-            _ => serde_json::Map::new(),
-        };
-        details.insert("idempotency_key".into(), json!(key));
-        error.details = Some(Value::Object(details));
-        error
-    })?;
+    let (reply, retried) = session
+        .submit(request, operation)
+        .map_err(|error| with_retry_key(error, &key))?;
     let (accepted, start) = match reply {
         Reply::Accepted(accepted) => (accepted, None),
         Reply::Prompted { accepted, start } => (accepted, Some(start)),
@@ -3256,6 +3270,32 @@ mod tests {
             start_phrase(&Start::Queued { behind: None }, true),
             "; interrupted the agent's current turn, and it starts once that has stopped"
         );
+    }
+
+    #[test]
+    fn only_a_retry_that_can_still_start_the_work_names_its_key() {
+        use crate::agent_execution::{NOT_SENT, OUTCOME_UNKNOWN};
+        let lost = with_retry_key(AppError::new("daemon", "The connection closed"), "k1");
+        assert!(
+            lost.message
+                .ends_with("retry with --idempotency-key k1 to avoid starting the work twice"),
+            "{}",
+            lost.message
+        );
+        assert_eq!(lost.details.unwrap()["idempotency_key"], "k1");
+        for ended in [
+            format!("{NOT_SENT}run 1 ended before the agent received it. Resume it from its pane."),
+            format!(
+                "{OUTCOME_UNKNOWN}run 1 was interrupted without proof of whether the agent received it."
+            ),
+        ] {
+            let error = with_retry_key(AppError::new("daemon", ended.clone()), "k1");
+            assert_eq!(
+                error.message, ended,
+                "retrying its key reports the same end"
+            );
+            assert!(error.details.is_none());
+        }
     }
 
     #[test]

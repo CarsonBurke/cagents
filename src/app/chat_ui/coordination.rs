@@ -524,6 +524,7 @@ fn arrival(arrival: Arrival) -> &'static str {
         Arrival::User => "Left in your inbox",
         Arrival::Started => "Started a run for them",
         Arrival::Queued => "Runs after their current work",
+        Arrival::Unknown => "Interrupted; may not have arrived",
     }
 }
 
