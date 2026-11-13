@@ -17,9 +17,9 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
-use crate::file_manager::{self, open_system_url};
 #[cfg(feature = "integrated-browser")]
 mod browser_backend;
 mod browser_host;
@@ -4590,6 +4590,13 @@ pub enum Message {
     FileRevealed(Result<file_manager::RevealOutcome, String>),
     NewBrowser,
     ExternalUrlOpened(Result<(), String>),
+    /// A page meant for a browser pane went to the system browser instead,
+    /// because the integrated browser is unavailable for `reason`.
+    #[cfg(feature = "integrated-browser")]
+    BrowserFallbackOpened {
+        result: Result<(), String>,
+        reason: crate::capability::BrowserUnavailable,
+    },
     #[cfg(feature = "integrated-browser")]
     BrowserBack(CardId),
     #[cfg(feature = "integrated-browser")]
@@ -5361,6 +5368,8 @@ pub struct Cagents {
     browser_backend: browser_backend::State,
     #[cfg(feature = "integrated-browser")]
     browser_parent_lifetime: Option<Arc<ParentWindowLifetime>>,
+    /// Hands URLs to the system browser; tests record them instead.
+    system_url_opener: file_manager::SystemUrlOpener,
     /// Compositor scale, before the user's interface scale multiplier.
     window_scale_factor: f32,
     /// Starts at an estimate, because the pane density and the strip's viewport
@@ -6617,7 +6626,7 @@ impl Cagents {
     ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
-            return Self::open_external_url(session.current_url.clone());
+            return self.open_external_url(session.current_url.clone());
         }
         let source_id = source.id;
         let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
@@ -7617,9 +7626,10 @@ impl Cagents {
         }
         match destination {
             LinkOpenDestination::IntegratedBrowser => self.add_browser(url),
-            LinkOpenDestination::SystemDefault => cosmic::task::future(async move {
-                Message::ExternalLinkOpened(open_system_url(url).await)
-            }),
+            LinkOpenDestination::SystemDefault => {
+                let opened = self.system_url_opener.open(url);
+                cosmic::task::future(async move { Message::ExternalLinkOpened(opened.await) })
+            }
         }
     }
 
@@ -7637,6 +7647,24 @@ impl Cagents {
 
     #[cfg(feature = "integrated-browser")]
     fn add_browser(&mut self, url: Url) -> Task<Message> {
+        // A pane that cannot show the page is a dead end, so a page the
+        // system browser can show goes there, and the notice says why. A
+        // check that might succeed on a second try starts again, so the next
+        // page can open here.
+        if let Some(reason) = self.browser_unavailable_reason()
+            && matches!(url.scheme(), "http" | "https" | "file")
+        {
+            let opened = self.system_url_opener.open(url);
+            return Task::batch([
+                cosmic::task::future(async move {
+                    Message::BrowserFallbackOpened {
+                        result: opened.await,
+                        reason,
+                    }
+                }),
+                self.recheck_browser(),
+            ]);
+        }
         let card_id = CardId::new();
         let session = BrowserSession {
             id: BrowserId::new(),
@@ -7719,11 +7747,12 @@ impl Cagents {
 
     #[cfg(not(feature = "integrated-browser"))]
     fn add_browser(&mut self, url: Url) -> Task<Message> {
-        Self::open_external_url(url)
+        self.open_external_url(url)
     }
 
-    fn open_external_url(url: Url) -> Task<Message> {
-        cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
+    fn open_external_url(&self, url: Url) -> Task<Message> {
+        let opened = self.system_url_opener.open(url);
+        cosmic::task::future(async move { Message::ExternalUrlOpened(opened.await) })
     }
 
     /// Keeps the saved focus on a pane the window still holds open.
@@ -8906,9 +8935,16 @@ impl Cagents {
         if matches!(
             self.card_state(card).map(|state| &state.kind),
             Some(CardKind::Browser(_))
-        ) && self.browser_unavailable_reason().is_some()
+        ) && let Some(reason) = self.browser_unavailable_reason()
         {
-            return Task::none();
+            // Only a check that may succeed on a second try is worth
+            // retrying; the pane waits for it and loads if it finds the
+            // browser.
+            if !reason.is_recoverable() {
+                return Task::none();
+            }
+            self.cards.insert(card, CardRuntime::Loading);
+            return self.recheck_browser();
         }
         if self.completed_terminal_has_native_owner(card) {
             return self.handle_chat_ui(chat_ui::Action::Switch(card));
@@ -8928,7 +8964,7 @@ impl Cagents {
         };
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &state.kind {
-            return Self::open_external_url(session.current_url.clone());
+            return self.open_external_url(session.current_url.clone());
         }
         // A utility pane starts nothing, so a retry only reinstalls its view.
         if state.kind.is_utility() {
@@ -9765,7 +9801,7 @@ impl Cagents {
                     #[cfg(feature = "integrated-browser")]
                     if let Some(session) = deferred_browser {
                         if let Some(reason) = self.browser_unavailable_reason() {
-                            self.fail_runtime(card, reason.to_string());
+                            self.settle_unavailable_browser(card, reason);
                             continue;
                         }
                         let Some(factory) = self.browser_factory.clone() else {
@@ -10766,7 +10802,11 @@ impl Cagents {
                         .into(),
                         widget::selectable_text(if browser_session.is_some() {
                             if let Some(reason) = self.browser_unavailable_reason() {
-                                std::borrow::Cow::Owned(reason.to_string())
+                                std::borrow::Cow::Owned(if reason.is_recoverable() {
+                                    "The integrated browser didn't start in time. Open this page in your system browser, or try the integrated browser again.".to_owned()
+                                } else {
+                                    format!("{reason}. Open this page in your system browser instead.")
+                                })
                             } else if cfg!(feature = "integrated-browser") {
                                 std::borrow::Cow::Borrowed("The browser could not load. Try again or open it in your system browser.")
                             } else {
@@ -10792,10 +10832,32 @@ impl Cagents {
                             .map(|guidance| design::caption(guidance).into())
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
-                            let mut controls = if browser_session.is_some()
-                                && self.browser_unavailable_reason().is_some()
+                            let mut controls = if let Some(reason) = browser_session
+                                .and(self.browser_unavailable_reason())
                             {
-                                Vec::new()
+                                // The page can still be read: the system
+                                // browser is the way to it, and a check that
+                                // may succeed again can be retried.
+                                let mut controls = vec![
+                                    crate::ui_controls::button::primary("Open in system browser")
+                                        .id(card_control_id(id, "retry"))
+                                        .name("Open this page in your system browser")
+                                        .on_press(Message::OpenBrowserInSystem(id))
+                                        .into(),
+                                ];
+                                if reason.is_recoverable() {
+                                    controls.push(
+                                        crate::ui_controls::button::secondary("Retry")
+                                            .id(card_control_id(id, "browser.recheck"))
+                                            .name("Retry the integrated browser")
+                                            .on_press_maybe(
+                                                (!self.terminal_close_in_progress(id))
+                                                    .then_some(Message::RetryCard(id)),
+                                            )
+                                            .into(),
+                                    );
+                                }
+                                controls
                             } else { vec![
                                 crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
@@ -14776,6 +14838,7 @@ impl Application for Cagents {
             browser_backend: browser_backend::State::default(),
             #[cfg(feature = "integrated-browser")]
             browser_parent_lifetime: None,
+            system_url_opener: file_manager::SystemUrlOpener::default(),
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
@@ -15340,6 +15403,17 @@ impl Application for Cagents {
                 self.status = Some(match result {
                     Ok(()) => TransientNotice::success("Opened in the system browser"),
                     Err(error) => TransientNotice::error(error),
+                });
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserFallbackOpened { result, reason } => {
+                self.status = Some(match result {
+                    Ok(()) => TransientNotice::warning(
+                        "Opened in your system browser because the integrated browser is unavailable",
+                    )
+                    .with_details(reason.to_string()),
+                    Err(error) => TransientNotice::error(error).with_details(reason.to_string()),
                 });
                 Task::none()
             }
@@ -30978,6 +31052,7 @@ mod tests {
             browser_backend: browser_backend::State::default(),
             #[cfg(feature = "integrated-browser")]
             browser_parent_lifetime: None,
+            system_url_opener: file_manager::SystemUrlOpener::default(),
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,

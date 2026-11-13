@@ -64,6 +64,37 @@ where
     Ok(RevealOutcome::OpenedContainingFolder)
 }
 
+/// What hands a URL to the system browser. The app opens every such URL
+/// through one of these, so a test can stand in for the desktop and never
+/// start a real browser.
+#[derive(Clone, Default)]
+pub(crate) enum SystemUrlOpener {
+    #[default]
+    Desktop,
+    /// Records each URL it is given and reports it opened.
+    #[cfg(test)]
+    Recording(std::sync::Arc<std::sync::Mutex<Vec<Url>>>),
+}
+
+impl SystemUrlOpener {
+    pub(crate) fn open(
+        &self,
+        url: Url,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+        let opener = self.clone();
+        async move {
+            match opener {
+                Self::Desktop => open_system_url(url).await,
+                #[cfg(test)]
+                Self::Recording(opened) => {
+                    opened.lock().unwrap().push(url);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn open_system_url(url: Url) -> Result<(), String> {
     let portal_result = async {
         let request = ashpd::desktop::open_uri::OpenFileRequest::default()

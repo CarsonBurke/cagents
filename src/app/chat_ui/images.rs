@@ -225,7 +225,7 @@ fn read_file(path: impl AsRef<Path>) -> Option<Vec<u8>> {
 }
 
 pub(super) async fn open_external(url: Url) -> Result<(), String> {
-    open_external_with(url, open_system_url).await
+    open_external_with(url, crate::file_manager::open_system_url).await
 }
 
 async fn open_external_with<F, Fut>(url: Url, opener: F) -> Result<(), String>

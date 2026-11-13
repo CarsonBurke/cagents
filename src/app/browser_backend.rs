@@ -4,7 +4,14 @@ use crate::browser::{BrowserError, CapabilityProbe};
 use crate::capability::BrowserUnavailable;
 use uuid::Uuid;
 
+/// How long the compositor may take to answer the check, counted from the
+/// first probe, which sends the check's requests. Its answer takes
+/// milliseconds; only a compositor that has stopped answering takes this long.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the window may take to run the check's first callbacks. They wait
+/// their turn on the UI thread, which restoring a large workspace can hold for
+/// seconds, and that wait says nothing about the compositor.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
@@ -13,6 +20,9 @@ pub(super) struct State {
     generation: Option<Uuid>,
     phase: Phase,
     progress: Option<ProbeProgress>,
+    /// Browser panes this check settled as unavailable. A later check that
+    /// finds the browser available loads them again.
+    settled: Vec<CardId>,
 }
 
 struct ProbeProgress {
@@ -28,12 +38,22 @@ enum Phase {
     #[default]
     Idle,
     Checking {
+        /// Until the first probe answers, when the window's callbacks are
+        /// overdue; after it, when the compositor's answer is.
         deadline: Instant,
+        /// Whether a probe has answered, so the check's requests are out.
+        requested: bool,
         binding: Option<BrowserFactoryBinding>,
-        probe_pending: Option<Uuid>,
+        probe_pending: Option<PendingProbe>,
     },
     Available,
     Unavailable(BrowserUnavailable),
+}
+
+#[derive(Clone, Copy)]
+struct PendingProbe {
+    operation: Uuid,
+    queued: Instant,
 }
 
 impl State {
@@ -46,7 +66,8 @@ impl State {
         self.parent = Some(parent);
         self.generation = Some(generation);
         self.phase = Phase::Checking {
-            deadline: now + PROBE_TIMEOUT,
+            deadline: now + CALLBACK_TIMEOUT,
+            requested: false,
             binding: None,
             probe_pending: None,
         };
@@ -100,6 +121,19 @@ impl State {
             Phase::Unavailable(reason) => Some(reason),
             _ => None,
         }
+    }
+
+    /// Lets a check that may succeed if tried again start over. A settled
+    /// reason that no new check can change, such as a missing protocol, stays.
+    fn reopen(&mut self) -> bool {
+        if !self
+            .unavailable()
+            .is_some_and(BrowserUnavailable::is_recoverable)
+        {
+            return false;
+        }
+        self.retire();
+        true
     }
 
     pub(super) fn retire(&mut self) {
@@ -193,16 +227,8 @@ impl Cagents {
             }
             return Task::none();
         }
-        if let Phase::Checking { deadline, .. } = &self.browser_backend.phase
-            && Instant::now() >= *deadline
-        {
-            self.browser_backend
-                .trace_check("binding_result_timeout", Instant::now());
-            if let Ok(binding) = result {
-                self.discard_browser_binding(binding);
-            }
-            return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
-        }
+        // A binding that arrives late is still good: only the compositor's
+        // silence after the check's requests are out can time the check out.
         match result {
             Ok(binding) => {
                 if Some(binding.parent_lifetime.window_id) != self.core.main_window_id()
@@ -259,17 +285,28 @@ impl Cagents {
         if let Some(progress) = &mut self.browser_backend.progress {
             progress.polls = progress.polls.saturating_add(1);
         }
+        let now = Instant::now();
         let Phase::Checking {
             deadline,
+            requested,
             binding,
             probe_pending,
         } = &mut self.browser_backend.phase
         else {
             return Task::none();
         };
-        if Instant::now() >= *deadline {
-            self.browser_backend
-                .trace_check("poll_timeout", Instant::now());
+        // Past the deadline, the check still looks once more before it gives
+        // up: a poll that the busy UI thread ran late proves nothing about
+        // the compositor. Only a probe queued after the deadline that still
+        // finds no answer times it out, in `browser_factory_probed`. Winit
+        // never running the callbacks at all is bounded here.
+        let overdue = match probe_pending {
+            _ if !*requested => now >= *deadline,
+            Some(pending) => now >= pending.queued.max(*deadline) + CALLBACK_TIMEOUT,
+            None => false,
+        };
+        if overdue {
+            self.browser_backend.trace_check("poll_timeout", now);
             return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         }
         let timer = probe_timer(generation);
@@ -278,7 +315,10 @@ impl Cagents {
             return timer;
         };
         let operation = Uuid::new_v4();
-        *probe_pending = Some(operation);
+        *probe_pending = Some(PendingProbe {
+            operation,
+            queued: now,
+        });
         let factory = binding.factory.clone();
         let lifetime = binding.parent_lifetime.clone();
         let first_probe = self
@@ -333,23 +373,38 @@ impl Cagents {
         {
             return Task::none();
         }
-        // A late successful result cannot override the bounded deadline.
-        if let Phase::Checking { deadline, .. } = &self.browser_backend.phase
-            && Instant::now() >= *deadline
-        {
-            self.browser_backend
-                .trace_check("probe_result_timeout", Instant::now());
-            return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
-        }
-        let Phase::Checking { probe_pending, .. } = &mut self.browser_backend.phase else {
+        let now = Instant::now();
+        let Phase::Checking {
+            deadline,
+            requested,
+            probe_pending,
+            ..
+        } = &mut self.browser_backend.phase
+        else {
             return Task::none();
         };
-        if *probe_pending != Some(operation) {
+        let Some(pending) = probe_pending.filter(|pending| pending.operation == operation) else {
             return Task::none();
-        }
+        };
         *probe_pending = None;
+        // The first probe sends the check's requests, so the compositor's
+        // time to answer starts with it. An answer, however late the UI
+        // thread delivers it, settles the check.
+        let first_answer = !*requested;
+        if first_answer {
+            *requested = true;
+            *deadline = now + PROBE_TIMEOUT;
+        }
+        let silent = matches!(result, CapabilityProbe::Pending)
+            && !first_answer
+            && pending.queued >= *deadline;
         if let Some(progress) = &mut self.browser_backend.progress {
             progress.probes_completed = progress.probes_completed.saturating_add(1);
+        }
+        if silent {
+            self.browser_backend
+                .trace_check("probe_result_timeout", now);
+            return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         }
         match result {
             CapabilityProbe::Pending => {
@@ -379,6 +434,7 @@ impl Cagents {
                 };
                 self.browser_factory = Some(binding.factory);
                 self.browser_backend.phase = Phase::Available;
+                self.reload_settled_browsers();
                 self.register_deferred_browsers();
                 self.lifecycle_sweep()
             }
@@ -406,10 +462,42 @@ impl Cagents {
             .map(|card| card.id)
             .collect::<Vec<_>>();
         for card in failed {
-            self.fail_runtime(card, reason.to_string());
+            self.settle_unavailable_browser(card, reason);
         }
         self.status = Some(TransientNotice::error(reason.to_string()));
         Task::none()
+    }
+
+    /// Shows a browser pane as unavailable for `reason`, and remembers it so
+    /// that a later check that succeeds loads it.
+    pub(super) fn settle_unavailable_browser(&mut self, card: CardId, reason: BrowserUnavailable) {
+        self.fail_runtime(card, reason.to_string());
+        if !self.browser_backend.settled.contains(&card) {
+            self.browser_backend.settled.push(card);
+        }
+    }
+
+    /// Returns the panes an earlier check gave up on to waiting, so they load
+    /// as panes that were waiting for this check do. A pane closed since
+    /// stays closed.
+    fn reload_settled_browsers(&mut self) {
+        for card in std::mem::take(&mut self.browser_backend.settled) {
+            if matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
+                && self.browser_system_request(card).is_some()
+            {
+                self.cards.insert(card, CardRuntime::Loading);
+            }
+        }
+    }
+
+    /// Checks again for the integrated browser after a check that may succeed
+    /// on a second try, such as one the compositor was slow to answer. Panes
+    /// it settled as unavailable load if this one finds the browser.
+    pub(super) fn recheck_browser(&mut self) -> Task<Message> {
+        if self.exit.is_some() || !self.browser_backend.reopen() {
+            return Task::none();
+        }
+        self.browser_factory_task()
     }
 }
 
@@ -425,18 +513,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_probe_per_parent_and_settled_failure_cannot_retry() {
+    fn one_probe_per_parent_and_only_a_timeout_reopens() {
         let mut state = State::default();
         let parent = window::Id::unique();
         let now = Instant::now();
         let generation = state.begin(parent, now).unwrap();
         assert!(state.checking(generation, Some(parent)));
         assert!(state.begin(parent, now).is_none());
-        state.phase = Phase::Unavailable(BrowserUnavailable::TimedOut);
+        state.phase = Phase::Unavailable(BrowserUnavailable::NotWayland);
+        assert!(!state.reopen());
         assert!(state.begin(parent, now + PROBE_TIMEOUT).is_none());
-        assert_eq!(state.unavailable(), Some(BrowserUnavailable::TimedOut));
-        assert!(!state.checking(generation, Some(parent)));
-        state.retire();
+        assert_eq!(state.unavailable(), Some(BrowserUnavailable::NotWayland));
+        state.phase = Phase::Unavailable(BrowserUnavailable::TimedOut);
+        assert!(state.begin(parent, now).is_none());
+        assert!(state.reopen());
+        assert!(state.unavailable().is_none());
         let next = state.begin(parent, now).unwrap();
         assert_ne!(generation, next);
         assert!(!state.checking(generation, Some(parent)));
@@ -445,19 +536,21 @@ mod tests {
     }
 
     #[test]
-    fn deadline_starts_at_parent_request_not_first_dispatch() {
+    fn callbacks_have_their_own_bound_until_the_first_probe_answers() {
         let mut state = State::default();
         let now = Instant::now();
         state.begin(window::Id::unique(), now).unwrap();
         let Phase::Checking {
             deadline,
+            requested,
             binding,
             probe_pending,
         } = &state.phase
         else {
             panic!()
         };
-        assert_eq!(*deadline, now + PROBE_TIMEOUT);
+        assert_eq!(*deadline, now + CALLBACK_TIMEOUT);
+        assert!(!requested);
         assert!(binding.is_none());
         assert!(probe_pending.is_none());
     }
@@ -487,12 +580,28 @@ mod action_tests {
         (app, card, parent)
     }
 
+    fn pend(app: &mut Cagents, queued: Instant) -> Uuid {
+        let operation = Uuid::new_v4();
+        let Phase::Checking { probe_pending, .. } = &mut app.browser_backend.phase else {
+            panic!("not checking")
+        };
+        *probe_pending = Some(PendingProbe { operation, queued });
+        operation
+    }
+
+    fn deadline(app: &Cagents) -> Instant {
+        let Phase::Checking { deadline, .. } = &app.browser_backend.phase else {
+            panic!("not checking")
+        };
+        *deadline
+    }
+
     #[test]
-    fn timeout_settles_waiting_cards_and_late_completion_cannot_install_factory() {
+    fn overdue_callbacks_time_out_and_retry_checks_again() {
         let (mut app, card, parent) = app();
         let generation = app
             .browser_backend
-            .begin(parent, Instant::now() - PROBE_TIMEOUT)
+            .begin(parent, Instant::now() - CALLBACK_TIMEOUT)
             .unwrap();
         let _ = app.browser_factory_poll(generation);
         assert_eq!(
@@ -504,6 +613,8 @@ mod action_tests {
             browser_host::LoadState::Unavailable
         );
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert_eq!(app.browser_backend.settled, vec![card]);
+        // A retired check's results install nothing.
         let _ = app.browser_factory_probed(generation, Uuid::new_v4(), CapabilityProbe::Available);
         let _ = app.browser_factory_ready(generation, Err(BrowserUnavailable::NotWayland));
         assert_eq!(
@@ -511,11 +622,189 @@ mod action_tests {
             Some(BrowserUnavailable::TimedOut)
         );
         assert!(app.browser_factory.is_none());
+        // Nothing starts a check again by itself...
         let _ = app.browser_factory_task();
         assert_eq!(
             app.browser_unavailable_reason(),
             Some(BrowserUnavailable::TimedOut)
         );
+        // ...but Retry does, and the pane waits for it.
+        let _ = app.retry_card(card);
+        assert!(app.browser_unavailable_reason().is_none());
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(matches!(app.browser_backend.phase, Phase::Checking { .. }));
+        assert_ne!(app.browser_backend.generation, Some(generation));
+        assert_eq!(
+            app.browser_host_load(card),
+            browser_host::LoadState::Loading
+        );
+    }
+
+    #[test]
+    fn a_ui_thread_stall_before_the_first_probe_does_not_time_out_the_check() {
+        let (mut app, card, parent) = app();
+        // Restoring the workspace held the UI thread well past the
+        // compositor's deadline before the first probe could run.
+        let begun = Instant::now() - 4 * PROBE_TIMEOUT;
+        let generation = app.browser_backend.begin(parent, begun).unwrap();
+        let _ = app.browser_factory_poll(generation);
+        assert!(app.browser_unavailable_reason().is_none());
+        let first = pend(&mut app, begun + 3 * PROBE_TIMEOUT);
+        let answered = Instant::now();
+        let _ = app.browser_factory_probed(generation, first, CapabilityProbe::Pending);
+        assert!(app.browser_unavailable_reason().is_none());
+        // The compositor's time starts with the requests the first probe sent.
+        assert!(deadline(&app) >= answered + PROBE_TIMEOUT);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+    }
+
+    #[test]
+    fn a_late_poll_looks_again_and_only_silence_after_the_deadline_times_out() {
+        let (mut app, card, parent) = app();
+        let generation = app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let first = pend(&mut app, Instant::now());
+        let _ = app.browser_factory_probed(generation, first, CapabilityProbe::Pending);
+        // The UI thread delivers the next poll after the deadline: it looks
+        // again rather than giving up on what it has not seen.
+        if let Phase::Checking { deadline, .. } = &mut app.browser_backend.phase {
+            *deadline = Instant::now() - POLL_INTERVAL;
+        }
+        let _ = app.browser_factory_poll(generation);
+        assert!(app.browser_unavailable_reason().is_none());
+        // A probe queued before the deadline proves nothing when it answers
+        // late, however long the UI thread held it.
+        let due = deadline(&app);
+        let before = pend(&mut app, due - POLL_INTERVAL);
+        let _ = app.browser_factory_probed(generation, before, CapabilityProbe::Pending);
+        assert!(app.browser_unavailable_reason().is_none());
+        // One queued after it that still finds no answer does.
+        let after = pend(&mut app, due);
+        let _ = app.browser_factory_probed(generation, after, CapabilityProbe::Pending);
+        assert_eq!(
+            app.browser_unavailable_reason(),
+            Some(BrowserUnavailable::TimedOut)
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    }
+
+    #[test]
+    fn a_probe_winit_never_runs_is_bounded() {
+        let (mut app, _, parent) = app();
+        let generation = app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let first = pend(&mut app, Instant::now());
+        let _ = app.browser_factory_probed(generation, first, CapabilityProbe::Pending);
+        let lost = Instant::now() - PROBE_TIMEOUT - CALLBACK_TIMEOUT;
+        if let Phase::Checking { deadline, .. } = &mut app.browser_backend.phase {
+            *deadline = lost;
+        }
+        pend(&mut app, lost);
+        let _ = app.browser_factory_poll(generation);
+        assert_eq!(
+            app.browser_unavailable_reason(),
+            Some(BrowserUnavailable::TimedOut)
+        );
+    }
+
+    #[test]
+    fn a_check_that_succeeds_loads_the_panes_an_earlier_one_gave_up_on() {
+        let (mut app, card, parent) = app();
+        app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let _ = app.browser_factory_unavailable(BrowserUnavailable::TimedOut);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let closed = CardId::new();
+        app.browser_backend.settled.push(closed);
+        app.reload_settled_browsers();
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(!app.cards.contains_key(&closed));
+        assert!(app.browser_backend.settled.is_empty());
+    }
+
+    /// The labels of the enabled buttons the whole window draws.
+    fn buttons(app: &Cagents) -> Vec<String> {
+        use iced::{
+            Size,
+            advanced::clipboard,
+            mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            cosmic::ApplicationExt::view_main(app),
+            Size::new(1280.0, 900.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        ui.update(
+            &[],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        ui.draw(
+            &mut renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        tree.root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && !node.node().is_disabled()
+            })
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
+    // The headless renderer starts its own runtime, so this test drives its
+    // tasks on one of its own rather than running inside one.
+    #[test]
+    fn a_restored_pane_offers_the_system_browser_without_opening_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (reason, retry) in [
+            (BrowserUnavailable::TimedOut, true),
+            (BrowserUnavailable::NotWayland, false),
+        ] {
+            let (mut app, card, parent) = app();
+            let opened = recording(&mut app);
+            app.browser_backend.begin(parent, Instant::now()).unwrap();
+            // The restored pane was waiting for the check when it gave up.
+            let task = app.browser_factory_unavailable(reason);
+            runtime.block_on(settle(&mut app, task));
+            let task = app.lifecycle_sweep();
+            runtime.block_on(settle(&mut app, task));
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert!(
+                opened.lock().unwrap().is_empty(),
+                "{reason:?} opened a page"
+            );
+            let buttons = buttons(&app);
+            assert!(
+                buttons
+                    .iter()
+                    .any(|label| label == "Open this page in your system browser"),
+                "{reason:?}: {buttons:?}"
+            );
+            assert_eq!(
+                buttons
+                    .iter()
+                    .any(|label| label == "Retry the integrated browser"),
+                retry,
+                "{reason:?}: {buttons:?}"
+            );
+            // The saved descriptor is what the action opens.
+            let (_, url) = app.browser_system_request(card).unwrap();
+            assert_eq!(url.host_str(), Some("example.test"));
+            let task = app.open_browser_in_system(card);
+            runtime.block_on(settle(&mut app, task));
+            assert_eq!(opened.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -542,22 +831,101 @@ mod action_tests {
         assert!(app.browser_system_request(card).is_some());
     }
 
-    #[test]
-    fn new_browser_under_unavailable_parent_settles_without_engine_or_new_probe() {
+    async fn settle(app: &mut Cagents, task: Task<Message>) -> Vec<Message> {
+        use cosmic::iced::futures::StreamExt;
+        let mut messages = Vec::new();
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    messages.push(message);
+                }
+            }
+        }
+        for message in &messages {
+            if let Message::BrowserFallbackOpened { result, reason } = message {
+                let _ = app.update(Message::BrowserFallbackOpened {
+                    result: result.clone(),
+                    reason: *reason,
+                });
+            }
+        }
+        messages
+    }
+
+    fn recording(app: &mut Cagents) -> Arc<std::sync::Mutex<Vec<Url>>> {
+        let opened = Arc::default();
+        app.system_url_opener = file_manager::SystemUrlOpener::Recording(Arc::clone(&opened));
+        opened
+    }
+
+    #[tokio::test]
+    async fn an_explicit_open_goes_to_the_system_browser_while_unavailable() {
         let (mut app, _, parent) = app();
+        let opened = recording(&mut app);
         app.browser_backend.begin(parent, Instant::now()).unwrap();
         let _ = app.browser_factory_unavailable(BrowserUnavailable::NotWayland);
-        let _ = app.add_browser(Url::parse("https://example.test/new").unwrap());
+        let cards = app.durable.cards.len();
+        let focused = app.workspace.focused();
+        let page = Url::parse("https://example.test/new").unwrap();
+        let task = app.add_browser(page.clone());
+        settle(&mut app, task).await;
+        assert_eq!(*opened.lock().unwrap(), vec![page]);
+        // No dead-end pane, and the reason is in the notice.
+        assert_eq!(app.durable.cards.len(), cards);
+        assert_eq!(app.workspace.focused(), focused);
+        let notice = &app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.notice.message.contains("system browser"))
+            .expect("a notice saying where the page went")
+            .notice;
+        assert_eq!(
+            notice.details.as_deref(),
+            Some(BrowserUnavailable::NotWayland.to_string().as_str())
+        );
+        // A settled reason no check can change starts no new one.
+        assert_eq!(
+            app.browser_unavailable_reason(),
+            Some(BrowserUnavailable::NotWayland)
+        );
+        assert!(app.browser_factory.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_explicit_open_after_a_timeout_also_checks_again() {
+        let (mut app, _, parent) = app();
+        let opened = recording(&mut app);
+        app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let _ = app.browser_factory_unavailable(BrowserUnavailable::TimedOut);
+        let page = Url::parse("https://example.test/next").unwrap();
+        let task = app.add_browser(page.clone());
+        // The check starts again so that the next page can open here.
+        assert!(matches!(app.browser_backend.phase, Phase::Checking { .. }));
+        let messages = settle(&mut app, task).await;
+        assert_eq!(*opened.lock().unwrap(), vec![page]);
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::BrowserFallbackOpened { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_the_system_browser_cannot_show_still_gets_a_pane() {
+        let (mut app, _, parent) = app();
+        let opened = recording(&mut app);
+        app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let _ = app.browser_factory_unavailable(BrowserUnavailable::NotWayland);
+        let task = app.add_browser(Url::parse("about:blank").unwrap());
+        settle(&mut app, task).await;
+        assert!(opened.lock().unwrap().is_empty());
         let card = app.workspace.focused().unwrap();
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
         assert!(app.browser_factory.is_none());
         assert_eq!(
             app.browser_host_load(card),
             browser_host::LoadState::Unavailable
-        );
-        assert_eq!(
-            app.browser_system_request(card).unwrap().1.as_str(),
-            "https://example.test/new"
         );
     }
 
@@ -582,17 +950,14 @@ mod action_tests {
     fn prior_poll_completion_cannot_clear_a_new_pending_poll() {
         let (mut app, _, parent) = app();
         let generation = app.browser_backend.begin(parent, Instant::now()).unwrap();
-        let operation = Uuid::new_v4();
-        if let Phase::Checking { probe_pending, .. } = &mut app.browser_backend.phase {
-            *probe_pending = Some(operation);
-        }
+        let operation = pend(&mut app, Instant::now());
         let _ = app.browser_factory_probed(
             generation,
             Uuid::new_v4(),
             CapabilityProbe::Unavailable(BrowserUnavailable::InitializationFailed),
         );
         assert!(matches!(&app.browser_backend.phase,
-            Phase::Checking { probe_pending: Some(current), .. } if *current == operation));
+            Phase::Checking { probe_pending: Some(current), .. } if current.operation == operation));
         assert_eq!(
             app.browser_backend
                 .progress
@@ -621,7 +986,7 @@ mod action_tests {
     }
 
     #[test]
-    fn delayed_binding_error_cannot_override_the_deadline() {
+    fn a_late_binding_error_still_reports_its_own_reason() {
         let (mut app, _, parent) = app();
         let generation = app
             .browser_backend
@@ -630,7 +995,7 @@ mod action_tests {
         let _ = app.browser_factory_ready(generation, Err(BrowserUnavailable::NotWayland));
         assert_eq!(
             app.browser_unavailable_reason(),
-            Some(BrowserUnavailable::TimedOut)
+            Some(BrowserUnavailable::NotWayland)
         );
     }
     #[cfg(feature = "browser-protocol-fixture")]
