@@ -3025,11 +3025,7 @@ impl Cagents {
         };
         let mut title_children = vec![
             self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-            design::body(visible_title)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
+            crate::ui_controls::fade_text(visible_title)
                 .width(Length::Fill)
                 .into(),
         ];

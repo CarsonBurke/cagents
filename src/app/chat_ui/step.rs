@@ -38,24 +38,12 @@ const RAIL_INSET: f32 = space::M;
 const THREAD_RAIL_OFFSET: f32 =
     GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
 
-/// A row's heading on one line, cut short with an ellipsis where the pane
-/// is too narrow for it, filling what the row's other parts leave. The
-/// heading is held in a clipped box of exactly that width, so the duration
-/// and status beside it keep their place whatever width the shaped text
-/// reports; the whole of what was cut is in the open row.
-fn one_line<'a>(
-    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
-) -> Element<'a, Message> {
-    widget::container(
-        text.width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            )),
-    )
-    .width(Length::Fill)
-    .clip(true)
-    .into()
+/// A row's heading on one line, fading out where the pane is too narrow
+/// for it, filling what the row's other parts leave. The fade stays within
+/// that width, so the duration and status beside it keep their place; the
+/// whole of what was cut is in the open row.
+fn one_line(text: crate::ui_controls::FadeText<'_>) -> Element<'_, Message> {
+    text.width(Length::Fill).into()
 }
 
 /// The indicator and tone a group's status draws as.
@@ -375,7 +363,7 @@ impl Runtime {
         // measured first and the summary cut to what it leaves, so the
         // duration stays in view. Opening the group shows the whole command.
         let text = self.strip_summary(turn);
-        let summary = one_line(design::heading(text.clone()));
+        let summary = one_line(crate::ui_controls::FadeText::heading(text.clone()));
         line.push(match &elapsed {
             Some(elapsed) => trailing::trailing(summary, design::caption(elapsed.clone()), GAP_S),
             None => summary,
@@ -522,7 +510,7 @@ impl Runtime {
         // row forgetting what is being built.
         let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if let Some(coordinated) = coordinated {
-            preview.push(one_line(design::body(label.clone())));
+            preview.push(one_line(crate::ui_controls::fade_text(label.clone())));
             let arrived = coordinated.reading.outcome.messages.len();
             if arrived > 0 {
                 preview.push(
@@ -535,7 +523,7 @@ impl Runtime {
                 );
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(one_line(design::body(label.clone())));
+            preview.push(one_line(crate::ui_controls::fade_text(label.clone())));
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }

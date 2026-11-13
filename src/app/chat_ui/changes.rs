@@ -267,11 +267,9 @@ impl Runtime {
                 .spacing(space::XS)
                 .into(),
             crate::interaction::tooltip(
-                design::caption("Reported edits · line totals include repeated edits")
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    )),
+                crate::ui_controls::FadeText::caption(
+                    "Reported edits · line totals include repeated edits",
+                ),
                 "Changes reported in available conversation history. Line totals count reported edits, including repeated edits; they are not a net worktree diff.",
             ),
         ];
@@ -302,11 +300,7 @@ impl Runtime {
         }
         if !coverage.is_empty() {
             rows.push(crate::interaction::tooltip(
-                design::caption(coverage.join(" · "))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    )),
+                crate::ui_controls::FadeText::caption(coverage.join(" · ")),
                 explanation.join(" "),
             ));
         }
@@ -351,13 +345,9 @@ impl Runtime {
                     detail.push_str(" · Earlier history");
                 }
                 let mut file_rows: Vec<Element<'_, Message>> = vec![
-                    design::body(&file.key.path)
+                    crate::ui_controls::fade_text(&file.key.path)
                         .font(iced::Font::MONOSPACE)
                         .width(Length::Fill)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
                         .into(),
                     design::caption(detail.clone())
                         .width(Length::Fill)
@@ -367,14 +357,8 @@ impl Runtime {
                         .into(),
                 ];
                 if let chat::ChangeKind::Renamed { from } = &file.kind {
-                    file_rows.push(
-                        design::caption(format!("from {from}"))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .into(),
-                    );
+                    file_rows
+                        .push(crate::ui_controls::FadeText::caption(format!("from {from}")).into());
                 }
                 files.push(crate::interaction::tooltip(
                     widget::button::custom(widget::column::with_children(file_rows).spacing(2))
@@ -464,11 +448,7 @@ impl Runtime {
         rows.push(body);
         if let Some(error) = &self.changes.error {
             rows.push(crate::interaction::tooltip(
-                design::caption(error.as_str())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    )),
+                crate::ui_controls::FadeText::caption(error.as_str()),
                 error.clone(),
             ));
         }

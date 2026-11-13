@@ -874,11 +874,7 @@ fn account_cell<'a>(
         }
         // Filling the cell is what lets a long name give way to the badge
         // after it instead of running under the row's actions.
-        None => design::body(row_name.clone())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
+        None => crate::ui_controls::fade_text(row_name.clone())
             .width(Length::Fill)
             .into(),
     };
@@ -963,14 +959,7 @@ fn account_cell<'a>(
             .into(),
     ];
     if !subtitle.is_empty() {
-        lines.push(
-            design::caption(subtitle.join(" · "))
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into(),
-        );
+        lines.push(crate::ui_controls::FadeText::caption(subtitle.join(" · ")).into());
     }
     widget::row::with_children(vec![
         widget::icon(crate::ui_controls::provider_icon(account.account.provider))
@@ -1347,14 +1336,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
         },
         widget::column::with_children(vec![
             design::body(format!("New {} account", login.provider.label())).into(),
-            crate::interaction::tooltip(
-                design::caption(phase)
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    )),
-                phase,
-            ),
+            crate::interaction::tooltip(crate::ui_controls::FadeText::caption(phase), phase),
         ])
         .spacing(1)
         .width(Length::Fill)

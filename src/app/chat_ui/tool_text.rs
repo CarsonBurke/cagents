@@ -391,12 +391,8 @@ impl Preview {
     /// The step's latest output, on one muted line under what it is.
     pub(super) fn tail_view(&self) -> Option<Element<'static, Message>> {
         (!self.tail.is_empty()).then(|| {
-            design::caption(self.tail.clone())
+            crate::ui_controls::FadeText::caption(self.tail.clone())
                 .font(iced::Font::MONOSPACE)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::advanced::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
                 .width(Length::Fill)
                 .into()
         })

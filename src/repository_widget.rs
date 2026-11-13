@@ -9215,12 +9215,9 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 .to_string_lossy()
                 .into_owned()
         };
-        let one_line = |text: widget::text::Text<'static, cosmic::Theme, cosmic::Renderer>| {
-            text.wrapping(iced::widget::text::Wrapping::None).ellipsize(
-                iced::widget::text::Ellipsize::Start(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ),
-            )
+        // A path is told apart by its end, so it gives way at its start.
+        let one_line = |text: crate::ui_controls::FadeText<'static>| {
+            text.edge(crate::ui_controls::FadeEdge::Start)
         };
         let mut label: Vec<Element<'_, RepositoryAction>> = Vec::new();
         if !runtime.standalone {
@@ -9228,7 +9225,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             // The name gives way to the caption only when there is one; on
             // its own it fills the slot as it always has.
             label.push(
-                one_line(crate::design::body(
+                one_line(crate::ui_controls::fade_text(
                     selected.path.to_string_lossy().into_owned(),
                 ))
                 .width(if linked.is_some() {
@@ -9250,7 +9247,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 } else {
                     format!("\u{2192} {}", file_name(source))
                 };
-                label.push(one_line(crate::design::caption(caption)).into());
+                label.push(one_line(crate::ui_controls::FadeText::caption(caption)).into());
                 format!("{} \u{2192} {}", selected.path.display(), source.display())
             }
             None => selected.path.to_string_lossy().into_owned(),
@@ -10054,11 +10051,7 @@ fn completion_row(
     let target = runtime.completion_target(card, index)?;
     let key = target.native_key();
     let label = crate::design::body(&item.label).width(Length::Fill);
-    let detail = crate::design::caption(item.detail.as_deref().unwrap_or_default())
-        .wrapping(iced::widget::text::Wrapping::None)
-        .ellipsize(iced::widget::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ));
+    let detail = crate::ui_controls::FadeText::caption(item.detail.as_deref().unwrap_or_default());
     let button = widget::button::custom(widget::column::with_children(vec![
         label.into(),
         detail.into(),

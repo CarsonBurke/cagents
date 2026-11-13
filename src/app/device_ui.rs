@@ -1116,12 +1116,11 @@ impl Cagents {
             && !state.directory.as_os_str().is_empty()
         {
             rows.push(crate::interaction::tooltip(
-                design::caption(format!("Current: {}", state.directory.display()))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill),
+                crate::ui_controls::FadeText::caption(format!(
+                    "Current: {}",
+                    state.directory.display()
+                ))
+                .width(Length::Fill),
                 format!(
                     "File and Git operations use {} until navigation succeeds",
                     state.directory.display()
@@ -1175,11 +1174,7 @@ impl Cagents {
                                 widget::icon(glyph.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
-                                design::body(&entry.name)
-                                    .wrapping(iced::widget::text::Wrapping::None)
-                                    .ellipsize(iced::widget::text::Ellipsize::End(
-                                        EllipsizeHeightLimit::Lines(1),
-                                    ))
+                                crate::ui_controls::fade_text(&entry.name)
                                     .width(Length::Fill)
                                     .into(),
                             ])

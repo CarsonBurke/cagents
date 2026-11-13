@@ -7310,11 +7310,7 @@ impl Cagents {
                             .icon()
                             .size(design::ROW_ICON_SIZE)
                             .into(),
-                        design::heading(heading)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
+                        crate::ui_controls::FadeText::heading(heading)
                             .width(Length::Fill)
                             .into(),
                     ])
@@ -19379,11 +19375,7 @@ impl Application for Cagents {
                 })
                 .into(),
                 crate::interaction::tooltip(
-                    design::caption(display_path(&directory).into_owned())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
+                    crate::ui_controls::FadeText::caption(display_path(&directory).into_owned())
                         .width(Length::Fill),
                     directory.display().to_string(),
                 ),
