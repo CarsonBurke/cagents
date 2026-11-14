@@ -53,6 +53,8 @@ elif arguments[0] == "build":
         (root / "build-pid").write_text(str(os.getpid()))
         time.sleep(30)
     if mode == "failure":
+        # Malformed output must not hide Cargo's own failure status.
+        print("[]")
         print("fixture helper build failed", file=sys.stderr)
         sys.exit(101)
     if mode != "missing-artifact":
@@ -138,8 +140,8 @@ elif arguments[0] in ("test", "t"):
 
     def test_failed_or_missing_helper_stops_before_test_execution(self):
         for mode, status, diagnostic in (("failure", 101, "fixture helper build failed"),
-                                        ("missing-artifact", 1, "exactly one cagentsd executable"),
-                                        ("directory", 1, "absolute executable file")):
+                                        ("missing-artifact", 1, "exactly one executable for cagentsd"),
+                                        ("directory", 1, "missing or not runnable")):
             with self.subTest(mode=mode):
                 self.events.unlink(missing_ok=True)
                 extra = {"FIXTURE_MODE": mode}
@@ -215,7 +217,8 @@ elif arguments[0] in ("test", "t"):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             child.stdin.write((json.dumps({"environment": {}, "host_test_helper":
-                (ROOT / "scripts/cargo-host-test-helper.py").read_text(), "memory_cap":
+                (ROOT / "scripts/cargo-host-test-helper.py").read_text(), "cargo_artifacts":
+                (ROOT / "scripts/cargo_artifacts.py").read_text(), "memory_cap":
                 (ROOT / "scripts/memory-capped").read_text()}) + "\n").encode())
             child.stdin.flush()
             # The agent cancels when its connection's stdin closes. Keep that
@@ -235,6 +238,21 @@ elif arguments[0] in ("test", "t"):
                 child.wait()
             child.stdout.close()
             child.stderr.close()
+
+    def test_installed_gate_can_prepare_helper_outside_the_repository(self):
+        installed = self.root / "installed"
+        installed.mkdir()
+        result = subprocess.run([str(ROOT / "scripts/install-cargo-gate"), str(installed)],
+                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((installed / "cargo_artifacts.py").is_file())
+        result = subprocess.run([str(installed / "cagents-cargo-gate"), "test", "--features=host"],
+                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in self.events.read_text().splitlines()]
+        self.assertEqual([event["args"][0] for event in events if event["args"][0] != "metadata"],
+                         ["build", "test", "test"])
+        self.assertEqual(events[-1]["helper"], str(self.product))
 
 
 if __name__ == "__main__":
