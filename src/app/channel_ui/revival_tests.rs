@@ -18,11 +18,18 @@ struct Fixture {
     channel: ChannelId,
     card: CardId,
     home: crate::channel_work::Home,
+    /// A conversation opened beside it and never sent, which no shared view
+    /// lists until its first send.
+    unsent: Option<CardId>,
 }
 
 /// A project at a real directory with one shared channel, entered, whose only
 /// card is a saved conversation the registry's view also holds.
 fn fixture() -> Fixture {
+    fixture_with(false)
+}
+
+fn fixture_with(unsent: bool) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().to_path_buf();
     let mut app = super::super::tests::context_inspector_test_app(true);
@@ -53,7 +60,27 @@ fn fixture() -> Fixture {
     chat.id = card;
     chat.kind = CardKind::Chat(session);
     chat.title = TITLE.into();
+    let draft = unsent.then(|| {
+        let mut draft = chat.clone();
+        draft.id = CardId::new();
+        draft.title = "Claude chat".into();
+        draft.kind = CardKind::Chat(
+            crate::chat::fresh_session(
+                crate::agent::Provider::Claude,
+                TerminalId::new(),
+                path.clone(),
+                &crate::account::Account::system(crate::agent::Provider::Claude),
+            )
+            .unwrap(),
+        );
+        draft
+    });
     durable.cards.push(chat);
+    let unsent = draft.map(|draft| {
+        let id = draft.id;
+        durable.cards.push(draft);
+        id
+    });
     durable.channels.push(ProjectChannel {
         title_source: crate::model::ChannelTitleSource::Manual,
         id: channel,
@@ -61,7 +88,7 @@ fn fixture() -> Fixture {
         title: "Investigation".into(),
         ordinal: home.creation_ordinal,
         shared: true,
-        cards: vec![card],
+        cards: std::iter::once(card).chain(unsent).collect(),
         focused: Some(card),
     });
     app.sidebar_model.projects.push(SidebarProject::new(
@@ -103,6 +130,7 @@ fn fixture() -> Fixture {
         channel,
         card,
         home,
+        unsent,
     }
 }
 
@@ -181,6 +209,46 @@ impl Fixture {
             Some(self.directory.path())
         );
         while received.try_recv().is_ok() {}
+        received
+    }
+
+    /// Another window closes the channel's only pane. The registry's view
+    /// settles empty and this window's card closes with it, but nothing here
+    /// closed a card, so nothing captures the channel for retirement.
+    fn empty_from_elsewhere(&mut self) {
+        let mut removed = self.app.workspace_model.clone();
+        removed
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(self.channel))
+            .unwrap()
+            .apply(&Change::Remove { id: self.card })
+            .unwrap();
+        removed.sequence += 1;
+        drop(self.app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Read(removed),
+        ));
+        let state = self.app.card_state(self.card).unwrap();
+        assert!(!state.existence.is_open());
+        assert!(self.app.channel_ui.retire_candidates.is_empty());
+        assert!(self.app.channel_ui.retiring.is_empty());
+    }
+
+    /// The registry's settled revision of the channel's view.
+    fn view_revision(&self) -> u64 {
+        self.app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(self.channel))
+            .unwrap()
+            .revision
+    }
+
+    /// Replaces the publisher so what the window asks next can be read.
+    fn listen(&mut self) -> async_channel::Receiver<ModelEdit> {
+        let (send, received) = async_channel::unbounded();
+        self.app.workspace_model_tx = send;
         received
     }
 
@@ -1346,4 +1414,196 @@ fn a_channel_named_from_its_conversation_gets_the_name_back() {
         .title = "Later".into();
     fixture.app.restore_channel_names();
     assert!(published.try_recv().is_err());
+}
+
+fn retirements(received: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+    std::iter::from_fn(|| received.try_recv().ok())
+        .filter(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. }))
+        .collect()
+}
+
+/// A channel emptied without one of its cards closing here stays until the
+/// person leaves it, and then retires as closing its last card would have:
+/// under the registry's settled revision, and revivable from its cards.
+#[test]
+fn leaving_a_channel_emptied_elsewhere_retires_it() {
+    let mut fixture = fixture();
+    fixture.empty_from_elsewhere();
+    assert!(
+        fixture
+            .app
+            .durable
+            .channels
+            .iter()
+            .any(|row| row.id == fixture.channel),
+        "nothing retires it while it is on screen"
+    );
+    let received = fixture.listen();
+
+    fixture.enter_other_project();
+
+    assert_eq!(
+        retirements(&received),
+        [ModelEdit::RetireEmptyChannel {
+            home: fixture.home,
+            expected_view_revision: fixture.view_revision(),
+        }]
+    );
+    fixture.answer_retirement(true);
+    assert!(
+        !fixture
+            .app
+            .durable
+            .channels
+            .iter()
+            .any(|row| row.id == fixture.channel)
+    );
+    assert!(matches!(
+        fixture.app.closed_channel_home(fixture.channel),
+        Some(ClosedCardHome::Retired(id)) if id == fixture.channel
+    ));
+}
+
+/// Leaving a channel never retires what it still holds: an open card of its
+/// own, a pane in its shared view, or an agent placed there that no window
+/// has shown yet. An agent whose pane was closed there holds nothing.
+#[test]
+fn leaving_a_channel_keeps_one_holding_work_or_recovery_evidence() {
+    // Its own saved conversation, still open.
+    let mut held = fixture();
+    let received = held.listen();
+    held.enter_other_project();
+    assert!(retirements(&received).is_empty());
+    assert!(held.app.channel_ui.retire_candidates.is_empty());
+
+    // A saved pane the registry holds that this window never attached.
+    let mut unattached = fixture();
+    let pane = unattached.app.workspace_model.views[0].panes[0].clone();
+    unattached.empty_from_elsewhere();
+    unattached.app.workspace_model.views[0].panes.push(Pane {
+        id: CardId::new(),
+        ..pane
+    });
+    let received = unattached.listen();
+    unattached.enter_other_project();
+    assert!(retirements(&received).is_empty());
+
+    // A detached agent waiting to be shown here, and then one whose pane
+    // was closed here.
+    for closed_here in [false, true] {
+        let mut detached = fixture();
+        detached.empty_from_elsewhere();
+        let agent = crate::agent_execution::Agent::fixture_placed_in(detached.channel);
+        if closed_here {
+            detached.app.workspace_model.views[0]
+                .retired
+                .push(CardId::from_uuid(agent.id.as_uuid()));
+        }
+        detached.app.workspace_model.agents.push(agent);
+        let received = detached.listen();
+        detached.enter_other_project();
+        assert_eq!(
+            retirements(&received).len(),
+            usize::from(closed_here),
+            "closed here: {closed_here}"
+        );
+    }
+}
+
+/// After this window's restore, the channels it is not showing that hold
+/// nothing retire once, under their settled revision. The one on screen
+/// stays, and nothing is swept before the restore allows it.
+#[test]
+fn the_startup_sweep_retires_empty_channels_off_screen_once() {
+    let mut swept = fixture();
+    swept.enter_other_project();
+    swept.empty_from_elsewhere();
+    let received = swept.listen();
+    swept.app.sweep_empty_channels();
+    assert!(
+        retirements(&received).is_empty(),
+        "a restore not yet verified sweeps nothing"
+    );
+
+    swept.app.allow_empty_channel_sweep();
+    assert_eq!(
+        retirements(&received),
+        [ModelEdit::RetireEmptyChannel {
+            home: swept.home,
+            expected_view_revision: swept.view_revision(),
+        }]
+    );
+    swept.answer_retirement(false);
+    swept.app.allow_empty_channel_sweep();
+    swept.app.sweep_empty_channels();
+    assert!(retirements(&received).is_empty(), "the sweep runs once");
+
+    // The channel on screen is not swept, however empty.
+    let mut shown = fixture();
+    shown.empty_from_elsewhere();
+    let received = shown.listen();
+    shown.app.allow_empty_channel_sweep();
+    assert!(retirements(&received).is_empty());
+    assert_eq!(shown.app.durable.active_channel, Some(shown.channel));
+
+    // A restore that left a session unattached keeps its channel for recovery.
+    let mut detached = fixture();
+    detached.enter_other_project();
+    detached.empty_from_elsewhere();
+    detached
+        .app
+        .workspace_model
+        .agents
+        .push(crate::agent_execution::Agent::fixture_placed_in(
+            detached.channel,
+        ));
+    let received = detached.listen();
+    detached.app.allow_empty_channel_sweep();
+    assert!(retirements(&received).is_empty());
+    assert!(detached.app.channel_ui.retire_candidates.is_empty());
+}
+
+/// The reported path: the channel's last card to close was a conversation
+/// never sent, which publishes no view edit. Its close captured the channel,
+/// but only a view edit's answer asked the registry to retire it, so the
+/// channel stayed empty, showing only "New conversation", until deleted.
+#[test]
+fn closing_an_unsent_last_conversation_retires_the_channel_without_a_view_edit() {
+    let mut fixture = fixture_with(true);
+    let unsent = fixture.unsent.unwrap();
+    assert!(fixture.app.workspace.order().any(|id| id == unsent));
+    // The saved conversation closes first, and another window's answer for
+    // it settles the view empty while the unsent one stays open.
+    fixture.app.workspace.request_close(fixture.card).unwrap();
+    drop(fixture.app.commit_card_removal(fixture.card, None).unwrap());
+    assert!(fixture.app.channel_ui.retire_candidates.is_empty());
+    let view = &mut fixture.app.workspace_model.views[0];
+    view.panes.clear();
+    view.retired.push(fixture.card);
+    view.revision = 8;
+    let received = fixture.listen();
+
+    fixture.app.workspace.request_close(unsent).unwrap();
+    drop(fixture.app.commit_card_removal(unsent, None).unwrap());
+    assert!(
+        fixture
+            .app
+            .channel_ui
+            .retire_candidates
+            .contains(&fixture.home)
+    );
+    // What the close's task delivers once the close has landed.
+    drop(
+        fixture
+            .app
+            .handle_channel_ui(super::Action::SettleRetirements),
+    );
+
+    assert_eq!(
+        retirements(&received),
+        [ModelEdit::RetireEmptyChannel {
+            home: fixture.home,
+            expected_view_revision: 8,
+        }]
+    );
 }

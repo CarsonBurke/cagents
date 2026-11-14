@@ -486,6 +486,22 @@ pub struct PullRequestCheck {
     pub workflow: String,
 }
 
+impl PullRequestCheck {
+    /// The check's actual state. gh's coarse buckets treat cancellation as
+    /// failure and skips as passes, so inspect those conclusions first.
+    pub fn work_state(&self) -> Option<crate::work::CheckState> {
+        use crate::work::CheckState;
+        match (self.state.0.as_str(), self.bucket.0.as_str()) {
+            ("CANCELLED", _) => Some(CheckState::Cancelled),
+            ("SKIPPED", _) => Some(CheckState::Skipped),
+            (_, "pass") => Some(CheckState::Passed),
+            (_, "fail") => Some(CheckState::Failed),
+            (_, "pending") => Some(CheckState::Pending),
+            _ => None,
+        }
+    }
+}
+
 /// Read-only inspector data. A failed section remains an error, never an empty
 /// successful section; callers can still display the independently loaded data.
 #[derive(Debug, Clone)]

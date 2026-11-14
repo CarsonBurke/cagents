@@ -1448,3 +1448,93 @@ fn a_file_queued_behind_this_windows_own_start_comes_along() {
         [std::path::Path::new(FILE)]
     );
 }
+
+#[test]
+fn a_working_chat_close_answers_enter_and_escape_and_can_stop_asking() {
+    use crate::app::dialog_ui::tests::{enter_control, key_press};
+    use crate::settings::Confirmation::StopWorkingChat;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("settings.toml");
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.settings_path = Some(path.clone());
+    app.settings_write_blocked = false;
+    let working = |app: &mut Cagents, thread| {
+        let card = super::tests::live_chat_for_provider(app, Provider::Claude, Some(thread));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("expected a chat runtime");
+        };
+        let handle = runtime.handle().unwrap();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.busy = true;
+        handle.publish_snapshot_for_test(snapshot);
+        card
+    };
+    let confirm = || widget::Id::new("dialog.chat-close.confirm");
+    let card = working(&mut app, "first-thread");
+
+    // Closing stops the chat but keeps its conversation, so the question
+    // opens on its answer and Enter gives it.
+    let opening = app.update(Message::CloseCard(card));
+    assert!(app.chat_close_dialog_visible());
+    assert_eq!(
+        crate::app::tests::focused_element(app.chat_close_dialog(), opening),
+        Some(confirm())
+    );
+    assert!(matches!(
+        enter_control(app.chat_close_dialog(), confirm()),
+        Message::ConfirmChatClose
+    ));
+
+    // Escape keeps the chat, and a tick only counts once the close goes ahead.
+    drop(app.update(Message::DontAskAgain(StopWorkingChat, true)));
+    let escape = crate::app::tests::task_app_message(app.update(Message::KeyEvent {
+        event: key_press(keyboard::key::Named::Escape),
+        captured: false,
+    }));
+    assert!(matches!(escape, Message::CancelChatClose));
+    drop(app.update(escape));
+    assert!(!app.chat_close_dialog_visible());
+    assert!(
+        app.card_state(card)
+            .is_some_and(|state| state.existence.is_open())
+    );
+    assert!(app.settings.asks(StopWorkingChat));
+
+    drop(app.update(Message::CloseCard(card)));
+    assert!(app.chat_close_dialog_visible());
+    assert!(
+        !app.dont_ask_again.contains(&StopWorkingChat),
+        "a new question starts unticked"
+    );
+    drop(app.update(Message::DontAskAgain(StopWorkingChat, true)));
+    drop(app.update(Message::ConfirmChatClose));
+    assert!(!app.settings.asks(StopWorkingChat));
+    app.save_settings_now().unwrap();
+    assert!(!crate::settings::load(&path).unwrap().asks(StopWorkingChat));
+
+    // Skipped, the next working chat closes without a question: at once, or
+    // in its turn behind the close still under way.
+    let skipped = working(&mut app, "skipped-thread");
+    drop(app.update(Message::CloseCard(skipped)));
+    assert!(!app.chat_close_asked(skipped));
+    assert!(!app.chat_close_dialog_visible());
+    assert!(
+        !app.card_state(skipped)
+            .is_some_and(|state| state.existence.is_open())
+            || app.chat_close_owned(skipped)
+            || !app.queued_card_closes.is_empty(),
+        "the close goes ahead without asking"
+    );
+
+    // Turning the question back on in Settings asks again.
+    let enable = app.update(Message::SettingsChanged {
+        field: SettingsField::Confirm(StopWorkingChat),
+        value: "true".into(),
+    });
+    crate::app::tests::settle_settings_task(&mut app, enable);
+    assert!(crate::settings::load(&path).unwrap().asks(StopWorkingChat));
+    let asked = working(&mut app, "asked-thread");
+    drop(app.update(Message::CloseCard(asked)));
+    assert!(app.chat_close_asked(asked));
+    assert!(app.chat_close_dialog_visible());
+}

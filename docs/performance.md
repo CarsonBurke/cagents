@@ -8,6 +8,9 @@
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
 - [Native chat viewport](#native-chat-viewport)
+- [Idle retained actors](#idle-retained-actors)
+- [Work board polling](#work-board-polling)
+- [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -581,6 +584,124 @@ pressure; commands of at most 2,048 bytes can be excluded using the
 recognizer's existing program-name predicate. Full rich coordination parts are
 still reparsed on changed publications; off-thread ownership does not make this
 cost incremental.
+
+## Idle retained actors
+
+Each retained Claude agent keeps a `cagents-native --cagents-native-actor`
+process alive between turns. An idle actor should not wake: its serve loop
+reaps adopted tool orphans when a child exits, read from a signalfd, and its
+`cagents-commands` cgroup sweeper backs off from 1 s to 8 s once a provider
+that reports its own activity has been quiet.
+
+`scripts/measure-idle-wakeups` counts context switches and on-CPU time per
+thread name from `/proc` alone, without signalling anything, so it is safe to
+run against the actors of a live session:
+
+```sh
+scripts/measure-idle-wakeups --seconds 60
+```
+
+`scripts/measure-idle-actors BIN_DIR [COUNT] [SECONDS]` builds a private
+fixture (HOME, XDG directories, runtime directory and project) from a matched
+`cagents` and `cagentsd`, spawns COUNT agents with the offline fixture provider
+one at a time, waits for each to settle, and then measures only the fixture's
+actors. It removes every process and directory it created on exit. Run it from
+a genuine user shell, such as `ssh fw16`; it refuses agent authority.
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 45 idle actors,
+60 s, `0b8b9aace` (before) against `6e62e851a` (after). The host was shared
+with other builds, so treat CPU as indicative; the wakeup counts are timer
+periods and barely depend on load.
+
+| Wakeups/s | Before | After |
+| --- | --- | --- |
+| `cagents-native` (serve loop) | 188.47 | 0 |
+| `cagents-command` (cgroup sweep) | 46.30 | 5.92 |
+| `cagents-chat` | 0 | 0 |
+| Total | 234.77 | 5.92 |
+| Per actor | 5.22 | 0.13 |
+
+CPU across all 45 actors fell from 3.32% to 0.08% of one core.
+
+`/proc` truncates the `cagents-commands` thread name to `cagents-command`.
+The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
+7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
+started without an announcement.
+
+## Work board polling
+
+The daemon's Work board keeps each open project's Git facts current. The Git
+watcher covers projects within a budget of 8192 directory watches, and each
+checkout's tracked directories count against it, so a repository with
+hundreds of worktrees is polled instead. Each worktree of a polled project
+comes due on its own. A worktree with an edit or agent session in the active
+window is read every 15 s, and any other every 120 s; reads due within the
+next 15 s share one scan. Previously one recent edit anywhere made the whole
+project re-read every worktree every 15 s.
+
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
+private fixture from a matched `cagents` and `cagentsd`: a project of
+WORKTREES worktrees (default 250) with 40 tracked directories each, which it
+checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
+worktrees. After the board has read every checkout once, it counts the
+`git status` reads the daemon starts and the CPU of its exited children over
+SECONDS (default 300). It removes everything it created on exit and refuses
+agent authority; run it from `ssh fw16`.
+
+Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
+300 s, `0ac78d249` (before) against `9b8523e9a` (after):
+
+| | Before | After |
+| --- | --- | --- |
+| `git status` per second | 15.79 | 2.47 |
+| Git CPU, % of one core | 7.22 | 1.71 |
+| Daemon CPU, % of one core | 1.83 | 0.45 |
+
+A fixture checkout holds 40 files. A real checkout costs more per read: on a
+347-worktree repository with 8 active worktrees, the scanner's Git processes
+took at least half a core before this change.
+
+## Git watcher during builds
+
+The daemon's Git watcher (`notify-rs inotify loop`, from the `notify` crate)
+covers each project's tracked directories and Git metadata. It asks the kernel
+for changes only: creations, removals, renames, content and metadata writes.
+An inotify watch that includes opens wakes the thread whenever `git status`, a
+compiler or an editor merely reads a watched file or lists a watched directory.
+Ignored output such as `target/` is never watched, because content watches come
+from the tracked-directory census.
+
+`scripts/measure-watch-wakeups BIN_DIR [SECONDS]` opens a shared clone of the
+checkout as the only project of a private daemon fixture. It then checks the
+clone's CLI through the build gate over and over, touching `src/main.rs` before
+each check, while `scripts/measure-idle-wakeups` counts the daemon's threads.
+Run it from a genuine user shell on the build host, with rustup's Cargo first
+on `PATH`:
+
+```sh
+scripts/measure-watch-wakeups ~/.local/state/cev/watch/target-after/dev-runtime 120
+```
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 120 s of
+builds, `7c7430da9` (before, notify 8.2) against `3611b064f` (after, notify 9
+with `EventKindMask::CORE`). Both sides used the same fixture from the after
+checkout; the host was shared with other builds.
+
+| Daemon, per second | Before | After |
+| --- | --- | --- |
+| `notify-rs inoti` wakeups | 937.08 | 0.47 |
+| `work-scan` wakeups | 3.05 | 5.75 |
+| All daemon threads, wakeups | 943.03 | 10.05 |
+| All daemon threads, CPU % of a core | 0.81 | 0.10 |
+| Checks completed | 26 | 49 |
+
+`work-scan` wakes to read a worktree's status after a real change. It followed
+the build rate on both sides, about 14 wakeups per check, so each touched source
+still reaches the Work board. The watcher's remaining 0.47 wakeups/s are about
+one per touch (0.41/s).
+
+A live daemon with 8,715 watches across several large projects showed the same
+pattern. A 60 s replica of its watch set saw 714 events/s, 701 of them opens.
 
 ## Reference results
 

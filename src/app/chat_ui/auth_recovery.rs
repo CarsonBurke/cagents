@@ -153,6 +153,7 @@ pub(super) fn view<'a>(
             } else {
                 "Sign in"
             })
+            .reserve_labels(["Sign in", "Signing in…"])
             .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
             .into(),
         );

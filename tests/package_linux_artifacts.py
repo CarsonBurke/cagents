@@ -28,7 +28,7 @@ class PackageLinuxArtifacts(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         for leaf in ("scripts", "packaging"):
             (self.checkout / leaf).mkdir(parents=True)
-        for name in ("package-linux.sh", "build-ceditor-product"):
+        for name in ("package-linux.sh", "build-ceditor-product", "cargo_artifacts.py"):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         for name in ("dev.cagents.Cagents.desktop", "dev.cagents.Cagents.Daemon.desktop",
                      "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",

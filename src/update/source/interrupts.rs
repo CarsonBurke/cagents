@@ -313,7 +313,7 @@ impl Interrupts {
                 "This older source cannot confirm interruptions before checkpointing",
             ));
         };
-        if ![156, crate::terminal_ipc::PROTOCOL_VERSION].contains(&client.protocol()) {
+        if !super::current_client_supports(client.protocol()) {
             return Err(invalid(
                 "This source protocol has no qualified interruption settlement boundary",
             ));

@@ -235,6 +235,7 @@ impl Cagents {
         if !regained {
             return self.accounts_focus_changed(focused, false);
         }
+        self.automation_approval_activity();
         Task::batch([
             // Coming back to the window is coming back to the pane in use.
             self.focus_pane_keyboard_on_activation(),

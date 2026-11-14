@@ -60,7 +60,7 @@ impl Serving {
         };
         let socket = server.socket.clone();
         let (control, startup) = UnixStream::pair().unwrap();
-        let serving = thread::spawn(move || server.serve(control));
+        let serving = thread::spawn(move || server.serve(control, None));
         let _: Attached = receive::<Result<Attached, String>>(&startup, TIMEOUT)
             .unwrap()
             .unwrap();

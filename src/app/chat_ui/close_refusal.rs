@@ -288,6 +288,7 @@ impl Runtime {
                 } else {
                     end_label(proved)
                 })
+                .reserve_labels([end_label(proved), "Ending…".to_owned()])
                 .on_press_maybe((!refusal.ending).then(|| action(Action::EndCloseHolders(target))))
                 .into(),
             );

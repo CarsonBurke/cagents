@@ -56,6 +56,7 @@ mod terminal_ui;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
+mod workspace_switcher;
 mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
@@ -66,7 +67,7 @@ use worktree_dialog::{
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -1434,7 +1435,8 @@ impl Default for PanePresence {
 /// sidebar. Each save projects every shared view and copies the workspace and
 /// every chat draft on the UI thread, so a burst is saved once, at its first
 /// move plus this delay. Any other save in between carries it along, and
-/// nothing outside this window reads it before then.
+/// nothing outside this window reads it before then. A channel name another
+/// window gave, which the shared registry already holds, waits the same way.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// What an update changed in the durable workspace beside focus, which decides
@@ -1451,28 +1453,7 @@ enum DurableChange {
     Content,
 }
 
-/// How long the modifier is held before the workspace switcher is drawn. A
-/// tap that toggles between the two most recent workspaces ends sooner, and
-/// would otherwise flash a list nobody reads.
 const WORKSPACE_HISTORY_LIMIT: usize = 128;
-const WORKSPACE_SWITCHER_DELAY: Duration = Duration::from_millis(120);
-const WORKSPACE_SWITCHER_SCROLL_ID: &str = "workspace-switcher.rows";
-/// Rows have one height so the list can be scrolled to a row by its index.
-const WORKSPACE_SWITCHER_ROW_HEIGHT: f32 = 52.0;
-const WORKSPACE_SWITCHER_ROW_GAP: f32 = space::XXS;
-const WORKSPACE_SWITCHER_VISIBLE_ROWS: f32 = 6.0;
-const WORKSPACE_SWITCHER_LIST_HEIGHT: f32 = WORKSPACE_SWITCHER_VISIBLE_ROWS
-    * WORKSPACE_SWITCHER_ROW_HEIGHT
-    + (WORKSPACE_SWITCHER_VISIBLE_ROWS - 1.0) * WORKSPACE_SWITCHER_ROW_GAP;
-
-/// One destination in the workspace switcher, in the order it is listed.
-#[derive(Debug)]
-struct WorkspaceSwitcherRow {
-    destination: WorkspaceDestination,
-    action: SidebarAction,
-    title: String,
-    detail: String,
-}
 
 fn deferred_terminal_session(
     state: Option<&CardState>,
@@ -2841,6 +2822,21 @@ fn repaint_tick(message: &Message) -> bool {
     }
 }
 
+/// Background polls, and their answers, whose handlers keep to their own
+/// state: the automation request reader's, and the accounts' figures, which
+/// only the view reads. No sidebar row, card chrome, worktree protection or
+/// source-control binding depends on them, so rebuilding those projections
+/// for every poll would spend several milliseconds of the UI thread on
+/// nothing.
+fn background_poll(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::AutomationApproval(
+            automation_approval::Action::Tick | automation_approval::Action::Read { .. }
+        ) | Message::AccountUi(account_ui::Action::Tick | account_ui::Action::OmpRead(_))
+    )
+}
+
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
         || matches!(
@@ -2858,7 +2854,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CancelTerminalClose
                 | Message::ConfirmChatClose
                 | Message::CancelChatClose
-                | Message::TerminalCloseDontAskChanged(_)
+                | Message::DontAskAgain(..)
                 | Message::SaveAndCloseRepository(_)
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
@@ -3058,12 +3054,13 @@ pub enum SettingsField {
     ChatContentFraction,
     DefaultNativePaneFraction,
     ShowStatusBar,
+    AccountUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
-    ConfirmTerminalClose,
+    Confirm(settings::Confirmation),
     FocusFollowsMouse,
     LinkOpenGesture,
     PullRequestOpenTarget,
@@ -3216,13 +3213,15 @@ impl SettingsField {
             Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
+            Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
-            Self::ConfirmTerminalClose => "Active processes",
+            Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
+            Self::Confirm(settings::Confirmation::CloseActiveTerminal) => "Active processes",
             Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
@@ -3250,6 +3249,7 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
+            Self::AccountUsageDisplay => SettingsCategory::Accounts,
             Self::AppTheme
             | Self::UiScale
             | Self::ShowStatusBar
@@ -3266,7 +3266,6 @@ impl SettingsField {
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackMib
-            | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
@@ -3277,6 +3276,7 @@ impl SettingsField {
             | Self::SidebarWorktrees
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
+            | Self::Confirm(_)
             | Self::FocusFollowsMouse => SettingsCategory::General,
             Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
                 SettingsCategory::NativeChat
@@ -3470,12 +3470,14 @@ struct SettingsDraft {
     editor_wrap_lines: bool,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
-    confirm_terminal_close: bool,
+    /// Whether each routine question is asked, as `AppSettings::asks` reads it.
+    confirmations: BTreeMap<settings::Confirmation, bool>,
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
     default_native_pane_fraction: String,
     show_status_bar: bool,
+    account_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
     relaunch_agents_on_upgrade: bool,
@@ -3532,7 +3534,10 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             diff_hide_unchanged: settings.diff_hide_unchanged,
-            confirm_terminal_close: settings.confirm_terminal_close,
+            confirmations: settings::Confirmation::ALL
+                .into_iter()
+                .map(|kind| (kind, settings.asks(kind)))
+                .collect(),
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
@@ -3540,6 +3545,7 @@ impl SettingsDraft {
             chat_content_fraction: settings.chat_content_fraction.to_string(),
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
+            account_usage_display: settings.account_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
@@ -3598,12 +3604,19 @@ impl SettingsDraft {
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
-            SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
+            SettingsField::Confirm(kind) => {
+                self.confirmations.insert(kind, value == "true");
+            }
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
             SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
+            SettingsField::AccountUsageDisplay => {
+                if let Some(display) = settings::AccountUsageDisplay::from_key(&value) {
+                    self.account_usage_display = display;
+                }
+            }
             SettingsField::ShowWorktreeChangesIcons => {
                 self.show_worktree_changes_icons = value == "true"
             }
@@ -3825,10 +3838,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.focus_follows_mouse = enabled)
             .map_err(|_| "Choose whether hovering activates panes.".to_owned()),
-        SettingsField::ConfirmTerminalClose => value
+        SettingsField::Confirm(kind) => value
             .parse::<bool>()
-            .map(|enabled| next.confirm_terminal_close = enabled)
-            .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+            .map(|ask| next.set_asks(kind, ask))
+            .map_err(|_| "Choose whether to ask first.".to_owned()),
         SettingsField::ConfirmMultilinePaste => value
             .parse::<bool>()
             .map(|value| next.confirm_multiline_paste = value)
@@ -3857,6 +3870,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
             .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
+        SettingsField::AccountUsageDisplay => settings::AccountUsageDisplay::from_key(value)
+            .map(|display| next.account_usage_display = display)
+            .ok_or_else(|| "Choose Left or Used.".to_owned()),
         SettingsField::ShowWorktreeChangesIcons => value
             .parse::<bool>()
             .map(|enabled| next.show_worktree_changes_icons = enabled)
@@ -4444,7 +4460,10 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
-    SidebarPreferencesObserved(AppSettings),
+    SharedPreferencesObserved {
+        generation: u64,
+        settings: AppSettings,
+    },
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -4468,7 +4487,8 @@ pub enum Message {
     CancelTerminalClose,
     ConfirmChatClose,
     CancelChatClose,
-    TerminalCloseDontAskChanged(bool),
+    /// Ticks or clears "Don't ask again" in the open question of this kind.
+    DontAskAgain(settings::Confirmation, bool),
     TerminalCloseFinished {
         card: CardId,
         terminal: TerminalId,
@@ -4520,6 +4540,12 @@ pub enum Message {
     /// The modifier holding the workspace switcher open since this instant
     /// was released.
     WorkspaceSwitcherReleased(Instant),
+    /// The scrim around the workspace switcher held open since this instant
+    /// was clicked.
+    WorkspaceSwitcherDismissed(Instant),
+    /// The switcher's selection, held open since this instant, may have
+    /// rested long enough to bring its pane up for the preview.
+    WorkspaceSwitcherRested(Option<Instant>),
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -5253,6 +5279,10 @@ pub struct Cagents {
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
+    /// Where editors were when a save last dropped them from durable: a
+    /// closed editor, or one still loading. A shared view reopening the same
+    /// pane, or a retried attach, puts the editor back there.
+    released_repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     /// A focused chat pane whose message input was not drawn when the pane
     /// was focused, which takes the keyboard once it is; see
     /// [`Cagents::focus_pane_keyboard`].
@@ -5403,7 +5433,9 @@ pub struct Cagents {
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
-    settings_reset_focus_confirm: bool,
+    /// Routine questions whose open dialog has "Don't ask again" ticked. The
+    /// tick is kept in settings only once the action goes ahead.
+    dont_ask_again: BTreeSet<settings::Confirmation>,
     settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
@@ -5467,6 +5499,12 @@ pub struct Cagents {
     settings_search: String,
     tab_history: crate::tab_history::TabHistory<CardId>,
     workspace_history: crate::tab_history::TabHistory<WorkspaceDestination>,
+    /// When each recently used workspace was last open, in seconds since the
+    /// Unix epoch, as the workspace switcher dates its quiet rows.
+    workspace_visits: HashMap<WorkspaceDestination, u64>,
+    /// The workspace open when visits were last dated, so leaving it dates
+    /// it however the switch came about.
+    workspace_visited: Option<WorkspaceDestination>,
     workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
@@ -7476,7 +7514,13 @@ impl Cagents {
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-        if let Some(navigation) = self.durable.repository_navigation.get(&card) {
+        let released = self.released_repository_navigation.remove(&card);
+        if let Some(navigation) = self
+            .durable
+            .repository_navigation
+            .get(&card)
+            .or(released.as_ref())
+        {
             runtime.restore_navigation(navigation);
         }
         let load = repository_task(runtime.initial_load(card));
@@ -9650,6 +9694,11 @@ impl Cagents {
                 }
             }
         }
+        // The pane the workspace switcher previews is on screen there,
+        // whichever workspace holds it.
+        if let Some(card) = self.chrome_ui.workspace_switcher_preview {
+            visible.insert(card);
+        }
         // An ended card holds no lifecycle slot, so the reconcile below never
         // brings it up; its final screen is asked for once it is on screen.
         let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
@@ -11102,410 +11151,6 @@ impl Cagents {
                     .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
             }
         })
-    }
-
-    /// Preview workspaces in a frozen MRU order, committing on modifier release.
-    fn cycle_workspace(
-        &mut self,
-        direction: crate::workspace::FocusDirection,
-        modifiers: keyboard::Modifiers,
-    ) -> Task<Message> {
-        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
-            return Task::none();
-        }
-        let Some(action) = self.next_workspace(direction) else {
-            return Task::none();
-        };
-        if self
-            .sidebar_entered_directory(&action)
-            .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
-        {
-            self.cancel_workspace_preview();
-            return Task::none();
-        }
-        let first = self.chrome_ui.workspace_preview.replace(action).is_none();
-        self.workspace_cycle_modifiers = modifiers
-            & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
-        if self.workspace_cycle_modifiers.is_empty() {
-            return self.commit_workspace_preview();
-        }
-        if !first {
-            // A second step is someone looking for a workspace, not a tap.
-            self.chrome_ui.workspace_switcher_shown = true;
-            return self.reveal_workspace_selection();
-        }
-        let since = Instant::now();
-        self.chrome_ui.workspace_preview_since = Some(since);
-        cosmic::task::future(async move {
-            tokio::time::sleep(WORKSPACE_SWITCHER_DELAY).await;
-            Message::WorkspaceSwitcherDue(since)
-        })
-    }
-
-    fn commit_workspace_preview(&mut self) -> Task<Message> {
-        let action = self.close_workspace_preview();
-        // Coming back round to the workspace already open is a way of
-        // cancelling. Selecting it again would give a workspace without a
-        // terminal or conversation its default pane.
-        let task = action
-            .filter(|action| {
-                let destination = WorkspaceDestination::from_action(action);
-                destination != self.active_workspace_destination()
-                    && sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state)
-                        .iter()
-                        .any(|available| available == action)
-            })
-            .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
-        self.workspace_history
-            .finish(self.active_workspace_destination());
-        self.workspace_history
-            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
-        self.persist();
-        task
-    }
-
-    fn cancel_workspace_preview(&mut self) {
-        self.close_workspace_preview();
-        self.workspace_history
-            .finish(self.active_workspace_destination());
-        self.workspace_history
-            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
-    }
-
-    fn close_workspace_preview(&mut self) -> Option<SidebarAction> {
-        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-        self.chrome_ui.workspace_preview_since = None;
-        self.chrome_ui.workspace_switcher_shown = false;
-        self.chrome_ui.workspace_switcher_scroll = 0.0;
-        self.chrome_ui.workspace_switcher_rows.clear();
-        self.chrome_ui.workspace_preview.take()
-    }
-
-    /// Keys while the switcher is open. It owns the keyboard: a key that
-    /// steers or dismisses it must not also reach the pane beneath, where
-    /// Escape interrupts an agent and the arrows move through a review.
-    fn workspace_switcher_key(&mut self, event: &keyboard::Event) -> Task<Message> {
-        use keyboard::key::Named;
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-            return Task::none();
-        };
-        match key {
-            keyboard::Key::Named(Named::Escape) => {
-                self.cancel_workspace_preview();
-                Task::none()
-            }
-            keyboard::Key::Named(Named::Enter) => self.commit_workspace_preview(),
-            keyboard::Key::Named(Named::Tab) => self.cycle_workspace(
-                if modifiers.shift() {
-                    crate::workspace::FocusDirection::Left
-                } else {
-                    crate::workspace::FocusDirection::Right
-                },
-                self.workspace_cycle_modifiers,
-            ),
-            keyboard::Key::Named(Named::Home) => self.select_workspace_preview(0),
-            keyboard::Key::Named(Named::End) => self.select_workspace_preview(
-                self.chrome_ui
-                    .workspace_switcher_rows
-                    .len()
-                    .saturating_sub(1),
-            ),
-            keyboard::Key::Named(Named::ArrowDown | Named::ArrowRight) => self.cycle_workspace(
-                crate::workspace::FocusDirection::Right,
-                self.workspace_cycle_modifiers,
-            ),
-            keyboard::Key::Named(Named::ArrowUp | Named::ArrowLeft) => self.cycle_workspace(
-                crate::workspace::FocusDirection::Left,
-                self.workspace_cycle_modifiers,
-            ),
-            _ => match workspace_widget::global_shortcut(
-                event,
-                &self.settings.keyboard_shortcuts,
-                self.focused_pane(),
-            ) {
-                Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
-                    self.cycle_workspace(direction, *modifiers)
-                }
-                _ => Task::none(),
-            },
-        }
-    }
-
-    /// The switcher's rows: recently used workspaces first, then the rest in
-    /// the sidebar's order.
-    fn build_workspace_switcher_rows(
-        &self,
-        order: &[WorkspaceDestination],
-        actions: Vec<SidebarAction>,
-    ) -> Vec<WorkspaceSwitcherRow> {
-        let projects: HashMap<_, _> = self
-            .sidebar_model
-            .projects
-            .iter()
-            .map(|p| (p.id, p))
-            .collect();
-        let worktrees: HashMap<_, _> = self
-            .sidebar_model
-            .projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter().map(move |w| (w.id, (p, w))))
-            .collect();
-        let channels: HashMap<_, _> = self
-            .sidebar_model
-            .projects
-            .iter()
-            .flat_map(|p| p.channels.iter().map(move |c| (c.id, (p, c))))
-            .collect();
-        let mut destinations: HashMap<_, _> = actions
-            .into_iter()
-            .filter_map(|action| Some((WorkspaceDestination::from_action(&action)?, action)))
-            .collect();
-        let status = |activity, unread: bool| match activity {
-            Some(crate::agent::ActivityState::Waiting) => Some("Waiting for input"),
-            Some(crate::agent::ActivityState::Working) => Some("Working"),
-            _ if unread => Some("Unread update"),
-            _ => None,
-        };
-        let described = |place: String, status: Option<&str>| match status {
-            Some(status) => format!("{place} · {status}"),
-            None => place,
-        };
-        order
-            .iter()
-            .filter_map(|destination| {
-                let action = destinations.remove(destination)?;
-                let (title, detail) = match &action {
-                    SidebarAction::OpenRepository {
-                        project_id,
-                        repository,
-                    } => (
-                        projects.get(project_id).map_or_else(
-                            || repository.display().to_string(),
-                            |project| project.name.clone(),
-                        ),
-                        display_path(repository).into_owned(),
-                    ),
-                    SidebarAction::OpenWorktree {
-                        project_id,
-                        worktree_id,
-                        path,
-                        ..
-                    } => {
-                        let (project, worktree) = worktrees.get(worktree_id)?;
-                        (
-                            format!("{} · {}", project.name, worktree.label()),
-                            described(
-                                display_path(path).into_owned(),
-                                status(
-                                    self.sidebar_state.agent_activity(*project_id, *worktree_id),
-                                    self.sidebar_state
-                                        .has_agent_update(*project_id, *worktree_id),
-                                ),
-                            ),
-                        )
-                    }
-                    SidebarAction::OpenChannel { channel_id } => {
-                        let (project, channel) = channels.get(channel_id)?;
-                        (
-                            format!("{} · {}", project.name, channel.title),
-                            described(
-                                "Channel".to_owned(),
-                                status(channel.activity, channel.unread),
-                            ),
-                        )
-                    }
-                    _ => return None,
-                };
-                Some(WorkspaceSwitcherRow {
-                    destination: *destination,
-                    action,
-                    title,
-                    detail,
-                })
-            })
-            .collect()
-    }
-
-    /// Scrolls the switcher's list just far enough to show the selected row.
-    fn reveal_workspace_selection(&mut self) -> Task<Message> {
-        let selected = self
-            .chrome_ui
-            .workspace_preview
-            .as_ref()
-            .and_then(WorkspaceDestination::from_action);
-        let Some(index) = self.workspace_history.cycle_index() else {
-            return Task::none();
-        };
-        if self
-            .chrome_ui
-            .workspace_switcher_rows
-            .get(index)
-            .map(|row| row.destination)
-            != selected
-        {
-            return Task::none();
-        }
-        let top = index as f32 * (WORKSPACE_SWITCHER_ROW_HEIGHT + WORKSPACE_SWITCHER_ROW_GAP);
-        let bottom = top + WORKSPACE_SWITCHER_ROW_HEIGHT;
-        let scroll = &mut self.chrome_ui.workspace_switcher_scroll;
-        *scroll = scroll.max(bottom - WORKSPACE_SWITCHER_LIST_HEIGHT).min(top);
-        iced::widget::operation::scroll_to(
-            widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID),
-            iced::widget::operation::AbsoluteOffset { x: 0.0, y: *scroll },
-        )
-    }
-
-    fn workspace_switcher(&self) -> Option<Element<'_, Message>> {
-        let selected =
-            WorkspaceDestination::from_action(self.chrome_ui.workspace_preview.as_ref()?);
-        if !self.chrome_ui.workspace_switcher_shown {
-            // Not drawn yet, but already holding the keyboard.
-            return Some(crate::interaction::keyboard_modal(
-                iced::widget::Space::new(),
-            ));
-        }
-        let since = self.chrome_ui.workspace_preview_since?;
-        let rows = self
-            .chrome_ui
-            .workspace_switcher_rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let active = Some(row.destination) == selected;
-                let content = widget::container(
-                    widget::column::with_children(vec![
-                        design::body(format!("{}{}", if active { "› " } else { "  " }, row.title))
-                            .into(),
-                        design::caption(&row.detail).into(),
-                    ])
-                    .spacing(space::XXS),
-                )
-                .padding([0.0, space::S])
-                .height(WORKSPACE_SWITCHER_ROW_HEIGHT)
-                .width(Length::Fill)
-                .align_y(Alignment::Center)
-                .class(cosmic::theme::Container::custom(move |theme| {
-                    iced::widget::container::Style {
-                        background: active.then(|| {
-                            iced::Background::Color(
-                                theme
-                                    .current_container()
-                                    .component
-                                    .selected_state_color()
-                                    .into(),
-                            )
-                        }),
-                        border: iced::Border {
-                            radius: design::RADIUS_S.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                }));
-                let button = widget::button::custom(content)
-                    .name(format!(
-                        "{} workspace: {} · {}",
-                        if active { "Selected" } else { "Open" },
-                        row.title,
-                        row.detail
-                    ))
-                    .selected(active)
-                    .class(crate::ui_controls::control_style(active, None))
-                    .padding(0)
-                    .width(Length::Fill)
-                    .on_press(Message::WorkspaceSwitcherActivate { since, index });
-                widget::mouse_area(button)
-                    .on_enter(Message::WorkspaceSwitcherSelected { since, index })
-                    .into()
-            })
-            .collect::<Vec<Element<'_, Message>>>();
-        Some(crate::interaction::keyboard_modal(
-            crate::interaction::opaque(
-                widget::container(
-                    widget::column::with_children(vec![
-                        design::heading("Switch workspace").into(),
-                        widget::container(crate::interaction::overflow_fade_y(
-                            widget::scrollable(
-                                widget::column::with_children(rows)
-                                    .spacing(WORKSPACE_SWITCHER_ROW_GAP)
-                                    .padding(design::with_vertical_rail(Padding::ZERO)),
-                            )
-                            .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
-                            .height(Length::Shrink),
-                            design::component_base,
-                        ))
-                        .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
-                        .into(),
-                        design::caption(
-                            "Tab, arrows, Home or End to choose · Release or Enter to open · Escape to cancel",
-                        )
-                        .into(),
-                    ])
-                    .spacing(space::S),
-                )
-                .class(cosmic::theme::Container::Card)
-                .padding(space::M)
-                .width(440),
-            ),
-        ))
-    }
-
-    /// Record only actual navigation at the workspace's save boundary.
-    /// Frames and preview steps never scan the project model or become visits.
-    fn capture_workspace_history(&mut self) {
-        if self.chrome_ui.workspace_preview.is_none() {
-            self.workspace_history
-                .observe(self.active_workspace_destination());
-        }
-        self.workspace_history
-            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
-        let history = self.workspace_history.recent().to_vec();
-        if self.durable.workspace_history != history {
-            Arc::make_mut(&mut self.durable).workspace_history = history;
-        }
-    }
-
-    fn select_workspace_preview(&mut self, index: usize) -> Task<Message> {
-        let Some(destination) = self.workspace_history.select_index(index) else {
-            return Task::none();
-        };
-        let Some(row) = self.chrome_ui.workspace_switcher_rows.get(index) else {
-            return Task::none();
-        };
-        if row.destination != destination {
-            return Task::none();
-        }
-        self.chrome_ui.workspace_preview = Some(row.action.clone());
-        self.reveal_workspace_selection()
-    }
-
-    fn next_workspace(
-        &mut self,
-        direction: crate::workspace::FocusDirection,
-    ) -> Option<SidebarAction> {
-        let backwards = direction == crate::workspace::FocusDirection::Left;
-        if self.workspace_history.cycle_order().is_some() {
-            self.workspace_history.advance(backwards)?;
-        } else {
-            let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
-            let available: Vec<_> = destinations
-                .iter()
-                .filter_map(WorkspaceDestination::from_action)
-                .collect();
-            let live: HashSet<_> = available.iter().copied().collect();
-            self.workspace_history.retain(|id| live.contains(&id));
-            self.workspace_history.step(
-                &available,
-                self.active_workspace_destination(),
-                backwards,
-            )?;
-            self.chrome_ui.workspace_switcher_rows = self
-                .build_workspace_switcher_rows(self.workspace_history.cycle_order()?, destinations);
-        }
-        self.chrome_ui
-            .workspace_switcher_rows
-            .get(self.workspace_history.cycle_index()?)
-            .map(|row| row.action.clone())
     }
 
     /// The focused card, reduced to what binding the source-control panel
@@ -14497,7 +14142,6 @@ impl Cagents {
         if !std::mem::take(&mut self.settings_reset_confirm) {
             return Task::none();
         }
-        self.settings_reset_focus_confirm = false;
         if let Some(restore) = self.settings_reset_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }
@@ -14666,6 +14310,7 @@ impl Application for Cagents {
                 .copied()
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
+        let workspace_visits = durable.workspace_visits.iter().copied().collect();
         let mut app = Self {
             startup_gate: startup_gate::State::default(),
             core,
@@ -14805,7 +14450,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
-            settings_reset_focus_confirm: false,
+            dont_ask_again: BTreeSet::new(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
@@ -14856,6 +14501,8 @@ impl Application for Cagents {
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
             workspace_history,
+            workspace_visits,
+            workspace_visited: None,
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
@@ -14871,6 +14518,7 @@ impl Application for Cagents {
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
             navigation_save_generation: 0,
+            released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -15145,7 +14793,10 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
+        let mut projection = if repaint_tick(&message)
+            || background_poll(&message)
+            || self.navigation_save_is_stale(&message)
+        {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -16800,22 +16451,34 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::SidebarPreferencesObserved(settings) => {
+            Message::SharedPreferencesObserved { generation, settings } => {
                 // A local edit owns these fields until its save is acknowledged.
-                if self.settings_save_generation == self.settings_ack_generation {
+                // A read queued by an earlier subscription can arrive after that
+                // acknowledgment; only the current save generation may apply.
+                if generation == self.settings_ack_generation
+                    && self.settings_save_generation == self.settings_ack_generation
+                {
                     // Never wait for a disk save on the event loop. An in-flight
                     // save's acknowledgment restarts this observation.
                     let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
+                    let adopt = |into: &mut AppSettings| {
+                        into.sidebar_worktrees = settings.sidebar_worktrees;
+                        into.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                        into.account_usage_display = settings.account_usage_display;
+                        into.confirm_terminal_close = settings.confirm_terminal_close;
+                        into.confirmations = settings.confirmations.clone();
+                    };
                     if let Some(saved) = lane.as_mut() {
-                        saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
-                        saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                        adopt(&mut saved.settings);
                     }
                     drop(lane);
-                    self.settings.sidebar_worktrees = settings.sidebar_worktrees;
-                    self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
-                    self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
-                    self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    adopt(&mut self.settings);
+                    adopt(&mut self.settings_base);
                     self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings_draft.account_usage_display = settings.account_usage_display;
+                    for kind in settings::Confirmation::ALL {
+                        self.settings_draft.confirmations.insert(kind, settings.asks(kind));
+                    }
                     self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
                     self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
@@ -17089,13 +16752,11 @@ impl Application for Cagents {
             Message::CancelTerminalClose => self.cancel_terminal_close(),
             Message::ConfirmChatClose => self.confirm_chat_close(),
             Message::CancelChatClose => self.cancel_chat_close(),
-            Message::TerminalCloseDontAskChanged(value) => {
-                if let Some(intent) = self.terminal_close.as_mut()
-                    && !intent.pending
-                    && intent.active
-                    && intent.detail.is_none()
-                {
-                    intent.dont_ask_again = value;
+            Message::DontAskAgain(confirmation, ticked) => {
+                if ticked {
+                    self.dont_ask_again.insert(confirmation);
+                } else {
+                    self.dont_ask_again.remove(&confirmation);
                 }
                 Task::none()
             }
@@ -17238,13 +16899,10 @@ impl Application for Cagents {
                 }
             }
             Message::WorkspaceSwitcherActivate { since, index } => {
-                if self.chrome_ui.workspace_preview_since != Some(since)
-                    || index >= self.chrome_ui.workspace_switcher_rows.len()
-                {
+                if self.chrome_ui.workspace_preview_since != Some(since) {
                     return Task::none();
                 }
-                drop(self.select_workspace_preview(index));
-                self.commit_workspace_preview()
+                self.open_workspace_row(index)
             }
             Message::WorkspaceSwitcherReleased(since) => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {
@@ -17259,9 +16917,15 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
-                self.chrome_ui.workspace_switcher_shown = true;
-                self.reveal_workspace_selection()
+                self.show_workspace_switcher()
             }
+            Message::WorkspaceSwitcherDismissed(since) => {
+                if self.chrome_ui.workspace_preview_since == Some(since) {
+                    self.cancel_workspace_preview();
+                }
+                Task::none()
+            }
+            Message::WorkspaceSwitcherRested(since) => self.workspace_switcher_rested(since),
             Message::NavigationSaveDue(generation) => {
                 if self.navigation_save_due(generation) {
                     self.persist();
@@ -17977,20 +17641,8 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     });
                 }
-                if self.settings_reset_on_top() {
-                    if is_escape_press(&event) {
-                        return self.close_settings_reset();
-                    }
-                    if is_tab_press(&event).is_some() {
-                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
-                        };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
-                    }
+                if self.settings_reset_on_top() && is_escape_press(&event) {
+                    return self.close_settings_reset();
                 }
                 if is_escape_press(&event) && !captured {
                     if self.transient_work_close.is_some() {
@@ -18054,14 +17706,6 @@ impl Application for Cagents {
                             InspectorAction::Close,
                         ));
                     }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close_dialog_visible()
-                {
-                    return self.cycle_terminal_close_focus(backwards);
-                }
-                if is_tab_press(&event).is_some() && self.chat_close_dialog_visible() {
-                    return self.cycle_chat_close_focus();
                 }
                 if let Some(backwards) = is_tab_press(&event)
                     && self.dirty_repository_close.is_some()
@@ -18349,11 +17993,12 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.settings_reset_confirm = true;
-                self.settings_reset_focus_confirm = false;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
-                    .map(cosmic::Action::App)
+                dialog_ui::Consequence::Irreversible.focus(
+                    widget::Id::new("dialog.reset-settings.cancel"),
+                    widget::Id::new("dialog.reset-settings.confirm"),
+                )
             }
             Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
@@ -18741,7 +18386,8 @@ impl Application for Cagents {
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
         let keyboard = self.settle_owed_keyboard();
-        Task::batch([task, activation, visibility, keyboard])
+        let preview = self.settle_workspace_switcher_preview();
+        Task::batch([task, activation, visibility, keyboard, preview])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -18850,13 +18496,19 @@ impl Application for Cagents {
                     _ => None,
                 }),
         );
-        subscriptions.push(
-            Subscription::run_with(
-                (self.settings_path.clone(), self.settings_ack_generation),
-                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
-            )
-            .map(Message::SidebarPreferencesObserved),
-        );
+        subscriptions.push(Subscription::run_with(
+            (self.settings_path.clone(), self.settings_ack_generation),
+            |(path, generation)| {
+                use cosmic::iced::futures::StreamExt;
+                let generation = *generation;
+                settings_ui::shared_preferences_stream(path.clone()).map(move |settings| {
+                    Message::SharedPreferencesObserved {
+                        generation,
+                        settings,
+                    }
+                })
+            },
+        ));
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
@@ -18919,7 +18571,7 @@ impl Application for Cagents {
                 }
             }
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::confirmation_surface(
                     widget::column::with_children(vec![
                         design::title("Keep unsaved work before closing").into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
@@ -18993,7 +18645,7 @@ impl Application for Cagents {
         // user configured, with no undo.
         if self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::confirmation_surface(
                     widget::column::with_children(vec![
                         design::title("Reset all settings?").into(),
                         notice_body(
@@ -19600,20 +19252,19 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        // The workspace switcher places itself, over a scrim of its own.
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
+            .map(|surface| {
+                widget::container(surface)
+                    .align_x(Alignment::Center)
+                    .padding(2.0 * design::HEADER_HEIGHT)
+                    .width(Length::Fill)
+                    .into()
+            })
             .or_else(|| self.workspace_switcher())
-            .map_or_else(
-                || iced::widget::Space::new().into(),
-                |switcher| {
-                    widget::container(switcher)
-                        .align_x(Alignment::Center)
-                        .padding(2.0 * design::HEADER_HEIGHT)
-                        .width(Length::Fill)
-                        .into()
-                },
-            );
+            .unwrap_or_else(|| iced::widget::Space::new().into());
         let surface = crate::interaction::layer(surface, switcher);
         let surface = crate::interaction::drive_animation(
             surface,
@@ -23533,7 +23184,7 @@ mod tests {
         };
         let expected = runtime.navigation().unwrap();
         let descriptor = runtime.descriptor.clone();
-        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor.clone());
         let saved = app.persistent_workspace();
         assert_eq!(saved.repository_navigation.get(&card), Some(&expected));
         let CardKind::Repository(view) = &saved
@@ -23578,6 +23229,22 @@ mod tests {
                 .repository_navigation
                 .contains_key(&card)
         );
+        assert!(!app.durable.repository_navigation.contains_key(&card));
+        assert_eq!(
+            app.released_repository_navigation.get(&card),
+            Some(&expected),
+            "the window keeps where the closed editor was"
+        );
+        // A shared view reopening the same pane attaches it there again.
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap()
+            .existence = crate::model::Existence::Open;
+        app.cards.remove(&card);
+        drop(app.attach_repository_pane(card, descriptor));
+        assert!(!app.released_repository_navigation.contains_key(&card));
     }
 
     #[test]
@@ -24625,7 +24292,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_settings_dialog_focus_cycles_and_escape_restores_origin() {
+    fn reset_settings_dialog_starts_on_cancel_cycles_within_and_escape_restores_origin() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
@@ -24656,22 +24323,31 @@ mod tests {
             text: None,
             repeat: false,
         };
-        // Both directions wrap within the two actions, even if a child has
-        // captured the key before the application receives it.
-        for (backwards, target) in [
-            (false, "dialog.reset-settings.confirm"),
-            (false, "dialog.reset-settings.cancel"),
-            (true, "dialog.reset-settings.confirm"),
-            (true, "dialog.reset-settings.cancel"),
+        // Resetting can't be undone, so Enter on the opening focus cancels,
+        // and the reset is one Tab, Shift+Tab or arrow away. Either way focus
+        // wraps within the two actions rather than reaching the window.
+        let cancel = widget::Id::new("dialog.reset-settings.cancel");
+        let reset = widget::Id::new("dialog.reset-settings.confirm");
+        assert!(matches!(
+            dialog_ui::tests::enter_control(
+                cosmic::Application::dialog(&app).unwrap(),
+                cancel.clone()
+            ),
+            Message::CancelResetSettings
+        ));
+        for (from, backwards, to) in [
+            (&cancel, false, &reset),
+            (&reset, false, &cancel),
+            (&cancel, true, &reset),
+            (&reset, true, &cancel),
         ] {
-            let task = app.update(Message::KeyEvent {
-                event: press(keyboard::key::Named::Tab, backwards),
-                captured: true,
-            });
-            assert_eq!(
-                focused_element(cosmic::Application::dialog(&app).unwrap(), task),
-                Some(widget::Id::new(target))
+            let (focused, captured) = dialog_ui::tests::focus_after_key(
+                cosmic::Application::dialog(&app).unwrap(),
+                from.clone(),
+                press(keyboard::key::Named::Tab, backwards),
             );
+            assert_eq!(focused.as_ref(), Some(to));
+            assert!(captured);
         }
         let task = app.update(Message::KeyEvent {
             event: press(keyboard::key::Named::Escape, false),
@@ -26835,7 +26511,9 @@ mod tests {
         };
         drop(app.update(key(keyboard::key::Named::End)));
         assert_eq!(app.workspace_history.cycle_index(), Some(19));
-        assert!(app.chrome_ui.workspace_switcher_scroll > WORKSPACE_SWITCHER_LIST_HEIGHT);
+        assert!(app.workspace_switcher_shows_row(19));
+        assert!(app.workspace_switcher_row_clear_of_fades(19));
+        assert!(!app.workspace_switcher_shows_row(0));
         drop(app.update(key(keyboard::key::Named::Home)));
         assert_eq!(app.workspace_history.cycle_index(), Some(0));
         assert_eq!(app.chrome_ui.workspace_switcher_scroll, 0.0);
@@ -26845,6 +26523,7 @@ mod tests {
         }));
         assert_eq!(app.workspace_history.cycle_index(), Some(15));
         assert!(app.chrome_ui.workspace_switcher_scroll > 0.0);
+        assert!(app.workspace_switcher_row_clear_of_fades(15));
         let current_scope = app.active_workspace_destination().unwrap();
         let saved_during_preview = app.persistent_workspace();
         assert_eq!(
@@ -26859,7 +26538,7 @@ mod tests {
             crate::workspace::FocusDirection::Right,
             keyboard::Modifiers::ALT,
         ));
-        assert_eq!(app.chrome_ui.workspace_switcher_rows[15].title, "Folder 15");
+        assert_eq!(app.chrome_ui.workspace_switcher_rows[15].name, "Folder 15");
         app.cancel_workspace_preview();
         drop(app.cycle_workspace(
             crate::workspace::FocusDirection::Right,
@@ -26941,6 +26620,68 @@ mod tests {
             Some(Path::new("/folder-0"))
         );
         assert!(app.durable.cards.is_empty());
+    }
+
+    /// Stepping moves only the switcher's selection; the preview follows it
+    /// once it rests, and a quick run of steps arms a single timer.
+    #[test]
+    fn workspace_switcher_steps_leave_the_workspace_and_rest_before_previewing() {
+        let mut app = workspace_switcher_test_app(4);
+        let alt = keyboard::Modifiers::ALT;
+        drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(Message::WorkspaceSwitcherDue(since)));
+        let first = app.workspace_switcher_selection();
+        assert_eq!(app.chrome_ui.workspace_switcher_rested, first);
+        drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+        let moved = app.chrome_ui.workspace_switcher_moved.unwrap();
+        drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+        // The second step reuses the timer the first armed.
+        assert!(app.chrome_ui.workspace_switcher_moved.unwrap() >= moved);
+        assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+        // A timer that fires before the dwell has passed waits out the rest.
+        drop(app.update(Message::WorkspaceSwitcherRested(Some(since))));
+        assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
+        app.chrome_ui.workspace_switcher_moved = Some(Instant::now() - Duration::from_secs(1));
+        drop(app.update(Message::WorkspaceSwitcherRested(Some(since))));
+        assert_eq!(
+            app.chrome_ui.workspace_switcher_rested,
+            app.workspace_switcher_selection()
+        );
+        // Clicking the scrim cancels, and nothing is left brought up.
+        drop(app.update(Message::WorkspaceSwitcherDismissed(since)));
+        assert!(app.chrome_ui.workspace_preview.is_none());
+        assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
+        assert_eq!(app.chrome_ui.workspace_switcher_preview, None);
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+    }
+
+    /// The switcher dates a quiet row from when its workspace was last open,
+    /// and the dates survive a restart with the history they belong to.
+    #[test]
+    fn workspace_visits_follow_navigation_and_are_saved_with_the_history() {
+        let mut app = workspace_switcher_test_app(2);
+        let first = app.active_workspace_destination().unwrap();
+        app.capture_workspace_history();
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::empty(),
+        ));
+        let second = app.active_workspace_destination().unwrap();
+        assert_ne!(first, second);
+        app.capture_workspace_history();
+        assert!(app.workspace_visits.contains_key(&first));
+        assert!(app.workspace_visits.contains_key(&second));
+        let saved = app.persistent_workspace();
+        let destinations: Vec<_> = saved.workspace_visits.iter().map(|(d, _)| *d).collect();
+        assert!(destinations.contains(&first) && destinations.contains(&second));
     }
 
     #[test]
@@ -30765,7 +30506,10 @@ mod tests {
             .sidebar_worktree_overrides
             .insert(project, settings::SidebarWorktrees::Expanded);
         settings::save(&path, &external).unwrap();
-        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        drop(app.update(Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: external,
+        }));
         assert_eq!(
             app.sidebar_state.worktree_display(project),
             settings::SidebarWorktrees::Expanded
@@ -30775,6 +30519,43 @@ mod tests {
         let saved = settings::load(&path).unwrap();
         assert_eq!(saved.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
         assert!(!saved.sidebar_worktree_overrides.contains_key(&project));
+    }
+
+    #[test]
+    fn another_windows_skipped_question_is_adopted_and_its_reenable_survives_a_save() {
+        use settings::Confirmation::{CloseActiveTerminal, StopWorkingChat};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.save_settings_now().unwrap();
+        // Another window stops asking both questions.
+        let mut external = settings::load(&path).unwrap();
+        external.set_asks(StopWorkingChat, false);
+        external.set_asks(CloseActiveTerminal, false);
+        settings::save(&path, &external).unwrap();
+        drop(app.update(Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: external,
+        }));
+        for question in [StopWorkingChat, CloseActiveTerminal] {
+            assert!(!app.asks(question), "{question:?} is adopted");
+            assert_eq!(
+                app.settings_draft.confirmations.get(&question),
+                Some(&false),
+                "Settings shows {question:?} off"
+            );
+        }
+        // This window turns one back on; the other's choice is kept.
+        let enable = app.update(Message::SettingsChanged {
+            field: SettingsField::Confirm(StopWorkingChat),
+            value: "true".into(),
+        });
+        settle_settings_task(&mut app, enable);
+        let saved = settings::load(&path).unwrap();
+        assert!(saved.asks(StopWorkingChat));
+        assert!(!saved.asks(CloseActiveTerminal));
     }
 
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
@@ -30824,6 +30605,7 @@ mod tests {
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
             navigation_save_generation: 0,
+            released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -30935,7 +30717,7 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
-            settings_reset_focus_confirm: false,
+            dont_ask_again: BTreeSet::new(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
@@ -30971,6 +30753,8 @@ mod tests {
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
             workspace_history: crate::tab_history::TabHistory::default(),
+            workspace_visits: HashMap::new(),
+            workspace_visited: None,
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
@@ -31242,10 +31026,13 @@ mod tests {
             .contains(&row)
     }
 
-    /// Gives the project holding `channel` a worktree and shows its row so
-    /// attention retention is exercised independently of group disclosure.
+    /// Moves `card` out of `channel` onto a new worktree of the channel's
+    /// project, as an unchanneled pane scoped to it, and shows worktree rows
+    /// so attention retention is exercised independently of group
+    /// disclosure. A channel's own panes never count on a worktree row.
     fn add_attention_worktree(
         app: &mut Cagents,
+        card: CardId,
         channel: crate::model::ChannelId,
     ) -> sidebar::SelectionRow {
         let project = app
@@ -31256,6 +31043,7 @@ mod tests {
             .unwrap()
             .project_id;
         let worktree = crate::model::WorktreeId::new();
+        let path = PathBuf::from("/repo/feature");
         app.sidebar_model
             .projects
             .iter_mut()
@@ -31264,9 +31052,17 @@ mod tests {
             .worktrees
             .push(sidebar::SidebarWorktree::from_durable(
                 worktree,
-                "/repo/feature".into(),
+                path.clone(),
                 Some("feature".into()),
             ));
+        let durable = Arc::make_mut(&mut app.durable);
+        for entry in &mut durable.channels {
+            entry.cards.retain(|known| *known != card);
+            if entry.focused == Some(card) {
+                entry.focused = None;
+            }
+        }
+        durable.card_scopes.insert(card, path);
         app.sidebar_state
             .set_sidebar_worktrees(settings::SidebarWorktrees::Expanded);
         sidebar::SelectionRow::Worktree(project, worktree)
@@ -31277,22 +31073,16 @@ mod tests {
     #[test]
     fn attention_forgets_kept_rows_once_their_surface_is_gone() {
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
-        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
-            unreachable!()
-        };
         let channel_row = sidebar::SelectionRow::Channel(channel);
-        app.sidebar_state
-            .observe_agent_update(card, project, worktree);
+        app.sidebar_state.observe_card_update(card);
         app.refresh_sidebar_channels();
-        assert!(attention_lists(&app, channel_row) && attention_lists(&app, worktree_row));
+        assert!(attention_lists(&app, channel_row));
         drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(
-            attention_lists(&app, channel_row) && attention_lists(&app, worktree_row),
-            "both rows are kept"
+            attention_lists(&app, channel_row),
+            "the channel row is kept"
         );
-
         let saved_channel = app
             .durable
             .channels
@@ -31300,6 +31090,35 @@ mod tests {
             .find(|entry| entry.id == channel)
             .unwrap()
             .clone();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|entry| entry.id != channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        assert!(
+            !attention_lists(&app, channel_row),
+            "a channel created again is not drawn as read"
+        );
+
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, worktree_row));
+        app.read_card_update(card);
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists(&app, worktree_row),
+            "the worktree row is kept"
+        );
         let saved_worktree = {
             let entry = app
                 .sidebar_model
@@ -31314,14 +31133,9 @@ mod tests {
                 .unwrap();
             entry.worktrees.remove(index)
         };
-        Arc::make_mut(&mut app.durable)
-            .channels
-            .retain(|entry| entry.id != channel);
         drop(app.update(Message::Sidebar(
             SidebarAction::SearchChanged(String::new()),
         )));
-
-        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
         app.sidebar_model
             .projects
             .iter_mut()
@@ -31333,10 +31147,6 @@ mod tests {
             SidebarAction::SearchChanged(String::new()),
         )));
         assert!(
-            !attention_lists(&app, channel_row),
-            "a channel created again is not drawn as read"
-        );
-        assert!(
             !attention_lists(&app, worktree_row),
             "a worktree created again is not drawn as read"
         );
@@ -31347,7 +31157,7 @@ mod tests {
     #[test]
     fn attention_does_not_keep_the_row_of_a_closed_unread_pane() {
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
         let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
             unreachable!()
         };
@@ -31370,7 +31180,7 @@ mod tests {
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
 
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
         let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
             unreachable!()
         };
@@ -31414,11 +31224,12 @@ mod tests {
             Some("Expand Worktrees (1), 1 unread conversation")
         );
 
-        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        app.read_card_update(card);
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(attention_lists_channel(&app, channel));
         assert!(!attention_lists(&app, worktree_row));
-        assert_eq!(group_name(&app).as_deref(), Some("Expand Worktrees (1)"));
+        // Nothing in the project needs the user any more, and no row of it
+        // was listed to be kept, so the group leaves the list with its news.
+        assert_eq!(group_name(&app).as_deref(), None);
     }
 
     fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {
@@ -32791,6 +32602,173 @@ mod tests {
         };
         assert_eq!(updated.terminal_font_size, 16.0);
         assert_eq!(updated.sidebar_width, settings.sidebar_width);
+    }
+
+    #[test]
+    fn account_usage_display_edits_apply_to_settings_and_draft() {
+        let settings = AppSettings::default();
+        let field = SettingsField::AccountUsageDisplay;
+        assert_eq!(field.category(), SettingsCategory::Accounts);
+        assert_eq!(
+            settings_update(&settings, field, "left"),
+            SettingsDecision::Unchanged
+        );
+        let SettingsDecision::Persist(updated) = settings_update(&settings, field, "used") else {
+            panic!("changing account usage display must request persistence");
+        };
+        assert_eq!(
+            updated.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+        let mut draft = SettingsDraft::from_settings(&settings);
+        draft.set(field, "used".into());
+        assert_eq!(draft, SettingsDraft::from_settings(&updated));
+        assert!(matches!(
+            settings_update(&updated, field, "unknown"),
+            SettingsDecision::Invalid(_)
+        ));
+        draft.set(field, "unknown".into());
+        assert_eq!(draft, SettingsDraft::from_settings(&updated));
+    }
+
+    #[test]
+    fn shared_preferences_read_before_a_local_save_cannot_revert_it_after_acknowledgment() {
+        use settings::AccountUsageDisplay::{Left, Used};
+        use settings::SidebarWorktrees::{Expanded, Grouped, Hidden};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let stale = Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        };
+        let project = ProjectId::new();
+        app.settings
+            .sidebar_worktree_overrides
+            .insert(project, Expanded);
+        drop(app.update(Message::SettingsChanged {
+            field: SettingsField::SidebarWorktrees,
+            value: "hidden".into(),
+        }));
+        let task = app.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "used".into(),
+        });
+        settle_settings_task(&mut app, task);
+        assert_eq!(app.settings_save_generation, app.settings_ack_generation);
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Used);
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+
+        // Deliver the old watcher output after the successful save. Neither
+        // visible settings nor any baseline used by a later save may regress.
+        drop(app.update(stale));
+        assert_eq!(app.settings.account_usage_display, Used);
+        assert_eq!(app.settings_draft.account_usage_display, Used);
+        assert_eq!(app.settings_draft.sidebar_worktrees, Hidden);
+        for settings in [&app.settings, &app.settings_base] {
+            assert_eq!(settings.account_usage_display, Used);
+            assert_eq!(settings.sidebar_worktrees, Hidden);
+            assert_eq!(
+                settings.sidebar_worktree_overrides.get(&project),
+                Some(&Expanded)
+            );
+        }
+        {
+            let lane = app.settings_save_lane.lock().unwrap();
+            let baseline = &lane.as_ref().unwrap().settings;
+            assert_eq!(baseline.account_usage_display, Used);
+            assert_eq!(baseline.sidebar_worktrees, Hidden);
+            assert_eq!(
+                baseline.sidebar_worktree_overrides.get(&project),
+                Some(&Expanded)
+            );
+        }
+        assert_eq!(app.sidebar_state.worktree_display(project), Expanded);
+        assert_eq!(app.sidebar_state.worktree_display(ProjectId::new()), Hidden);
+
+        // The next click back to Left must persist a change, rather than look
+        // unchanged because the stale observation already changed local state.
+        let task = app.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "left".into(),
+        });
+        settle_settings_task(&mut app, task);
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Left);
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+
+        // A current-generation external observation is still accepted.
+        let mut external = saved;
+        external.sidebar_worktrees = Grouped;
+        external.account_usage_display = Used;
+        drop(app.update(Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: external,
+        }));
+        assert_eq!(app.settings.account_usage_display, Used);
+        assert_eq!(app.settings_draft.sidebar_worktrees, Grouped);
+    }
+
+    #[test]
+    fn account_usage_display_syncs_between_windows_and_keeps_local_edits_until_saved() {
+        use settings::AccountUsageDisplay::{Left, Used};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut first = context_inspector_test_app(false);
+        let mut second = context_inspector_test_app(false);
+        for app in [&mut first, &mut second] {
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+        }
+        let task = first.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "used".into(),
+        });
+        settle_settings_task(&mut first, task);
+        let observed = settings::load(&path).unwrap();
+        assert_eq!(observed.account_usage_display, Used);
+        drop(second.update(Message::SharedPreferencesObserved {
+            generation: second.settings_ack_generation,
+            settings: observed,
+        }));
+        assert_eq!(second.settings.account_usage_display, Used);
+        assert_eq!(second.settings_draft.account_usage_display, Used);
+        assert_eq!(second.settings_base.account_usage_display, Used);
+
+        // A later unrelated save must retain the observed preference, including
+        // the baseline cached in this window's save lane.
+        let task = second.update(Message::SettingsChanged {
+            field: SettingsField::TerminalFontSize,
+            value: "18".into(),
+        });
+        settle_settings_task(&mut second, task);
+        assert_eq!(settings::load(&path).unwrap().account_usage_display, Used);
+        let task = second.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "left".into(),
+        });
+        drop(second.update(Message::SharedPreferencesObserved {
+            generation: second.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        }));
+        assert_eq!(second.settings.account_usage_display, Left);
+        assert_eq!(second.settings_draft.account_usage_display, Left);
+        settle_settings_task(&mut second, task);
+        drop(first.update(Message::SharedPreferencesObserved {
+            generation: first.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        }));
+        assert_eq!(first.settings.account_usage_display, Left);
+        assert_eq!(first.settings_draft.account_usage_display, Left);
+        assert_eq!(first.settings_base.account_usage_display, Left);
+        first.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Left);
+        assert_eq!(saved.terminal_font_size, 18.0);
     }
 
     #[test]

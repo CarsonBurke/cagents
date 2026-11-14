@@ -1,9 +1,5 @@
 //! Literal non-Markdown readers use the existing admitted preparation boundary.
 use super::*;
-use iced::advanced::{
-    Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
-    widget::{Operation, Tree, tree},
-};
 
 pub(super) struct NoticeData {
     pub(super) summary: markdown::Text,
@@ -19,39 +15,36 @@ pub(super) enum Prepared {
 }
 /// A notice's heading and body as they are shown.
 ///
-/// A heading is one line saying what the notice is about. Claude Code names a
-/// command it was given no description for by the command itself, so a heredoc
-/// arrives as a heading thousands of lines long. Such a heading keeps only its
-/// first line and the rest leads the body, which shows a few lines until the
-/// reader opens it. A first line too long for a heading is cut, and then the
-/// body leads with the whole of it, so nothing is shown only in part.
+/// Headings retain their complete first line for the shared overflow fade.
+/// Additional lines belong to the literal detail, without repeating the heading
+/// or an identical body. Provider protocol adapters supply meaningful headings
+/// for commands; generic notices still preserve all their original text.
 pub(super) fn notice_parts<'a>(
     summary: &'a str,
     body: &'a str,
 ) -> (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>) {
     let summary = summary.trim();
+    let summary = summary
+        .strip_prefix("Monitor event: ")
+        .map(|description| {
+            description
+                .strip_prefix('"')
+                .and_then(|description| description.strip_suffix('"'))
+                .unwrap_or(description)
+        })
+        .unwrap_or(summary);
     let (first, rest) = summary
         .split_once(['\r', '\n'])
         .map_or((summary, ""), |(first, rest)| {
             (first.trim_end(), rest.trim_start_matches(['\r', '\n']))
         });
-    let fits = first.chars().nth(view::NOTICE_HEADING_CHARS).is_none();
-    if fits && rest.is_empty() {
-        return (summary.into(), body.into());
+    let body = if body.trim() == summary { "" } else { body };
+    match (rest.is_empty(), body.is_empty()) {
+        (true, _) => (first.into(), body.into()),
+        (false, true) => (first.into(), rest.into()),
+        (false, false) if rest == body.trim() => (first.into(), body.into()),
+        (false, false) => (first.into(), format!("{rest}\n\n{body}").into()),
     }
-    let (heading, lead) = if fits {
-        (first.to_owned(), rest)
-    } else {
-        let mut heading: String = first.chars().take(view::NOTICE_HEADING_CHARS).collect();
-        heading.push('…');
-        (heading, summary)
-    };
-    let full = if body.is_empty() {
-        lead.to_owned()
-    } else {
-        format!("{lead}\n\n{body}")
-    };
-    (heading.into(), full.into())
 }
 pub(super) struct Notice(Option<Box<NoticeData>>);
 impl Notice {
@@ -445,125 +438,5 @@ pub(super) fn notice_body(
         .into()
     } else {
         body
-    }
-}
-pub(super) fn notice_summary(
-    runtime: &Runtime,
-    item: &chat::Item,
-    cached: &CachedItem,
-    mut settings: markdown::Settings,
-) -> Element<'static, Message> {
-    let Some(notice) = runtime.prepared_literal(item).and_then(Content::notice) else {
-        return design::caption("Loading notice…").into();
-    };
-    settings.text_size = design::TEXT_CAPTION.into();
-    settings.style.font = iced::Font::default();
-    let body = prose::paragraph(
-        settings,
-        &notice.summary,
-        runtime.target,
-        None,
-        Some(selectable_prose::Logical {
-            identity: selection::logical_identity(&item.id, &[9]),
-            start: 0,
-        }),
-        Some(&cached.flow_cache),
-    );
-    Element::new(DisplayOnly(body))
-}
-/// Notice headings retain their previous nonselectable caption semantics.
-/// Redraw still reaches Flow admission; no anonymous selection endpoint leaks
-/// into the body-only transcript Catalog.
-struct DisplayOnly(Element<'static, Message>);
-impl Widget<Message, cosmic::Theme, cosmic::Renderer> for DisplayOnly {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<Self>()
-    }
-    fn state(&self) -> tree::State {
-        tree::State::None
-    }
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.0)]
-    }
-    fn diff(&mut self, tree: &mut Tree) {
-        tree.children[0].diff(&mut self.0);
-    }
-    fn size(&self) -> iced::Size<Length> {
-        self.0.as_widget().size()
-    }
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &cosmic::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.0
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut cosmic::Renderer,
-        theme: &cosmic::Theme,
-        defaults: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &iced::Rectangle,
-    ) {
-        self.0.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            defaults,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-    fn a11y_nodes(
-        &self,
-        layout: Layout<'_>,
-        tree: &Tree,
-        cursor: mouse::Cursor,
-    ) -> iced_accessibility::A11yTree {
-        self.0
-            .as_widget()
-            .a11y_nodes(layout, &tree.children[0], cursor)
-    }
-    fn operate(
-        &mut self,
-        _: &mut Tree,
-        _: Layout<'_>,
-        _: &cosmic::Renderer,
-        _: &mut dyn Operation,
-    ) {
-    }
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &iced::Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &cosmic::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-        viewport: &iced::Rectangle,
-    ) {
-        if matches!(
-            event,
-            iced::Event::Window(iced::window::Event::RedrawRequested(_))
-        ) {
-            self.0.as_widget_mut().update(
-                &mut tree.children[0],
-                event,
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-            );
-        }
     }
 }

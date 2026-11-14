@@ -746,19 +746,10 @@ pub(crate) fn fresh_environment_key(
     value: &str,
     persistable: bool,
 ) -> bool {
-    if [
-        "PI_TOOL_BRIDGE_",
-        "PI_EVAL_",
-        "PI_SESSION_",
-        "PI_AGENT_",
-        "OMP_SESSION_",
-        "OMP_AGENT_",
-        "CAGENTS_",
-        "ORCA_",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-        || name == "PI_ARTIFACTS_DIR"
+    if crate::agent::is_session_variable(name)
+        || ["CAGENTS_", "ORCA_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     {
         return false;
     }
@@ -881,6 +872,11 @@ fn preserved_native_environment(
             .is_some_and(|previous| previous != value)
         {
             return Err("The source environment contains conflicting duplicate variables".into());
+        }
+        if crate::agent::is_session_variable(name) {
+            // The source's parent session, or one an older recipe recorded;
+            // never the converted conversation's own.
+            continue;
         }
         if native_runtime_environment_key(name) {
             environment.insert(name.to_owned(), value.to_owned());
@@ -1041,7 +1037,12 @@ fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<Fo
     let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
     let working_directory = fs::read_link(root.join("cwd")).ok()?;
     let environ = bounded_read(root.join("environ"), 128 * 1024);
-    let mut inherited = request.hint.map(|base| base.environment.clone());
+    // A recipe saved before parent sessions were withheld may still name one.
+    let mut inherited = request.hint.map(|base| {
+        let mut environment = base.environment.clone();
+        environment.retain(|name, _| !crate::agent::is_session_variable(name));
+        environment
+    });
     // Recovery retains its existing fallback. Activity requires the actual
     // allowlisted environment: missing keys must not inherit terminal
     // overrides, and an argv that long is not an agent invocation.
@@ -1536,6 +1537,58 @@ mod tests {
         ] {
             assert!(sensitive_environment_key(key));
         }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_parent_session_is_neither_recorded_nor_carried_into_a_native_conversation() {
+        for provider in Provider::ALL {
+            for name in [
+                "CLAUDECODE",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                "CLAUDE_CODE_MESSAGING_TOKEN",
+                "CLAUDE_PID",
+                "CODEX_THREAD_ID",
+                "CODEX_ESCALATE_SOCKET",
+                "OMP_SESSION_ID",
+            ] {
+                for persistable in [false, true] {
+                    assert!(
+                        !fresh_environment_key(provider, name, "parent", persistable),
+                        "{provider:?} takes {name}"
+                    );
+                }
+            }
+        }
+        // The user's own Claude configuration still reaches Claude.
+        for name in ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION"] {
+            assert!(fresh_environment_key(
+                Provider::Claude,
+                name,
+                "/home/a",
+                true
+            ));
+        }
+        // A source started inside another session, under a recipe saved before
+        // sessions were withheld, converts without either of them.
+        let explicit = BTreeMap::from([(
+            "CLAUDE_CODE_MESSAGING_SOCKET".to_owned(),
+            "/run/parent.sock".to_owned(),
+        )]);
+        let environment = preserved_native_environment(
+            b"HOME=/source\0CLAUDECODE=1\0CLAUDE_CODE_MESSAGING_SOCKET=/run/parent.sock\0CLAUDE_CODE_MESSAGING_TOKEN=parent\0CLAUDE_CONFIG_DIR=/home/a/.claude\0",
+            Provider::Claude,
+            &explicit,
+        )
+        .unwrap();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("CLAUDE_CONFIG_DIR".to_owned(), "/home/a/.claude".to_owned()),
+                ("HOME".to_owned(), "/source".to_owned()),
+            ])
+        );
     }
 
     #[cfg(feature = "host")]

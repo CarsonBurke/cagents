@@ -933,7 +933,7 @@ impl Cagents {
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {
         let (card, text) = self.terminal_paste.as_ref()?;
         let card = *card;
-        Some(dialog_ui::overlay(dialog_ui::surface(widget::column::with_children(vec![
+        Some(dialog_ui::overlay(dialog_ui::confirmation_surface(widget::column::with_children(vec![
             crate::design::title("Paste multiple lines?").into(),
             notice_body("This program does not use bracketed paste. Each newline may run a command immediately."),
             widget::text(format!("{} lines · {} characters", text.lines().count(), text.chars().count())).into(),

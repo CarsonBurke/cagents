@@ -25,7 +25,8 @@ loader.exec_module(hot)
 
 class HotRunner(unittest.TestCase):
     @contextmanager
-    def orchestration(self, arguments, *, failed_build=None, failed_metadata=False, missing_artifact=None):
+    def orchestration(self, arguments, *, failed_build=None, failed_metadata=False, missing_artifact=None,
+                      artifact_mode=None):
         fixtures = source.parents[1] / ".worktrees"
         fixtures.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="hot-run-test-", dir=fixtures) as directory, ExitStack() as stack:
@@ -36,12 +37,27 @@ class HotRunner(unittest.TestCase):
             def build(command, **kwargs):
                 calls.append(("build", command))
                 name = command[command.index("--bin") + 1]
+                product = root / "products" / name
+                product.parent.mkdir(exist_ok=True)
+                product.write_text("#!/bin/sh\nexit 0\n")
+                product.chmod(0o700)
+                message = {"reason": "compiler-artifact", "target": {"name": name, "kind": ["bin"]},
+                           "executable": str(product)}
+                messages = [message]
+                if artifact_mode == "non-bin":
+                    message["target"]["kind"] = ["lib"]
+                elif artifact_mode == "relative":
+                    message["executable"] = "relative/" + name
+                elif artifact_mode == "not-executable":
+                    product.chmod(0o600)
+                elif artifact_mode in ("ambiguous", "repeated"):
+                    other = product.with_name("another-" + name)
+                    other.write_bytes(product.read_bytes())
+                    other.chmod(0o700)
+                    messages.append(message | {"executable": str(other if artifact_mode == "ambiguous" else product)})
                 child = mock.MagicMock()
                 child.__enter__.return_value = child
-                child.stdout = [] if name == missing_artifact else [json.dumps({
-                    "reason": "compiler-artifact", "target": {"name": name},
-                    "executable": str(root / "products" / name),
-                }) + "\n"]
+                child.stdout = [] if name == missing_artifact else [json.dumps(value) + "\n" for value in messages]
                 child.wait.return_value = int(name == failed_build)
                 return child
 
@@ -131,7 +147,7 @@ class HotRunner(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as failure:
                     hot.main()
                 self.assertEqual(str(failure.exception),
-                                 f"Locked {missing} build failed; development daemon was not stopped")
+                                 f"Cargo did not report exactly one executable for {missing} (found 0)")
                 state.prerequisites.assert_called_once_with()
                 names = ["cagents"] if missing == "cagents" else ["cagents", "cagentsd"]
                 self.assertEqual([call[0] for call in state.calls], ["build"] * len(names))
@@ -148,6 +164,22 @@ class HotRunner(unittest.TestCase):
                 state.execute.assert_not_called()
                 state.run.assert_not_called()
                 self.assertFalse(state.target.exists())
+
+    def test_invalid_companions_never_stage_or_launch(self):
+        for mode in ("ambiguous", "non-bin", "relative", "not-executable"):
+            with self.subTest(mode=mode), self.orchestration(["--fresh-daemon"], artifact_mode=mode) as state:
+                with self.assertRaises(RuntimeError):
+                    hot.main()
+                state.stage.assert_not_called()
+                state.execute.assert_not_called()
+                state.run.assert_not_called()
+                self.assertFalse(state.target.exists())
+
+    def test_repeated_companion_reports_can_launch(self):
+        with self.orchestration([], artifact_mode="repeated") as state:
+            hot.main()
+            self.assertEqual(state.stage.call_count, 2)
+            state.execute.assert_called_once()
 
     def test_fresh_daemon_and_ui_arguments_are_forwarded_only_to_hot_launch(self):
         arguments = ["--device", "device with spaces", "--new-window", "--log-file", "ui.log"]

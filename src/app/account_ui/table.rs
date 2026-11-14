@@ -1,5 +1,5 @@
 //! The Accounts pane: every account as one row of a table grouped by
-//! provider, with what each has left in every window, and the controls to
+//! provider, with each window’s usage figure, and the controls to
 //! add, choose, rename and remove accounts.
 //!
 //! The table follows the card's width rather than the window's: a column
@@ -736,17 +736,19 @@ fn row<'a>(
                 Column::Session => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Session)),
                     now,
-                    stale,
+                    account,
+                    app.settings.account_usage_display,
                 ),
                 Column::Weekly => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Weekly)),
                     now,
-                    stale,
+                    account,
+                    app.settings.account_usage_display,
                 ),
                 Column::Model => {
                     let window = snapshot
                         .and_then(|snapshot| window_of(snapshot, account::WindowKind::Scoped));
-                    let cell = usage_cell(window, now, stale);
+                    let cell = usage_cell(window, now, account, app.settings.account_usage_display);
                     match window {
                         Some(window) => crate::interaction::tooltip(cell, window.label.clone()),
                         None => cell,
@@ -986,20 +988,22 @@ fn account_cell<'a>(
     .into()
 }
 
-/// A usage window as a table cell: what is left, when it resets, and a bar
+/// A usage window as a table cell: its usage figure, reset time, and a bar
 /// in the tone of how close the window is to its end.
-fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Element<'a, Message> {
+fn usage_cell<'a>(
+    window: Option<&UsageWindow>,
+    now: Millis,
+    account: &AccountState,
+    mode: AccountUsageDisplay,
+) -> Element<'a, Message> {
     let Some(window) = window else {
         return dash();
     };
-    let tone = if stale {
-        design::Tone::Themed(design::muted_color)
-    } else {
-        design::Tone::Themed(design::budget_tone(window.used))
-    };
+    let figure = usage_figure(window.used, mode);
+    let tone = account.usage_tone(window, now);
     let mut figures: Vec<Element<'a, Message>> = vec![
-        design::caption(format!("{}% left", percent_left(window.used)))
-            .class(cosmic::theme::Text::Default)
+        design::caption(figure.text)
+            .class(tone.text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .into(),
         iced::widget::Space::new().width(Length::Fill).into(),
@@ -1015,7 +1019,7 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
         widget::row::with_children(figures)
             .spacing(space::XS)
             .into(),
-        crate::ui_controls::budget_bar(window.left(), tone),
+        crate::ui_controls::budget_bar(figure.fraction, tone.bar_tone()),
     ])
     .spacing(space::XS)
     .width(Length::Fill)
@@ -1758,6 +1762,19 @@ mod tests {
             },
         );
         let widths = [1_400.0, 1_100.0, 520.0, 360.0];
+        for mode in AccountUsageDisplay::ALL {
+            app.settings.account_usage_display = mode;
+            for width in widths {
+                let (texts, _, _) = measure(&app, &id, width);
+                let (expected, opposite) = match mode {
+                    AccountUsageDisplay::Left => ("60% left", "40% used"),
+                    AccountUsageDisplay::Used => ("40% used", "60% left"),
+                };
+                assert!(texts.iter().any(|(text, _)| text == expected));
+                assert!(!texts.iter().any(|(text, _)| text == opposite));
+            }
+        }
+        app.settings.account_usage_display = AccountUsageDisplay::Left;
         let healthy = widths.map(|width| measure(&app, &id, width));
         assert!(healthy[0].0.iter().any(|(text, _)| text == "Available"));
         assert!(healthy.iter().all(|(texts, _, _)| {

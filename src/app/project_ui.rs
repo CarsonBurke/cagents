@@ -1958,7 +1958,7 @@ impl Cagents {
                     if removal.channels == 1 { "" } else { "s" }
                 )
             };
-            return Some(super::dialog_ui::surface(
+            return Some(super::dialog_ui::confirmation_surface(
                 widget::column::with_children(vec![
                     design::title("Remove project from cagents?").into(),
                     super::notice_body(&removal.name),
@@ -2021,7 +2021,7 @@ impl Cagents {
             .id(widget::Id::new("dialog.project.confirm"))
             .on_press_maybe(confirm),
         ));
-        Some(super::dialog_ui::surface(
+        Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))

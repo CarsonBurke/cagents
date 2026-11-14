@@ -2,6 +2,7 @@
 //! delegation records. Reading confers no authority over any listed session.
 
 use super::{SharedHost, caller, registry};
+use crate::workspace_model::views::Scope as ViewScope;
 use crate::{
     account::{UsageStatus, UsageWindow, info::RemainingWindow},
     agent::{ActivityState, Provider},
@@ -16,7 +17,7 @@ use crate::{
     project_location::{Placement, place},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -51,6 +52,9 @@ pub(super) struct Listing {
     pub(super) sessions: Vec<Member>,
     /// What was served: a directory widened to `All`, or the caller's channel.
     pub(super) served: Wanted,
+    /// The launch of each listed chat that only a saved pane holds, which
+    /// locates its provider history.
+    pub(super) saved: HashMap<TerminalId, crate::chat::Launch>,
 }
 
 impl Listing {
@@ -110,7 +114,8 @@ pub(super) fn channel(
     // channel's work needs first; it costs a file lookup per session, so only
     // the small channel listing pays for it.
     for member in listing.caller.iter_mut().chain(&mut listing.sessions) {
-        member.active_at = super::transcript::source(host, member.session.id, false)
+        let saved = listing.saved.get(&member.session.id);
+        member.active_at = super::transcript::source(host, member.session.id, false, saved)
             .ok()
             .and_then(|source| source.modified());
     }
@@ -142,6 +147,7 @@ pub(super) fn list(
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
     let mut live = live_sessions(host);
+    let mut saved = HashMap::new();
     if members {
         live.extend(exited_chats(host));
     }
@@ -149,6 +155,17 @@ pub(super) fn list(
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
+        if members {
+            // A named channel's listing needs only that channel's panes.
+            let only = match &wanted {
+                Wanted::Channel(Some(channel)) => Some(ViewScope::Channel(*channel)),
+                _ => None,
+            };
+            for (entry, launch) in saved_chats(&model, only.as_ref(), &live) {
+                saved.insert(entry.id, launch);
+                live.push(entry);
+            }
+        }
         let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
         let mut delegations = BTreeMap::new();
         // Only a live session's delegation is listed, so only its latest run
@@ -400,10 +417,17 @@ pub(super) fn list(
             entry.title.clone(),
         )
     });
+    let listed = me
+        .iter()
+        .chain(&sessions)
+        .map(|member| member.session.id)
+        .collect::<HashSet<_>>();
+    saved.retain(|id, _| listed.contains(id));
     Ok(Listing {
         caller: me,
         sessions,
         served,
+        saved,
     })
 }
 
@@ -501,6 +525,48 @@ fn exited_chats(host: &SharedHost) -> Vec<Live> {
             chat: Some(record.handle.clone()),
         })
         .collect()
+}
+
+/// Chats a pane still shows that this daemon is not hosting, such as one
+/// saved before a restart that no window has reopened yet, with the launch
+/// that locates each one's history. Its provider is not running, but its
+/// conversation is still a member of its view and stays readable. With
+/// `only`, just that view's panes are read.
+fn saved_chats(
+    model: &crate::workspace_model::WorkspaceModel,
+    only: Option<&ViewScope>,
+    hosted: &[Live],
+) -> Vec<(Live, crate::chat::Launch)> {
+    let hosted = hosted.iter().map(|live| live.id).collect::<HashSet<_>>();
+    let mut saved: BTreeMap<TerminalId, (Live, crate::chat::Launch)> = BTreeMap::new();
+    let views = model
+        .views
+        .iter()
+        .filter(|view| only.is_none_or(|scope| view.scope == *scope));
+    for pane in views.flat_map(|view| &view.panes) {
+        let crate::model::CardKind::Chat(session) = &pane.kind else {
+            continue;
+        };
+        if session.is_unstarted() || hosted.contains(&session.id) {
+            continue;
+        }
+        saved.entry(session.id).or_insert_with(|| {
+            let live = Live {
+                id: session.id,
+                surface: Surface::Chat,
+                provider: Some(session.launch.provider),
+                title: Some(pane.user_title.as_ref().unwrap_or(&pane.title).clone())
+                    .filter(|title| !title.is_empty()),
+                state: ActivityState::Idle,
+                directory: session.launch.recipe.working_directory.clone(),
+                exited: true,
+                failure: None,
+                chat: None,
+            };
+            (live, session.launch.clone())
+        });
+    }
+    saved.into_values().collect()
 }
 
 /// The usage limit that stops a conversation now: the one its provider last

@@ -28,6 +28,8 @@ class ReleaseHostHelper(unittest.TestCase):
             (fixture / "tools").mkdir()
             shutil.copyfile(ROOT / "scripts/build-ceditor-product",
                             fixture / "scripts/build-ceditor-product")
+            shutil.copyfile(ROOT / "scripts/cargo_artifacts.py",
+                            fixture / "scripts/cargo_artifacts.py")
             helper = fixture / "reported target with spaces" / "cagentsd"
             helper.parent.mkdir()
             helper.write_text("#!/bin/sh\nexit 97\n")

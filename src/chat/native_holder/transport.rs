@@ -8,6 +8,7 @@ use crate::{
         protocol::{LaunchCleanup, LaunchOutcome, ProcessSpec, TransportSpec},
     },
     daemon::{
+        child_events::ChildEvents,
         holder_registry::{self as registry, Kind, Process, Record},
         owned_children::DetachedWork,
     },
@@ -107,15 +108,7 @@ impl Spawn {
         // The helper's signalfd owns SIGCHLD; its provider must receive the
         // usual unblocked child-exit signals after exec.
         unsafe {
-            command.pre_exec(|| {
-                let mut signals = std::mem::zeroed();
-                libc::sigemptyset(&mut signals);
-                libc::sigaddset(&mut signals, libc::SIGCHLD);
-                if libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            command.pre_exec(crate::daemon::child_events::unblock_sigchld_for_exec);
         }
         if let Some(fd) = self.directory_fd {
             // The dedicated holder keeps this validated directory alive. Only
@@ -415,7 +408,7 @@ impl Drop for Holder {
 
 pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
     std::hint::black_box(&SERVE);
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     if source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly {
         return Err(
             "A durable native source requires verified adoption, never another server launch"
@@ -1197,63 +1190,6 @@ impl Residence {
     }
 }
 
-/// SIGCHLD is blocked only in the dedicated holder. The provider's pre-exec
-/// hook restores the ordinary mask so its own child management is unaffected.
-struct ChildEvents {
-    fd: std::fs::File,
-    previous: libc::sigset_t,
-}
-
-impl ChildEvents {
-    fn new() -> io::Result<Self> {
-        // SAFETY: both signal sets are live writable objects. This runs before
-        // the holder starts any thread, so every later thread inherits the
-        // blocked mask, and this helper is the sole owner of child statuses.
-        unsafe {
-            let mut mask = std::mem::zeroed();
-            let mut previous = std::mem::zeroed();
-            libc::sigemptyset(&mut mask);
-            libc::sigaddset(&mut mask, libc::SIGCHLD);
-            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
-            if result != 0 {
-                return Err(io::Error::from_raw_os_error(result));
-            }
-            let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
-                return Err(error);
-            }
-            Ok(Self {
-                fd: std::fs::File::from_raw_fd(fd),
-                previous,
-            })
-        }
-    }
-
-    fn drain(&self) -> io::Result<()> {
-        let mut event = [0_u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-        loop {
-            match (&self.fd).read(&mut event) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Drop for ChildEvents {
-    fn drop(&mut self) {
-        // SAFETY: restore the mask on the same single holder thread.
-        unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
-        }
-    }
-}
-
 /// A child exit or control message is the only source of idle wakeups. Reap
 /// once before blocking as well, including orphans already pending at startup.
 fn wait_for_control(
@@ -1291,7 +1227,7 @@ fn wait_for_control_with_reaper(
                 revents: 0,
             },
             libc::pollfd {
-                fd: child_events.fd.as_raw_fd(),
+                fd: child_events.fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1650,15 +1586,7 @@ mod tests {
             // All libtest threads must inherit the blocked signal. Blocking
             // only this test thread would let the harness consume SIGCHLD.
             unsafe {
-                fixture.pre_exec(|| {
-                    let mut mask = std::mem::zeroed();
-                    libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, libc::SIGCHLD);
-                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                fixture.pre_exec(crate::daemon::child_events::block_sigchld_for_exec);
             }
             let output = fixture.output().unwrap();
             assert!(output.status.success(), "{output:?}");
@@ -1807,15 +1735,7 @@ mod tests {
             // Isolate subreaper/wait ownership and block SIGCHLD in every
             // libtest thread, as in the existing idle-reaper fixture.
             unsafe {
-                fixture.pre_exec(|| {
-                    let mut mask = std::mem::zeroed();
-                    libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, libc::SIGCHLD);
-                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                fixture.pre_exec(crate::daemon::child_events::block_sigchld_for_exec);
             }
             let output = fixture.output().unwrap();
             assert!(output.status.success(), "{output:?}");
@@ -1980,15 +1900,7 @@ exec /bin/sleep 60
                 ])
                 .env(STAGE, "1");
             unsafe {
-                fixture.pre_exec(|| {
-                    let mut mask = std::mem::zeroed();
-                    libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, libc::SIGCHLD);
-                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                fixture.pre_exec(crate::daemon::child_events::block_sigchld_for_exec);
             }
             let output = fixture.output().unwrap();
             assert!(output.status.success(), "{output:?}");

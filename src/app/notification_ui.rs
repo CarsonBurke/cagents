@@ -817,6 +817,9 @@ impl Cagents {
                 Task::batch([open, self.activate_main_window(None)])
             }
             Action::Snapshot(snapshot) => {
+                // Agents make automation requests, and a snapshot follows
+                // their turns ending.
+                self.automation_approval_activity();
                 self.notification_ui.snapshot_host = self.notification_ui.host.clone();
                 self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
@@ -2946,9 +2949,11 @@ mod tests {
                     "inventory alias order cannot determine managed activation identity"
                 );
                 assert_eq!(app.card_state(alias_id).unwrap().existence, alias_existence);
+                // Only an open pane's draft is saved; a retired alias keeps
+                // its card, and storage never held a draft for it.
                 assert_eq!(
                     app.durable.chat_drafts.get(&alias_id).map(String::as_str),
-                    Some("Preserved alias draft")
+                    alias_open.then_some("Preserved alias draft")
                 );
                 assert_eq!(app.durable.cards.len(), 2);
                 assert_eq!(app.workspace_model.agents[0], agent);

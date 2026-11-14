@@ -351,7 +351,9 @@ impl Verb {
             // An agent waiting on its own background work has not finished.
             ToolStatus::Running | ToolStatus::Waiting => self.doing,
             ToolStatus::Succeeded => self.done,
-            ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => self.tried,
+            ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped | ToolStatus::Ended => {
+                self.tried
+            }
         }
     }
 }

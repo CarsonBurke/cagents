@@ -29,6 +29,19 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     // Configurable titles do not provide an unconditional lifecycle grammar.
     activity_from_title: |_| None,
     identity_options: &["resume"],
+    // What Codex exports to the commands a session runs: its thread, its
+    // sandbox and the socket through which they ask it to escalate.
+    session_environment: |name| {
+        matches!(
+            name,
+            "CODEX_THREAD_ID"
+                | "CODEX_SESSION_ID"
+                | "CODEX_SANDBOX"
+                | "CODEX_SANDBOX_NETWORK_DISABLED"
+                | "CODEX_ESCALATE_SOCKET"
+                | "CODEX_CI"
+        )
+    },
     cwd_options: &["-C", "--cd"],
     value_options: &[
         "--model",

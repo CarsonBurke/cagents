@@ -44,6 +44,20 @@ pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(
 const TIP_GAP: f32 = space::XS;
 const TIP_MAX_WIDTH: f32 = 320.0;
 
+/// Reject accessibility requests whose native event identity disagrees with
+/// their declared target, before a control can act on only one of the two.
+pub fn a11y_target<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::A11yTarget,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
 /// Let a focused field answer Escape before its native blur handler runs.
 pub fn focused_escape<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -404,7 +418,7 @@ pub fn overflow_fade_x<'a, Message: 'a>(
     Element::new(OverflowFade {
         content: content.into(),
         axis: Axis::Horizontal,
-        fill: crate::design::base,
+        fill: Box::new(crate::design::base),
     })
 }
 
@@ -425,12 +439,57 @@ pub fn overflow_fade_x<'a, Message: 'a>(
 /// into; the scrollbar's rail at the trailing edge is left unfaded.
 pub fn overflow_fade_y<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
-    fill: fn(&Theme) -> cosmic::iced::Color,
+    fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
 ) -> Element<'a, Message> {
     Element::new(OverflowFade {
         content: content.into(),
         axis: Axis::Vertical,
-        fill,
+        fill: Box::new(fill),
+    })
+}
+
+/// Fade into the actual surface behind a strip, including an enclosing
+/// control's hover/focus paint. The surface is resolved at draw time.
+pub fn overflow_fade_x_on<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    surface: impl Fn(&Theme) -> Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(OverflowFade {
+        content: content.into(),
+        axis: Axis::Horizontal,
+        fill: Box::new(move |theme| Color {
+            a: 1.0,
+            ..surface(theme)
+        }),
+    })
+}
+
+/// Lets a single line run past its width and fades its trailing edge into
+/// `background`, rather than cutting it off or ending it in an ellipsis.
+///
+/// The content is laid out at its natural width and clipped to the width it
+/// is given; the fade is drawn only when something is cut. `background` is
+/// the opaque colour behind the line, which the fade blends into.
+pub fn fade_overflow<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    background: impl Fn(&Theme) -> Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(FadeOverflow {
+        content: content.into(),
+        background: Box::new(background),
+    })
+}
+
+/// Shows `content` without letting anyone use it: a glimpse of a pane drawn
+/// elsewhere, whose buttons and links belong to the pane itself.
+///
+/// Only redraw requests reach the content, so its spinners and streaming text
+/// keep moving. Pointer and keyboard input, focus and other widget operations
+/// stop here, so nothing inside takes a click, claims an ID the real pane
+/// uses, or is reached by assistive technology as a second copy of the pane.
+pub fn inert<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Element::new(Inert {
+        content: content.into(),
     })
 }
 
@@ -588,6 +647,161 @@ pub fn keyboard_modal<'a, Message: 'a>(
         on_focused_key: None,
     }
     .into()
+}
+
+/// Keeps Tab, Shift+Tab and the Left and Right arrows moving keyboard focus
+/// among the controls inside `content`, wrapping at either end, so a dialog's
+/// choices are one key apart and focus never wanders to the window behind it.
+/// A key a focused control claimed, such as an arrow in a text field, is left
+/// to that control.
+pub fn focus_scope<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusScope,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Counts the focusable controls in a subtree and finds the focused one.
+/// Selectable text registers as focusable without an id; it is for the
+/// pointer to copy from, not a stop on the way between a dialog's choices.
+#[derive(Default)]
+struct ScopeFocus {
+    count: usize,
+    focused: Option<usize>,
+}
+
+impl Operation for ScopeFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if id.is_none() {
+            return;
+        }
+        if state.is_focused() {
+            self.focused = Some(self.count);
+        }
+        self.count += 1;
+    }
+}
+
+/// Focuses the subtree's `target`th focusable control and no other.
+struct FocusNth {
+    target: usize,
+    index: usize,
+}
+
+impl Operation for FocusNth {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if id.is_some() && self.index == self.target {
+            state.focus();
+        } else {
+            state.unfocus();
+        }
+        self.index += usize::from(id.is_some());
+    }
+}
+
+/// Where Tab, Shift+Tab, Left or Right moves focus within a scope.
+fn scope_step(event: &Event) -> Option<bool> {
+    use cosmic::iced::keyboard::{self, key::Named};
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(key),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        Named::Tab => Some(modifiers.shift()),
+        Named::ArrowLeft if !modifiers.shift() => Some(true),
+        Named::ArrowRight if !modifiers.shift() => Some(false),
+        _ => None,
+    }
+}
+
+/// A key held down long enough to repeat Enter or Space.
+fn is_held_activation(event: &Event) -> bool {
+    use cosmic::iced::keyboard::{self, key::Named};
+    matches!(
+        event,
+        Event::Keyboard(keyboard::Event::KeyPressed { key, repeat: true, .. })
+            if *key == keyboard::Key::Named(Named::Enter)
+                || *key == keyboard::Key::Character(" ".into())
+    )
+}
+
+/// A printable key other than Space, pressed without a command modifier.
+fn is_typed_text(event: &Event) -> bool {
+    use cosmic::iced::keyboard;
+    matches!(
+        event,
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(character),
+            modifiers,
+            ..
+        }) if character.as_str() != " "
+            && !modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+    )
+}
+
+/// An unmodified Space press restated as Enter, the key that presses a
+/// focused button.
+fn space_as_enter(event: &Event) -> Option<Event> {
+    use cosmic::iced::keyboard::{self, key::Named};
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character(character),
+        physical_key,
+        location,
+        modifiers,
+        repeat,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if character.as_str() != " "
+        || modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+        || modifiers.shift()
+    {
+        return None;
+    }
+    let enter = keyboard::Key::Named(Named::Enter);
+    Some(Event::Keyboard(keyboard::Event::KeyPressed {
+        key: enter.clone(),
+        modified_key: enter,
+        physical_key: *physical_key,
+        location: *location,
+        modifiers: *modifiers,
+        text: None,
+        repeat: *repeat,
+    }))
 }
 
 /// Blocks click-through without hiding the child's accessibility tree.
@@ -1261,7 +1475,7 @@ enum Axis {
 struct OverflowFade<'a, Message> {
     content: Element<'a, Message>,
     axis: Axis,
-    fill: fn(&Theme) -> Color,
+    fill: Box<dyn Fn(&Theme) -> Color + 'a>,
 }
 
 /// How far the fade reaches at the start and the end of the strip.
@@ -1556,6 +1770,172 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
     }
 }
 
+struct Inert<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for Inert<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                mouse::Cursor::Unavailable,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            mouse::Cursor::Unavailable,
+            viewport,
+        );
+    }
+}
+
+struct FadeOverflow<'a, Message> {
+    content: Element<'a, Message>,
+    background: Box<dyn Fn(&Theme) -> Color + 'a>,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for FadeOverflow<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let natural =
+            layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height));
+        let child = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, &natural);
+        let size = limits.width(Length::Fill).height(Length::Shrink).resolve(
+            Length::Fill,
+            Length::Shrink,
+            child.size(),
+        );
+        layout::Node::with_children(Size::new(size.width, child.size().height), vec![child])
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        let Some(child) = layout.children().next() else {
+            return;
+        };
+        renderer.with_layer(clip, |renderer| {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                child,
+                cursor,
+                &clip,
+            );
+        });
+        if child.bounds().width > bounds.width + 0.5 {
+            // A layer of its own: within one layer, quads are drawn beneath
+            // text, so the fade would sit under the letters it should cover.
+            let width = OVERFLOW_FADE.min(bounds.width);
+            let fade = Rectangle {
+                x: bounds.x + bounds.width - width,
+                width,
+                ..bounds
+            };
+            renderer.with_layer(clip, |renderer| {
+                fill_overflow_fade(renderer, fade, Edge::Right, (self.background)(theme));
+            });
+        }
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        layout
+            .children()
+            .next()
+            .map_or_else(Default::default, |child| {
+                self.content
+                    .as_widget()
+                    .a11y_nodes(child, &tree.children[0], cursor)
+            })
+    }
+}
+
 /// The edge of a scrolling surface that an overflow fade is opaque at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Edge {
@@ -1642,6 +2022,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, fade: Rectangle, edge: Edge, colo
 
 #[derive(Clone, Copy)]
 enum Kind {
+    A11yTarget,
     KeyboardList(bool),
     FocusedKey,
     ListRow,
@@ -1662,6 +2043,7 @@ enum Kind {
     Opaque,
     KeyboardModal,
     UnclaimedKey,
+    FocusScope,
 }
 
 struct Effect<'a, Message> {
@@ -1756,6 +2138,7 @@ impl<Message: 'static> PartTip<Message> {
 // Distinct tags prevent a positional diff from reusing a tooltip's clock as a
 // hover/fade clock when a conditional wrapper changes kind.
 struct HoverTag;
+struct A11yTargetTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
 struct FocusedKeyTag;
@@ -1766,6 +2149,7 @@ struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
 struct KeyboardModalTag;
+struct FocusScopeTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
 
@@ -1848,6 +2232,7 @@ impl Default for State {
 impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
+            Kind::A11yTarget => tree::Tag::of::<A11yTargetTag>(),
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
             Kind::UnclaimedKey => tree::Tag::of::<UnclaimedKeyTag>(),
@@ -1859,6 +2244,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
+            Kind::FocusScope => tree::Tag::of::<FocusScopeTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
             Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
@@ -1961,6 +2347,16 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if matches!(self.kind, Kind::A11yTarget)
+            && let Event::A11y(id, request) = event
+        {
+            use iced_accessibility::{A11yId, accesskit::TreeId};
+            if request.target_tree != TreeId::ROOT
+                || request.target_node != A11yId::from(id.clone()).into()
+            {
+                return;
+            }
+        }
         if matches!(self.kind, Kind::FocusedKey)
             && let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
@@ -2079,6 +2475,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             );
             return;
         }
+        if matches!(self.kind, Kind::FocusScope) && is_held_activation(event) {
+            // A held Enter or Space would answer every question it meets,
+            // including the next one a queue of closes opens.
+            shell.capture_event();
+            return;
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -2089,6 +2491,72 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::FocusScope) {
+            if !shell.is_event_captured()
+                && let Some(backwards) = scope_step(event)
+            {
+                let mut focus = ScopeFocus::default();
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut focus,
+                );
+                if focus.count > 0 {
+                    let target = match (focus.focused, backwards) {
+                        (Some(current), false) => (current + 1) % focus.count,
+                        (Some(current), true) => (current + focus.count - 1) % focus.count,
+                        (None, false) => 0,
+                        (None, true) => focus.count - 1,
+                    };
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut FocusNth { target, index: 0 },
+                    );
+                    shell.request_redraw();
+                }
+                // Even with nothing to focus, the key stays in the dialog.
+                shell.capture_event();
+            } else if !shell.is_event_captured() && is_typed_text(event) {
+                // Text no control took was meant for whatever had the
+                // keyboard before the question appeared. Whoever is still
+                // typing hasn't read it, so the Enter that ends their line
+                // must not answer it: focus leaves every choice until Tab
+                // or a click picks one.
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut FocusNth {
+                        target: usize::MAX,
+                        index: 0,
+                    },
+                );
+                shell.request_redraw();
+                shell.capture_event();
+            } else if !shell.is_event_captured()
+                && let Some(enter) = space_as_enter(event)
+            {
+                // Buttons here answer only Enter. Space, which every
+                // toolkit also uses to press a focused button or tick a
+                // checkbox, reaches them as Enter once no focused control,
+                // such as a text field, has taken it as text.
+                self.content.as_widget_mut().update(
+                    &mut tree.children[0],
+                    &enter,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+                shell.capture_event();
+            }
+            return;
+        }
         if matches!(self.kind, Kind::UnclaimedKey)
             && !shell.is_event_captured()
             && let Event::Keyboard(event) = event
@@ -2101,7 +2569,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell.capture_event();
             return;
         }
-        if matches!(self.kind, Kind::TabHistory(_)) {
+        if matches!(self.kind, Kind::TabHistory(_) | Kind::A11yTarget) {
             return;
         }
         if matches!(self.kind, Kind::ContextMenu) {

@@ -2004,11 +2004,19 @@ pub(crate) fn environment(
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {
     if persistable {
+        // An older device service may still report the session its daemon
+        // was started inside; that is never this conversation's.
         SELECTED
             .get()
             .and_then(|context| context.environment.get())
             .and_then(|environment| environment.get(&provider))
-            .cloned()
+            .map(|environment| {
+                environment
+                    .iter()
+                    .filter(|(name, _)| !crate::agent::is_session_variable(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         Default::default()

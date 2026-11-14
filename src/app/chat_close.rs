@@ -1,11 +1,14 @@
 //! Closing a pane closes it in every window and stops what it runs, so a chat
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
+//! The conversation stays in history, so this is a routine question: Enter
+//! answers it, and the person may choose not to be asked again.
 
 use super::*;
 
 const CANCEL: &str = "dialog.chat-close.cancel";
 const CONFIRM: &str = "dialog.chat-close.confirm";
+const QUESTION: settings::Confirmation = settings::Confirmation::StopWorkingChat;
 /// How much of a first message can stand in for a conversation's name.
 const FIRST_MESSAGE_NAME_CHARS: usize = 60;
 
@@ -15,7 +18,6 @@ pub(super) struct ChatCloseConfirm {
     session: TerminalId,
     /// False when this window cannot tell, as while it is still attaching.
     certain: bool,
-    focus_confirm: bool,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
 }
@@ -36,7 +38,7 @@ impl Cagents {
         // A question asked beside a close under way could end up under that
         // close's own dialog. A chat with nothing to ask doesn't have to wait.
         if self.chat_close_dialog_visible()
-            || (self.chat_working_session(card).is_some() && self.another_close_under_way(card))
+            || (self.chat_close_would_ask(card).is_some() && self.another_close_under_way(card))
         {
             self.queue_card_close(card, false);
             return Some(Task::none());
@@ -44,19 +46,26 @@ impl Cagents {
         self.ask_before_chat_close(card)
     }
 
+    /// The working conversation a close of this card would ask about, unless
+    /// the person chose not to be asked.
+    fn chat_close_would_ask(&self, card: CardId) -> Option<(TerminalId, bool)> {
+        self.asks(QUESTION)
+            .then(|| self.chat_working_session(card))
+            .flatten()
+    }
+
     pub(super) fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
-        let (session, certain) = self.chat_working_session(card)?;
+        let (session, certain) = self.chat_close_would_ask(card)?;
         let restore_keyboard_nav = self.core.keyboard_nav();
         self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
             session,
             certain,
-            focus_confirm: false,
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
         });
         self.core.set_keyboard_nav(false);
-        Some(chat_close_focus(false))
+        Some(self.open_confirmation(QUESTION, widget::Id::new(CANCEL), widget::Id::new(CONFIRM)))
     }
 
     /// Whether the conversation asked about is still the one on the card. One
@@ -99,6 +108,7 @@ impl Cagents {
             return None;
         }
         drop(self.finish_chat_close_question());
+        self.dismiss_confirmation(QUESTION);
         Some(self.next_queued_card_close())
     }
 
@@ -112,6 +122,7 @@ impl Cagents {
         let Some(intent) = self.finish_chat_close_question() else {
             return Task::none();
         };
+        self.dismiss_confirmation(QUESTION);
         let card = intent
             .restore_card
             .filter(|card| self.workspace.order().any(|id| id == *card))
@@ -126,18 +137,14 @@ impl Cagents {
             return Task::none();
         };
         if current {
-            self.begin_chat_close(intent.card)
+            // Only a close that goes ahead keeps a tick in "Don't ask again";
+            // one whose conversation changed meanwhile answered nothing.
+            let remember = self.commit_confirmation(QUESTION);
+            Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
+            self.dismiss_confirmation(QUESTION);
             Task::none()
         }
-    }
-
-    pub(super) fn cycle_chat_close_focus(&mut self) -> Task<Message> {
-        let Some(intent) = self.chat_close_confirm.as_mut() else {
-            return Task::none();
-        };
-        intent.focus_confirm = !intent.focus_confirm;
-        chat_close_focus(intent.focus_confirm)
     }
 
     pub(super) fn chat_close_dialog(&self) -> Element<'_, Message> {
@@ -173,10 +180,11 @@ impl Cagents {
             "It may still be working. Closing it stops it and closes it in every window."
         };
         dialog_ui::overlay(
-            dialog_ui::surface(
+            dialog_ui::confirmation_surface(
                 widget::column::with_children(vec![
                     crate::design::title(title).into(),
                     crate::design::body(body).into(),
+                    self.dont_ask_again_control(QUESTION, true),
                     dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Keep working")
                             .id(widget::Id::new(CANCEL))
@@ -193,9 +201,4 @@ impl Cagents {
             1.0,
         )
     }
-}
-
-fn chat_close_focus(confirm: bool) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if confirm { CONFIRM } else { CANCEL }))
-        .map(cosmic::Action::App)
 }

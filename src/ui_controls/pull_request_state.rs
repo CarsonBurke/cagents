@@ -184,9 +184,9 @@ impl ChecksSummary {
         Self::of_each([
             count(checks.failed),
             count(checks.pending),
-            0,
+            count(checks.cancelled),
             count(checks.passed),
-            0,
+            count(checks.skipped),
         ])
     }
 
@@ -354,6 +354,7 @@ mod tests {
             passed,
             failed,
             pending,
+            ..Default::default()
         };
         let summary = ChecksSummary::of_counts(counts(0, 3, 4)).unwrap();
         assert_eq!(summary.worst, CheckState::Pending);
@@ -364,6 +365,54 @@ mod tests {
         );
         assert!(ChecksSummary::of_counts(counts(0, 0, 0)).is_none());
         assert!(ChecksSummary::of([]).is_none());
+    }
+
+    #[test]
+    fn board_counts_match_individual_check_states() {
+        let counts = crate::work::Checks {
+            failed: 1,
+            pending: 2,
+            cancelled: 3,
+            passed: 4,
+            skipped: 5,
+        };
+        let states = [
+            (CheckState::Failed, 1),
+            (CheckState::Pending, 2),
+            (CheckState::Cancelled, 3),
+            (CheckState::Passed, 4),
+            (CheckState::Skipped, 5),
+        ];
+        assert_eq!(
+            ChecksSummary::of_counts(counts),
+            ChecksSummary::of(
+                states
+                    .into_iter()
+                    .flat_map(|(state, count)| std::iter::repeat_n(state, count))
+            )
+        );
+        for (counts, state, label) in [
+            (
+                crate::work::Checks {
+                    cancelled: 1,
+                    ..Default::default()
+                },
+                CheckState::Cancelled,
+                "1 cancelled",
+            ),
+            (
+                crate::work::Checks {
+                    skipped: 1,
+                    ..Default::default()
+                },
+                CheckState::Skipped,
+                "1 skipped",
+            ),
+        ] {
+            let summary = ChecksSummary::of_counts(counts).unwrap();
+            assert_eq!(summary.worst, state);
+            assert_eq!(summary.label, label);
+        }
     }
 
     #[test]

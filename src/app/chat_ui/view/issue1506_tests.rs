@@ -453,13 +453,13 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     };
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWorking), "Subagents working".into())
+        (Some(Icon::AgentWorking), "1 agent working".into())
     );
 
     snapshot.waiting = true;
     let parent_and_child = (
         Some(Icon::AgentWorking),
-        "Waiting for you · 1 subagent working".to_owned(),
+        "Waiting for you · 1 agent working".to_owned(),
     );
     assert_eq!(publish(&mut snapshot), parent_and_child);
     snapshot.detail = "Background command completed".into();
@@ -482,7 +482,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWorking),
-            "Account limit reached · 1 subagent working".into(),
+            "Account limit reached · 1 agent working".into(),
         )
     );
     snapshot.subagents[0].waiting = true;
@@ -490,7 +490,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::Warning),
-            "Account limit reached · 1 subagent waiting".into(),
+            "Account limit reached · 1 agent waiting".into(),
         )
     );
     snapshot.subagents[0].status = ToolStatus::Succeeded;
@@ -502,8 +502,8 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     snapshot.error = None;
     for status in [
         ToolStatus::Succeeded,
-        ToolStatus::Failed,
         ToolStatus::Stopped,
+        ToolStatus::Ended,
     ] {
         snapshot.subagents[0].status = status;
         assert_eq!(
@@ -515,12 +515,15 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     snapshot.subagents[0].waiting = true;
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWaiting), "Waiting for you".into())
+        (
+            Some(Icon::AgentWaiting),
+            "Waiting for you · 1 agent waiting".into()
+        )
     );
     snapshot.requests.clear();
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWaiting), "Subagents waiting".into())
+        (Some(Icon::AgentWaiting), "1 agent waiting".into())
     );
 }
 
@@ -541,9 +544,9 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
     assert_eq!(icon, Some(Icon::AgentWorking));
     for text in [
         "Account limit reached",
-        "1 subagent working",
-        "1 subagent waiting",
-        "1 subagent failed",
+        "1 agent working",
+        "1 waiting",
+        "1 failed:",
     ] {
         assert!(status.contains(text), "{status}");
     }
@@ -587,7 +590,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                format!("{label} · 1 subagent working")
+                format!("{label} · 1 agent working")
             )
         );
         let details: Vec<_> = runtime
@@ -607,7 +610,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                "Provider at capacity · 1 subagent working".into(),
+                "Provider at capacity · 1 agent working".into(),
             )
         );
         assert!(runtime.failure_ui.incidents.iter().any(|incident| {
@@ -619,7 +622,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                format!("{label} · 1 subagent working")
+                format!("{label} · 1 agent working")
             )
         );
 
@@ -632,7 +635,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.refresh();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), "Subagents working".into())
+            (Some(Icon::AgentWorking), "1 agent working".into())
         );
         runtime.error = None;
         runtime.reconcile_failure_ui();
@@ -758,8 +761,8 @@ fn waiting_child_quota_detail_without_items_is_projected_and_does_not_hide_other
     assert!(runtime.snapshot.subagents[0].items.is_empty());
     let (icon, status) = runtime.conversation_status(false);
     assert_eq!(icon, Some(Icon::AgentWorking));
-    assert!(status.contains("1 subagent working"), "{status}");
-    assert!(status.contains("1 subagent waiting"), "{status}");
+    assert!(status.contains("1 agent working"), "{status}");
+    assert!(status.contains("1 waiting"), "{status}");
     assert!(runtime.error.is_none());
 }
 
@@ -1354,20 +1357,31 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
         assert!(
             surface
                 .accessible
-                .contains(&format!("Show report details: {heading}"))
+                .contains(&format!("Show delivery details: {heading}"))
         );
-        assert!(
+        assert!(surface.accessible.contains(&"Copy this message".to_owned()));
+        let title = heading.strip_suffix(outcome).unwrap();
+        assert_eq!(
             surface
-                .accessible
-                .contains(&format!("Copy original report: {heading}"))
+                .text
+                .iter()
+                .filter(|text| text.as_str() == title)
+                .count(),
+            1,
+            "the single-line title keeps its source for overflow fading"
         );
-        assert!(!surface.text.iter().any(|text| text == &heading));
+        assert_eq!(
+            surface
+                .text
+                .iter()
+                .filter(|text| text.as_str() == outcome.trim())
+                .count(),
+            1,
+            "the outcome stays in its own trailing cell at narrow widths"
+        );
         assert!(
-            surface.text.iter().any(|text| text.ends_with(outcome)
-                && text.contains('…')
-                && text.chars().count() <= 73 + outcome.chars().count()),
-            "compact task identity must preserve {outcome}: {:?}",
-            surface.text
+            !surface.text.iter().any(|text| text == "Copy report"),
+            "closed reports use the message footer Copy action"
         );
         let marker = body.lines().next().unwrap();
         assert!(
@@ -1376,7 +1390,7 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .iter()
                 .chain(&surface.accessible)
                 .any(|text| text.contains(marker)),
-            "even short report bodies stay behind Details"
+            "even short report bodies stay behind the disclosure"
         );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
@@ -1478,7 +1492,25 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             );
             assert!(!cached.source.provisional());
             let surface = report_surface(live, "disclosed-report");
-            assert!(surface.text.iter().any(|text| text == heading));
+            assert_eq!(
+                surface
+                    .text
+                    .iter()
+                    .filter(|text| text.as_str() == "Agent \"Detailed review\"")
+                    .count(),
+                1,
+                "expansion retains one title rather than repeating the full heading"
+            );
+            assert_eq!(
+                surface
+                    .text
+                    .iter()
+                    .filter(|text| text.as_str() == "finished")
+                    .count(),
+                1
+            );
+            assert!(surface.text.iter().any(|text| text == "Copy report"));
+            assert!(surface.accessible.contains(&"Copy this message".to_owned()));
             assert!(
                 surface.text.iter().any(|text| text.contains(needle)),
                 "the late body match must actually be rendered"
@@ -1486,7 +1518,7 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             assert!(
                 surface
                     .accessible
-                    .contains(&format!("Hide report details: {heading}"))
+                    .contains(&format!("Hide delivery details: {heading}"))
             );
             assert!(live.failure_ui.incidents.is_empty());
             if temporary_find {
@@ -1588,6 +1620,136 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             &original,
             live.active_item("disclosed-report").unwrap()
         ));
+    }
+}
+
+#[test]
+fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    const BODY: &str = "Readable delivered body with the original contents preserved.";
+    const SENDER: &str = "opaque-transcript-sender-7f31";
+    #[derive(Default)]
+    struct Paragraphs {
+        sender: Option<iced::Rectangle>,
+        body: Option<iced::Rectangle>,
+    }
+    impl Operation for Paragraphs {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            let Some(text) = state.downcast_ref::<selectable_prose::State>() else {
+                return;
+            };
+            if text.plain.as_ref() == format!("Sender: {SENDER}") {
+                assert_eq!(
+                    text.mounted_typography(),
+                    Some((iced::Font::default(), design::TEXT_CAPTION.into())),
+                    "sender metadata uses the regular caption face"
+                );
+                let spans = text.spans.as_ref().expect("mounted sender spans");
+                assert!(spans.iter().all(|span| {
+                    span.font.unwrap_or_default() == iced::Font::default()
+                        && span.size.unwrap_or(design::TEXT_CAPTION.into())
+                            == design::TEXT_CAPTION.into()
+                        && span.color == Some(design::muted_color(&cosmic::theme::active()))
+                }));
+                assert_eq!(text.copied(0..text.plain.len()), text.plain.as_ref());
+                assert!(text.target.is_some(), "metadata stays selectable");
+                self.sender = Some(bounds);
+            } else if text.plain.as_ref() == BODY {
+                self.body = Some(bounds);
+            }
+        }
+    }
+
+    let renderer = crate::app::tests::headless_renderer();
+    for kind in [chat::DeliveryKind::Report, chat::DeliveryKind::Message] {
+        let delivered = chat::Item {
+            id: "sender-metadata".into(),
+            role: Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Delivery {
+                kind,
+                from: if kind == chat::DeliveryKind::Message {
+                    "Fixture peer".into()
+                } else {
+                    String::new()
+                },
+                sender: SENDER.into(),
+                summary: "Agent fixture finished".into(),
+                body: BODY.into(),
+            },
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&delivered));
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, delivered.id.clone())));
+        for searching in [false, true] {
+            if searching {
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    SENDER.into(),
+                ));
+            }
+            let live = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(live);
+            assert!(live.item_expanded(&delivered.id));
+            if searching {
+                assert!(
+                    !live.find_matches.is_empty(),
+                    "Find retains the opaque sender"
+                );
+            }
+            for width in [275.0, 960.0] {
+                let mut element = live.delivery_view(
+                    &delivered,
+                    &live.presentation_cache()[&delivered.id],
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 4_000.0)),
+                );
+                let mut paragraphs = Paragraphs::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut paragraphs,
+                );
+                let sender = paragraphs.sender.expect("expanded selectable sender");
+                let body = paragraphs.body.expect("expanded delivered body");
+                assert!(
+                    (sender.x - body.x).abs() < 0.1,
+                    "kind={kind:?}, width={width}"
+                );
+                assert!((sender.x - step::GAP_M).abs() < 0.1);
+                assert!(sender.y + sender.height <= body.y);
+                assert!(sender.x + sender.width <= node.size().width + 0.1);
+            }
+        }
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .item_expanded(&delivered.id),
+            "closing Find preserves the reader's explicit disclosure"
+        );
     }
 }
 

@@ -631,6 +631,7 @@ impl Cagents {
                 } else {
                     "Create worktree"
                 })
+                .reserve_labels(["Create worktree", "Creating…"])
                 .id(widget::Id::new("dialog.worktree.create"))
                 .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
                 .into(),

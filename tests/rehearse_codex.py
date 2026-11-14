@@ -44,12 +44,35 @@ class ConfigurationTests(unittest.TestCase):
                 'threadId':configured.thread}},str(root))
             self.assertIn({'_sleep':90},replies)
 
+    def test_history_opens_only_the_first_turn_with_earlier_messages(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            (root / "codex-fixture.json").write_text(json.dumps({"pause": 1, "history": [5, 200]}))
+            adapter.configure_peer(root)
+            self.assertEqual(os.environ["CAGENTS_TOOL_ROWS_HISTORY"], "5 200")
+            scenario = peer.Scenario()
+            def history(turn):
+                replies = scenario.notifications(turn)
+                completed = next(reply for reply in replies if reply.get("method") == "turn/completed"
+                                 and reply["params"]["threadId"] == scenario.thread)
+                return [item for item in completed["params"]["turn"]["items"]
+                        if item["id"].startswith("history-")], replies
+            first, replies = history("first")
+            self.assertEqual([item["id"] for item in first], [f"history-{at}" for at in range(5)])
+            self.assertTrue(all(len(item["text"]) == len(f"Step {at}: ") + 200
+                                for at, item in enumerate(first)))
+            started = [reply["params"]["item"]["id"] for reply in replies
+                       if reply.get("method") == "item/completed"][:5]
+            self.assertEqual(started, [item["id"] for item in first])
+            self.assertEqual(history("second")[0], [])
+
     def test_rejects_unknown_invalid_and_symlink_configuration(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
             root = Path(directory)
             path = root / "codex-fixture.json"
             for settings in ({"arbitrary_env": "value"}, {"pause": True}, {"pause": 0},
-                             {"pause": 301}, {"never_confirm_close": "1"}):
+                             {"pause": 301}, {"never_confirm_close": "1"}, {"history": 5},
+                             {"history": [5]}, {"history": [5, -1]}, {"history": [5, True]}):
                 path.write_text(json.dumps(settings))
                 with self.subTest(settings=settings), self.assertRaises(ValueError):
                     adapter.configure_peer(root)

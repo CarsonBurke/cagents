@@ -163,6 +163,7 @@ fn render(entry: &Entry) -> String {
                 ToolStatus::Failed => " (failed)",
                 ToolStatus::Denied => " (denied)",
                 ToolStatus::Stopped => " (stopped)",
+                ToolStatus::Ended => " (ended)",
                 ToolStatus::Waiting => " (waiting on its own background work)",
             };
             let mut line = format!(

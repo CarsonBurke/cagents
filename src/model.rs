@@ -266,10 +266,13 @@ impl LaunchRecipe {
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
-    /// Apply explicit removals and the equivalent policy for legacy managed homes.
-    pub(crate) fn remove_unset_environment(&self, environment: &mut BTreeMap<String, String>) {
+    /// Remove what this launch must not pass on: its explicit removals, the
+    /// equivalent policy for legacy managed homes, and any provider session's
+    /// identity, which a recipe saved before it was withheld may still hold.
+    pub(crate) fn withhold_environment(&self, environment: &mut BTreeMap<String, String>) {
         let names = crate::account::launch_credential_overrides(self);
-        environment.retain(|name, _| !names.contains(name));
+        environment
+            .retain(|name, _| !names.contains(name) && !crate::agent::is_session_variable(name));
     }
 }
 
@@ -1550,6 +1553,10 @@ pub struct WorkspaceState {
     /// identities are pruned when navigation opens; this grants no ownership.
     #[serde(default)]
     pub workspace_history: Vec<WorkspaceDestination>,
+    /// When each workspace in the history was last open, in seconds since
+    /// the Unix epoch, newest first.
+    #[serde(default)]
+    pub workspace_visits: Vec<(WorkspaceDestination, u64)>,
     /// Current file, caret and viewport for each editor in this window.
     #[serde(default)]
     pub repository_navigation: HashMap<CardId, RepositoryNavigation>,
@@ -1593,6 +1600,7 @@ impl Default for WorkspaceState {
             chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
+            workspace_visits: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
