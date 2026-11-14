@@ -838,6 +838,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                 .enumerate()
             {
                 if self.front_exclusive && index == 0 {
+                    // The retained subtree must not keep a second focused
+                    // control when the chooser takes the keyboard.
+                    child.as_widget_mut().operate(
+                        tree,
+                        layout,
+                        renderer,
+                        &mut operation::focusable::unfocus::<()>(),
+                    );
                     continue;
                 }
                 child
@@ -857,6 +865,30 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.front_exclusive
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::ModifiersChanged(_))
+            )
+        {
+            // Releases can arrive while the covering layer is closing. Keep
+            // retained widgets' modifier state current without dispatching
+            // hidden actions or consuming the visible layer's event.
+            self.children[0].as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout
+                    .children()
+                    .next()
+                    .expect("layer base")
+                    .with_virtual_offset(layout.virtual_offset()),
+                mouse::Cursor::Unavailable,
+                renderer,
+                clipboard,
+                &mut Shell::new(&mut Vec::new()),
+                viewport,
+            );
+        }
         let over = cursor.is_over(layout.bounds());
         let exclusive_viewport = layout.bounds().intersection(viewport).unwrap_or_default();
         if self.front_exclusive && !over {

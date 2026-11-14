@@ -955,7 +955,6 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     handle.publish_snapshot_for_test(snapshot);
     live.refresh();
     let mut app = crate::app::tests::context_inspector_test_app(true);
-    app.context_inspector_open = false;
     let mut target = live.target;
     target.card = app.workspace.focused().unwrap();
     live.target = target;

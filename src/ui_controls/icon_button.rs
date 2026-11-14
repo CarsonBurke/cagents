@@ -214,6 +214,14 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
                 None if raised => component.on.into(),
                 None => design::muted_icon_color(theme),
             }),
+            // A selected control is already raised, so focus also rings it,
+            // the way it rings a text button.
+            outline_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+            outline_color: if focused {
+                design::accent_color(theme)
+            } else {
+                iced::Color::TRANSPARENT
+            },
             ..border
         }
     };
@@ -246,4 +254,23 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
 fn disabled_icon_color(theme: &cosmic::Theme) -> iced::Color {
     let component = &theme.current_container().component;
     design::mix(component.base.into(), component.on.into(), 0.38)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_shows_on_a_selected_control_as_well_as_a_resting_one() {
+        let theme = cosmic::Theme::dark();
+        for selected in [false, true] {
+            let cosmic::theme::Button::Custom { active, .. } = control_style(selected, None) else {
+                panic!("a custom style");
+            };
+            let (rest, focused) = (active(false, &theme), active(true, &theme));
+            assert_eq!(rest.outline_width, 0.0, "selected: {selected}");
+            assert!(focused.outline_width > 0.0, "selected: {selected}");
+            assert_eq!(focused.outline_color, design::accent_color(&theme));
+        }
+    }
 }

@@ -789,6 +789,16 @@ impl Workspace {
         &self.geometry
     }
 
+    /// The card's place in the strip, found through the card index rather
+    /// than by searching the strip.
+    pub fn card_geometry(&self, id: CardId) -> Option<CardGeometry> {
+        let index = *self.card_indices.get(&id)?;
+        self.geometry
+            .card_at(index)
+            .filter(|card| card.id == id)
+            .or_else(|| self.geometry.card(id))
+    }
+
     /// The card whose trailing edge currently sits on the viewport's own
     /// trailing edge, if any.
     ///

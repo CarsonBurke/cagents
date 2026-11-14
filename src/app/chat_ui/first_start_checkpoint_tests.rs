@@ -443,7 +443,6 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         "replacement-both",
     ] {
         let (mut app, _directory, card, target) = fixture();
-        app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         app.workspace.resize_viewport(1200.0);
         let _ = app.workspace.take_widget_focus_request();

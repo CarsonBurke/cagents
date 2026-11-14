@@ -96,6 +96,16 @@ pub fn heading_font() -> Font {
     weighted(Weight::Medium)
 }
 
+/// A list section's header: description-sized, semibold and muted, so it
+/// names the rows beneath it without outweighing them.
+pub fn section_heading<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
+    cosmic::widget::text::body(text)
+        .size(TEXT_DESCRIPTION)
+        .line_height(LineHeight::Absolute(LINE_DESCRIPTION.into()))
+        .font(weighted(Weight::Semibold))
+        .class(cosmic::theme::Text::Custom(muted_text))
+}
+
 /// The name of a dialog, a form or a section of a page.
 pub fn title<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)

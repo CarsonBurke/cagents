@@ -1788,7 +1788,6 @@ mod tests {
     fn background_window_keeps_attention_until_its_agent_is_focused() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.core.set_main_window_id(Some(window::Id::RESERVED));
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         let session = card_session(&app.durable.cards[0]).unwrap();
         let id = uuid::Uuid::new_v4();
@@ -1848,7 +1847,6 @@ mod tests {
     fn opted_in_focused_alert_survives_snapshot_and_is_read_on_return() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.core.set_main_window_id(Some(window::Id::RESERVED));
-        app.context_inspector_open = false;
         app.settings.notifications.while_focused = true;
         app.refresh_ui.focused = true;
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
@@ -1914,7 +1912,6 @@ mod tests {
     fn attention_modal_visibility_updates_presence_and_invalidates_parent_dwell_without_card_changes()
      {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         let card = app.workspace.focused().unwrap();
         let session = card_session(app.card_state(card).unwrap()).unwrap();
@@ -2021,7 +2018,6 @@ mod tests {
                 .acknowledged
                 .is_empty()
         );
-        app.context_inspector_open = false;
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         let card = app.workspace.focused().unwrap();
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
@@ -2061,7 +2057,6 @@ mod tests {
     #[test]
     fn attention_opted_in_fresh_alert_survives_an_older_visibility_dwell() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         let card = app.workspace.focused().unwrap();
         app.settings.notifications.while_focused = true;
@@ -2136,7 +2131,6 @@ mod tests {
     #[test]
     fn attention_committed_window_close_stops_claiming_viewed_content_during_exit_reap() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let session = live_session(&mut app);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
@@ -2312,7 +2306,6 @@ mod tests {
             Agent, Origin, Placement, Spec, Surface, Target as AgentTarget,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         let project = ProjectId::new();
         let repository = PathBuf::from("/tmp");
         let channel = ChannelId::new();
@@ -2726,7 +2719,6 @@ mod tests {
     #[test]
     fn attention_unmanaged_open_session_is_not_shadowed_by_its_retired_alias() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         let session = card_session(app.card_state(card).unwrap()).unwrap();
         let mut alias = app.card_state(card).unwrap().clone();
@@ -3382,7 +3374,6 @@ mod tests {
     #[test]
     fn missing_attention_target_does_not_scan_on_unrelated_wakes_and_expiry_is_fenced() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         let first = TerminalId::new();
         drop(app.update_notifications(Action::Activated(Target::Session(first))));
         let first_generation = app.notification_ui.activation_generation;
@@ -3409,7 +3400,6 @@ mod tests {
     #[test]
     fn attention_activation_retries_when_its_project_arrives_without_card_membership_changes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         let target = super::super::tests::terminal_card_state();
         let card = target.id;
         let session = card_session(&target).unwrap();
@@ -3452,7 +3442,6 @@ mod tests {
     #[test]
     fn attention_activation_waits_for_dialog_and_latest_target_wins() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let previous = app.workspace.focused();
         let card = super::super::tests::terminal_card_state();
         let session = card_session(&card).unwrap();

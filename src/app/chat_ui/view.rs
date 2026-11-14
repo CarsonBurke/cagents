@@ -10796,7 +10796,6 @@ mod tests {
         };
         let (mut live, _handle) = frame_cost::live_runtime(&[thought]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
@@ -11833,7 +11832,6 @@ mod tests {
 
         let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
@@ -15970,7 +15968,6 @@ mod tests {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut live, _handle) = frame_cost::live_runtime(&[]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         live.target.card = card;
         let target = live.target;
@@ -16203,7 +16200,6 @@ mod prepared_disclosure_tests {
         };
         let (mut live, _handle) = frame_cost::live_runtime(&[item]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
