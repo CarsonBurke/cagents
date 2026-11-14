@@ -5189,8 +5189,31 @@ impl Runtime {
         )
     }
 
+    /// Install the answer being written in the update that staged it, so
+    /// each streamed chunk costs one frame rather than two. Waiting for the
+    /// parse, rather than drawing the old text meanwhile, costs the UI
+    /// thread less than that frame would.
+    fn settle_streaming_answer(&mut self) -> Task<Message> {
+        /// Streamed publications parse in under a millisecond at the 95th
+        /// percentile, and a frame of the transcript costs about 3 ms.
+        const BUDGET: Duration = Duration::from_millis(2);
+        // Only a chat on screen parses, as only it has subscriptions.
+        if !self.presents() || !self.visible.load(Ordering::Relaxed) {
+            return Task::none();
+        }
+        match self.preparation.settle_tail(self.target, BUDGET) {
+            preparation::Settled::Idle => Task::none(),
+            preparation::Settled::Ready(id, run, ready) => {
+                self.markdown_prepared(self.target, &id, run, ready);
+                Task::none()
+            }
+            preparation::Settled::Pending(task) => task,
+        }
+    }
+
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
         if !self.presents() {
+            self.preparation.unclaim(id, run);
             return;
         }
         // Observe any replacement already published by the client before
@@ -12131,6 +12154,7 @@ impl Cagents {
                     Wake::Changed => {
                         let before = Arc::clone(&runtime.snapshot);
                         runtime.refresh();
+                        let settled = runtime.settle_streaming_answer();
                         // What the provider holds is saved as it changes, so a
                         // queue outlives a provider that goes with the computer.
                         let queue_changed =
@@ -12180,6 +12204,7 @@ impl Cagents {
                             self.persist();
                         }
                         return Task::batch([
+                            settled,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
                             self.dispatch_queued(target),
