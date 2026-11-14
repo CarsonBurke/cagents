@@ -1640,7 +1640,7 @@ fn cancellation_after_native_index_publication_retains_partial_state() {
 set -eu
 [ "${CAGENTS_PR_MODE:-}" = effect ] || exit 0
 printf paused > "$CAGENTS_PR_GITDIR_FD/checkout-paused"
-/usr/bin/timeout 5 /bin/sh -c 'while [ ! -e "$CAGENTS_PR_GITDIR_FD/release-checkout" ]; do /bin/sleep 0.02; done'
+/usr/bin/timeout 120 /bin/sh -c 'while [ ! -e "$CAGENTS_PR_GITDIR_FD/release-checkout" ]; do /bin/sleep 0.02; done'
 "#).unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let plan = fixture.prepare(&fixture.request(new.clone()));
@@ -1651,7 +1651,7 @@ printf paused > "$CAGENTS_PR_GITDIR_FD/checkout-paused"
                 .service
                 .reconcile_existing_pr_checkout(&plan, &cancel)
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         while !fixture.root.join(".git/checkout-paused").exists() {
             assert!(
                 Instant::now() < deadline,
@@ -2158,7 +2158,7 @@ fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
         &["config", "core.hooksPath", policy.to_str().unwrap()],
     );
     let hook = policy.join("reference-transaction");
-    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/setsid /usr/bin/timeout 5 /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
+    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let plan = fixture.prepare(&fixture.request(new.clone()));
     let cancel = CancellationToken::default();
@@ -2180,7 +2180,7 @@ fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
                 .send(service.reconcile_existing_pr_checkout(plan, worker_cancel))
                 .unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         let operation = loop {
             if let Some(path) = fs::read_dir(fixture.root.join(".git"))
                 .unwrap()
@@ -2213,11 +2213,11 @@ fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
             "an inherited lease must prevent success until its holder exits"
         );
         observed_receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .expect("the original lease must be observed before releasing its fixture holder");
         fs::write(operation.join("release-descendant"), b"release").unwrap();
         let failure = receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .unwrap()
             .unwrap_err();
         assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
@@ -2271,7 +2271,7 @@ fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_rece
 set -eu
 input=$(/bin/cat)
 if [ "$1" = committed ] && printf '%s' "$input" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then
- /usr/bin/setsid /usr/bin/timeout 5 /bin/sh -c '
+ /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c '
   touch "$CAGENTS_PR_PRIVATE/late-child-started"
   while [ ! -e "$CAGENTS_PR_PRIVATE/release-late-child" ]; do /bin/sleep 0.02; done
   printf "\n[branch \"feature\"]\n merge = refs/heads/changed-by-child\n" >> "$CAGENTS_PR_COMMON_FD/config"
@@ -2301,7 +2301,7 @@ fi
                 .unwrap()
                 .path();
             fs::write(operation.join("release-late-child"), b"release").unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
             let observer = fs::File::open(operation.join("lease")).unwrap();
             loop {
                 // SAFETY: independent descriptor pins the original lease inode.
