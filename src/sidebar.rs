@@ -7898,7 +7898,8 @@ fn child_glyph(icon: Icon, tone: GlyphTone, compact: bool) -> Element<'static, S
 
 /// A row's title followed by where it is, dimmed: "Codex chat · fix-sidebar".
 /// The title keeps the width it needs and the place gives way first, since
-/// the title is what tells two rows apart.
+/// the title is what tells two rows apart. Only once the place is gone does
+/// the title itself truncate.
 fn titled_label(
     title: &str,
     place: Option<&str>,
@@ -7915,28 +7916,55 @@ fn titled_label(
                 EllipsizeHeightLimit::Lines(1),
             ))
     };
-    let place = ellipsized(widget::text::body(format!(" · {place}")))
-        .class(theme::Text::Custom(design::muted_text));
-    // A highlighted title is measured by its own fitting label, which fills
-    // its slot, so the place keeps its natural width beside it.
-    let (title, place): (Element<'static, SidebarAction>, _) =
-        if search_highlight_ranges(title, query).is_empty() {
-            (
-                ellipsized(widget::text::body(title.to_owned()))
-                    .class(ink.text_class())
-                    .into(),
-                place.width(Length::Fill),
-            )
-        } else {
-            (
-                search_label(title, query, CHILD_ROW_TEXT_SIZE, ink.text_class(), false),
-                place,
-            )
-        };
-    widget::row::with_children(vec![title, place.into()])
+    let place = format!(" · {place}");
+    let place = move || -> Element<'static, SidebarAction> {
+        ellipsized(widget::text::body(place.clone()))
+            .class(theme::Text::Custom(design::secondary_text))
+            .width(Length::Fill)
+            .into()
+    };
+    if search_highlight_ranges(title, query).is_empty() {
+        // A shrinking text takes its natural width before the filling place
+        // is laid out, and ellipsizes only if the row cannot hold even that.
+        return widget::row::with_children(vec![
+            ellipsized(widget::text::body(title.to_owned()))
+                .class(ink.text_class())
+                .into(),
+            place(),
+        ])
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into();
+    }
+    // A highlighted title is a fitting label that fills whatever slot it is
+    // given, so it is given its natural width, measured once, or the whole
+    // row when that is narrower.
+    let title = title.to_owned();
+    let query = query.to_owned();
+    let natural = std::cell::OnceCell::new();
+    crate::ui_controls::responsive(move |slot| {
+        let natural = *natural.get_or_init(|| {
+            let (font, emphasis) = search_label_fonts(false);
+            search_spans_width(&title, &query, CHILD_ROW_TEXT_SIZE, font, emphasis).ceil()
+        });
+        widget::row::with_children(vec![
+            widget::container(search_label(
+                &title,
+                &query,
+                CHILD_ROW_TEXT_SIZE,
+                ink.text_class(),
+                false,
+            ))
+            .width(Length::Fixed(natural.min(slot.width)))
+            .into(),
+            place(),
+        ])
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .into()
+    })
+    .height(CHILD_ROW_TEXT_SIZE * 1.5)
+    .into()
 }
 
 /// One pane the Attention list names on its own row: its kind, its title and
@@ -8058,9 +8086,13 @@ fn in_progress_section(
 ) -> Element<'static, SidebarAction> {
     let collapsed = state.in_progress_collapsed;
     let count = rows.len();
+    // A channel can have more than one agent at work, so the header counts
+    // agents, as its accessible name does, rather than the rows below it.
+    let agents: usize = rows.iter().map(|row| row.attention().working).sum();
     let name = format!(
-        "{} In progress ({count}), agents working",
-        if collapsed { "Expand" } else { "Collapse" }
+        "{} In progress, {agents} agent{} working",
+        if collapsed { "Expand" } else { "Collapse" },
+        if agents == 1 { "" } else { "s" }
     );
     let grid = RowGrid::child(compact);
     let glyph: Element<'static, SidebarAction> = if collapsed {
@@ -8073,24 +8105,29 @@ fn in_progress_section(
     .size(CHILD_ROW_ICON_SIZE)
     .into();
     let content = if compact {
-        grid.rail(glyph, rail::Badges::in_progress(count, collapsed))
+        grid.rail(glyph, rail::Badges::in_progress(agents, collapsed))
     } else {
-        let label = widget::row::with_children(vec![
-            design::body("In progress").width(Length::Fill).into(),
-            design::caption(count.to_string()).into(),
-        ])
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-        grid.content(
-            glyph,
-            Some(label.into()),
-            collapsed.then(|| {
+        // The count sits in the indicator slot, where every row's badge is.
+        // Folded, the spinner above it says the hidden rows are still at work,
+        // as a counted badge does on any other row.
+        let count = design::caption(agents.to_string());
+        let indicator: Element<'static, SidebarAction> = if collapsed {
+            widget::column::with_children(vec![
                 crate::ui_controls::activity_spinner(
                     f32::from(ROW_ICON_SIZE),
                     design::warning_color,
-                )
-            }),
+                ),
+                count.size(9).into(),
+            ])
+            .align_x(Alignment::Center)
+            .into()
+        } else {
+            count.into()
+        };
+        grid.content(
+            glyph,
+            Some(design::body("In progress").width(Length::Fill).into()),
+            Some(indicator),
         )
     };
     let header = grid
@@ -8113,8 +8150,10 @@ fn in_progress_section(
     }
 }
 
-/// An "In progress" row: a spinner, the channel's or pane's title, and the
-/// project it belongs to, since the section gathers rows from every project.
+/// An "In progress" row, drawn like the row it stands for: its kind, its
+/// title and where it is, and its work in the indicator slot. The section
+/// gathers rows from every project, so the place names the project, and for
+/// a pane also its checkout: "Claude Code · cagents › fix-sidebar".
 fn in_progress_row(
     row: InProgressRow<'_>,
     state: &SidebarState,
@@ -8122,7 +8161,7 @@ fn in_progress_row(
     modal_open: bool,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
-    let project = &row.project.name;
+    let place = row.place();
     let (kind, title, icon, attention, selected, id, action) = match row.item {
         InProgressItem::Channel(channel) => (
             "channel",
@@ -8145,31 +8184,30 @@ fn in_progress_row(
             SidebarAction::OpenCard { card: card.id },
         ),
     };
+    let glyph = child_glyph(icon, GlyphTone::Ink(RowInk::Full), compact);
     let content = if compact {
-        grid.rail(
-            child_glyph(icon, GlyphTone::Ink(RowInk::Full), true),
-            rail::Badges::attention(attention),
-        )
+        grid.rail(glyph, rail::Badges::attention(attention))
     } else {
         grid.content(
-            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
+            glyph,
             Some(titled_label(
                 title,
-                Some(project),
+                Some(&place),
                 &state.query,
                 RowInk::Full,
             )),
-            None,
+            attention_indicator(attention),
         )
     };
+    let news = attention.description();
     let control = grid
         .control(content, selected)
         .id(id)
-        .name(format!("Open {kind} {title} in {project}, agent working"))
+        .name(format!("Open {kind} {title} in {place}, {news}"))
         .on_press_maybe(gated(action, modal_open));
     let control = grid.mount(crate::interaction::tooltip(
         control,
-        format!("{title} · {project}\nAn agent is actively working"),
+        format!("{title} · {place}\n{news}"),
     ));
     let control = match row.item {
         InProgressItem::Channel(channel) => channel_context_controls(
@@ -12567,6 +12605,26 @@ enum InProgressItem<'a> {
 }
 
 impl InProgressRow<'_> {
+    /// Where the row is, as its suffix and accessible name say: the project,
+    /// and for a pane the checkout it runs in.
+    fn place(self) -> String {
+        let project = &self.project.name;
+        match self.item {
+            InProgressItem::Card(card) => match card.checkout(self.project) {
+                Some(checkout) => format!("{project} › {checkout}"),
+                None => project.clone(),
+            },
+            InProgressItem::Channel(_) => project.clone(),
+        }
+    }
+
+    fn attention(self) -> AttentionSummary {
+        match self.item {
+            InProgressItem::Channel(channel) => channel.attention,
+            InProgressItem::Card(card) => card.attention,
+        }
+    }
+
     fn row(self) -> SelectionRow {
         match self.item {
             InProgressItem::Channel(channel) => SelectionRow::Channel(channel.id),
@@ -12752,18 +12810,7 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
-    let font = cosmic::font::Font {
-        weight: if heading {
-            cosmic::iced::font::Weight::Medium
-        } else {
-            cosmic::iced::font::Weight::Normal
-        },
-        ..cosmic::font::default()
-    };
-    let emphasis = cosmic::font::Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
+    let (font, emphasis) = search_label_fonts(heading);
     let highlights = search_highlight_ranges(label, query);
     if highlights.is_empty() {
         return widget::text::body(label.to_owned())
@@ -12813,6 +12860,23 @@ fn search_label(
     })
     .height(size * 1.5)
     .into()
+}
+
+/// A search label's font, and the one its matches are drawn in.
+fn search_label_fonts(heading: bool) -> (cosmic::iced::Font, cosmic::iced::Font) {
+    let font = cosmic::font::Font {
+        weight: if heading {
+            cosmic::iced::font::Weight::Medium
+        } else {
+            cosmic::iced::font::Weight::Normal
+        },
+        ..cosmic::font::default()
+    };
+    let emphasis = cosmic::font::Font {
+        weight: cosmic::iced::font::Weight::Bold,
+        ..font
+    };
+    (font, emphasis)
 }
 
 fn search_label_spans(
@@ -20981,9 +21045,9 @@ pub(crate) mod tests {
         let names = accessible_names(&renderer, project_list(&model, &state, false, false));
         for name in [
             "Open pane Agent in main, 1 waiting for input",
-            "Collapse In progress (2), agents working",
-            "Open channel Investigate in Cagents, agent working",
-            "Open pane Agent in Cagents, agent working",
+            "Collapse In progress, 2 agents working",
+            "Open channel Investigate in Cagents, 1 working",
+            "Open pane Agent in Cagents › fix-sidebar, 1 working",
         ] {
             assert!(names.iter().any(|known| known == name), "{name}: {names:?}");
         }
@@ -20991,7 +21055,7 @@ pub(crate) mod tests {
         assert!(
             compact
                 .iter()
-                .any(|name| name == "Collapse In progress (2), agents working"),
+                .any(|name| name == "Collapse In progress, 2 agents working"),
             "{compact:?}"
         );
 
@@ -21014,11 +21078,11 @@ pub(crate) mod tests {
             assert!(
                 names
                     .iter()
-                    .any(|name| name == "Expand In progress (2), agents working"),
+                    .any(|name| name == "Expand In progress, 2 agents working"),
                 "compact={compact}: {names:?}"
             );
             assert!(
-                !names.iter().any(|name| name.ends_with(", agent working")),
+                !names.iter().any(|name| name.ends_with(", 1 working")),
                 "compact={compact}: {names:?}"
             );
         }
@@ -21075,6 +21139,36 @@ pub(crate) mod tests {
             state.selected_rows(&visible),
             vec![SelectionRow::Channel(channel_id)]
         );
+    }
+
+    /// Every text the element draws, with where it draws it.
+    fn drawn_texts(
+        mut element: Element<'_, SidebarAction>,
+        width: f32,
+    ) -> Vec<(String, Rectangle)> {
+        use cosmic::iced::advanced::widget::Operation;
+        #[derive(Default)]
+        struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 2_000.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        texts.0
     }
 
     /// The Attention list's main section lists a row for what needs the
@@ -21159,6 +21253,109 @@ pub(crate) mod tests {
             names.contains(&model.projects[0].chrome.open_name.to_string()),
             "{names:?}"
         );
+    }
+
+    /// Two working panes in one project read apart: each In progress row
+    /// names the project and the checkout its pane runs in, and is drawn as
+    /// every other row is, its kind first and its work in the indicator slot,
+    /// where the header keeps its count too.
+    #[test]
+    fn in_progress_rows_say_where_they_are() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let project = project_id(1);
+        let main = model.projects[0].worktrees[0].clone();
+        let feature = model.projects[0].worktrees[1].clone();
+        let root = CardId::from_uuid(Uuid::from_u128(87));
+        let linked = CardId::from_uuid(Uuid::from_u128(88));
+        let durable = pane_workspace(&[(root, &main.path), (linked, &feature.path)]);
+        let activity = |state| Activity {
+            provider: Provider::Codex,
+            state,
+        };
+        let mut state = expanded_worktree_state();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        for (card, worktree) in [(root, main.id), (linked, feature.id)] {
+            state.set_agent_activity(card, project, worktree, activity(ActivityState::Working));
+        }
+        refresh_attention(&mut state, &mut model, &durable);
+        let renderer = headless_renderer();
+        let names = accessible_names(&renderer, project_list(&model, &state, false, false));
+        for name in [
+            format!("Open pane Agent in Cagents › {}, 1 working", main.label()),
+            format!(
+                "Open pane Agent in Cagents › {}, 1 working",
+                feature.label()
+            ),
+            "Collapse In progress, 2 agents working".to_owned(),
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+
+        let rows = in_progress_rows(&model, &state, false);
+        let section = || in_progress_section(&rows, &state, false, false);
+        let mut element = section();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(260.0, 2_000.0)),
+        );
+        let mut grid = Vec::new();
+        navigation_rows(Layout::new(&node), &mut grid);
+        assert_eq!(grid.len(), 3, "the header and two rows");
+        let status = grid[0].1[2];
+        let count = drawn_texts(section(), 260.0)
+            .into_iter()
+            .find(|(text, _)| text == "2")
+            .expect("the header's count")
+            .1;
+        assert!(
+            status.contains(count.center()),
+            "the count sits in the indicator slot: {count:?} in {status:?}"
+        );
+        for (_, slots) in &grid[1..] {
+            assert_eq!(slots[2].x, status.x, "one indicator column");
+        }
+        assert!(draws_work_spinner(&section()));
+
+        state.set_agent_activity(root, project, main.id, activity(ActivityState::Idle));
+        refresh_attention(&mut state, &mut model, &durable);
+        let names = accessible_names(&renderer, project_list(&model, &state, false, false));
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Collapse In progress, 1 agent working"),
+            "{names:?}"
+        );
+    }
+
+    /// The title is what tells two rows apart, so the place beside it gives
+    /// way first, a search highlight in the title included.
+    #[test]
+    fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
+        let (font, emphasis) = search_label_fonts(false);
+        let title = "Review agent";
+        let natural =
+            search_spans_width(title, "review", CHILD_ROW_TEXT_SIZE, font, emphasis).ceil();
+        let place = "fix-sidebar-and-a-long-checkout-name";
+        let width = natural + 40.0;
+        for query in ["", "review"] {
+            let texts = drawn_texts(titled_label(title, Some(place), query, RowInk::Full), width);
+            let (_, bounds) = texts
+                .iter()
+                .find(|(text, _)| text.starts_with(" · "))
+                .expect("the place");
+            assert!(
+                bounds.x >= natural - 1.0 || query.is_empty(),
+                "query={query:?}: the title keeps {natural}, place at {bounds:?}"
+            );
+            assert!(
+                bounds.x + bounds.width <= width + 0.5,
+                "query={query:?}: the place ellipsizes within the row: {bounds:?}"
+            );
+            assert!(bounds.width < 45.0, "query={query:?}: {bounds:?}");
+        }
     }
 
     /// A search whose only matches are working rows shows them under In
@@ -23089,7 +23286,7 @@ pub(crate) mod tests {
         );
         assert!(
             rows.iter()
-                .any(|(name, _)| name == "Open pane Agent in Cagents, agent working"),
+                .any(|(name, _)| name == "Open pane Agent in Cagents, 1 working"),
             "it is in progress instead: {rows:?}"
         );
         sidebar.state.set_agent_activity(
