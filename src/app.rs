@@ -4593,7 +4593,7 @@ pub enum Message {
     NewBrowser,
     ExternalUrlOpened(Result<(), String>),
     /// A page meant for a browser pane went to the system browser instead,
-    /// because the integrated browser is unavailable for `reason`.
+    /// because the integrated browser wasn't available for `reason`.
     #[cfg(feature = "integrated-browser")]
     BrowserFallbackOpened {
         result: Result<(), String>,
@@ -15412,7 +15412,7 @@ impl Application for Cagents {
             Message::BrowserFallbackOpened { result, reason } => {
                 self.status = Some(match result {
                     Ok(()) => TransientNotice::warning(
-                        "Opened in your system browser because the integrated browser is unavailable",
+                        "Opened in your system browser because the integrated browser wasn't available",
                     )
                     .with_details(reason.to_string()),
                     Err(error) => TransientNotice::error(error).with_details(reason.to_string()),
