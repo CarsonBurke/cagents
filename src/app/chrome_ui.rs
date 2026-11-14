@@ -247,13 +247,14 @@ mod tests {
     }
 
     #[test]
-    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+    fn tab_density_fits_four_compact_and_real_titles_when_comfortable() {
         let mut app = tab_fixture(30, 900.0);
         let (available, width) = app.tab_strip_geometry();
         assert!(
             4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
                 <= available + 0.1
         );
+        let mut app = tab_fixture(2, 1600.0);
         let id = app.durable.cards[0].id;
         app.chrome_ui
             .user_titles
@@ -294,6 +295,46 @@ mod tests {
                 >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
             "the real title allocation must fit, after its icon, padding and controls"
         );
+    }
+
+    #[test]
+    fn tab_density_compacts_overflowing_rows_even_in_wide_workspaces() {
+        for viewport in [900.0, 1500.0, 1600.0] {
+            let mut app = tab_fixture(12, viewport);
+            for card in app.durable.cards.iter() {
+                app.chrome_ui
+                    .user_titles
+                    .insert(card.id, "A long conversation title".into());
+            }
+            drop(app.sync_chrome());
+            let (available, width) = app.tab_strip_geometry();
+            assert!(width < design::TAB_MIN_WIDTH, "{viewport}: compact tabs");
+            let visible = ((available - 2.0 * crate::tab_strip::EDGE_INSET)
+                / (width + crate::tab_strip::SPACING))
+                .floor();
+            assert!(visible >= if viewport >= 1500.0 { 9.0 } else { 4.0 });
+            app.open_pane_inspector_now(app.workspace.focused().unwrap());
+            assert_eq!(app.tab_strip_geometry(), (available, width));
+        }
+    }
+
+    #[test]
+    fn tab_density_changes_at_the_rows_fit_boundary_not_a_workspace_breakpoint() {
+        let mut app = tab_fixture(2, 900.0);
+        let (_, comfortable) = app.tab_strip_geometry();
+        assert!(
+            comfortable >= design::TAB_MIN_WIDTH,
+            "few tabs fit below 1100 px"
+        );
+        let (available, _) = app.tab_strip_geometry();
+        let overhead = app.workspace.viewport_width() - available;
+        let fitting = overhead
+            + 2.0 * (comfortable + crate::tab_strip::SPACING)
+            + 2.0 * crate::tab_strip::EDGE_INSET;
+        app.workspace.resize_viewport(fitting + 0.5);
+        assert_eq!(app.tab_strip_geometry().1, comfortable);
+        app.workspace.resize_viewport(fitting - 0.5);
+        assert!(app.tab_strip_geometry().1 < design::TAB_MIN_WIDTH);
     }
 
     #[test]
@@ -2723,21 +2764,18 @@ impl Cagents {
             .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        let width = if self.workspace.viewport_width() > 0.0
-            && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
-        {
-            // Keep four compact tabs visible in a tiled workspace. Full names
-            // remain available in each tab's tooltip.
+        let count = self.workspace.order().count();
+        let comfortable = count as f32 * (desired + crate::tab_strip::SPACING)
+            + 2.0 * crate::tab_strip::EDGE_INSET;
+        let width = if comfortable > available {
+            // Compact whenever the comfortable row would scroll, regardless
+            // of the workspace width. Full names remain in the tooltips.
             let visible = self.workspace.order().count().clamp(1, 4) as f32;
             let fitting = (available / visible
                 - crate::tab_strip::SPACING
                 - 2.0 * crate::tab_strip::EDGE_INSET / visible)
                 .max(56.0);
-            if visible < 4.0 {
-                desired.min(fitting)
-            } else {
-                fitting.min(112.0)
-            }
+            fitting.min(112.0)
         } else {
             desired
         };

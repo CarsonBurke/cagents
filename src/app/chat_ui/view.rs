@@ -1262,6 +1262,11 @@ impl Cagents {
                         .card(card)
                         .map_or(self.workspace.viewport_width(), |card| card.width())
                         .min(super::layout::READING_COLUMN),
+                    if self.pane_inspector_layout(card).is_none() {
+                        crate::app::pane_inspector::TOGGLE_CLEARANCE
+                    } else {
+                        0.0
+                    },
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -2214,6 +2219,7 @@ impl Runtime {
         enter_sends: bool,
         shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
+        transcript_clearance: f32,
         place: Place,
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
@@ -2670,7 +2676,9 @@ impl Runtime {
         // narrower than the composer in a pane no wider than the column.
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
+                .padding(
+                    iced::Padding::new(step::GAP_M).right(step::GAP_M.max(transcript_clearance)),
+                )
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
         )
@@ -3053,11 +3061,13 @@ impl Runtime {
                     child
                 } else {
                     widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
+                        .padding(if index == 0 {
+                            iced::Padding::new(step::GAP_M)
+                                .bottom(0.0)
+                                .right(step::GAP_M.max(transcript_clearance))
                         } else {
-                            0.0
-                        }))
+                            iced::Padding::from([0.0, step::GAP_M])
+                        })
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
@@ -6597,6 +6607,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "Fixture".into(),
                     channel: None,
@@ -7506,6 +7517,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
+                0.0,
                 Place {
                     channel: None,
                     name: "Spacing fixture".into(),
@@ -8160,6 +8172,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -8380,6 +8393,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -8598,6 +8612,7 @@ mod tests {
                 true,
                 shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -9274,6 +9289,7 @@ mod tests {
             true,
             &shortcuts,
             600.0,
+            0.0,
             Place {
                 name: "project".into(),
                 branch: None,
@@ -9373,6 +9389,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
+                0.0,
                 Place {
                     name: "restore-fixture".into(),
                     branch: None,
@@ -9573,6 +9590,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
+                    0.0,
                     Place {
                         name: "restore-fixture".into(),
                         branch: None,
@@ -10015,6 +10033,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
+                0.0,
                 Place {
                     name: "restore-fixture".into(),
                     branch: None,
@@ -10522,6 +10541,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
+                    0.0,
                     Place {
                         name: "restore-fixture".into(),
                         branch: None,
@@ -10829,6 +10849,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 360.0,
+                0.0,
                 Place {
                     name: "native-fixture".into(),
                     branch: None,
@@ -11757,6 +11778,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width.min(super::super::layout::READING_COLUMN),
+                0.0,
                 Place {
                     channel: None,
                     name: "Fixture".into(),
@@ -11822,6 +11844,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 450.0,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -12006,6 +12029,7 @@ mod tests {
             true,
             &shortcuts,
             width,
+            0.0,
             Place {
                 channel: Some("A long conversation name".into()),
                 name: "A long repository name".into(),
@@ -12299,6 +12323,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width,
+                    0.0,
                     Place {
                         channel: None,
                         name: "Fixture".into(),
@@ -12328,6 +12353,261 @@ mod tests {
                 assert_eq!(bounds.x, step::GAP_M);
                 assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
             }
+        }
+    }
+
+    fn inspector_chat_fixture(width: f32) -> (Cagents, CardId) {
+        let mut items = frame_cost::transcript(1);
+        items.truncate(1);
+        if let ItemContent::Text { text, .. } = &mut items[0].content {
+            *text = format!("{}restart safety.", "Review the retry change. ".repeat(12));
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        runtime.target.card = card;
+        runtime.composer = text_editor::Content::with_text("retained draft");
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(runtime.session.clone());
+        app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.workspace.resize_viewport(width));
+        app.sync_pane_inspectors();
+        (app, card)
+    }
+
+    #[test]
+    fn inspector_toggle_clearance_keeps_transcript_rows_out_of_its_footprint() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Bounds {
+            toggle: widget::Id,
+            row: Option<iced::Rectangle>,
+            composer_id: widget::Id,
+            composer: Option<iced::Rectangle>,
+            button: Option<iced::Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&scroll::item_id("0-prompt")) {
+                    self.row = Some(bounds);
+                }
+                if id == Some(&self.composer_id) {
+                    self.composer = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == Some(&self.toggle) {
+                    self.button = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [420.0, 720.0, 1440.0] {
+            let (app, card) = inspector_chat_fixture(width);
+            let mut element = app.card_view(card, true, false);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+            );
+            let mut bounds = Bounds {
+                toggle: card_control_id(card, "inspector.toggle"),
+                composer_id: card_control_id(card, "chat-composer-surface"),
+                row: None,
+                composer: None,
+                button: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let row = bounds.row.expect("rendered first user row");
+            let button = bounds.button.expect("floating toggle");
+            assert!(
+                row.x + row.width + step::GAP_S <= button.x + 0.1,
+                "{width}: {row:?} / {button:?}"
+            );
+            let composer = bounds.composer.expect("composer remains mounted");
+            let reading = width.min(super::super::layout::READING_COLUMN);
+            assert_eq!(composer.x, (width - reading) / 2.0 + step::GAP_M);
+            assert_eq!(composer.width, reading - 2.0 * step::GAP_M);
+        }
+    }
+
+    #[test]
+    fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let (mut app, card) = inspector_chat_fixture(1440.0);
+        app.open_pane_inspector_now(card);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let ui = UserInterface::build(
+            app.card_view(card, true, false),
+            iced::Size::new(1440.0, 800.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let nodes = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .collect::<Vec<_>>();
+        let header = nodes
+            .iter()
+            .find(|node| {
+                node.node()
+                    .label()
+                    .is_some_and(|label| label.starts_with("Source control section"))
+            })
+            .and_then(|node| node.node().bounds())
+            .expect("source-control heading button");
+        let toggle = nodes
+            .iter()
+            .find(|node| {
+                node.node()
+                    .label()
+                    .is_some_and(|label| label.starts_with("Toggle inspector"))
+            })
+            .and_then(|node| node.node().bounds())
+            .expect("inspector toggle button");
+        assert!(
+            toggle.x0 - header.x1 >= f64::from(step::GAP_S) - 0.1,
+            "heading {header:?} stops a standard gap before toggle {toggle:?}"
+        );
+    }
+
+    #[test]
+    fn inspector_overlay_fills_its_pane_and_escape_restores_the_retained_toggle_focus() {
+        use iced::advanced::widget::{Operation, operation};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        struct Panel {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
+        impl Operation for Panel {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            width: f32,
+            cache: Cache,
+            task: Task<Message>,
+            renderer: &mut cosmic::Renderer,
+        ) -> (Cache, Option<widget::Id>, Option<iced::Rectangle>) {
+            let mut ui = UserInterface::build(
+                app.card_view(card, true, false),
+                iced::Size::new(width, 800.0),
+                cache,
+                renderer,
+            );
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                while let Some(action) = executor.block_on(stream.next()) {
+                    if let iced::runtime::Action::Widget(mut op) = action {
+                        loop {
+                            ui.operate(renderer, &mut op);
+                            match op.finish() {
+                                operation::Outcome::Chain(next) => op = next,
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            let focused = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let sink = focused.clone();
+            let mut find = operation::map(operation::focusable::find_focused(), move |id| {
+                *sink.lock().unwrap() = Some(id)
+            });
+            ui.operate(renderer, &mut find);
+            let _ = find.finish();
+            let mut panel = Panel {
+                id: card_control_id(card, "inspector.panel"),
+                bounds: None,
+            };
+            ui.operate(renderer, &mut panel);
+            let id = focused.lock().unwrap().clone();
+            (ui.into_cache(), id, panel.bounds)
+        }
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [420.0, 600.0] {
+            let (mut app, card) = inspector_chat_fixture(width);
+            let (cache, _, _) = frame(&app, card, width, Cache::new(), Task::none(), &mut renderer);
+            let opened = app.set_pane_inspector_open(card, true);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, bounds) = frame(
+                &app,
+                card,
+                width,
+                cache,
+                Task::batch([opened, finished]),
+                &mut renderer,
+            );
+            assert_eq!(focused, Some(card_control_id(card, "inspector.toggle")));
+            let bounds = bounds.expect("actual overlay panel");
+            assert_eq!(
+                (bounds.x, bounds.width),
+                (0.0, width),
+                "overlay fills the pane"
+            );
+            let closed = app.update(Message::KeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                },
+                captured: false,
+            });
+            assert!(!app.pane_inspectors.is_open(card));
+            assert!(
+                app.pane_content_inputs_blocked(card),
+                "closing slide still covers content"
+            );
+            let (cache, _, _) = frame(&app, card, width, cache, closed, &mut renderer);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, panel) = frame(&app, card, width, cache, finished, &mut renderer);
+            assert!(panel.is_none());
+            assert_eq!(
+                focused,
+                Some(card_control_id(card, "inspector.toggle")),
+                "Escape returns focus after the slide"
+            );
+            let (_, focused, _) = frame(&app, card, width, cache, Task::none(), &mut renderer);
+            assert_eq!(
+                focused,
+                Some(card_control_id(card, "inspector.toggle")),
+                "focus survives the next retained frame"
+            );
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("retained chat")
+            };
+            assert_eq!(runtime.composer.text(), "retained draft");
         }
     }
 
@@ -12413,6 +12693,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width.min(super::super::layout::READING_COLUMN),
+                    0.0,
                     Place {
                         channel: None,
                         name: "Fixture".into(),
@@ -13926,6 +14207,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -15718,6 +16000,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -15953,6 +16236,7 @@ mod tests {
                 true,
                 &shortcuts,
                 viewport.width,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -16054,6 +16338,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     width,
+                    0.0,
                     Place {
                         name: "fixture".into(),
                         branch: None,
@@ -16112,6 +16397,7 @@ mod tests {
                         true,
                         &shortcuts,
                         width,
+                        0.0,
                         Place {
                             name: "Fixture".into(),
                             channel: None,

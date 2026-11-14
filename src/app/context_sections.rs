@@ -268,7 +268,13 @@ impl Cagents {
         panes.push(self.workspace_pane(card, width, work.scope.clone()));
         panes.extend(self.language_server_panes(card));
         if let Some(first) = panes.first_mut() {
-            first.controls.push(toggle);
+            first.controls.push(
+                widget::container(toggle)
+                    // The row supplies XXS between its existing controls.
+                    // Leave a full standard gap before the inspector toggle.
+                    .padding(Padding::ZERO.left(space::S - space::XXS))
+                    .into(),
+            );
         }
         let shared = panes
             .iter()

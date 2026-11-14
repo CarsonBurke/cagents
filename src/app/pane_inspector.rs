@@ -23,6 +23,9 @@ pub(super) const PANE_CONTENT_MIN_WIDTH: f32 = 360.0;
 /// The gap between the floating toggle and the corner of the pane's content.
 const TOGGLE_INSET: f32 = space::XS;
 
+/// Content stops a standard gap before the floating toggle's leading edge.
+pub(super) const TOGGLE_CLEARANCE: f32 = TOGGLE_INSET + design::PRIMARY_CONTROL_SIZE + space::S;
+
 /// One pane's inspector.
 #[derive(Debug, Clone, Copy, Default)]
 struct PaneState {
@@ -263,9 +266,14 @@ impl PaneInspectors {
 
 impl Cagents {
     /// The width a pane gives its inspector: the one width every inspector
-    /// shares, narrowed as far as the inspector's minimum to leave the
-    /// pane's content its own, and never more than the pane.
+    /// shares when docked, narrowed to leave room for content. An overlay
+    /// instead occupies the whole pane, including through its closing slide.
     pub(super) fn pane_inspector_width(&self, card: CardId) -> f32 {
+        if self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
+            && let Some(width) = pane_width(&self.workspace, card)
+        {
+            return width;
+        }
         let width = self
             .settings
             .inspector_width
@@ -311,6 +319,8 @@ impl Cagents {
     }
 
     pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
+        let closing_overlay =
+            !open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay);
         let narrow = self.pane_too_narrow(card);
         if !self.pane_inspectors.set_open(
             card,
@@ -326,7 +336,9 @@ impl Cagents {
         let binding = self.rebind_source_control();
         // An inspector opened over the pane's content takes the keyboard
         // from it, so typing never lands in content it hides.
-        let focus = if open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay) {
+        let focus = if closing_overlay
+            || (open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay))
+        {
             iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
                 .map(cosmic::Action::App)
         } else {
@@ -341,13 +353,27 @@ impl Cagents {
     }
 
     pub(super) fn advance_pane_inspector_transitions(&mut self, now: Instant) -> Task<Message> {
+        // The floating toggle replaces the outgoing panel's toggle once the
+        // slide ends. Focus that newly mounted control, unless the user has
+        // moved to another pane or opened a modal in the meantime.
+        let closing_overlay = self.workspace.focused().filter(|card| {
+            !self.modal_is_open()
+                && !self.pane_inspectors.is_open(*card)
+                && self.pane_inspector_layout(*card) == Some(InspectorLayout::Overlay)
+        });
         if !self.pane_inspectors.advance(now) {
             return Task::none();
         }
         self.sync_pane_inspectors();
         // A frame skips the rebind, and a closed inspector no longer pins
         // the panels to the work it showed.
-        self.rebind_source_control()
+        let focus = closing_overlay
+            .filter(|card| self.pane_inspector_layout(*card).is_none())
+            .map_or_else(Task::none, |card| {
+                iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
+                    .map(cosmic::Action::App)
+            });
+        Task::batch([self.rebind_source_control(), focus])
     }
 
     /// Runs at the tail of every update, before the source-control rebind;
@@ -527,6 +553,7 @@ impl Cagents {
             .height(Length::Fill),
         )
         .class(cosmic::theme::Container::Background)
+        .id(card_control_id(card, "inspector.panel"))
         .width(width)
         .height(Length::Fill)
         .into()
