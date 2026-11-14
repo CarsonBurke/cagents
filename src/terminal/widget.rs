@@ -1026,7 +1026,8 @@ struct WidgetState {
     /// The cell the blink phase is anchored to.
     blink_anchor: Option<(u16, u16)>,
     /// When the cursor stops blinking and rests lit: the blink's timeout
-    /// after it last moved or regained focus. `None` while nothing blinks.
+    /// after it last moved, took a key or regained focus. `None` while
+    /// nothing blinks.
     blink_rests_at: Option<Instant>,
     /// Text being composed by the input method, held so the shell can paint it
     /// at the cursor until it is committed.
@@ -1098,6 +1099,18 @@ impl WidgetState {
         if let Some(selection) = &mut self.selection {
             selection.head = cell;
         }
+    }
+
+    /// Restarts the blink lit, as typing does even when the cursor stays
+    /// where it was. Returns whether a frame is needed to show it: the cursor
+    /// had come to rest, or was in its dark phase.
+    fn restart_blink(&mut self) -> bool {
+        let resting = self.blink_rests_at.is_some() && self.blink_since.is_none();
+        let needs_frame = resting || self.cursor_dark;
+        self.blink_rests_at = None;
+        self.blink_since = None;
+        self.cursor_dark = false;
+        needs_frame
     }
 
     /// Advances the cursor-blink phase to the frame instant `now` and returns
@@ -2582,7 +2595,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     *repeat,
                 );
                 match self.handle.key(input) {
-                    Ok(()) => shell.capture_event(),
+                    Ok(()) => {
+                        if state.restart_blink() {
+                            shell.request_redraw();
+                        }
+                        shell.capture_event();
+                    }
                     Err(error) => self.publish_error(error, shell),
                 }
             }
@@ -2979,6 +2997,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     {
                         self.publish_error(error, shell);
                     }
+                    state.restart_blink();
                     shell.capture_event();
                     shell.request_redraw();
                 }
@@ -4337,6 +4356,33 @@ mod tests {
         );
         state.advance_blink(later + BLINK_PHASE, Some((3, 5)));
         assert!(state.cursor_dark);
+    }
+
+    #[test]
+    fn typing_wakes_a_resting_cursor_where_it_stands() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((3, 4));
+        // Nothing has blinked yet, so a key needs no frame of its own.
+        assert!(!state.restart_blink());
+        let mut frame = start;
+        while let Some(next) = state.advance_blink(frame, anchor) {
+            frame = next;
+        }
+        // A key the child answers without moving the cursor, such as
+        // Backspace at the start of a prompt, still restarts the blink lit.
+        assert!(state.restart_blink());
+        let typed = frame + BLINK_PHASE * 3;
+        assert_eq!(
+            state.advance_blink(typed, anchor),
+            Some(typed + BLINK_PHASE)
+        );
+        assert!(!state.cursor_dark);
+        state.advance_blink(typed + BLINK_PHASE, anchor);
+        assert!(state.cursor_dark);
+        // Typing during the dark phase brings the cursor straight back.
+        assert!(state.restart_blink());
+        assert!(!state.cursor_dark);
     }
 
     #[test]

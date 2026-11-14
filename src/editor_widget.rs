@@ -2621,6 +2621,10 @@ where
                     }
                     Ime::Commit(text) => {
                         shell.publish(on_edit(Action::Edit(Edit::Paste(Arc::new(text)))));
+
+                        if let Some(focus) = &mut state.focus {
+                            focus.updated_at = Instant::now();
+                        }
                     }
                 },
                 Update::Binding(binding) => {
