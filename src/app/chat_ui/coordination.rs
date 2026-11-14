@@ -1391,7 +1391,7 @@ impl Runtime {
         let painted = disclosure::Painted::on(transcript_surface);
         let mut line: Vec<Element<'static, Message>> = if let Some(destination) = &row.destination {
             // A destination keeps the room approved for narrow spawn rows.
-            // The identity/task preview and status fade in the remaining room;
+            // The identity/task preview fades and the status cuts to fit;
             // both remain whole in the row's tooltip and accessible name.
             vec![
                 lead,
@@ -1430,23 +1430,46 @@ impl Runtime {
                 ),
             ]
         };
-        if row.state.live {
-            line.push(crate::ui_controls::activity_spinner(
-                f32::from(design::COMPACT_ICON_SIZE),
-                design::muted_color,
-            ));
-        }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
             Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        line.push(if row.destination.is_some() {
-            painted.fade(status)
+        if row.destination.is_some() {
+            let mut trailing: Vec<Element<'static, Message>> = Vec::new();
+            if row.state.live {
+                trailing.push(crate::ui_controls::activity_spinner(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::muted_color,
+                ));
+            }
+            trailing.push(
+                status
+                    .ellipsize(iced::advanced::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .into(),
+            );
+            line.push(
+                widget::container(
+                    widget::row::with_children(trailing)
+                        .spacing(step::GAP_S)
+                        .align_y(Alignment::Center),
+                )
+                .align_right(Length::Fill)
+                .clip(true)
+                .into(),
+            );
         } else {
-            status.into()
-        });
+            if row.state.live {
+                line.push(crate::ui_controls::activity_spinner(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::muted_color,
+                ));
+            }
+            line.push(status.into());
+        }
         let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
