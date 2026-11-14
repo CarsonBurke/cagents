@@ -2987,7 +2987,7 @@ mod tests {
     /// subagent's 11 KB heredoc reached the parent conversation this way and
     /// drew every line of it under a collapsed group.
     #[test]
-    fn a_notice_named_by_a_whole_command_shows_one_line_and_a_bounded_body() {
+    fn notice_heading_preserves_first_line_for_fade_and_multiline_detail() {
         let command = format!(
             "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'\n{}EOF\npython3 /var/tmp/fw16-audit/sampler.py 2 10",
             "def sample(path):\n    with open(path) as f:\n        return f.read()\n\n".repeat(160)
@@ -3000,18 +3000,7 @@ mod tests {
                 "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'",
                 command.split_once('\n').unwrap().1,
             ),
-            (
-                one_line.as_str(),
-                "exit code 0",
-                &*format!(
-                    "{}…",
-                    one_line
-                        .chars()
-                        .take(view::NOTICE_HEADING_CHARS)
-                        .collect::<String>()
-                ),
-                one_line.trim(),
-            ),
+            (one_line.as_str(), "exit code 0", one_line.trim(), ""),
         ] {
             let (mut runtime, _handle) = literal_runtime(ItemContent::Delivery {
                 kind: chat::DeliveryKind::Notice,
@@ -3031,7 +3020,11 @@ mod tests {
             let full = notice.body.full.plain();
             assert!(full.starts_with(lead), "the whole name stays on demand");
             assert!(full.ends_with(body));
-            assert!(notice.body.long, "a long name folds until it is opened");
+            assert_eq!(
+                notice.body.long,
+                !lead.is_empty(),
+                "only multiline details need a preview"
+            );
             let shown = notice.body.shown(false).plain();
             assert!(shown.lines().count() <= view::NOTICE_LINES, "{shown}");
             assert!(shown.chars().count() <= view::NOTICE_CHARS, "{shown}");
@@ -3046,7 +3039,12 @@ mod tests {
             ("Monitor event: \"Build\"", "warning: unused import"),
         ] {
             let (heading, shown) = literal_content::notice_parts(summary, body);
-            assert_eq!((&*heading, &*shown), (summary, body));
+            let expected = if summary.starts_with("Monitor event: ") {
+                "Build"
+            } else {
+                summary
+            };
+            assert_eq!((&*heading, &*shown), (expected, body));
         }
         let (heading, shown) = literal_content::notice_parts("Done\r\n\r\nexit 0\r\n", "log");
         assert_eq!((&*heading, &*shown), ("Done", "exit 0\n\nlog"));

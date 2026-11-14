@@ -230,6 +230,9 @@ class Evidence(unittest.TestCase):
             "STUB_TASK": str(self.task),
             "CLAUDE_CONFIG_DIR": "/must/not/reach/the/fixture",
             "CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.native_lock),
+            # One slot, so the lock alone says whether a session runs; the
+            # slot tests below raise it.
+            "CAGENTS_EVIDENCE_NATIVE_SLOTS": "1",
             "CAGENTS_BUILD_LOCK": str(self.cargo_lock),
             "CAGENTS_BUILD_SLOTS": "1",
             # These fixtures exercise this host's queue; Rust never compiles.
@@ -1115,9 +1118,52 @@ class Evidence(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.run_tool("start", "after", "--wait-lock", "0", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("native lock stayed busy", result.stderr)
-        self.assertIn(f"scripts/lock-holders {self.native_lock}", result.stderr)
+        self.assertIn("every native slot stayed busy for 0 seconds", result.stderr)
+        self.assertIn(f"scripts/lock-holders {self.native_lock})", result.stderr)
         self.assertFalse((self.logs / "kwin").exists())
+
+    def test_a_session_takes_a_free_slot_beside_a_busy_one(self) -> None:
+        self.built()
+        slots = {"CAGENTS_EVIDENCE_NATIVE_SLOTS": "2"}
+        second = Path(f"{self.native_lock}.1")
+        with open(self.native_lock, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.run_tool("start", "after", "--wait-lock", "0", extra=slots)
+            self.assertFalse(self.lock_is_free(second))
+            self.assertNotIn(str(second), (self.logs / "kwin-fds").read_text())
+            status = self.run_tool("status", extra=slots).stdout
+            self.assertIn("native slots: 0 free of 2; held: 0 1", status)
+            self.assertIn("this session: slot 1", status)
+            # Neither the queue nor the other slot stays open in the session.
+            supervisor = (self.task / "session" / "pid").read_text().strip()
+            opened = {os.readlink(entry) for entry in Path(f"/proc/{supervisor}/fd").iterdir()}
+            self.assertIn(str(second), opened)
+            self.assertNotIn(str(self.native_lock), opened)
+            self.assertNotIn(f"{self.native_lock}.queue", opened)
+            self.run_tool("stop", extra=slots)
+        self.assertTrue(self.lock_is_free(second))
+        self.assertIn("native slots: 2 free of 2", self.run_tool("status", extra=slots).stdout)
+
+    def test_start_names_every_busy_slot(self) -> None:
+        self.built()
+        second = Path(f"{self.native_lock}.1")
+        with open(self.native_lock, "a") as lock, open(second, "a") as other:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.flock(other, fcntl.LOCK_EX)
+            result = self.run_tool("start", "after", "--wait-lock", "0", check=False,
+                                   extra={"CAGENTS_EVIDENCE_NATIVE_SLOTS": "2"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"every native slot stayed busy for 0 seconds (see scripts/lock-holders {self.native_lock} {second})",
+                      result.stderr)
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_a_session_cannot_ask_to_hold_its_slot_for_long(self) -> None:
+        self.built()
+        result = self.run_tool("start", "after", "--limit", "1801", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("at most 1800 seconds", result.stderr)
+        self.assertFalse((self.task / "session" / "pid").exists())
+        self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_session_lifecycle_holds_the_lock_isolates_state_and_ends_its_processes(self) -> None:
         checkout = self.built()
@@ -1856,7 +1902,7 @@ REMOTE_TOOL = """
         # More than one line, written apart, as the real status is: a reader
         # that stops at the first ends it with SIGPIPE.
         status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
-                sleep 0.2; echo "native lock: free" ;;
+                sleep 0.2; echo "native slots: 3 free of 3" ;;
         shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
         build) printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2" ;;

@@ -24,6 +24,8 @@ enum Outcome {
     Observed,
     Failed,
     Busy,
+    /// An account or worktree operation holds the paths it would touch.
+    Deferred,
 }
 
 #[derive(Default)]
@@ -84,6 +86,113 @@ impl Wake {
             drop(self.changed.wait_while(state, unchanged));
         }
     }
+}
+
+/// How long an account or worktree reservation waits for provider listings
+/// already in flight on its paths, which end within the census timeout.
+const PROBE_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Provider observations in flight. They run outside the control gate, so
+/// each is admitted under it the way a launch is: refused while an account or
+/// worktree reservation covers its process's homes or directory. A
+/// reservation, installed under the writer, then waits for the ones on its
+/// paths, which were all admitted before it.
+#[derive(Default)]
+pub(super) struct Probes {
+    running: Mutex<BTreeMap<u64, Probe>>,
+    next: std::sync::atomic::AtomicU64,
+    finished: Condvar,
+}
+
+/// What an observation may touch: its process's directory and account homes.
+#[derive(Clone)]
+pub(super) struct Probe {
+    pub working_directory: std::path::PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub unset: BTreeSet<String>,
+}
+
+pub(super) struct ProbeLease {
+    probes: Arc<Probes>,
+    id: u64,
+}
+
+impl Drop for ProbeLease {
+    fn drop(&mut self) {
+        self.probes
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+        self.probes.finished.notify_all();
+    }
+}
+
+impl Probes {
+    pub(super) fn admit(self: &Arc<Self>, probe: Probe) -> ProbeLease {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, probe);
+        ProbeLease {
+            probes: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// The observations running now.
+    pub(super) fn running(&self) -> Vec<(u64, Probe)> {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, probe)| (*id, probe.clone()))
+            .collect()
+    }
+
+    /// Waits up to `PROBE_PATIENCE` for the observations `ids` to end, and
+    /// returns those that have not.
+    pub(super) fn wait_for(&self, ids: &BTreeSet<u64>) -> Vec<Probe> {
+        self.wait_within(ids, PROBE_PATIENCE)
+    }
+
+    fn wait_within(&self, ids: &BTreeSet<u64>, patience: Duration) -> Vec<Probe> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        let (running, _) = self
+            .finished
+            .wait_timeout_while(running, patience, |running| {
+                ids.iter().any(|id| running.contains_key(id))
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        ids.iter()
+            .filter_map(|id| running.get(id).cloned())
+            .collect()
+    }
+}
+
+/// Admits an observation of `process`, as a launch into its directory and
+/// homes would be, unless a reservation covers them. The caller holds the
+/// control gate, which orders this against every reservation's install.
+fn admit(host: &SharedHost, probes: &Arc<Probes>, process: &AgentProcess) -> Option<ProbeLease> {
+    let launch = &process.launch;
+    let unset = crate::account::launch_credential_overrides(launch);
+    super::account_lifecycle::ensure_launch(
+        host,
+        &launch.working_directory,
+        &launch.environment,
+        &unset,
+        false,
+    )
+    .ok()?;
+    Some(probes.admit(Probe {
+        working_directory: launch.working_directory.clone(),
+        environment: launch.environment.clone(),
+        unset,
+    }))
 }
 
 #[derive(Clone)]
@@ -169,6 +278,7 @@ impl Schedule {
                     (INTERVAL * (1 << entry.failures.min(4))).min(MAX_BACKOFF)
                 }
                 Outcome::Busy => Duration::from_millis(500),
+                Outcome::Deferred => INTERVAL,
             };
             entry.due = now + delay;
         }
@@ -349,16 +459,14 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
     let Some(host) = host.upgrade() else {
         return Outcome::Failed;
     };
-    let (gate, observer) = {
+    let (gate, observer, probes) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
             Arc::clone(&state.control_gate),
             Arc::clone(&state.agent_observer),
+            Arc::clone(&state.agent_probes),
         )
     };
-    // Keep provider observation and owner apply inside upgrade admission, but
-    // never hold HostState during provider I/O or waiting on the PTY owner.
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
     let current = || {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         !state.shutting_down
@@ -369,10 +477,32 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
                 .is_some_and(|record| record.handle.same_worker(&candidate.handle))
             && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
     };
-    if !current() {
-        return Outcome::Failed;
-    }
-    let observation = observer.try_observe(&candidate.process);
+    // Provider I/O can take seconds, so it runs outside the control gate and
+    // shutdown or an upgrade never waits for it. It is admitted under the
+    // gate like a launch into the same homes and directory, and its effects
+    // apply under it only while the observed process is still current.
+    // HostState is never held during provider I/O or while waiting on the PTY
+    // owner.
+    let observation = {
+        let lease = {
+            let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+            if !current() {
+                return Outcome::Failed;
+            }
+            // An account or worktree operation holds the paths; look again
+            // once it is likely done, without counting this as a failure.
+            let Some(lease) = admit(&host, &probes, &candidate.process) else {
+                return Outcome::Deferred;
+            };
+            lease
+        };
+        let observation = observer.try_observe(&candidate.process);
+        // Released as soon as the listing ends, so a reservation waiting for
+        // it is not also held up while its effects apply.
+        drop(lease);
+        observation
+    };
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
     if !current() {
         return Outcome::Failed;
     }
@@ -605,6 +735,93 @@ mod tests {
         assert!(schedule.deadline().is_none(), "no agents means no timer");
         assert!(schedule.next(now).is_none());
         let _ = first.handle.shutdown();
+    }
+
+    fn probe(directory: &str) -> Probe {
+        Probe {
+            working_directory: directory.into(),
+            environment: BTreeMap::new(),
+            unset: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn waiting_for_observations_returns_only_those_that_outlast_it() {
+        let probes = Arc::new(Probes::default());
+        assert!(
+            probes
+                .wait_within(&BTreeSet::new(), Duration::ZERO)
+                .is_empty()
+        );
+
+        // Released while the wait runs: generous patience, so load cannot
+        // turn the release into a timeout.
+        let brief = probes.admit(probe("/brief"));
+        let (waiting, started) = crossbeam_channel::bounded(1);
+        let releaser = thread::spawn(move || {
+            started.recv().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            drop(brief);
+        });
+        let ids = probes.running().into_iter().map(|(id, _)| id).collect();
+        waiting.send(()).unwrap();
+        assert!(probes.wait_within(&ids, Duration::from_secs(60)).is_empty());
+        releaser.join().unwrap();
+
+        // One not asked about is neither waited for nor returned.
+        let stuck = probes.admit(probe("/stuck"));
+        let ids: BTreeSet<_> = probes.running().into_iter().map(|(id, _)| id).collect();
+        let unrelated = probes.admit(probe("/unrelated"));
+        let remaining = probes.wait_within(&ids, Duration::from_millis(10));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].working_directory,
+            std::path::Path::new("/stuck")
+        );
+        drop(stuck);
+        assert!(probes.wait_within(&ids, Duration::ZERO).is_empty());
+        drop(unrelated);
+        assert!(probes.running().is_empty());
+    }
+
+    #[test]
+    fn an_observation_is_admitted_only_outside_reserved_homes_and_holds_a_lease() {
+        use crate::account::{Account, home::Homes, registry::Store};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("claude-home");
+        std::fs::create_dir(&home).unwrap();
+        let candidate = candidate();
+        let mut process = candidate.process.clone();
+        process.launch.working_directory = root.path().into();
+        process.launch.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_str().unwrap().into()),
+            ("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into()),
+        ]);
+        let host = super::super::account_lifecycle::tests::host();
+        let probes = Arc::clone(&host.lock().unwrap().agent_probes);
+
+        let lease = admit(&host, &probes, &process).expect("no reservation");
+        assert_eq!(probes.running().len(), 1);
+        drop(lease);
+        assert!(probes.running().is_empty());
+
+        let reservation = super::super::account_lifecycle::Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                home.clone(),
+            )],
+            Store::at(root.path().join("registry")),
+            &Homes::at(root.path().join("homes")),
+        )
+        .unwrap();
+        assert!(admit(&host, &probes, &process).is_none());
+        assert!(probes.running().is_empty());
+        drop(reservation);
+        assert!(admit(&host, &probes, &process).is_some());
+        let _ = candidate.handle.shutdown();
     }
 
     #[test]

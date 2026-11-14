@@ -162,6 +162,33 @@ pub struct EdgeChanges {
     pub effects: EditEffects,
 }
 
+/// A title edge may use the metadata-only projector only when its canonical
+/// effects contain no other work. Scoped recovery or lifecycle effects still
+/// need the complete reconciliation, even when the original edit was a title.
+fn channel_title_only(
+    edit: &ModelEdit,
+    effects: &EditEffects,
+    views: &ViewChanges,
+) -> Option<ChannelId> {
+    let (ModelEdit::RetitleChannel { id, .. } | ModelEdit::SuggestChannelTitle { id, .. }) = edit
+    else {
+        return None;
+    };
+    (effects.views.is_empty()
+        && effects.closed.is_empty()
+        && effects.projects.is_empty()
+        && effects.removed_projects.is_empty()
+        && effects.removed_channels.is_empty()
+        && effects.navigation_orders.is_empty()
+        && effects.agents.is_empty()
+        && effects.removed_agents.is_empty()
+        && effects.channels.iter().all(|channel| channel.id == *id)
+        && views.views.is_empty()
+        && views.removed.is_empty()
+        && views.absent.is_empty())
+    .then_some(*id)
+}
+
 /// Metadata rows have independent clocks: a newer receipt for one scope must
 /// not discard a delayed observer edge for a different channel or project.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1222,6 +1249,7 @@ impl Cagents {
                 };
                 let transferred =
                     operation.and_then(|id| self.shared_views.requested_transfer_card(id));
+                let title = channel_title_only(&edit, &receipt.effects, &views);
                 let Some(result) = self.install_changed_edge(
                     receipt.sequence,
                     &edit,
@@ -1258,7 +1286,10 @@ impl Cagents {
                     }
                     _ => Task::none(),
                 };
-                Task::batch([result, finish, self.reconcile_workspace_model()])
+                let projected = title
+                    .and_then(|id| self.absorb_channel_title(id))
+                    .unwrap_or_else(|| self.reconcile_workspace_model());
+                Task::batch([result, finish, projected])
             }
             ModelUpdate::ScopeConflicted {
                 identity,
@@ -1355,7 +1386,9 @@ impl Cagents {
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
-                Task::batch([closed, self.reconcile_workspace_model()])
+                let reconciled = self.reconcile_workspace_model();
+                self.sweep_empty_channels();
+                Task::batch([closed, reconciled])
             }
             ModelUpdate::RetirementAnswered { .. } => {
                 unreachable!("a retirement answer is applied as the snapshot it carries")
@@ -1552,6 +1585,12 @@ impl Cagents {
         if let Some(changes) = changes {
             return self.apply_changed_edge(sequence, &edit, changes);
         }
+        if let ModelEdit::RetitleChannel { id, .. } | ModelEdit::SuggestChannelTitle { id, .. } =
+            &edit
+            && let Some(task) = self.absorb_channel_title(*id)
+        {
+            return task;
+        }
         let removed = closing.map_or_else(Task::none, |repository| {
             self.close_shared_project(&repository)
         });
@@ -1584,9 +1623,15 @@ impl Cagents {
         edit: &ModelEdit,
         changes: EdgeChanges,
     ) -> Task<Message> {
+        let title = channel_title_only(edit, &changes.effects, &changes.views);
         let Some(installed) = self.install_changed_edge(sequence, edit, changes) else {
             return Task::none();
         };
+        if let Some(id) = title
+            && let Some(title) = self.absorb_channel_title(id)
+        {
+            return Task::batch([installed, title]);
+        }
         Task::batch([installed, self.reconcile_workspace_model()])
     }
 
@@ -1813,6 +1858,41 @@ impl Cagents {
             self.shared_views.view_sequences.insert(scope, sequence);
         }
         changed
+    }
+
+    /// Shows a channel's new name from an already folded title edge.
+    ///
+    /// A name changes no project, channel membership, view or agent, which
+    /// are everything [`Self::reconcile_workspace_model`] projects, so only
+    /// the channel itself is absorbed rather than every view the window
+    /// holds. Its save waits like a navigation save: the registry already
+    /// holds the name, and a burst of renames is saved once.
+    ///
+    /// `None` leaves a channel this window does not show as an ordinary
+    /// member, such as one it has yet to adopt or is deleting, to the full
+    /// reconciliation.
+    fn absorb_channel_title(&mut self, id: ChannelId) -> Option<Task<Message>> {
+        if self.channel_ui.is_deleting(id) || self.channel_ui.was_deleted(id) {
+            return None;
+        }
+        let index = self
+            .durable
+            .channels
+            .iter()
+            .position(|local| local.id == id)?;
+        let shared = self.workspace_model.channel(id)?.clone();
+        let mut tasks = Vec::new();
+        if self.absorb_shared_channel(index, &shared) {
+            self.sort_durable_channels();
+            self.refresh_sidebar_channels();
+            tasks.push(self.sync_chrome());
+            tasks.push(self.save_navigation_soon());
+        }
+        // A manual name ends a pending suggestion, and a name arriving can
+        // release one this window was holding back.
+        self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
+        Some(Task::batch(tasks))
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
@@ -6164,6 +6244,100 @@ mod tests {
             .channels
             .push(shared(id, repository, &local.title, ordinal));
         ModelUpdate::Ranked { channel: id, model }
+    }
+
+    /// The real observer and publisher deliver canonical effects, rather
+    /// than the legacy Edited message used by metadata-only unit fixtures.
+    #[test]
+    fn delta_channel_titles_save_once_per_burst_and_keep_canonical_names() {
+        use crate::workspace_model::views::View;
+        for committed in [false, true] {
+            let (mut app, project, repository) = app_with_project();
+            let channel = ChannelId::new();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(local(channel, project, "Original", 0));
+            app.workspace_model = registry(vec![shared(channel, &repository, "Original", 0)]);
+            app.workspace_model.views.push(View::empty(channel));
+            let identity = app.workspace_model.identity;
+            let before = app.durable.clone();
+            let generation = app.navigation_save_generation;
+            let saved = super::super::terminal_output_tests::persists();
+            for index in 0..5 {
+                let sequence = 10 + index;
+                let title = format!("Renamed {index}");
+                let edit = ModelEdit::RetitleChannel {
+                    id: channel,
+                    title: title.clone(),
+                };
+                let effects = EditEffects {
+                    channels: vec![shared(channel, &repository, &title, 0)],
+                    ..Default::default()
+                };
+                let update = if committed {
+                    ModelUpdate::Committed {
+                        receipt: EditReceipt {
+                            identity,
+                            sequence,
+                            effects,
+                        },
+                        edit,
+                        views: ViewChanges::default(),
+                    }
+                } else {
+                    ModelUpdate::Changed {
+                        sequence,
+                        edit,
+                        changes: EdgeChanges {
+                            identity: Some(identity),
+                            effects,
+                            ..Default::default()
+                        },
+                    }
+                };
+                drop(app.apply_workspace_model_update(update));
+                assert_eq!(app.workspace_model.channel(channel).unwrap().title, title);
+                assert_eq!(app.durable.channels[0].title, title);
+                assert!(
+                    app.navigation_save_pending,
+                    "the canonical title is saved soon"
+                );
+            }
+            assert_eq!(app.navigation_save_generation, generation.wrapping_add(1));
+            assert_eq!(super::super::terminal_output_tests::persists(), saved);
+            assert_eq!(app.durable.cards, before.cards);
+            assert_eq!(app.durable.card_scopes, before.card_scopes);
+            // A rejected suggestion's request text is not canonical. Empty
+            // effects preserve the manually chosen name on both paths.
+            let edit = ModelEdit::SuggestChannelTitle {
+                id: channel,
+                title: "Refused suggestion".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            };
+            let update = if committed {
+                ModelUpdate::Committed {
+                    receipt: EditReceipt {
+                        identity,
+                        sequence: 15,
+                        effects: EditEffects::default(),
+                    },
+                    edit,
+                    views: ViewChanges::default(),
+                }
+            } else {
+                ModelUpdate::Changed {
+                    sequence: 15,
+                    edit,
+                    changes: EdgeChanges {
+                        identity: Some(identity),
+                        ..Default::default()
+                    },
+                }
+            };
+            drop(app.apply_workspace_model_update(update));
+            assert_eq!(app.durable.channels[0].title, "Renamed 4");
+            assert_eq!(app.navigation_save_generation, generation.wrapping_add(1));
+        }
     }
 
     #[test]

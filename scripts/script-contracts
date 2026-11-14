@@ -51,15 +51,15 @@ class Job:
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote"),
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py"),
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(
-        Suite("build offload", "tests/cargo_offload.py", sources=("scripts/cargo-offload",)),
+        Suite("build offload", "tests/cargo_offload.py", sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py")),
     )),
     Job("cargo gate", suites=(
         Suite("held-command cancellation", "tests/cargo_gate.py",
-              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py"),
+              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py"),
               syntax=(("sh", "scripts/cargo-gate"),)),
     )),
     Job("build directories", suites=(
@@ -67,16 +67,19 @@ JOBS = (
         Suite("build directory seeding", "tests/seed_build_dir.py", sources=("scripts/seed-build-dir",),
               syntax=(("sh", "scripts/seed-build-dir"),)),
         Suite("build disk guard and gate install", "tests/build_disk_guard.py",
-              sources=("scripts/build-disk-guard", "scripts/install-cargo-gate"),
+              sources=("scripts/build-disk-guard", "scripts/install-cargo-gate", "scripts/cargo_artifacts.py"),
               syntax=(("sh", "scripts/build-disk-guard"), ("sh", "scripts/install-cargo-gate"))),
         Suite("lock holders", "tests/lock_holders.py", sources=("scripts/lock-holders",)),
+        Suite("native slots", "tests/native_slots.py", sources=("scripts/native_slots.py",)),
         Suite("memory limit", "tests/memory_capped.py", sources=("scripts/memory-capped",)),
         Suite("workload time limit", "tests/bounded.py", sources=("scripts/bounded",)),
         Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib",)),
-        Suite("HOST test helper", "tests/cargo_host_test_helper.py", sources=("scripts/cargo-host-test-helper.py",)),
+        Suite("HOST test helper", "tests/cargo_host_test_helper.py",
+              sources=("scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py")),
         Suite("main build sentinel", "tests/main_build_sentinel.py", sources=("scripts/main-build-sentinel",)),
     )),
     Job("tooling", suites=(
+        Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
         Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
@@ -93,16 +96,24 @@ JOBS = (
               sources=("tests/fixtures/chat-composer-claude.sh",)),
         Suite("Codex resume history", "tests/codex_resume_history.py",
               sources=("tests/fixtures/codex-resume-history.py",)),
+        Suite("Codex busy buttons", "tests/codex_busy_buttons_fixture.py",
+              sources=("tests/fixtures/codex-child-errors.py", "tests/fixtures/fixture-codex.sh"),
+              syntax=(("sh", "tests/fixtures/fixture-codex.sh"),)),
         Suite("local install head check", "tests/install_local.py", sources=("scripts/install-local",),
               syntax=(("bash", "scripts/install-local"),)),
-        Suite("GitHub status bootstrap", "tests/gh-pr-status.py", sources=("scripts/gh-pr-status",)),
+        Suite("GitHub status bootstrap", "tests/gh-pr-status.py",
+              sources=("scripts/gh-pr-status", "scripts/cargo_artifacts.py")),
         Suite("GitHub request telemetry", "tests/gh-observe.py", sources=("scripts/gh-observe",)),
         Suite("GitHub request coordination", "tests/gh-coordinate.py", sources=("scripts/gh-coordinate.py",)),
     )),
 )
 
 # Suites CI runs in its source job, which needs the comparison base and rustfmt.
-SOURCE_JOB_FIXTURES = ("tests/protocol_contract.py", "tests/check_older_clients.py")
+SOURCE_JOB_FIXTURES = (
+    "tests/protocol_contract.py",
+    "tests/check_older_clients.py",
+    "tests/check_update_sources.py",
+)
 
 # Python suites deliberately outside the script contracts, so that a new suite
 # is scheduled or excluded on purpose rather than silently never running.

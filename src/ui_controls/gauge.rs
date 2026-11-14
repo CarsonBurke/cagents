@@ -294,7 +294,7 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
 }
 
 /// The sweep a radial gauge fills for `fraction`, as start and end angles in
-/// radians measured from twelve o'clock, or `None` when nothing is used.
+/// radians measured from twelve o'clock, or `None` when nothing is filled.
 ///
 /// A fraction outside the unit range is clamped rather than wrapped: a
 /// provider reporting more context than its own window says the reader is
@@ -312,7 +312,8 @@ fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
     (filled > 0.0).then(|| (-FRAC_PI_2, -FRAC_PI_2 + filled * TAU))
 }
 
-/// A ring whose filled sweep is the fraction of a budget in use.
+/// A ring whose filled sweep is the supplied budget fraction.
+/// Callers pass the fraction described by the adjacent text: left or used.
 ///
 /// The sweep uses the same muted neutral ink as inactive navigation icons,
 /// so a healthy status line is not a row of competing colours; a caller whose

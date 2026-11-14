@@ -11,8 +11,13 @@ if [ "${1:-}" = --version ]; then
     printf '%s\n' '2.1.286 (Claude Code fixture)'
     exit 0
 fi
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 if [ "${1:-}" = auth ]; then
-    printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    if [ -f "$config/fixture-auth-status.json" ]; then
+        cat "$config/fixture-auth-status.json"
+    else
+        printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    fi
     exit 0
 fi
 
@@ -38,7 +43,6 @@ done
 # Native chat restores from the provider's exact on-disk transcript after a
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
-config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 task_scene=
 task_scene_file=$config/fixture-agent-task-receipt.json
 if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
@@ -257,6 +261,28 @@ tools_turn() {
     done < "$tools_file"
 }
 
+# One jq process writes the whole replay: a process per record would take
+# minutes for a hundred conversations.
+long_history_turn() {
+    local records
+    records=$(jq -cn --arg turn "$turn" --arg session "$session" --arg parent "$parent" \
+        --argjson count "${long_history% *}" --argjson bytes "${long_history#* }" '
+        ("Reviewed the failing step, its logs and the last good run. " as $phrase
+         | [range(0; $bytes / ($phrase | length) | ceil)] | map($phrase) | add // "" | .[:$bytes]) as $text
+        | reduce range(0; $count) as $at ({parent: (if $parent == "null" then null else $parent end), records: []};
+            ("fixture-history-" + $turn + "-" + ($at | tostring)) as $uuid
+            | .records += [(if $at % 2 == 0
+                then {type: "user", message: {role: "user", content: ("Step \($at): " + $text)}}
+                else {type: "assistant", message: {id: $uuid, role: "assistant", content: [{type: "text", text: ("Step \($at): " + $text)}]}}
+                end) + {uuid: $uuid, sessionId: $session, parentUuid: .parent}]
+            | .parent = $uuid)
+        | .records[]')
+    [ -n "$records" ] || return 0
+    printf '%s\n' "$records" >> "$history"
+    printf '%s\n' "$records"
+    parent=$(printf '%s\n' "$records" | tail -n 1 | jq -r '.uuid')
+}
+
 # Optional raw stream: each line of fixture-frames.jsonl is one stream-json
 # frame, emitted in order on every turn before its answer, with "@TURN@" in any
 # string replaced by the turn number so IDs stay unique. Assistant and user
@@ -413,6 +439,18 @@ if [ "$probe" = false ] && [ -s "$config/fixture-first-turn-seconds" ]; then
     first_turn_seconds=$(head -n 1 "$config/fixture-first-turn-seconds")
     if ! [[ $first_turn_seconds =~ ^[0-9]+$ ]]; then
         printf '%s\n' "fixture: fixture-first-turn-seconds must hold whole seconds, such as 8, not '$first_turn_seconds'" >&2
+        exit 2
+    fi
+fi
+# While fixture-long-history holds "COUNT BYTES", the first turn of a
+# conversation started then first replays COUNT earlier exchanges of about
+# BYTES each, alternating prompt and answer, so a scale check gets the long
+# transcripts of conversations that have run for days.
+long_history=
+if [ "$probe" = false ] && [ -s "$config/fixture-long-history" ]; then
+    long_history=$(head -n 1 "$config/fixture-long-history")
+    if ! [[ $long_history =~ ^[0-9]+\ [0-9]+$ ]]; then
+        printf '%s\n' "fixture: fixture-long-history must hold a count and a size in bytes, such as 400 1536, not '$long_history'" >&2
         exit 2
     fi
 fi
@@ -665,6 +703,7 @@ while next_frame; do
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
+                if [ -n "$long_history" ] && [ "$turn" -eq 1 ]; then long_history_turn; fi
                 if [ -f "$frames_file" ]; then
                     frames_turn
                     if [ "$frames_ended" = 1 ]; then continue; fi

@@ -1361,7 +1361,22 @@ pub(in crate::host) fn adopt_resumed(
         _ => None,
     });
     let Some(predecessor) = predecessors.next() else {
-        return Ok(false);
+        // A conversation reopened in place keeps its chat ID, so the agent
+        // bound to it is no predecessor in its lineage but holds the
+        // descriptor of the process it replaced.
+        let bound = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_for_session(successor.id)?;
+        let next = HostedSession::Chat(successor.clone());
+        return match bound.and_then(|agent| agent.session) {
+            Some(HostedSession::Chat(previous))
+                if !HostedSession::Chat(previous.clone()).same_process(&next) =>
+            {
+                adopt_successor(host, &previous, successor)
+            }
+            _ => Ok(false),
+        };
     };
     if predecessors.next().is_some() {
         return Err("More than one open agent claims the resumed conversation's lineage".into());
@@ -1394,10 +1409,12 @@ pub(in crate::host) fn adopt_successor(
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state
-            .chats
-            .get(&predecessor.id)
-            .is_some_and(|record| !record.handle.is_completed())
+        // A chat reopened in place is itself the one running under its ID.
+        if predecessor.id != successor.id
+            && state
+                .chats
+                .get(&predecessor.id)
+                .is_some_and(|record| !record.handle.is_completed())
         {
             return Err("The predecessor is still running in this daemon".into());
         }
@@ -2509,6 +2526,7 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
         ToolStatus::Failed => " (failed)",
         ToolStatus::Denied => " (denied)",
         ToolStatus::Stopped => " (stopped)",
+        ToolStatus::Ended => " (ended)",
         ToolStatus::Waiting => " (waiting on its own background work)",
     };
     let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();

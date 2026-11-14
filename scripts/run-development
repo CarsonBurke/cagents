@@ -890,21 +890,29 @@ esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
-# Whether this launch holds the native lock, on which every other native session
-# queues. An ancestor having it open covers `flock --close`, which keeps it in the
-# parent only. niri starts a session's programs detached, so ancestry stops there:
-# a launch in a nested session while the lock is held counts as under it.
+# Whether this launch holds a native slot, which other native sessions wait for:
+# the native lock itself, slot 0, or LOCK.N. An ancestor having one open covers
+# `flock --close`, which keeps it in the parent only. niri starts a session's
+# programs detached, so ancestry stops there: a launch in a nested session while
+# any slot is held counts as under it.
 under_native_lock() {
     native_lock=$(readlink -f -- "${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}" 2>/dev/null) || return 1
     [ -f "$native_lock" ] && [ -r "$native_lock" ] || return 1
     process=$$
     while [ "${process:-0}" -gt 1 ]; do
         for descriptor in "/proc/$process/fd/"*; do
-            [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$native_lock" ] || return 0
+            case $(readlink -- "$descriptor" 2>/dev/null) in
+                "$native_lock" | "$native_lock".[1-9] | "$native_lock".[1-9][0-9]) return 0 ;;
+            esac
         done
         process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
     done
-    in_nested_session && command -v flock >/dev/null 2>&1 && ! flock -n "$native_lock" true 2>/dev/null
+    in_nested_session && command -v flock >/dev/null 2>&1 || return 1
+    for slot in "$native_lock" "$native_lock".[1-9] "$native_lock".[1-9][0-9]; do
+        [ -f "$slot" ] && [ -r "$slot" ] || continue
+        flock -n "$slot" true 2>/dev/null || return 0
+    done
+    return 1
 }
 
 in_nested_session() {
