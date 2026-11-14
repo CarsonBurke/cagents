@@ -1322,6 +1322,14 @@ impl Cagents {
             }
         };
         let card_id = CardId::from_uuid(agent.id.as_uuid());
+        // Canonical projection may install this proved successor after adoption
+        // sees the old local descriptor. Its label is ready when that happens;
+        // a replacement that matches neither source never inherits the label.
+        if self.chrome_ui.agent_labels.contains_key(&agent.id) {
+            self.chrome_ui
+                .agent_title_sources
+                .insert(card_id, session.clone());
+        }
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
         if let Some(existing) = self.durable.cards.iter().find(|card| card.id == card_id) {
@@ -1339,11 +1347,6 @@ impl Cagents {
             };
             if !session.same_process(&current) {
                 return None;
-            }
-            if self.chrome_ui.agent_labels.contains_key(&agent.id) {
-                self.chrome_ui
-                    .agent_title_sources
-                    .insert(card_id, session.clone());
             }
             let saved = display.pane.as_ref()?;
             let in_place = match placement {
@@ -1455,9 +1458,6 @@ impl Cagents {
                 }
             }
         }
-        self.chrome_ui
-            .agent_title_sources
-            .insert(card_id, session.clone());
         self.cards.insert(card_id, CardRuntime::Loading);
         self.register_presence(card_id, Exposure::Offscreen, Residency::Cold);
         // Native chats keep a lightweight attachment even offscreen, just as
