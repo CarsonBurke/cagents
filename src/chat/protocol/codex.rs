@@ -527,6 +527,9 @@ fn create_inner(
             effective_reasoning: None,
             running_model: None,
             running_reasoning: None,
+            model_turn: None,
+            model_turn_settled: false,
+            recent_model_turns: Default::default(),
             default_reasoning: Default::default(),
             pricing: Default::default(),
             turn_pricing: Default::default(),
@@ -687,6 +690,11 @@ struct Codex {
     effective_reasoning: Option<String>,
     running_model: Option<String>,
     running_reasoning: Option<String>,
+    /// Exact turn owning the displayed model, independent of the pricing
+    /// estimator's provisional request matching.
+    model_turn: Option<String>,
+    model_turn_settled: bool,
+    recent_model_turns: std::collections::VecDeque<String>,
     default_reasoning: BTreeMap<String, String>,
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
@@ -1366,6 +1374,22 @@ impl Codex {
             self.turn_pricing.pop_front();
         }
         self.turn_pricing.push_back((id.into(), model, tier));
+    }
+    fn remember_model_turn(&mut self, id: &str) {
+        if self.recent_model_turns.iter().any(|turn| turn == id) {
+            return;
+        }
+        if self.recent_model_turns.len() >= 32 {
+            self.recent_model_turns.pop_front();
+        }
+        self.recent_model_turns.push_back(id.to_owned());
+    }
+    fn bind_model_turn(&mut self, id: &str) {
+        self.remember_model_turn(id);
+        if self.model_turn.as_deref() != Some(id) {
+            self.model_turn_settled = false;
+        }
+        self.model_turn = Some(id.to_owned());
     }
     fn history(&mut self, step: &mut Step, cursor: Option<String>) -> Result<(), String> {
         if !self.materialized {
@@ -2400,6 +2424,7 @@ impl Adapter for Codex {
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.effective_reasoning = self.reasoning.clone();
+                    self.model_turn = None;
                     self.running_model = self.effective_model.clone();
                     self.running_reasoning = self.effective_reasoning.clone();
                     self.busy = thread["status"]["type"] == "active";
@@ -2434,6 +2459,9 @@ impl Adapter for Codex {
                             && self.notification_turn.is_none()
                         {
                             self.notification_turn = self.turn.clone();
+                            if let Some(id) = self.notification_turn.clone() {
+                                self.bind_model_turn(&id);
+                            }
                         }
                     } else {
                         self.history(&mut step, None)?;
@@ -2653,6 +2681,9 @@ impl Adapter for Codex {
                         && self.busy
                     {
                         self.notification_turn = self.turn.clone();
+                        if let Some(id) = self.notification_turn.clone() {
+                            self.bind_model_turn(&id);
+                        }
                     }
                     self.finish_history(&mut step)?;
                 }
@@ -2670,6 +2701,7 @@ impl Adapter for Codex {
                             self.effective_model = model;
                             self.effective_reasoning = reasoning;
                             if !self.busy {
+                                self.model_turn = None;
                                 self.running_model = self.effective_model.clone();
                                 self.running_reasoning = self.effective_reasoning.clone();
                                 self.active_model_event(&mut step);
@@ -2705,11 +2737,19 @@ impl Adapter for Codex {
                             || (!self.busy
                                 && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
                     let early_completion = early_completion.filter(|_| owns_lifecycle);
-                    if owns_lifecycle {
+                    // A completion can beat its ACK too. Confirming that
+                    // exact last turn fills its model without reviving work.
+                    let owns_model = owns_lifecycle
+                        || (self.ready && self.attached && self.model_turn.as_deref() == Some(id));
+                    if owns_model {
                         self.running_model = model.clone().or_else(|| self.effective_model.clone());
                         self.running_reasoning = reasoning;
+                        self.bind_model_turn(id);
                         self.active_model_event(&mut step);
                     }
+                    // Even a late reply identifies its turn. Remember it so
+                    // a delayed start cannot replace a newer turn's status.
+                    self.remember_model_turn(id);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
@@ -2861,6 +2901,9 @@ impl Adapter for Codex {
                                 && child.busy
                             {
                                 child.notification_turn = child.turn.clone();
+                                if let Some(id) = child.notification_turn.clone() {
+                                    child.bind_model_turn(&id);
+                                }
                             }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
@@ -3067,6 +3110,7 @@ impl Adapter for Codex {
                     self.effective_reasoning = settings["effort"].as_str().map(str::to_owned);
                 }
                 if !self.busy {
+                    self.model_turn = None;
                     self.running_model = self.effective_model.clone();
                     self.running_reasoning = self.effective_reasoning.clone();
                 }
@@ -3095,6 +3139,33 @@ impl Adapter for Codex {
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
                 let turn_id = string(turn, "id")?;
+                if method == "turn/started" {
+                    let same_model_turn = self.model_turn.as_deref() == Some(turn_id);
+                    if (self.recent_model_turns.iter().any(|id| id == turn_id) && !same_model_turn)
+                        || (same_model_turn
+                            && (self.model_turn_settled
+                                || (!self.busy
+                                    && self.notification_turn.as_deref() != Some(turn_id))))
+                    {
+                        step.suppress_current_notification = true;
+                        return Ok(step);
+                    }
+                    if !same_model_turn {
+                        // A start has no request ID. An outstanding override
+                        // cannot be attributed until its exact ACK arrives.
+                        let awaiting_ack = self
+                            .pending
+                            .values()
+                            .any(|pending| matches!(pending, Pending::Turn { .. }));
+                        self.running_model = (!awaiting_ack)
+                            .then(|| self.effective_model.clone())
+                            .flatten();
+                        self.running_reasoning = (!awaiting_ack)
+                            .then(|| self.effective_reasoning.clone())
+                            .flatten();
+                        self.bind_model_turn(turn_id);
+                    }
+                }
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
                 let current =
@@ -3157,7 +3228,7 @@ impl Adapter for Codex {
                     }
                 }
                 if method == "turn/started" {
-                    let (model, reasoning, tier) = self
+                    let (model, _reasoning, tier) = self
                         .pending
                         .values()
                         .find_map(|pending| match pending {
@@ -3176,10 +3247,6 @@ impl Adapter for Codex {
                                 self.service_tier.clone(),
                             )
                         });
-                    if current {
-                        self.running_model = model.clone();
-                        self.running_reasoning = reasoning;
-                    }
                     self.remember_turn_pricing(turn_id, model, tier);
                     self.prediction_turn = Some(turn_id.into());
                 }
@@ -3190,6 +3257,9 @@ impl Adapter for Codex {
                 }
                 if current {
                     if method == "turn/completed" {
+                        if self.model_turn.as_deref() == Some(turn_id) {
+                            self.model_turn_settled = true;
+                        }
                         step.events.push(Event::TurnSettled);
                     }
                     self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
@@ -6622,6 +6692,9 @@ print(json.dumps({'frames': frames, 'replies': {
             effective_reasoning: None,
             running_model: None,
             running_reasoning: None,
+            model_turn: None,
+            model_turn_settled: false,
+            recent_model_turns: Default::default(),
             default_reasoning: Default::default(),
             pricing: Default::default(),
             turn_pricing: Default::default(),
@@ -9839,6 +9912,210 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
             event,
             Event::Models { models, .. } if models.len() == 1 && models[0].id == "gpt-a"
         )));
+    }
+
+    fn active_model_turn_fixture() -> (Codex, Value) {
+        let mut adapter = adapter();
+        adapter.models.push(Model {
+            id: "override-model".into(),
+            label: "Override model".into(),
+            reasoning: vec!["high".into()],
+        });
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("medium".into());
+        adapter.running_model = adapter.effective_model.clone();
+        adapter.running_reasoning = adapter.effective_reasoning.clone();
+        adapter
+            .command(Command::SetModel {
+                model: "override-model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "Use the override".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = sent
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        (adapter, request)
+    }
+
+    fn active_model_turn_started(id: &str) -> Value {
+        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+    }
+
+    fn active_model_turn_completed(id: &str) -> Value {
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[]}}})
+    }
+
+    fn assert_active_model_selection(adapter: &Codex, model: Option<&str>, effort: Option<&str>) {
+        let mut step = Step::default();
+        adapter.active_model_event(&mut step);
+        assert!(
+            step.events.iter().any(|event| match event {
+                Event::ActiveModel(Some(actual)) =>
+                    Some(actual.id.as_str()) == model && actual.reasoning.as_deref() == effort,
+                Event::ActiveModel(None) => model.is_none() && effort.is_none(),
+                _ => false,
+            }),
+            "wrong active model status: {:?}",
+            step.events
+        );
+    }
+
+    #[test]
+    fn active_model_turn_ack_then_started_keeps_both_overrides() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-exact","threadSettings":{"model":"new-default","effort":"low"}
+            }}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+    }
+
+    #[test]
+    fn active_model_turn_started_then_ack_does_not_guess_the_pending_selection() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        assert!(
+            adapter
+                .turn_pricing
+                .iter()
+                .any(|(turn, model, _)| turn == "chosen"
+                    && model.as_deref() == Some("override-model"))
+        );
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+    }
+
+    #[test]
+    fn active_model_turn_unrelated_start_and_late_ack_cannot_borrow_overrides() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("foreign"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        let late = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"requested"}}}))
+            .unwrap();
+        assert!(late.suppress_current_notification);
+        assert_active_model_selection(&adapter, None, None);
+        assert_eq!(adapter.notification_turn.as_deref(), Some("foreign"));
+        adapter
+            .receive(active_model_turn_completed("foreign"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("genuinely-new"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        adapter
+            .receive(active_model_turn_started("requested"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("genuinely-new"));
+    }
+
+    #[test]
+    fn active_model_turn_old_duplicate_cannot_replace_a_newer_turn() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        adapter.receive(active_model_turn_started("newer")).unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn active_model_turn_completed_before_ack_is_confirmed_without_restarting() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        assert!(!adapter.busy);
+        assert!(adapter.turn.is_none());
+        assert!(adapter.notification_turn.is_none());
+        let duplicate = adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert!(duplicate.suppress_current_notification);
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn active_model_turn_settled_duplicate_cannot_claim_a_new_scalar_lifecycle() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        adapter
+            .receive(json!({"method":"thread/status/changed","params":{
+                "threadId":"thread-exact","status":{"type":"active","activeFlags":[]}
+            }}))
+            .unwrap();
+        assert!(adapter.busy);
+        let lifecycle = adapter.lifecycle_revision;
+        let notifications = adapter.notification_revision;
+        let stale = adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert!(stale.suppress_current_notification);
+        assert_eq!(adapter.lifecycle_revision, lifecycle);
+        assert_eq!(adapter.notification_revision, notifications);
+        assert!(adapter.notification_turn.is_none());
+        assert!(adapter.turn.is_none());
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
     }
 
     #[test]
