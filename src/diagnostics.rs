@@ -125,16 +125,7 @@ impl Check {
     /// Only storage names a rule; it makes one from a
     /// [`crate::persistence::RefusedCheck`], which never holds content.
     pub(crate) fn new(rule: &str) -> Self {
-        let mut text = rule.replace(char::is_control, " ");
-        if text.len() > CHECK_BYTES {
-            let mut end = CHECK_BYTES - '…'.len_utf8();
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            text.push('…');
-        }
-        Self(text)
+        Self(bounded(rule))
     }
 
     pub fn as_str(&self) -> &str {
@@ -146,10 +137,10 @@ impl TryFrom<String> for Check {
     type Error = &'static str;
 
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        if text.len() > CHECK_BYTES || text.contains(char::is_control) {
-            Err("invalid refusal check")
-        } else {
+        if is_bounded(&text) {
             Ok(Self(text))
+        } else {
+            Err("invalid refusal check")
         }
     }
 }
@@ -166,6 +157,119 @@ impl From<Check> for String {
     }
 }
 
+/// Text cut at `CHECK_BYTES`, with control characters replaced, so a record
+/// holding it fits `RECORD_BYTES` and renders on one line.
+fn bounded(text: &str) -> String {
+    let mut text = text.replace(char::is_control, " ");
+    if text.len() > CHECK_BYTES {
+        let mut end = CHECK_BYTES - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+fn is_bounded(text: &str) -> bool {
+    text.len() <= CHECK_BYTES && !text.contains(char::is_control)
+}
+
+/// Text compiled into a cagents executable that says where or why it
+/// panicked: a source location such as `src/host/work.rs:120:9`, or a panic
+/// message the source wrote as a literal. A formatted message can carry the
+/// values it was formatted with, which may be prompts, paths or tokens, so it
+/// is never kept; its location says which message it was in that version.
+///
+/// A literal can still name the builder's paths when it was built with
+/// `concat!(env!(…))` or `file!()`; such text is the builder's, never the
+/// user's content.
+///
+/// Bounded like [`Check`]; a record read back with more, or with control
+/// characters, is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SourceText(String);
+
+impl SourceText {
+    /// Where `location` is, relative to its crate's source, so a dependency
+    /// compiled from the builder's home directory does not record it.
+    fn location(location: &std::panic::Location<'_>) -> Self {
+        Self(bounded(&format!(
+            "{}:{}:{}",
+            source_path(location.file()),
+            location.line(),
+            location.column()
+        )))
+    }
+
+    /// The message when the source wrote it as a literal: `panic!("…")`,
+    /// `unreachable!("…")` without arguments, and the standard library's own
+    /// fixed messages, such as an arithmetic overflow.
+    fn literal(payload: &(dyn std::any::Any + Send)) -> Option<Self> {
+        payload
+            .downcast_ref::<&'static str>()
+            .map(|message| Self(bounded(message)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A path within its crate: Cargo's registry and Git checkouts, and the
+/// standard library's source, are absolute and name the builder's home.
+fn source_path(file: &str) -> &str {
+    if !file.starts_with('/') {
+        return file;
+    }
+    // `…/registry/src/INDEX/CRATE-VERSION/src/lib.rs`,
+    // `…/git/checkouts/REPOSITORY/REVISION/src/lib.rs` (kept from the
+    // repository on) and
+    // `/rustc/HASH/library/core/src/…` keep their part from the crate on.
+    for (marker, skipped) in [
+        ("/registry/src/", 1),
+        ("/git/checkouts/", 0),
+        ("/rustc/", 1),
+    ] {
+        if let Some(index) = file.rfind(marker) {
+            let mut rest = &file[index + marker.len()..];
+            for _ in 0..skipped {
+                rest = rest.split_once('/').map_or("", |(_, rest)| rest);
+            }
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    // Any other absolute path, such as a path dependency, may sit directly
+    // in a home directory, so it keeps only its part from its last `src` on,
+    // or its file name.
+    file.rfind("/src/")
+        .map(|index| &file[index + 1..])
+        .or_else(|| file.rsplit_once('/').map(|(_, name)| name))
+        .unwrap_or(file)
+}
+
+impl TryFrom<String> for SourceText {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if is_bounded(&text) {
+            Ok(Self(text))
+        } else {
+            Err("invalid panic source text")
+        }
+    }
+}
+
+impl From<SourceText> for String {
+    fn from(text: SourceText) -> Self {
+        text.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
@@ -177,6 +281,12 @@ pub enum Event {
     },
     Panic {
         recovered: bool,
+        /// Where it panicked. Absent from records written before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<SourceText>,
+        /// Its message, only when the source wrote it as a literal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<SourceText>,
     },
     PersistenceStarted,
     PersistenceFailed {
@@ -314,8 +424,9 @@ pub fn record(event: Event) {
 }
 
 /// A panic may interrupt a thread holding the ordinary writer mutex. Never
-/// block that thread on its own lock or recursively format its payload.
-pub fn record_panic(recovered: bool) {
+/// block that thread on its own lock or recursively format its payload: only
+/// its location and a literal message are kept, never formatted text.
+pub fn record_panic(recovered: bool, panic: &std::panic::PanicHookInfo<'_>) {
     let Some(sink) = SINK.get() else {
         return;
     };
@@ -323,9 +434,17 @@ pub fn record_panic(recovered: bool) {
         return;
     }
     match sink.try_lock() {
-        Ok(mut sink) => append_global(&mut sink, Event::Panic { recovered }),
+        Ok(mut sink) => append_global(&mut sink, panic_event(recovered, panic)),
         Err(std::sync::TryLockError::WouldBlock) => skipped(1),
         Err(std::sync::TryLockError::Poisoned(_)) => fail_sink(),
+    }
+}
+
+fn panic_event(recovered: bool, panic: &std::panic::PanicHookInfo<'_>) -> Event {
+    Event::Panic {
+        recovered,
+        at: panic.location().map(SourceText::location),
+        message: SourceText::literal(panic.payload()),
     }
 }
 
@@ -665,7 +784,9 @@ impl ProductReport {
                         observed.lifecycle = Lifecycle::StartupFailed;
                         observed.clean_shutdown = Some(false);
                     }
-                    Event::Panic { recovered: false } => {
+                    Event::Panic {
+                        recovered: false, ..
+                    } => {
                         unrecovered_failure = true;
                         observed.lifecycle = Lifecycle::Panicked;
                         observed.clean_shutdown = Some(false);
@@ -957,12 +1078,24 @@ fn event_label(value: &Event) -> String {
         Event::Ready => "ready".into(),
         Event::StartupFailed => "startup failed".into(),
         Event::Exit { success } => if success { "clean exit" } else { "failed exit" }.into(),
-        Event::Panic { recovered } => if recovered {
-            "panic (recovered)"
-        } else {
-            "panic (unrecovered)"
+        Event::Panic {
+            recovered,
+            ref at,
+            ref message,
+        } => {
+            let mut label = String::from(if recovered {
+                "panic (recovered)"
+            } else {
+                "panic (unrecovered)"
+            });
+            if let Some(at) = at {
+                label.push_str(&format!(" at {}", at.as_str()));
+            }
+            if let Some(message) = message {
+                label.push_str(&format!(": {}", message.as_str()));
+            }
+            label
         }
-        .into(),
         Event::PersistenceStarted => "persistence started".into(),
         Event::PersistenceFailed {
             category,
@@ -1413,7 +1546,13 @@ mod tests {
         let (_root, path) = fixture();
         let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
         recorder.append(Event::Startup).unwrap();
-        recorder.append(Event::Panic { recovered: false }).unwrap();
+        recorder
+            .append(Event::Panic {
+                recovered: false,
+                at: None,
+                message: None,
+            })
+            .unwrap();
         for _ in 0..RECENT_RECORDS {
             recorder.append(Event::PersistenceRecovered).unwrap();
         }
@@ -1565,7 +1704,11 @@ mod tests {
     #[test]
     fn unrecovered_failure_is_not_erased_by_a_later_normal_return() {
         for failure in [
-            Event::Panic { recovered: false },
+            Event::Panic {
+                recovered: false,
+                at: None,
+                message: None,
+            },
             Event::StartupFailed,
             Event::SettingsFailed {
                 category: Failure::Unknown,
@@ -1645,7 +1788,13 @@ mod tests {
                 exhausted: true,
             })
             .unwrap();
-        recorder.append(Event::Panic { recovered: false }).unwrap();
+        recorder
+            .append(Event::Panic {
+                recovered: false,
+                at: None,
+                message: None,
+            })
+            .unwrap();
         let data = serde_json::to_string(&inspect_at(path.clone()).unwrap()).unwrap();
         for forbidden in [
             "terminal",
@@ -1709,7 +1858,14 @@ mod tests {
                     for _ in 0..40 {
                         let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
                         recorder.limit = 1024;
-                        for event in [Event::Startup, Event::Panic { recovered: false }] {
+                        for event in [
+                            Event::Startup,
+                            Event::Panic {
+                                recovered: false,
+                                at: None,
+                                message: None,
+                            },
+                        ] {
                             // Production may skip a bounded busy attempt. Exercise
                             // that same contention policy rather than requiring
                             // flock fairness or retrying until every event lands.
@@ -1852,6 +2008,52 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_location_names_its_crate_source_and_not_the_builder_s_home() {
+        for (file, kept) in [
+            ("src/host/work.rs", "src/host/work.rs"),
+            (
+                "/home/builder/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/task/harness.rs",
+                "tokio-1.48.0/src/runtime/task/harness.rs",
+            ),
+            (
+                "/home/builder/.cargo/git/checkouts/libcosmic-0123/abcdef0/src/widget/mod.rs",
+                "libcosmic-0123/abcdef0/src/widget/mod.rs",
+            ),
+            (
+                "/rustc/17067e9ac6d7e98f18d4d1e7b8e1e6f7c1b2a3d4/library/core/src/str/mod.rs",
+                "library/core/src/str/mod.rs",
+            ),
+            ("/home/builder/elsewhere/crate/src/lib.rs", "src/lib.rs"),
+            ("/home/builder/src/lib.rs", "src/lib.rs"),
+            ("/home/builder/build.rs", "build.rs"),
+            ("/lib.rs", "lib.rs"),
+        ] {
+            assert_eq!(source_path(file), kept);
+        }
+    }
+
+    #[test]
+    fn a_panic_recorded_before_its_location_was_kept_still_reads() {
+        let record = r#"{"schema_version":1,"product":"daemon","run":"9c718d26-4863-40e7-81d4-a927ead88917","pid":6794,"at_unix_ms":1794601201707,"version":"0.1.3+local.43678f2fb","protocol":173,"event":{"kind":"panic","recovered":true}}"#;
+        let record = serde_json::from_str::<Record>(record).unwrap();
+        assert_eq!(
+            record.event,
+            Event::Panic {
+                recovered: true,
+                at: None,
+                message: None,
+            }
+        );
+        assert_eq!(event_label(&record.event), "panic (recovered)");
+        // An unbounded location is not this executable's.
+        let long = format!(
+            r#"{{"kind":"panic","recovered":true,"at":"{}"}}"#,
+            "x".repeat(CHECK_BYTES + 1)
+        );
+        assert!(serde_json::from_str::<Event>(&long).is_err());
+    }
+
+    #[test]
     fn a_refusal_check_is_bounded_and_fits_a_record() {
         let long = format!("{}\u{1b}[31m{}", "é".repeat(100), "x".repeat(400));
         let check = Check::new(&long);
@@ -1913,17 +2115,21 @@ mod process_tests {
             missing_accessibility_bus_fixture(PathBuf::from(path));
             return;
         }
+        // Content reaches a panic formatted into its message, never as a
+        // literal of the source.
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("panic")) {
-            panic!(
-                "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m"
-            );
+            let content = std::hint::black_box(String::from(
+                "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m",
+            ));
+            panic!("{content}");
         }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("recovered")) {
-            let outcome = {
-                let _recovered = crate::instance::recovered_panic_scope();
-                std::panic::catch_unwind(|| panic!("RECOVERED_SECRET prompt https://private.test"))
-            };
-            assert!(outcome.is_err());
+            let content =
+                std::hint::black_box(String::from("RECOVERED_SECRET prompt https://private.test"));
+            let _recovered = crate::instance::recovered_panic_scope();
+            let formatted = std::panic::catch_unwind(|| panic!("{content}"));
+            let literal = std::panic::catch_unwind(|| panic!("a literal panic message"));
+            assert!(formatted.is_err() && literal.is_err());
             record(Event::Ready);
             record(Event::Exit { success: true });
             return;
@@ -2188,17 +2394,38 @@ mod process_tests {
             product.last_observed.as_ref().unwrap().clean_shutdown,
             Some(true)
         );
-        assert!(
-            product
-                .records
-                .iter()
-                .any(|r| matches!(r.event, Event::Panic { recovered: true }))
-        );
-        assert!(
-            !serde_json::to_string(&report)
-                .unwrap()
-                .contains("RECOVERED_SECRET")
-        );
+        let panics = product
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Panic {
+                    recovered: true,
+                    at,
+                    message,
+                } => Some((
+                    at.as_ref().map(SourceText::as_str),
+                    message.as_ref().map(SourceText::as_str),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [
+            (Some(formatted_at), None),
+            (Some(literal_at), Some("a literal panic message")),
+        ] = panics[..]
+        else {
+            panic!("expected a formatted and a literal recovered panic: {panics:?}");
+        };
+        for at in [formatted_at, literal_at] {
+            assert!(at.starts_with("src/diagnostics.rs:"), "{at}");
+        }
+        assert_ne!(formatted_at, literal_at);
+        let evidence = serde_json::to_string(&report).unwrap();
+        assert!(!evidence.contains("RECOVERED_SECRET"));
+        assert!(!evidence.contains("private.test"));
+        assert!(report.human_at(0).contains(&format!(
+            "panic (recovered) at {literal_at}: a literal panic message"
+        )));
     }
     #[test]
     fn real_panic_hook_retains_only_typed_evidence_after_exit() {
@@ -2226,6 +2453,21 @@ mod process_tests {
         let last = report.products[0].last_observed.as_ref().unwrap();
         assert_eq!(last.lifecycle, Lifecycle::Panicked);
         assert_eq!(last.clean_shutdown, Some(false));
+        let panic = report.products[0]
+            .records
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Panic {
+                    recovered: false,
+                    at,
+                    message,
+                } => Some((at.as_ref().map(SourceText::as_str), message.clone())),
+                _ => None,
+            });
+        assert!(
+            matches!(panic, Some((Some(at), None)) if at.starts_with("src/diagnostics.rs:")),
+            "{panic:?}"
+        );
         let evidence = serde_json::to_string(&report).unwrap();
         for forbidden in [
             "TOKEN",
