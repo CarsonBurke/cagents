@@ -68,6 +68,13 @@ locate() {
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
 }
+# The same, for the topmost such run.
+locate_top() {
+    "$ne" drive observe 2>/dev/null | grep -E -- "$1" |
+        sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\2 \1 \3 \4/' |
+        sort -n | head -1 |
+        awk '{printf "%d,%d", $2 + $3 / 2, $1 + $4 / 2}'
+}
 # Click the control labelled $1, which the harness finds through the app's
 # accessibility tree as well as the screen. A fold's button is only on the
 # screen, whose reading may split its label, so name the part read whole.
@@ -157,8 +164,11 @@ if [ "$scene" = keys ]; then
     # window's traversal starts again: one step back is the tab strip's new
     # tab button, and the rows follow it after the conversation's tab and
     # its terminal button.
-    # The first message's tooltip names the agent its row cuts short.
-    first=$(locate 'The repo is now')
+    # The first message's tooltip names the agent its row cuts short. The
+    # screen reading may split its text into runs anywhere, so its status,
+    # the topmost "Queued", stands in for it.
+    first=$(locate 'The repo is now|repo is now')
+    [ -n "$first" ] || first=$(locate_top 'Queued')
     if [ -n "$first" ]; then
         "$ne" drive move "$first" >/dev/null 2>&1
         sleep 3
