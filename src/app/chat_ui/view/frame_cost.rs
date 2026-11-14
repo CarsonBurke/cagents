@@ -1146,9 +1146,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
     let waiting = labels(&runtime, &mut tree);
     assert!(
-        waiting
-            .iter()
-            .any(|label| label.contains("Waiting for you")),
+        waiting.iter().any(|label| label == "Waiting"),
         "{waiting:?}"
     );
     assert!(
@@ -1165,7 +1163,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     assert!(
         !stopped
             .iter()
-            .any(|label| label == "Starting…" || label == "Working" || label == "Waiting for you"),
+            .any(|label| label == "Starting…" || label == "Working" || label == "Waiting"),
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);

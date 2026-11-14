@@ -357,6 +357,7 @@ pub enum Action {
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
     SubagentPicker(Target, bool),
+    SubagentFailures(Target),
     SubagentQuery(Target, String),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
@@ -747,6 +748,7 @@ impl Action {
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
             Self::SubagentPicker(..) => "SubagentPicker",
+            Self::SubagentFailures(..) => "SubagentFailures",
             Self::SubagentQuery(..) => "SubagentQuery",
             Self::ToggleFailure(..) => "ToggleFailure",
             Self::CopyFailure(..) => "CopyFailure",
@@ -1329,6 +1331,7 @@ impl ChangeToken {
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
             chat::ToolStatus::Waiting => 5,
+            chat::ToolStatus::Ended => 6,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -1581,6 +1584,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::Ended => "Ended",
         chat::ToolStatus::Waiting => "Waiting on background work",
     }
 }
@@ -13570,6 +13574,18 @@ impl Cagents {
             }
             Action::FailureCopied(target, key, request, result) => {
                 return self.finish_failure_copy(target, key, request, result);
+            }
+            Action::SubagentFailures(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let mut picker = child_navigation::Picker::new(&runtime.snapshot.subagents);
+                    picker.filter = child_navigation::Filter::Failed;
+                    runtime.child_picker = Some(picker);
+                    return widget::text_input::focus(card_control_id(
+                        target.card,
+                        "chat-subagent-search",
+                    ))
+                    .map(cosmic::Action::App);
+                }
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
