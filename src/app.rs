@@ -18824,6 +18824,8 @@ impl Application for Cagents {
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
         let terminal_probes = self.terminal_transcript_probes();
+        // Another project shown, or a review or the workspace switcher closed.
+        let approval = self.read_owed_automation_requests();
         Task::batch([
             task,
             binding,
@@ -18831,6 +18833,7 @@ impl Application for Cagents {
             deferred,
             notices,
             terminal_probes,
+            approval,
         ])
             })();
         self.reconcile_chat_failure_presentations();
