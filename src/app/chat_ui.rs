@@ -6549,6 +6549,13 @@ fn draft_snapshot(
     }
 }
 
+/// The chosen model, including a listed default alias when no explicit model
+/// has been stored yet. A stale explicit choice does not select another model.
+pub(super) fn selected_chat_model(snapshot: &Snapshot) -> Option<&chat::Model> {
+    let selected = snapshot.selected_model.as_deref().unwrap_or("default");
+    snapshot.models.iter().find(|model| model.id == selected)
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -14261,10 +14268,9 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.model_picker = None;
-                let Some(model) = runtime.snapshot.models.iter().find(|model| {
-                    model.id == model_id
-                        && Some(&model.id) == runtime.snapshot.selected_model.as_ref()
-                }) else {
+                let Some(model) =
+                    selected_chat_model(&runtime.snapshot).filter(|model| model.id == model_id)
+                else {
                     return Task::none();
                 };
                 if reasoning
@@ -14279,7 +14285,9 @@ impl Cagents {
                     if !runtime.choosing() {
                         return Task::none();
                     }
-                    Arc::make_mut(&mut runtime.snapshot).reasoning = reasoning.clone();
+                    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                    snapshot.selected_model = Some(model.clone());
+                    snapshot.reasoning = reasoning.clone();
                     self.remember_chat_model(provider, Some(model), reasoning);
                     return Task::none();
                 }
@@ -27460,6 +27468,67 @@ mod tests {
             let next = app.chat_draft_snapshot(provider);
             assert_eq!(next.selected_model.as_deref(), Some("other-model"));
             assert!(next.reasoning.is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_action_implicit_default_alias_preserves_high_and_reset_for_first_submit() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for clear in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                drop(app.observe_listed_models(
+                    provider,
+                    vec![
+                        fixture_model("other-model", &["low"]),
+                        fixture_model("default", &["low", "high"]),
+                    ],
+                    None,
+                ));
+                let card = draft_chat_for_provider(&mut app, provider);
+                let runtime = chat_runtime(&app, card);
+                assert!(runtime.snapshot.selected_model.is_none());
+                assert_eq!(
+                    selected_chat_model(&runtime.snapshot).unwrap().id,
+                    "default"
+                );
+                let target = runtime.target;
+                drop(app.update(Message::ChatUi(Action::Reasoning(
+                    target,
+                    "other-model".into(),
+                    Some("low".into()),
+                ))));
+                assert!(chat_runtime(&app, card).snapshot.selected_model.is_none());
+                drop(app.update(Message::ChatUi(Action::Reasoning(
+                    target,
+                    "default".into(),
+                    Some("high".into()),
+                ))));
+                assert_eq!(
+                    chat_runtime(&app, card).snapshot.reasoning.as_deref(),
+                    Some("high")
+                );
+                if clear {
+                    drop(app.update(Message::ChatUi(Action::Reasoning(
+                        target,
+                        "default".into(),
+                        None,
+                    ))));
+                }
+                let effort = (!clear).then(|| "high".to_owned());
+                let next = app.chat_draft_snapshot(provider);
+                assert_eq!(next.selected_model.as_deref(), Some("default"));
+                assert_eq!(next.reasoning, effort);
+                assert_eq!(
+                    app.chat_ui.last_models.get(&provider),
+                    Some(&("default".into(), effort.clone()))
+                );
+                write(&mut app, card, "hello");
+                submit(&mut app, card);
+                assert_eq!(
+                    chat_runtime(&app, card).queued.as_ref().unwrap().model,
+                    Some(("default".into(), effort))
+                );
+            }
         }
     }
 
