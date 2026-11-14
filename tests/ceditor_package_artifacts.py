@@ -26,7 +26,7 @@ class CeditorPackageArtifacts(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         (self.checkout / "scripts").mkdir(parents=True)
         (self.checkout / "packaging").mkdir()
-        for name in ("package-ceditor-linux.sh", "build-ceditor-product"):
+        for name in ("package-ceditor-linux.sh", "build-ceditor-product", "cargo_artifacts.py"):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         for name in ("io.github.cagents.ceditor.svg", "io.github.cagents.ceditor.desktop"):
             shutil.copy2(ROOT / "packaging" / name, self.checkout / "packaging" / name)
