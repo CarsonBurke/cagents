@@ -954,7 +954,7 @@ impl Cagents {
                     );
                 }
                 rows.push(
-                    widget::container(
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::column::with_children(choices)
                                 .padding(design::with_vertical_rail(Padding::ZERO)),
@@ -963,7 +963,9 @@ impl Cagents {
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
+                        // The chooser is a popover, on the elevated surface.
+                        design::component_base,
+                    ))
                     .max_height(280)
                     .into(),
                 );

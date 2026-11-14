@@ -446,11 +446,20 @@ impl Cagents {
         {
             return Task::none();
         }
+        // The selected row stays clear of a fading edge, unless it is the
+        // first or last row, where nothing is hidden and nothing fades.
+        let reveal = crate::interaction::OVERFLOW_FADE;
         let top = LIST_PADDING + index as f32 * (ROW_HEIGHT + ROW_GAP);
-        let bottom = top + ROW_HEIGHT + LIST_PADDING;
+        let bottom = top + ROW_HEIGHT + reveal;
         let list = self.workspace_switcher_geometry().list_height + 2.0 * LIST_PADDING;
+        let content =
+            rows_height(self.chrome_ui.workspace_switcher_rows.len()) + 2.0 * LIST_PADDING;
         let scroll = &mut self.chrome_ui.workspace_switcher_scroll;
-        *scroll = scroll.max(bottom - list).min(top - LIST_PADDING).max(0.0);
+        *scroll = scroll
+            .max(bottom - list)
+            .min(top - reveal)
+            .min(content - list)
+            .max(0.0);
         iced::widget::operation::scroll_to(
             widget::Id::new(SCROLL_ID),
             iced::widget::operation::AbsoluteOffset { x: 0.0, y: *scroll },
@@ -471,6 +480,20 @@ impl Cagents {
         let scroll = self.chrome_ui.workspace_switcher_scroll;
         let view = self.workspace_switcher_geometry().list_height + 2.0 * LIST_PADDING;
         top >= scroll && top + ROW_HEIGHT <= scroll + view
+    }
+
+    /// Whether row `index` lies clear of the fade at each edge of the list's
+    /// scrolled view, which is as deep as the content hidden past that edge.
+    #[cfg(test)]
+    pub(super) fn workspace_switcher_row_clear_of_fades(&self, index: usize) -> bool {
+        let fade = |hidden: f32| hidden.clamp(0.0, crate::interaction::OVERFLOW_FADE);
+        let top = LIST_PADDING + index as f32 * (ROW_HEIGHT + ROW_GAP);
+        let scroll = self.chrome_ui.workspace_switcher_scroll;
+        let view = self.workspace_switcher_geometry().list_height + 2.0 * LIST_PADDING;
+        let content =
+            rows_height(self.chrome_ui.workspace_switcher_rows.len()) + 2.0 * LIST_PADDING;
+        top - scroll >= fade(scroll)
+            && scroll + view - (top + ROW_HEIGHT) >= fade(content - scroll - view)
     }
 
     pub(super) fn workspace_switcher_selection(&self) -> Option<WorkspaceDestination> {
@@ -848,13 +871,21 @@ impl Cagents {
                 )
             })
             .collect::<Vec<Element<'_, Message>>>();
-        let list = widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(ROW_GAP)
-                .padding(LIST_PADDING),
-        )
-        .id(widget::Id::new(SCROLL_ID))
-        .height(Length::Fill);
+        // Rows passing an edge fade into the panel. The rail stays clear of
+        // the rows, so the fade, which leaves the rail at full strength,
+        // covers every row it reaches.
+        let list = crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .spacing(ROW_GAP)
+                    .padding(design::with_vertical_rail(iced::Padding::from(
+                        LIST_PADDING,
+                    ))),
+            )
+            .id(widget::Id::new(SCROLL_ID))
+            .height(Length::Fill),
+            panel_color,
+        );
         let list = widget::container(list)
             .width(if geometry.detail {
                 Length::Fixed(LIST_WIDTH)
