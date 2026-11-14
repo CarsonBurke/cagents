@@ -1011,6 +1011,18 @@ class Evidence(unittest.TestCase):
         finally:
             self.run_tool("stop", check=False)
             process.wait(timeout=20)
+            self.assertFalse(receipt.exists())
+
+    def test_start_discards_previous_session_window_readiness(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.run_tool("stop")
+        state = self.task / "session"
+        for name in ("window-window-2", "window-window-2.new-1", "replaying"):
+            (state / name).write_text("23\n")
+        self.run_tool("start", "after")
+        self.assertFalse(list(state.glob("window-*")))
+        self.assertFalse((state / "replaying").exists())
 
     def test_open_window_cannot_use_the_existing_primary_as_readiness(self) -> None:
         self.built()

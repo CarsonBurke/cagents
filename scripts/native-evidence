@@ -1030,7 +1030,7 @@ cmd_open_window() {
         touch "$state/stop"
     ) 7>&- &
     watcher=$!
-    trap 'kill "$watcher" 2>/dev/null || :; rm -f -- "$state/replaying" "$receipt"' EXIT
+    trap 'kill "$watcher" 2>/dev/null || :; rm -f -- "$state/replaying" "$receipt" "$state/window-$slot"' EXIT
     trap 'exit 143' TERM HUP
     run_app "$side" "$slot" 7>&- || status=$?
     kill "$watcher" 2>/dev/null || :
@@ -1150,6 +1150,9 @@ cmd_start() {
     fi
     rm -f -- "$state/codex-executable-installed.json"
     rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
+    # Readiness belongs to one live session and one additional-window command.
+    # A previous side must not satisfy a caller waiting for this side to map.
+    rm -f -- "$state"/window-* "$state/replaying"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
