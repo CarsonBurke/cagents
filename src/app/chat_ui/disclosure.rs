@@ -44,6 +44,79 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     }
 }
 
+/// A control whose one-line text fades out into whatever the control is
+/// painted with at that moment. Cosmic resolves a button's style before
+/// drawing its children, so the control records its paint over `base` and
+/// the fade reads it, rather than guessing hover or focus from the text's
+/// smaller bounds. This also keeps keyboard feedback intact.
+#[derive(Clone)]
+pub(super) struct Painted {
+    surface: Rc<Cell<Option<iced::Color>>>,
+    base: Rc<dyn Fn(&cosmic::Theme) -> iced::Color>,
+}
+
+impl Painted {
+    pub(super) fn on(base: impl Fn(&cosmic::Theme) -> iced::Color + 'static) -> Self {
+        Self {
+            surface: Rc::new(Cell::new(None)),
+            base: Rc::new(base),
+        }
+    }
+
+    /// `text` on one line, fading out where the space runs short.
+    pub(super) fn fade(
+        &self,
+        text: cosmic::iced::widget::Text<'static, cosmic::Theme, cosmic::Renderer>,
+    ) -> Element<'static, Message> {
+        let painted = self.clone();
+        crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
+            widget::scrollable(text.wrapping(iced::widget::text::Wrapping::None))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill)
+                .height(design::LINE_BODY),
+            move |theme| {
+                painted
+                    .surface
+                    .get()
+                    .unwrap_or_else(|| (painted.base)(theme))
+            },
+        ))
+    }
+
+    /// The transcript control style, recording each paint for the fade.
+    pub(super) fn button_class(&self) -> cosmic::theme::Button {
+        let cosmic::theme::Button::Custom {
+            active,
+            disabled,
+            hovered,
+            pressed,
+        } = crate::ui_controls::control_style(false, None)
+        else {
+            unreachable!("control_style draws a custom button");
+        };
+        let painted = self.clone();
+        let paint = Rc::new(move |style: widget::button::Style, theme: &cosmic::Theme| {
+            let backdrop = (painted.base)(theme);
+            let color = match style.background {
+                Some(iced::Background::Color(color)) => over(color, backdrop),
+                _ => backdrop,
+            };
+            painted.surface.set(Some(color));
+            style
+        });
+        let (active_paint, hovered_paint, pressed_paint) =
+            (paint.clone(), paint.clone(), paint.clone());
+        cosmic::theme::Button::Custom {
+            active: Box::new(move |focused, theme| active_paint(active(focused, theme), theme)),
+            disabled: Box::new(move |theme| paint(disabled(theme), theme)),
+            hovered: Box::new(move |focused, theme| hovered_paint(hovered(focused, theme), theme)),
+            pressed: Box::new(move |focused, theme| pressed_paint(pressed(focused, theme), theme)),
+        }
+    }
+}
+
 pub(super) fn row(
     label: String,
     name: String,
@@ -116,26 +189,9 @@ fn row_painted(
     toggle: Option<Action>,
     base: impl Fn(&cosmic::Theme) -> iced::Color + 'static,
 ) -> Element<'static, Message> {
-    // Cosmic resolves a button's style before drawing its children. Share that
-    // resolved paint with the fade rather than guessing hover/focus from the
-    // text's smaller bounds. This also keeps keyboard feedback intact.
-    let surface = Rc::new(Cell::new(None));
-    let faded_surface = surface.clone();
-    let base = Rc::new(base);
-    let faded_base = base.clone();
-    let text = crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
-        widget::scrollable(
-            design::body(label)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .direction(iced::widget::scrollable::Direction::Horizontal(
-            iced::widget::scrollable::Scrollbar::hidden(),
-        ))
-        .width(Length::Fill)
-        .height(design::LINE_BODY),
-        move |theme| faded_surface.get().unwrap_or_else(|| faded_base(theme)),
-    ));
+    let painted = Painted::on(base);
+    let text =
+        painted.fade(design::body(label).class(cosmic::theme::Text::Custom(design::muted_text)));
     let indicator = match status {
         Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -181,27 +237,6 @@ fn row_painted(
         .spacing(step::GAP_S)
         .align_y(Alignment::Center);
     if let Some(toggle) = toggle {
-        let cosmic::theme::Button::Custom {
-            active,
-            disabled,
-            hovered,
-            pressed,
-        } = crate::ui_controls::control_style(false, None)
-        else {
-            unreachable!("control_style draws a custom button");
-        };
-        let paint = move |style: widget::button::Style, theme: &cosmic::Theme| {
-            let backdrop = base(theme);
-            let color = match style.background {
-                Some(iced::Background::Color(color)) => over(color, backdrop),
-                _ => backdrop,
-            };
-            surface.set(Some(color));
-            style
-        };
-        let active_paint = paint.clone();
-        let hovered_paint = paint.clone();
-        let pressed_paint = paint.clone();
         crate::interaction::a11y_target(
             widget::button::custom(line)
                 .name(name)
@@ -210,18 +245,7 @@ fn row_painted(
                 } else {
                     "Expand details"
                 })
-                .class(cosmic::theme::Button::Custom {
-                    active: Box::new(move |focused, theme| {
-                        active_paint(active(focused, theme), theme)
-                    }),
-                    disabled: Box::new(move |theme| paint(disabled(theme), theme)),
-                    hovered: Box::new(move |focused, theme| {
-                        hovered_paint(hovered(focused, theme), theme)
-                    }),
-                    pressed: Box::new(move |focused, theme| {
-                        pressed_paint(pressed(focused, theme), theme)
-                    }),
-                })
+                .class(painted.button_class())
                 .width(Length::Fill)
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(toggle)),

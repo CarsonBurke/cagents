@@ -632,9 +632,10 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<ScopedId, Item>,
-    /// Agent calls that published their agent's name. A child's own frames
-    /// carry at most its type, which must not rename it. Bounded by `tools`.
-    named_agents: HashSet<String>,
+    /// Agent calls that published what their agent goes by. A child's own
+    /// frames carry its type and task, which must not rename it. Bounded by
+    /// `tools`.
+    labelled_agents: HashSet<String>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -970,7 +971,7 @@ impl Claude {
     }
     fn forget_tool(&mut self, key: &ScopedId) {
         self.tools.remove(key);
-        self.named_agents.remove(&key.id);
+        self.labelled_agents.remove(&key.id);
         self.edit_tools.remove(key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
@@ -1879,9 +1880,14 @@ impl Claude {
                                 if background == Some(true) {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                                let kind = agent_name(&block["input"]);
+                                let input = &block["input"];
+                                let kind = agent_label(
+                                    string(input, "name"),
+                                    string(input, "description"),
+                                    string(input, "subagent_type"),
+                                );
                                 if !kind.is_empty() {
-                                    self.named_agents.insert(tool_id.clone());
+                                    self.labelled_agents.insert(tool_id.clone());
                                 }
                                 step.events.push(Event::Subagent {
                                     model: block["input"]["model"].as_str().map(str::to_owned),
@@ -2162,12 +2168,17 @@ impl Claude {
                 waiting: None,
                 detail: None,
                 id: parent.into(),
-                // The Agent call's name, once published, outranks the type a
+                // The Agent call's label, once published, outranks what a
                 // child's frame may carry; an empty kind leaves it in place.
-                kind: if self.named_agents.contains(parent) {
+                kind: if self.labelled_agents.contains(parent) {
                     String::new()
                 } else {
-                    string(frame, "subagent_type").into()
+                    agent_label(
+                        "",
+                        string(frame, "task_description"),
+                        string(frame, "subagent_type"),
+                    )
+                    .into()
                 },
                 description: string(frame, "task_description").into(),
                 status: None,
@@ -3506,7 +3517,7 @@ impl Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
-                self.named_agents.clear();
+                self.labelled_agents.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
@@ -4279,14 +4290,14 @@ fn choice(id: &str, label: &str) -> Choice {
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
-/// What an Agent call's agent is called: the name it was asked to go by,
-/// else its agent type. Several agents can share a type, and the reader
-/// tells them apart by name; the task description is never the name.
-fn agent_name(input: &Value) -> &str {
-    ["name", "subagent_type"]
+/// What an agent goes by: the name its Agent call asked for, else the first
+/// line of the short task description it was given, else its agent type.
+/// Several agents share a type, such as `general-purpose`, so the type, which
+/// the call's own card still shows, is the last resort.
+fn agent_label<'a>(name: &'a str, description: &'a str, agent_type: &'a str) -> &'a str {
+    [name, description, agent_type]
         .into_iter()
-        .map(|key| string(input, key).trim())
-        .find(|name| !name.is_empty())
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or_default()
 }
 fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -7993,10 +8004,12 @@ impl History {
             }
             children.push((
                 parent.to_owned(),
-                self.agent_names
-                    .get(parent)
-                    .map_or_else(|| string(&meta, "agentType"), String::as_str)
-                    .into(),
+                agent_label(
+                    self.agent_names.get(parent).map_or("", String::as_str),
+                    string(&meta, "description"),
+                    string(&meta, "agentType"),
+                )
+                .into(),
                 string(&meta, "description").into(),
                 frames.into_iter().map(|(frame, _)| frame).collect(),
                 outcomes,
@@ -14568,7 +14581,7 @@ mod tests {
     fn child_frames_stay_in_their_subagent_transcript() {
         let mut adapter = Claude::default();
         let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"subagent_type":"Explore","description":"Inspect parser"}}]}})).unwrap();
-        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, description, status:Some(ToolStatus::Running), .. } if id == "tool-agent" && kind == "Explore" && description == "Inspect parser")));
+        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, description, status:Some(ToolStatus::Running), .. } if id == "tool-agent" && kind == "Inspect parser" && description == "Inspect parser")));
         let child = adapter.receive(json!({"type":"user","uuid":"child-carrier","parent_tool_use_id":"tool-agent","message":{"content":"Internal prompt"}})).unwrap();
         assert!(
             !child
@@ -14594,7 +14607,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_calls_name_their_agent_before_its_type_and_never_by_task() {
+    /// Several agents share a type, so an unnamed one goes by its short task
+    /// description, and only one without either by its type.
+    fn agent_calls_label_their_agent_by_name_then_task_then_type() {
         for (input, expected) in [
             (
                 json!({"name":" Scout ","subagent_type":"Explore","description":"Inspect parser"}),
@@ -14602,16 +14617,21 @@ mod tests {
             ),
             (
                 json!({"name":" \t","subagent_type":"Explore","description":"Inspect parser"}),
+                "Inspect parser",
+            ),
+            (json!({"description":"Inspect parser"}), "Inspect parser"),
+            (
+                json!({"subagent_type":"Explore","description":" \n"}),
                 "Explore",
             ),
-            (json!({"description":"Inspect parser"}), ""),
         ] {
             let mut adapter = Claude::default();
             let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":input}]}})).unwrap();
             assert!(
                 started.events.iter().any(|event| matches!(event,
                     Event::Subagent { id, kind, description, .. }
-                        if id == "tool-agent" && kind == expected && description == "Inspect parser")),
+                        if id == "tool-agent" && kind == expected
+                            && Some(description.as_str()) == input["description"].as_str())),
                 "{input}: {:?}",
                 started.events
             );
@@ -14699,7 +14719,7 @@ mod tests {
         let expect = |id: &str, name: &str, status: ToolStatus, waiting: bool| {
             assert_eq!(state[id], (name.to_owned(), Some(status), waiting), "{id}");
         };
-        expect("explore-logs", "Explore", ToolStatus::Succeeded, false);
+        expect("explore-logs", "Read logs", ToolStatus::Succeeded, false);
         expect("scout", "Scout", ToolStatus::Running, false);
         expect("planner", "Planner", ToolStatus::Running, true);
         expect("builder", "Builder", ToolStatus::Failed, false);
@@ -17664,7 +17684,7 @@ mod tests {
         let loaded = history.subagent_frames().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "tool-one");
-        assert_eq!(loaded[0].1, "Explore");
+        assert_eq!(loaded[0].1, "Inspect");
         assert_eq!(loaded[0].3.len(), 1);
         assert_eq!(loaded[0].3[0]["uuid"], "child");
     }

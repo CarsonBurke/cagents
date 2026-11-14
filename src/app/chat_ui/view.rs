@@ -1431,19 +1431,27 @@ impl Runtime {
         let mut chars = raw.chars();
         let text: String = chars.by_ref().take(limit).collect();
         if chars.next().is_some() {
-            format!("{text}…")
+            format!("{}…", text.trim_end())
         } else {
             text
         }
     }
-    /// The agent's own name: Codex's nickname, the name Claude was asked to
-    /// give an agent, else its type, or OMP's agent name. The description is
-    /// the task it was given, which says what it does rather than who it is,
-    /// so it never stands in for the name.
+
+    /// What the agent goes by: the name its provider reports for it, else
+    /// the first line of the task it was given, which tells apart agents of
+    /// one type better than the type does. Claude and OMP report a name, then
+    /// a short description, then the type; Codex reports only a nickname.
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
         Some(agent.kind.trim())
             .filter(|name| !name.is_empty())
+            .or_else(|| Self::native_child_task(agent))
             .unwrap_or("Subagent")
+    }
+
+    /// Whether `agent` goes by the task it was given, which its tab and
+    /// heading then already say.
+    pub(super) fn named_by_task(agent: &chat::Subagent) -> bool {
+        Self::native_child_task(agent) == Some(Self::native_child_name(agent))
     }
 
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
@@ -1497,7 +1505,7 @@ impl Runtime {
                 None => identity.push_str(&Self::short_description(detail, 120)),
             }
         }
-        if let Some(task) = Self::native_child_task(agent) {
+        if let Some(task) = Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
             identity.push_str(" · Task: ");
             identity.push_str(&Self::short_description(task, 120));
         }
@@ -2124,7 +2132,12 @@ impl Runtime {
                 builder.markdown(&item.id, &[0], cached.markdown.items());
             }
         }
-        if let Some(coordinated) = &cached.coordination {
+        // What a coordinating step said and collected is drawn only in its
+        // open detail.
+        if let Some(coordinated) = &cached.coordination
+            && detail
+            && self.item_expanded(&item.id)
+        {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
@@ -2250,12 +2263,13 @@ impl Runtime {
                 Provider::Claude => "Claude",
                 Provider::Omp => "OMP",
             };
+            // A model the provider never reported is left out rather than
+            // announced; the tooltip says so for whoever asks.
             let model = agent
                 .model
                 .as_deref()
                 .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .unwrap_or("Model not reported");
+                .filter(|model| !model.is_empty());
             let mut heading = vec![
                 widget::row::with_children(vec![
                     chat_title(self.child_label(agent, 80))
@@ -2270,8 +2284,11 @@ impl Runtime {
                 .into(),
             ];
             // The name titles the transcript; the task it was given sits
-            // beneath it, quieter, so the reader knows what it is for.
-            if let Some(task) = Self::native_child_task(agent) {
+            // beneath it, quieter, so the reader knows what it is for, unless
+            // the agent already goes by that task.
+            if let Some(task) =
+                Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent))
+            {
                 heading.push(
                     design::caption(Self::short_description(task, 80))
                         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -2280,10 +2297,13 @@ impl Runtime {
             }
             heading.push(
                 crate::interaction::tooltip(
-                    design::caption(format!(
-                        "Native subagent · {provider} · {}",
-                        Self::short_description(model, 80)
-                    )),
+                    design::caption(match model {
+                        Some(model) => format!(
+                            "{provider} subagent · {}",
+                            Self::short_description(model, 80)
+                        ),
+                        None => format!("{provider} subagent"),
+                    }),
                     self.native_child_identity(agent),
                 )
                 .into(),
@@ -2363,10 +2383,6 @@ impl Runtime {
                 };
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
-                    || cached
-                        .coordination
-                        .as_deref()
-                        .is_some_and(Coordinated::is_card)
                 {
                     MESSAGE_ACTION_FOOTER
                 } else {
@@ -2409,13 +2425,7 @@ impl Runtime {
                                     let raw = self
                                         .item_expanded(&item.id)
                                         .then(|| self.step_detail(item, cached, markdown_settings));
-                                    self.coordination_card(
-                                        item,
-                                        cached,
-                                        coordinated,
-                                        markdown_settings,
-                                        raw,
-                                    )
+                                    self.coordination_card(item, coordinated, raw)
                                 } else {
                                     match &item.content {
                                         ItemContent::Text { .. } => self.prose_view(
@@ -4599,7 +4609,7 @@ impl Runtime {
                     let raw = self
                         .item_expanded(&item.id)
                         .then(|| self.step_detail(item, cached, settings));
-                    self.coordination_card(item, cached, coordinated, settings, raw)
+                    self.coordination_card(item, coordinated, raw)
                 },
                 settings,
             )
@@ -4777,6 +4787,8 @@ impl Runtime {
         hasher.finish()
     }
 
+    /// The room a prose row leaves under it for its hover actions. A
+    /// coordination row carries its actions in its context menu instead.
     fn prose_action_footer(&self, item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
         if slot == turn::Slot::Thinking
             && !(self.item_expanded(&item.id)
@@ -4787,9 +4799,7 @@ impl Runtime {
         {
             return 0.0;
         }
-        if matches!(item.content, ItemContent::Text { .. })
-            || (slot == turn::Slot::Card && cached.coordination.is_some())
-        {
+        if matches!(item.content, ItemContent::Text { .. }) {
             MESSAGE_ACTION_FOOTER
         } else {
             0.0
@@ -4897,6 +4907,9 @@ impl Runtime {
             }
             rows.push(strip);
         }
+        // A run of coordination rows reads as one list, as the step strip's
+        // rows do, rather than as blocks set apart from one another.
+        let mut after_card = false;
         for prose in &turn.prose {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
@@ -4907,12 +4920,16 @@ impl Runtime {
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
-                rows.message(
+                let gap = if after_card { step::GAP_XS } else { rows.gap };
+                rows.push_with_gap(
                     scroll::item(&item.id, card(item, cached, coordinated)),
-                    self.prose_action_footer(item, cached, prose.slot),
+                    gap,
+                    0.0,
                 );
+                after_card = true;
                 continue;
             }
+            after_card = false;
             rows.message(
                 scroll::item(
                     &item.id,

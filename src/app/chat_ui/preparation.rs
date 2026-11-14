@@ -4869,14 +4869,20 @@ mod tests {
                 let (first,last) = catalog.endpoints().unwrap();
                 (catalog.search_blocks(),catalog.copy(first,last).unwrap())
             }).collect::<Vec<_>>();
+            // What a one-row step said is drawn, and selectable, only in its open detail.
+            let closed = runtime.selection_document().0;
+            assert!(contents.iter().flat_map(|(blocks, _)| blocks).all(|(identity, _)| closed.text(*identity).is_none()), "a closed row's detail is not selectable");
+            drop(closed);
+            runtime.expanded.insert("message".into());
             let catalog = runtime.selection_document().0;
             for (blocks, text) in contents {
                 for (identity, plain) in blocks {
-                    assert_eq!(catalog.text(identity).as_deref(), Some(plain.as_ref()), "actual card catalog preserves every prepared logical source block");
+                    assert_eq!(catalog.text(identity).as_deref(), Some(plain.as_ref()), "actual open detail catalog preserves every prepared logical source block");
                 }
                 assert!(text.contains("λ") || text.contains("Report"));
             }
             drop(catalog);
+            runtime.expanded.remove("message");
             let previous = runtime.cache.remove("message").unwrap();
             let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
             assert_eq!(rebuilt.coordination.as_ref().unwrap().address(), address, "disclosure reuses the same prepared canonical graphs/palettes");
