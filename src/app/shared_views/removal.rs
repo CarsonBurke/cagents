@@ -171,7 +171,12 @@ impl Cagents {
                             .unwrap()
                             .revision,
                         model_sequence: self.shared_views.snapshot_sequence.max(
-                        self.shared_views.view_sequences.get(scope).copied().unwrap_or(0)),
+                            self.shared_views
+                                .view_sequences
+                                .get(scope)
+                                .copied()
+                                .unwrap_or(0),
+                        ),
                         before: before.clone(),
                     }
                 }),
@@ -409,7 +414,8 @@ impl Cagents {
         self.shared_views.ended_terminal_workers.remove(&card);
         self.shared_views.attached.insert(card);
         self.terminal_recovery_attempts.remove(&terminal);
-        if matches!(self.card_state(card).map(|s| &s.kind), Some(CardKind::Terminal(s)) if terminal_ended(s)) {
+        if matches!(self.card_state(card).map(|s| &s.kind), Some(CardKind::Terminal(s)) if terminal_ended(s))
+        {
             self.cards.insert(card, CardRuntime::Completed);
             self.lifecycle.remove(card);
             self.set_residency(card, Residency::Hibernated);

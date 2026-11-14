@@ -2036,7 +2036,9 @@ impl Cagents {
         let mut discarded = HashSet::new();
         let mut stale_actor = false;
         for (operation, scope, change) in &mut self.shared_views.pending {
-            let (Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }) = change else {
+            let (Change::Update { before, pane }
+            | Change::UpdateTerminalSource { before, pane, .. }) = change
+            else {
                 continue;
             };
             let card = pane.id;
