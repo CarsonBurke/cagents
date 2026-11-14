@@ -1784,7 +1784,6 @@ impl<Message> Widget<Message, Theme, Renderer> for FadeOverflow<'_, Message> {
         let Some(child) = layout.children().next() else {
             return;
         };
-        let cut = child.bounds().width > bounds.width + 0.5;
         renderer.with_layer(clip, |renderer| {
             self.content.as_widget().draw(
                 &tree.children[0],
@@ -1795,11 +1794,15 @@ impl<Message> Widget<Message, Theme, Renderer> for FadeOverflow<'_, Message> {
                 cursor,
                 &clip,
             );
-            if cut {
-                let to = (self.background)(theme);
-                let mut from = to;
-                from.a = 0.0;
-                let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
+        });
+        if child.bounds().width > bounds.width + 0.5 {
+            // A layer of its own: within one layer, quads are drawn beneath
+            // text, so the fade would sit under the letters it should cover.
+            let to = (self.background)(theme);
+            let mut from = to;
+            from.a = 0.0;
+            let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
+            renderer.with_layer(clip, |renderer| {
                 fill_overflow_fade(
                     renderer,
                     Rectangle {
@@ -1811,8 +1814,8 @@ impl<Message> Widget<Message, Theme, Renderer> for FadeOverflow<'_, Message> {
                     from,
                     to,
                 );
-            }
-        });
+            });
+        }
     }
     fn a11y_nodes(
         &self,

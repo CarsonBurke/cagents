@@ -1117,10 +1117,10 @@ impl Cagents {
             self.workspace_visits.get(&selected).map(|&at| {
                 let seconds = now.saturating_sub(at);
                 if seconds < 60 {
-                    "Open a moment ago".to_owned()
+                    "Visited a moment ago".to_owned()
                 } else {
                     format!(
-                        "Last open {}",
+                        "Visited {}",
                         crate::account::format_ago(i64::try_from(seconds).unwrap_or(i64::MAX))
                     )
                 }
@@ -1265,12 +1265,15 @@ impl Cagents {
         } else {
             Length::Shrink
         })
+        // Inside its outline, so a terminal's screen does not paint over it.
+        .padding(design::BORDER_WIDTH)
         .clip(true)
         .class(cosmic::theme::Container::custom(|theme| {
             widget::container::Style {
                 background: Some(iced::Background::Color(design::sunken(theme))),
                 border: iced::Border {
-                    color: design::accent_color(theme),
+                    // Not the accent: the preview is looked at, not focused.
+                    color: design::component_rule(theme),
                     width: design::BORDER_WIDTH,
                     radius: design::RADIUS_S.into(),
                 },
