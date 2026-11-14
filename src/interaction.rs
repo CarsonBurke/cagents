@@ -877,7 +877,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             self.children[0].as_widget_mut().update(
                 &mut tree.children[0],
                 event,
-                layout.children().next().expect("layer base"),
+                layout
+                    .children()
+                    .next()
+                    .expect("layer base")
+                    .with_virtual_offset(layout.virtual_offset()),
                 mouse::Cursor::Unavailable,
                 renderer,
                 clipboard,

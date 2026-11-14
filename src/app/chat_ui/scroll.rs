@@ -2352,6 +2352,14 @@ mod tests {
             &mut exposed,
             &mut tree,
             &node,
+            Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+        );
+        send(
+            &mut exposed,
+            &mut tree,
+            &node,
             modifiers(keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
         );
         let before = read(&mut exposed, &mut tree, &node);
