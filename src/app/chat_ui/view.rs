@@ -4571,8 +4571,10 @@ impl Runtime {
                 dark,
             );
         }
+        // The preview is a picture of the chat, so it carries no failure
+        // control to press.
         if let Some((glyph, label)) = self.timeline_activity(false, None) {
-            transcript.push(activity_row(glyph, label));
+            transcript.push(activity_row(glyph, label, None));
         }
         Some(virtualized::column(transcript.children, Default::default()))
     }

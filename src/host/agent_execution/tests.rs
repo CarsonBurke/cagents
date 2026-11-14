@@ -2473,7 +2473,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     let (host, mut request, path) = fixture();
     let root = path.parent().unwrap().to_owned();
     let program = root.join("bin/codex");
-    std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
+    std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let Destination::New(spec) = &mut request.destination else {
         unreachable!()
@@ -2656,7 +2656,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
