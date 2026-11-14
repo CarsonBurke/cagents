@@ -6415,15 +6415,9 @@ mod tests {
         }
     }
 
-    fn wait_for_retirement_fact(mut ready: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready() {
-            assert!(
-                Instant::now() < deadline,
-                "original retirement fact did not settle"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+    #[track_caller]
+    fn wait_for_retirement_fact(ready: impl FnMut() -> bool) {
+        crate::test_timing::eventually("the original retirement fact", ready);
     }
 
     #[test]
@@ -6432,17 +6426,22 @@ mod tests {
             return;
         }
         let (handle, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
-        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap();
         assert!(handle.is_completed());
         assert!(!handle.worker_joined_for_test());
         let source = shell_session("exit 0");
         let proof = retirement_test_proof();
-        let before = Instant::now();
-        handle.begin_completed_retirement().unwrap();
-        assert!(
-            before.elapsed() < Duration::from_secs(1),
-            "retirement request waited for TLS"
-        );
+        // The TLS stays blocked until released below, so a request that
+        // waited for it would not return, and one that waited for a bounded
+        // shutdown would take its whole timeout.
+        let started = Instant::now();
+        let handle = crate::test_timing::returns("the retirement request", move || {
+            handle.begin_completed_retirement().unwrap();
+            handle
+        });
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);
         assert!(matches!(
             handle.completed_retirement(&source, &proof),
             TerminalRetirement::Pending
@@ -7183,7 +7182,7 @@ mod tests {
             let _ = delivered.send(());
         });
         later
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .expect("the notifier stopped after one subscriber panicked");
     }
 
@@ -7200,12 +7199,13 @@ mod tests {
             .set_host_visibility(super::super::ipc::TerminalVisibility::Hidden)
             .unwrap();
         assert!(!handle.inner.published.visible.load(Ordering::Acquire));
-        let started = std::time::Instant::now();
-        assert_eq!(
-            handle.search(1, "query".into(), true),
-            Err(TerminalSendError::Closed)
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Preparation never finishes on its own, so a request that waited
+        // for it without a bound would not return.
+        let (handle, searched) = crate::test_timing::returns("the search request", move || {
+            let searched = handle.search(1, "query".into(), true);
+            (handle, searched)
+        });
+        assert_eq!(searched, Err(TerminalSendError::Closed));
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
         handle.inner.published.archive_ready.notify_all();
         handle.shutdown().unwrap();
