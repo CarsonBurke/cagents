@@ -31,7 +31,7 @@ import urllib.parse
 INSTALLER = "scripts/install-cargo-gate"
 # What the gate needs beside it, should a record not say.
 GATE_FILES = ["scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo-gate-sync.py",
-              "scripts/cargo-host-test-helper.py",
+              "scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py",
               "scripts/cargo-gate-rustc-guard",
               "scripts/cargo-offload", "scripts/seed-build-dir", "scripts/build-disk-guard",
               "scripts/memory-capped", "scripts/prune-build-dirs", INSTALLER]

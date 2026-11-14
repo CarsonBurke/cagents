@@ -12,10 +12,24 @@
 - [Standalone editor](#standalone-editor)
 
 The README's [Run from source](../README.md#run-from-source) section is the
-quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
-is also required by the Cargo gate, ceditor development/installation scripts,
-experimental hot runner, and the full Servo dependency graph.
+quick start; this page is the full reference. Repository tooling uses shell
+(POSIX `sh`, plus Bash for the release and benchmark scripts), Python 3, and
+Rust. Python supports build-gate orchestration, script contract tests, offline
+provider fixtures, and native validation tools. The full Servo dependency graph
+also requires Python during its build. Native accessibility probes additionally
+use the system's Python GObject/AT-SPI bindings.
+
+The Python build tools share `scripts/cargo_artifacts.py` for Cargo JSON and
+binary executable selection. It preserves configured target/output paths,
+requires one distinct runnable binary, and forwards diagnostics separately from
+the selected path. Callers retain their own subprocess and sandbox handling and
+check Cargo's exit status before selecting an executable. The module is shipped
+beside the HOST test helper in gate installations and remote slots; isolated
+Python entry points explicitly import their own companion directory.
+
+[Issue #2780](https://github.com/CarsonBurke/cagents/issues/2780) tracks adopting
+mise tasks as the supported command interface while preserving the build and
+development contracts below.
 
 ## Prerequisites
 
