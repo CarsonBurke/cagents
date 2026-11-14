@@ -721,6 +721,9 @@ impl Cagents {
     pub(super) fn begin_startup_gate(&mut self) -> Task<Message> {
         if !instance::ui_launch_handshake_requested() {
             instance::finish_window_restore();
+            // Nothing launched this window to verify a restore; the sweep's
+            // own checks still keep every channel holding a card or session.
+            self.allow_empty_channel_sweep();
             return report(Ok(()));
         }
         self.startup_gate.retire_inspections();
@@ -1177,8 +1180,9 @@ impl Cagents {
         }
         self.startup_gate.reported = true;
         instance::finish_window_restore();
-        if let Err(reason) = &result {
-            self.status = Some(incomplete_notice(reason));
+        match &result {
+            Ok(()) => self.allow_empty_channel_sweep(),
+            Err(reason) => self.status = Some(incomplete_notice(reason)),
         }
         report(result)
     }

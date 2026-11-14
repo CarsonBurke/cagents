@@ -421,6 +421,52 @@ impl Agent {
             Placement::Worktree { .. } => None,
         }
     }
+
+    /// Whether this agent is a session `channel` still holds without showing
+    /// it: open, placed there, and its pane never closed there. A window
+    /// adopts such an agent into the channel, and one whose adoption has not
+    /// happened yet, or failed, is recovery evidence rather than emptiness.
+    /// A headless automation run is never adopted, but it is still live work
+    /// placed in the channel, which a reused run returns to.
+    /// `closed_panes` are the channel view's retired panes.
+    pub fn awaits_pane_in(
+        &self,
+        channel: ChannelId,
+        closed_panes: &[crate::model::CardId],
+    ) -> bool {
+        !self.closed
+            && self.channel() == Some(channel)
+            && !closed_panes.contains(&crate::model::CardId::from_uuid(self.id.as_uuid()))
+    }
+
+    /// An open user agent placed in `channel` that has not started a session.
+    #[cfg(test)]
+    pub(crate) fn fixture_placed_in(channel: ChannelId) -> Self {
+        let placement = Placement::Channel(channel);
+        Self {
+            name: None,
+            id: AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: None,
+            console: None,
+            created_ms: 0,
+            closed: false,
+        }
+    }
 }
 
 /// Private launch policy stored with the accepted agent, not a path-based

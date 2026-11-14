@@ -192,7 +192,7 @@ the separate option below.
 | PEER | Script | Each prompt |
 | --- | --- | --- |
 | `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
-| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect` and `closed-after-finish` pick the neighbouring cases |
+| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect`, `closed-after-finish` and `auth-required` pick the neighbouring cases |
 | `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
 
 `start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
@@ -209,8 +209,16 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-rows \
 ```
 
 The peers model the app-server protocol only: no provider, account, model or
-network is contacted, and the app's account and usage-limit handling isn't
-exercised.
+network is contacted, and live account credentials and usage limits aren't
+verified.
+
+For native sign-in controls, prompt the `child-errors` peer with `auth-required`.
+It refuses `turn/start` with an explicit authentication error. Put a whole number
+of seconds in `home/.codex/fixture-sign-in-seconds` to keep the fake `codex login`
+terminal open while **Signing in…** is visible; `login status` stays immediate.
+This exercises the app's recovery controls and login-terminal lifecycle without
+authenticating an account or contacting a provider. It does not verify provider
+credentials or account changes.
 
 ## A real Codex in the fixture
 

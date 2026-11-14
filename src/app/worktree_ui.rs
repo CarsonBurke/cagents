@@ -554,12 +554,17 @@ impl Cagents {
             };
         }
         self.snapshot_workspace_scope();
+        let left = self
+            .durable
+            .active_channel
+            .filter(|&previous| previous != id);
         let discarded = if self.durable.active_channel != Some(id) {
             self.discard_unused_default_chats()
         } else {
             false
         };
         Arc::make_mut(&mut self.durable).active_channel = Some(id);
+        self.retire_left_channel(left);
         let focused = self
             .durable
             .channels
@@ -957,7 +962,9 @@ impl Cagents {
             } else {
                 false
             };
+        let left = self.durable.active_channel;
         Arc::make_mut(&mut self.durable).active_channel = None;
+        self.retire_left_channel(left);
         let roots = self
             .known_worktree_roots
             .iter()
