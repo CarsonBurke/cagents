@@ -2275,10 +2275,44 @@ mod tests {
 
     #[test]
     fn a_pane_inspector_keeps_modifier_releases_without_scrolling_covered_history() {
+        struct Position {
+            id: Id,
+            top: Option<f32>,
+            bottom: Option<f32>,
+        }
+        impl Operation for Position {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id != Some(&self.id) {
+                    return;
+                }
+                self.top = Some(translation.y);
+                if let Some(bottom) = self.bottom.take() {
+                    state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(bottom),
+                    });
+                }
+            }
+        }
         let renderer = crate::app::tests::headless_renderer();
         let target = Target {
             card: CardId::new(),
             generation: 0,
+        };
+        let position = || Position {
+            id: card_control_id(target.card, "chat-transcript"),
+            top: None,
+            bottom: None,
         };
         let memory = Memory::default();
         let bounds = Rectangle::with_size(Size::new(720.0, 400.0));
@@ -2325,11 +2359,11 @@ mod tests {
             );
         };
         let read = |element: &mut Element<'_, Message>, tree: &mut Tree, node: &layout::Node| {
-            let mut top = ReadTop::default();
+            let mut position = position();
             element
                 .as_widget_mut()
-                .operate(tree, Layout::new(node), &renderer, &mut top);
-            top.0.expect("native transcript scroll position")
+                .operate(tree, Layout::new(node), &renderer, &mut position);
+            position.top.expect("native transcript scroll position")
         };
         let modifiers = |value| Event::Keyboard(keyboard::Event::ModifiersChanged(value));
         let wheel = || {
@@ -2346,7 +2380,10 @@ mod tests {
             &mut tree,
             Layout::new(&node),
             &renderer,
-            &mut SetBottom(500.0),
+            &mut Position {
+                bottom: Some(500.0),
+                ..position()
+            },
         );
         send(
             &mut exposed,
