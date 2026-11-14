@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn completed_shared_close_cannot_adopt_a_replacement_worker_receipt() {
+    use crate::workspace_model::views::TerminalRemovalBasis;
+    let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+    source.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: source.launch.clone(),
+        last_exit: Some(crate::model::TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 1,
+        }),
+    };
+    let (mut app, _, _, pane) = channel_move_fixture_with_kind(Some(CardKind::Terminal(source)));
+    assert!(app.capture_shared_removal(pane.id));
+    let replacement = TerminalRemovalBasis::Worker {
+        owner: HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        },
+        instance: uuid::Uuid::new_v4(),
+    };
+    // The current inventory may name B, even though the saved pane still
+    // describes A. Neither a completion nor Active/Confirm grants B to Close.
+    let authority = app.terminal_cleanup_authority(pane.id);
+    assert!(authority.requires_absence());
+    assert!(!authority.permits(&replacement));
+    assert!(!app.shared_removal_terminal_basis(pane.id, replacement));
+    assert!(!app.shared_removal_ready(pane.id));
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+}
+
+#[test]
+fn active_confirmation_preserves_the_captured_worker_authority() {
+    use super::super::TerminalCleanupAuthority;
+    use crate::workspace_model::views::TerminalRemovalBasis;
+    let owner = HostSessionProof {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-incarnation".into(),
+    };
+    let original = TerminalRemovalBasis::Worker {
+        owner: owner.clone(),
+        instance: uuid::Uuid::new_v4(),
+    };
+    let replacement = TerminalRemovalBasis::Worker {
+        owner,
+        instance: uuid::Uuid::new_v4(),
+    };
+    let authority = TerminalCleanupAuthority::Shared(Some(original.clone()));
+    assert!(authority.permits(&original));
+    assert!(!authority.permits(&replacement));
+}
+
+#[test]
 fn missing_worker_receipt_can_only_probe_a_shared_live_terminal() {
     let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
     source.continuity = TerminalContinuity::Live {

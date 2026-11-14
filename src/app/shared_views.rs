@@ -6,6 +6,7 @@ use crate::workspace_model::{
     views::{self, Change, Pane, Scope, View},
 };
 mod removal;
+pub(super) use removal::TerminalCleanupAuthority;
 
 /// One immutable projection for a publication pass. Scope discovery includes
 /// historical directories, but their cards never become open shared panes.

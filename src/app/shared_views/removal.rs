@@ -8,6 +8,29 @@ pub(in crate::app) struct RemovalSource {
     change: Change,
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::app) enum TerminalCleanupAuthority {
+    Local,
+    Shared(Option<TerminalRemovalBasis>),
+}
+
+impl TerminalCleanupAuthority {
+    pub(in crate::app) fn requires_absence(&self) -> bool {
+        matches!(
+            self,
+            Self::Shared(None | Some(TerminalRemovalBasis::Absent { .. }))
+        )
+    }
+
+    pub(in crate::app) fn permits(&self, observed: &TerminalRemovalBasis) -> bool {
+        match self {
+            Self::Local => true,
+            Self::Shared(Some(expected)) => expected == observed,
+            Self::Shared(None) => false,
+        }
+    }
+}
+
 impl Cagents {
     pub(in crate::app) fn capture_shared_removal(&mut self, card: CardId) -> bool {
         let captured = (|| {
@@ -161,7 +184,8 @@ impl Cagents {
                 },
             ) => a != b || latest_worker == &Some(*instance),
             (Some(existing), next) => existing == next,
-            (None, _) => true,
+            (None, TerminalRemovalBasis::Absent { .. }) => true,
+            (None, TerminalRemovalBasis::Worker { .. }) => false,
         };
         if valid {
             *terminal = Some(basis);
@@ -198,6 +222,20 @@ impl Cagents {
                 ..
             }))
         )
+    }
+
+    pub(in crate::app) fn terminal_cleanup_authority(
+        &self,
+        card: CardId,
+    ) -> TerminalCleanupAuthority {
+        match self.shared_views.removals.get(&card) {
+            Some(None) => TerminalCleanupAuthority::Local,
+            Some(Some(RemovalSource {
+                change: Change::RemoveSource { terminal, .. },
+                ..
+            })) => TerminalCleanupAuthority::Shared(terminal.clone()),
+            _ => TerminalCleanupAuthority::Shared(None),
+        }
     }
 
     pub(in crate::app) fn shared_removal_ready(&mut self, card: CardId) -> bool {

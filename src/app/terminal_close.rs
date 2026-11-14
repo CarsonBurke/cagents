@@ -438,10 +438,16 @@ impl Cagents {
             return Task::none();
         }
         if let Some(session) = self.ended_terminal(card).cloned() {
+            let authority = self.terminal_cleanup_authority(card);
             self.completed_release = Some(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    if authority.requires_absence() {
+                        return super::daemon_recovery::prove_not_hosted(&source, &[])
+                            .map(CompletedCloseOutcome::ClosedWithBasis)
+                            .map_err(|kept| kept.reason);
+                    }
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
                     let mut client =
@@ -449,6 +455,14 @@ impl Cagents {
                     let basis = client
                         .terminal_removal_basis(source.clone())
                         .map_err(|error| error.to_string())?;
+                    if matches!(basis, crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }) {
+                        return super::daemon_recovery::prove_not_hosted(&source, &[])
+                            .map(CompletedCloseOutcome::ClosedWithBasis)
+                            .map_err(|kept| kept.reason);
+                    }
+                    if !authority.permits(&basis) {
+                        return Err("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
+                    }
                     match client
                         .release_completed_terminal(source, allow_active)
                         .map_err(|error| error.to_string())?
@@ -892,17 +906,19 @@ impl Cagents {
         intent.pending = true;
         intent.generation = self.terminal_close_generation;
         let intent = intent.clone();
+        let authority = self.terminal_cleanup_authority(intent.card);
         cosmic::task::future(async move {
             let card = intent.card;
             let terminal = intent.terminal;
             let proof = intent.proof.clone();
             let generation = intent.generation;
-            let outcome =
-                tokio::task::spawn_blocking(move || revalidate_and_close(&intent, allow_active))
-                    .await
-                    .unwrap_or_else(|error| {
-                        CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
-                    });
+            let outcome = tokio::task::spawn_blocking(move || {
+                revalidate_and_close(&intent, allow_active, &authority)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
+            });
             Message::TerminalCloseFinished {
                 card,
                 terminal,
@@ -2446,8 +2462,18 @@ mod tests {
     }
 }
 
-fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
+fn revalidate_and_close(
+    intent: &CloseIntent,
+    allow_active: bool,
+    authority: &super::shared_views::TerminalCleanupAuthority,
+) -> CloseOutcome {
     if let Some(source) = &intent.completed_source {
+        if authority.requires_absence() {
+            return match super::daemon_recovery::prove_not_hosted(source, &intent.leave) {
+                Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
+                Err(kept) => CloseOutcome::Kept(kept),
+            };
+        }
         let run = || -> Result<CloseOutcome, String> {
             let path =
                 crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
@@ -2458,6 +2484,20 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
             let basis = client
                 .terminal_removal_basis(source.clone())
                 .map_err(|error| error.to_string())?;
+            if matches!(
+                basis,
+                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+            ) {
+                return Ok(
+                    match super::daemon_recovery::prove_not_hosted(source, &intent.leave) {
+                        Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
+                        Err(kept) => CloseOutcome::Kept(kept),
+                    },
+                );
+            }
+            if !authority.permits(&basis) {
+                return Ok(CloseOutcome::Stale);
+            }
             client
                 .release_completed_terminal(source.clone(), allow_active)
                 .map_err(|error| error.to_string())
