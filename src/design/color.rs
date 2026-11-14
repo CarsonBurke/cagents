@@ -66,8 +66,21 @@ pub fn mix(under: Color, over: Color, amount: f32) -> Color {
 }
 
 /// The surface a pane draws on.
-fn base(theme: &Theme) -> Color {
+pub fn base(theme: &Theme) -> Color {
     theme.current_container().base.into()
+}
+
+/// The fill of a component surface on the pane: an [`elevated`] popover or a
+/// `Card` container.
+///
+/// [`elevated`]: crate::design::elevated
+pub fn component_base(theme: &Theme) -> Color {
+    theme.current_container().component.base.into()
+}
+
+/// The fill of a `Dialog` container.
+pub fn dialog_base(theme: &Theme) -> Color {
+    theme.cosmic().primary(theme.transparent).base.into()
 }
 
 /// A separator that reads as an edge rather than as a frame.
@@ -354,6 +367,19 @@ mod tests {
             assert!(link >= 3.0, "{link}");
             let text = contrast(theme.cosmic().on_bg_color().into(), wash);
             assert!(text >= 4.5, "{text}");
+        }
+    }
+
+    /// The context panel holding the source-control and file lists is a
+    /// `Container::Background`, so lists that fade at its edges fade into
+    /// [`base`]. COSMIC's Primary layer is a different fill wherever a theme
+    /// sets its containers apart, as dark palettes such as Catppuccin do.
+    #[test]
+    fn base_is_the_fill_of_a_background_container() {
+        use cosmic::iced::widget::container::Catalog;
+        for theme in [Theme::dark(), Theme::light()] {
+            let style = theme.style(&cosmic::theme::Container::Background);
+            assert_eq!(style.background, Some(base(&theme).into()));
         }
     }
 

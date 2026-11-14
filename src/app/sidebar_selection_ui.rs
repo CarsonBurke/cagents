@@ -776,9 +776,17 @@ impl Cagents {
         let (cascade, note) = self.group_cascade(dialog);
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title(title).into(),
-            widget::container(widget::scrollable(members))
-                .max_height(240)
-                .into(),
+            widget::container(crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    members.padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                )),
+                design::dialog_base,
+            ))
+            .max_height(240)
+            .into(),
         ];
         if let Some(cascade) = cascade {
             rows.push(super::notice_body(cascade));

@@ -572,15 +572,19 @@ impl Runtime {
             .width(Length::Fill),
             true,
         );
-        let panel = widget::container(
-            widget::scrollable(list)
+        // The panel's top and bottom inset scrolls with the list, so the
+        // viewport runs to the panel's edges and a row passing one fades
+        // into the panel instead of stopping a band short of it.
+        let panel = widget::container(crate::interaction::overflow_fade_y(
+            widget::scrollable(widget::container(list).padding([space::M, 0.0]))
                 .id(card_control_id(target.card, "chat-subagent-list"))
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     design::scrollbar(),
                 ))
                 .height(Length::Fill),
-        )
-        .padding(space::M)
+            design::sunken,
+        ))
+        .padding([0.0, space::M])
         .width(Length::Fill)
         .height(Length::Fill)
         .class(design::surface(

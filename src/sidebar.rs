@@ -9078,16 +9078,21 @@ fn source_control_panel<'a>(
         header,
         tabs,
         notices.into(),
+        // The rows pass under the tab row and the commit box's rule; they
+        // fade into the pane there rather than being cut at either edge.
         Some(crate::interaction::keyboard_list(
-            widget::scrollable(
-                widget::container(body)
-                    .padding(design::with_vertical_rail(Padding::from([0.0, space::S])))
-                    .width(Length::Fill),
-            )
-            .direction(sidebar_scroll_direction())
-            .class(cosmic::style::iced::Scrollable::Minimal)
-            .width(Length::Fill)
-            .height(Length::Fill),
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::container(body)
+                        .padding(design::with_vertical_rail(Padding::from([0.0, space::S])))
+                        .width(Length::Fill),
+                )
+                .direction(sidebar_scroll_direction())
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .width(Length::Fill)
+                .height(Length::Fill),
+                design::base,
+            ),
             !modal_open,
         )),
         footer,
@@ -9536,20 +9541,22 @@ fn files_section<'a>(
         .padding([0.0, space::S])
         .width(Length::Fill)
         .into(),
-        widget::scrollable(
-            widget::container(list)
-                .padding(design::with_vertical_rail(Padding::from([
-                    space::XS,
-                    space::S,
-                ])))
-                .width(Length::Fill),
-        )
-        .id(files_scroll_id(key))
-        .direction(sidebar_scroll_direction())
-        .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into(),
+        crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::container(list)
+                    .padding(design::with_vertical_rail(Padding::from([
+                        space::XS,
+                        space::S,
+                    ])))
+                    .width(Length::Fill),
+            )
+            .id(files_scroll_id(key))
+            .direction(sidebar_scroll_direction())
+            .class(cosmic::style::iced::Scrollable::Minimal)
+            .width(Length::Fill)
+            .height(Length::Fill),
+            design::base,
+        ),
         if flat {
             cosmic::iced::widget::Space::new().height(0).into()
         } else {

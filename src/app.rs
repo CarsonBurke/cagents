@@ -11461,14 +11461,15 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         design::heading("Switch workspace").into(),
-                        widget::container(
+                        widget::container(crate::interaction::overflow_fade_y(
                             widget::scrollable(
                                 widget::column::with_children(rows)
                                     .spacing(WORKSPACE_SWITCHER_ROW_GAP),
                             )
                             .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
                             .height(Length::Shrink),
-                        )
+                            design::component_base,
+                        ))
                         .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
                         .into(),
                         design::caption(

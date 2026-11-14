@@ -291,16 +291,22 @@ impl cosmic::Application for Window {
                 .spacing(space::S)
                 .align_y(iced::Alignment::Center)
                 .into(),
-                widget::scrollable(
-                    widget::column::with_children(body)
-                        .spacing(space::L)
-                        .width(iced::Length::Fill),
-                )
-                .height(iced::Length::Fill)
-                .into(),
+                // The gaps either side of the body scroll with it, so the
+                // viewport meets the heading and the footer and a line
+                // passing either fades there instead of being cut a gap
+                // short of it.
+                crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(body)
+                            .spacing(space::L)
+                            .padding([space::L, 0.0])
+                            .width(iced::Length::Fill),
+                    )
+                    .height(iced::Length::Fill),
+                    crate::design::base,
+                ),
                 footer.into(),
             ])
-            .spacing(space::L)
             .height(iced::Length::Fill),
         )
         .padding(space::XL)

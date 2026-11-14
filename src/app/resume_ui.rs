@@ -614,15 +614,7 @@ impl iced::advanced::widget::Operation<Message> for RevealSelection {
 }
 fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current: f32) -> f32 {
     let top = selected as f32 * (ROW_HEIGHT + ROW_SPACING);
-    let bottom = top + ROW_HEIGHT;
-    let target = if top < current {
-        top
-    } else if bottom > current + viewport {
-        bottom - viewport
-    } else {
-        current
-    };
-    target.clamp(0.0, (content - viewport).max(0.0))
+    crate::interaction::selection_offset(top, ROW_HEIGHT, viewport, content, current)
 }
 
 impl Cagents {
@@ -1523,7 +1515,7 @@ impl Cagents {
             Element::from(
                 widget::row::with_children(vec![
                     list,
-                    widget::container(
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::container(preview)
                                 .padding(design::with_vertical_rail(Padding::ZERO))
@@ -1532,7 +1524,8 @@ impl Cagents {
                         .direction(
                             iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
                         ),
-                    )
+                        design::dialog_base,
+                    ))
                     .width(Length::Fixed(PREVIEW_WIDTH))
                     .height(Length::Fill)
                     .into(),
@@ -1646,18 +1639,20 @@ impl Cagents {
         if rows.is_empty() {
             rows.push(self.resume_empty());
         }
-        widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(ROW_SPACING)
-                .padding(design::with_vertical_rail(Padding::ZERO)),
+        crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .spacing(ROW_SPACING)
+                    .padding(design::with_vertical_rail(Padding::ZERO)),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .id(widget::Id::new("conversation-resume.results"))
+            .width(Length::Fill)
+            .height(Length::Fill),
+            design::dialog_base,
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .id(widget::Id::new("conversation-resume.results"))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
     }
 
     /// Why nothing is listed, and where else to look.
@@ -2345,11 +2340,12 @@ mod tests {
 
     #[test]
     fn resume_selection_uses_the_actual_viewport_and_preserves_visible_rows() {
-        // Rows are 54 px apart by 2: the fourth ends at 222.
-        assert_eq!(resume_selection_offset(3, 160.0, 1040.0, 0.0), 62.0);
+        // Rows are 54 px apart by 2: the fourth ends at 222, and is revealed
+        // with the 24 px fade beneath it.
+        assert_eq!(resume_selection_offset(3, 160.0, 1040.0, 0.0), 86.0);
         assert_eq!(resume_selection_offset(3, 420.0, 1040.0, 0.0), 0.0);
         assert_eq!(resume_selection_offset(0, 160.0, 1040.0, 248.0), 0.0);
-        assert_eq!(resume_selection_offset(9, 160.0, 1040.0, 248.0), 398.0);
+        assert_eq!(resume_selection_offset(9, 160.0, 1040.0, 248.0), 422.0);
     }
 
     #[test]
