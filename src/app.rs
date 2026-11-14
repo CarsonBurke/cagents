@@ -2851,6 +2851,21 @@ fn repaint_tick(message: &Message) -> bool {
     }
 }
 
+/// Background polls, and their answers, whose handlers keep to their own
+/// state: the automation request reader's, and the accounts' figures, which
+/// only the view reads. No sidebar row, card chrome, worktree protection or
+/// source-control binding depends on them, so rebuilding those projections
+/// for every poll would spend several milliseconds of the UI thread on
+/// nothing.
+fn background_poll(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::AutomationApproval(
+            automation_approval::Action::Tick | automation_approval::Action::Read { .. }
+        ) | Message::AccountUi(account_ui::Action::Tick | account_ui::Action::OmpRead(_))
+    )
+}
+
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
         || matches!(
@@ -15044,7 +15059,10 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
+        let mut projection = if repaint_tick(&message)
+            || background_poll(&message)
+            || self.navigation_save_is_stale(&message)
+        {
             Projection::Unchanged
         } else {
             Projection::Full

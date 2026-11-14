@@ -33,7 +33,7 @@ pub(super) struct Writer {
 /// nothing in the census; only the lock can name it.
 pub(super) fn writer(lock: Option<&Path>, thread: &str) -> io::Result<Option<Writer>> {
     let pid = match lock {
-        Some(lock) => lock_holder(lock, &lock_table().map_err(io::Error::other)?)?,
+        Some(lock) => held_lock_holder(lock)?,
         None => None,
     };
     let pid = match pid {
@@ -47,8 +47,10 @@ fn lock_table() -> Result<String, String> {
     #[cfg(test)]
     if let Some(table) = LOCK_TABLE.with(|slot| {
         slot.borrow().as_ref().map(|table| {
-            table.reads.set(table.reads.get() + 1);
-            table.value.clone()
+            let read = table.reads.get();
+            table.reads.set(read + 1);
+            // The last table stands for every later read.
+            table.values[read.min(table.values.len() - 1)].clone()
         })
     }) {
         return Ok(table);
@@ -63,7 +65,7 @@ std::thread_local! {
 
 #[cfg(test)]
 struct TestLockTable {
-    value: String,
+    values: Vec<String>,
     reads: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
@@ -78,10 +80,16 @@ pub(super) struct LockTableScope {
 #[cfg(test)]
 impl LockTableScope {
     pub(super) fn new(value: String) -> Self {
+        Self::reads_of(vec![value])
+    }
+
+    /// Successive reads see successive tables; the last one repeats.
+    pub(super) fn reads_of(values: Vec<String>) -> Self {
+        assert!(!values.is_empty());
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
         let previous = LOCK_TABLE.with(|slot| {
             slot.replace(Some(TestLockTable {
-                value,
+                values,
                 reads: reads.clone(),
             }))
         });
@@ -102,6 +110,24 @@ impl Drop for LockTableScope {
 
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("Cannot read {path}: {error}"))
+}
+
+/// The holder of `lock`. A held lock missing from one read of the table is
+/// read for again: see `crate::flock::proven_owners` for why a read can skip
+/// it.
+fn held_lock_holder(lock: &Path) -> io::Result<Option<libc::pid_t>> {
+    let mut reads = 1;
+    loop {
+        match lock_holder(lock, &lock_table().map_err(io::Error::other)?) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && reads < crate::flock::INDEX_READS =>
+            {
+                reads += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The process holding the lock at `lock`, according to the kernel's `locks`
@@ -467,6 +493,22 @@ mod tests {
                 io::Error::from_raw_os_error(libc::EWOULDBLOCK)
             )
         );
+        // The kernel can skip a held row in one read of the table; the
+        // holder is read for again, a bounded number of times.
+        let (major, minor) = kernel_device(&held).unwrap();
+        let identity = format!("{major:02x}:{minor:02x}:{}", held.metadata().unwrap().ino());
+        let row = format!("1: FLOCK  ADVISORY  WRITE 31337 {identity} 0 EOF\n");
+        let tables = LockTableScope::reads_of(vec![String::new(), row]);
+        assert_eq!(held_lock_holder(&lock).unwrap(), Some(31337));
+        assert_eq!(tables.reads(), 2);
+        drop(tables);
+        let tables = LockTableScope::new(String::new());
+        assert_eq!(
+            held_lock_holder(&lock).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(tables.reads(), crate::flock::INDEX_READS);
+        drop(tables);
         assert_eq!(
             independent_flock(&lock).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
