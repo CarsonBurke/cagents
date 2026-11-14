@@ -972,6 +972,32 @@ fn muted_glyph(icon: Icon) -> Element<'static, Message> {
         .into()
 }
 
+/// The transcript's own background, which a row's open detail sits on, so
+/// a fold fades into it rather than into a card that is no longer there.
+fn transcript_surface(theme: &cosmic::Theme) -> iced::Color {
+    theme.current_container().base.into()
+}
+
+/// A row's heading on one line, cut short with an ellipsis where the pane
+/// is too narrow for it, filling what the row's other parts leave. The
+/// heading is held in a clipped box of exactly that width, so the status
+/// beside it keeps its place whatever width the shaped text reports; the
+/// whole of what was cut is in its tooltip and open detail.
+fn one_line<'a>(
+    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
+) -> Element<'a, Message> {
+    widget::container(
+        text.width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::advanced::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            )),
+    )
+    .width(Length::Fill)
+    .clip(true)
+    .into()
+}
+
 /// How a row's status reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
@@ -1034,10 +1060,11 @@ impl Runtime {
             .find(|agent| agent.id == listed)
     }
 
-    /// The name an agent's tab shows, where this conversation lists it.
+    /// A listed agent's full name and distinguishing ordinal. Transcript rows
+    /// bound their own visible previews while retaining this accessible name.
     pub(super) fn listed_agent_name(&self, address: &str) -> Option<String> {
         self.subagent(address)
-            .map(|agent| self.child_label(agent, 80).into_owned())
+            .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
     /// How a row names a listed agent: in its tab's words, number and all.
@@ -1349,7 +1376,7 @@ impl Runtime {
                 .size(design::TEXT_BODY)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            step::one_line(
+            one_line(
                 design::body(row.preview.clone())
                     .class(cosmic::theme::Text::Custom(design::muted_text)),
             ),
@@ -1508,6 +1535,7 @@ impl Runtime {
                         brief,
                         "Show shared brief",
                         settings,
+                        transcript_surface,
                     ));
                 }
                 let several = spawn.agents.len() > 1;
@@ -1569,9 +1597,15 @@ impl Runtime {
     ) -> Option<Element<'static, Message>> {
         Some(match (text, content) {
             (Text::Inline(text), _) if text.trim().is_empty() => return None,
-            (Text::Inline(_), Some(content)) => {
-                self.folded_markdown(item, cached, part, content, unfold, settings)
-            }
+            (Text::Inline(_), Some(content)) => self.folded_markdown(
+                item,
+                cached,
+                part,
+                content,
+                unfold,
+                settings,
+                transcript_surface,
+            ),
             (Text::File(path), _) => design::caption(format!("The contents of {path}")).into(),
             _ => design::caption("Read from standard input, which the transcript does not show")
                 .into(),
@@ -1588,20 +1622,28 @@ impl Runtime {
         content: &markdown::Content,
         unfold: &'static str,
         settings: markdown::Settings,
+        surface: fn(&cosmic::Theme) -> iced::Color,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
         let open = self.part_unfolded(&key);
-        let toggle =
-            widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Unfold(self.target, key)));
+        let label = if open { "Show less" } else { unfold }.to_owned();
+        let toggle = disclosure::row_on(
+            label.clone(),
+            label,
+            Icon::Chat,
+            None,
+            None,
+            Some(open),
+            Some(Action::Unfold(self.target, key)),
+            surface,
+        );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
             toggle,
             !open,
             view::DELIVERY_FOLDED_HEIGHT,
             step::GAP_S,
-            design::raised,
+            surface,
         )
     }
 
@@ -1655,7 +1697,15 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-                self.folded_markdown(item, cached, part, content, "Show more", settings),
+                self.folded_markdown(
+                    item,
+                    cached,
+                    part,
+                    content,
+                    "Show more",
+                    settings,
+                    design::sunken,
+                ),
             ])
             .spacing(step::GAP_XS),
         )
@@ -1688,6 +1738,110 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    /// However long an agent's name or a step's text, its row stays one line
+    /// in a narrow pane, as tall as a row with short ones. The row's
+    /// accessible name keeps the agent whole, and drawing the row leaves the
+    /// transcript item as it was.
+    #[test]
+    fn a_narrow_row_stays_one_line_and_names_its_agent_whole() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let rows = |name: &str, task: &str, message: &str| {
+            let items = [
+                (
+                    "spawn",
+                    "Agent",
+                    serde_json::json!({
+                        "subagent_type": name,
+                        "description": task,
+                        "prompt": message
+                    }),
+                ),
+                (
+                    "message",
+                    "SendMessage",
+                    serde_json::json!({
+                        "to": "spawn",
+                        "message": message,
+                        "summary": "Review request"
+                    }),
+                ),
+            ]
+            .map(|(id, tool, input)| chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: tool.into(),
+                    input: input.to_string(),
+                    output: String::new(),
+                    status: ToolStatus::Succeeded,
+                },
+                started_at: None,
+                at: None,
+            });
+            let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&items);
+            Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .push(chat::Subagent {
+                    id: "spawn".into(),
+                    kind: name.into(),
+                    description: task.into(),
+                    status: ToolStatus::Succeeded,
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
+                    background: false,
+                    items: Vec::new(),
+                });
+            let renderer = crate::app::tests::headless_renderer();
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let cached = &runtime.cache[&item.id];
+                    let coordinated = cached.coordination.as_deref().unwrap();
+                    let mut element = runtime.coordination_card(item, coordinated, None);
+                    let mut tree = Tree::new(element.as_widget());
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+                    );
+                    let accessible = element.as_widget().a11y_nodes(
+                        Layout::new(&node),
+                        &tree,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let named = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter(|node| node.node().role() == Role::Button)
+                        .filter_map(|node| node.node().label().map(str::to_owned))
+                        .collect::<Vec<_>>();
+                    assert_eq!(runtime.snapshot.items[index].as_ref(), item);
+                    (node.size(), named)
+                })
+                .collect::<Vec<_>>()
+        };
+        let name = format!("Reviewer {}", "界".repeat(300));
+        let task = format!("Verify {}\nRetain the full task", "permissions ".repeat(80));
+        let long = rows(&name, &task, &"Review the fixture ".repeat(200));
+        let short = rows("Reviewer", "Verify", "Review the fixture");
+        for ((long_size, named), (short_size, _)) in long.iter().zip(&short) {
+            assert_eq!(long_size.width, 200.0);
+            assert_eq!(
+                long_size.height, short_size.height,
+                "a long name or text must not wrap the row"
+            );
+            assert!(
+                matches!(named.as_slice(), [label] if label.contains(&name)),
+                "the row is one control named with its agent whole: {named:?}"
+            );
+        }
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the

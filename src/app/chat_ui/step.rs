@@ -33,74 +33,9 @@ pub(super) const GAP_L: f32 = design::GRID_UNIT * 7.0;
 /// rather than per row, so it cannot break between rows.
 const RAIL_INSET: f32 = space::M;
 
-/// Where a group's thread line hangs: under the centre of the header's
-/// disclosure chevron, which sits one control inset from the header's edge.
+/// Where a group's thread line hangs: under the centre of its kind icon.
 const THREAD_RAIL_OFFSET: f32 =
     GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
-
-/// A row's heading on one line, cut short with an ellipsis where the pane
-/// is too narrow for it, filling what the row's other parts leave. The
-/// heading is held in a clipped box of exactly that width, so the duration
-/// and status beside it keep their place whatever width the shaped text
-/// reports; the whole of what was cut is in the open row.
-pub(super) fn one_line<'a>(
-    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
-) -> Element<'a, Message> {
-    widget::container(
-        text.width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            )),
-    )
-    .width(Length::Fill)
-    .clip(true)
-    .into()
-}
-
-/// The indicator and tone a group's status draws as.
-///
-/// Status is information, not a control, so it is a plain glyph rather than
-/// one of the buttons that used to line every row. Running is the exception:
-/// a static glyph for work in flight says only that something was running
-/// when the frame was drawn, so it is the animated indicator the rest of the
-/// shell uses for the same state.
-fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
-    let glyph = |name: Icon, tone: Option<design::Tone>| {
-        (
-            widget::icon(name.handle())
-                .size(design::COMPACT_ICON_SIZE)
-                .into(),
-            tone,
-        )
-    };
-    match status {
-        ToolStatus::Running => (
-            crate::ui_controls::activity_spinner(
-                f32::from(design::COMPACT_ICON_SIZE),
-                design::accent_color,
-            ),
-            Some(design::Tone::Themed(design::accent_color)),
-        ),
-        ToolStatus::Succeeded => glyph(Icon::Check, None),
-        ToolStatus::Failed => glyph(
-            Icon::Error,
-            Some(design::Tone::Themed(design::destructive_color)),
-        ),
-        ToolStatus::Denied => glyph(
-            Icon::Unavailable,
-            Some(design::Tone::Themed(design::muted_color)),
-        ),
-        ToolStatus::Stopped | ToolStatus::Ended => glyph(
-            Icon::Cancel,
-            Some(design::Tone::Themed(design::muted_color)),
-        ),
-        ToolStatus::Waiting => glyph(
-            Icon::AgentBackground,
-            Some(design::Tone::Themed(design::muted_color)),
-        ),
-    }
-}
 
 /// The glyph that stands for what a step was doing, so a reader scanning the
 /// left edge of a strip can tell reading from running from editing without
@@ -246,6 +181,16 @@ fn change_view(change: &FileChange) -> Element<'static, Message> {
 }
 
 impl Runtime {
+    /// Group indices refer to the selected transcript, including child streams.
+    fn step_items(&self) -> &[Arc<chat::Item>] {
+        self.selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
+            .map_or(self.snapshot.items.as_slice(), |agent| {
+                agent.items.as_slice()
+            })
+    }
+
     fn tool_code_surface(
         &self,
         item: &chat::Item,
@@ -312,10 +257,9 @@ impl Runtime {
             return turn.summary.clone();
         };
         let Some(coordinated) = self
-            .snapshot
-            .items
+            .step_items()
             .get(only.index)
-            .and_then(|item| self.cache.get(&item.id))
+            .and_then(|item| self.presentation_cache().get(&item.id))
             .and_then(|cached| cached.coordination.as_deref())
         else {
             return turn.summary.clone();
@@ -349,91 +293,73 @@ impl Runtime {
             .get(key)
             .copied()
             .unwrap_or(self.tool_groups_expanded);
-        let mut line: Vec<Element<'static, Message>> = vec![
-            widget::icon(Icon::handle(if open {
-                Icon::PanDown
-            } else {
-                Icon::PanEnd
-            }))
-            .size(design::COMPACT_ICON_SIZE)
-            .into(),
-        ];
-        let tone = match turn.glyph().map(status_indicator) {
-            Some((indicator, tone)) => {
-                line.push(indicator);
-                tone
-            }
-            None => None,
+        let elapsed = if turn.running {
+            self.source_now_ms()
+                .and_then(|now| turn.duration_label(now))
+        } else {
+            turn.duration_label(0)
         };
-        // The one-second chat tick advances running timers even while a tool
-        // is quiet. The label shares its cadence with the retained-turn cache.
-        let elapsed = self
-            .source_now_ms()
-            .and_then(|now| turn.duration_label(now));
-        // One line, whatever the summary names: a group of one long
-        // command would otherwise wrap it across the pane. The duration is
-        // measured first and the summary cut to what it leaves, so the
-        // duration stays in view. Opening the group shows the whole command.
         let text = self.strip_summary(turn);
-        let summary = one_line(design::heading(text.clone()));
-        line.push(match &elapsed {
-            Some(elapsed) => trailing::trailing(summary, design::caption(elapsed.clone()), GAP_S),
-            None => summary,
+        let name = text.clone();
+        let mut kinds = turn.steps.iter().filter_map(|step| {
+            self.step_items().get(step.index).map(|item| {
+                self.presentation_cache()
+                    .get(&item.id)
+                    .and_then(|cached| cached.coordination.as_deref())
+                    .and_then(Coordinated::glyph)
+                    .unwrap_or_else(|| kind_glyph(&item.content))
+            })
         });
-        // The duration is part of what the control says, so it belongs in the
-        // name as well: a reader on a screen reader is the one who cannot see
-        // the caption beside it.
-        let name = match &elapsed {
-            Some(elapsed) => format!("{text} · {elapsed}"),
-            None => text,
+        let first = kinds.next().unwrap_or(Icon::Utilities);
+        let kind = if kinds.all(|kind| kind == first) {
+            first
+        } else {
+            Icon::Utilities
         };
-        let header = widget::button::custom(
-            widget::row::with_children(line)
-                .spacing(GAP_S)
-                .align_y(Alignment::Start),
-        )
-        .name(name)
-        .class(crate::ui_controls::control_style(false, tone))
-        .padding([GAP_XS as u16, GAP_S as u16])
-        .on_press(action(Action::ToggleTurn(target, key.to_owned())));
-        // The header is sized to its own text rather than stretched across the
-        // pane. A full-width control for a four-word summary is what made the
-        // surface read as a stack of bars.
-        let header = widget::container(header).width(Length::Shrink);
-        if !open {
-            return header.into();
+        let header = disclosure::row(
+            text,
+            name,
+            kind,
+            turn.glyph(),
+            elapsed,
+            Some(open),
+            Some(Action::ToggleTurn(target, key.to_owned())),
+        );
+        // Keep the header at the same tree path through repeated keyboard
+        // toggles. Only the body is appended when the group opens.
+        let mut content = vec![header];
+        if open {
+            let rows = steps();
+            content.push(
+                // One hairline beside the rows rather than a border on each of
+                // them, so the sequence reads as continuous. `Border` carries a
+                // single width for all four edges, so a left-only edge has to be
+                // its own sliver.
+                // The rail hangs from the kind icon so its nested steps read
+                // as one thread below the group's summary.
+                widget::row::with_children(vec![
+                    widget::container(iced::widget::Space::new().height(Length::Fill))
+                        .width(design::BORDER_WIDTH)
+                        .height(Length::Fill)
+                        .class(cosmic::theme::Container::custom(|theme| {
+                            cosmic::widget::container::Style {
+                                background: Some(iced::Background::Color(design::hairline(theme))),
+                                ..Default::default()
+                            }
+                        }))
+                        .into(),
+                    virtualized::column(rows, Default::default()),
+                ])
+                .spacing(RAIL_INSET)
+                .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
+                .width(Length::Fill)
+                .into(),
+            );
         }
-        let rows = steps();
-        widget::column::with_children(vec![
-            header.into(),
-            // One hairline beside the rows rather than a border on each of
-            // them, so the sequence reads as continuous. `Border` carries a
-            // single width for all four edges, so a left-only edge has to be
-            // its own sliver.
-            // The hairline hangs from the header's disclosure chevron, so the
-            // steps read as a thread that opens from it rather than a block
-            // set off to the left of the summary they belong to.
-            widget::row::with_children(vec![
-                widget::container(iced::widget::Space::new().height(Length::Fill))
-                    .width(design::BORDER_WIDTH)
-                    .height(Length::Fill)
-                    .class(cosmic::theme::Container::custom(|theme| {
-                        cosmic::widget::container::Style {
-                            background: Some(iced::Background::Color(design::hairline(theme))),
-                            ..Default::default()
-                        }
-                    }))
-                    .into(),
-                virtualized::column(rows, Default::default()),
-            ])
-            .spacing(RAIL_INSET)
-            .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
+        widget::column::with_children(content)
+            .spacing(GAP_XS)
             .width(Length::Fill)
-            .into(),
-        ])
-        .spacing(GAP_XS)
-        .width(Length::Fill)
-        .into()
+            .into()
     }
 
     /// One step: a summary line that discloses its own detail.
@@ -444,36 +370,34 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        if !open {
-            return self.step_header(item, cached, open);
-        }
-        let detail = self.step_detail(item, cached, settings);
-        // The step's actions stay beside its header, and its detail keeps to
-        // the header's width rather than running out under them, so an open
-        // step ends at one right edge.
-        hover::beside_first(
-            self.step_button(item, cached, open),
-            self.message_copy(item),
-            widget::container(detail)
+        let mut rows = vec![self.step_header(item, cached, open)];
+        if open {
+            rows.push(
+                widget::container(super::view::message_actions(
+                    self.step_detail(item, cached, settings),
+                    self.message_copy(item),
+                    Alignment::Start,
+                ))
                 .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
-                .width(Length::Fill),
-            GAP_XS,
-        )
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+        widget::column::with_children(rows)
+            .spacing(GAP_XS)
+            .width(Length::Fill)
+            .into()
     }
 
-    /// A step's summary line, which is the whole of a closed step and owns
-    /// what it draws, so a finished exchange can keep it between frames.
+    /// The header occupies the whole row; copy and time-stamp controls remain
+    /// available with the expanded detail instead of shifting its chevron.
     pub(super) fn step_header(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
     ) -> Element<'static, Message> {
-        hover::view(
-            self.step_button(item, cached, open),
-            self.message_copy(item),
-            GAP_XS,
-        )
+        self.step_button(item, cached, open)
     }
 
     /// The summary line's toggle, without the actions placed beside it.
@@ -497,88 +421,37 @@ impl Runtime {
         let glyph = coordinated
             .and_then(Coordinated::glyph)
             .unwrap_or_else(|| kind_glyph(&item.content));
-        let mut line: Vec<Element<'static, Message>> = vec![
-            widget::icon(Icon::handle(if open {
-                Icon::PanDown
-            } else {
-                Icon::PanEnd
-            }))
-            .size(design::COMPACT_ICON_SIZE)
-            .into(),
-            widget::icon(glyph.handle()).size(14).into(),
-        ];
-        if !verb.is_empty() {
-            line.push(design::caption(verb.clone()).into());
-        }
-        // The target is a path, a pattern, or a command, so it is set in the
-        // same face the reader would see it in a terminal or an editor. That
-        // is also what separates it at a glance from the verb beside it.
-        // A long command wraps onto the next line rather than running under
-        // the outcome beside it: a pane is often narrow, and a row whose end
-        // is hidden is a row the reader cannot check.
-        // What the step is comes first and stays: the tool's name and
-        // input, or the command. What it last printed follows on a muted
-        // line of its own, so a running build can be followed without the
-        // row forgetting what is being built.
-        let mut preview: Vec<Element<'static, Message>> = Vec::new();
-        if let Some(coordinated) = coordinated {
-            preview.push(one_line(design::body(label.clone())));
-            let arrived = coordinated.reading.outcome.messages.len();
-            if arrived > 0 {
-                preview.push(
-                    design::caption(if arrived == 1 {
-                        "1 message arrived".to_owned()
-                    } else {
-                        format!("{arrived} messages arrived")
-                    })
-                    .into(),
-                );
-            }
-        } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(one_line(design::body(label.clone())));
-            if !cached.preview.text.is_empty() {
-                preview.push(cached.preview.view());
-            }
-        } else {
-            preview.push(cached.preview.view());
-            // The first line of a script (`python3 - <<'EOF'`) does not say
-            // what it does, so the provider's account of it is kept in view
-            // until the open step shows it above the command.
-            if !open && let Some(description) = turn::script_description(&item.content) {
-                preview.push(design::caption(description.to_owned()).into());
-            }
-        }
-        if !coordinated.is_some_and(|coordinated| coordinated.reading.output_is_agent_states()) {
-            preview.extend(cached.preview.tail_view());
-        }
-        line.push(
-            widget::column::with_children(preview)
-                .spacing(GAP_XS)
-                .width(Length::Fill)
-                .into(),
-        );
-        if let Some(detail) = &cached.detail {
-            line.push(design::caption(detail.clone()).into());
-        }
-        let mut name = if verb.is_empty() {
+        let mut label = if verb.is_empty() {
             label
         } else {
             format!("{verb} {label}")
         };
-        if let Some(description) = turn::command_description(&item.content) {
-            name = format!("{name} · {description}");
+        if let ItemContent::Command {
+            exit_code: Some(code),
+            ..
+        } = item.content
+            && code != 0
+        {
+            label.push_str(&format!(" · exit {code}"));
+        } else if let Some(word) = item.content.status().and_then(unsettled_word)
+            && item.content.status() != Some(ToolStatus::Running)
+        {
+            label.push_str(&format!(" · {word}"));
         }
-        widget::button::custom(
-            widget::row::with_children(line)
-                .spacing(GAP_S)
-                .align_y(Alignment::Start),
+        let elapsed = disclosure::item_duration(item, self.source_now_ms());
+        let mut name = label.clone();
+        if let Some(description) = turn::command_description(&item.content) {
+            name.push_str(&format!(" · {description}"));
+        }
+        disclosure::row(
+            turn::headline(label),
+            name,
+            glyph,
+            item.content.status(),
+            elapsed,
+            Some(open),
+            Some(Action::Toggle(target, item.id.clone())),
         )
-        .name(name)
-        .class(crate::ui_controls::control_style(open, None))
-        .padding([GAP_XS as u16, GAP_S as u16])
-        .width(Length::Fill)
-        .on_press(action(Action::Toggle(target, item.id.clone())))
-        .into()
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
@@ -744,13 +617,146 @@ impl Runtime {
                 }
             }
         }
-        // A step carries no controls of its own. Copying belongs to an answer,
-        // and the pieces of a step a reader actually copies - a command, its
-        // output, a tool's input - each carry their own control on the surface
-        // that holds them.
+        // Commands, output and tool inputs keep their own copy controls;
+        // the expanded step adds whole-message actions beneath this detail.
         widget::column::with_children(rows)
             .spacing(space::XS)
             .width(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::advanced::{
+        Layout, Shell, clipboard, layout,
+        widget::{Operation, Tree, operation::Focusable},
+    };
+
+    #[derive(Default)]
+    struct FocusHeader {
+        assign: bool,
+        focused: Option<bool>,
+    }
+
+    impl Operation for FocusHeader {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+
+        fn focusable(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn Focusable,
+        ) {
+            if self.focused.is_none() {
+                if self.assign {
+                    state.focus();
+                }
+                self.focused = Some(state.is_focused());
+            }
+        }
+    }
+
+    /// A native Enter press must keep reaching the same header after both
+    /// disclosure transitions, including the group that used to change its
+    /// root widget when it opened.
+    #[test]
+    fn step_and_group_headers_retain_keyboard_focus_through_repeated_toggles() {
+        let item = chat::Item {
+            id: "keyboard-command".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: "Check the fixture".into(),
+                command: "git status --short".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(12_000),
+                output: "Working tree clean".into(),
+            },
+            started_at: Some(1_000),
+            at: Some(13_000),
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(275.0, 1_000.0));
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        for group in [false, true] {
+            let (mut runtime, _handle) =
+                super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
+            let key = runtime.turns[0].key.clone();
+            let build = |runtime: &Runtime| {
+                if group {
+                    runtime.step_strip(&runtime.turns[0], Vec::new)
+                } else {
+                    runtime.step_view(&item, &runtime.cache[&item.id], settings)
+                }
+            };
+            let mut tree = Tree::new(build(&runtime).as_widget());
+            for (index, open) in [false, true, false].into_iter().enumerate() {
+                runtime.opened.insert(key.clone(), open);
+                if open {
+                    runtime.expanded.insert(item.id.clone());
+                } else {
+                    runtime.expanded.remove(&item.id);
+                }
+                let mut element = build(&runtime);
+                tree.diff(element.as_widget_mut());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                );
+                let mut focus = FocusHeader {
+                    assign: index == 0,
+                    ..Default::default()
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut focus,
+                );
+                assert_eq!(focus.focused, Some(true), "group={group}, open={open}");
+
+                let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &enter,
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(messages.len(), 1, "one Enter emits one disclosure action");
+                match &messages[0] {
+                    Message::ChatUi(Action::ToggleTurn(target, id)) if group => {
+                        assert_eq!(*target, runtime.target);
+                        assert_eq!(id, &key);
+                    }
+                    Message::ChatUi(Action::Toggle(target, id)) if !group => {
+                        assert_eq!(*target, runtime.target);
+                        assert_eq!(id, &item.id);
+                    }
+                    _ => panic!("the focused header must emit its own disclosure action"),
+                }
+            }
+        }
     }
 }
