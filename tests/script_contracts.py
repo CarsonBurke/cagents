@@ -259,10 +259,12 @@ class Running(Tree):
         jobs = (Job("first", (Suite("one", "tests/one.py"),)),
                 Job("sharded", (Suite("two", "tests/two.py"),), shards=3),
                 Job("last", (Suite("three", "tests/three.py"),)))
+        self.recording("tests/source.py", "source", exit_code=4)
         with quiet():
-            self.assertEqual(contracts.run_all(self.root, jobs=jobs), 5)
+            self.assertEqual(contracts.run_all(self.root, jobs=jobs, source_fixtures=("tests/source.py",)), 5)
         calls = self.calls()
-        self.assertEqual([call["fixture"] for call in calls], ["one", "two", "three"])
+        # The source job's suites, which CI runs beside the jobs, run last.
+        self.assertEqual([call["fixture"] for call in calls], ["one", "two", "three", "source"])
         # The sharded job's suite ran whole rather than as one shard.
         self.assertEqual(calls[1]["arguments"], ["-v"])
 

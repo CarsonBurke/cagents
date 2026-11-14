@@ -12,7 +12,8 @@ older-head applicability case to tolerate.
   protocol-base     print the commit the protocol contract compares with
   run [JOB [SHARD]] run one job's suites; SHARD (I/N) runs every Nth test of a
                     sharded job's single suite, so the shards cover it exactly.
-                    Without JOB, run every job unsharded, one after another
+                    Without JOB, run every job unsharded, one after another,
+                    then the source job's suites
 """
 
 import argparse
@@ -340,13 +341,18 @@ def run(root, job_name, shard_text=None, jobs=JOBS):
     return failures[0][1] if failures else 0
 
 
-def run_all(root, jobs=JOBS):
-    """Run every job whole, continuing past failures; the first failure's status."""
+def run_all(root, jobs=JOBS, source_fixtures=SOURCE_JOB_FIXTURES):
+    """Run every suite CI runs, continuing past failures; the first failure's status."""
     failures = []
     for job in jobs:
         returncode = run(root, job.name, jobs=jobs)
         if returncode:
             failures.append((job.name, returncode))
+    if source_fixtures:
+        source = Job("source", tuple(Suite(Path(fixture).stem, fixture) for fixture in source_fixtures))
+        returncode = run(root, source.name, jobs=(source,))
+        if returncode:
+            failures.append((source.name, returncode))
     for name, returncode in failures:
         print(f"Failed job: {name} (exit {returncode})", file=sys.stderr)
     return failures[0][1] if failures else 0
