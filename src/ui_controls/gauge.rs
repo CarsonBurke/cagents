@@ -78,6 +78,33 @@ pub(crate) fn activity_animates() -> bool {
     ANIMATE_ACTIVITY.get()
 }
 
+// Each visible spinner sees the same redraw event. Keep one timestamp per UI
+// thread so recording scales with frames, not the number of busy indicators.
+fn trace_activity_frame(now: cosmic::iced::time::Instant, focused: bool) {
+    std::thread_local! {
+        static LAST: std::cell::Cell<Option<(cosmic::iced::time::Instant, bool)>> = const { std::cell::Cell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some((previous, was_focused)) = last.get() {
+            if previous == now {
+                return;
+            }
+            // A focus transition changes the intended cadence. Do not count
+            // that interval as a steady focused or background frame interval.
+            if was_focused == focused {
+                tracing::debug!(
+                    target: "cagents::workspace_pipeline",
+                    stage = "activity_redraw",
+                    interval_ns = now.saturating_duration_since(previous).as_nanos().min(u64::MAX as u128) as u64,
+                    focused,
+                    "Observed a redraw with a visible activity indicator"
+                );
+            }
+        }
+        last.set(Some((now, focused)));
+    });
+}
+
 /// The arc the spinner draws `elapsed` after [`SPINNER_EPOCH`], as start and
 /// end angles in radians measured from twelve o'clock.
 ///
@@ -206,6 +233,9 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         if let cosmic::iced::Event::Window(cosmic::iced::window::Event::RedrawRequested(now)) =
             event
         {
+            if tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG) {
+                trace_activity_frame(*now, ANIMATE_ACTIVITY.get());
+            }
             let state = tree.state.downcast_mut::<SpinnerState>();
             let since = now.saturating_duration_since(*SPINNER_EPOCH);
             // A redraw repaints the whole window, so the arc is stepped at a
