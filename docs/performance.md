@@ -109,6 +109,12 @@ and the terminal. Before, each focused cursor repainted the whole window every
 500 ms for as long as it held focus, and the chat composer holds focus after a
 chat opens or a message is sent.
 
+Where the desktop states its own blink through the settings portal
+(`org.gnome.desktop.interface` on GNOME, GTK and COSMIC), cursors use its
+interval and timeout instead, and follow changes while the app runs. With
+blinking turned off, every cursor is steady and asks for no frames, including a
+terminal whose program requested a blinking cursor.
+
 To measure it, seed a fixture with 30 settled chats, start a session with
 `scripts/native-evidence start SIDE --ui-trace`, spawn three agents whose
 first turn stays busy, then interrupt them. Leave the composer focused and the
