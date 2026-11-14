@@ -4340,16 +4340,17 @@ impl Runtime {
             self.target,
             &offers,
             draft,
-            (provider, self.snapshot.selected_model.as_deref()),
+            (
+                provider,
+                selected_chat_model(&self.snapshot)
+                    .map(|model| model.id.as_str())
+                    .or(self.snapshot.selected_model.as_deref()),
+            ),
             query,
         );
         let mut sections = vec![models];
         if self.snapshot.capabilities.reasoning_selection
-            && let Some(model) = self
-                .snapshot
-                .models
-                .iter()
-                .find(|model| Some(&model.id) == self.snapshot.selected_model.as_ref())
+            && let Some(model) = selected_chat_model(&self.snapshot)
             && !model.reasoning.is_empty()
         {
             let default_effort = reasoning_default(&self.snapshot, provider, model, catalog);
@@ -6308,10 +6309,7 @@ fn footer_model_label<'a>(
     fit: FooterFit,
     draft_default_effort: Option<&str>,
 ) -> Cow<'a, str> {
-    let selected = snapshot.models.iter().find(|model| {
-        Some(&model.id) == snapshot.selected_model.as_ref()
-            || (snapshot.selected_model.is_none() && model.id == "default")
-    });
+    let selected = selected_chat_model(snapshot);
     let active = (!draft).then_some(snapshot.active_model.as_ref()).flatten();
     let label = if let Some(active) = active {
         active.label.as_str().into()
@@ -6442,7 +6440,7 @@ fn picker_choice_row<'a>(
                 .into(),
         );
     }
-    widget::button::custom(
+    let control = widget::button::custom(
         widget::row::with_children(vec![
             if selected {
                 widget::icon(Icon::Check.handle())
@@ -6467,8 +6465,12 @@ fn picker_choice_row<'a>(
     .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
     .height(Length::Fixed(design::list::TWO_LINE_HEIGHT))
     .width(Length::Fill)
-    .on_press(message)
-    .into()
+    .on_press(message);
+    if selected {
+        control.description("Selected").into()
+    } else {
+        control.into()
+    }
 }
 
 /// The search field and the models `query` names among `offers`, under a
@@ -15625,6 +15627,55 @@ mod tests {
             listed(&model_rows(&offers, "", true)),
             [(Provider::Claude, vec!["default"])]
         );
+    }
+
+    #[test]
+    fn footer_cached_implicit_default_mounts_checked_model_and_effort_choices() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = furnished_runtime();
+        runtime.model_picker = Some(String::new());
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![chat::Model {
+            id: "default".into(),
+            label: "Default (Opus 5.5)".into(),
+            reasoning: vec!["low".into(), "high".into()],
+        }];
+        snapshot.selected_model = None;
+        snapshot.reasoning = None;
+        snapshot.active_model = None;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut menu = runtime.model_search(Vec::new()).unwrap();
+        let mut tree = Tree::new(menu.as_widget());
+        let node = menu.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 900.0)),
+        );
+        let accessible = menu.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let choices: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| {
+                node.node().label().map(|name| {
+                    (
+                        name.to_owned(),
+                        node.node().description().map(str::to_owned),
+                    )
+                })
+            })
+            .collect();
+        for title in ["Default (Opus 5.5)", "Default", "Low", "High"] {
+            assert!(
+                choices.iter().any(|(name, selected)| name == title
+                    && selected.as_deref() == title.starts_with("Default").then_some("Selected")),
+                "{choices:?}"
+            );
+        }
     }
 
     #[test]
