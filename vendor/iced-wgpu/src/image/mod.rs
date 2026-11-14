@@ -347,7 +347,7 @@ impl State {
                         // pixel: nearest sampling keeps it exact as long as
                         // the quad covers exactly the raster's pixels. Snapping
                         // each corner on its own makes a fractional extent one
-                        // pixel short or long, which drops or repeats a row.
+                        // pixel short, which skips a row or column of texels.
                         // A rotated raster no longer lines up with the pixel
                         // grid at all; nearest sampling turns its antialiased
                         // edges into steps, so it is filtered instead.
