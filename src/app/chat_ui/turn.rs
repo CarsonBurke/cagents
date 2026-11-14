@@ -198,6 +198,7 @@ impl Turn {
             return " · working";
         }
         match self.outcome {
+            Some(ToolStatus::Failed) if self.steps.len() > 1 => " · includes a failed step",
             Some(ToolStatus::Failed) => " · failed",
             Some(ToolStatus::Denied) => " · denied",
             Some(ToolStatus::Stopped) => " · stopped",
@@ -1062,7 +1063,7 @@ mod tests {
             Some(ToolStatus::Failed),
             "later success must not hide a failed command in a collapsed group"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands · failed");
+        assert_eq!(turns[0].summary, "Ran 2 commands · includes a failed step");
         let items = vec![
             text("u1", Role::User, Phase::Final, false),
             command("c1", ToolStatus::Succeeded),
@@ -1074,7 +1075,7 @@ mod tests {
             Some(ToolStatus::Failed),
             "a group that ended on a failure still reports it"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands · failed");
+        assert_eq!(turns[0].summary, "Ran 2 commands · includes a failed step");
     }
 
     #[test]
