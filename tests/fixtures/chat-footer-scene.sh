@@ -157,7 +157,17 @@ for provider in claude codex; do
         reasoning
         "$ne" drive click 'high'
     else
-        "$ne" drive click 'High'
+        # OCR can omit the popup rows even while they remain visibly present.
+        # The search field is recognized reliably; leave one model above the
+        # effort section, then traverse model, Default, Low, Medium, High.
+        "$ne" drive click 'models'
+        "$ne" drive key ctrl+a
+        case $provider in
+            claude) "$ne" drive type 'Default' ;;
+            codex) "$ne" drive type 'Offline Mini' ;;
+        esac
+        for _ in 1 2 3 4 5; do "$ne" drive key Tab; done
+        "$ne" drive key Return
     fi
     sleep 2
     prompt "Confirm the $provider footer with high effort."
