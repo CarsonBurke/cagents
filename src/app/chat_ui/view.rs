@@ -12895,7 +12895,7 @@ mod tests {
                 ),
                 working_directory: "/project".into(),
                 action: chat::CommandAction::Run,
-                status: ToolStatus::Succeeded,
+                status: chat::ToolStatus::Succeeded,
                 exit_code: Some(0),
                 duration_ms: Some(20),
                 output: format!(
