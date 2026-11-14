@@ -51,6 +51,27 @@ pub(super) struct Row {
     pub(super) place: String,
 }
 
+impl Row {
+    /// Which end of the name gives way: a repository outside any project is
+    /// named by its path, which is told apart by its end.
+    fn name_edge(&self) -> crate::ui_controls::FadeEdge {
+        if self.project.is_none() {
+            self.place_edge()
+        } else {
+            crate::ui_controls::FadeEdge::End
+        }
+    }
+
+    /// Which end of the place gives way: a repository's place is its path.
+    fn place_edge(&self) -> crate::ui_controls::FadeEdge {
+        if matches!(self.action, SidebarAction::OpenRepository { .. }) {
+            crate::ui_controls::FadeEdge::Start
+        } else {
+            crate::ui_controls::FadeEdge::End
+        }
+    }
+}
+
 /// The panes of the highlighted workspace, read when the selection moves.
 #[derive(Debug, Default)]
 pub(super) struct Panes {
@@ -957,9 +978,11 @@ impl Cagents {
         );
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())
+                .edge(row.name_edge())
                 .width(Length::Fill)
                 .into(),
             crate::ui_controls::FadeText::caption(row.place.as_str())
+                .edge(row.place_edge())
                 .width(Length::Fill)
                 .into(),
         ])
@@ -1051,6 +1074,7 @@ impl Cagents {
             project.map_or_else(|| iced::widget::Space::new().into(), sidebar::project_chip),
             widget::column::with_children(vec![
                 crate::ui_controls::FadeText::title(row.name.as_str())
+                    .edge(row.name_edge())
                     .width(Length::Fill)
                     .into(),
                 crate::ui_controls::FadeText::caption(if attention.is_empty() {
@@ -1058,6 +1082,7 @@ impl Cagents {
                 } else {
                     format!("{} · {attention}", row.place)
                 })
+                .edge(row.place_edge())
                 .width(Length::Fill)
                 .into(),
             ])
