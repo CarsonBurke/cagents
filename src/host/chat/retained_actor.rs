@@ -452,12 +452,7 @@ fn persist_confirmed_identity(
             &aliases,
             &crate::agent_execution::HostedSession::Chat(projected.clone()),
         )?;
-        let registered = registry.register_native_actor_ownership(
-            target.identity.instance,
-            &target.identity.record,
-            &projected,
-            target.handle.launch_account_scope(),
-        );
+        let registered = registry.confirm_native_actor_identity(&owner.0, &projected);
         (changed, registered)
     };
     // Adoption may have committed even if census publication needs retry.

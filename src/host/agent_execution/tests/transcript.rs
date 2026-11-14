@@ -438,23 +438,47 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
-    retained_identity_case(false, false);
+    retained_identity_case(false, false, ProviderHome::Original);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn confirmed_identity_retries_after_census_publication_failure() {
-    retained_identity_case(true, false);
+    retained_identity_case(true, false, ProviderHome::Original);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
-    retained_identity_case(false, true);
+    retained_identity_case(false, true, ProviderHome::Original);
 }
 
 #[cfg(target_os = "linux")]
-fn retained_identity_case(fail_census: bool, shutdown_before_confirmation: bool) {
+#[test]
+fn shutdown_saves_confirmed_identity_after_provider_home_is_removed() {
+    retained_identity_case(false, true, ProviderHome::Removed);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_saves_confirmed_identity_after_provider_home_is_replaced() {
+    retained_identity_case(false, true, ProviderHome::Replaced);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderHome {
+    Original,
+    Removed,
+    Replaced,
+}
+
+#[cfg(target_os = "linux")]
+fn retained_identity_case(
+    fail_census: bool,
+    shutdown_before_confirmation: bool,
+    home: ProviderHome,
+) {
     if super::retained_automation::isolated_retained() {
         return;
     }
@@ -528,6 +552,13 @@ fn retained_identity_case(fail_census: bool, shutdown_before_confirmation: bool)
             || !crate::host::chat::retained_actor::broker_running(&host),
             "background broker did not stop before confirmation",
         );
+        assert!(host.lock().unwrap().shutting_down);
+        if home != ProviderHome::Original {
+            std::fs::rename(root.join("home/.claude"), root.join("home/original-claude")).unwrap();
+            if home == ProviderHome::Replaced {
+                std::fs::create_dir(root.join("home/.claude")).unwrap();
+            }
+        }
         std::fs::write(root.join("cleanup-release"), "").unwrap();
     }
     wait(
@@ -535,7 +566,9 @@ fn retained_identity_case(fail_census: bool, shutdown_before_confirmation: bool)
         "provider never confirmed its conversation",
     );
     let confirmed = handle.confirmed_session_id().unwrap();
-    save_claude_transcript(&host, id, root);
+    if home == ProviderHome::Original {
+        save_claude_transcript(&host, id, root);
+    }
     if shutdown_before_confirmation {
         let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
         assert!(
@@ -624,6 +657,17 @@ fn retained_identity_case(fail_census: bool, shutdown_before_confirmation: bool)
         || !identity.record.root.is_current() && !identity.record.holder.is_current(),
         "daemon stop left retained processes alive",
     );
+    if home != ProviderHome::Original {
+        let retirement = store
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retirement.scope(), handle.launch_account_scope());
+        assert_eq!(retirement.confirmed_session(), Some(confirmed.as_str()));
+        return;
+    }
     let mut restarted = HostState::new(proof);
     restarted.install_model(Registry::at(&path).unwrap());
     assert!(restarted.chats.is_empty());
