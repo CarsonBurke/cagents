@@ -100,6 +100,30 @@ pub(super) fn sessions(
     })
 }
 
+pub(super) fn context(
+    host: &SharedHost,
+    authority: &Authority,
+    scope: Scope,
+    standing: bool,
+) -> Result<crate::agent_execution::directory::Context, String> {
+    let listing = list(host, authority, Wanted::Scope(scope), false, standing)?;
+    let Wanted::Scope(scope) = listing.served else {
+        unreachable!("a context read serves a scope");
+    };
+    let lineage_channel = listing
+        .caller
+        .as_ref()
+        .and_then(|caller| caller.session.lineage_channel.clone());
+    Ok(crate::agent_execution::directory::Context {
+        sessions: Sessions {
+            caller: listing.caller,
+            scope,
+            sessions: listing.sessions,
+        },
+        lineage_channel,
+    })
+}
+
 /// The sessions in a channel, including chats whose provider exited.
 pub(super) fn channel(
     host: &SharedHost,
@@ -151,7 +175,7 @@ pub(super) fn list(
     if members {
         live.extend(exited_chats(host));
     }
-    let (model, delegations, lineages, succession) = {
+    let (model, delegations, lineages, succession, channel_history) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
@@ -174,6 +198,7 @@ pub(super) fn list(
                 .lineage_succession(lineages.get(&caller).copied().unwrap_or(Lineage(caller)))?,
             None => Vec::new(),
         };
+        let channel_history = registry.session_channels(&succession)?;
         let mut delegations = BTreeMap::new();
         // Only a live session's delegation is listed, so only its latest run
         // is read.
@@ -198,7 +223,7 @@ pub(super) fn list(
                 ),
             );
         }
-        (model, delegations, lineages, succession)
+        (model, delegations, lineages, succession, channel_history)
     };
     let lineage = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
     // A plain shell is listed only where it matters: as the caller, or as the
@@ -270,7 +295,7 @@ pub(super) fn list(
         _ => None,
     };
     let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
-    let lineage_channel = lineage_channel(&model, &scopes, &succession);
+    let lineage_channel = lineage_channel(&model, &scopes, &succession, &channel_history);
     let now = super::now();
     let accounts = standing
         .then(|| super::account_info::Accounts::load(now))
@@ -720,11 +745,12 @@ fn bears_on(summary: &str, scope: Option<&str>) -> bool {
 /// The channel the latest session of a lineage belonged to, `succession`
 /// listing its sessions newest first. A managed agent's own placement is its
 /// membership; any other session belongs where exactly one channel shows it.
-/// One shown in two channels says nothing, and an older session decides.
+/// Missing or ambiguous panes retain the session's last recorded channel.
 fn lineage_channel(
     model: &crate::workspace_model::WorkspaceModel,
     scopes: &BTreeMap<TerminalId, Option<crate::agent_execution::Placement>>,
     succession: &[TerminalId],
+    history: &BTreeMap<TerminalId, crate::agent_execution::directory::ChannelHome>,
 ) -> Option<crate::agent_execution::directory::ChannelHome> {
     succession.iter().find_map(|session| {
         let placed = model
@@ -742,7 +768,9 @@ fn lineage_channel(
             Some(Some(crate::agent_execution::Placement::Channel(channel))) => Some(*channel),
             _ => None,
         };
-        let channel = placed.or(shown)?;
+        let channel = placed
+            .or(shown)
+            .or_else(|| history.get(session).map(|home| home.id))?;
         let channel = model.channel(channel)?;
         Some(crate::agent_execution::directory::ChannelHome {
             id: channel.id,
@@ -1209,16 +1237,23 @@ mod tests {
         };
         let (caller, predecessor) = (TerminalId::new(), TerminalId::new());
         let succession = [caller, predecessor];
+        let history = BTreeMap::new();
         // Nothing of the lineage is in a channel.
         let scopes = session_scopes(&model);
-        assert_eq!(lineage_channel(&model, &scopes, &succession), None);
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            None
+        );
 
         // The predecessor's pane is still in one channel.
         let mut kept = View::empty(Scope::Channel(first));
         kept.panes.push(terminal_pane(predecessor));
         model.views.push(kept);
         let scopes = session_scopes(&model);
-        assert_eq!(lineage_channel(&model, &scopes, &succession), home(first));
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            home(first)
+        );
 
         // The caller shown in two channels says nothing; the older session
         // still decides.
@@ -1229,7 +1264,23 @@ mod tests {
         }
         let scopes = session_scopes(&model);
         assert_eq!(scopes[&caller], None);
-        assert_eq!(lineage_channel(&model, &scopes, &succession), home(first));
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            home(first)
+        );
+
+        // A root session needs no still-visible predecessor to remember its
+        // last channel when two views now make its membership ambiguous.
+        let remembered = BTreeMap::from([(caller, home(second).unwrap())]);
+        assert_eq!(
+            lineage_channel(&model, &scopes, &[caller], &remembered),
+            home(second)
+        );
+        // The same last channel survives when the current pane is missing.
+        assert_eq!(
+            lineage_channel(&model, &BTreeMap::new(), &[caller], &remembered),
+            home(second)
+        );
 
         // A managed agent's own placement is its membership, however many
         // views show it.
@@ -1239,14 +1290,23 @@ mod tests {
         };
         agent.session = Some(crate::agent_execution::HostedSession::Terminal(session));
         model.agents.push(agent);
-        assert_eq!(lineage_channel(&model, &scopes, &succession), home(third));
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            home(third)
+        );
         // ...until it is closed.
         model.agents[0].closed = true;
-        assert_eq!(lineage_channel(&model, &scopes, &succession), home(first));
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            home(first)
+        );
 
         // A deleted channel is no home; nothing older is placed.
         model.channels.retain(|channel| channel.id != first);
-        assert_eq!(lineage_channel(&model, &scopes, &succession), None);
+        assert_eq!(
+            lineage_channel(&model, &scopes, &succession, &history),
+            None
+        );
     }
 
     #[test]

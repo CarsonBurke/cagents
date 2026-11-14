@@ -10,6 +10,40 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
+/// Keep a session's channel after its pane is removed or rebound to a successor.
+/// The authoritative pane writer records moves in the same transaction; reads
+/// and ambiguous/missing membership never erase that history.
+pub(super) fn migrate_channels(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE session_channels(
+             session TEXT PRIMARY KEY,
+             channel TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE
+         ) STRICT;
+         INSERT INTO session_channels(session, channel)
+             SELECT p.resource, s.channel FROM panes p JOIN view_scopes s ON s.id=p.scope
+             WHERE p.kind IN ('chat','terminal') AND s.channel IS NOT NULL
+             ORDER BY s.revision, p.id
+             ON CONFLICT(session) DO UPDATE SET channel=excluded.channel;
+         CREATE TRIGGER session_channel_insert AFTER INSERT ON panes
+             WHEN NEW.kind IN ('chat','terminal')
+             AND (SELECT channel FROM view_scopes WHERE id=NEW.scope) IS NOT NULL
+         BEGIN
+             INSERT INTO session_channels(session,channel)
+                 SELECT NEW.resource,channel FROM view_scopes WHERE id=NEW.scope
+                 ON CONFLICT(session) DO UPDATE SET channel=excluded.channel;
+         END;
+         CREATE TRIGGER session_channel_move AFTER UPDATE OF scope,resource,kind ON panes
+             WHEN NEW.kind IN ('chat','terminal')
+             AND (SELECT channel FROM view_scopes WHERE id=NEW.scope) IS NOT NULL
+         BEGIN
+             INSERT INTO session_channels(session,channel)
+                 SELECT NEW.resource,channel FROM view_scopes WHERE id=NEW.scope
+                 ON CONFLICT(session) DO UPDATE SET channel=excluded.channel;
+         END;",
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Keeps an idempotency key that a rewritten origin would make collide out of
 /// reach: requests cannot contain control characters, so no retry matches it.
 const RETIRED_KEY_SEPARATOR: char = '\u{1f}';
@@ -328,6 +362,34 @@ impl Registry {
         }
         Ok(sessions)
     }
+
+    pub(crate) fn session_channels(
+        &self,
+        sessions: &[TerminalId],
+    ) -> Result<BTreeMap<TerminalId, crate::agent_execution::directory::ChannelHome>, String> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT c.id,c.repository FROM session_channels s JOIN channels c ON c.id=s.channel WHERE s.session=?1",
+        ).map_err(|error| error.to_string())?;
+        let mut channels = BTreeMap::new();
+        for session in sessions {
+            let saved: Option<(String, String)> = statement
+                .query_row([session.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some((channel, repository)) = saved {
+                channels.insert(
+                    *session,
+                    crate::agent_execution::directory::ChannelHome {
+                        id: channel
+                            .parse()
+                            .map_err(|_| "Stored session channel is invalid".to_owned())?,
+                        repository: repository.into(),
+                    },
+                );
+            }
+        }
+        Ok(channels)
+    }
 }
 
 fn lineage_members_in(db: &Connection, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
@@ -607,6 +669,134 @@ mod tests {
         assert_eq!(
             registry.lineage_succession(Lineage(root)).unwrap(),
             [second, first, root]
+        );
+    }
+
+    #[test]
+    fn session_channel_history_survives_moves_missing_panes_and_restart() {
+        use crate::model::{CardId, CardKind, ChannelId};
+        use crate::workspace_model::views::{Change, Pane, Scope};
+
+        let (mut registry, directory, _) = fixture();
+        let repository = directory.path().to_path_buf();
+        let (first, second) = (ChannelId::new(), ChannelId::new());
+        for id in [first, second] {
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id,
+                    repository: repository.clone(),
+                    title: "Fixture channel".into(),
+                    title_source: Default::default(),
+                })
+                .unwrap();
+        }
+        let session = TerminalId::new();
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Fixture shell".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            scope: None,
+            kind: CardKind::Terminal(shell(session, None)),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(first),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            registry.session_channels(&[session]).unwrap()[&session].id,
+            first
+        );
+
+        // Move through a second channel, then to a worktree. The latter has
+        // no channel of its own and must not erase the lineage's last one.
+        let worktree = Scope::Worktree {
+            repository: repository.clone(),
+            path: repository,
+        };
+        let mut source = Scope::Channel(first);
+        for destination in [Scope::Channel(second), worktree.clone()] {
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    expected_revision: registry.view_revision(&source).unwrap(),
+                    scope: source,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: destination.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            source = destination;
+        }
+        registry
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: registry.view_revision(&worktree).unwrap(),
+                scope: worktree,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Remove { id: pane.id },
+            })
+            .unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.session_channels(&[session]).unwrap()[&session].id,
+            second
+        );
+        registry
+            .apply(&ModelEdit::DeleteChannel { id: second })
+            .unwrap();
+        assert!(
+            registry.session_channels(&[session]).unwrap().is_empty(),
+            "deleted destinations are not revived"
+        );
+    }
+
+    #[test]
+    fn session_channel_migration_seeds_existing_panes_and_downgrades_cleanly() {
+        use crate::model::{CardId, CardKind, ChannelId};
+        use crate::workspace_model::views::{Pane, Scope};
+
+        let (mut registry, directory, _) = fixture();
+        let channel = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: channel,
+                repository: directory.path().to_path_buf(),
+                title: "Fixture channel".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let session = TerminalId::new();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(channel),
+                panes: vec![Pane {
+                    id: CardId::new(),
+                    title: "Fixture shell".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    scope: None,
+                    kind: CardKind::Terminal(shell(session, None)),
+                }],
+                closed: vec![],
+            })
+            .unwrap();
+        let model = registry.model().unwrap();
+        drop(registry);
+        let path = directory.path().join("model.sqlite3");
+        assert_eq!(Registry::downgrade_at(&path, 24).unwrap(), Some(25));
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(registry.model().unwrap(), model);
+        assert_eq!(
+            registry.session_channels(&[session]).unwrap()[&session].id,
+            channel
         );
     }
 

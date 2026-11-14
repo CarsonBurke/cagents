@@ -55,7 +55,11 @@ impl Listing {
             (
                 Self::Sessions,
                 ClientRequest::Agent {
-                    operation: Operation::Sessions(scope),
+                    operation:
+                        Operation::Context {
+                            scope,
+                            standing: true,
+                        },
                     ..
                 },
             ) => {
@@ -92,11 +96,14 @@ impl Listing {
                 } else {
                     vec![]
                 };
-                ServerResponse::Agent(agent_execution::Reply::Sessions(
-                    agent_execution::directory::Sessions {
-                        caller: None,
-                        scope: agent_execution::directory::Scope::All,
-                        sessions,
+                ServerResponse::Agent(agent_execution::Reply::Context(
+                    agent_execution::directory::Context {
+                        sessions: agent_execution::directory::Sessions {
+                            caller: None,
+                            scope: agent_execution::directory::Scope::All,
+                            sessions,
+                        },
+                        lineage_channel: None,
                     },
                 ))
             }
@@ -517,15 +524,18 @@ fn accepted_wait_output(
                     panic!("request outside private agent contract");
                 };
                 let reply = match operation {
-                    Operation::Directory(_) => {
-                        Reply::Directory(agent_execution::directory::Directory {
+                    Operation::Context {
+                        standing: false, ..
+                    } => Reply::Context(agent_execution::directory::Context {
+                        sessions: agent_execution::directory::Sessions {
                             caller: None,
                             scope: agent_execution::directory::Scope::Project(
                                 accepted.agent.spec.target.repository.clone(),
                             ),
                             sessions: vec![],
-                        })
-                    }
+                        },
+                        lineage_channel: None,
+                    }),
                     // The agent's usage limit and account, read beside its run.
                     Operation::Sessions(scope) => {
                         Reply::Sessions(agent_execution::directory::Sessions {

@@ -61,7 +61,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -995,6 +995,10 @@ fn migrate_through(
         console_relaunch::migrate(tx)?;
         schema::migration_checkpoint(24)?;
     }
+    if version < 25 && target >= 25 {
+        lineage::migrate_channels(tx)?;
+        schema::migration_checkpoint(25)?;
+    }
     Ok(())
 }
 
@@ -1536,7 +1540,10 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE console_relaunches;
+                "DROP TRIGGER session_channel_insert;
+                 DROP TRIGGER session_channel_move;
+                 DROP TABLE session_channels;
+                 DROP TABLE console_relaunches;
                  DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;

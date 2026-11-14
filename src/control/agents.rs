@@ -941,14 +941,19 @@ impl Session {
         ),
         AppError,
     > {
-        let Reply::Directory(directory) = self.call(Operation::Directory(scope))? else {
+        let Reply::Context(context) = self.call(Operation::Context {
+            scope,
+            standing: false,
+        })?
+        else {
             return Err(AppError::new("sessions", "Unexpected directory response"));
         };
+        let directory = context.into_sessions();
         let project = match directory.scope {
             Scope::Project(project) => Some(project),
             _ => None,
         };
-        Ok((project, directory.caller))
+        Ok((project, directory.caller.map(|caller| caller.session)))
     }
 }
 

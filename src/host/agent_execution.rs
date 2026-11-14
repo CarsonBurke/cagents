@@ -1804,6 +1804,9 @@ pub(super) fn process(
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
+        Operation::Context { scope, standing } => {
+            directory::context(host, &authority, scope, standing).map(Reply::Context)
+        }
         Operation::AccountInfo(query) => {
             account_info::read(host, &authority, query).map(Reply::AccountInfo)
         }
