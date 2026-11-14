@@ -272,12 +272,12 @@ if [ "$scene" = coordination ]; then
     shot rows-coordination-prompt-expanded
     click_row '^Show less$'
     scroll_top
-    click_row '^Show tool call$'
+    click_row '^Show tool call\b'
     find_row '^Input$' >/dev/null
     shot rows-coordination-tool-expanded
     # The raw input retains its own hover Copy action. The reviewer also
     # exercises it and Transcript in the live native handoff.
-    click_row '^Hide tool call$'
+    click_row '^Hide tool call\b'
     click_row '^Show full message$'
     find_row MESSAGE_END >/dev/null
     shot rows-coordination-message-expanded
@@ -287,7 +287,9 @@ if [ "$scene" = coordination ]; then
         # The baseline keeps a plain heading and separate Details button.
         click_row '^Details$'
     else
-        click_row 'Agent.*Review fixture controls.*finished'
+        # The report title and outcome are independent row cells. Match
+        # the stable title; verify the original full body below.
+        click_row 'Agent.*Review fixture'
     fi
     find_row REPORT_END >/dev/null
     shot rows-report-expanded
