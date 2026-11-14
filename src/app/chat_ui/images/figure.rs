@@ -579,7 +579,9 @@ fn read(url: &str, origin: Origin, known: Option<Stamp>) -> Outcome {
             return Outcome::Failed {
                 reason: Reason::Unavailable,
                 detail,
-                stamp,
+                // A read can recover without changing the file's bytes,
+                // such as after its permissions are repaired.
+                stamp: None,
             };
         }
     };
@@ -601,7 +603,7 @@ fn read(url: &str, origin: Origin, known: Option<Stamp>) -> Outcome {
         Loaded::Failed(detail) => Outcome::Failed {
             reason: Reason::Unavailable,
             detail,
-            stamp,
+            stamp: None,
         },
     }
 }

@@ -172,6 +172,37 @@ fn images_that_cannot_be_shown_say_why() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unreadable_image_is_retried_after_permissions_change_without_a_content_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mockup.png");
+    std::fs::write(&path, png(3, 2)).unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    // An elevated test process can read a mode-000 file; that environment
+    // cannot exercise permission recovery.
+    if std::fs::read(&path).is_ok() {
+        return;
+    }
+    let Outcome::Failed { stamp, .. } = read("mockup.png", origin(directory.path()), None) else {
+        panic!("the unreadable image reports its failed read");
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    assert_eq!(before.len(), after.len());
+    assert!(
+        matches!(
+            read("mockup.png", origin(directory.path()), stamp),
+            Outcome::Ready { .. }
+        ),
+        "read errors retry even when the file's content stamp is unchanged"
+    );
+}
+
 #[test]
 fn a_preview_redraws_only_when_what_it_draws_changes() {
     let figures = Figures::default();
