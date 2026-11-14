@@ -35,8 +35,11 @@ pub(crate) fn main() -> std::process::ExitCode {
 pub(crate) fn main_with_before_start(
     before_start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> std::process::ExitCode {
-    // SAFETY: first statement of main, before any thread exists.
-    unsafe { cagents::account::detach_inherited_selections() };
+    // SAFETY: first statements of main, before any thread exists.
+    unsafe {
+        cagents::account::detach_inherited_selections();
+        cagents::agent::detach_session_environment();
+    }
     // Before any mode dispatch. A starting window refuses beside any process
     // still named `cagents-ui`. The helper modes never take the window lease,
     // so they would not otherwise rename themselves, and a window refused at

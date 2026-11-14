@@ -267,6 +267,11 @@ pub enum Action {
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
     ReopenTimedOut(ChannelId, std::time::Instant),
+    /// Retires the emptied channels whose views have already settled, once
+    /// the closes that emptied them have landed. A pane that never reached
+    /// its shared view, such as an unsent conversation, publishes no view
+    /// edit whose answer would otherwise do this.
+    SettleRetirements,
 }
 
 impl Action {
@@ -283,6 +288,7 @@ impl Action {
                 | Self::SessionsClosed(..)
                 | Self::RetryDelete(_)
                 | Self::ReopenTimedOut(..)
+                | Self::SettleRetirements
         )
     }
 }
@@ -335,6 +341,18 @@ pub struct State {
     /// published into one of these channels before the answer arrives would
     /// land after it retired.
     pub(super) retiring: HashMap<ChannelId, (u64, std::time::Instant)>,
+    /// Where the one sweep for channels emptied while nobody watched stands.
+    pub(super) sweep: Sweep,
+}
+
+/// The startup sweep waits for this window's restore to verify what it saved,
+/// then runs once the registry is joined.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sweep {
+    #[default]
+    Waiting,
+    Ready,
+    Done,
 }
 
 /// Bound a deferred reopen's wait without assuming the retirement was refused.
@@ -534,6 +552,10 @@ impl Cagents {
     }
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
+        if let Action::SettleRetirements = action {
+            self.retire_settled_empty_channels();
+            return Task::none();
+        }
         if let Action::ReopenTimedOut(id, sent) = action {
             if self
                 .channel_ui
@@ -612,7 +634,10 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::SessionsClosed(..) | Action::RetryDelete(_) | Action::ReopenTimedOut(..) => {
+            Action::SessionsClosed(..)
+            | Action::RetryDelete(_)
+            | Action::ReopenTimedOut(..)
+            | Action::SettleRetirements => {
                 unreachable!()
             }
             Action::RetryFailed(id) => {
@@ -1130,7 +1155,126 @@ impl Cagents {
     /// A work-bearing channel survives its final conversation, across windows.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
-        for &id in &emptied {
+        if emptied.is_empty() {
+            return Task::none();
+        }
+        self.capture_retire_candidates(&emptied);
+        // The closing card is still open here; settle after its close lands.
+        // A published pane is still in its view until the registry answers
+        // the removal, which keeps the channel waiting for that answer.
+        cosmic::task::message(Message::ChannelUi(Action::SettleRetirements))
+    }
+
+    /// Retires channel `left`, which this window just navigated away from,
+    /// when it holds nothing, as closing its last card would have. A channel
+    /// can reach that state without one of its cards closing here: a pane
+    /// moved out, a discarded composer, a peer's close, or a restore.
+    pub(super) fn retire_left_channel(&mut self, left: Option<ChannelId>) {
+        let Some(left) = left.filter(|&id| self.durable.active_channel != Some(id)) else {
+            return;
+        };
+        if self.channel_holds_nothing(left) {
+            self.capture_retire_candidates(&[left]);
+            self.retire_settled_empty_channels();
+        }
+    }
+
+    /// Asks once, after this window's restore settled and it joined the
+    /// registry, to retire every channel it is not showing that holds
+    /// nothing. Startup, including the relaunch an update makes, is when
+    /// channels emptied while no window watched them are found.
+    pub(super) fn sweep_empty_channels(&mut self) {
+        let sweep = &mut self.channel_ui.sweep;
+        if *sweep != Sweep::Ready
+            || self.shared_views.registry_unavailable
+            || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+        {
+            return;
+        }
+        *sweep = Sweep::Done;
+        let empty = self
+            .durable
+            .channels
+            .iter()
+            .map(|channel| channel.id)
+            .filter(|&id| self.durable.active_channel != Some(id) && self.channel_holds_nothing(id))
+            .collect::<Vec<_>>();
+        if empty.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            count = empty.len(),
+            "retiring channels found empty at startup"
+        );
+        self.capture_retire_candidates(&empty);
+        self.retire_settled_empty_channels();
+    }
+
+    /// The restore this window was launched to perform verified everything it
+    /// saved, so the sweep may run once the registry is also joined. A failed
+    /// restore never sweeps: what it left unattached must stay visible.
+    pub(super) fn allow_empty_channel_sweep(&mut self) {
+        if self.channel_ui.sweep == Sweep::Waiting {
+            self.channel_ui.sweep = Sweep::Ready;
+        }
+        self.sweep_empty_channels();
+    }
+
+    /// Whether `id` holds nothing a person could lose with it, as this window
+    /// and its copy of the registry see it: no open card of its own here, no
+    /// pane in its shared view, and no session waiting to be shown in it.
+    /// The registry repeats the view, work and session checks when it is
+    /// asked to retire the channel.
+    fn channel_holds_nothing(&self, id: ChannelId) -> bool {
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return false;
+        };
+        if self.workspace_model.channel(id).is_none()
+            || self.channel_ui.is_deleting(id)
+            || self.channel_retiring(id)
+            || self.channel_ui.reopening.contains_key(&id)
+        {
+            return false;
+        }
+        let open_content = channel.cards.iter().any(|&card| {
+            self.is_channel_content(card)
+                && self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+        });
+        if open_content {
+            return false;
+        }
+        self.workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == crate::workspace_model::views::Scope::Channel(id))
+            .is_some_and(|view| view.panes.is_empty() && !self.channel_awaits_session(id, view))
+    }
+
+    /// Whether an open agent placed in `id` has not been shown in it yet, or
+    /// failed to be: a detached session, which keeps the channel.
+    fn channel_awaits_session(
+        &self,
+        id: ChannelId,
+        view: &crate::workspace_model::views::View,
+    ) -> bool {
+        self.workspace_model
+            .agents
+            .iter()
+            .any(|agent| agent.awaits_pane_in(id, &view.retired))
+    }
+
+    /// Records `ids` as retirement candidates under the incarnation the
+    /// registry now holds, each with a snapshot that lets a card reopened from
+    /// it bring it back.
+    fn capture_retire_candidates(&mut self, ids: &[ChannelId]) {
+        for &id in ids {
             let Some(channel) = self
                 .durable
                 .channels
@@ -1147,7 +1291,7 @@ impl Cagents {
             };
             self.remember_emptied(snapshot);
         }
-        let captured = emptied.into_iter().filter_map(|id| {
+        let captured = ids.iter().filter_map(|&id| {
             let channel = self.workspace_model.channel(id)?;
             let home = crate::channel_work::Home {
                 registry: self.workspace_model.identity,
@@ -1157,7 +1301,6 @@ impl Cagents {
             home.validate().ok().map(|_| home)
         });
         self.channel_ui.retire_candidates.extend(captured);
-        Task::none()
     }
 
     /// View publication supplies the settled revision. The registry checks
@@ -1195,7 +1338,11 @@ impl Cagents {
             }
             // An empty view can precede a live pane's first publication. Closing
             // that pane later captures the channel again.
-            if self.channel_holds_unpublished_work(channel) {
+            // So can an agent's first adoption, which a failed restore can
+            // leave undone; that session is not emptiness either.
+            if self.channel_holds_unpublished_work(channel)
+                || self.channel_awaits_session(channel, view)
+            {
                 self.channel_ui.retire_candidates.remove(&captured);
                 continue;
             }
@@ -1777,7 +1924,7 @@ impl Cagents {
             .id(widget::Id::new("dialog.channel.confirm"))
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
-        Some(super::dialog_ui::surface(
+        Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))

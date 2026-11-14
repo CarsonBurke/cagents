@@ -236,7 +236,10 @@ use crate::{
 /// typed edit receipts and narrow metadata reads have appended requests/replies.
 /// The changed watch snapshot and edge shape require matched windows; older
 /// carried CLIs retain explicit whole-model reads/edits but cannot watch.
-pub const PROTOCOL_VERSION: u16 = 175;
+/// Version 176 separates cancelled and skipped Work check counts from failures
+/// and passes. Board reads, pins and subscriptions require a matching client.
+/// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
+pub const PROTOCOL_VERSION: u16 = 177;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -248,8 +251,8 @@ pub const PROTOCOL_VERSION: u16 = 175;
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
+pub(crate) use older_clients::{ENDED_TOOL_STATUS, WAITING_TOOL_STATUS, encoding_before};
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
-pub(crate) use older_clients::{WAITING_TOOL_STATUS, encoding_before};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -2745,6 +2748,16 @@ mod tests {
             .unwrap();
             bytes
         };
+        let ended = message(ToolStatus::Ended);
+        let stopped = message(ToolStatus::Stopped);
+        assert_eq!(
+            encode(CANDIDATE_LINE_PROTOCOL, &ended),
+            encode(CANDIDATE_LINE_PROTOCOL, &stopped)
+        );
+        assert_ne!(
+            encode(PROTOCOL_VERSION, &ended),
+            encode(PROTOCOL_VERSION, &stopped)
+        );
         let waiting = message(ToolStatus::Waiting);
         let running = message(ToolStatus::Running);
         assert_eq!(

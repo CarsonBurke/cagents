@@ -237,6 +237,16 @@ account check and each conversation read it whenever they ask. A live usage chan
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
 reported.
 
+For multiple synthetic accounts, put an `auth status --json` response in each
+account's `fixture-auth-status.json`, such as
+`{"loggedIn":true,"email":"account-one@example.test","subscriptionType":"pro"}`.
+The fixture reads it from `CLAUDE_CONFIG_DIR`, or `HOME/.claude` when no config
+directory is selected. Give each account a distinct email so the app treats
+the homes as separate sign-ins, and put its usage response in that home's
+`fixture-usage.json`. Without an auth file, the fixture keeps its default
+`fixture@example.test` identity. Keep all these homes inside the isolated fixture;
+never write them into a real provider home.
+
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads
 anything: the number of seconds on the file's first line, such as `1.5`, or
@@ -273,3 +283,13 @@ provider home; `CAGENTS_FIXTURE_IMAGE` overrides the path when the script runs
 directly. Each turn then also returns that image as a provider-produced base64
 image block, recorded in the synthetic history like other frames. Paste an image into the composer to
 cover a user-attached image in the same transcript. Use synthetic images only.
+
+For task-delivery checks, `tests/fixtures/delivery-notices-scene.sh wide` (or
+`narrow`, with a session started at 900 pixels wide) opens an invented Claude
+transcript containing successful and failed background commands, a Monitor
+event, a background agent report and a teammate message. Its shell commands
+contain `&&`, `>` and `<`; notification XML escapes them while peer message
+bodies retain their literal text. The fixture records the same user frames
+for history replay. Capture the closed rows, then expand command details and
+the report to check literal output and disclosure. The scene uses only the
+native-evidence fixture's provider home and never calls a live model.

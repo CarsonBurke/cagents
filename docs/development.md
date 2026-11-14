@@ -1723,7 +1723,7 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.5 GiB. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.5 GiB. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
@@ -1796,14 +1796,26 @@ harness, it provides:
 - **A shared path caveat.** With no worktree selected, the Workspace page shows
   the app's working directory, which is the checkout and so differs between
   sides. Select the fixture project's worktree before capturing a pair.
-- **One session at a time.** `start` waits for `/var/tmp/cagents-fw16-native.lock`
-  (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
-  evidence. A session gives the lock up after `--limit` seconds even if its
-  owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **A few sessions at once.** Sessions from different tasks run side by side:
+  each has its own compositor, runtime directory, harness state and fixture,
+  so nothing in one can reach another. `start` waits for one of the host's
+  native slots, `CAGENTS_EVIDENCE_NATIVE_SLOTS` of them (default 3, at most 8):
+  slot 0 is `/var/tmp/cagents-fw16-native.lock` (override with
+  `CAGENTS_EVIDENCE_NATIVE_LOCK`) and slot N is that path with `.N` added.
+  Waiters take slots in about the order they arrived, through `LOCK.queue`; update
+  rehearsals' desktops take the same slots, and tools from before slots wait
+  for slot 0 alone. `status` shows which slots are held.
+- **Short sessions.** A session releases its slot `--limit` seconds after
+  taking it, 900 by default, even if its owner has gone, and `start` refuses a limit over
+  1800 seconds, so no session keeps the others waiting for long. Stop as soon
+  as you have the evidence. A measurement that needs longer is several
+  sessions: `relaunch` restarts the UI within one, and a seed carries data
+  from one session to the next. `build` uses `/var/tmp/cagents-fw16-cargo.lock`
+  the same way.
 - **Startup deadline.** `start SIDE --startup-timeout 900` allows a large seed
   up to 900 seconds to show its app window. The default is 180 seconds; use a
   whole number from 1 to 3600. Readiness still requires the mapped window.
-  This deadline does not extend the independent `--limit` session lifetime.
+  This deadline counts toward, and does not extend, the `--limit` session lifetime.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
@@ -1815,15 +1827,16 @@ harness, it provides:
   For real app-server lifecycle or saved-history tests, use
   `--codex-executable /absolute/path/to/codex` instead. The path is on the
   execution host (`fw16` with `--remote fw16`); the runner validates and
-  snapshots the ELF before waiting for the native lock, then installs an
+  snapshots the ELF before waiting for a native slot, then installs an
   isolated mode-0755 copy. Validation never runs the executable. The receipt
   in `TASK/session/codex-executable-installed.json` records source, snapshot
   and installed identities and SHA256 hashes. The options are mutually
   exclusive. With neither option, the app lists Codex as not installed.
   See [A real Codex in the fixture](fixtures.md#a-real-codex-in-the-fixture)
   for private offline config and saved-history setup.
-- **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
-  the holder and whether it is doing anything, when `start` seems stuck.
+- **Who holds the slots.** `scripts/lock-holders`, given the slot paths that
+  `status` names, shows each holder and whether it is doing anything, when
+  `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that
   inherited the task's private runtime directory. That path is the proof of
   ownership, so nothing else on the host is touched.
@@ -1833,7 +1846,7 @@ harness, it provides:
   session each count as use of both sides, and it never removes a target that
   a build or session has open or whose executables are running, nor either
   side while any `native-evidence` process names the task, including a session
-  still waiting for the native lock. A side whose
+  still waiting for a native slot. A side whose
   target went says so; build it again, which in a shared slot recompiles only
   what changed since that slot's last build. Screenshots, logs and the fixture
   stay. Tasks outside the pruner's roots, `~/.cache`, `~/.local/state` and
@@ -1870,7 +1883,7 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-prs clean
 ```
 
 `pair` takes minutes: it builds two sides and may wait up to 30 minutes for
-the host's native lock while another session runs. Run it in the background,
+a native slot while other sessions hold them all. Run it in the background,
 or with a command timeout of at least an hour. A command killed by a short
 tool timeout drops the SSH connection, and that ends the work on the host too.
 
@@ -2034,6 +2047,19 @@ The scenario verifies its mapped window too. The default seed includes Claude
 chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
+
+Use `--scale-chats 120` to rehearse a daemon that has run for days: it also
+opens that many chats, every third one Codex, across both projects. Each opens
+with `--scale-entries` earlier messages (default 400) of about `--scale-bytes`
+each (default 1536), then settles idle, so the update records long transcript
+pages without treating the chats as working. The Claude fake reads
+`fixture-long-history` and `fixture-first-turn-seconds` at launch, and the
+Codex peer reads `history` from `codex-fixture.json`; the seed removes those
+settings once every scale chat is idle, so later launches are unaffected.
+Spawns wait for a free slot, as the daemon runs at most eight agents a person
+starts at once, so seeding 120 chats takes several minutes; it therefore cannot
+be combined with the working or natural-idle cases, whose Codex turn would end
+first. `scale-seed.json` records the counts and seeding time.
 
 Use `--codex-pause 90` to keep the offline Codex turn active at the update
 prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a

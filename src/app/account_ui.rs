@@ -45,6 +45,7 @@ use crate::account::{
     schedule::{self, Millis, Schedule, Trigger},
 };
 use crate::agent::Provider;
+use crate::settings::AccountUsageDisplay;
 
 mod table;
 
@@ -1007,6 +1008,24 @@ impl AccountState {
         self.headline()?;
         selection_window(self.snapshot.as_ref()?)
     }
+
+    /// Urgency follows consumed allowance, independent of the display mode.
+    /// Old figures and failed checks must not look like current warnings.
+    fn usage_tone(&self, window: &UsageWindow, now: Millis) -> ChipTone {
+        match &self.snapshot {
+            Some(snapshot)
+                if self.failure.is_none()
+                    && !is_stale(snapshot, now)
+                    && matches!(
+                        snapshot.status,
+                        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+                    ) =>
+            {
+                ChipTone::of_usage(snapshot.status, window.used)
+            }
+            _ => ChipTone::Stale,
+        }
+    }
 }
 
 /// A sign-in running in a terminal, for an account that is not yet in the
@@ -1318,12 +1337,28 @@ fn reset_since(snapshot: &UsageSnapshot, now: Millis) -> bool {
     })
 }
 
-/// The whole percentage left in a window, rounded toward caution: a window
-/// 42.4% used has 57% left, not 58%.
-fn percent_left(used: f32) -> u32 {
-    // Float noise must not turn an exact 43% into 44% used.
-    let used = (used * 100.0 - 0.001).ceil().clamp(0.0, 100.0);
-    (100.0 - used) as u32
+/// One account usage figure: its label and gauge always describe the same
+/// whole percentage, regardless of which display mode the reader chose.
+#[derive(Debug, Clone, PartialEq)]
+struct UsageFigure {
+    text: String,
+    fraction: f32,
+}
+
+fn usage_figure(used: f32, mode: AccountUsageDisplay) -> UsageFigure {
+    // Round toward caution: 42.4% used is shown as 43% used or 57% left.
+    // Float noise must not turn an exact 43% into 44% used. Providers can
+    // report over-cap consumption; only the remaining amount is capped.
+    // Gauge geometry already saturates at full for fractions above one.
+    let used = (used * 100.0 - 0.001).ceil().max(0.0);
+    let (percent, suffix) = match mode {
+        AccountUsageDisplay::Left => ((100.0 - used).clamp(0.0, 100.0) as u32, "left"),
+        AccountUsageDisplay::Used => (used as u32, "used"),
+    };
+    UsageFigure {
+        text: format!("{percent}% {suffix}"),
+        fraction: percent as f32 / 100.0,
+    }
 }
 
 fn unix_seconds(now: Millis) -> i64 {
@@ -1357,7 +1392,7 @@ fn reset_countdown(window: &UsageWindow, now: Millis) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChipTone {
+pub(super) enum ChipTone {
     Current,
     /// Current figures running low: worth a glance before starting work.
     Low,
@@ -1385,7 +1420,7 @@ impl ChipTone {
     }
 
     /// The color the chip's gauge takes, or `None` for the neutral stroke.
-    fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
+    pub(super) fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
         match self {
             Self::Low | Self::Attention => Some(design::warning_color),
             Self::Exhausted => Some(design::destructive_color),
@@ -1394,7 +1429,7 @@ impl ChipTone {
     }
 
     /// The chip's text in the same tone as its gauge.
-    fn text_class(self) -> cosmic::theme::Text {
+    pub(super) fn text_class(self) -> cosmic::theme::Text {
         match self {
             Self::Current => cosmic::theme::Text::Default,
             Self::Low | Self::Attention => cosmic::theme::Text::Custom(design::warning_text),
@@ -1403,14 +1438,24 @@ impl ChipTone {
             Self::Stale => cosmic::theme::Text::Custom(design::muted_text),
         }
     }
+
+    /// Detailed bars retain their accent while current and healthy.
+    fn bar_tone(self) -> design::Tone {
+        design::Tone::Themed(match self {
+            Self::Current => design::accent_color,
+            Self::Stale => design::muted_color,
+            Self::Low | Self::Attention => design::warning_color,
+            Self::Exhausted => design::destructive_color,
+        })
+    }
 }
 
 /// What an account's chip says.
 #[derive(Debug, Clone, PartialEq)]
 struct Chip {
     text: String,
-    /// The used fraction of the binding window, drawn as the ring.
-    gauge: Option<f32>,
+    /// The displayed usage fraction of the binding window, drawn as the ring.
+    usage_fraction: Option<f32>,
     tone: ChipTone,
     /// Kept when the bar is too narrow for the rest of the text.
     essential: bool,
@@ -1456,18 +1501,19 @@ fn preview_chips(
     name: &str,
     now: Millis,
     selected: Option<&Vec<String>>,
+    mode: AccountUsageDisplay,
 ) -> Vec<Chip> {
     let Some(selected) = selected else {
-        return vec![chip(account, name, now)];
+        return vec![chip(account, name, now, mode)];
     };
     let Some(snapshot) = &account.snapshot else {
-        return vec![chip(account, name, now)];
+        return vec![chip(account, name, now, mode)];
     };
     if !matches!(
         snapshot.status,
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
     ) {
-        return vec![chip(account, name, now)];
+        return vec![chip(account, name, now, mode)];
     }
     let windows: Vec<_> = snapshot
         .windows
@@ -1478,14 +1524,20 @@ fn preview_chips(
     let mut chips: Vec<_> = windows
         .into_iter()
         .map(|window| {
-            let mut summary = chip_with_window(account, name, now, |snapshot| {
-                snapshot
-                    .windows
-                    .iter()
-                    .find(|candidate| candidate.key == window.key)
-            });
+            let mut summary = chip_with_window(
+                account,
+                name,
+                now,
+                |snapshot| {
+                    snapshot
+                        .windows
+                        .iter()
+                        .find(|candidate| candidate.key == window.key)
+                },
+                mode,
+            );
             summary.text = if multiple {
-                format!("{}: {}% left", window.label, percent_left(window.used))
+                format!("{}: {}", window.label, usage_figure(window.used, mode).text)
             } else {
                 format!("{}: {}", window.label, summary.text)
             };
@@ -1498,7 +1550,7 @@ fn preview_chips(
         let text = format!("Extra: {}", credits.summary());
         chips.push(Chip {
             text: text.clone(),
-            gauge: None,
+            usage_fraction: None,
             tone: if is_stale(snapshot, now) {
                 ChipTone::Stale
             } else {
@@ -1511,8 +1563,8 @@ fn preview_chips(
     chips
 }
 
-fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
-    chip_with_window(account, name, now, headline_window)
+fn chip(account: &AccountState, name: &str, now: Millis, mode: AccountUsageDisplay) -> Chip {
+    chip_with_window(account, name, now, headline_window, mode)
 }
 
 /// Account choices compare the same weekly allowance, regardless of which
@@ -1532,19 +1584,20 @@ fn chip_with_window(
     name: &str,
     now: Millis,
     window_of: impl Fn(&UsageSnapshot) -> Option<&UsageWindow>,
+    mode: AccountUsageDisplay,
 ) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
             Some(failure) => Chip {
                 text: "Unavailable".into(),
-                gauge: None,
+                usage_fraction: None,
                 tone: ChipTone::Stale,
                 essential: false,
                 tooltip: format!("{name} usage could not be read: {failure}"),
             },
             None => Chip {
                 text: "Checking…".into(),
-                gauge: None,
+                usage_fraction: None,
                 tone: ChipTone::Stale,
                 essential: false,
                 tooltip: format!("Checking {name} usage…"),
@@ -1554,14 +1607,14 @@ fn chip_with_window(
     match snapshot.status {
         UsageStatus::NeedsLogin => Chip {
             text: "Sign in".into(),
-            gauge: None,
+            usage_fraction: None,
             tone: ChipTone::Attention,
             essential: true,
             tooltip: format!("{name} is signed out. Sign in to see its usage."),
         },
         UsageStatus::Unavailable => Chip {
             text: "Unavailable".into(),
-            gauge: None,
+            usage_fraction: None,
             tone: ChipTone::Stale,
             essential: false,
             tooltip: snapshot
@@ -1573,14 +1626,14 @@ fn chip_with_window(
             let Some(window) = window_of(snapshot) else {
                 return Chip {
                     text: "No limits".into(),
-                    gauge: None,
+                    usage_fraction: None,
                     tone: ChipTone::Current,
                     essential: false,
                     tooltip: format!("{name} reports no usage limits for this account"),
                 };
             };
             let stale = is_stale(snapshot, now);
-            let left = percent_left(window.used);
+            let figure = usage_figure(window.used, mode);
             let now_seconds = unix_seconds(now);
             let remaining = window
                 .resets_at
@@ -1592,12 +1645,12 @@ fn chip_with_window(
                     account::format_local_moment(unix_seconds(snapshot.observed_at), now_seconds)
                 )
             });
-            let mut text = format!("{left}% left");
+            let mut text = figure.text.clone();
             if let Some(when) = as_of.as_ref().or(remaining.as_ref()) {
                 text.push_str(" · ");
                 text.push_str(when);
             }
-            let mut tooltip = format!("{name} · {}: {left}% left", window.label);
+            let mut tooltip = format!("{name} · {}: {}", window.label, figure.text);
             if snapshot.status == UsageStatus::Limited {
                 tooltip.push_str(", limited");
             }
@@ -1619,19 +1672,15 @@ fn chip_with_window(
                 .filter(|binding| binding.key != window.key)
             {
                 tooltip.push_str(&format!(
-                    "\n{}: {}% left",
+                    "\n{}: {}",
                     scoped.label,
-                    percent_left(scoped.used)
+                    usage_figure(scoped.used, mode).text
                 ));
             }
-            let tone = if stale || account.failure.is_some() {
-                ChipTone::Stale
-            } else {
-                ChipTone::of_usage(snapshot.status, window.used)
-            };
+            let tone = account.usage_tone(window, now);
             Chip {
                 text,
-                gauge: Some(window.used),
+                usage_fraction: Some(figure.fraction),
                 tone,
                 // An account that cannot take new work keeps its figure even
                 // in a bar too narrow for the others'.
@@ -1804,11 +1853,12 @@ fn account_of_recipe<'a>(
 pub(super) struct ChatAccount {
     pub id: AccountId,
     pub label: String,
-    /// The plan and what is left, where known: `Max · 62% left`.
+    /// The plan and usage figure, where known: `Max · 62% left` or `Max · 38% used`.
     pub detail: String,
     pub selected: bool,
-    /// The used fraction of the account's headline window, for its ring.
-    pub used: Option<f32>,
+    /// The displayed usage fraction of the selection window, for its ring.
+    pub usage_fraction: Option<f32>,
+    pub tone: ChipTone,
 }
 
 /// One account the settings pane offers as a provider's default.
@@ -4835,11 +4885,14 @@ impl Cagents {
                 if let Some(plan) = account.plan() {
                     detail.push(plan);
                 }
-                let headline = account.selection_window();
-                match (&account.snapshot, headline) {
-                    (_, Some(window)) => {
-                        detail.push(format!("{}% left", percent_left(window.used)))
-                    }
+                let window = account.selection_window();
+                let usage = window
+                    .map(|window| usage_figure(window.used, self.settings.account_usage_display));
+                let tone = window.map_or(ChipTone::Stale, |window| {
+                    account.usage_tone(window, state.now_ms)
+                });
+                match (&account.snapshot, &usage) {
+                    (_, Some(figure)) => detail.push(figure.text.clone()),
                     (Some(snapshot), None) if snapshot.status == UsageStatus::NeedsLogin => {
                         detail.push("Signed out".into())
                     }
@@ -4853,7 +4906,8 @@ impl Cagents {
                     label: state.display_name(account),
                     detail: detail.join(" · "),
                     selected: current.is_some_and(|current| current.id == account.id),
-                    used: headline.map(|window| window.used),
+                    usage_fraction: usage.map(|figure| figure.fraction),
+                    tone,
                 }
             })
             .collect();
@@ -4975,6 +5029,7 @@ impl Cagents {
         now: Millis,
         compact: bool,
     ) -> Option<Element<'_, Message>> {
+        let mode = self.settings.account_usage_display;
         let state = &self.account_ui;
         let present: Vec<&AccountState> = state
             .of(provider)
@@ -4992,7 +5047,7 @@ impl Cagents {
             lead.name().to_owned()
         };
         let selected = self.settings.usage_preview_rows.get(provider.executable());
-        let mut previews = preview_chips(lead, &name, now, selected);
+        let mut previews = preview_chips(lead, &name, now, selected, mode);
         let mut summary = previews.first().cloned().unwrap_or_else(|| {
             let unavailable = selected.is_some_and(|rows| !rows.is_empty());
             Chip {
@@ -5001,7 +5056,7 @@ impl Cagents {
                 } else {
                     lead.name().to_owned()
                 },
-                gauge: None,
+                usage_fraction: None,
                 tone: if unavailable {
                     ChipTone::Stale
                 } else {
@@ -5045,9 +5100,12 @@ impl Cagents {
         ];
         for preview in previews {
             let tone = preview.tone.color();
-            if let Some(used) = preview.gauge {
+            if let Some(fraction) = preview.usage_fraction {
                 items.push(crate::interaction::tooltip(
-                    crate::ui_controls::budget_radial_toned(used, tone.map(design::Tone::Themed)),
+                    crate::ui_controls::budget_radial_toned(
+                        fraction,
+                        tone.map(design::Tone::Themed),
+                    ),
                     preview.tooltip.clone(),
                 ));
             }
@@ -5124,14 +5182,15 @@ impl Cagents {
         .into()
     }
 
-    /// The popover's list of every account of a provider, each with what it
-    /// has left, to select a Cagents-managed default or inspect an Omp login.
+    /// The popover's list of every account of a provider and its usage figure,
+    /// to select a Cagents-managed default or inspect an Omp login.
     fn account_switcher<'a>(
         &'a self,
         provider: Provider,
         shown: &AccountId,
         now: Millis,
     ) -> Element<'a, Message> {
+        let mode = self.settings.account_usage_display;
         let state = &self.account_ui;
         let rows: Vec<Element<'a, Message>> = state
             .of(provider)
@@ -5140,14 +5199,17 @@ impl Cagents {
                 let selected = &account.id == shown;
                 let conflict = state.login_conflict(account);
                 let mut items: Vec<Element<'a, Message>> = Vec::new();
+                let summary =
+                    chip_with_window(account, account.name(), now, selection_window, mode);
                 match conflict
                     .is_none()
-                    .then(|| account.selection_window())
+                    .then_some(summary.usage_fraction)
                     .flatten()
                 {
-                    Some(window) => {
-                        items.push(crate::ui_controls::budget_radial(window.used));
-                    }
+                    Some(fraction) => items.push(crate::ui_controls::budget_radial_toned(
+                        fraction,
+                        summary.tone.color().map(design::Tone::Themed),
+                    )),
                     None => items.push(
                         iced::widget::Space::new()
                             .width(design::RADIAL_GAUGE_SIZE)
@@ -5171,10 +5233,12 @@ impl Cagents {
                     .into(),
                 );
                 items.push(
-                    design::caption(conflict.as_ref().map_or_else(
-                        || chip_with_window(account, account.name(), now, selection_window).text,
-                        |conflict| conflict.label().to_owned(),
-                    ))
+                    design::caption(
+                        conflict
+                            .as_ref()
+                            .map_or_else(|| summary.text, |conflict| conflict.label().to_owned()),
+                    )
+                    .class(summary.tone.text_class())
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
                     .into(),
                 );
@@ -5311,7 +5375,6 @@ impl Cagents {
                     );
                 }
                 UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
-                    let stale = is_stale(snapshot, now);
                     rows.extend(snapshot.windows.iter().map(|window| {
                         let key = preview_window_key(window);
                         let included = preview_row_included(
@@ -5322,7 +5385,13 @@ impl Cagents {
                             &key,
                         );
                         let toggle = self.preview_row_toggle(account, key, included, &window.label);
-                        usage_window_row(window, now, stale, toggle)
+                        usage_window_row(
+                            window,
+                            now,
+                            account.usage_tone(window, now),
+                            toggle,
+                            self.settings.account_usage_display,
+                        )
                     }));
                     if snapshot.windows.is_empty() {
                         rows.push(
@@ -5696,24 +5765,19 @@ fn identity_line(identity: &Identity) -> Option<String> {
 fn usage_window_row<'a>(
     window: &'a UsageWindow,
     now: Millis,
-    stale: bool,
+    tone: ChipTone,
     toggle: Element<'a, Message>,
+    mode: AccountUsageDisplay,
 ) -> Element<'a, Message> {
-    let tone = if stale {
-        design::Tone::Themed(design::muted_color)
-    } else {
-        design::Tone::Themed(design::budget_tone(window.used))
-    };
+    let figure = usage_figure(window.used, mode);
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
             toggle,
-            design::caption(format!("{}% left", percent_left(window.used)))
-                .class(cosmic::theme::Text::Default)
-                .into(),
+            design::caption(figure.text).class(tone.text_class()).into(),
         ])
         .align_y(Alignment::Center)
         .into(),
-        crate::ui_controls::budget_bar(window.left(), tone),
+        crate::ui_controls::budget_bar(figure.fraction, tone.bar_tone()),
     ];
     if let Some(line) = reset_line(window, now) {
         rows.push(design::caption(line).into());
@@ -6285,21 +6349,36 @@ mod tests {
         assert!(preview_row_included(usage, None, "window:seven_day"));
         assert!(!preview_row_included(usage, None, "window:seven_day_fable"));
         assert_eq!(
-            preview_chips(&state, "Claude", NOW, None),
-            vec![chip(&state, "Claude", NOW)]
+            preview_chips(&state, "Claude", NOW, None, AccountUsageDisplay::Left),
+            vec![chip(&state, "Claude", NOW, AccountUsageDisplay::Left)]
         );
         let selected = vec![
             "window:session".into(),
             "window:seven_day".into(),
             "window:seven_day_fable".into(),
         ];
-        let chips = preview_chips(&state, "Claude", NOW, Some(&selected));
+        let chips = preview_chips(
+            &state,
+            "Claude",
+            NOW,
+            Some(&selected),
+            AccountUsageDisplay::Left,
+        );
         assert_eq!(chips.len(), 3);
         assert!(chips[0].text.starts_with("Session:"));
         assert!(chips[1].text.starts_with("Weekly:"));
         assert!(chips[2].text.starts_with("Fable:"));
         let empty = Vec::new();
-        assert!(preview_chips(&state, "Claude", NOW, Some(&empty)).is_empty());
+        assert!(
+            preview_chips(
+                &state,
+                "Claude",
+                NOW,
+                Some(&empty),
+                AccountUsageDisplay::Left
+            )
+            .is_empty()
+        );
         assert!(!preview_row_included(
             usage,
             Some(&empty),
@@ -6312,7 +6391,14 @@ mod tests {
         let empty = Vec::new();
         let state = state_with(Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW)));
         assert_eq!(
-            preview_chips(&state, "Claude", NOW, Some(&empty))[0].text,
+            preview_chips(
+                &state,
+                "Claude",
+                NOW,
+                Some(&empty),
+                AccountUsageDisplay::Left
+            )[0]
+            .text,
             "Sign in"
         );
         let state = state_with(Some(UsageSnapshot::state(
@@ -6321,19 +6407,205 @@ mod tests {
             NOW,
         )));
         assert_eq!(
-            preview_chips(&state, "Claude", NOW, Some(&empty))[0].text,
+            preview_chips(
+                &state,
+                "Claude",
+                NOW,
+                Some(&empty),
+                AccountUsageDisplay::Left
+            )[0]
+            .text,
             "Unavailable"
         );
     }
 
     #[test]
-    fn percent_left_rounds_toward_caution_without_float_noise() {
-        assert_eq!(percent_left(0.43), 57);
-        assert_eq!(percent_left(0.424), 57);
-        assert_eq!(percent_left(0.0), 100);
-        assert_eq!(percent_left(1.0), 0);
-        assert_eq!(percent_left(1.3), 0);
-        assert_eq!(percent_left(0.001), 99);
+    fn usage_figures_round_toward_caution_and_match_their_gauges() {
+        for (used, left_percent, used_percent) in [
+            (0.43, 57, 43),
+            (0.424, 57, 43),
+            (0.0, 100, 0),
+            (1.0, 0, 100),
+            (1.3, 0, 130),
+            (1.304, 0, 131),
+            (-0.1, 100, 0),
+            (0.001, 99, 1),
+        ] {
+            for (mode, percent, suffix) in [
+                (AccountUsageDisplay::Left, left_percent, "left"),
+                (AccountUsageDisplay::Used, used_percent, "used"),
+            ] {
+                let figure = usage_figure(used, mode);
+                assert_eq!(figure.text, format!("{percent}% {suffix}"));
+                assert_eq!(figure.fraction, percent as f32 / 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn account_rings_match_both_usage_modes_without_changing_tones() {
+        for (used, left_percent, used_percent, tone) in [
+            (1.0, 0, 100, ChipTone::Exhausted),
+            (0.63, 37, 63, ChipTone::Current),
+            (0.01, 99, 1, ChipTone::Current),
+            (0.37, 63, 37, ChipTone::Current),
+            (0.99, 1, 99, ChipTone::Exhausted),
+            (0.9, 10, 90, ChipTone::Low),
+            (0.999, 0, 100, ChipTone::Exhausted),
+            (0.424, 57, 43, ChipTone::Current),
+            (0.001, 99, 1, ChipTone::Current),
+            (0.0, 100, 0, ChipTone::Current),
+            (1.3, 0, 130, ChipTone::Exhausted),
+        ] {
+            let state = state_with(Some(snapshot(vec![window(used, None)], NOW)));
+            for (mode, percent, suffix) in [
+                (AccountUsageDisplay::Left, left_percent, "left"),
+                (AccountUsageDisplay::Used, used_percent, "used"),
+            ] {
+                let summary = chip(&state, "Claude", NOW, mode);
+                assert_eq!(summary.text, format!("{percent}% {suffix}"));
+                assert_eq!(summary.usage_fraction, Some(percent as f32 / 100.0));
+                assert_eq!(summary.tone, tone);
+                assert!(
+                    summary
+                        .tooltip
+                        .contains(&format!("Session: {percent}% {suffix}"))
+                );
+                let previews = preview_chips(
+                    &state,
+                    "Claude",
+                    NOW,
+                    Some(&vec![preview_window_key(
+                        &state.snapshot.as_ref().unwrap().windows[0],
+                    )]),
+                    mode,
+                );
+                assert_eq!(previews[0].usage_fraction, summary.usage_fraction);
+                assert_eq!(previews[0].text, format!("Session: {percent}% {suffix}"));
+            }
+        }
+    }
+
+    #[test]
+    fn composer_account_rings_match_both_usage_modes_and_tones() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.now_ms = NOW;
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 2736);
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        for (used, left_percent, used_percent, status, tone) in [
+            (1.0, 0, 100, UsageStatus::Ok, ChipTone::Exhausted),
+            (0.9, 10, 90, UsageStatus::Ok, ChipTone::Low),
+            (0.63, 37, 63, UsageStatus::Ok, ChipTone::Current),
+            (0.01, 99, 1, UsageStatus::Ok, ChipTone::Current),
+            (0.0, 100, 0, UsageStatus::Ok, ChipTone::Current),
+            (1.3, 0, 130, UsageStatus::Ok, ChipTone::Exhausted),
+            (0.5, 50, 50, UsageStatus::Warning, ChipTone::Low),
+            (0.5, 50, 50, UsageStatus::Limited, ChipTone::Exhausted),
+        ] {
+            let mut weekly = window(used, None);
+            weekly.kind = WindowKind::Weekly;
+            weekly.key = "weekly".into();
+            // Choices compare weekly allowances even when a session binds.
+            let mut reading = snapshot(vec![window(1.0, None), weekly], NOW);
+            reading.status = status;
+            app.account_ui.account_mut(&id).unwrap().snapshot = Some(reading);
+            for (mode, percent, suffix) in [
+                (AccountUsageDisplay::Left, left_percent, "left"),
+                (AccountUsageDisplay::Used, used_percent, "used"),
+            ] {
+                app.settings.account_usage_display = mode;
+                let accounts = app.chat_accounts(Provider::Codex, &recipe).unwrap();
+                let choice = accounts
+                    .choices
+                    .iter()
+                    .find(|choice| choice.id == id)
+                    .unwrap();
+                assert!(choice.detail.contains(&format!("{percent}% {suffix}")));
+                assert_eq!(choice.usage_fraction, Some(percent as f32 / 100.0));
+                assert_eq!(choice.tone, tone);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_account_tones_do_not_warn_on_stale_failed_or_unknown_usage() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.now_ms = NOW;
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 2770);
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        let current = snapshot(vec![window(1.0, None)], NOW);
+        let old = snapshot(
+            vec![window(1.0, None)],
+            NOW - schedule::DISPLAY_STALE_AFTER - 1,
+        );
+        let reset = snapshot(vec![window(1.0, Some(unix_seconds(NOW) - 1))], NOW - 2_000);
+        let mut unavailable = current.clone();
+        unavailable.status = UsageStatus::Unavailable;
+        for (reading, failure, has_ring) in [
+            (Some(old), None, true),
+            (Some(reset), None, true),
+            (Some(current), Some("Check failed".into()), true),
+            (Some(unavailable), None, false),
+            (None, None, false),
+        ] {
+            let account = app.account_ui.account_mut(&id).unwrap();
+            account.snapshot = reading;
+            account.failure = failure;
+            for mode in [AccountUsageDisplay::Left, AccountUsageDisplay::Used] {
+                app.settings.account_usage_display = mode;
+                let accounts = app.chat_accounts(Provider::Codex, &recipe).unwrap();
+                let choice = accounts
+                    .choices
+                    .iter()
+                    .find(|choice| choice.id == id)
+                    .unwrap();
+                assert_eq!(choice.tone, ChipTone::Stale);
+                assert_eq!(choice.usage_fraction.is_some(), has_ring);
+            }
+        }
+    }
+
+    #[test]
+    fn used_mode_formats_model_limits_and_multiple_previews_consistently() {
+        let mut weekly = window(0.63, None);
+        weekly.kind = WindowKind::Weekly;
+        weekly.key = "weekly".into();
+        weekly.label = "Weekly".into();
+        let mut scoped = window(0.99, None);
+        scoped.kind = WindowKind::Scoped;
+        scoped.key = "model".into();
+        scoped.label = "Model".into();
+        scoped.binding = true;
+        let state = state_with(Some(snapshot(vec![weekly, scoped], NOW)));
+        let summary = chip(&state, "Claude", NOW, AccountUsageDisplay::Used);
+        assert_eq!(summary.text, "63% used");
+        assert_eq!(summary.usage_fraction, Some(0.63));
+        assert!(summary.tooltip.contains("Weekly: 63% used"));
+        assert!(summary.tooltip.contains("Model: 99% used"));
+        assert!(!summary.tooltip.contains("% left"));
+        let previews = preview_chips(
+            &state,
+            "Claude",
+            NOW,
+            Some(&vec!["window:weekly".into(), "window:model".into()]),
+            AccountUsageDisplay::Used,
+        );
+        assert_eq!(previews[0].text, "Weekly: 63% used");
+        assert_eq!(previews[0].usage_fraction, Some(0.63));
+        assert_eq!(previews[1].text, "Model: 99% used");
+        assert_eq!(previews[1].usage_fraction, Some(0.99));
     }
 
     #[test]
@@ -6343,9 +6615,10 @@ mod tests {
             &state_with(Some(snapshot(vec![window(0.38, Some(reset))], NOW))),
             "Claude",
             NOW,
+            AccountUsageDisplay::Left,
         );
         assert_eq!(chip.text, "62% left · 2h 14m");
-        assert_eq!(chip.gauge, Some(0.38));
+        assert_eq!(chip.usage_fraction, Some(0.62));
         assert_eq!(chip.tone, ChipTone::Current);
         assert!(chip.tooltip.contains("Session: 62% left"));
         assert_eq!(
@@ -6364,8 +6637,17 @@ mod tests {
                 vec![window(session_used, Some(unix_seconds(NOW) + 3600)), weekly],
                 NOW,
             )));
-            let summary = chip_with_window(&account, "Claude", NOW, selection_window);
-            assert_eq!(summary.gauge, Some(weekly_used));
+            let summary = chip_with_window(
+                &account,
+                "Claude",
+                NOW,
+                selection_window,
+                AccountUsageDisplay::Left,
+            );
+            assert_eq!(
+                summary.usage_fraction,
+                Some(usage_figure(weekly_used, AccountUsageDisplay::Left).fraction)
+            );
             assert!(
                 summary.text.ends_with(&format!("{days}d")),
                 "{}",
@@ -6393,7 +6675,7 @@ mod tests {
             vec![window(0.43, None), weekly, scoped],
             NOW,
         )));
-        let chip = chip(&state, "Claude", NOW);
+        let chip = chip(&state, "Claude", NOW, AccountUsageDisplay::Left);
         assert_eq!(chip.text, "5% left");
         assert!(
             chip.tooltip.contains("Weekly · Fable: 0% left"),
@@ -6407,7 +6689,12 @@ mod tests {
         let tone = |used: f32, status: UsageStatus| {
             let mut snapshot = snapshot(vec![window(used, None)], NOW);
             snapshot.status = status;
-            chip(&state_with(Some(snapshot)), "Claude", NOW)
+            chip(
+                &state_with(Some(snapshot)),
+                "Claude",
+                NOW,
+                AccountUsageDisplay::Left,
+            )
         };
         assert_eq!(tone(0.05, UsageStatus::Ok).tone, ChipTone::Current);
         assert_eq!(tone(0.8, UsageStatus::Ok).tone, ChipTone::Low);
@@ -6427,7 +6714,13 @@ mod tests {
         );
         old.status = UsageStatus::Limited;
         assert_eq!(
-            chip(&state_with(Some(old)), "Claude", NOW).tone,
+            chip(
+                &state_with(Some(old)),
+                "Claude",
+                NOW,
+                AccountUsageDisplay::Left
+            )
+            .tone,
             ChipTone::Stale
         );
     }
@@ -6439,6 +6732,7 @@ mod tests {
             &state_with(Some(snapshot(vec![window(0.5, None)], observed))),
             "Claude",
             NOW,
+            AccountUsageDisplay::Left,
         );
         assert_eq!(old.tone, ChipTone::Stale);
         assert!(old.text.starts_with("50% left · as of "), "{}", old.text);
@@ -6447,7 +6741,13 @@ mod tests {
         let before_reset = snapshot(vec![window(0.9, Some(reset))], NOW - 5 * 60_000);
         assert!(reset_since(&before_reset, NOW));
         assert_eq!(
-            chip(&state_with(Some(before_reset)), "Claude", NOW).tone,
+            chip(
+                &state_with(Some(before_reset)),
+                "Claude",
+                NOW,
+                AccountUsageDisplay::Left
+            )
+            .tone,
             ChipTone::Stale
         );
     }
@@ -6455,15 +6755,26 @@ mod tests {
     #[test]
     fn a_signed_out_account_asks_for_a_sign_in_and_an_unanswered_one_says_so() {
         let signed_out = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW);
-        let chip_for_login = chip(&state_with(Some(signed_out)), "Claude", NOW);
+        let chip_for_login = chip(
+            &state_with(Some(signed_out)),
+            "Claude",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
         assert_eq!(chip_for_login.text, "Sign in");
         assert_eq!(chip_for_login.tone, ChipTone::Attention);
         assert!(chip_for_login.essential);
 
-        assert_eq!(chip(&state_with(None), "Claude", NOW).text, "Checking…");
+        assert_eq!(
+            chip(&state_with(None), "Claude", NOW, AccountUsageDisplay::Left).text,
+            "Checking…"
+        );
         let mut failed = state_with(None);
         failed.failure = Some("Claude Code did not answer".into());
-        assert_eq!(chip(&failed, "Claude", NOW).text, "Unavailable");
+        assert_eq!(
+            chip(&failed, "Claude", NOW, AccountUsageDisplay::Left).text,
+            "Unavailable"
+        );
     }
 
     #[test]
@@ -6471,11 +6782,11 @@ mod tests {
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
         snapshot.windows = vec![window(0.42, None)];
         let mut state = state_with(Some(snapshot));
-        let current = chip(&state, "Codex", NOW);
+        let current = chip(&state, "Codex", NOW, AccountUsageDisplay::Left);
         assert_ne!(current.tone, ChipTone::Stale);
         assert!(!current.tooltip.contains("Last check failed"));
         state.failure = Some("Codex could not read usage just now".into());
-        let failed = chip(&state, "Codex", NOW);
+        let failed = chip(&state, "Codex", NOW, AccountUsageDisplay::Left);
         assert_eq!(failed.text, current.text);
         assert_eq!(failed.tone, ChipTone::Stale);
         assert!(
@@ -9557,7 +9868,11 @@ mod app_tests {
                             assert!(app.account_ui.shown_in_switcher(state));
                             assert_eq!(app.account_ui.account_origin(state), "System default");
                             assert!(app.provider_chip(provider, finished, false).is_some());
-                            assert!(chip(state, "Fixture system", finished).gauge.is_some());
+                            assert!(
+                                chip(state, "Fixture system", finished, AccountUsageDisplay::Left)
+                                    .usage_fraction
+                                    .is_some()
+                            );
                         } else {
                             assert!(state.snapshot.is_none() && state.identity.is_none());
                             assert!(!state.present);

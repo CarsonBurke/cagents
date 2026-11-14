@@ -192,7 +192,7 @@ the separate option below.
 | PEER | Script | Each prompt |
 | --- | --- | --- |
 | `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
-| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect` and `closed-after-finish` pick the neighbouring cases |
+| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect`, `closed-after-finish` and `auth-required` pick the neighbouring cases |
 | `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
 
 `start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
@@ -209,8 +209,16 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-rows \
 ```
 
 The peers model the app-server protocol only: no provider, account, model or
-network is contacted, and the app's account and usage-limit handling isn't
-exercised.
+network is contacted, and live account credentials and usage limits aren't
+verified.
+
+For native sign-in controls, prompt the `child-errors` peer with `auth-required`.
+It refuses `turn/start` with an explicit authentication error. Put a whole number
+of seconds in `home/.codex/fixture-sign-in-seconds` to keep the fake `codex login`
+terminal open while **Signing in…** is visible; `login status` stays immediate.
+This exercises the app's recovery controls and login-terminal lifecycle without
+authenticating an account or contacting a provider. It does not verify provider
+credentials or account changes.
 
 ## A real Codex in the fixture
 
@@ -300,7 +308,7 @@ evidence shot channel-prs
 real file chooser, go to each side's `start`. Prepare data that both
 sides need once, then `save-seed` it, rather than repeating slow setup in each
 side's steps. `{fixture}` in a steps file means the fixture's root on the
-host. `pair` can wait 30 minutes for the native lock, so run it in the
+host. `pair` can wait 30 minutes for a native slot, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
 
@@ -338,7 +346,8 @@ Every refusal names its cause and the next command. The common ones:
 | `changed since its build; run: build SIDE CHECKOUT` | Evidence must show what was built. Build again. |
 | `has not been built, or its unused build was reclaimed` | `scripts/prune-build-dirs` removed an idle target. Build again; a shared slot recompiles only what changed. |
 | `refusing to compile ... while holding the native lock` | Something in the session asked Cargo for a build that `build` didn't do. Build first; keep builds out of a session. |
-| `the native lock stayed busy` | Another session is running. `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows whose. |
+| `every native slot stayed busy` | Other sessions hold every slot. The message names the slot files; `scripts/lock-holders` given them shows whose. |
+| `a session may hold a native slot for at most 1800 seconds` | `--limit` asked for longer. Capture in one short session, or split a long measurement across sessions. |
 | `memory-capped: stopped` | The session exceeded its memory limit; the log names the process. |
 | `session: lost` in `status` | Its supervisor was killed. `stop` ends what remains. |
 | `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |

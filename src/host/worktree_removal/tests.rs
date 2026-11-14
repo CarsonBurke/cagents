@@ -235,3 +235,34 @@ fn hosted_and_durable_work_inside_the_worktree_refuses_its_removal() {
     let error = reservation.ensure_unoccupied(&host).unwrap_err();
     assert!(error.starts_with("Agent work"), "{error}");
 }
+
+#[test]
+fn an_agent_observation_in_the_worktree_is_waited_for_and_refuses_its_removal_if_it_stays() {
+    let (root, worktree) = tree();
+    let host = host();
+    host.lock().unwrap().execution_registry = Some(Arc::new(Mutex::new(
+        super::super::model::Registry::at(&root.path().join("registry.sqlite3")).unwrap(),
+    )));
+    let probes = Arc::clone(&host.lock().unwrap().agent_probes);
+    let probe = |directory: PathBuf| super::super::activity::Probe {
+        working_directory: directory,
+        environment: BTreeMap::new(),
+        unset: BTreeSet::new(),
+    };
+    // One elsewhere is neither waited for nor an occupant.
+    let _elsewhere = probes.admit(probe(root.path().join("other")));
+    let brief = probes.admit(probe(worktree.join("child")));
+    let reservation = Reservation::install(&host, &worktree).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(brief);
+    });
+    reservation.ensure_unoccupied(&host).unwrap();
+    releaser.join().unwrap();
+
+    let stuck = probes.admit(probe(worktree.clone()));
+    let error = reservation.ensure_unoccupied(&host).unwrap_err();
+    assert!(error.contains("still checking an agent"), "{error}");
+    drop(stuck);
+    reservation.ensure_unoccupied(&host).unwrap();
+}
