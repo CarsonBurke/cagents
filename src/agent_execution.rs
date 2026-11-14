@@ -618,6 +618,12 @@ pub enum Operation {
     /// `Send` that also says how an agent recipient takes the message: as a
     /// run started now, or one waiting behind its current work.
     Deliver(mailbox::Outgoing),
+    /// Read sessions and the caller's durable channel fallback. Older
+    /// directory and session replies retain their positional wire layout.
+    Context {
+        scope: directory::Scope,
+        standing: bool,
+    },
 }
 
 /// What became of a prompt accepted for an existing agent.
@@ -702,6 +708,7 @@ pub enum Reply {
         start: Start,
     },
     Handed(mailbox::Handed),
+    Context(directory::Context),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

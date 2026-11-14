@@ -377,6 +377,9 @@ pub enum Action {
     /// Brings forward the open session whose id starts with the given one,
     /// as an agent addressed it in a command.
     OpenSession(String),
+    /// Brings forward the tab of the agent whose ID starts with the given
+    /// one, as the CLI printed it when a conversation started the agent.
+    OpenAgent(String),
     SessionResolved(Result<session_links::Destination, String>),
     SessionLinkOpened(Result<(), String>),
     SessionLinkWindowBackend(String, TerminalId, bool),
@@ -759,6 +762,7 @@ impl Action {
             Self::SubagentPage(..) => "SubagentPage",
             Self::Unfold(..) => "Unfold",
             Self::OpenSession(..) => "OpenSession",
+            Self::OpenAgent(..) => "OpenAgent",
             Self::SessionResolved(..) => "SessionResolved",
             Self::SessionLinkOpened(..) => "SessionLinkOpened",
             Self::SessionLinkWindowBackend(..) => "SessionLinkWindowBackend",
@@ -13793,6 +13797,9 @@ impl Cagents {
             }
             Action::OpenSession(prefix) => {
                 return self.open_session_link(prefix);
+            }
+            Action::OpenAgent(prefix) => {
+                return self.open_agent_tab(&prefix);
             }
             Action::SessionResolved(result) => {
                 return self.session_link_resolved(result);

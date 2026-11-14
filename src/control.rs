@@ -33,7 +33,7 @@ mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 mod gh;
-pub use agents::AgentCommand;
+pub use agents::{AgentCommand, PlacedIn};
 pub use gh::GhCommand;
 mod automations;
 mod completions;

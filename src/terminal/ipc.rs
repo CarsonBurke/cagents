@@ -239,7 +239,9 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-pub const PROTOCOL_VERSION: u16 = 177;
+/// Version 178 appends agent placement context without changing the frozen
+/// directory entry decoded by carried CLIs.
+pub const PROTOCOL_VERSION: u16 = 178;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

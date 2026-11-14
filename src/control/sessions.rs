@@ -116,6 +116,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
 /// stops it, whatever activity the provider last reported.
 pub(super) fn session_json(member: &Member) -> Value {
     let mut value = json!(member.session);
+    value["lineage_channel"] = json!(member.session.lineage_channel);
     if member.limit.is_some() {
         value["state"] = json!("Limited");
     }
@@ -350,10 +351,16 @@ fn current_directory() -> Result<PathBuf, AppError> {
 }
 
 fn read(scope: Scope) -> Result<Sessions, AppError> {
-    request(Operation::Sessions(scope), |reply| match reply {
-        Reply::Sessions(sessions) => Some(sessions),
-        _ => None,
-    })
+    request(
+        Operation::Context {
+            scope,
+            standing: true,
+        },
+        |reply| match reply {
+            Reply::Context(context) => Some(context.into_sessions()),
+            _ => None,
+        },
+    )
 }
 
 fn request<T>(
@@ -391,6 +398,7 @@ mod tests {
                 path: "/fixture/linked".into(),
             }),
             channel_repository: None,
+            lineage_channel: None,
             state: ActivityState::Waiting,
             directory: Some("/fixture/linked".into()),
             worktree: Some("/fixture/linked".into()),
@@ -416,6 +424,44 @@ mod tests {
             limit: None,
             account: None,
         }
+    }
+
+    #[test]
+    fn lineage_context_keeps_the_frozen_entry_wire_layout_and_reports_cli_json() {
+        use crate::agent_execution::directory::{ChannelHome, Context};
+        let mut caller = entry();
+        let frozen = postcard::to_allocvec(&caller).unwrap();
+        let home = ChannelHome {
+            id: ChannelId::new(),
+            repository: "/fixture/.git".into(),
+        };
+        caller.lineage_channel = Some(home.clone());
+        assert_eq!(postcard::to_allocvec(&caller).unwrap(), frozen);
+        let context = Context {
+            sessions: Sessions {
+                caller: Some(live(caller)),
+                scope: Scope::All,
+                sessions: vec![],
+            },
+            lineage_channel: Some(home.clone()),
+        };
+        let bytes = postcard::to_allocvec(&context).unwrap();
+        let decoded: Context = postcard::from_bytes(&bytes).unwrap();
+        assert!(
+            decoded
+                .sessions
+                .caller
+                .as_ref()
+                .unwrap()
+                .session
+                .lineage_channel
+                .is_none()
+        );
+        let sessions = decoded.into_sessions();
+        assert_eq!(
+            session_json(sessions.caller.as_ref().unwrap())["lineage_channel"],
+            json!(home)
+        );
     }
 
     fn account(remaining: f32, stale: bool) -> SessionAccount {

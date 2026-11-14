@@ -233,6 +233,10 @@ impl Coordinated {
         self.reading.is_card()
     }
 
+    pub(super) fn is_spawn_step(&self) -> bool {
+        self.reading.cli && matches!(self.reading.kind, Kind::Spawn(_))
+    }
+
     /// The text of each part the card folds, by the part's name.
     pub(super) fn parts(&self) -> Vec<(String, &str)> {
         let mut parts = Vec::new();
@@ -624,19 +628,12 @@ fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<
     if !spawn.effort.is_empty() {
         parts.push(spawn.effort.clone());
     }
-    if reading.cli {
-        parts.push(match &spawn.placement {
-            Some(crate::agent_execution::Placement::Channel(channel)) => {
-                format!("Channel {channel}")
-            }
-            Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
-                format!("Worktree view {}", path.display())
-            }
-            None => spawn.channel.as_ref().map_or_else(
-                || "View not reported".to_owned(),
-                |channel| format!("Channel {channel}"),
-            ),
-        });
+    // A channel the agent went to other than this conversation's is named
+    // on the card's first line, by its title; an ID would say nothing here.
+    if reading.cli
+        && let Some(crate::agent_execution::Placement::Worktree { path, .. }) = &spawn.placement
+    {
+        parts.push(format!("Worktree view {}", path.display()));
     }
     parts.join(" · ")
 }
@@ -791,6 +788,11 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let reported = item.content.status().unwrap_or(ToolStatus::Succeeded);
         let status = coordinated.reading.status(reported);
+        if coordinated.reading.cli
+            && let Kind::Spawn(spawn) = &coordinated.reading.kind
+        {
+            return self.spawn_step(item, cached, coordinated, spawn, status, settings, raw);
+        }
         let output = match &item.content {
             ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
                 output.as_str()
@@ -845,6 +847,143 @@ impl Runtime {
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
         .into()
+    }
+
+    /// A separate agent is one coordination step in its parent's conversation.
+    /// Keep the launch details available without repeating them in the transcript.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_step<'a>(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        coordinated: &Coordinated,
+        spawn: &Spawn,
+        status: ToolStatus,
+        settings: markdown::Settings,
+        raw: Option<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        let expanded = self.item_expanded(&item.id);
+        let name = started(spawn);
+        let task = spawn.agents.first().and_then(|agent| {
+            agent
+                .prompt
+                .inline()
+                .filter(|text| !text.trim().is_empty())
+                .or_else(|| (!agent.description.is_empty()).then_some(agent.description.as_str()))
+        });
+        let mut title = Self::short_description(&name, 60);
+        if let Some(task) = task {
+            title.push_str(" · ");
+            let task = Self::short_description(task, 160);
+            title.push_str(task.lines().next().unwrap_or(&task));
+        }
+        let summary = widget::container(
+            design::caption(Self::short_description(&title, 200))
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::advanced::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                )),
+        )
+        .width(Length::Fill)
+        .clip(true);
+        let disclosure = widget::button::custom(
+            widget::row::with_children(vec![
+                self.card_indicator(status, Icon::Agent),
+                summary.into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .class(crate::ui_controls::control_style(expanded, None))
+        .padding([step::GAP_XS as u16, step::GAP_S as u16])
+        .name(if expanded {
+            "Hide spawn details"
+        } else {
+            "Show spawn details"
+        })
+        .on_press(action(Action::Toggle(self.target, item.id.clone())));
+        let mut heading = vec![crate::interaction::tooltip(disclosure, title).into()];
+        if let Some(placed) = coordinated
+            .reading
+            .outcome
+            .run
+            .as_ref()
+            .and_then(|run| run.placed_in.as_ref())
+        {
+            let destination = placed.title.as_ref().map_or_else(
+                || "in another channel".to_owned(),
+                |title| format!("in channel \u{201c}{title}\u{201d}"),
+            );
+            // Reserve the destination independently of a long task, as the
+            // separate channel is what the person needs to locate here.
+            heading.push(
+                crate::interaction::tooltip(
+                    widget::container(
+                        design::caption(Self::short_description(&destination, 80))
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .ellipsize(iced::advanced::text::Ellipsize::End(
+                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                            )),
+                    )
+                    .width(Length::Fixed(180.0))
+                    .clip(true),
+                    destination,
+                )
+                .into(),
+            );
+        }
+        if let Some(run) = &coordinated.reading.outcome.run
+            && !run.agent.is_empty()
+        {
+            heading.push(
+                widget::button::custom(design::caption("Open").class(cosmic::theme::Text::Custom(
+                    |theme| cosmic::iced::widget::text::Style {
+                        color: Some(design::accent_color(theme)),
+                        ..Default::default()
+                    },
+                )))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .name(format!("Open agent {}", run.agent))
+                .on_press(action(Action::OpenAgent(run.agent.clone())))
+                .into(),
+            );
+        }
+        let mut rows = vec![
+            widget::row::with_children(heading)
+                .align_y(Alignment::Center)
+                .into(),
+        ];
+        if expanded {
+            let output = match &item.content {
+                ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
+                    output.as_str()
+                }
+                _ => "",
+            };
+            self.spawn_rows(
+                &mut rows,
+                item,
+                cached,
+                coordinated,
+                spawn,
+                status,
+                output,
+                settings,
+            );
+            rows.extend(raw);
+        }
+        widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                false,
+            ))
+            .width(Length::Fill)
+            .into()
     }
 
     /// The glyph or spinner a card's heading opens with.
@@ -1028,46 +1167,46 @@ impl Runtime {
     ) {
         let reading = &coordinated.reading;
         let background = self.background_state(coordinated);
-        // Use the observed task state while a native launch tool is still
-        // settling, but keep an explicit launch failure visible.
-        let indicator = match background
-            .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
-        {
-            Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
-            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
-            Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
-            None => self.card_indicator(status, Icon::Agent),
-        };
-        // The agent is named as its tab names it. Its task describes it in
-        // the tooltip but never stands in for an absent name; agent origin
-        // and launch options belong on their own secondary line.
         let primary = match reading.subagents.as_slice() {
             [id] => self.listed_agent_name(id),
             _ => None,
         }
         .unwrap_or_else(|| started(spawn));
-        let task = match spawn.agents.as_slice() {
-            [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
-            _ => primary.clone(),
-        };
-        rows.push(
-            widget::row::with_children(vec![
-                indicator,
-                faded_caption(
-                    primary.clone(),
-                    true,
-                    if primary == task {
-                        task
-                    } else {
-                        format!("{primary}\n{task}")
-                    },
-                ),
-            ])
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .width(Length::Fill)
-            .into(),
-        );
+        // CLI details sit beneath their compact heading; native subagents
+        // keep the shared disclosure presentation.
+        if !reading.cli {
+            let indicator = match background
+                .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
+            {
+                Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+                Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
+                Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
+                None => self.card_indicator(status, Icon::Agent),
+            };
+            let task = match spawn.agents.as_slice() {
+                [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
+                _ => primary.clone(),
+            };
+            rows.push(
+                widget::row::with_children(vec![
+                    indicator,
+                    faded_caption(
+                        primary.clone(),
+                        true,
+                        if primary == task {
+                            task
+                        } else {
+                            format!("{primary}\n{task}")
+                        },
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+        let run = reading.outcome.run.as_ref();
         let observed_model = if !reading.cli {
             match reading.subagents.as_slice() {
                 [id] => self.subagent(id).and_then(|agent| agent.model.as_deref()),
@@ -1140,7 +1279,6 @@ impl Runtime {
             ));
         }
         // How the run went, as far as this step saw it.
-        let run = reading.outcome.run.as_ref();
         let line = match status {
             ToolStatus::Running if background.is_some() => None,
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
@@ -1885,16 +2023,18 @@ mod identity_tests {
         reading.cli = true;
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
-            "cagents agent · Model not reported · View not reported"
+            "cagents agent · Model not reported"
         );
         spawn.provider = "codex".into();
         spawn.model = "gpt-reported".into();
         spawn.effort = "low".into();
         let channel = crate::model::ChannelId::new();
         spawn.channel = Some(channel);
+        spawn.placement = Some(crate::agent_execution::Placement::Channel(channel));
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
-            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+            "cagents agent · codex · gpt-reported · low",
+            "a channel is named by title on the first line, never by its ID"
         );
         spawn.placement = Some(crate::agent_execution::Placement::Worktree {
             repository: "/repo".into(),

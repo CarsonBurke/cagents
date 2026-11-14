@@ -239,6 +239,10 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            25 => {
+                tx.execute_batch("DROP TRIGGER session_channel_insert; DROP TRIGGER session_channel_move; DROP TABLE session_channels;")
+                    .map_err(|error| error.to_string())?;
+            }
             24 => {
                 let retained: bool = tx
                     .query_row(
@@ -369,6 +373,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FIVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -383,6 +388,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
         24 => &TWENTY_FOUR,
+        25 => &TWENTY_FIVE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -876,6 +882,7 @@ mod tests {
             (16, "DROP INDEX automation_lifecycle_scoped;"),
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
             (24, "DROP TABLE console_relaunches;"),
+            (25, "DROP TABLE session_channels;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1099,7 +1106,7 @@ mod tests {
 
         let registry = Registry::at(&path).unwrap();
         require_current(&registry.db).unwrap();
-        assert_eq!(inspect(&registry.db).unwrap().version, 24);
+        assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
         assert_eq!(registry.model().unwrap().identity.to_string(), identity);
         assert_eq!(
             super::super::views::read(&registry.db, &channel.into()).unwrap(),
@@ -1115,7 +1122,7 @@ mod tests {
         );
         drop(registry);
 
-        assert_eq!(downgrade(&path, 23).unwrap(), Some(24));
+        assert_eq!(downgrade(&path, 23).unwrap(), Some(SCHEMA_VERSION));
         let db = Connection::open(&path).unwrap();
         require_open_layout(&db, 23).unwrap();
         assert_eq!(inspect(&db).unwrap().version, 23);
@@ -1312,7 +1319,8 @@ mod tests {
                 )
             );
             // This current opener also applies retention20, run-attention21,
-            // history22 and the empty console recovery ledger24.
+            // history22, the empty console recovery ledger24 and session
+            // channel history25.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1325,6 +1333,7 @@ mod tests {
                 "automation_removed_history",
                 "automation_firing_successors",
                 "console_relaunches",
+                "session_channels",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1340,6 +1349,7 @@ mod tests {
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
                 "console_relaunches",
+                "session_channels",
             ] {
                 assert_eq!(
                     registry
