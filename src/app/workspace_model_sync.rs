@@ -1917,12 +1917,18 @@ impl Cagents {
             }
             _ => None,
         };
+        if let Some((scope, attempt)) = &seed {
+            self.shared_views
+                .seed_attempts
+                .insert(scope.clone(), *attempt);
+        }
         if let Err(error) = self.workspace_model_tx.try_send(request) {
-            if let Some((scope, _)) = seed {
-                self.shared_views.seeding.remove(&scope);
-                self.shared_views
-                    .seed_failures
-                    .insert(scope, "The workspace connection is unavailable".into());
+            if let Some((scope, attempt)) = seed {
+                self.refuse_view_seed(
+                    scope,
+                    attempt,
+                    "The workspace connection is unavailable".into(),
+                );
             }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
@@ -1930,8 +1936,6 @@ impl Cagents {
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
-        } else if let Some((scope, attempt)) = seed {
-            self.shared_views.seed_attempts.insert(scope, attempt);
         }
     }
 }
