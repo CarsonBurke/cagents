@@ -502,9 +502,6 @@ fn retained_identity_case(
     .unwrap();
     host.lock().unwrap().notifications = Some(notifications.handle());
     let db = rusqlite::Connection::open(&path).unwrap();
-    if fail_census {
-        db.execute_batch("CREATE TRIGGER reject_confirmed_census BEFORE UPDATE ON native_actor_ownerships WHEN json_extract(NEW.ownership, '$.source.launch.session_id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture census publication failure'); END;").unwrap();
-    }
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     let store = registry(&host).unwrap();
     wait(
@@ -583,6 +580,11 @@ fn retained_identity_case(
     let (before, provider_session) = saved_pane();
     assert!(before.launch.session_id.is_none());
     assert!(provider_session.is_none());
+    if fail_census {
+        // Install the fault after ordinary model edits validate the published
+        // schema, and before the provider can publish its confirmed identity.
+        db.execute_batch("CREATE TRIGGER reject_confirmed_census BEFORE UPDATE ON native_actor_ownerships WHEN json_extract(NEW.ownership, '$.source.launch.session_id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture census publication failure'); END;").unwrap();
+    }
     if shutdown_before_confirmation {
         let (terminals, _) = host.lock().unwrap().graceful_shutdown();
         assert!(terminals.is_empty());
