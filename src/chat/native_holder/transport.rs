@@ -1609,11 +1609,7 @@ mod tests {
                 .spawn()
                 .unwrap();
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while !server.exited() {
-                assert!(Instant::now() < deadline, "fixture launcher did not exit");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            crate::test_timing::eventually("the fixture launcher's exit", || server.exited());
             let read_pid = |name| {
                 std::fs::read_to_string(directory.path().join(name))
                     .unwrap()
@@ -2735,9 +2731,11 @@ exec /bin/sleep 60
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(&10_u32.to_be_bytes()).unwrap();
         writer.write_all(b"{").unwrap();
-        let began = Instant::now();
-        assert!(receive::<Request>(&reader, Duration::from_millis(30)).is_err());
-        assert!(began.elapsed() < Duration::from_secs(1));
+        // The writer stays open, so only the deadline can end the receive.
+        assert!(crate::test_timing::returns(
+            "the partial receive",
+            move || { receive::<Request>(&reader, Duration::from_millis(30)).is_err() }
+        ));
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer
             .write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())

@@ -141,6 +141,8 @@ pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod test_timing;
 #[cfg(all(test, any(feature = "host", feature = "ui")))]
 pub(crate) mod test_tracing;
 pub(crate) mod transcript_cache;
