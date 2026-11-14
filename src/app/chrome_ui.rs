@@ -43,7 +43,17 @@ pub(super) struct State {
     /// Where the switcher's list was last scrolled to, so following the
     /// selection moves it no further than the selection requires.
     pub(super) workspace_switcher_scroll: f32,
-    pub(super) workspace_switcher_rows: Vec<WorkspaceSwitcherRow>,
+    pub(super) workspace_switcher_rows: Vec<workspace_switcher::Row>,
+    /// The panes of the workspace the switcher highlights.
+    pub(super) workspace_switcher_panes: workspace_switcher::Panes,
+    /// The highlighted workspace, once the selection has rested on it long
+    /// enough to bring its pane up for the preview.
+    pub(super) workspace_switcher_rested: Option<WorkspaceDestination>,
+    /// When the selection last moved, while a timer waits to see it rest.
+    pub(super) workspace_switcher_moved: Option<Instant>,
+    /// The pane brought up to be shown live in the switcher, whose
+    /// visibility is put back once the switcher no longer shows it.
+    pub(super) workspace_switcher_preview: Option<CardId>,
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
     attention_page: usize,

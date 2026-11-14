@@ -258,6 +258,7 @@ pub struct WorkspaceManifest {
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
+    pub workspace_visits: Vec<(WorkspaceDestination, u64)>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
@@ -2172,6 +2173,7 @@ impl StateStore {
             chat_waiting_messages: manifest.chat_waiting_messages,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
+            workspace_visits: manifest.workspace_visits,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
@@ -4292,6 +4294,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:workspace_visits"),
+        &to_json(&state.workspace_visits)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:agent_updates"),
         &to_json(&state.agent_updates)?,
     )?;
@@ -5911,6 +5918,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace history", &value))
         .transpose()?
         .unwrap_or_default(),
+        workspace_visits: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:workspace_visits"),
+        )?
+        .map(|value| from_json("workspace visits", &value))
+        .transpose()?
+        .unwrap_or_default(),
         repository_navigation: metadata(
             connection,
             &format!("workspace:{id}:navigation:repository_navigation"),
@@ -6639,6 +6653,7 @@ mod tests {
             chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
+            workspace_visits: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),

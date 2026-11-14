@@ -1568,7 +1568,7 @@ impl Runtime {
     /// and wherever the transcript already says what is happening: a first
     /// message starting shows it on the message, and switching, closing, a
     /// lost connection or a stopped agent each say so with their controls.
-    pub(super) fn timeline_activity(
+    pub(in crate::app) fn timeline_activity(
         &self,
         transitioning: bool,
         selected: Option<&chat::Subagent>,
@@ -2341,49 +2341,12 @@ impl Runtime {
                 );
             }
             for turn in &self.turns {
-                use std::hash::{Hash, Hasher};
-                let mut key = std::hash::DefaultHasher::new();
-                turn.key.hash(&mut key);
-                let estimate = turn
-                    .prompt
-                    .iter()
-                    .chain(turn.prose.iter().map(|placed| &placed.index))
-                    .filter_map(|index| snapshot.items.get(*index))
-                    .map(|item| {
-                        CachedItem::prose(&item.content).map_or(60.0, |body| {
-                            ((body.len() as f32 / (content_width / 8.0).max(20.0))
-                                .ceil()
-                                .max(1.0)
-                                * 22.0)
-                                + 40.0
-                        })
-                    })
-                    .sum::<f32>()
-                    + if turn.steps.is_empty() { 0.0 } else { 48.0 };
-                let aliases = turn
-                    .prompt
-                    .iter()
-                    .chain(
-                        turn.prose
-                            .iter()
-                            .chain(&turn.steps)
-                            .map(|placed| &placed.index),
-                    )
-                    .filter_map(|index| snapshot.items.get(*index))
-                    .map(|item| scroll::item_id(&item.id))
-                    .collect();
-                transcript.lazy(
-                    key.finish(),
-                    self.turn_fingerprint(turn, dark),
-                    estimate,
-                    aliases,
-                    if turn.prompt.is_empty() {
-                        step::GAP_M
-                    } else {
-                        step::GAP_L
-                    },
-                    self.turn_trailing_footer(turn),
-                    move || self.turn_view(turn, markdown_settings, dark),
+                self.push_turn_row(
+                    &mut transcript,
+                    turn,
+                    content_width,
+                    markdown_settings,
+                    dark,
                 );
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
                     !incident.active_recovery
@@ -4368,6 +4331,90 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .into(),
         )
+    }
+
+    /// One exchange's row in a virtual transcript: its key, fingerprint,
+    /// height estimate and the item anchors find and scrolling address.
+    fn push_turn_row<'a>(
+        &'a self,
+        transcript: &mut VirtualRows<'a>,
+        turn: &'a turn::Turn,
+        content_width: f32,
+        markdown_settings: markdown::Settings,
+        dark: bool,
+    ) {
+        let snapshot = &self.snapshot;
+        use std::hash::{Hash, Hasher};
+        let mut key = std::hash::DefaultHasher::new();
+        turn.key.hash(&mut key);
+        let estimate = turn
+            .prompt
+            .iter()
+            .chain(turn.prose.iter().map(|placed| &placed.index))
+            .filter_map(|index| snapshot.items.get(*index))
+            .map(|item| {
+                CachedItem::prose(&item.content).map_or(60.0, |body| {
+                    ((body.len() as f32 / (content_width / 8.0).max(20.0))
+                        .ceil()
+                        .max(1.0)
+                        * 22.0)
+                        + 40.0
+                })
+            })
+            .sum::<f32>()
+            + if turn.steps.is_empty() { 0.0 } else { 48.0 };
+        let aliases = turn
+            .prompt
+            .iter()
+            .chain(
+                turn.prose
+                    .iter()
+                    .chain(&turn.steps)
+                    .map(|placed| &placed.index),
+            )
+            .filter_map(|index| snapshot.items.get(*index))
+            .map(|item| scroll::item_id(&item.id))
+            .collect();
+        transcript.lazy(
+            key.finish(),
+            self.turn_fingerprint(turn, dark),
+            estimate,
+            aliases,
+            if turn.prompt.is_empty() {
+                step::GAP_M
+            } else {
+                step::GAP_L
+            },
+            self.turn_trailing_footer(turn),
+            move || self.turn_view(turn, markdown_settings, dark),
+        );
+    }
+
+    /// The newest exchanges, read-only, for a glance from outside the pane:
+    /// the same rows as the transcript, bottom-aligned in whatever height the
+    /// caller gives them, with what the agent is doing now beneath. It holds
+    /// nothing while the chat's transcript is not loaded.
+    pub(in crate::app) fn transcript_preview(&self) -> Option<Element<'_, Message>> {
+        if self.turns.is_empty() {
+            return None;
+        }
+        let dark = cosmic::theme::is_dark();
+        let markdown_settings =
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let mut transcript = VirtualRows::new(step::GAP_L);
+        for turn in &self.turns {
+            self.push_turn_row(
+                &mut transcript,
+                turn,
+                super::layout::READING_COLUMN,
+                markdown_settings,
+                dark,
+            );
+        }
+        if let Some((glyph, label)) = self.timeline_activity(false, None) {
+            transcript.push(activity_row(glyph, label));
+        }
+        Some(virtualized::column(transcript.children, Default::default()))
     }
 
     /// One exchange: what was asked, what was done, and what came back.

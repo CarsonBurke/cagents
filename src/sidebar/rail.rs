@@ -284,12 +284,12 @@ fn activity_badge<'a>(activity: Activity) -> Element<'a, SidebarAction> {
 }
 
 /// A project's identity chip: its avatar, or its initials on its own colour.
-pub(super) fn project_chip<'a>(
+pub(super) fn project_chip<'a, Message: 'a>(
     avatar: Option<&cosmic::iced::advanced::image::Handle>,
     initials: String,
     color: Color,
     muted: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'a, Message> {
     let opacity = if muted { 0.5 } else { 1.0 };
     match avatar {
         Some(handle) => cosmic::iced::widget::image(handle.clone())
