@@ -101,6 +101,15 @@ pub enum BrowserUnavailable {
     NotWayland,
     InitializationFailed,
 }
+impl BrowserUnavailable {
+    /// Whether checking again could find the browser available. A compositor
+    /// that was slow to answer may answer the next check; one that lacks a
+    /// protocol, or a session that is not Wayland, never will.
+    pub fn is_recoverable(self) -> bool {
+        matches!(self, Self::TimedOut)
+    }
+}
+
 impl std::fmt::Display for BrowserUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

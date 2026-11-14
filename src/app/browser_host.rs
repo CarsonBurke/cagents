@@ -313,13 +313,14 @@ impl Cagents {
         let Some((browser, url)) = self.browser_system_request(card) else {
             return Task::none();
         };
+        let opened = self.system_url_opener.open(url);
         cosmic::task::future(async move {
             // The explicit action needs the complete navigation URL. Neither
             // the URL nor an opener's backend error enters a public property.
             Message::BrowserSystemOpened {
                 card,
                 browser,
-                opened: open_system_url(url).await.is_ok(),
+                opened: opened.await.is_ok(),
             }
         })
     }

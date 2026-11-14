@@ -775,7 +775,7 @@ impl Cagents {
             }
             Action::CheckNow => self.start_update_check(true),
             Action::OpenReleaseNotes(url) => match Url::parse(&url) {
-                Ok(url) => Self::open_external_url(url),
+                Ok(url) => self.open_external_url(url),
                 Err(error) => {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open the release notes: {error}"

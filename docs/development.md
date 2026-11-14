@@ -1727,6 +1727,10 @@ cropped image. This changes the capture viewport, not application layouts.
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
 driven by `niri-harness`, running `scripts/run-development --browserless`.
+`build SIDE CHECKOUT --integrated` (or `pair --integrated`) builds that side's UI
+with the embedded browser instead, and its sessions run the runner without
+`--browserless`, for evidence of the integrated lane. Links the app opens still
+go to the fixture's recording `xdg-open`, never a real browser.
 Add `start SIDE --instance NAME` to opt a new task into a named instance.
 It stays in the existing private compositor through the runner's `--in-session`
 mode; CLI and cleanup use the same name. The task keeps that selection across

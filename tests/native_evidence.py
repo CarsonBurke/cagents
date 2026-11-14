@@ -671,6 +671,32 @@ class Evidence(unittest.TestCase):
         self.assertEqual((self.logs / "cargo-metadata").read_text(), metadata)
         self.run_tool("stop")
 
+    def test_an_integrated_side_builds_and_runs_the_embedded_browser_lane(self) -> None:
+        checkout = self.checkout("after")
+        shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
+        git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "."], check=True, env=self.env)
+        subprocess.run([*git, "commit", "-qm", "real runner"], check=True, env=self.env)
+        self.run_tool("build", "after", str(checkout), "--integrated")
+        built = (self.logs / "cargo").read_text()
+        self.assertIn("--features development,integrated-browser --bin cagents-ui", built)
+        self.assertNotIn("development,ui --bin cagents-ui", built)
+        self.assertIn("lane integrated", (self.task / "target-after" / "evidence-source").read_text())
+        started = self.run_tool("start", "after", "--instance", "native-review", check=False)
+        self.assertEqual(started.returncode, 0, (self.logs / "app-output").read_text())
+        for _ in range(100):
+            if (self.logs / "ui-ran").exists():
+                break
+            time.sleep(0.1)
+        # The real runner asked the session's cargo only for what was built.
+        self.assertTrue((self.logs / "ui-ran").exists(), "the runner did not start the recorded UI")
+        self.assertEqual((self.logs / "cargo").read_text(), built)
+        self.run_tool("stop")
+        # A browserless build of the same side goes back to that lane.
+        self.run_tool("build", "after", str(checkout))
+        self.assertIn("lane browserless", (self.task / "target-after" / "evidence-source").read_text())
+
     def test_a_refusals_next_step_works_straight_away(self) -> None:
         path = self.built()
         (self.logs / "runner-checks").touch()
