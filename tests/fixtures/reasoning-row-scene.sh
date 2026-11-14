@@ -270,14 +270,16 @@ if [ "$scene" = refresh-notices ]; then
         "$fixture/state/reasoning-refresh-notices-spawn.json" 'Notice refresh'
     evidence drive wait prepared --timeout 10 >/dev/null
     scroll_top
-    align_row '^Background command'
+    # The adapter uses the original Bash descriptions for known tasks. Match
+    # those stable prefixes rather than the generic orphan-notice fallback.
+    align_row 'Wait for k.?gather'
     shot refresh-notices-collapsed
-    click_row '^Background command' 0
-    click_row '^Background command' 1
+    click_row 'Wait for k.?gather'
+    click_row 'Check k.?pool'
     find_row 'summary.txt' >/dev/null
     shot refresh-command-notices-expanded
-    click_row '^Background command' 1
-    click_row '^Background command' 0
+    click_row 'Check k.?pool'
+    click_row 'Wait for k.?gather'
     align_row 'casmi GPU jobs finishing'
     click_row 'casmi GPU jobs finishing'
     find_row 'MONITOR[ _]?END' >/dev/null
