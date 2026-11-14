@@ -1317,8 +1317,7 @@ fn reasoning_elapsed(
     }
     let start = item.started_at?;
     let end = item
-        .started_at
-        .and(item.at)
+        .at
         .or_else(|| {
             items
                 .iter()
@@ -13699,8 +13698,8 @@ mod tests {
         };
         let next = chat::Item {
             id: "command".into(),
-            started_at: Some(1_000),
-            at: Some(13_000),
+            started_at: Some(25_000),
+            at: Some(25_000),
             content: ItemContent::Tool {
                 name: "Read".into(),
                 input: "{}".into(),
