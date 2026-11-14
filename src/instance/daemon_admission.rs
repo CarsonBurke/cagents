@@ -69,6 +69,20 @@ pub(super) fn publish_capability(lease: &mut File) -> io::Result<()> {
     lease.sync_all()
 }
 
+/// The pid a window recorded in its lease when it took the lease. It is only
+/// a candidate: the bytes can be stale, mid-publication or another user's
+/// claim, so the caller must still prove the lock is that process's.
+pub(super) fn recorded_owner(lease: &File) -> Option<u32> {
+    let length = lease.metadata().ok()?.len();
+    if length == 0 || length > MAX_CAPABILITY_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = vec![0; length as usize];
+    lease.read_exact_at(&mut bytes, 0).ok()?;
+    let capability: WindowCapability = serde_json::from_slice(&bytes).ok()?;
+    Some(capability.owner.pid)
+}
+
 fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file()
         || metadata.uid() != current_uid()
