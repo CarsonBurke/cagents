@@ -2,7 +2,9 @@ mod accessibility;
 #[cfg(test)]
 mod accessibility_tests;
 mod links;
+mod preview;
 pub(crate) use accessibility::ReviewInputBarrier;
+pub use preview::SnapshotPreview;
 
 use std::{
     cell::RefCell,
