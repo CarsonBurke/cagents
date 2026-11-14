@@ -526,7 +526,7 @@ where
                         );
 
                     let is_cursor_visible = !is_disabled
-                        && text::Blink::DEFAULT
+                        && text::Blink::current()
                             .visible(focus.now - focus.updated_at);
 
                     let cursors = if is_cursor_visible {
@@ -1372,7 +1372,7 @@ where
                     ) {
                         focus.now = *now;
 
-                        if let Some(next) = text::Blink::DEFAULT
+                        if let Some(next) = text::Blink::current()
                             .next_frame(*now - focus.updated_at)
                         {
                             shell.request_redraw_at(*now + next);
