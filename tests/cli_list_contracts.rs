@@ -520,6 +520,27 @@ fn accepted_wait_output(
             );
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof.as_ref(), Some(&proof));
+                if matches!(&request.request, ClientRequest::ReadWorkspaceModel) {
+                    respond(
+                        &mut stream,
+                        request.request_id,
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel {
+                                model: WorkspaceModel {
+                                    channels: vec![ModelChannel {
+                                        id: accepted.agent.channel().unwrap(),
+                                        repository: accepted.agent.spec.target.repository.clone(),
+                                        title: "Fixture accepted agents".into(),
+                                        title_source: Default::default(),
+                                        ordinal: 0,
+                                    }],
+                                    ..Default::default()
+                                },
+                            },
+                        },
+                    );
+                    continue;
+                }
                 let ClientRequest::Agent { operation, .. } = request.request else {
                     panic!("request outside private agent contract");
                 };
@@ -733,6 +754,17 @@ fn accepted_wait_recovery_is_readable_and_normal_timeout_stays_distinct() {
             receipt["idempotency_key"]
         );
         assert_eq!(response["data"]["run"]["state"], "Running");
+        if spawn {
+            let agent: Agent = serde_json::from_value(receipt["agent"].clone()).unwrap();
+            assert_eq!(
+                response["data"]["placed_in"]["channel"],
+                serde_json::json!(agent.channel().unwrap())
+            );
+            assert_eq!(
+                response["data"]["placed_in"]["title"],
+                "Fixture accepted agents"
+            );
+        }
     }
 }
 
