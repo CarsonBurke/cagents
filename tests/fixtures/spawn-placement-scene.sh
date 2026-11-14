@@ -55,7 +55,7 @@ sleep 4
 evidence drive observe
 shot spawn-start
 if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
-    printf '120\n' >"$config/fixture-first-turn-seconds"
+    printf '300\n' >"$config/fixture-first-turn-seconds"
 fi
 printf '%s\n' "cagents agent spawn --name reviewer --model haiku --surface chat 'Review the one-row cards'" >"$config/fixture-run-once"
 evidence cli agent send "$parent" 'Start a reviewer on the one-row cards.'
@@ -74,6 +74,10 @@ if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
     evidence drive move "$at"
     sleep 2
     evidence shot same-project-hover
+    evidence drive move 1,1
+    evidence drive key shift+Tab shift+Tab
+    sleep 1
+    evidence shot same-project-keyboard
 fi
 if [ "$SIDE" = after ] || [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
     open_spawn

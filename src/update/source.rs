@@ -900,7 +900,14 @@ mod admission_message_tests {
     fn live_sources_are_the_pinned_releases_and_the_current_release() {
         assert_eq!(
             protocols().collect::<Vec<_>>(),
-            [156, 173, 175, 177, 178, crate::terminal_ipc::PROTOCOL_VERSION]
+            [
+                156,
+                173,
+                175,
+                177,
+                178,
+                crate::terminal_ipc::PROTOCOL_VERSION
+            ]
         );
         for source in RELEASED_SOURCES {
             assert!(source.protocol < crate::terminal_ipc::PROTOCOL_VERSION);
