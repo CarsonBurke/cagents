@@ -4422,6 +4422,11 @@ pub enum Message {
         basis: DiffBasis,
     },
     Sidebar(SidebarAction),
+    /// Folds the Attention list's In progress section, once a probe of the
+    /// drawn rows has said whether one of them had keyboard focus.
+    FoldInProgress {
+        refocus: bool,
+    },
     FocusCard(CardId),
     AcknowledgeVisiblePane {
         card: CardId,
@@ -11198,6 +11203,8 @@ impl Cagents {
         // list's selection, which stays with the focused card.
         self.sidebar_state
             .pin_panel_worktree(self.inspector_panel_pin());
+        // The Attention list draws the focused pane's row as current.
+        self.sidebar_state.follow_card(self.workspace.focused());
         let focus = self.sidebar_focus();
         let changed = self
             .sidebar_state
@@ -14790,6 +14797,7 @@ impl Application for Cagents {
                 | Message::ProjectUi(_)
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
+                | Message::FoldInProgress { .. }
                 | Message::FocusCard(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
@@ -15743,6 +15751,18 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                // Folding takes the rows, and any keyboard focus on one, out
+                // of the tree; ask the tree drawn now before it does.
+                if action == SidebarAction::ToggleInProgress
+                    && !self.sidebar_state.in_progress_collapsed()
+                {
+                    return sidebar::in_progress_holds_focus(
+                        &self.sidebar_model,
+                        &self.sidebar_state,
+                        self.projects_sidebar_mode() == SidebarMode::Compact,
+                    )
+                    .map(|refocus| cosmic::Action::App(Message::FoldInProgress { refocus }));
+                }
                 if matches!(&action, SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
@@ -16280,6 +16300,15 @@ impl Application for Cagents {
                         }
                         self.save_settings_task(false)
                     },
+                }
+            }
+            Message::FoldInProgress { refocus } => {
+                self.sidebar_state.fold_in_progress();
+                if refocus {
+                    sidebar::focus_and_reveal(sidebar::in_progress_focus_id())
+                        .map(cosmic::Action::App)
+                } else {
+                    Task::none()
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
@@ -31291,6 +31320,208 @@ mod tests {
         );
         drop(app.update(Message::Sidebar(SidebarAction::HideReadAttention)));
         assert!(!attention_lists(&app, card_row));
+    }
+
+    /// A conversation open in two panes has one row, and opening it reads
+    /// both cards, not only the one it goes to.
+    #[test]
+    fn opening_a_pane_row_reads_every_card_of_its_conversation() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        let mut alias = app.card_state(card).unwrap().clone();
+        alias.id = CardId::new();
+        let alias_id = alias.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .card_scopes
+            .insert(alias_id, PathBuf::from("/repo/feature"));
+        durable.cards.push(alias);
+        for id in [card, alias_id] {
+            app.sidebar_state
+                .observe_agent_update(id, project, worktree);
+        }
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        assert_eq!(
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false),
+            vec![
+                sidebar::SelectionRow::Project(project),
+                sidebar::SelectionRow::Card(card),
+            ],
+            "one row for the conversation"
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            !app.sidebar_state.has_card_update(alias_id),
+            "the other card of the conversation is read with it"
+        );
+    }
+
+    /// Revealing a pane while the Attention list draws its row goes to that
+    /// row and keeps the list; a pane the list does not draw is revealed at
+    /// its checkout, in the unfiltered list.
+    #[test]
+    fn revealing_a_pane_under_attention_targets_its_row() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        app.context_inspector_open = false;
+        let card_row = sidebar::SelectionRow::Card(card);
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        app.sidebar_state
+            .apply(&SidebarAction::ToggleProject(project));
+        assert!(!attention_lists(&app, card_row), "folded away");
+        drop(app.update_chrome(chrome_ui::Action::Reveal(card)));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(
+            app.sidebar_state.filter(),
+            sidebar::SidebarFilter::Attention
+        );
+        assert!(attention_lists(&app, card_row), "its project unfolds");
+        assert_eq!(app.reveal_card_row(card), Some(card_row));
+
+        app.read_card_update(card);
+        drop(app.update(Message::Sidebar(SidebarAction::HideReadAttention)));
+        assert!(!attention_lists(&app, card_row));
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        app.active_workspace = Some(PathBuf::from("/repo/feature"));
+        assert_eq!(
+            app.reveal_card_row(card),
+            Some(sidebar::SelectionRow::Worktree(project, worktree))
+        );
+        assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
+    }
+
+    /// Renaming a pane renames its row in the Attention list at once.
+    #[test]
+    fn renaming_a_pane_retitles_its_attention_row() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        let _ = app.update_chrome(chrome_ui::Action::Rename(card));
+        let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
+        drop(app.update_chrome(chrome_ui::Action::RenameSubmit));
+        let row = app
+            .sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| &project.attention_cards)
+            .find(|row| row.id == card)
+            .expect("the pane keeps its row");
+        assert_eq!(row.title, "Release review");
+        assert!(
+            sidebar_names(&app)
+                .iter()
+                .any(|name| name.starts_with("Open pane Release review in feature")),
+            "{:?}",
+            sidebar_names(&app)
+        );
+    }
+
+    /// Folding In progress while one of its rows has keyboard focus hands
+    /// focus to the section's header, where the user can unfold it again;
+    /// folding it with focus elsewhere moves nothing.
+    #[test]
+    fn folding_in_progress_moves_focus_from_its_rows_to_its_header() {
+        use cosmic::iced::advanced::widget::Tree;
+        use cosmic::iced::advanced::{Layout, layout};
+        use cosmic::iced::runtime::{Action, task};
+        use cosmic::iced::{Size, advanced::widget::operation};
+
+        /// Runs `tasks` in turn over one tree of the app's view, as the
+        /// runtime runs them over the frame it built, and returns the
+        /// messages they answer with.
+        fn run(app: &Cagents, tasks: Vec<Task<Message>>) -> Vec<Message> {
+            use cosmic::iced::futures::StreamExt;
+            let renderer = headless_renderer();
+            let mut element = cosmic::Application::view(app);
+            let mut tree = Tree::new(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+            );
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("executor");
+            let mut messages = Vec::new();
+            for task in tasks {
+                let Some(mut stream) = task::into_stream(task) else {
+                    continue;
+                };
+                while let Some(action) = executor.block_on(stream.next()) {
+                    match action {
+                        Action::Widget(mut operation) => loop {
+                            element.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                &mut operation,
+                            );
+                            match operation.finish() {
+                                operation::Outcome::Chain(next) => operation = next,
+                                _ => break,
+                            }
+                        },
+                        Action::Output(cosmic::Action::App(message)) => messages.push(message),
+                        _ => {}
+                    }
+                }
+            }
+            messages
+        }
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        app.context_inspector_open = false;
+        let card_row = sidebar::SelectionRow::Card(card);
+        add_attention_worktree(&mut app, card, channel);
+        app.observe_agent_activity_for_card(
+            card,
+            agent_activity(crate::agent::ActivityState::Working),
+        );
+        app.refresh_sidebar_channels();
+        assert!(!app.sidebar_state.in_progress_collapsed());
+        assert!(
+            attention_lists(&app, card_row),
+            "the working pane is in progress"
+        );
+
+        for (focus, refocus) in [(Some(card_row), true), (None, false)] {
+            let mut tasks = Vec::new();
+            if let Some(row) = focus {
+                tasks.push(
+                    sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                        .map(cosmic::Action::App),
+                );
+            }
+            tasks.push(app.update(Message::Sidebar(SidebarAction::ToggleInProgress)));
+            assert!(
+                !app.sidebar_state.in_progress_collapsed(),
+                "the fold waits for the probe"
+            );
+            let answers = run(&app, tasks);
+            let [Message::FoldInProgress { refocus: answer }] = answers.as_slice() else {
+                panic!("one answer: {answers:?}")
+            };
+            assert_eq!(*answer, refocus);
+            let task = app.update(Message::FoldInProgress { refocus: *answer });
+            assert!(app.sidebar_state.in_progress_collapsed());
+            assert!(!attention_lists(&app, card_row));
+            assert_eq!(
+                focused(&app, task),
+                refocus.then(sidebar::in_progress_focus_id),
+                "focus={focus:?}"
+            );
+            // Unfolding is immediate.
+            drop(app.update(Message::Sidebar(SidebarAction::ToggleInProgress)));
+            assert!(!app.sidebar_state.in_progress_collapsed());
+        }
     }
 
     fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {

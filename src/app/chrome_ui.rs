@@ -1887,6 +1887,55 @@ impl Cagents {
         self.focus_popup_control(ring)
     }
 
+    /// The sidebar row that shows the focused pane `card`, made visible:
+    /// the pane's own row while the Attention list draws it, otherwise the
+    /// row of the channel, checkout or folder the pane is in, revealed in
+    /// the unfiltered list, which draws no pane rows.
+    pub(super) fn reveal_card_row(&mut self, card: CardId) -> Option<sidebar::SelectionRow> {
+        if self.sidebar_state.filter() == sidebar::SidebarFilter::Attention
+            && let Some(shown_on) = self.sidebar_state.attention_card_row(card)
+            && let Some(project) = self
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.attention_cards.iter().any(|row| row.id == shown_on))
+                .map(|project| project.id)
+        {
+            let row = sidebar::SelectionRow::Card(shown_on);
+            let collapsed = !self.sidebar_state.project_expanded(project);
+            self.sidebar_state.expand_project(project);
+            if self.visible_sidebar_rows().contains(&row) {
+                return Some(row);
+            }
+            if collapsed {
+                self.sidebar_state
+                    .apply(&SidebarAction::ToggleProject(project));
+            }
+        }
+        let destination = self.active_workspace_destination()?;
+        let (project, row) = self.sidebar_model.projects.iter().find_map(|project| {
+            let row = match destination {
+                WorkspaceDestination::Channel(id)
+                    if project.channels.iter().any(|channel| channel.id == id) =>
+                {
+                    sidebar::SelectionRow::Channel(id)
+                }
+                WorkspaceDestination::Worktree(id)
+                    if project.worktrees.iter().any(|worktree| worktree.id == id) =>
+                {
+                    sidebar::SelectionRow::Worktree(project.id, id)
+                }
+                WorkspaceDestination::Folder(id) if project.id == id => {
+                    sidebar::SelectionRow::Project(id)
+                }
+                _ => return None,
+            };
+            Some((project.id, row))
+        })?;
+        self.sidebar_state.reveal_project(project);
+        Some(row)
+    }
+
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
         if self.modal_is_open() && !matches!(action, Action::Close) {
             return Task::none();
@@ -2041,39 +2090,7 @@ impl Cagents {
                 }
                 let overlay = self.sync_context_overlay_state();
                 self.synchronize_sidebar_selection();
-                let destination = self.active_workspace_destination();
-                // The Attention list draws no checkout rows; it names the
-                // pane itself when it lists it.
-                let pane = self
-                    .sidebar_state
-                    .attention_card_row(id)
-                    .filter(|_| self.sidebar_state.filter() == sidebar::SidebarFilter::Attention);
-                let target = self.sidebar_model.projects.iter().find_map(|project| {
-                    if let Some(card) = pane
-                        && project.attention_cards.iter().any(|row| row.id == card)
-                    {
-                        return Some((project.id, sidebar::SelectionRow::Card(card)));
-                    }
-                    let row = match destination {
-                        Some(WorkspaceDestination::Channel(id))
-                            if project.channels.iter().any(|channel| channel.id == id) =>
-                        {
-                            sidebar::SelectionRow::Channel(id)
-                        }
-                        Some(WorkspaceDestination::Worktree(id))
-                            if project.worktrees.iter().any(|worktree| worktree.id == id) =>
-                        {
-                            sidebar::SelectionRow::Worktree(project.id, id)
-                        }
-                        Some(WorkspaceDestination::Folder(id)) if project.id == id => {
-                            sidebar::SelectionRow::Project(id)
-                        }
-                        _ => return None,
-                    };
-                    Some((project.id, row))
-                });
-                if let Some((project, row)) = target {
-                    self.sidebar_state.reveal_project(project);
+                if let Some(row) = self.reveal_card_row(id) {
                     self.persist();
                     let reveal = if self.context_inspector_is_overlay() {
                         Task::none()
