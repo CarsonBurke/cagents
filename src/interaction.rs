@@ -433,6 +433,35 @@ pub fn overflow_fade_x_on<'a, Message: 'a>(
     })
 }
 
+/// Lets a single line run past its width and fades its trailing edge into
+/// `background`, rather than cutting it off or ending it in an ellipsis.
+///
+/// The content is laid out at its natural width and clipped to the width it
+/// is given; the fade is drawn only when something is cut. `background` is
+/// the opaque colour behind the line, which the fade blends into.
+pub fn fade_overflow<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    background: impl Fn(&Theme) -> Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(FadeOverflow {
+        content: content.into(),
+        background: Box::new(background),
+    })
+}
+
+/// Shows `content` without letting anyone use it: a glimpse of a pane drawn
+/// elsewhere, whose buttons and links belong to the pane itself.
+///
+/// Only redraw requests reach the content, so its spinners and streaming text
+/// keep moving. Pointer and keyboard input, focus and other widget operations
+/// stop here, so nothing inside takes a click, claims an ID the real pane
+/// uses, or is reached by assistive technology as a second copy of the pane.
+pub fn inert<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Element::new(Inert {
+        content: content.into(),
+    })
+}
+
 /// Projects a wheel gesture onto the horizontal axis, taking the axis it
 /// mostly moves along.
 ///
@@ -1660,6 +1689,180 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
             renderer,
             destinations,
         );
+    }
+}
+
+struct Inert<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for Inert<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                mouse::Cursor::Unavailable,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            mouse::Cursor::Unavailable,
+            viewport,
+        );
+    }
+}
+
+struct FadeOverflow<'a, Message> {
+    content: Element<'a, Message>,
+    background: Box<dyn Fn(&Theme) -> Color + 'a>,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for FadeOverflow<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let natural =
+            layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height));
+        let child = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, &natural);
+        let size = limits.width(Length::Fill).height(Length::Shrink).resolve(
+            Length::Fill,
+            Length::Shrink,
+            child.size(),
+        );
+        layout::Node::with_children(Size::new(size.width, child.size().height), vec![child])
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        let Some(child) = layout.children().next() else {
+            return;
+        };
+        renderer.with_layer(clip, |renderer| {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                child,
+                cursor,
+                &clip,
+            );
+        });
+        if child.bounds().width > bounds.width + 0.5 {
+            // A layer of its own: within one layer, quads are drawn beneath
+            // text, so the fade would sit under the letters it should cover.
+            let to = (self.background)(theme);
+            let mut from = to;
+            from.a = 0.0;
+            let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
+            renderer.with_layer(clip, |renderer| {
+                fill_overflow_fade(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x + bounds.width - width,
+                        y: bounds.y,
+                        width,
+                        height: bounds.height,
+                    },
+                    from,
+                    to,
+                );
+            });
+        }
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        layout
+            .children()
+            .next()
+            .map_or_else(Default::default, |child| {
+                self.content
+                    .as_widget()
+                    .a11y_nodes(child, &tree.children[0], cursor)
+            })
     }
 }
 
