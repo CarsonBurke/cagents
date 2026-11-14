@@ -205,7 +205,7 @@ mod tests {
         assert!(failure.details.is_none());
         let history = Failure::control(
             ControlError::Remote {
-                code: ProtocolErrorCode::NotFound,
+                code: ProtocolErrorCode::InvalidRequest,
                 message: "This automation is no longer available".into(),
                 retryable: false,
             },
