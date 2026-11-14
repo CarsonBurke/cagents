@@ -3485,12 +3485,14 @@ impl SidebarState {
         }
     }
 
-    /// The news a row draws. The Attention list's main section holds rows
-    /// for what needs the user, and its In progress section is where the work
-    /// spinner means something; a spinner above it would say the row is
-    /// listed for its work. Rows elsewhere draw everything.
+    /// The news a row draws. The Attention list's main section lists a row
+    /// for what needs the user, and its indicator says which; the work
+    /// spinner there would claim the row is listed for its work, which In
+    /// progress is for. A row kept there after the user dealt with it has no
+    /// news to show, so its work still shows: it never moves to In progress.
+    /// Rows elsewhere draw everything.
     fn shown_attention(&self, attention: AttentionSummary) -> AttentionSummary {
-        if self.filter == SidebarFilter::Attention {
+        if self.filter == SidebarFilter::Attention && attention.needs_attention() {
             attention.without_work()
         } else {
             attention
@@ -21387,6 +21389,21 @@ pub(crate) mod tests {
             names.contains(&model.projects[0].chrome.open_name.to_string()),
             "{names:?}"
         );
+        state.apply(&SidebarAction::ToggleProject(project));
+
+        // Read, the pane is kept in place with no news to give, and In
+        // progress never takes it: its work shows on its own row.
+        read(&mut state, &model, busy, Vec::new());
+        refresh_attention(&mut state, &mut model, &durable);
+        assert!(in_progress_rows(&model, &state, false).is_empty());
+        assert!(visible_selection_rows(&model, &state, false).contains(&SelectionRow::Card(busy)));
+        assert!(draws_work_spinner(&card_view(
+            &model.projects[0],
+            &model.projects[0].attention_cards[0],
+            &state,
+            false,
+            false,
+        )));
     }
 
     /// Two working panes in one project read apart: each In progress row
