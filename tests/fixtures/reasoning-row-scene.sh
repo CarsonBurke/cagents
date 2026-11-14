@@ -53,7 +53,7 @@ first_reasoning_row() {
     evidence drive --json observe | /usr/bin/python3 -c '
 import json,sys
 runs=json.load(sys.stdin)["runs"]
-matches=[r for r in runs if "thinking" in r["text"].lower() or "assuming" in r["text"].lower()]
+matches=[r for r in runs if "thinking" in r["text"].lower() or "ssuming" in r["text"].lower()]
 if not matches: raise SystemExit("reasoning-row-scene: no visible reasoning row")
 r=min(matches,key=lambda r:(r["y"],r["x"]))
 print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
