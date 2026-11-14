@@ -11,6 +11,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifactError, CargoArtifacts
+
 
 HELPER = "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
 VALUED = {"-p", "--package", "--bin", "--example", "--test", "--bench", "-F", "--features",
@@ -119,31 +122,14 @@ def prepare(cargo, arguments):
     command = [cargo, *toolchain, "build", *build, "--package", package["id"],
                "--bin", "cagentsd", "--message-format=json-render-diagnostics"]
     print("cargo-gate: building the matched cagentsd helper for HOST tests", file=sys.stderr)
-    products = set()
+    artifacts = CargoArtifacts()
     with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as child:
         for line in child.stdout:
-            try:
-                message = json.loads(line)
-            except ValueError:
-                sys.stderr.write(line)
-                continue
-            if message.get("reason") == "compiler-message":
-                sys.stderr.write(message.get("message", {}).get("rendered") or "")
-            target = message.get("target", {})
-            if (message.get("reason") == "compiler-artifact"
-                    and target.get("name") == "cagentsd" and "bin" in target.get("kind", [])
-                    and message.get("executable") is not None):
-                products.add(message["executable"])
+            artifacts.read(line, diagnostics=sys.stderr)
         status = child.wait()
     if status:
         raise SystemExit(status if status > 0 else 128 - status)
-    if len(products) != 1:
-        raise SystemExit("cargo-gate: helper build did not report exactly one cagentsd executable")
-    product = products.pop()
-    if (not isinstance(product, str) or not os.path.isabs(product)
-            or not Path(product).is_file() or not os.access(product, os.X_OK)):
-        raise SystemExit("cargo-gate: helper build did not produce an absolute executable file")
-    return product
+    return str(artifacts.executable("cagentsd"))
 
 
 def main():
@@ -166,5 +152,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except OSError as error:
+    except (OSError, CargoArtifactError) as error:
         raise SystemExit(f"cargo-gate: could not prepare the HOST test helper: {error}")

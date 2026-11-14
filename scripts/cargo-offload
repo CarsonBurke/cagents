@@ -2393,7 +2393,11 @@ elif command == "run":
         helper = os.path.join(base, "cargo-host-test-helper.py")
         with open(helper, "w") as file:
             file.write(request["host_test_helper"])
-        arguments = [sys.executable, "-I", helper, "--run", *arguments]
+        with open(os.path.join(base, "cargo_artifacts.py"), "w") as file:
+            file.write(request["cargo_artifacts"])
+        # Each invocation supplies its own source. Do not leave bytecode that
+        # could alias a later same-size source update within one timestamp tick.
+        arguments = [sys.executable, "-I", "-B", helper, "--run", *arguments]
     if request.get("memory_cap") is not None:
         # The gate's helper travels with this invocation, including installed
         # gates and arbitrary Cargo workspaces that have no repository scripts.
@@ -3086,6 +3090,7 @@ class Offload:
                 helper = Path(__file__).resolve().with_name("cargo-host-test-helper.py")
                 if helper.is_file():
                     request["host_test_helper"] = helper.read_text()
+                    request["cargo_artifacts"] = helper.with_name("cargo_artifacts.py").read_text()
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())
