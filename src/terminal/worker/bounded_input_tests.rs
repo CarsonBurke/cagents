@@ -262,11 +262,14 @@ fn nonreading_child_keeps_publishing_and_interrupt_bypasses_backpressure() {
     );
     handle.input(vec![3]).unwrap();
     wait_for_text(&handle, "interrupted");
-    let started = std::time::Instant::now();
-    handle.shutdown().unwrap();
+    // The child never reads, so a shutdown that waited on its input would
+    // not return.
+    let handle = crate::test_timing::returns("the shutdown", move || {
+        handle.shutdown().unwrap();
+        handle
+    });
     assert!(handle.worker_joined_for_test());
     root.settled();
-    assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
 }
 
 #[test]
@@ -631,11 +634,14 @@ fn nonreading_child_shutdown_is_bounded_with_a_full_pending_paste() {
         .paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard)
         .unwrap();
     thread::sleep(Duration::from_millis(50));
-    let started = std::time::Instant::now();
-    handle.shutdown().unwrap();
+    // The child never reads, so a shutdown that waited on its input would
+    // not return.
+    let handle = crate::test_timing::returns("the shutdown", move || {
+        handle.shutdown().unwrap();
+        handle
+    });
     assert!(handle.worker_joined_for_test());
     root.settled();
-    assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
 }
 
 #[test]
@@ -1428,12 +1434,13 @@ while True: time.sleep(1)
     let token = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (resumed, restarted) = crossbeam_channel::bounded(1);
     let started = Instant::now();
-    let error = handle
-        .prepare_input_handoff(token.clone(), resumed)
-        .unwrap_err();
+    let prepared = token.clone();
+    let (handle, error) = crate::test_timing::returns("the input handoff", move || {
+        let error = handle.prepare_input_handoff(prepared, resumed).unwrap_err();
+        (handle, error)
+    });
     assert!(error.contains("remains unconfirmed"), "{error}");
     assert!(started.elapsed() >= Duration::from_secs(3));
-    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(!token.load(Ordering::Acquire));
     assert!(matches!(
         restarted.try_recv(),

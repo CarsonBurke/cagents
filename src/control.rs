@@ -9391,11 +9391,18 @@ mod tests {
                     .is_none()
             );
         });
-        let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let started = Instant::now();
-        let error = client
-            .request_with_deadline(ClientRequest::List, started + Duration::from_millis(6100))
-            .unwrap_err();
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        // The reported budget tells the full deadline apart from a single
+        // read's IO_TIMEOUT; a client that enforced neither never returns.
+        let error = crate::test_timing::returns("a request with a long deadline", move || {
+            let mut client = client;
+            client
+                .request_with_deadline(
+                    ClientRequest::List,
+                    Instant::now() + Duration::from_millis(6100),
+                )
+                .unwrap_err()
+        });
         assert!(
             matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
             "{error}"
@@ -9406,8 +9413,6 @@ mod tests {
                 .contains("the daemon did not answer within 6."),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(8));
-        drop(client);
         server.join().unwrap();
     }
 

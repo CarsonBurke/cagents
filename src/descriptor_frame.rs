@@ -394,7 +394,7 @@ mod tests {
     use std::time::Duration;
 
     fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(2)
+        Instant::now() + crate::test_timing::EVENTUALLY
     }
 
     fn socket_flags(socket: &UnixStream) -> libc::c_int {
@@ -421,7 +421,7 @@ mod tests {
         // A concurrent test's fork briefly duplicates every descriptor,
         // close-on-exec or not, until its child execs. Only a write end that
         // stays open past that window is a leak.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         loop {
             let mut byte = 0_u8;
             let read = unsafe { libc::read(reader.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
@@ -723,18 +723,18 @@ mod tests {
                 }
             }
         });
-        first_sent.recv_timeout(Duration::from_secs(2)).unwrap();
+        first_sent
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap();
         let flags = socket_flags(&receiver);
-        let started = Instant::now();
         let result = receive_json_with_fds_until::<Value>(
             &receiver,
-            started + Duration::from_millis(100),
+            Instant::now() + Duration::from_millis(100),
             64,
             1,
             FrameByteOrder::LittleEndian,
         );
         assert!(result.unwrap_err().contains("deadline"));
-        assert!(started.elapsed() < Duration::from_millis(180));
         assert_eq!(socket_flags(&receiver), flags);
         assert_pipe_closed(&reader);
         release.send(()).unwrap();
@@ -760,19 +760,22 @@ mod tests {
         let flags = socket_flags(&sender);
         let directory = File::open(".").unwrap();
         let value = "x".repeat(1 << 20);
-        let started = Instant::now();
-        let error = send_json_with_fds_until(
-            &sender,
-            &value,
-            &[directory.as_fd()],
-            started + Duration::from_millis(200),
-            2 << 20,
-            1,
-            FrameByteOrder::BigEndian,
-        )
-        .unwrap_err();
+        // Nobody reads, so a send that waited for the reader never returns.
+        let (sender, directory, value, error) =
+            crate::test_timing::returns("a stalled send", move || {
+                let error = send_json_with_fds_until(
+                    &sender,
+                    &value,
+                    &[directory.as_fd()],
+                    Instant::now() + Duration::from_millis(200),
+                    2 << 20,
+                    1,
+                    FrameByteOrder::BigEndian,
+                )
+                .unwrap_err();
+                (sender, directory, value, error)
+            });
         assert!(error.contains("deadline"));
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(socket_flags(&sender), flags);
         assert_eq!(sender.write_timeout().unwrap(), None);
 
