@@ -1207,6 +1207,7 @@ impl Runtime {
             widget::row::with_children(heading)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
+                .wrap()
                 .into(),
         );
         let observed_model = if !reading.cli {
