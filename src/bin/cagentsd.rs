@@ -44,7 +44,10 @@ fn main() -> std::process::ExitCode {
     }
     // SAFETY: helper mode returned above; no thread exists. Every
     // terminal and conversation this daemon starts inherits its environment.
-    unsafe { cagents::account::detach_inherited_selections() };
+    unsafe {
+        cagents::account::detach_inherited_selections();
+        cagents::agent::detach_session_environment();
+    }
     if let Some(result) = cagents::host::run_upgrade_inspection_helper() {
         return match result {
             Ok(()) => std::process::ExitCode::SUCCESS,

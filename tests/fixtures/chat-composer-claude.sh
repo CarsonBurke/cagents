@@ -11,11 +11,10 @@ if [ "${1:-}" = --version ]; then
     printf '%s\n' '2.1.286 (Claude Code fixture)'
     exit 0
 fi
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 if [ "${1:-}" = auth ]; then
-    # Optional login: fixture-login.json is `auth status --json`'s answer,
-    # such as one naming an organization with `orgName`.
-    if [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/fixture-login.json" ]; then
-        jq -c . "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/fixture-login.json"
+    if [ -f "$config/fixture-auth-status.json" ]; then
+        cat "$config/fixture-auth-status.json"
     else
         printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
     fi
@@ -44,7 +43,6 @@ done
 # Native chat restores from the provider's exact on-disk transcript after a
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
-config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 task_scene=
 task_scene_file=$config/fixture-agent-task-receipt.json
 if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
