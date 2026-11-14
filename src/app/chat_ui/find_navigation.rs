@@ -1206,10 +1206,10 @@ fn raw_scan_inner(
             }
             charge(item.id.len().checked_add(128)?)?;
             let mut parts = Vec::new();
-            // A step drawn as one row folds nothing: what it said is drawn
-            // whole only in its tool call, as that call's escaped text, so
-            // only a match there, found above, opens it.
-            if let Some(reading) = coordinated.as_ref().filter(|reading| !reading.is_card()) {
+            // What a coordinating step said and collected is drawn, folded,
+            // in its open detail; a match there opens the detail and unfolds
+            // the part it is in.
+            if let Some(reading) = &coordinated {
                 use chat::coordination::Kind;
                 let mut texts = Vec::new();
                 match &reading.kind {
@@ -1261,6 +1261,11 @@ fn raw_scan_inner(
             }
             let raw_disclosure =
                 !matches!(&item.content, ItemContent::Delivery { .. }) && raw.raw_disclosure;
+            // A one-row step draws its parts only in its open detail.
+            let row_parts = coordinated
+                .as_ref()
+                .is_some_and(chat::coordination::Coordination::is_card)
+                && !parts.is_empty();
             let delivery = match &item.content {
                 ItemContent::Delivery {
                     kind: chat::DeliveryKind::Report,
@@ -1287,7 +1292,7 @@ fn raw_scan_inner(
                 plans.push(ItemPlan {
                     id: item.id.clone(),
                     source: Arc::downgrade(item),
-                    expand: (raw_disclosure && matched) || delivery,
+                    expand: (raw_disclosure && matched) || delivery || row_parts,
                     parts,
                 });
             }
@@ -2560,7 +2565,7 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
     #[test]
-    fn a_one_row_step_is_found_only_in_the_tool_call_it_draws() {
+    fn a_one_row_step_opens_on_a_match_in_what_it_said_or_its_tool_call() {
         let prompt = "say \"NEEDLE λ\"";
         let item = Arc::new(chat::Item {
             id: "agent".into(),
@@ -2593,15 +2598,18 @@ mod tests {
             let tools = tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>();
             (groups, tools)
         };
-        // The call draws the prompt as JSON, escaped: a match only in the
-        // unescaped prompt has nothing to highlight, so it claims no step.
+        // The call draws the prompt as JSON, escaped, so a match only in the
+        // prompt as written is in the formatted prompt the open detail
+        // draws: it opens the detail and unfolds that prompt.
         let (groups, tools) = scan(prompt);
-        assert!(groups.is_empty());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
+        assert!(groups[0].1[0].expand);
         assert_eq!(tools, vec![2]);
-        // A match in the drawn call opens it, and folds nothing open.
+        // A match in both opens the detail and unfolds the prompt too.
         let (groups, tools) = scan("NEEDLE λ");
         assert_eq!(groups.len(), 1);
-        assert!(groups[0].1[0].parts.is_empty());
+        assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
         assert!(groups[0].1[0].expand);
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
         assert_eq!(tools, vec![2]);

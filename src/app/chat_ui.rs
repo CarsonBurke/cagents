@@ -29525,7 +29525,7 @@ mod tests {
             at: None,
         };
         let coordinated = chat::coordination::recognize(&item, Provider::Claude).unwrap();
-        let coordinated = CachedItem::updated(
+        let mut coordinated = CachedItem::updated(
             &item.content,
             theme,
             None,
@@ -29533,10 +29533,7 @@ mod tests {
             false,
             Some(coordination::Prepared::new(coordinated)),
         );
-        // A step drawn as one row shows its prompt plain: no fence of it is
-        // highlighted, so a palette change has nothing of it to redo.
-        assert!(coordinated.blocks.is_empty());
-        for cached in [&mut finished, &mut hidden] {
+        for cached in [&mut finished, &mut hidden, &mut coordinated] {
             assert!(!cached.blocks.is_empty());
             assert!(cached.open.is_none());
             cached.rehighlight(next);

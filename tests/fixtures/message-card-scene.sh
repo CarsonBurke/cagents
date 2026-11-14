@@ -45,9 +45,9 @@
 #           rows by keyboard: keyboard-focus (the long
 #           message focused), keyboard-menu (its menu from the Menu key),
 #           keyboard-refused-open and keyboard-refused-closed (Enter twice
-#           on the refused message, its tool call opening and closing while
-#           the row keeps focus) and keyboard-enter (Enter on the started
-#           agent, which opens it)
+#           on the refused message, its detail - the message in full, then
+#           its tool call - opening and closing while the row keeps focus)
+#           and keyboard-enter (Enter on the started agent, which opens it)
 #
 # A state that does not appear within 30 seconds is logged and the scene goes
 # on, so a missing state is visible in the log and the shot.

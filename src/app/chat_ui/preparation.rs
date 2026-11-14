@@ -4849,7 +4849,7 @@ mod tests {
             let mut output = std::thread::spawn(move || execute(shared, permit()).unwrap()).join().unwrap();
             let prepared = output.coordination.as_mut().expect("provider-specific worker recognition");
             assert_ne!(prepared.created_on, std::thread::current().id());
-            assert!(prepared.contents().next().is_none(), "a step drawn as one row parses none of its text");
+            assert!(prepared.contents().next().unwrap().items().len() > 4);
             let (sent, disposed) = std::sync::mpsc::channel();
             prepared.watch_disposal(sent);
             runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
@@ -4859,6 +4859,27 @@ mod tests {
             assert!(matches!(&coordinated.reading.kind, crate::chat::coordination::Kind::Spawn(spawn) if spawn.agents[0].prompt.inline()==Some(prompt.as_str())));
             assert!(runtime.turns.iter().flat_map(|turn| &turn.prose).any(|placed| placed.index==0 && placed.slot==turn::Slot::Card), "async completion regroups actual parent turns into the rich card slot");
             let address = coordinated.address();
+            let contents = coordinated.contents().enumerate().map(|(index, content)| {
+                let mut builder = selection::Catalog::builder();
+                builder.markdown(&source.id, &[1,index as u32], content.items());
+                let catalog = builder.finish();
+                let (first,last) = catalog.endpoints().unwrap();
+                (catalog.search_blocks(),catalog.copy(first,last).unwrap())
+            }).collect::<Vec<_>>();
+            // What a one-row step said is drawn, and selectable, only in its open detail.
+            let closed = runtime.selection_document().0;
+            assert!(contents.iter().flat_map(|(blocks, _)| blocks).all(|(identity, _)| closed.text(*identity).is_none()), "a closed row's detail is not selectable");
+            drop(closed);
+            runtime.expanded.insert("message".into());
+            let catalog = runtime.selection_document().0;
+            for (blocks, text) in contents {
+                for (identity, plain) in blocks {
+                    assert_eq!(catalog.text(identity).as_deref(), Some(plain.as_ref()), "actual open detail catalog preserves every prepared logical source block");
+                }
+                assert!(text.contains("λ") || text.contains("Report"));
+            }
+            drop(catalog);
+            runtime.expanded.remove("message");
             let previous = runtime.cache.remove("message").unwrap();
             let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
             assert_eq!(rebuilt.coordination.as_ref().unwrap().address(), address, "disclosure reuses the same prepared canonical graphs/palettes");

@@ -2026,7 +2026,12 @@ impl Runtime {
                 builder.markdown(&item.id, &[0], cached.markdown.items());
             }
         }
-        if let Some(coordinated) = &cached.coordination {
+        // What a coordinating step said and collected is drawn only in its
+        // open detail.
+        if let Some(coordinated) = &cached.coordination
+            && detail
+            && self.item_expanded(&item.id)
+        {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
