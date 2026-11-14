@@ -641,6 +641,7 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (172, "superseded before update sources were pinned"),
     (174, "main served it under a day; never installed"),
     (176, "main served it under a day; never installed"),
+    (177, "main served it about a day; never installed"),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
