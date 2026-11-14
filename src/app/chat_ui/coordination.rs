@@ -1620,23 +1620,35 @@ mod identity_tests {
         }
         // A separate session retains its navigation button alongside the faded
         // recipient, including when the full recipient name exceeds the pane.
-        let cached = &runtime.cache["message"];
-        let mut reading = cached.coordination.as_deref().unwrap().reading.clone();
-        reading.outcome.receipt = Some(chat::coordination::Receipt {
-            message: "fixture-message".into(),
-            recipient: format!("session 95fcd1b9e0aa \"{name}\""),
-            arrival: Arrival::WhenIdle,
-        });
-        let coordinated = Coordinated::new(reading);
+        let session_message = chat::Item {
+            id: "session-message".into(),
+            content: ItemContent::Command {
+                label: "Send the review request".into(),
+                command: "cagents send 95fcd1b9e0aa 'Review the fixture'".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                output: format!(
+                    "Sent 45d4828a to session 95fcd1b9e0aa \"{name}\"; it arrives as soon as that conversation is idle"
+                ),
+                exit_code: Some(0),
+                duration_ms: None,
+            },
+            ..items[1].clone()
+        };
+        let (session_runtime, _session_handle) =
+            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&session_message));
+        let cached = &session_runtime.cache["session-message"];
+        let coordinated = cached.coordination.as_deref().unwrap();
         let Kind::Message(message) = &coordinated.reading.kind else {
             unreachable!()
         };
         let mut rows = Vec::new();
-        runtime.message_rows(
+        session_runtime.message_rows(
             &mut rows,
-            &items[1],
+            &session_message,
             cached,
-            &coordinated,
+            coordinated,
             message,
             ToolStatus::Succeeded,
             "",
