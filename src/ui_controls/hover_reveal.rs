@@ -8,15 +8,15 @@
 //! so hovering anywhere on the row reveals the action, not only hovering
 //! the trailing slot itself.
 //!
-//! The action stays in the focus order and the accessibility tree while it
-//! is hidden, so the keyboard reaches it the same way the pointer does and
-//! focusing it reveals it.
+//! The action stays in the focus order, just after its row, and in the
+//! accessibility tree while it is hidden, so the keyboard reaches it the
+//! same way the pointer does and focusing it reveals it.
 
 use std::{cell::Cell, rc::Rc};
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
-    widget::{Operation, Tree, operation, tree},
+    widget::{self, Operation, Tree, operation, tree},
 };
 use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector, mouse, window};
 use cosmic::{Element, Renderer, Theme};
@@ -122,12 +122,17 @@ impl<Message> Widget<Message, Theme, Renderer> for HoverRegion<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            child(layout),
-            renderer,
-            operation,
-        );
+        // A row's button names its own focus after its content's, which
+        // would put the action before the row it acts on. The row comes
+        // first, then what is inside it.
+        for part in [Part::Own, Part::Inside] {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                child(layout),
+                renderer,
+                &mut Split { operation, part },
+            );
+        }
     }
 
     fn update(
@@ -239,6 +244,93 @@ impl<Message> Widget<Message, Theme, Renderer> for HoverRegion<'_, Message> {
             renderer,
             destinations,
         );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    /// The widget's own calls, without descending into it.
+    Own,
+    /// Only what is inside the widget.
+    Inside,
+}
+
+/// One [`Part`] of an operation over a widget.
+struct Split<'a, 'b> {
+    operation: &'a mut (dyn Operation + 'b),
+    part: Part,
+}
+
+impl Split<'_, '_> {
+    fn own(&self) -> bool {
+        self.part == Part::Own
+    }
+}
+
+impl Operation for Split<'_, '_> {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        if !self.own() {
+            self.operation.traverse(operate);
+        }
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+        if self.own() {
+            self.operation.container(id, bounds);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if self.own() {
+            self.operation
+                .scrollable(id, bounds, content_bounds, translation, state);
+        }
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if self.own() {
+            self.operation.focusable(id, bounds, state);
+        }
+    }
+
+    fn text_input(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn operation::TextInput,
+    ) {
+        if self.own() {
+            self.operation.text_input(id, bounds, state);
+        }
+    }
+
+    fn text(&mut self, id: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+        if self.own() {
+            self.operation.text(id, bounds, text);
+        }
+    }
+
+    fn custom(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
+        if self.own() {
+            self.operation.custom(id, bounds, state);
+        }
     }
 }
 
@@ -504,6 +596,65 @@ mod tests {
         assert_eq!(idle.bounds().x + idle.bounds().width, 48.0);
         assert_eq!(active.bounds().x + active.bounds().width, 48.0);
         assert_eq!(idle.bounds().y, 4.0);
+    }
+
+    /// The bounds of each focusable widget, in focus order.
+    struct Focusables(Vec<Rectangle>);
+
+    impl Operation for Focusables {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(
+            &mut self,
+            _id: Option<&widget::Id>,
+            bounds: Rectangle,
+            _state: &mut dyn operation::Focusable,
+        ) {
+            self.0.push(bounds);
+        }
+    }
+
+    #[test]
+    fn the_keyboard_reaches_a_row_before_the_action_inside_it() {
+        let shared = Region::new();
+        let action =
+            cosmic::widget::button::custom(cosmic::widget::Space::new().width(24).height(24))
+                .on_press(());
+        let row = cosmic::widget::button::custom(
+            cosmic::widget::row::with_children(vec![
+                cosmic::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(24)
+                    .into(),
+                reveal(
+                    cosmic::widget::Space::new().width(48).height(16),
+                    action,
+                    &shared,
+                ),
+            ])
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .on_press(());
+        let mut content = region::<()>(row, &shared);
+        let renderer = super::super::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(&content);
+        let node = content.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 40.0)),
+        );
+        let mut found = Focusables(Vec::new());
+        content
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
+        let [row, action] = found.0[..] else {
+            panic!("the row and its action: {:?}", found.0);
+        };
+        assert_eq!(row.width, 200.0);
+        assert!(action.width < row.width, "{action:?}");
     }
 
     #[test]
