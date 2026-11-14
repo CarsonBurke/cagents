@@ -6912,6 +6912,13 @@ pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
             && repository.parent() == Some(worktree))
 }
 
+/// A project's identity chip as the sidebar draws it: its avatar, or its
+/// initials on a colour of its own, for showing the project elsewhere.
+pub fn project_chip<'a, Message: 'a>(project: &SidebarProject) -> Element<'a, Message> {
+    let (initials, color) = project_identity(&project.name);
+    rail::project_chip(project.avatar.as_ref(), initials, color, false)
+}
+
 /// Stable identity independent of process hashes, theme, load order, and IDs.
 fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
     let letters: Vec<_> = name.chars().filter(|ch| ch.is_alphanumeric()).collect();
