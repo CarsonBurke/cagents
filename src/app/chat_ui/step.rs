@@ -617,10 +617,8 @@ impl Runtime {
                 }
             }
         }
-        // A step carries no controls of its own. Copying belongs to an answer,
-        // and the pieces of a step a reader actually copies - a command, its
-        // output, a tool's input - each carry their own control on the surface
-        // that holds them.
+        // Commands, output and tool inputs keep their own copy controls;
+        // the expanded step adds whole-message actions beneath this detail.
         widget::column::with_children(rows)
             .spacing(space::XS)
             .width(Length::Fill)
