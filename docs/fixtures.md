@@ -329,6 +329,20 @@ CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" web
 ```
 
+For the neighboring disclosure controls, continue with `coordination` then
+`diagnostics` in that same session. The first atomically stages
+[`coordination.jsonl`](../tests/fixtures/reasoning-row-scene/coordination.jsonl)
+and starts another offline Claude conversation. It captures folded cards, the
+full Agent prompt, raw tool call, full SendMessage body and delivered report.
+The report comes from a completed task notification; the child transcript is
+also populated by a live child frame. Exercise the raw Input block's hover
+Copy action and the footer's Transcript link during live review. The report's
+Copy action is checked against its final `REPORT_END` paragraph where that
+control exists. The diagnostic mode switches the offline Codex peer to
+`fixture-row-diagnostics`, emitting an original root error followed by a failed
+turn. It captures Details closed/open and checks Copy details through the
+nested compositor's private clipboard. Neither mode reaches the host clipboard.
+
 All provider settings and transcripts stay inside the task's private fixture;
 no live model, provider account or real provider home is used. Stop afterward:
 the final thought deliberately stays active for 600 seconds. The background

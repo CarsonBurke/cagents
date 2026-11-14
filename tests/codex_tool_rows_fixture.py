@@ -96,6 +96,33 @@ class CodexToolRowsFixture(unittest.TestCase):
         self.assertEqual(completed[0]["params"]["turn"]["status"], "interrupted")
         return sent
 
+    def test_private_diagnostics_scene_preserves_original_failed_turn_without_child(self):
+        with tempfile.TemporaryDirectory(prefix="codex-row-diagnostics-") as directory:
+            home = Path(directory)
+            (home / "fixture-row-diagnostics").touch()
+            # This marker takes precedence even after the web scene ran.
+            (home / "fixture-web-rows").touch()
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            generations = scenario.playback(replies)
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.publish(scenario, replies[:pause], generations)
+            self.assertEqual(scenario.latest["status"], "inProgress")
+            self.assertIsNone(scenario.child_latest)
+            sent = self.publish(scenario, replies[pause + 1:], generations)
+            error = next(frame["params"] for frame in sent if frame.get("method") == "error")
+            self.assertFalse(error["willRetry"])
+            self.assertEqual(scenario.latest["status"], "failed")
+            self.assertEqual(scenario.latest["items"], [])
+            self.assertEqual(scenario.latest["error"], error["error"])
+            self.assertIn("fixture-original-diagnostic", error["error"]["message"])
+            self.assertEqual(scenario.request({"id": 2, "method": "thread/list"}, str(home))[0]
+                             ["result"]["data"], [])
+            resumed = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, str(home))[0]["result"]
+            self.assertEqual(resumed["initialTurnsPage"]["data"], [scenario.latest])
+
     def test_private_web_scene_publishes_results_without_child_or_diff(self):
         with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
             home = Path(directory)

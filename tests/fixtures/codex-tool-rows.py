@@ -20,6 +20,8 @@ only: no provider, credentials, network service or tool is contacted.
 With CODEX_HOME/fixture-web-rows present, each prompt instead plays one
 webSearch item with synthetic results. This isolates the native web-search
 row without collaboration activity or unrelated tool/event rows.
+CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
+short, synthetic original diagnostic for the native Details/Copy controls.
 """
 import copy
 import importlib.util
@@ -278,10 +280,20 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True, *, web_rows=False):
-        starts_child = starts_child and not web_rows
+    def notifications(self, turn, starts_child=True, *, web_rows=False, diagnostics=False):
+        starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
+        if diagnostics:
+            raw = ("Fixture diagnostic: the local synthetic receipt was rejected.\n"
+                   "request-id: fixture-original-diagnostic\n"
+                   "Original diagnostic detail: no provider or network was contacted.\n"
+                   "Recover by reviewing the recorded receipt; no files changed.")
+            return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                    {"_sleep": PAUSE},
+                    notify("error", turnId=turn, error={"message": raw}, willRetry=False),
+                    notify("turn/completed", turn={"id": turn, "status": "failed", "items": [],
+                                                   "error": {"message": raw}})]
         started, completed = [], []
         pairs = web_items() if web_rows else items(self.child)
         for begin, end in pairs:
@@ -335,7 +347,8 @@ class Scenario:
             result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
                        "displayName": "Offline fixture"}], "nextCursor": None}
         elif method == "thread/list":
-            result = {"data": [] if (Path(codex_home) / "fixture-web-rows").is_file()
+            result = {"data": [] if any((Path(codex_home) / marker).is_file()
+                                       for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
                       else [self.metadata(self.child)], "nextCursor": None}
         elif method == "thread/turns/list":
             latest = self.latest if params.get("threadId") == self.thread else self.child_latest
@@ -363,11 +376,12 @@ class Scenario:
             self.latest = copy.deepcopy(result["turn"])
             self._advance(self.thread)
             web_rows = (Path(codex_home) / "fixture-web-rows").is_file()
-            starts_child = not web_rows and (not self.child_latest or self.child_latest["status"] != "inProgress")
+            diagnostics = (Path(codex_home) / "fixture-row-diagnostics").is_file()
+            starts_child = not (web_rows or diagnostics) and (not self.child_latest or self.child_latest["status"] != "inProgress")
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child, web_rows=web_rows)
+            after = self.notifications(turn, starts_child, web_rows=web_rows, diagnostics=diagnostics)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):

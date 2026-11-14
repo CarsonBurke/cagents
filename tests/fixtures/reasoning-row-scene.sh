@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web}
-case "$scene" in wide|narrow|web) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics}
+case "$scene" in wide|narrow|web|coordination|diagnostics) ;; *) exit 2 ;; esac
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a ready native-evidence task}"
@@ -38,6 +38,8 @@ config=$fixture/home/.claude
 }
 wide_ready=$fixture/state/reasoning-row-scene-wide
 narrow_done=$fixture/state/reasoning-row-scene-narrow
+web_done=$fixture/state/reasoning-row-scene-web
+coordination_done=$fixture/state/reasoning-row-scene-coordination
 
 shot() {
     evidence drive move 1,1 >/dev/null
@@ -149,7 +151,7 @@ narrow_layout() {
 tools_details() {
     local prefix=$1
     scroll_top
-    click_row '^edited'
+    if ! text_visible 'inspect'; then click_row '^edited'; fi
     if ! text_visible '\bInspection\b'; then click_row 'inspect'; fi
     evidence drive wait Inspection --timeout 15 >/dev/null
     shot "${prefix}rows-tools-expanded"
@@ -165,7 +167,7 @@ outcome_details() {
     click_row 'optional-probe-denied'
     if ! text_visible '\bRefused\b'; then click_row 'optional-probe-denied' 1; fi
     evidence drive wait Refused --timeout 15 >/dev/null
-    click_row '(ran|running) 2 commands'
+    if ! text_visible 'fixture-log-ready'; then click_row '(ran|running) 2 commands'; fi
     local point y steps
     point=$(find_row 'optional-probe-denied')
     y=${point#*,}
@@ -180,6 +182,106 @@ outcome_details() {
     scroll_top
 }
 
+close_cards() {
+    for ((card=0; card<$1; card++)); do
+        evidence drive key ctrl+w >/dev/null
+        sleep 1
+    done
+}
+
+open_spawned() {
+    local label=$1
+    for _ in 1 2 3 4 5 6 7 8; do
+        sleep 2
+        evidence drive move 1,1 >/dev/null
+        if evidence drive click "$label" >/dev/null 2>&1 ||
+            evidence drive click 'New channel' >/dev/null 2>&1 ||
+            evidence drive click 'Offline tool rows' >/dev/null 2>&1; then return; fi
+    done
+    printf 'reasoning-row-scene: conversation did not open: %s\n' "$label" >&2
+    return 1
+}
+
+scroll_bottom() {
+    evidence drive scroll --at 420,400 v -- 40 >/dev/null
+    sleep 1
+}
+
+copy_contains() {
+    # This reads only the clipboard belonging to native-evidence's nested
+    # compositor. Never use a clipboard command in the invoking host shell.
+    evidence nested wl-paste --no-newline | /usr/bin/python3 -c '
+import sys
+value=sys.stdin.read()
+if sys.argv[1] not in value: raise SystemExit("private clipboard did not retain "+sys.argv[1])
+print("Verified private clipboard contains "+sys.argv[1])
+' "$1"
+}
+
+if [ "$scene" = coordination ]; then
+    [ -f "$web_done" ] || { printf '%s\n' 'run web before coordination' >&2; exit 2; }
+    close_cards 2
+    cp "$here/reasoning-row-scene/coordination.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli --json agent spawn --provider claude --model haiku --surface chat \
+        --repository "$fixture/project" --prompt 'Coordination fixture: review the recorded transcript controls.' >/dev/null
+    open_spawned 'Coordination fixture'
+    evidence drive wait 'Coordination controls ready' --timeout 30 >/dev/null
+    scroll_top
+    shot rows-coordination-folded
+    click_row '^Show full prompt$'
+    find_row PROMPT_END >/dev/null
+    shot rows-coordination-prompt-expanded
+    click_row '^Show less$'
+    scroll_top
+    click_row '^Show tool call$'
+    find_row '^Input$' >/dev/null
+    shot rows-coordination-tool-expanded
+    # The raw input retains its own hover Copy action. The reviewer also
+    # exercises it and Transcript in the live native handoff.
+    click_row '^Hide tool call$'
+    click_row '^Show full message$'
+    find_row MESSAGE_END >/dev/null
+    shot rows-coordination-message-expanded
+    click_row '^Show less$'
+    scroll_bottom
+    if text_visible '^Details$'; then
+        # The baseline keeps a plain heading and separate Details button.
+        click_row '^Details$'
+    else
+        click_row 'Agent.*Review fixture controls.*finished'
+    fi
+    find_row REPORT_END >/dev/null
+    shot rows-report-expanded
+    if text_visible '^Copy report$'; then
+        click_row '^Copy report$'
+        copy_contains REPORT_END
+    fi
+    touch "$coordination_done"
+    printf '%s\n' 'Captured coordination folds, raw call and delivered report.'
+    exit 0
+fi
+
+if [ "$scene" = diagnostics ]; then
+    [ -f "$coordination_done" ] || { printf '%s\n' 'run coordination before diagnostics' >&2; exit 2; }
+    close_cards 1
+    touch "$fixture/home/.codex/fixture-row-diagnostics"
+    evidence cli --json agent spawn --provider codex --model fixture-mini --surface chat \
+        --repository "$fixture/project" --prompt 'Diagnostic fixture: inspect the original synthetic failure.' >/dev/null
+    open_spawned 'Diagnostic fixture'
+    evidence drive wait 'Copy details' --timeout 30 >/dev/null
+    scroll_top
+    shot rows-diagnostic-collapsed
+    click_row '^Details$'
+    evidence drive wait 'fixture-original-diagnostic' --timeout 15 >/dev/null
+    shot rows-diagnostic-expanded
+    click_row '^Copy details$'
+    copy_contains fixture-original-diagnostic
+    click_row '^Hide details$'
+    printf '%s\n' 'Captured original failure Details and verified private Copy details.'
+    exit 0
+fi
+
 if [ "$scene" = web ]; then
     [ -x "$fixture/bin/codex" ] && [ -d "$fixture/home/.codex" ] || {
         printf '%s\n' 'reasoning-row-scene: start with --codex tool-rows for web' >&2
@@ -187,10 +289,7 @@ if [ "$scene" = web ]; then
     }
     [ -f "$narrow_done" ] || { printf '%s\n' 'run wide and narrow before web' >&2; exit 2; }
     # Close the two cards; their provider conversations remain in the sidebar.
-    evidence drive key ctrl+w >/dev/null
-    sleep 1
-    evidence drive key ctrl+w >/dev/null
-    sleep 1
+    close_cards 2
     touch "$fixture/home/.codex/fixture-web-rows"
     evidence cli --json agent spawn --provider codex --model fixture-mini --surface chat \
         --repository "$fixture/project" --prompt 'Web references: inspect synthetic search results.' >/dev/null
@@ -214,7 +313,8 @@ if [ "$scene" = web ]; then
     click_row temporary
     evidence drive wait Recorded --timeout 15 >/dev/null
     shot rows-web-expanded
-    printf '%s\n' 'Captured dedicated Codex web-search rows.'
+    touch "$web_done"
+    printf '%s\n' 'Captured dedicated Codex web-search rows; coordination may run next.'
     exit 0
 fi
 
