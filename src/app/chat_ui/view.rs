@@ -3973,9 +3973,8 @@ impl Runtime {
     /// The account, model, reasoning effort, and permission mode, at the
     /// status line's own scale.
     ///
-    /// They come back in two groups: who acts and under which permissions,
-    /// which belong with the conversation's place, and what the agent runs
-    /// on, which sits with its usage at the footer's trailing edge.
+    /// They come back in two groups: the account beside the branch, and the
+    /// model followed by its permission mode at the footer's trailing edge.
     ///
     /// These were three full-size dropdowns stacked above the composer, which
     /// gave settings a reader changes occasionally more room than the message
@@ -13925,11 +13924,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
-                Place {
-                    name: "project".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
