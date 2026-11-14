@@ -295,19 +295,13 @@ impl Builder {
                     }
                     self.exit();
                 }
+                // Only the title is drawn as text; the alternative text
+                // names the preview or its link.
                 markdown::Item::Image {
-                    title,
-                    title_text,
-                    alt,
-                    ..
+                    title, title_text, ..
                 } => {
-                    let mut part = key.clone();
-                    part.push(0);
-                    if !alt.plain().is_empty() {
-                        self.indexed(item, &part, alt.plain(), alt.plain_prefixes());
-                    }
                     if !title.is_empty() {
-                        part.pop();
+                        let mut part = key.clone();
                         part.push(1);
                         self.indexed(item, &part, title_text.plain(), title_text.plain_prefixes());
                     }

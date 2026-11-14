@@ -3,6 +3,8 @@
 use super::*;
 mod canvas;
 pub(super) mod clipboard;
+pub(super) mod figure;
+pub(super) mod preview;
 pub(in crate::app) use clipboard::{ImageCommand, ImageRef};
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
@@ -310,15 +312,36 @@ fn load_file_with_request(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
 ) -> Loaded {
+    match file_bytes_with_request(path, origin, request) {
+        Ok(bytes) => match bounded_handle(bytes, budget()) {
+            Loaded::Unavailable => Loaded::Failed(format!(
+                "Cannot preview {path:?} on {}: unsupported, damaged or oversized image.",
+                origin.device.as_deref().unwrap_or("this device")
+            )),
+            loaded => loaded,
+        },
+        Err(error) => Loaded::Failed(error),
+    }
+}
+
+/// The encoded bytes of the image file `path` names, read on the device
+/// `origin` names and within the inline image limit, before any decoding.
+fn file_bytes_with_request(
+    path: &Path,
+    origin: &Origin,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Result<Vec<u8>, String> {
     if path.as_os_str().is_empty() {
-        return Loaded::Failed("The attachment does not provide an image file path.".into());
+        return Err("The attachment does not provide an image file path.".into());
     }
     if path.as_os_str().as_encoded_bytes().len() > 4096 {
-        return Loaded::Failed("The attachment's image path exceeds 4096 bytes.".into());
+        return Err("The attachment's image path exceeds 4096 bytes.".into());
     }
     // Never interpret a child's relative name through its parent's cwd.
     if origin.child && !path.is_absolute() {
-        return Loaded::Failed(format!(
+        return Err(format!(
             "Cannot preview {path:?}: the child conversation's working directory is unavailable. Ask for a concrete absolute image path."
         ));
     }
@@ -327,7 +350,7 @@ fn load_file_with_request(
             .to_str()
             .is_some_and(|path| Url::parse(path).is_ok_and(|url| !url.scheme().is_empty()))
     {
-        return Loaded::Failed(
+        return Err(
             "This attachment needs a concrete image file path or inline image data.".into(),
         );
     }
@@ -346,30 +369,21 @@ fn load_file_with_request(
     } else {
         crate::device_service::read_image_file(&origin.root, path, chat::MAX_INLINE_IMAGE_BYTES)
     };
-    match bytes {
-        Ok(bytes) => match bounded_handle(bytes, budget()) {
-            Loaded::Unavailable => Loaded::Failed(format!(
-                "Cannot preview {path:?} on {}: unsupported, damaged or oversized image.",
-                origin.device.as_deref().unwrap_or("this device")
-            )),
-            loaded => loaded,
-        },
-        Err(error) => {
-            let hint = if path
-                .to_string_lossy()
-                .chars()
-                .any(|ch| matches!(ch, '*' | '?' | '[' | '{' | '}'))
-            {
-                " Paths are literal; attach each concrete image instead of brace or wildcard shorthand."
-            } else {
-                ""
-            };
-            Loaded::Failed(format!(
-                "Cannot preview {path:?} on {}: {error}{hint}",
-                origin.device.as_deref().unwrap_or("this device")
-            ))
-        }
-    }
+    bytes.map_err(|error| {
+        let hint = if path
+            .to_string_lossy()
+            .chars()
+            .any(|ch| matches!(ch, '*' | '?' | '[' | '{' | '}'))
+        {
+            " Paths are literal; attach each concrete image instead of brace or wildcard shorthand."
+        } else {
+            ""
+        };
+        format!(
+            "Cannot preview {path:?} on {}: {error}{hint}",
+            origin.device.as_deref().unwrap_or("this device")
+        )
+    })
 }
 
 /// Explicit device-file links share transcript image admission, without
@@ -620,6 +634,7 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image_attempt = cached.image_attempt.wrapping_add(1);
 }
 pub(super) fn sync(runtime: &mut Runtime) {
+    figure::sync(runtime);
     if !runtime.visible.load(Ordering::Relaxed)
         || runtime
             .preview_request
@@ -791,7 +806,14 @@ pub(super) fn complete(
         Loaded::Ready(handle) => Some(handle),
         _ => None,
     };
+    cached.image_size = cached.image.as_ref().and_then(pixel_size);
     None
+}
+fn pixel_size(handle: &iced::widget::image::Handle) -> Option<(u32, u32)> {
+    match handle {
+        iced::widget::image::Handle::Rgba { width, height, .. } => Some((*width, *height)),
+        _ => None,
+    }
 }
 pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
     interest(runtime)
@@ -1054,6 +1076,19 @@ impl Runtime {
             _ => "Image".into(),
         };
         let Some(handle) = &cached.image else {
+            // A preview whose pixels are being read again keeps its room, so
+            // returning to the conversation doesn't shift it as they arrive.
+            let room = |note: &str| -> Element<'static, Message> {
+                let caption = design::caption(format!("{label} · {note}")).into();
+                match cached.image_size {
+                    Some((width, height)) => {
+                        widget::column::with_children(vec![preview::room(width, height), caption])
+                            .spacing(step::GAP_XS)
+                            .into()
+                    }
+                    None => caption,
+                }
+            };
             return if cached.image_unavailable {
                 design::caption(
                     cached
@@ -1063,13 +1098,13 @@ impl Runtime {
                 )
                 .into()
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                room("Waiting for preview memory…")
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                room("Loading preview…")
             } else {
                 widget::column::with_children(vec![
                     design::caption(label).into(),
@@ -1081,10 +1116,7 @@ impl Runtime {
                 .into()
             };
         };
-        let preview = iced::widget::image(handle.clone())
-            .width(Length::Fill)
-            .height(280)
-            .content_fit(iced::ContentFit::Contain);
+        let preview = preview::image(handle.clone());
         let image = ImageRef::Transcript(self.target, handle.id());
         let path = clipboard::has_copyable_path(self, &item.content);
         widget::column::with_children(vec![
@@ -1092,14 +1124,12 @@ impl Runtime {
                 widget::button::custom(preview)
                     .class(crate::ui_controls::control_style(false, None))
                     .padding(0)
-                    .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                    .width(Length::Fill),
+                    .on_press(action(Action::OpenImage(self.target, item.id.clone()))),
                 move || clipboard::menu(image, path, false),
             ),
             design::caption(format!("{label} · Click to enlarge")).into(),
         ])
         .spacing(step::GAP_XS)
-        .width(Length::Fill)
         .into()
     }
 }

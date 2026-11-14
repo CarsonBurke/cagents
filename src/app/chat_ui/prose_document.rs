@@ -16,6 +16,8 @@ pub(super) struct Stats {
     prose_rows: usize,
     code_rows: usize,
     blocks: usize,
+    /// Local images, each estimated as tall as the tallest preview.
+    previews: usize,
 }
 impl Stats {
     pub(super) fn inline(self) -> bool {
@@ -29,6 +31,7 @@ impl Stats {
         self.prose_rows = self.prose_rows.saturating_add(other.prose_rows);
         self.code_rows = self.code_rows.saturating_add(other.code_rows);
         self.blocks = self.blocks.saturating_add(other.blocks);
+        self.previews = self.previews.saturating_add(other.previews);
     }
     fn horizontal(&mut self, other: Self) {
         self.bytes = self.bytes.saturating_add(other.bytes);
@@ -38,6 +41,7 @@ impl Stats {
         self.prose_rows = self.prose_rows.max(other.prose_rows);
         self.code_rows = self.code_rows.max(other.code_rows);
         self.blocks = self.blocks.max(other.blocks);
+        self.previews = self.previews.max(other.previews);
     }
     pub(super) fn estimate(self, settings: markdown::Settings) -> f32 {
         let prose_line = iced::widget::text::LineHeight::default()
@@ -52,6 +56,7 @@ impl Stats {
         let rows = (self.prose_rows as f64).max(wrapped);
         let value = rows * prose_line
             + self.code_rows as f64 * code_line
+            + self.previews as f64 * images::preview::MAX_HEIGHT as f64
             + self.blocks.saturating_sub(1) as f64 * settings.spacing.0 as f64;
         // Estimates never become glyph/source authority. Bound the arithmetic
         // so an extreme recipe cannot publish NaN/Infinity into prefix sums.
@@ -226,27 +231,29 @@ impl Metadata {
                 }
             }
             Item::Image {
-                alt,
+                url,
                 title,
                 title_text,
                 ..
             } => {
-                let mut children = Vec::new();
+                // The alternative text is drawn as no text of its own: it
+                // names the preview or its link. The title is a caption.
+                let mut children = vec![Self::default()];
                 let mut stats = Stats::default();
-                for (index, text, shown) in
-                    [(0, alt, alt.len() > 0), (1, title_text, !title.is_empty())]
-                {
-                    path.push(index);
-                    let metadata = if shown {
-                        Self::text(text.len(), path, outline, Kind::ImageText)
-                    } else {
-                        Self::default()
-                    };
-                    path.pop();
-                    stats.vertical(metadata.stats);
-                    children.push(metadata);
+                path.push(1);
+                let caption = if title.is_empty() {
+                    Self::default()
+                } else {
+                    Self::text(title_text.len(), path, outline, Kind::ImageText)
+                };
+                path.pop();
+                stats.vertical(caption.stats);
+                children.push(caption);
+                if images::figure::previewed(url) {
+                    stats.previews = stats.previews.saturating_add(1);
+                } else {
+                    stats.prose_rows = stats.prose_rows.saturating_add(1);
                 }
-                stats.prose_rows = stats.prose_rows.saturating_add(2);
                 stats.nodes = stats.nodes.saturating_add(1);
                 Self {
                     kind: Kind::Item,
