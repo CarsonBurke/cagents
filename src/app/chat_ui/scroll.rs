@@ -2272,6 +2272,115 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_inspector_keeps_modifier_releases_without_scrolling_covered_history() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let bounds = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, bounds.size());
+        let make = |covered: bool| {
+            crate::interaction::exclusive_layer(
+                transcript_observed(
+                    item(
+                        "body",
+                        widget::Space::new().height(2_000).width(Length::Fill),
+                    ),
+                    target,
+                    None,
+                    vec![],
+                    true,
+                    vec![(item_id("body"), "body")],
+                    Observations::default(),
+                    memory.clone(),
+                    false,
+                    HashSet::new(),
+                    None,
+                ),
+                covered.then(|| {
+                    widget::container(widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }),
+            )
+        };
+        let send = |element: &mut Element<'_, Message>,
+                    tree: &mut Tree,
+                    node: &layout::Node,
+                    event: Event| {
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut vec![]),
+                &bounds,
+            );
+        };
+        let read = |element: &mut Element<'_, Message>, tree: &mut Tree, node: &layout::Node| {
+            let mut top = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), &renderer, &mut top);
+            top.0.expect("native transcript scroll position")
+        };
+        let modifiers = |value| Event::Keyboard(keyboard::Event::ModifiersChanged(value));
+        let wheel = || {
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            })
+        };
+        let mut exposed = make(false);
+        let mut tree = Tree::new(&exposed);
+        let node = exposed
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        exposed.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(500.0),
+        );
+        send(
+            &mut exposed,
+            &mut tree,
+            &node,
+            modifiers(keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+        );
+        let before = read(&mut exposed, &mut tree, &node);
+        assert!(before > 500.0);
+        let mut covered = make(true);
+        tree.diff(covered.as_widget_mut());
+        let node = covered
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        send(
+            &mut covered,
+            &mut tree,
+            &node,
+            modifiers(keyboard::Modifiers::empty()),
+        );
+        send(&mut covered, &mut tree, &node, wheel());
+        let mut exposed = make(false);
+        tree.diff(exposed.as_widget_mut());
+        let node = exposed
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(read(&mut exposed, &mut tree, &node), before);
+        send(&mut exposed, &mut tree, &node, wheel());
+        assert!(
+            read(&mut exposed, &mut tree, &node) > before,
+            "released Shift must not redirect vertical wheel input to the horizontal axis"
+        );
+    }
+
     #[test]
     fn input_capture_and_anchor_preserve_accessible_children() {
         let captured = Rc::new(Cell::new(false));
