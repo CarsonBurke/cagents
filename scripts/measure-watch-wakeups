@@ -34,7 +34,7 @@ checkout=$(cd "$(dirname "$0")/.." && pwd)
 root=$(mktemp -d "$HOME/.local/state/watch-wakeups.XXXXXX")
 # Unix socket paths are short: keep the runtime beneath the real one.
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ww.XXXXXX")
-mkdir -p "$root"/{home,data,config,cache}
+mkdir -p "$root"/{home,data,config,cache,logs}
 
 fixture() {
     env -u CLAUDE_CONFIG_DIR -u CAGENTS_SESSION_ID \
@@ -68,11 +68,13 @@ daemon=$(fixture_processes | while read -r pid; do
     if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = cagentsd ]; then echo "$pid"; fi
 done | head -n 1)
 [ -n "$daemon" ] || { printf '%s\n' 'The fixture daemon is not running' >&2; exit 1; }
+# The watcher covers the project's parent too, where a worktree would be
+# added: the build's log goes a level deeper, so as not to measure itself.
 build() {
     # Outside the fixture's environment: the build is the user's own.
     (cd "$project" && scripts/cargo-gate check --locked --no-default-features --bin cagents) \
-        >"$root/build.log" 2>&1 || {
-        tail -n 20 "$root/build.log" >&2
+        >"$root/logs/build.log" 2>&1 || {
+        tail -n 20 "$root/logs/build.log" >&2
         printf '%s\n' 'The fixture build failed' >&2
         exit 1
     }
