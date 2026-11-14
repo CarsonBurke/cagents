@@ -42,3 +42,6 @@ seconds after its last input, the cursor rests visible and the input asks for
 no more redraws. Upstream it repainted the window every 500 ms for as long as it
 kept focus. Typing, a click, an input-method commit or returning to the window
 restarts the blink; the last is new, since upstream's blink never stopped.
+It reads the schedule through `Blink::current()`, so the desktop's blink
+interval and timeout apply, and a desktop that turns blinking off holds the
+cursor steady.

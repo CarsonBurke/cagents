@@ -2364,7 +2364,7 @@ pub fn update<'a, Message: Clone + 'static>(
             if let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) {
                 focus.now = *now;
 
-                if let Some(next) = text::Blink::DEFAULT.next_frame(*now - focus.updated_at) {
+                if let Some(next) = text::Blink::current().next_frame(*now - focus.updated_at) {
                     shell.request_redraw_at(window::RedrawRequest::At(
                         now.checked_add(next).unwrap_or(*now),
                     ));
@@ -2803,7 +2803,7 @@ pub fn draw<'a, Message>(
                     state.scroll_offset,
                 );
                 let is_cursor_visible = handling_dnd_offer
-                    || text::Blink::DEFAULT.visible(focus.now - focus.updated_at);
+                    || text::Blink::current().visible(focus.now - focus.updated_at);
 
                 if is_cursor_visible && !dnd_icon {
                     (
