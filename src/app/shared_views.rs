@@ -4768,9 +4768,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
-        use super::super::workspace_model_sync::ModelUpdate;
+    /// A desktop-scale inventory: 30 channels holding 122 open panes, 433
+    /// closed historical cards and 1,218 historical worktree scopes.
+    fn desktop_inventory_fixture() -> (Cagents, crate::workspace_model::WorkspaceModel) {
         let (mut app, _, _, template) = fixture();
         let repository = PathBuf::from("/repo/.git");
         let project = app.durable.channels[0].project_id;
@@ -4866,6 +4866,245 @@ mod tests {
                 .sum::<usize>(),
             122
         );
+        (app, model)
+    }
+
+    /// Paired measurement for #2641: the UI thread's CPU for a burst of 20
+    /// channel renames observed from the registry, at desktop inventory scale.
+    /// Run with `--ignored --nocapture` on the same host for both revisions.
+    #[test]
+    #[ignore = "manual paired measurement of observed metadata edits"]
+    fn measure_observed_channel_renames_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        fn thread_cpu() -> Duration {
+            let mut value = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `value` is a valid, writable timespec.
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) },
+                0
+            );
+            Duration::new(value.tv_sec as u64, value.tv_nsec as u32)
+        }
+        let (mut app, model) = desktop_inventory_fixture();
+        // Every historical scope is a worktree the sidebar still lists.
+        for view in &model.views {
+            if let Scope::Worktree { path, .. } = &view.scope {
+                app.known_worktree_roots.insert(path.clone());
+                app.sidebar_model.projects[0]
+                    .worktrees
+                    .push(crate::sidebar::SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        path.clone(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ));
+            }
+        }
+        let (tx, _rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                model.clone(),
+            ))),
+        );
+        let channel = app.durable.channels[0].id;
+        let mut cpu = Vec::new();
+        let mut wall = Vec::new();
+        for index in 0..20 {
+            let title = format!("Measured rename {index:02}");
+            let sequence = app.workspace_model.sequence + 1;
+            let (started, started_cpu) = (Instant::now(), thread_cpu());
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                    sequence,
+                    edit: ModelEdit::RetitleChannel {
+                        id: channel,
+                        title: title.clone(),
+                    },
+                })),
+            );
+            // The issue's burst is one rename per 100 ms. A deferred save
+            // falls due once a second and costs what an immediate one did.
+            if index % 10 == 9 && app.navigation_save_pending {
+                drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+            }
+            cpu.push(thread_cpu() - started_cpu);
+            wall.push(started.elapsed());
+            assert_eq!(app.durable.channels[0].title, title);
+        }
+        let report = |name: &str, samples: &mut Vec<Duration>| {
+            let total: Duration = samples.iter().sum();
+            samples.sort();
+            println!(
+                "observed_renames {name}: total {:.3} ms, median {:.3} ms, max {:.3} ms",
+                total.as_secs_f64() * 1e3,
+                samples[samples.len() / 2].as_secs_f64() * 1e3,
+                samples[samples.len() - 1].as_secs_f64() * 1e3,
+            );
+        };
+        report("thread cpu", &mut cpu);
+        report("wall", &mut wall);
+    }
+
+    /// #2641: a burst of renames from another window held the UI thread for
+    /// seconds, each one projecting every view the window holds and saving.
+    #[test]
+    fn observed_channel_renames_project_no_view_and_save_once_per_burst() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, model) = desktop_inventory_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        app.navigation_save_pending = false;
+        let before = app.durable.clone();
+        let channel = before.channels[3].id;
+        let generation = app.navigation_save_generation;
+        let persists = super::super::terminal_output_tests::persists;
+        let saved = persists();
+        let rename = |app: &mut Cagents, edit: ModelEdit| {
+            app.shared_views.local_projection_count.set(0);
+            let sequence = app.workspace_model.sequence + 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited { sequence, edit }));
+            assert_eq!(
+                app.shared_views.local_projection_count.get(),
+                0,
+                "a name changes no view, so none is projected"
+            );
+            assert_eq!(app.workspace_model.sequence, sequence);
+        };
+        for index in 0..5 {
+            let title = format!("Renamed {index}");
+            rename(
+                &mut app,
+                ModelEdit::RetitleChannel {
+                    id: channel,
+                    title: title.clone(),
+                },
+            );
+            assert_eq!(app.durable.channels[3].title, title);
+            assert_eq!(
+                app.sidebar_model
+                    .projects
+                    .iter()
+                    .flat_map(|project| &project.channels)
+                    .find(|row| row.id == channel)
+                    .map(|row| row.title.as_str()),
+                Some(title.as_str()),
+                "the sidebar shows the name"
+            );
+            assert!(app.navigation_save_pending, "the name is saved soon");
+        }
+        assert_eq!(
+            app.navigation_save_generation,
+            generation.wrapping_add(1),
+            "the burst arms one save"
+        );
+        assert_eq!(persists(), saved, "no rename saves at once");
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once, after it");
+        assert!(!app.navigation_save_pending);
+        // A suggestion cannot replace the manual name, so nothing changes and
+        // nothing more is saved.
+        app.navigation_save_pending = false;
+        rename(
+            &mut app,
+            ModelEdit::SuggestChannelTitle {
+                id: channel,
+                title: "Inferred".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            },
+        );
+        assert_eq!(app.durable.channels[3].title, "Renamed 4");
+        assert!(!app.navigation_save_pending);
+        // A conversation naming a channel that has no name yet is absorbed
+        // the same way.
+        let unnamed = before.channels[4].id;
+        rename(
+            &mut app,
+            ModelEdit::RetitleChannel {
+                id: unnamed,
+                title: String::new(),
+            },
+        );
+        rename(
+            &mut app,
+            ModelEdit::SuggestChannelTitle {
+                id: unnamed,
+                title: "Inferred".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            },
+        );
+        assert_eq!(app.durable.channels[4].title, "Inferred");
+        assert_eq!(
+            app.durable.channels[4].title_source,
+            crate::model::ChannelTitleSource::Provider
+        );
+        assert!(app.navigation_save_pending);
+        assert_eq!(app.durable.cards, before.cards);
+        assert_eq!(app.durable.card_scopes, before.card_scopes);
+        for (after, before) in app.durable.channels.iter().zip(&before.channels) {
+            assert_eq!(after.cards, before.cards);
+            assert_eq!(after.focused, before.focused);
+        }
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView { .. } | ModelEdit::SeedView { .. }
+            ))
+        );
+    }
+
+    /// A name for a channel this window has not adopted still reaches the
+    /// full reconciliation, which adopts it.
+    #[test]
+    fn a_rename_of_a_channel_this_window_lacks_reconciles_in_full() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, mut model) = desktop_inventory_fixture();
+        let (tx, _rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let unseen = ChannelId::new();
+        model.channels.push(crate::workspace_model::ModelChannel {
+            id: unseen,
+            repository: PathBuf::from("/repo/.git"),
+            title: "Elsewhere".into(),
+            title_source: Default::default(),
+            ordinal: 30,
+        });
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|channel| channel.id != unseen);
+        app.shared_views.local_projection_count.set(0);
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence,
+            edit: ModelEdit::RetitleChannel {
+                id: unseen,
+                title: "Renamed elsewhere".into(),
+            },
+        }));
+        assert!(app.shared_views.local_projection_count.get() > 0);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == unseen)
+                .map(|channel| channel.title.as_str()),
+            Some("Renamed elsewhere")
+        );
+    }
+
+    #[test]
+    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, mut model) = desktop_inventory_fixture();
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let before = app.durable.clone();

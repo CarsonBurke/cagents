@@ -3425,6 +3425,13 @@ impl SidebarState {
         });
     }
 
+    /// Whether an agent in any pane this window holds is in a turn.
+    pub fn any_agent_working(&self) -> bool {
+        self.agent_activity
+            .values()
+            .any(|entry| entry.activity.state == crate::agent::ActivityState::Working)
+    }
+
     pub fn card_activity(&self, card: CardId) -> Option<crate::agent::Activity> {
         self.agent_activity.get(&card).map(|entry| entry.activity)
     }
@@ -3739,7 +3746,13 @@ impl SidebarState {
             let Some(owner) = owner.filter(|owner| loaded.contains(owner)) else {
                 continue;
             };
-            let worktree = if let Some(scope) = durable.card_scopes.get(&card.id) {
+            // A channel's pane is opened, read and cleared from its channel
+            // row; no worktree row shows it, even though it keeps the scope of
+            // the checkout its agent runs in. Counting it on that worktree
+            // left a bell there that nothing under it could clear.
+            let worktree = if channels.contains_key(&card.id) {
+                None
+            } else if let Some(scope) = durable.card_scopes.get(&card.id) {
                 roots.get(scope.as_path()).copied().flatten()
             } else {
                 self.attention_owner(card.id)
@@ -11111,7 +11124,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             if untracked == 1 { "file" } else { "files" }
         ));
     }
-    crate::app::dialog_ui::surface(
+    crate::app::dialog_ui::confirmation_surface(
         widget::column::with_children(vec![
             design::title("Discard changes?").into(),
             design::body(detail.join(". "))
@@ -13917,6 +13930,59 @@ pub(crate) mod tests {
                 .unread,
             1
         );
+    }
+
+    /// A channel's pane keeps the scope of the checkout its agent runs in,
+    /// usually the repository's main worktree, but only its channel row shows,
+    /// opens and reads it. Its news must not also put a bell on that
+    /// worktree's row, where nothing under the row could clear it.
+    #[test]
+    fn channel_pane_attention_stays_off_the_worktree_it_runs_in() {
+        let project = project();
+        let main = project.worktrees[0].clone();
+        let scoped = compact_attention_terminal(CardId::new());
+        let remembered = compact_attention_terminal(CardId::new());
+        let unchanneled = compact_attention_terminal(CardId::new());
+        let channel = crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Channel".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![scoped.id, remembered.id],
+            focused: None,
+        };
+        let channel_only = Arc::new(crate::model::WorkspaceState {
+            cards: vec![scoped.clone(), remembered.clone()].into(),
+            channels: vec![channel.clone()],
+            card_scopes: std::collections::HashMap::from([(scoped.id, main.path.clone())]),
+            ..Default::default()
+        });
+        let projects = vec![project.clone()];
+        let mut state = SidebarState::default();
+        state.observe_card_update(scoped.id);
+        // An owner recorded before the pane joined the channel is stale too.
+        state.observe_agent_update(remembered.id, project.id, main.id);
+        state.refresh_attention_projection(&channel_only, &projects);
+        assert_eq!(state.project_attention(project.id).unread, 2);
+        assert_eq!(
+            state.worktree_attention(project.id, main.id),
+            AttentionSummary::default()
+        );
+        assert!(!state.worktree_needs_attention(project.id, main.id));
+
+        // A pane in no channel is listed under its worktree, so it counts.
+        let with_unchanneled = Arc::new(crate::model::WorkspaceState {
+            cards: vec![scoped, remembered, unchanneled.clone()].into(),
+            card_scopes: std::collections::HashMap::from([(unchanneled.id, main.path.clone())]),
+            channels: vec![channel],
+            ..Default::default()
+        });
+        state.observe_card_update(unchanneled.id);
+        state.refresh_attention_projection(&with_unchanneled, &projects);
+        assert_eq!(state.project_attention(project.id).unread, 3);
+        assert_eq!(state.worktree_attention(project.id, main.id).unread, 1);
     }
 
     fn relocated_attention_model(

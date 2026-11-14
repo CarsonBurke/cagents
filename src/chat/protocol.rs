@@ -332,9 +332,13 @@ pub(crate) fn validate_launch_directory(
 }
 
 impl ProcessSpec {
-    pub(crate) fn remove_unset_environment(&mut self) {
-        self.environment
-            .retain(|name, _| !self.unset_environment.contains(name));
+    /// Remove what the process must not receive: the launch's removals, and
+    /// any provider session's identity, which a recipe saved before it was
+    /// withheld may still hold.
+    pub(crate) fn withhold_environment(&mut self) {
+        self.environment.retain(|name, _| {
+            !self.unset_environment.contains(name) && !crate::agent::is_session_variable(name)
+        });
     }
 }
 #[derive(Debug, Default)]
@@ -470,6 +474,35 @@ mod launch_tests {
         fn cleanup(&self) -> Result<LaunchOutcome, String> {
             Ok(*self.0.lock().unwrap())
         }
+    }
+
+    #[test]
+    fn a_conversation_never_receives_the_session_its_recipe_was_saved_inside() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::from([
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CODE_SESSION_ID".into(), "parent".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+                ("ANTHROPIC_API_KEY".into(), "removed".into()),
+            ]),
+            unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+        };
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.withhold_environment();
+        assert_eq!(
+            spec.environment,
+            BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into())])
+        );
+        let mut environment = recipe.environment.clone();
+        recipe.withhold_environment(&mut environment);
+        assert_eq!(environment, spec.environment);
     }
 
     #[test]
