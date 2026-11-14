@@ -2764,6 +2764,146 @@ mod tests {
     }
 
     #[test]
+    fn pending_handoffs_reject_replaced_sources_and_contexts() {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let target = target();
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for change_context in [false, true] {
+            let original = item("The old answer is still being prepared.");
+            let raw = Arc::downgrade(&original);
+            let mut state = configured(target, &original);
+            state.stage(&original, true, theme, |_, _| false);
+            state.rank("message", TAIL);
+            let (old_run, shared) = job(&state);
+            let lease = Arc::downgrade(&shared.lease);
+            let pool = shared.workers.clone();
+            let capacity = pool.permits.available_permits();
+            let held = hold_retirement();
+            let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+                panic!("the held reclaimer keeps the handoff pending");
+            };
+            assert_eq!(pool.permits.available_permits(), capacity - 1);
+
+            let replacement = item("A rewritten answer belongs to the current context.");
+            if change_context {
+                state.context(
+                    target,
+                    Some("other-session"),
+                    Some("child"),
+                    std::slice::from_ref(&replacement),
+                );
+            }
+            state.stage(&replacement, true, theme, |_, _| false);
+            let current_run = job(&state).0;
+            assert_ne!(current_run, old_run);
+            assert!(shared.cancelled.load(Ordering::Relaxed));
+            drop(original);
+            drop(shared);
+            // Release before awaiting: execute must cross this same barrier.
+            drop(held);
+            let message = executor.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    iced::runtime::task::into_stream(task).unwrap().next(),
+                )
+                .await
+                .expect("the cancelled handoff still delivers its outcome")
+            });
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MarkdownPrepared(delivered, id, delivered_run, ready),
+            )))) = message
+            else {
+                panic!("the task delivers the old handoff outcome");
+            };
+            assert_eq!((delivered, delivered_run), (target, old_run));
+            assert!(state.accept(target, &id, delivered_run, ready).is_none());
+            assert_eq!(job(&state).0, current_run);
+            assert!(
+                state.error().is_none(),
+                "old cancellation cannot fail the replacement"
+            );
+            retirement_barrier();
+            assert!(raw.upgrade().is_none());
+            assert!(lease.upgrade().is_none());
+            assert_eq!(pool.permits.available_permits(), capacity);
+
+            state.rank("message", TAIL);
+            let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10))
+            else {
+                panic!("the replacement can use the released parser");
+            };
+            let prepared = state.accept(target, &id, run, ready).unwrap();
+            assert!(Arc::ptr_eq(prepared.item(), &replacement));
+            prepared.discard();
+            drop(state);
+            retirement_barrier();
+            assert_eq!(pool.permits.available_permits(), capacity);
+        }
+    }
+
+    #[test]
+    fn dropping_a_pending_handoff_task_retires_its_output_and_releases_its_parser() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = executor.enter();
+        let target = target();
+        let source = item("The abandoned task still owns an actual parser result.");
+        let raw = Arc::downgrade(&source);
+        let mut state = configured(target, &source);
+        state.stage(
+            &source,
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        state.rank("message", TAIL);
+        let (_, shared) = job(&state);
+        let lease = Arc::downgrade(&shared.lease);
+        let pool = shared.workers.clone();
+        let capacity = pool.permits.available_permits();
+        drop(shared);
+        let held = hold_retirement();
+        let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+            panic!("the held reclaimer keeps the handoff pending");
+        };
+        drop(task);
+        assert_eq!(pool.permits.available_permits(), capacity - 1);
+        // Keep State alive until the worker has finished, so it produces a
+        // successful result rather than merely observing cancellation.
+        drop(held);
+        drop(entered);
+        executor.shutdown_timeout(Duration::from_secs(10));
+        retirement_barrier();
+        assert!(
+            state.growing_canonical_for_test(&source).is_none(),
+            "an abandoned result was never accepted by the UI"
+        );
+        assert!(
+            state.entries["message"]
+                .shared
+                .canonical
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(pool.permits.available_permits(), capacity);
+        drop(state);
+        drop(source);
+        retirement_barrier();
+        assert!(raw.upgrade().is_none());
+        assert!(lease.upgrade().is_none());
+    }
+
+    #[test]
     fn a_contending_tail_yields_the_head_to_history_that_arrives() {
         current_thread().block_on(async {
             let pool = Arc::new(Pool::new(2));
