@@ -75,7 +75,7 @@ if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
     sleep 2
     evidence shot same-project-hover
     evidence drive move 1,1
-    for _ in $(seq 1 "${SPAWN_ACTION_REVERSE_TABS:-2}"); do
+    for _ in $(seq 1 "${SPAWN_ACTION_REVERSE_TABS:-3}"); do
         evidence drive key shift+Tab
     done
     sleep 1
