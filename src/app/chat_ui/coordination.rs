@@ -634,8 +634,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
 /// agent goes by its tab's shorter words.
 const LABEL_CHARS: usize = 32;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
-/// and the gap before it.
-const ARROW_ROOM: f32 = 14.0 + step::GAP_S;
+/// and the gap before it, as a step row keeps for its chevron, so statuses
+/// end in line with step durations.
+const ARROW_ROOM: f32 = design::COMPACT_ICON_SIZE as f32 + step::GAP_S;
 /// How much of a message a row's tooltip shows.
 const TIP_CHARS: usize = 600;
 const TIP_LINES: usize = 12;
@@ -961,41 +962,15 @@ impl widget::menu::Action for RowCommand<'_> {
     }
 }
 
+/// A glyph at the size and tone of the step rows beside it.
 fn muted_glyph(icon: Icon) -> Element<'static, Message> {
-    widget::icon(icon.handle())
-        .size(14)
-        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-            cosmic::iced::widget::svg::Style {
-                color: Some(design::muted_icon_color(theme)),
-            }
-        })))
-        .into()
+    crate::ui_controls::passive_icon(icon.handle(), design::COMPACT_ICON_SIZE)
 }
 
 /// The transcript's own background, which a row's open detail sits on, so
 /// a fold fades into it rather than into a card that is no longer there.
 fn transcript_surface(theme: &cosmic::Theme) -> iced::Color {
     theme.current_container().base.into()
-}
-
-/// A row's heading on one line, cut short with an ellipsis where the pane
-/// is too narrow for it, filling what the row's other parts leave. The
-/// heading is held in a clipped box of exactly that width, so the status
-/// beside it keeps its place whatever width the shaped text reports; the
-/// whole of what was cut is in its tooltip and open detail.
-fn one_line<'a>(
-    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
-) -> Element<'a, Message> {
-    widget::container(
-        text.width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            )),
-    )
-    .width(Length::Fill)
-    .clip(true)
-    .into()
 }
 
 /// How a row's status reads.
@@ -1354,7 +1329,7 @@ impl Runtime {
         let failed = row.state.tone == Tone::Error;
         let lead: Element<'static, Message> = if failed {
             widget::icon(Icon::Error.handle())
-                .size(14)
+                .size(design::COMPACT_ICON_SIZE)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
                     cosmic::iced::widget::svg::Style {
                         color: Some(design::destructive_color(theme)),
@@ -1366,6 +1341,10 @@ impl Runtime {
         };
         let (tip, name) = row.described();
         let label = row.shown.clone();
+        // The preview fades out where the pane runs short, as a step row's
+        // summary does, into whatever the row is painted with; the agent
+        // keeps its tab's words, cut as the tab cuts them.
+        let painted = disclosure::Painted::on(transcript_surface);
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
             design::body(row.verb)
@@ -1376,15 +1355,15 @@ impl Runtime {
                 .size(design::TEXT_BODY)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            one_line(
+            painted.fade(
                 design::body(row.preview.clone())
                     .class(cosmic::theme::Text::Custom(design::muted_text)),
             ),
         ];
         if row.state.live {
             line.push(crate::ui_controls::activity_spinner(
-                14.0,
-                design::accent_color,
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::muted_color,
             ));
         }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
@@ -1444,12 +1423,21 @@ impl Runtime {
         let pressed = row
             .open
             .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
-        let button = widget::button::custom(content)
+        let mut button = widget::button::custom(content)
             .name(name)
-            .class(crate::ui_controls::control_style(false, None))
+            .class(painted.button_class())
             .padding(padding)
             .width(Length::Fill)
             .on_press(action(pressed));
+        if !opens {
+            // As a step row says whether pressing it shows or hides its detail.
+            button = button.description(if open_tool {
+                "Collapse details"
+            } else {
+                "Expand details"
+            });
+        }
+        let button = crate::interaction::a11y_target(button);
         let row: Element<'static, Message> = if opens {
             // The way in, drawn inside the row's highlight where the
             // pointer is. It only marks the row as one that opens: the row
@@ -1464,9 +1452,9 @@ impl Runtime {
                 .height(Length::Fill)
                 .align_x(iced::alignment::Horizontal::Right)
                 .align_y(iced::alignment::Vertical::Center);
-            hover::over(tipped(button.into()), arrow)
+            hover::over(tipped(button), arrow)
         } else {
-            tipped(button.into())
+            tipped(button)
         };
         crate::interaction::context_menu_lazy(row, menu)
     }
