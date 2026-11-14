@@ -146,6 +146,49 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn pending_completion_rebases_after_neighboring_pane_retirement() {
+    let fixture = Fixture::new();
+    let writer = writer(&fixture.host).unwrap();
+    let mut registry = writer.lock().unwrap();
+    let mut neighbor = fixture.pane.clone();
+    neighbor.id = CardId::new();
+    neighbor.kind = CardKind::Terminal(session(fixture.directory.path()));
+    let revision = registry.view_revision(&fixture.scope).unwrap();
+    registry
+        .apply(&ModelEdit::ChangeView {
+            scope: fixture.scope.clone(),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Insert {
+                pane: neighbor.clone(),
+                before: None,
+            },
+        })
+        .unwrap();
+    let reservation = pending_terminal(&registry, fixture.pane.id, fixture.session.id).unwrap();
+    // Execution retirement uses another connection, outside writer admission.
+    let mut execution = Registry::at(&fixture.path).unwrap();
+    execution
+        .apply(&ModelEdit::ChangeView {
+            scope: fixture.scope.clone(),
+            expected_revision: reservation.revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Remove { id: neighbor.id },
+        })
+        .unwrap();
+    complete_terminal(
+        &fixture.host,
+        &mut registry,
+        reservation,
+        fixture.session.clone(),
+    )
+    .unwrap();
+    let view = registry.view_snapshot(&fixture.scope).unwrap().0.unwrap();
+    assert_eq!(view.panes.len(), 1);
+    assert!(!view.panes[0].pending_terminal_start);
+}
+
+#[test]
 fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
     let fixture = Fixture::new();
     // A real schema object refuses only the completion save; reading the
@@ -156,7 +199,8 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
             "CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
         )
         .unwrap();
-    fixture.complete().unwrap();
+    let error = fixture.complete().unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::Internal);
     let original = fixture.host.lock().unwrap().terminals[&fixture.session.id]
         .handle
         .clone();
@@ -174,7 +218,11 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
             .handle
             .same_worker(&original)
     );
+    let issued = state.terminals[&fixture.session.id].session.clone();
     drop(state);
+    let saved = fixture.view();
+    assert!(!saved.panes[0].pending_terminal_start);
+    assert_eq!(saved.panes[0].kind, CardKind::Terminal(issued));
     let deadline = Instant::now() + Duration::from_secs(3);
     let launches = loop {
         if let Ok(launches) = fs::read_to_string(fixture.directory.path().join("launches")) {
@@ -186,4 +234,159 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
         thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(launches, "started\n");
+}
+
+#[test]
+fn pending_completion_refuses_changes_to_the_reserved_pane() {
+    for mutation in ["title", "width", "source", "pending", "remove", "transfer"] {
+        let fixture = Fixture::new();
+        let writer = writer(&fixture.host).unwrap();
+        let mut registry = writer.lock().unwrap();
+        let reservation = pending_terminal(&registry, fixture.pane.id, fixture.session.id).unwrap();
+        let mut execution = Registry::at(&fixture.path).unwrap();
+        let change = match mutation {
+            "remove" => Change::Remove {
+                id: fixture.pane.id,
+            },
+            "transfer" => {
+                let channel = crate::model::ChannelId::new();
+                execution
+                    .apply(&ModelEdit::CreateChannel {
+                        id: channel,
+                        repository: fixture.directory.path().into(),
+                        title: "destination".into(),
+                        title_source: Default::default(),
+                    })
+                    .unwrap();
+                Change::Transfer {
+                    id: fixture.pane.id,
+                    destination: Scope::Channel(channel),
+                    before: None,
+                }
+            }
+            _ => {
+                let mut pane = fixture.pane.clone();
+                match mutation {
+                    "title" => pane.user_title = Some("renamed".into()),
+                    "width" => pane.width_fraction = 0.75,
+                    "source" => pane.kind = CardKind::Terminal(session(fixture.directory.path())),
+                    "pending" => pane.pending_terminal_start = false,
+                    _ => unreachable!(),
+                }
+                Change::Update {
+                    before: fixture.pane.clone(),
+                    pane,
+                }
+            }
+        };
+        execution
+            .apply(&ModelEdit::ChangeView {
+                scope: fixture.scope.clone(),
+                expected_revision: reservation.revision,
+                operation: uuid::Uuid::new_v4(),
+                change,
+            })
+            .unwrap();
+        let before = registry.model().unwrap();
+        let error = complete_terminal(
+            &fixture.host,
+            &mut registry,
+            reservation,
+            fixture.session.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.code,
+                ProtocolErrorCode::ViewConflict | ProtocolErrorCode::InvalidRequest
+            ),
+            "{mutation}: {error:?}"
+        );
+        assert_eq!(registry.model().unwrap(), before, "{mutation}");
+    }
+}
+
+#[test]
+fn failed_pending_save_cannot_retarget_the_retained_worker() {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(&fixture.path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+    assert_eq!(
+        fixture.complete().unwrap_err().code,
+        ProtocolErrorCode::Internal
+    );
+    let original = fixture.host.lock().unwrap().terminals[&fixture.session.id]
+        .handle
+        .clone();
+    db.execute_batch("DROP TRIGGER reject_pending").unwrap();
+    let mut pane = fixture.pane.clone();
+    // The launch recipe and terminal ID still match. Accepting only those
+    // would silently reinterpret the original worker's publication intent.
+    pane.user_title = Some("changed while completion was refused".into());
+    edit_delta(
+        &fixture.host,
+        1,
+        ModelEdit::ChangeView {
+            scope: fixture.scope.clone(),
+            expected_revision: fixture.view().revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Update {
+                before: fixture.pane.clone(),
+                pane: pane.clone(),
+            },
+        },
+    )
+    .unwrap();
+    let error = fixture.complete().unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+    assert_eq!(fixture.view().panes, vec![pane]);
+    let state = fixture.host.lock().unwrap();
+    assert_eq!(state.terminals.len(), 1);
+    assert!(
+        state.terminals[&fixture.session.id]
+            .handle
+            .same_worker(&original)
+    );
+}
+
+#[test]
+fn retry_reports_pane_withdrawal_between_reservation_reads() {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(&fixture.path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+    assert_eq!(
+        fixture.complete().unwrap_err().code,
+        ProtocolErrorCode::Internal
+    );
+    let original = fixture.host.lock().unwrap().terminals[&fixture.session.id]
+        .handle
+        .clone();
+    db.execute_batch("DROP TRIGGER reject_pending").unwrap();
+    let host = fixture.host.clone();
+    let scope = fixture.scope.clone();
+    let revision = fixture.view().revision;
+    let pane = fixture.pane.id;
+    BEFORE_PENDING_START.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            edit_delta(
+                &host,
+                1,
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision: revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Remove { id: pane },
+                },
+            )
+            .unwrap();
+        }))
+    });
+    let error = fixture.complete().unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+    assert!(fixture.view().panes.is_empty());
+    assert!(
+        fixture.host.lock().unwrap().terminals[&fixture.session.id]
+            .handle
+            .same_worker(&original)
+    );
 }

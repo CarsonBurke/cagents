@@ -631,6 +631,15 @@ impl Cagents {
             && !self.shared_views.registry_unavailable
     }
 
+    /// The accepted automatic start, including a save still awaiting Retry.
+    pub(super) fn pending_terminal_reservation(&self, card: CardId) -> Option<&Pane> {
+        self.workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == card && pane.pending_terminal_start)
+    }
+
     /// Whether `card` attaches as a pane of a joined registry rather than
     /// from this window's own saved descriptor.
     pub(super) fn attaches_as_shared(&self, card: CardId) -> bool {
@@ -7250,6 +7259,54 @@ mod tests {
                 .contains_key(&aliases[1])
         );
         assert!(app.shared_chat_has_local_work(app.workspace_model.views[0].panes[1].id));
+    }
+
+    #[test]
+    fn retry_pending_terminal_preserves_the_reserved_identity() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let source = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(source.clone(), None));
+        let card = app.workspace.focused().unwrap();
+        app.terminal_starts.lock().unwrap().clear();
+        Arc::make_mut(&mut app.durable)
+            .pending_terminal_creations
+            .remove(&card);
+        app.shared_views.attached.insert(card);
+        app.shared_views.pending.clear();
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.pending_terminal_start = true;
+        let mut view = View::empty(channel);
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        app.cards
+            .insert(card, CardRuntime::Failed("completion save refused".into()));
+
+        let mut hosted = source.clone();
+        hosted.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("pending-fixture"),
+            boot_id: crate::model::BootId::new("pending-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("pending-fixture"),
+        };
+        // Reconnecting inventory is evidence that the worker exists, not
+        // permission to publish its source over the outstanding reservation.
+        drop(app.observe_hosted_terminals(vec![hosted]));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(source.clone())
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+
+        drop(app.retry_card(card));
+
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(source)
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(app.terminal_starts.lock().unwrap().contains_key(&card));
     }
 
     #[test]

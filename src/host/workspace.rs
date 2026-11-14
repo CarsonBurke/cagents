@@ -22,6 +22,19 @@ mod pending_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PENDING_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn pending_start_test_hook() {
+    let hook = BEFORE_PENDING_START.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, message, false)
 }
@@ -236,16 +249,39 @@ pub(super) fn apply_delta(
 }
 
 /// An automatic terminal's pane, as the daemon accepted it.
+#[derive(Clone)]
 pub(super) struct PendingTerminal {
     pub(super) session: TerminalSession,
     pane: Pane,
     scope: Scope,
     revision: u64,
+    operation: uuid::Uuid,
 }
 
 impl PendingTerminal {
+    pub(super) fn pane_is_pending(&self) -> bool {
+        self.pane.pending_terminal_start
+    }
+
     pub(super) fn accepts(&self, session: &TerminalSession) -> bool {
         self.pane.pending_terminal_start && self.session.launch == session.launch
+    }
+
+    /// Execution writes use another connection. Read the pane and its revision
+    /// together; the next transaction fences any change after this snapshot.
+    pub(super) fn current_revision(&self, registry: &Registry) -> Result<u64, ProtocolError> {
+        let (view, _) = registry.view_snapshot(&self.scope).map_err(unavailable)?;
+        if let Some(view) = view
+            && !view.retired.contains(&self.pane.id)
+            && view.panes.iter().find(|pane| pane.id == self.pane.id) == Some(&self.pane)
+        {
+            return Ok(view.revision);
+        }
+        Err(ProtocolError::new(
+            ProtocolErrorCode::ViewConflict,
+            Registry::VIEW_SOURCE_CONFLICT,
+            true,
+        ))
     }
 }
 
@@ -266,6 +302,7 @@ pub(super) fn pending_terminal(
                     pane: candidate,
                     scope: view.scope,
                     revision: view.revision,
+                    operation: uuid::Uuid::new_v4(),
                 });
             }
         }
@@ -284,28 +321,48 @@ pub(super) fn complete_terminal(
     registry: &mut Registry,
     reservation: PendingTerminal,
     session: TerminalSession,
-) {
-    let terminal_id = session.id;
+) -> Result<(), ProtocolError> {
     let mut pane = reservation.pane.clone();
     pane.pending_terminal_start = false;
     pane.kind = CardKind::Terminal(session);
-    let edit = ModelEdit::ChangeView {
-        scope: reservation.scope,
+    let mut edit = ModelEdit::ChangeView {
+        scope: reservation.scope.clone(),
         expected_revision: reservation.revision,
-        operation: uuid::Uuid::new_v4(),
+        operation: reservation.operation,
         change: Change::Update {
-            before: reservation.pane,
+            before: reservation.pane.clone(),
             pane,
         },
     };
-    match registry.apply_delta(&edit) {
-        Ok(applied) if applied.changed => host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(0, applied.receipt.sequence, &edit, &applied.receipt.effects),
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation")
+    let mut conflicts = 0;
+    loop {
+        match apply_delta(registry, &edit) {
+            Err(error) if error.code == ProtocolErrorCode::ViewConflict && conflicts < 2 => {
+                // Rebase only unrelated changes, never a new source, edited
+                // presentation, transferred pane or withdrawn reservation.
+                let revision = reservation.current_revision(registry)?;
+                if let ModelEdit::ChangeView {
+                    expected_revision, ..
+                } = &mut edit
+                {
+                    *expected_revision = revision;
+                }
+                conflicts += 1;
+            }
+            result => {
+                let applied = result?;
+                if applied.changed {
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .announce_model_edit(
+                            0,
+                            applied.receipt.sequence,
+                            &edit,
+                            &applied.receipt.effects,
+                        );
+                }
+                return Ok(());
+            }
         }
     }
 }

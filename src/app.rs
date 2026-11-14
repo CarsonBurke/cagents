@@ -5988,19 +5988,24 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.attaches_as_shared(card);
-        let reserved = self
-            .workspace_model
-            .views
-            .iter()
-            .flat_map(|view| &view.panes)
-            .any(|pane| pane.id == card && pane.pending_terminal_start);
+        let reservation = self.pending_terminal_reservation(card);
+        let reserved = reservation.is_some();
+        if reservation.is_some_and(
+            |pane| !matches!(&pane.kind, CardKind::Terminal(current) if current.id == session.id),
+        ) {
+            return cosmic::task::message(Message::TerminalStarted {
+                card,
+                terminal,
+                result: Err(SHARED_TERMINAL_DISCONNECTED.into()),
+            });
+        }
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 if existing_only {
                     return attach_initial_terminal(card, session, sender);
                 }
                 let mut created = false;
-                let (recovered, mode) = if shared && !explicit_retry {
+                let (recovered, mode) = if shared && (!explicit_retry || reserved) {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
                     let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
                     // A reserved start has nothing to find yet, and completing
@@ -8947,7 +8952,8 @@ impl Cagents {
         }
         self.saved_terminals.entries.remove(&card);
         let retry_details = self.terminal_details(card);
-        let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
+        let terminal_replacement = if self.pending_terminal_reservation(card).is_none()
+            && let CardKind::Terminal(session) = &mut state.kind
             && session.continuity.live_proof().is_none()
         {
             let expected_terminal_id = session.id;
