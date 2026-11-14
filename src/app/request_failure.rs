@@ -76,29 +76,38 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    pub(super) fn control(error: ControlError, activity: Activity, scoped: bool) -> Self {
-        if matches!(
-            &error,
+    pub(super) fn permission_denied(
+        error: &ControlError,
+        activity: Activity,
+        scoped: bool,
+    ) -> Option<Self> {
+        matches!(
+            error,
             ControlError::Remote {
                 code: ProtocolErrorCode::PermissionDenied,
                 ..
             }
-        ) {
-            Self {
-                message: activity.refusal(scoped, false),
-                details: Some(error.to_string()),
-            }
-        } else {
+        )
+        .then(|| Self {
+            message: activity.refusal(scoped, false),
+            details: Some(error.to_string()),
+        })
+    }
+
+    pub(super) fn control(error: ControlError, activity: Activity, scoped: bool) -> Self {
+        Self::permission_denied(&error, activity, scoped).unwrap_or_else(|| {
             // Preserve the existing formatting for failures outside this case.
             let message = match activity {
-                Activity::ViewAutomations | Activity::ChangeAutomations => error.reason(),
+                Activity::ViewAutomations
+                | Activity::ChangeAutomations
+                | Activity::ViewLifecycle => error.reason(),
                 _ => error.to_string(),
             };
             Self {
                 message,
                 details: None,
             }
-        }
+        })
     }
 
     pub(super) fn remote(activity: Activity) -> String {
@@ -194,5 +203,16 @@ mod tests {
             "The definition changed; refresh before saving"
         );
         assert!(failure.details.is_none());
+        let history = Failure::control(
+            ControlError::Remote {
+                code: ProtocolErrorCode::NotFound,
+                message: "This automation is no longer available".into(),
+                retryable: false,
+            },
+            Activity::ViewLifecycle,
+            true,
+        );
+        assert_eq!(history.message, "This automation is no longer available");
+        assert!(history.details.is_none());
     }
 }

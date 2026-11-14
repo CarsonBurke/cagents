@@ -16,6 +16,9 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    /// The pending automation requests of this project changed, or of any
+    /// project while the window was not watching.
+    AutomationRequestsChanged(Option<std::path::PathBuf>),
     OpenNotice(NoticeActivation),
     HostBound(HostSessionProof),
     LifecycleResolved {
@@ -124,12 +127,8 @@ fn read_lifecycle(
             limit: 1,
         })
         .map_err(|error| {
-            let failure = Failure::control(error, Activity::ViewLifecycle, scoped);
-            if failure.details.is_some() {
-                LifecycleReadError::Refused(failure)
-            } else {
-                LifecycleReadError::Unavailable
-            }
+            Failure::permission_denied(&error, Activity::ViewLifecycle, scoped)
+                .map_or(LifecycleReadError::Unavailable, LifecycleReadError::Refused)
         })? {
         crate::automations::Response::Audit(page) => page,
         _ => return Err(LifecycleReadError::Unavailable),
@@ -372,6 +371,10 @@ fn observe(
     sender
         .send_blocking(Action::Snapshot(snapshot))
         .map_err(|error| error.to_string())?;
+    // Changes made before watching were not pushed to this window.
+    sender
+        .send_blocking(Action::AutomationRequestsChanged(None))
+        .map_err(|error| error.to_string())?;
     while !sender.is_closed() {
         let action = match client
             .next_notification()
@@ -383,6 +386,9 @@ fn observe(
                     .map_err(|error| error.to_string())?,
             ),
             Update::Activated(session) => Action::Activated(session),
+            Update::AutomationProposalsChanged(repository) => {
+                Action::AutomationRequestsChanged(Some(repository))
+            }
         };
         sender
             .send_blocking(action)
@@ -404,6 +410,9 @@ impl Cagents {
                 while !observer.is_closed() {
                     if let Err(error) = observe(&observer, &presence) {
                         tracing::debug!(%error, "notification observation disconnected");
+                        // Unwatched, a change goes untold: each attempt to
+                        // watch again stands in for what it would have said.
+                        let _ = observer.try_send(Action::AutomationRequestsChanged(None));
                     }
                     thread::sleep(crate::daemon_health::retry_delay());
                 }
@@ -852,10 +861,10 @@ impl Cagents {
                 let open = self.open_utility_card(CardKind::Automations);
                 Task::batch([open, self.activate_main_window(None)])
             }
+            Action::AutomationRequestsChanged(repository) => {
+                self.automation_requests_changed(repository.as_deref())
+            }
             Action::Snapshot(snapshot) => {
-                // Agents make automation requests, and a snapshot follows
-                // their turns ending.
-                self.automation_approval_activity();
                 self.notification_ui.snapshot_host = self.notification_ui.host.clone();
                 self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
@@ -3764,6 +3773,46 @@ mod tests {
         assert_eq!(app.durable.cards, cards);
         assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
+    #[test]
+    fn a_stale_lifecycle_refusal_does_not_replace_the_current_notice() {
+        for changed_host in [false, true] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            let generation = app.notification_ui.lifecycle_read.unwrap();
+            let cards = app.durable.cards.clone();
+            if changed_host {
+                let mut replacement = app.notification_ui.host.clone().unwrap();
+                replacement.host_incarnation = crate::model::HostIncarnation::new("new backend");
+                drop(app.update_notifications(Action::HostBound(replacement)));
+            }
+            app.status = Some(TransientNotice::success("Current action completed"));
+            let refusal = Failure::permission_denied(
+                &crate::control::ControlError::Remote {
+                    code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
+                    message: "Synthetic stale authority refusal".into(),
+                    retryable: false,
+                },
+                Activity::ViewLifecycle,
+                true,
+            )
+            .unwrap();
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation: if changed_host {
+                    generation
+                } else {
+                    generation + 1
+                },
+                result: Err(LifecycleReadError::Refused(refusal)),
+            }));
+            assert_eq!(
+                app.status.as_ref().unwrap().message,
+                "Current action completed"
+            );
+            assert_eq!(app.durable.cards, cards);
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+        }
+    }
+
     #[test]
     fn lifecycle_activation_churn_keeps_one_actual_read_until_its_matching_completion() {
         let (mut app, id, sequence, notice) = lifecycle_notice_fixture();

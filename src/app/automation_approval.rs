@@ -11,14 +11,20 @@ pub(super) struct State {
     proposal: Option<Proposal>,
     available: Option<Proposal>,
     reading: bool,
-    /// The daemon connection every read of pending requests reuses. A focused
-    /// window reads every two seconds, and a connection apiece had the daemon
-    /// accept, authenticate and serve a new one each time.
+    /// The daemon connection every read of pending requests reuses, rather
+    /// than having the daemon accept and authenticate one per read.
     reader: Arc<std::sync::Mutex<Option<transport::Connection>>>,
-    /// Reads in a row that found nothing to review for `read_repository`,
-    /// which space the next read out; see [`State::read_interval`].
-    idle_reads: u32,
-    read_repository: Option<PathBuf>,
+    /// How many times the daemon has said this window's project's pending
+    /// requests changed, or that it may have missed saying so.
+    changes: u64,
+    /// The project the read in flight is for, and `changes` when it began.
+    reading_for: Option<(PathBuf, u64)>,
+    /// The project the offered request was last read for, and `changes` then.
+    /// A read is owed until it matches the project shown and `changes`.
+    read_for: Option<(PathBuf, u64)>,
+    /// The project whose reads have failed, and how many times in a row,
+    /// which spaces its next attempts out; see [`State::retry_interval`].
+    failed_reads: Option<(PathBuf, u32)>,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -26,22 +32,29 @@ pub(super) struct State {
     restore_keyboard_nav: Option<bool>,
 }
 
-/// How often a focused window reads pending requests while one could
-/// appear at any moment: one is offered, an agent is working, or the window
-/// has not yet read the project it shows.
+/// How soon a focused window that owes a read tries it again, while an open
+/// review, the workspace switcher or a read already in flight holds it off
+/// and nothing else that could end that happens.
 const READ_INTERVAL: Duration = Duration::from_secs(2);
-/// The longest a focused window waits between reads while none could. Only
-/// an agent makes a request, so this bounds how late one made by an agent
-/// this window doesn't show is offered.
-const IDLE_READ_INTERVAL: Duration = Duration::from_secs(16);
+/// The longest a focused window waits between attempts while the daemon
+/// cannot be reached.
+const RETRY_INTERVAL: Duration = Duration::from_secs(16);
 
 impl State {
-    /// [`READ_INTERVAL`], doubling with each read that found nothing up to
-    /// [`IDLE_READ_INTERVAL`].
-    fn idle_read_interval(&self) -> Duration {
+    /// Reads of `repository` in a row that failed.
+    fn failed_reads(&self, repository: Option<&Path>) -> u32 {
+        match &self.failed_reads {
+            Some((failed, count)) if Some(failed.as_path()) == repository => *count,
+            _ => 0,
+        }
+    }
+
+    /// [`READ_INTERVAL`], doubling with each read of `repository` that could
+    /// not reach the daemon up to [`RETRY_INTERVAL`].
+    fn retry_interval(&self, repository: Option<&Path>) -> Duration {
         READ_INTERVAL
-            .saturating_mul(1 << self.idle_reads.min(8))
-            .min(IDLE_READ_INTERVAL)
+            .saturating_mul(1 << self.failed_reads(repository).min(8))
+            .min(RETRY_INTERVAL)
     }
 }
 
@@ -225,35 +238,77 @@ impl Cagents {
         .into()
     }
 
+    /// A timer runs only while a focused window owes a read it could not
+    /// make at once. Otherwise the daemon says when there is something new.
     pub(super) fn automation_approval_subscription(&self) -> Subscription<Message> {
-        if self.refresh_ui.focused && !self.sidebar_model.projects.is_empty() {
-            cosmic::iced::time::every(self.automation_approval_read_interval())
-                .map(|_| Message::AutomationApproval(Action::Tick))
+        if self.refresh_ui.focused && self.automation_approval_read_owed() {
+            cosmic::iced::time::every(
+                self.automation_approval
+                    .retry_interval(self.approval_repository()),
+            )
+            .map(|_| Message::AutomationApproval(Action::Tick))
         } else {
             Subscription::none()
         }
     }
 
-    /// How long until the next read of pending requests. An agent asking
-    /// for approval waits in its turn for the answer, so while any agent
-    /// works, reads keep the quick pace that offers its request at once.
-    fn automation_approval_read_interval(&self) -> Duration {
+    /// Whether what this window offers may be out of date: it has not read
+    /// the project it shows since the daemon last said its requests changed.
+    fn automation_approval_read_owed(&self) -> bool {
         let state = &self.automation_approval;
-        if state.available.is_some()
-            || self.sidebar_state.any_agent_working()
-            || self.approval_repository() != state.read_repository.as_deref()
-        {
-            READ_INTERVAL
-        } else {
-            state.idle_read_interval()
-        }
+        self.approval_repository().is_some_and(|repository| {
+            !state
+                .read_for
+                .as_ref()
+                .is_some_and(|(read, changes)| read == repository && *changes == state.changes)
+        })
     }
 
-    /// Something that could have made a request happened: an agent's turn
-    /// ended, or the window was focused again. Reads go back to their quick
-    /// pace until they find nothing again.
-    pub(super) fn automation_approval_activity(&mut self) {
-        self.automation_approval.idle_reads = 0;
+    /// The daemon said the pending requests of the project at `repository`
+    /// changed, or, with none, that it may have missed saying so for any
+    /// project, as when this window began watching or could not. A focused
+    /// window that shows that project reads them at once, unless reads keep
+    /// failing and the daemon has not been heard from since.
+    pub(super) fn automation_requests_changed(
+        &mut self,
+        repository: Option<&Path>,
+    ) -> Task<Message> {
+        let state = &self.automation_approval;
+        let shown = |path: &Path| {
+            self.approval_repository() == Some(path)
+                || state
+                    .read_for
+                    .as_ref()
+                    .is_some_and(|(read, _)| read == path)
+        };
+        if repository.is_some_and(|repository| !shown(repository)) {
+            // Another project's: showing that one reads it anyway.
+            return Task::none();
+        }
+        if repository.is_some() {
+            // The daemon was just heard from.
+            self.automation_approval.failed_reads = None;
+        }
+        self.automation_approval.changes = self.automation_approval.changes.wrapping_add(1);
+        self.read_owed_automation_requests()
+    }
+
+    /// Reads pending requests now if this window owes a read and can make it:
+    /// after anything that could have shown another project, ended what held
+    /// a read off, or made one owed. Reads that keep failing are left to the
+    /// subscription's slower retries.
+    pub(super) fn read_owed_automation_requests(&mut self) -> Task<Message> {
+        if self.refresh_ui.focused
+            && self.automation_approval_read_owed()
+            && self
+                .automation_approval
+                .failed_reads(self.approval_repository())
+                == 0
+        {
+            self.update_automation_approval(Action::Tick)
+        } else {
+            Task::none()
+        }
     }
 
     pub(super) fn adopt_automation_approval_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -323,10 +378,8 @@ impl Cagents {
                 let Some(repository) = self.approval_repository().map(Path::to_path_buf) else {
                     return Task::none();
                 };
-                if self.automation_approval.read_repository.as_ref() != Some(&repository) {
-                    self.automation_approval.idle_reads = 0;
-                    self.automation_approval.read_repository = Some(repository.clone());
-                }
+                self.automation_approval.reading_for =
+                    Some((repository.clone(), self.automation_approval.changes));
                 self.automation_approval.reading = true;
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
@@ -344,7 +397,7 @@ impl Cagents {
                         });
                         with_connection(
                             &mut reader,
-                            || context.connect(),
+                            || context.connect(Activity::ViewApprovals),
                             |client| pending_proposal(client, &repository),
                             |error| {
                                 request_failure::message(error, Activity::ViewApprovals, scoped)
@@ -364,28 +417,27 @@ impl Cagents {
                     return Task::none();
                 }
                 self.automation_approval.reading = false;
-                // Nothing to review, or no daemon to ask: read less often.
-                // An offered request keeps the quick pace so its review
-                // follows another window resolving it.
-                let offered = result.as_ref().as_ref().is_ok_and(|proposals| {
-                    proposals
-                        .iter()
-                        .any(|proposal| proposal.state == ProposalState::Pending)
-                });
-                self.automation_approval.idle_reads = if offered {
-                    0
-                } else {
-                    self.automation_approval.idle_reads.saturating_add(1)
+                let read_for = self.automation_approval.reading_for.take();
+                let Ok(proposals) = result.as_ref() else {
+                    // The read stays owed, and is tried again less often.
+                    if let Some((repository, _)) = read_for {
+                        let failed = self
+                            .automation_approval
+                            .failed_reads(Some(&repository))
+                            .saturating_add(1);
+                        self.automation_approval.failed_reads = Some((repository, failed));
+                    }
+                    return Task::none();
                 };
+                self.automation_approval.failed_reads = None;
+                // Not offered now, so still owed for when it can be.
                 if self.modal_is_open()
                     || !self.refresh_ui.focused
                     || self.chrome_ui.workspace_preview_since.is_some()
                 {
                     return Task::none();
                 }
-                let Ok(proposals) = result.as_ref() else {
-                    return Task::none();
-                };
+                self.automation_approval.read_for = read_for;
                 self.automation_approval.available = proposals
                     .iter()
                     .find(|proposal| {
@@ -394,7 +446,8 @@ impl Cagents {
                                 == Some(proposal.definition.agent.target.repository.as_path())
                     })
                     .cloned();
-                Task::none()
+                // Requests changed during the read, or another project shows.
+                self.read_owed_automation_requests()
             }
             Action::Open { id, revision } => {
                 if self.update_prepared
@@ -761,9 +814,8 @@ mod tests {
         }
     }
 
-    /// A focused window reads pending requests every two seconds on one
-    /// connection, and reaches a restarted daemon on the read that finds the
-    /// old connection closed.
+    /// Pending-request reads reuse one connection, and reach a restarted
+    /// daemon on the read that finds the old connection closed.
     #[test]
     fn approval_reads_reuse_one_connection_and_replace_one_that_closed() {
         struct Connection(u32);
@@ -852,12 +904,11 @@ mod tests {
         assert_eq!(connects, 3);
     }
 
-    /// A focused window with nothing to review reads less and less often,
-    /// and quickly again while a request could appear: one is offered, an
-    /// agent is working, another project opened or anything could have made
-    /// one.
+    /// A window reads a project's pending requests when it shows that project
+    /// and when the daemon says they changed, never on a timer that runs
+    /// while nothing does. A read it could not make or apply stays owed.
     #[test]
-    fn idle_approval_reads_back_off_until_something_could_have_changed() {
+    fn approval_reads_follow_the_daemon_instead_of_polling() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         for repository in ["/fixture", "/second"] {
             app.sidebar_model.projects.push(
@@ -874,56 +925,165 @@ mod tests {
         }
         app.active_workspace = Some("/fixture".into());
         app.refresh_ui.focused = true;
-        let interval = |app: &Cagents| app.automation_approval_read_interval().as_secs();
-        let read = |app: &mut Cagents, result: Result<Vec<Proposal>, String>| {
-            drop(app.update_automation_approval(Action::Tick));
+        let finish = |app: &mut Cagents, result: Result<Vec<Proposal>, String>| {
+            assert!(app.automation_approval.reading, "a read is in flight");
             let generation = app.automation_approval.generation;
             drop(app.update_automation_approval(Action::Read {
                 generation,
                 result: Arc::new(result),
             }));
-            interval(app)
         };
-        assert_eq!(interval(&app), 2);
-        let idle = (0..5)
-            .map(|_| read(&mut app, Ok(Vec::new())))
-            .collect::<Vec<_>>();
-        assert_eq!(idle, [4, 8, 16, 16, 16]);
-        assert_eq!(read(&mut app, Err("no daemon".into())), 16);
-
-        // An offered request keeps reads quick until it is gone.
-        assert_eq!(read(&mut app, Ok(vec![proposal()])), 2);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 8);
-
-        // An agent asking for approval waits in its turn for the answer.
-        let agent = CardId::new();
-        let activity = |state| crate::agent::Activity {
-            provider: crate::agent::Provider::Claude,
-            state,
+        let reads = |app: &mut Cagents| {
+            let generation = app.automation_approval.generation;
+            drop(app.read_owed_automation_requests());
+            app.automation_approval.generation != generation
         };
-        app.sidebar_state
-            .set_card_activity(agent, activity(crate::agent::ActivityState::Working));
-        assert_eq!(interval(&app), 2);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 2);
-        app.sidebar_state
-            .set_card_activity(agent, activity(crate::agent::ActivityState::Idle));
-        assert_eq!(interval(&app), 16);
 
-        // An agent's turn ended: the window's notifications changed.
-        drop(
-            app.update_notifications(super::super::notification_ui::Action::Snapshot(
-                crate::notifications::Snapshot::default(),
-            )),
-        );
-        assert_eq!(interval(&app), 2);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 8);
+        // Nothing read yet: the project shown is read.
+        assert!(app.automation_approval_read_owed());
+        assert!(reads(&mut app));
+        finish(&mut app, Ok(Vec::new()));
+        assert!(!app.automation_approval_read_owed());
+        assert!(!reads(&mut app), "nothing changed, so nothing is read");
 
-        // Another project's requests are read at once at the quick pace.
+        // Another project's change is read only on showing that project.
+        drop(app.automation_requests_changed(Some(Path::new("/second"))));
+        assert!(!app.automation_approval.reading);
+        assert!(!app.automation_approval_read_owed());
+
+        // This project's change is read at once and offered.
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        finish(&mut app, Ok(vec![proposal()]));
+        assert!(app.automation_approval.available.is_some());
+        assert!(!app.automation_approval_read_owed());
+
+        // A change during a read is read again as soon as it lands.
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        finish(&mut app, Ok(vec![proposal()]));
+        assert!(app.automation_approval_read_owed());
+        finish(&mut app, Ok(Vec::new()));
+        assert!(app.automation_approval.available.is_none());
+        assert!(!app.automation_approval_read_owed());
+
+        // A daemon that cannot be reached is tried less and less often, on
+        // the subscription's timer rather than at every chance.
+        let interval = |app: &Cagents, repository: &str| {
+            app.automation_approval
+                .retry_interval(Some(Path::new(repository)))
+                .as_secs()
+        };
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        let mut intervals = Vec::new();
+        for _ in 0..4 {
+            finish(&mut app, Err("no daemon".into()));
+            assert!(app.automation_approval_read_owed());
+            intervals.push(interval(&app, "/fixture"));
+            assert!(!reads(&mut app), "a failing read waits for its retry");
+            drop(app.automation_requests_changed(None));
+            assert!(!app.automation_approval.reading, "so does watching again");
+            drop(app.update_automation_approval(Action::Tick));
+        }
+        assert_eq!(intervals, [4, 8, 16, 16]);
+        finish(&mut app, Err("no daemon".into()));
+
+        // Another project shown is read at once, its own reads not having
+        // failed, and the daemon telling of a change shows it is back.
         app.active_workspace = Some("/second".into());
-        assert_eq!(interval(&app), 2);
-        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
+        assert_eq!(interval(&app, "/second"), 2);
+        assert!(reads(&mut app));
+        finish(&mut app, Ok(Vec::new()));
+        assert!(!app.automation_approval_read_owed());
+        app.active_workspace = Some("/fixture".into());
+        assert!(app.automation_approval_read_owed());
+        assert!(reads(&mut app), "the earlier failure was cleared by a read");
+        finish(&mut app, Err("no daemon".into()));
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        assert!(app.automation_approval.reading);
+        finish(&mut app, Ok(Vec::new()));
+        assert_eq!(interval(&app, "/fixture"), 2);
+        assert!(!app.automation_approval_read_owed());
+
+        // A read that lands while the window is away stays owed, and is
+        // made on its return.
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        app.refresh_ui.focused = false;
+        finish(&mut app, Ok(vec![proposal()]));
+        assert!(app.automation_approval.available.is_none());
+        assert!(!reads(&mut app), "an unfocused window waits");
+        let window = cosmic::iced::window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        drop(app.update(Message::RefreshUi(
+            super::super::refresh_ui::Action::Focused(window, true),
+        )));
+        assert!(app.automation_approval.reading, "focus returning reads");
+        finish(&mut app, Ok(vec![proposal()]));
+        assert!(app.automation_approval.available.is_some());
+        assert!(!app.automation_approval_read_owed());
+
+        // Watching again after missing what the daemon said owes a read.
+        drop(app.automation_requests_changed(None));
+        finish(&mut app, Ok(vec![proposal()]));
+        assert!(!app.automation_approval_read_owed());
+    }
+
+    /// Opening a review discards the read in flight, which stays owed and is
+    /// made once the review closes.
+    #[test]
+    fn a_review_opened_during_a_read_reads_again_when_it_closes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "/fixture".into(),
+                "/fixture".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        app.active_workspace = Some("/fixture".into());
+        app.refresh_ui.focused = true;
+        let offered = proposal();
+        drop(app.read_owed_automation_requests());
+        let generation = app.automation_approval.generation;
+        drop(app.update_automation_approval(Action::Read {
+            generation,
+            result: Arc::new(Ok(vec![offered.clone()])),
+        }));
+        assert!(app.automation_approval.available.is_some());
+
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
+        let in_flight = app.automation_approval.generation;
+        assert!(app.automation_approval.reading);
+        drop(app.update_automation_approval(Action::Open {
+            id: offered.id,
+            revision: offered.revision,
+        }));
+        assert!(app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Read {
+            generation: in_flight,
+            result: Arc::new(Ok(Vec::new())),
+        }));
+        assert!(
+            app.automation_approval_read_owed(),
+            "the late read is set aside"
+        );
+        drop(app.read_owed_automation_requests());
+        assert!(
+            !app.automation_approval.reading,
+            "not while the review is open"
+        );
+
+        let generation = app.automation_approval.generation;
+        drop(app.update(Message::AutomationApproval(Action::Dismiss {
+            id: offered.id,
+            revision: offered.revision,
+            generation,
+        })));
+        assert!(!app.automation_approval_open());
+        assert!(app.automation_approval.reading, "closing the review reads");
     }
 
     #[test]
@@ -984,13 +1144,15 @@ mod tests {
         let proposal = proposal();
         let mut unrelated = proposal.clone();
         unrelated.definition.agent.target.repository = "/other-project".into();
+        drop(app.read_owed_automation_requests());
         drop(app.update_automation_approval(Action::Read {
-            generation: 0,
+            generation: app.automation_approval.generation,
             result: Arc::new(Ok(vec![unrelated])),
         }));
         assert!(app.automation_approval.available.is_none());
+        drop(app.automation_requests_changed(Some(Path::new("/fixture"))));
         let task = app.update_automation_approval(Action::Read {
-            generation: 0,
+            generation: app.automation_approval.generation,
             result: Arc::new(Ok(vec![proposal.clone()])),
         });
         assert!(
@@ -1022,11 +1184,12 @@ mod tests {
         let mut declined = proposal.clone();
         declined.state = ProposalState::Declined;
         drop(app.update_automation_approval(Action::Finished {
-            generation: 1,
+            generation: app.automation_approval.generation,
             result: Arc::new(Ok(declined)),
         }));
         assert!(!app.automation_approval_open());
         assert!(app.core.keyboard_nav());
+        // A read begun before the review is set aside.
         drop(app.update_automation_approval(Action::Read {
             generation: 0,
             result: Arc::new(Ok(vec![proposal])),

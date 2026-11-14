@@ -239,7 +239,10 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-pub const PROTOCOL_VERSION: u16 = 177;
+/// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
+/// a window watching notifications that a project's pending automation
+/// requests changed, so it reads them then rather than polling.
+pub const PROTOCOL_VERSION: u16 = 178;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -926,6 +929,13 @@ pub enum ServerMessage {
     ChatAgentAddresses {
         chat_id: TerminalId,
         addresses: Vec<crate::chat::AgentAddress>,
+    },
+    /// The project at `repository` gained a pending automation request, or one
+    /// was approved or declined. Delivered to every connection watching
+    /// notifications, which reads the project's pending requests again if it
+    /// offers them.
+    AutomationProposalsChanged {
+        repository: std::path::PathBuf,
     },
 }
 

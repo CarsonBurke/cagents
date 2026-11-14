@@ -273,8 +273,8 @@ impl Peer {
             let (mut peer, first, probes) = accept_request(&listener);
             assert_eq!(probes, expected_probes);
             read(&mut peer, first);
-            // The second Tick must reach this stream, including after the
-            // first detail read was refused. A reconnect cannot satisfy it.
+            // The next owed read must reach this stream, including after
+            // the first detail read was refused. A reconnect cannot satisfy it.
             let second: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             read(&mut peer, second);
             drop(peer);
@@ -349,20 +349,20 @@ fn exercise_app() {
         .unwrap();
     for approved in [None, Some(false), Some(true)] {
         let (mut app, proposal) = reviewing();
-        let action = if let Some(approved) = approved {
-            Action::Decide {
+        let peer = Peer::new(proposal.clone(), approved, authority.clone());
+        let task = if let Some(approved) = approved {
+            app.update_automation_approval(Action::Decide {
                 id: proposal.id,
                 revision: proposal.revision,
                 generation: app.automation_approval.generation,
                 approved,
-            }
+            })
         } else {
             drop(app.cancel_automation_approval());
             app.automation_approval.available = None;
-            Action::Tick
+            assert!(app.automation_approval_read_owed());
+            app.read_owed_automation_requests()
         };
-        let peer = Peer::new(proposal.clone(), approved, authority.clone());
-        let task = app.update_automation_approval(action);
         let completion = complete(&runtime, task);
         match &completion {
             Action::Read { result, .. } => {
@@ -419,7 +419,7 @@ fn exercise_app() {
     }
 }
 
-/// Drive the owning Tick task across refusal, reuse, and daemon disconnect.
+/// Drive event-owed App reads across refusal, reuse, and daemon disconnect.
 /// The role defines the oracle independently of the production env parser.
 fn exercise_cache(role: &str) {
     let authority = match role {
@@ -441,10 +441,18 @@ fn exercise_cache(role: &str) {
     for read in 0..3 {
         if read == 2 {
             // The second reply can reach the App before the server closes.
-            // Wait for closure so the third Tick deterministically reconnects.
+            // Wait for closure so the third read deterministically reconnects.
             closure.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        let task = app.update_automation_approval(Action::Tick);
+        let task = if read == 0 {
+            assert!(app.automation_approval_read_owed());
+            app.read_owed_automation_requests()
+        } else {
+            // A new daemon event owes a read even after a successful read,
+            // and clears a previous refusal's retry backoff. The event does
+            // not replace the retained connection or its captured caller.
+            app.automation_requests_changed(Some(&proposal.definition.agent.target.repository))
+        };
         let completion = complete(&runtime, task);
         let Action::Read { result, .. } = &completion else {
             panic!("a pending approval read must produce its owning completion");
@@ -467,6 +475,11 @@ fn exercise_cache(role: &str) {
         assert!(
             app.automation_approval.reader.lock().unwrap().is_some(),
             "an answered read retains its connection, including scope refusals",
+        );
+        assert_eq!(
+            app.automation_approval_read_owed(),
+            scoped,
+            "successful reads settle the event; refused reads stay owed",
         );
     }
     drop(app);
