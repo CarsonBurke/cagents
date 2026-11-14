@@ -868,7 +868,11 @@ impl Runtime {
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
         let mut parts: Vec<Element<'static, Message>> = Vec::new();
         if !recipient.name.is_empty() {
-            parts.push(chat_title(recipient.name.clone()).into());
+            parts.push(faded_caption(
+                recipient.name.clone(),
+                true,
+                recipient.name.clone(),
+            ));
         }
         let Some(session) = &recipient.session else {
             return parts;
@@ -882,12 +886,14 @@ impl Runtime {
                 .into()
         };
         parts.push(if recipient.live {
-            widget::button::custom(label)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([0, step::GAP_XS as u16])
-                .name(format!("Go to session {shown}"))
-                .on_press(action(Action::OpenSession(session.clone())))
-                .into()
+            crate::interaction::tooltip(
+                widget::button::custom(label)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([0, step::GAP_XS as u16])
+                    .name(format!("Go to session {shown}"))
+                    .on_press(action(Action::OpenSession(session.clone()))),
+                format!("Go to session {session}"),
+            )
         } else {
             label
         });
@@ -910,14 +916,16 @@ impl Runtime {
         let recipient = recipient(message, reading, &|id| self.listed_agent_name(id));
         let mut heading = vec![
             self.card_indicator(status, Icon::Send),
-            design::caption(message_verb(message.kind)).into(),
+            design::caption(message_verb(message.kind))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
         ];
         heading.extend(self.session_link(&recipient));
         rows.push(
             widget::row::with_children(heading)
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
-                .wrap()
+                .width(Length::Fill)
                 .into(),
         );
         // An agent's tab names it by its type, which several agents share;
@@ -1057,6 +1065,7 @@ impl Runtime {
             ])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
+            .width(Length::Fill)
             .into(),
         );
         let observed_model = if !reading.cli {
@@ -1576,28 +1585,85 @@ mod identity_tests {
                 ),
                 _ => panic!("fixture is an agent card"),
             }
-            let mut element = rows.swap_remove(index);
-            let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
-            );
-            let mut captions = Captions(Vec::new());
-            element.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                &mut captions,
-            );
-            let source = if index == 0 { &name } else { &task };
-            assert_eq!(captions.0, [turn::headline(source.clone())]);
-            assert!(!captions.0[0].contains('…'));
-            assert!(!captions.0[0].contains('\n'));
-            assert!(captions.0[0].chars().count() > 80);
-            assert!(node.size().height <= design::LINE_BODY);
+            for (row, mut element) in rows.into_iter().take(index + 1).enumerate() {
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+                );
+                let mut captions = Captions(Vec::new());
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut captions,
+                );
+                let expected = if index == 1 && row == 0 {
+                    vec!["Message to".to_owned(), turn::headline(name.clone())]
+                } else {
+                    vec![turn::headline(if index == 0 {
+                        name.clone()
+                    } else {
+                        task.clone()
+                    })]
+                };
+                assert_eq!(captions.0, expected);
+                assert!(captions.0.iter().all(|text| !text.contains(['…', '\n'])));
+                assert_eq!(node.size().width, 200.0);
+                assert!(
+                    node.size().height <= design::LINE_BODY,
+                    "the whole heading must stay one line"
+                );
+            }
             assert_eq!(runtime.snapshot.items[index].as_ref(), item);
         }
+        // A separate session retains its navigation button alongside the faded
+        // recipient, including when the full recipient name exceeds the pane.
+        let cached = &runtime.cache["message"];
+        let mut reading = cached.coordination.as_deref().unwrap().reading.clone();
+        reading.outcome.receipt = Some(chat::coordination::Receipt {
+            message: "fixture-message".into(),
+            recipient: format!("session 95fcd1b9e0aa \"{name}\""),
+            arrival: Arrival::WhenIdle,
+        });
+        let coordinated = Coordinated::new(reading);
+        let Kind::Message(message) = &coordinated.reading.kind else {
+            unreachable!()
+        };
+        let mut rows = Vec::new();
+        runtime.message_rows(
+            &mut rows,
+            &items[1],
+            cached,
+            &coordinated,
+            message,
+            ToolStatus::Succeeded,
+            "",
+            settings,
+        );
+        let mut element = rows.remove(0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+        );
+        assert_eq!(node.size().width, 200.0);
+        assert!(node.size().height <= design::LINE_BODY);
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let link = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().label() == Some("Go to session 95fcd1b9"))
+            .expect("live session navigation survives the bounded heading");
+        let bounds = link.node().bounds().unwrap();
+        assert!(bounds.x0 >= 0.0 && bounds.x1 <= 200.0);
         assert_eq!(runtime.snapshot.subagents[0].kind, name);
         assert_eq!(runtime.snapshot.subagents[0].description, task);
         assert_eq!(
