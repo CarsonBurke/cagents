@@ -2228,7 +2228,7 @@ impl Runtime {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
-            return self.pending_admission_view();
+            return self.pending_admission_view(transcript_clearance);
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
@@ -12466,10 +12466,10 @@ mod tests {
             .find(|node| {
                 node.node()
                     .label()
-                    .is_some_and(|label| label.starts_with("Source control section"))
+                    .is_some_and(|label| label == "Show files")
             })
             .and_then(|node| node.node().bounds())
-            .expect("source-control heading button");
+            .expect("last header control before the inspector toggle");
         let toggle = nodes
             .iter()
             .find(|node| {
@@ -12481,8 +12481,48 @@ mod tests {
             .expect("inspector toggle button");
         assert!(
             toggle.x0 - header.x1 >= f64::from(step::GAP_S) - 0.1,
-            "heading {header:?} stops a standard gap before toggle {toggle:?}"
+            "adjacent control {header:?} stops a standard gap before toggle {toggle:?}"
         );
+    }
+
+    #[test]
+    fn inspector_saved_admission_actions_clear_the_floating_toggle() {
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        for width in [420.0, 720.0] {
+            let (mut app, card) = inspector_chat_fixture(width);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("fixture chat")
+            };
+            runtime.connection = Connection::AwaitingAdmission;
+            let mut renderer = crate::app::tests::headless_renderer();
+            let ui = UserInterface::build(
+                app.card_view(card, true, false),
+                iced::Size::new(width, 800.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let all = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .collect::<Vec<_>>();
+            let copy = all
+                .iter()
+                .find(|node| node.node().label() == Some("Copy saved draft"))
+                .and_then(|node| node.node().bounds())
+                .expect("copy saved draft control");
+            let toggle = all
+                .iter()
+                .find(|node| {
+                    node.node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Toggle inspector"))
+                })
+                .and_then(|node| node.node().bounds())
+                .expect("floating toggle");
+            assert!(copy.x1 + f64::from(step::GAP_S) <= toggle.x0 + 0.1);
+        }
     }
 
     #[test]
@@ -12510,9 +12550,22 @@ mod tests {
             cache: Cache,
             task: Task<Message>,
             renderer: &mut cosmic::Renderer,
-        ) -> (Cache, Option<widget::Id>, Option<iced::Rectangle>) {
+            event: Option<keyboard::Event>,
+        ) -> (
+            Cache,
+            Option<widget::Id>,
+            Option<iced::Rectangle>,
+            Vec<Message>,
+        ) {
             let mut ui = UserInterface::build(
-                app.card_view(card, true, false),
+                widget::row::with_children(
+                    app.workspace
+                        .order()
+                        .map(|id| app.card_view(id, true, false)),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
                 iced::Size::new(width, 800.0),
                 cache,
                 renderer,
@@ -12534,6 +12587,16 @@ mod tests {
                     }
                 }
             }
+            let mut messages = Vec::new();
+            if let Some(event) = event {
+                let _ = ui.update(
+                    &[iced::Event::Keyboard(event)],
+                    iced::mouse::Cursor::Unavailable,
+                    renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut messages,
+                );
+            }
             let focused = std::sync::Arc::new(std::sync::Mutex::new(None));
             let sink = focused.clone();
             let mut find = operation::map(operation::focusable::find_focused(), move |id| {
@@ -12547,22 +12610,31 @@ mod tests {
             };
             ui.operate(renderer, &mut panel);
             let id = focused.lock().unwrap().clone();
-            (ui.into_cache(), id, panel.bounds)
+            (ui.into_cache(), id, panel.bounds, messages)
         }
         let mut renderer = crate::app::tests::headless_renderer();
         for width in [420.0, 600.0] {
             let (mut app, card) = inspector_chat_fixture(width);
-            let (cache, _, _) = frame(&app, card, width, Cache::new(), Task::none(), &mut renderer);
+            let (cache, _, _, _) = frame(
+                &app,
+                card,
+                width,
+                Cache::new(),
+                Task::none(),
+                &mut renderer,
+                None,
+            );
             let opened = app.set_pane_inspector_open(card, true);
             let finished =
                 app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
-            let (cache, focused, bounds) = frame(
+            let (cache, focused, bounds, _) = frame(
                 &app,
                 card,
                 width,
                 cache,
                 Task::batch([opened, finished]),
                 &mut renderer,
+                None,
             );
             assert_eq!(focused, Some(card_control_id(card, "inspector.toggle")));
             let bounds = bounds.expect("actual overlay panel");
@@ -12588,17 +12660,19 @@ mod tests {
                 app.pane_content_inputs_blocked(card),
                 "closing slide still covers content"
             );
-            let (cache, _, _) = frame(&app, card, width, cache, closed, &mut renderer);
+            let (cache, _, _, _) = frame(&app, card, width, cache, closed, &mut renderer, None);
             let finished =
                 app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
-            let (cache, focused, panel) = frame(&app, card, width, cache, finished, &mut renderer);
+            let (cache, focused, panel, _) =
+                frame(&app, card, width, cache, finished, &mut renderer, None);
             assert!(panel.is_none());
             assert_eq!(
                 focused,
                 Some(card_control_id(card, "inspector.toggle")),
                 "Escape returns focus after the slide"
             );
-            let (_, focused, _) = frame(&app, card, width, cache, Task::none(), &mut renderer);
+            let (_, focused, _, _) =
+                frame(&app, card, width, cache, Task::none(), &mut renderer, None);
             assert_eq!(
                 focused,
                 Some(card_control_id(card, "inspector.toggle")),
@@ -12608,6 +12682,84 @@ mod tests {
                 panic!("retained chat")
             };
             assert_eq!(runtime.composer.text(), "retained draft");
+        }
+        // Native focus can enter the left inspector by Tab while workspace
+        // focus still names the right pane. Escape must follow native focus.
+        for move_focus_during_close in [false, true] {
+            let (mut app, left) = inspector_chat_fixture(840.0);
+            let right = super::super::tests::draft_chat_for_provider(&mut app, Provider::Claude);
+            for card in Arc::make_mut(&mut app.durable).cards.iter_mut() {
+                card.width_fraction = 0.5;
+            }
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            drop(app.workspace.resize_viewport(840.0));
+            assert_eq!(app.workspace.focused(), Some(right));
+            let opened = app.set_pane_inspector_open(left, true);
+            let completed =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, _, _) = frame(
+                &app,
+                left,
+                840.0,
+                Cache::new(),
+                Task::batch([opened, completed]),
+                &mut renderer,
+                None,
+            );
+            assert_eq!(focused, Some(card_control_id(left, "inspector.toggle")));
+            let escape = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            };
+            let (cache, _, _, messages) = frame(
+                &app,
+                left,
+                840.0,
+                cache,
+                Task::none(),
+                &mut renderer,
+                Some(escape),
+            );
+            let close = messages
+                .into_iter()
+                .find(
+                    |message| matches!(message, Message::ClosePaneInspector(card) if *card == left),
+                )
+                .expect("actual focused inspector consumes Escape and names its own pane");
+            let closed = app.update(close);
+            assert!(!app.pane_inspectors.is_open(left));
+            assert_eq!(app.workspace.focused(), Some(left));
+            let (cache, _, _, _) = frame(&app, left, 840.0, cache, closed, &mut renderer, None);
+            let expected = if move_focus_during_close {
+                card_control_id(right, "chat-composer")
+            } else {
+                card_control_id(left, "inspector.toggle")
+            };
+            let newer_focus = if move_focus_during_close {
+                iced::widget::operation::focus(expected.clone()).map(cosmic::Action::App)
+            } else {
+                Task::none()
+            };
+            let (cache, _, _, _) =
+                frame(&app, left, 840.0, cache, newer_focus, &mut renderer, None);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (_, focused, _, _) = frame(&app, left, 840.0, cache, finished, &mut renderer, None);
+            assert_eq!(
+                focused,
+                Some(expected),
+                "completion preserves a newer native focus choice"
+            );
+            drop(app.update(Message::ClosePaneInspector(left)));
+            assert!(
+                !app.pane_inspectors.is_open(left),
+                "repeated Escape cannot reopen it"
+            );
         }
     }
 

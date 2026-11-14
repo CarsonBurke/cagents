@@ -2782,6 +2782,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
         | Message::TogglePaneInspector(_)
+        | Message::ClosePaneInspector(_)
         | Message::ReviewFilePanelToggle { .. }
         | Message::ReviewFilePanelResize { .. }
         | Message::ReviewFilePanelResizeFinished
@@ -2955,6 +2956,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             }
             | Message::ToggleContextInspector
             | Message::TogglePaneInspector(_)
+            | Message::ClosePaneInspector(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -4715,6 +4717,7 @@ pub enum Message {
     ToggleContextInspector,
     /// Opens or closes this pane's inspector.
     TogglePaneInspector(CardId),
+    ClosePaneInspector(CardId),
     ContextSection(context_sections::Action),
     /// The inspector sections were laid out at this height.
     ContextSectionsMeasured(f32),
@@ -17562,7 +17565,7 @@ impl Application for Cagents {
                         && self.pane_inspectors.is_open(card)
                         && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
                     {
-                        return self.set_pane_inspector_open(card, false);
+                        return self.close_pane_inspector_overlay(card);
                     }
                 }
                 if let Some(backwards) = is_tab_press(&event)
@@ -17725,8 +17728,9 @@ impl Application for Cagents {
                 Some(card) => self.toggle_pane_inspector(card),
                 None => Task::none(),
             },
-            Message::TogglePaneInspector(_) if self.modal_is_open() => Task::none(),
+            Message::TogglePaneInspector(_) | Message::ClosePaneInspector(_) if self.modal_is_open() => Task::none(),
             Message::TogglePaneInspector(card) => self.toggle_pane_inspector(card),
+            Message::ClosePaneInspector(card) => self.close_pane_inspector_overlay(card),
             Message::ContextSection(_) if self.modal_is_open() => Task::none(),
             Message::ContextSection(action) => self.handle_context_section(action),
             // Reported on the first layout and whenever the size changes,

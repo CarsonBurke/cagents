@@ -352,6 +352,23 @@ impl Cagents {
         self.set_pane_inspector_open(card, open)
     }
 
+    pub(super) fn close_pane_inspector_overlay(&mut self, card: CardId) -> Task<Message> {
+        if !self.pane_inspectors.is_open(card)
+            || self.pane_inspector_layout(card) != Some(InspectorLayout::Overlay)
+        {
+            return Task::none();
+        }
+        // Escape belongs to the inspector whose descendants hold native
+        // focus, even if the pointer last activated another pane.
+        let update = self
+            .workspace
+            .focus_without_scrolling(card)
+            .unwrap_or_else(|_| ViewportUpdate::unchanged());
+        self.workspace.take_widget_focus_request();
+        let viewport = self.apply_viewport(update, false, DurableChange::None);
+        Task::batch([viewport, self.set_pane_inspector_open(card, false)])
+    }
+
     pub(super) fn advance_pane_inspector_transitions(&mut self, now: Instant) -> Task<Message> {
         // The floating toggle replaces the outgoing panel's toggle once the
         // slide ends. Focus that newly mounted control, unless the user has
@@ -370,7 +387,7 @@ impl Cagents {
         let focus = closing_overlay
             .filter(|card| self.pane_inspector_layout(*card).is_none())
             .map_or_else(Task::none, |card| {
-                iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
+                workspace_widget::focus_if_unheld(self.pane_inspector_toggle_id(card))
                     .map(cosmic::Action::App)
             });
         Task::batch([self.rebind_source_control(), focus])
@@ -541,6 +558,20 @@ impl Cagents {
     fn pane_inspector_panel(&self, card: CardId, width: f32, open: bool) -> Element<'_, Message> {
         let sections =
             self.context_sections_view(card, width, self.pane_inspector_toggle(card, open));
+        let overlay = open
+            && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
+            && !self.modal_is_open();
+        let sections = crate::interaction::focused_key(sections, move |event| {
+            (overlay
+                && matches!(
+                    event,
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }
+                ))
+            .then_some(Message::ClosePaneInspector(card))
+        });
         widget::container(
             widget::row::with_children(vec![
                 design::vertical_rule(),
