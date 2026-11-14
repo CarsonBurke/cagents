@@ -1997,9 +1997,10 @@ mod tests {
             );
         }
         assert!(current::supports_protocol(156));
+        assert!(current::supports_protocol(173));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
-            [156, crate::terminal_ipc::PROTOCOL_VERSION]
+            [156, 173, crate::terminal_ipc::PROTOCOL_VERSION]
         );
     }
 
