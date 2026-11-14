@@ -67,6 +67,9 @@ pub(super) enum News {
     /// A provider usage limit stops an agent until it resets. The expanded
     /// sidebar's alarm.
     Limited,
+    /// How many rows a folded section holds: a neutral pill, since counting
+    /// them is not news the user has to act on.
+    Count(usize),
 }
 
 /// Who is doing the work a bottom-right spinner shows.
@@ -106,6 +109,15 @@ impl Badges {
         Self {
             news,
             activity: (summary.working != 0).then_some(Activity::Agent),
+        }
+    }
+
+    /// The Attention list's "In progress" disclosure: how many agents are at
+    /// work, and while it is folded, that the work goes on.
+    pub fn in_progress(count: usize, collapsed: bool) -> Self {
+        Self {
+            news: Some(News::Count(count)),
+            activity: collapsed.then_some(Activity::Agent),
         }
     }
 
@@ -186,7 +198,10 @@ fn ring(theme: &cosmic::Theme) -> Color {
 
 fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
     match news {
-        News::Unread(Some(count)) => unread_pill(count),
+        News::Unread(Some(count)) => count_pill(count, design::accent_color, |theme| {
+            theme.cosmic().accent.on.into()
+        }),
+        News::Count(count) => count_pill(count, design::muted_icon_color, design::rail_tray),
         News::Unread(None) => widget::container(cosmic::iced::widget::Space::new())
             .width(Length::Fixed(DOT))
             .height(Length::Fixed(DOT))
@@ -217,7 +232,11 @@ fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
     }
 }
 
-fn unread_pill<'a>(count: usize) -> Element<'a, SidebarAction> {
+fn count_pill<'a>(
+    count: usize,
+    fill: fn(&cosmic::Theme) -> Color,
+    ink: fn(&cosmic::Theme) -> Color,
+) -> Element<'a, SidebarAction> {
     let label = count_label(count);
     // A single digit is a circle; longer counts grow the pill leftwards over
     // the glyph, never past the cell.
@@ -239,15 +258,17 @@ fn unread_pill<'a>(count: usize) -> Element<'a, SidebarAction> {
     .center_y(Length::Fixed(PILL_HEIGHT))
     .align_x(Alignment::Center)
     .width(width)
-    .class(theme::Container::custom(|theme| widget::container::Style {
-        background: Some(Background::Color(design::accent_color(theme))),
-        text_color: Some(theme.cosmic().accent.on.into()),
-        border: Border {
-            color: ring(theme),
-            width: RING,
-            radius: (PILL_HEIGHT / 2.0).into(),
-        },
-        ..Default::default()
+    .class(theme::Container::custom(move |theme| {
+        widget::container::Style {
+            background: Some(Background::Color(fill(theme))),
+            text_color: Some(ink(theme)),
+            border: Border {
+                color: ring(theme),
+                width: RING,
+                radius: (PILL_HEIGHT / 2.0).into(),
+            },
+            ..Default::default()
+        }
     }))
     .into()
 }
