@@ -191,8 +191,10 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
     }
 }
 
-/// Fades any one line of text that overflows, such as a [`rich_text`] label
-/// with highlighted matches, as [`FadeText`] fades plain text.
+/// Fades the end of any one line of text that overflows, such as a
+/// [`rich_text`] label with highlighted matches, as [`FadeText`] fades plain
+/// text. Only the end: a line moved back to show its end is drawn outside its
+/// own bounds, which rich text skips drawing.
 ///
 /// The line must not wrap or ellipsize, and must keep its default shrinking
 /// width, which is how its full width is measured; size the row around it
@@ -202,14 +204,11 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
 /// line's start, where a fade rarely reaches.
 ///
 /// [`rich_text`]: cosmic::iced::widget::rich_text
-pub fn fade_overflow<'a, Message: 'a>(
-    line: impl Into<Element<'a, Message>>,
-    edge: FadeEdge,
-) -> Element<'a, Message> {
+pub fn fade_line<'a, Message: 'a>(line: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Element::new(Faded {
         line: line.into(),
         class: None,
-        edge,
+        edge: FadeEdge::End,
         cut: false,
     })
 }
@@ -593,7 +592,7 @@ mod tests {
         ])
         .size(design::TEXT_BODY)
         .wrapping(Wrapping::None);
-        let (natural, width) = measure(fade_overflow(rich, FadeEdge::End), 80.0);
+        let (natural, width) = measure(fade_line(rich), 80.0);
         assert!((natural - plain).abs() < 1.0, "{natural} vs {plain}");
         assert!(width <= 80.0);
     }

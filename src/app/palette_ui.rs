@@ -244,12 +244,11 @@ fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static,
     if start < label.len() || spans.is_empty() {
         spans.push(Span::new(label[start..].to_owned()));
     }
-    widget::container(crate::ui_controls::fade_overflow(
+    widget::container(crate::ui_controls::fade_line(
         iced::widget::rich_text(spans)
             .size(design::TEXT_BODY)
             .font(font)
             .wrapping(iced::widget::text::Wrapping::None),
-        crate::ui_controls::FadeEdge::End,
     ))
     .width(Length::Fill)
     .clip(true)
