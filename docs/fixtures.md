@@ -440,6 +440,15 @@ state. This exercises the real daemon's mutation API and the native UI's
 projection, using fixture shells and no model provider. The competing window
 and delayed request are scripted; unit tests cover the UI's capture and queue.
 
+For a real native stale Close gesture, run `prepare-live` instead. Open **Native
+Close race**, open the original terminal's Close confirmation, then run
+`replace-live` before confirming it. The fixture stops its own original shell
+and publishes another worker under the same terminal ID and recipe. Confirm
+the old native dialog and inspect the surviving replacement and refusal state.
+The private scene file prevents delivering the replacement twice. These modes
+use a sleeping fixture shell and no model provider; stopping native-evidence
+cleans up its workers. Exercise a fresh native Close afterward as well.
+
 Write the scene as steps, not as instructions in a PR comment, so the next
 agent can rerun it:
 

@@ -1,6 +1,6 @@
 //! Reproduce a delayed Close against a replacement in a native-evidence fixture.
 //! The ordinary daemon and UI run; only the competing window is scripted.
-//! Usage: shared-removal-fixture PROTOCOL unconditional|conditional
+//! Usage: shared-removal-fixture PROTOCOL unconditional|conditional|prepare-live|replace-live
 use cagents::{
     model::{
         CardId, CardKind, ChannelId, HostSessionProof, LaunchRecipe, ProjectId, RepositoryView,
@@ -237,6 +237,105 @@ fn session(directory: PathBuf, text: &str) -> TerminalSession {
     }
 }
 
+fn live_session(directory: PathBuf) -> TerminalSession {
+    let mut source = session(directory, "Close race worker is running");
+    source.launch.arguments[1].push_str("; sleep 600");
+    source.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: source.launch.clone(),
+        last_exit: None,
+    };
+    source
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LiveScene {
+    scope: Scope,
+    pane: Pane,
+    replaced: bool,
+}
+
+fn replace_live(peer: &mut Peer, fixture: &Path, repository: &Path) -> Result<()> {
+    let path = fixture.join("live-close-scene.json");
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err("live fixture scene must be a regular private file".into());
+    }
+    let mut scene: LiveScene = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if scene.replaced {
+        return Err("live fixture replacement was already delivered".into());
+    }
+    let CardKind::Terminal(source) = &scene.pane.kind else {
+        return Err("live fixture scene is not a terminal".into());
+    };
+    if source.launch != live_session(fixture.join("project")).launch {
+        return Err("live fixture launch escaped the scripted shell scene".into());
+    }
+    let model = peer.model()?;
+    let Scope::Channel(channel) = scene.scope else {
+        return Err("live fixture requires its channel".into());
+    };
+    if model
+        .channel(channel)
+        .is_none_or(|channel| channel.repository != repository)
+    {
+        return Err("live fixture channel belongs to another project".into());
+    }
+    let current = model
+        .views
+        .iter()
+        .find(|view| view.scope == scene.scope)
+        .and_then(|view| view.panes.iter().find(|pane| pane.id == scene.pane.id))
+        .ok_or("live fixture original pane disappeared")?
+        .clone();
+    if !cagents::workspace_model::views::same_removal_source(&scene.pane, &current) {
+        return Err("live fixture original source changed before replacement".into());
+    }
+    peer.request(ClientRequest::Attach {
+        terminal_id: source.id,
+        after_generation: 0,
+        after_event_sequence: 0,
+    })?;
+    peer.request(ClientRequest::ShutdownTerminal {
+        terminal_id: source.id,
+    })?;
+    let current = peer
+        .model()?
+        .views
+        .into_iter()
+        .find(|view| view.scope == scene.scope)
+        .and_then(|view| view.panes.into_iter().find(|pane| pane.id == scene.pane.id))
+        .ok_or("live fixture pane disappeared during original cleanup")?;
+    if !cagents::workspace_model::views::same_removal_source(&scene.pane, &current) {
+        return Err("live fixture source changed during original cleanup".into());
+    }
+    let mut replacement = current.clone();
+    let mut session = source.clone();
+    session.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: session.launch.clone(),
+        last_exit: None,
+    };
+    replacement.kind = CardKind::Terminal(session);
+    replacement.title = "Replacement terminal".into();
+    replacement.user_title = Some(replacement.title.clone());
+    replacement.pending_terminal_start = true;
+    peer.change(
+        &scene.scope,
+        Change::Update {
+            before: current,
+            pane: replacement,
+        },
+    )?;
+    peer.request(ClientRequest::CompletePendingTerminal {
+        pane: scene.pane.id,
+        terminal_id: source.id,
+        options: TerminalSpawnOptions::default(),
+    })?;
+    scene.replaced = true;
+    std::fs::write(path, serde_json::to_vec(&scene)?)?;
+    println!("Native Close fixture replaced the worker under the same terminal ID and recipe");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let fixture = PathBuf::from(
         std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").ok_or("requires native-evidence fixture")?,
@@ -248,10 +347,13 @@ fn main() -> Result<()> {
     }
     let mut args = std::env::args().skip(1);
     let version = args.next().ok_or("missing protocol")?.parse()?;
-    let conditional = match args.next().as_deref() {
-        Some("conditional") => true,
-        Some("unconditional") => false,
-        _ => return Err("expected conditional or unconditional".into()),
+    let mode = args.next().ok_or("missing fixture mode")?;
+    let conditional = match mode.as_str() {
+        "conditional" => true,
+        "unconditional" | "prepare-live" | "replace-live" => false,
+        _ => {
+            return Err("expected conditional, unconditional, prepare-live or replace-live".into());
+        }
     };
     if args.next().is_some() {
         return Err("unexpected fixture arguments".into());
@@ -292,11 +394,22 @@ fn main() -> Result<()> {
         .find(|project| project.repository.starts_with(&fixture_project))
         .ok_or("open the fixture project first")?;
     let repository = project.repository.clone();
+    if mode == "replace-live" {
+        return replace_live(&mut peer, &fixture, &repository);
+    }
+    if mode == "prepare-live" && fixture.join("live-close-scene.json").exists() {
+        return Err("live fixture scene already exists".into());
+    }
     let channel = ChannelId::new();
     peer.edit(ModelEdit::CreateChannel {
         id: channel,
         repository: repository.clone(),
-        title: "Shared Close race".into(),
+        title: if mode == "prepare-live" {
+            "Native Close race"
+        } else {
+            "Shared Close race"
+        }
+        .into(),
         title_source: cagents::model::ChannelTitleSource::Manual,
     })?;
     let scope = Scope::Channel(channel);
@@ -314,7 +427,11 @@ fn main() -> Result<()> {
             selected_file: None,
         }),
     };
-    let original = session(fixture.join("project"), "Original worker");
+    let original = if mode == "prepare-live" {
+        live_session(fixture.join("project"))
+    } else {
+        session(fixture.join("project"), "Original worker")
+    };
     let card = CardId::new();
     let victim = Pane {
         id: card,
@@ -335,6 +452,31 @@ fn main() -> Result<()> {
         terminal_id: original.id,
         options: TerminalSpawnOptions::default(),
     })?;
+    if mode == "prepare-live" {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let pane = peer
+            .model()?
+            .views
+            .into_iter()
+            .find(|view| view.scope == scope)
+            .and_then(|view| view.panes.into_iter().find(|pane| pane.id == card))
+            .ok_or("missing live fixture pane")?;
+        let scene = LiveScene {
+            scope,
+            pane,
+            replaced: false,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(fixture.join("live-close-scene.json"))?;
+        file.write_all(&serde_json::to_vec(&scene)?)?;
+        println!(
+            "Native Close fixture ready: open its original terminal's real Close confirmation"
+        );
+        return Ok(());
+    }
     let ended = peer.ended(original.id)?;
     let model = peer.model()?;
     let before = model
