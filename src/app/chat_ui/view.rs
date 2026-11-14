@@ -4267,7 +4267,7 @@ impl Runtime {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
         if !self.is_draft()
-            && let Some(choice) = staged_model_choice(&self.snapshot)
+            && let Some(choice) = staged_model_choice(&self.snapshot, self.session.launch.provider)
         {
             tooltip = format!("{choice} applies from the next turn");
         }
@@ -4352,7 +4352,7 @@ impl Runtime {
                 .find(|model| Some(&model.id) == self.snapshot.selected_model.as_ref())
             && !model.reasoning.is_empty()
         {
-            let default_effort = reasoning_default(&self.snapshot, model, catalog);
+            let default_effort = reasoning_default(&self.snapshot, provider, model, catalog);
             let mut choices = vec![picker_section_header(
                 widget::row::with_children(vec![
                     iced::widget::Space::new()
@@ -6244,29 +6244,36 @@ fn reasoning_rows<'a>(
         .collect()
 }
 
-fn model_matches_active(model: &chat::Model, active: &chat::ActiveModel) -> bool {
+fn model_matches_active(
+    provider: Provider,
+    model: &chat::Model,
+    active: &chat::ActiveModel,
+) -> bool {
     model.id == active.id
-        || (matches!(
-            model.id.as_str(),
-            "default" | "opus" | "sonnet" | "haiku" | "opusplan"
-        ) && (model.label == active.label
-            || (model.id == "default" && model.label == format!("Default ({})", active.label))))
+        || (provider == Provider::Claude
+            && matches!(
+                model.id.as_str(),
+                "default" | "opus" | "sonnet" | "haiku" | "opusplan"
+            )
+            && (model.label == active.label
+                || (model.id == "default" && model.label == format!("Default ({})", active.label))))
 }
 
 fn reasoning_default<'a>(
     snapshot: &'a chat::Snapshot,
+    provider: Provider,
     model: &chat::Model,
     catalog: Option<&'a crate::account::cache::Catalog>,
 ) -> Option<&'a str> {
     snapshot
         .active_model
         .as_ref()
-        .filter(|active| model_matches_active(model, active))
+        .filter(|active| model_matches_active(provider, model, active))
         .and_then(|active| active.default_reasoning.as_deref())
         .or_else(|| catalog.and_then(|catalog| catalog.default_effort(Some(&model.id))))
 }
 
-fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
+fn staged_model_choice(snapshot: &chat::Snapshot, provider: Provider) -> Option<String> {
     let active = snapshot.active_model.as_ref()?;
     let selected = snapshot.selected_model.as_deref();
     let model = snapshot
@@ -6274,7 +6281,7 @@ fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
         .iter()
         .find(|model| Some(model.id.as_str()) == selected);
     let model_changed = selected.is_some_and(|id| id != active.id)
-        && !model.is_some_and(|model| model_matches_active(model, active));
+        && !model.is_some_and(|model| model_matches_active(provider, model, active));
     let default = active.default_reasoning.as_deref();
     let effort_changed =
         snapshot.reasoning.as_deref().or(default) != active.reasoning.as_deref().or(default);
@@ -15663,28 +15670,34 @@ mod tests {
             reasoning: None,
             default_reasoning: Some("medium".into()),
         });
-        assert_eq!(staged_model_choice(snapshot), None);
+        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
         snapshot.models.push(model("opus", "Opus 5.5"));
         snapshot.selected_model = Some("opus".into());
         assert_eq!(
-            staged_model_choice(snapshot),
+            staged_model_choice(snapshot, Provider::Claude),
             None,
             "ordinary aliases also resolve to the running model"
         );
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = Some("high".into());
-        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("High"));
+        assert_eq!(
+            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            Some("High")
+        );
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
             "Opus 5.5"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
-        assert_eq!(staged_model_choice(snapshot), None);
+        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
         snapshot.reasoning = None;
-        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("Default"));
+        assert_eq!(
+            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            Some("Default")
+        );
         snapshot.selected_model = Some("next".into());
         assert_eq!(
-            staged_model_choice(snapshot).as_deref(),
+            staged_model_choice(snapshot, Provider::Claude).as_deref(),
             Some("Next model · Default")
         );
         let catalog = crate::account::cache::Catalog {
@@ -15694,22 +15707,35 @@ mod tests {
             reasoning_defaults: [("next".into(), "high".into())].into(),
         };
         assert_eq!(
-            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
+            reasoning_default(
+                snapshot,
+                Provider::Claude,
+                &snapshot.models[1],
+                Some(&catalog)
+            ),
             Some("high")
         );
-        assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
+        assert_eq!(
+            reasoning_default(snapshot, Provider::Claude, &snapshot.models[1], None),
+            None
+        );
         snapshot.models[1].label = "Opus 5.5".into();
         assert_eq!(
-            staged_model_choice(snapshot).as_deref(),
+            staged_model_choice(snapshot, Provider::Claude).as_deref(),
             Some("Opus 5.5 · Default"),
             "distinct concrete models can share a display name"
         );
         assert_eq!(
-            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
+            reasoning_default(
+                snapshot,
+                Provider::Claude,
+                &snapshot.models[1],
+                Some(&catalog)
+            ),
             Some("high")
         );
         snapshot.active_model = None;
-        assert_eq!(staged_model_choice(snapshot), None);
+        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
         snapshot.selected_model = Some("default".into());
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
