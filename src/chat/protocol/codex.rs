@@ -9849,12 +9849,13 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
             label: "Next model".into(),
             reasoning: vec!["high".into()],
         });
-        adapter.busy = true;
-        adapter.turn = Some("active".into());
         adapter.effective_model = Some("model".into());
         adapter.effective_reasoning = Some("future-effort".into());
-        adapter.running_model = adapter.effective_model.clone();
-        adapter.running_reasoning = adapter.effective_reasoning.clone();
+        adapter
+            .receive(json!({"method":"turn/started","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
         let change = adapter
             .command(Command::SetModel {
                 model: "next-model".into(),
@@ -9894,10 +9895,13 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
     #[test]
     fn active_model_does_not_change_when_thread_defaults_change_during_a_turn() {
         let mut adapter = adapter();
-        adapter.busy = true;
-        adapter.turn = Some("active".into());
-        adapter.running_model = Some("model".into());
-        adapter.running_reasoning = Some("future-effort".into());
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("future-effort".into());
+        adapter
+            .receive(json!({"method":"turn/started","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
         let change = adapter
             .receive(json!({"method":"thread/settings/updated","params":{
                 "threadId":"thread-exact","threadSettings":{"model":"next-model","effort":"high"}

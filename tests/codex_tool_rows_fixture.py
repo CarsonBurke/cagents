@@ -146,6 +146,21 @@ class CodexToolRowsFixture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "nonempty model/list result"):
                 PEER["Scenario"]().request({"id": 1, "method": "model/list"}, home)
 
+    def test_native_evidence_can_hold_a_turn_without_environment_forwarding(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-turn-pause").write_text("20\n")
+            scenario = PEER["Scenario"]()
+            responses = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual([frame["_sleep"] for frame in responses if "_sleep" in frame], [20])
+            for invalid in ("NaN", "-1", "301", "not seconds"):
+                Path(home, "fixture-turn-pause").write_text(invalid)
+                scenario = PEER["Scenario"]()
+                with self.assertRaisesRegex(ValueError, "seconds between 0 and 300"):
+                    scenario.request({"id": 1, "method": "turn/start", "params": {
+                        "threadId": scenario.thread}}, home)
+
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {

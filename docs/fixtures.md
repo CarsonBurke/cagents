@@ -227,6 +227,10 @@ one. Model and effort overrides sent with later turns are retained when the
 fixture thread resumes. Without the file, it keeps the usual `fixture-mini`
 catalog. This exercises catalog and selection handling, without checking
 which models or efforts a live account can use.
+`home/.codex/fixture-turn-pause` optionally holds a number of seconds from 0
+to 300 for the peer's busy turn, instead of its usual six-second pause.
+The footer scene uses 20 seconds so native capture can show confirmed running
+work without depending on how quickly OCR and screenshot conversion finish.
 
 [`tests/fixtures/chat-footer-scene.sh`](../tests/fixtures/chat-footer-scene.sh)
 captures a draft, a started conversation, the open model picker and a selected

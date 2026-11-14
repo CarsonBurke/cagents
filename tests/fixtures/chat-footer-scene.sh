@@ -28,7 +28,9 @@ fi
     "$fixture/home/.claude/fixture-models.json"
 "$ne" env sh -c 'printf "%s\n" "$1" >"$HOME/.codex/fixture-models.json"' sh \
     '{"data":[{"id":"offline-mini","model":"offline-mini","displayName":"Offline Mini","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}],"nextCursor":null}'
+"$ne" env sh -c 'printf "%s\n" 20 >"$HOME/.codex/fixture-turn-pause"'
 "$ne" env sh -c 'printf "%s\n" "The offline footer fixture is ready." >"$HOME/.claude/fixture-reply.md"'
+"$ne" env sh -c 'printf "%s\n" 1 >"$HOME/.claude/fixture-first-turn-seconds"'
 "$ne" env sh -c 'printf "%s\n" "$1" "$2" >"$HOME/.claude/fixture-frames.jsonl"' sh \
     '{"type":"assistant","uuid":"footer-start-@TURN@","message":{"id":"footer-start-@TURN@","role":"assistant","content":[{"type":"text","text":"Checking the offline footer."}]}}' \
     '{"_sleep":20}'
@@ -55,13 +57,24 @@ composer() {
     local at
     at=$(locate 'Message')
     if [ -z "$at" ]; then
-        # In the old footer the permission label is just below the editor.
+        # Token figures can wrap the old footer and move its permission
+        # caption to a second line. The composer's + stays beside the input.
         at=$("$ne" drive observe 2>/dev/null |
-            sed -nE '/Ask before|Read.only/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
-            tail -1 | awk '{printf "%d,%d", $1 + 70, $2 + $4 / 2 - 45}')
+            sed -nE '/ +\+$/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
+            tail -1 | awk '{printf "%d,%d", $1 + 75, $2 + $4 / 2}')
     fi
     [ -n "$at" ] || { echo 'Could not locate the native chat composer.' >&2; return 1; }
     "$ne" drive click "$at" >/dev/null
+}
+reasoning() {
+    local at
+    # OCR may join the old control's caption to the following token counts;
+    # its leading 25 pixels are still inside the Reasoning button.
+    at=$("$ne" drive observe 2>/dev/null |
+        sed -nE '/Reasoning/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
+        tail -1 | awk '{printf "%d,%d", $1 + 25, $2 + $4 / 2}')
+    [ -n "$at" ] || { echo 'Could not locate the old Reasoning control.' >&2; return 1; }
+    "$ne" drive click "$at"
 }
 prompt() {
     composer
@@ -69,37 +82,39 @@ prompt() {
     "$ne" drive key Return
 }
 
+# Narrow windows begin with the inspector as a modal overlay. Escape closes
+# it; the wide docked inspector uses its ordinary toggle. Establish the
+# resulting state before asking the workspace to handle any shortcuts.
+"$ne" drive key Escape
+observed=$("$ne" drive observe)
+if rg -F 'Source control' <<<"$observed" >/dev/null; then
+    "$ne" drive key ctrl+shift+i
+fi
+"$ne" drive wait 'Source control' --gone --timeout 20
 "$ne" cli project open "$fixture/project" >/dev/null
-sleep 2
-"$ne" drive key ctrl+shift+g
-sleep 2
+"$ne" drive wait main --timeout 30
+"$ne" drive click main
 for provider in claude codex; do
-    "$ne" drive key ctrl+t
-    sleep 2
-    if [ "$provider" = claude ]; then
-        # A fresh fixture opens the inspector by default; keep the footer's
-        # conversation pane available at both requested viewport widths.
-        "$ne" drive key ctrl+shift+i
-    fi
+    # Separate channels keep the tested footer at the full conversation pane
+    # width instead of adding the second provider as a neighbouring column.
+    "$ne" drive key ctrl+shift+g
+    "$ne" drive wait 'conversation appears' --timeout 30
     "$ne" drive key ctrl+shift+m
+    "$ne" drive wait models --timeout 20
     "$ne" drive type "$provider"
-    if [ "$provider" = claude ]; then
-        if [ "${SIDE:-after}" = before ]; then alias='Default (recommended)';
-        else alias='Default (Opus 5.5)'; fi
-        "$ne" drive wait "$alias" --timeout 20
-        "$ne" drive click "$alias"
-    else
-        "$ne" drive wait 'Default model' --timeout 20
-        "$ne" drive click 'Default model'
-    fi
-    sleep 2
+    # A provider search puts its default first. Enter selects that native
+    # top match, whether its catalog has been observed or not.
+    "$ne" drive key Return
+    "$ne" drive wait models --gone --timeout 20
+    case $provider in claude) draft_title='Claude chat';; codex) draft_title='Codex chat';; esac
+    "$ne" drive --window "$draft_title" observe --no-text
     shot "$provider-draft"
 
     prompt "Show the $provider footer using the offline provider default."
     if [ "$provider" = claude ]; then
-        "$ne" drive wait 'Checking the offline footer' --timeout 30
+        "$ne" drive wait 'offline footer' --timeout 30
     else
-        "$ne" drive wait 'Offline Mini' --timeout 30
+        "$ne" drive wait 'Offline' --timeout 30
     fi
     shot "$provider-running"
     "$ne" drive key ctrl+shift+m
@@ -108,12 +123,17 @@ for provider in claude codex; do
 
     # Model changes in Codex stage the next turn. Let this turn finish, choose
     # the effort, then submit a follow-up so the peer confirms the selection.
-    if [ "$provider" = claude ]; then sleep 20; else sleep 7; fi
+    sleep 20
 
     if [ "${SIDE:-after}" = before ]; then
         "$ne" drive key Escape
-        "$ne" drive click 'Reasoning'
+        reasoning
         "$ne" drive click 'high'
+    elif [ "$provider" = codex ]; then
+        # Search → the sole model → Low → Medium → High. The model popup's
+        # search still owns focus after its screenshot and the provider pause.
+        for _ in 1 2 3 4; do "$ne" drive key Tab; done
+        "$ne" drive key Return
     else
         "$ne" drive click 'High'
     fi
@@ -121,4 +141,7 @@ for provider in claude codex; do
     prompt "Confirm the $provider footer with high effort."
     sleep 2
     shot "$provider-high-effort"
+    # Settle while this channel remains visible, so the next provider's
+    # sidebar has the same read/finished state on both revisions.
+    if [ "$provider" = claude ]; then sleep 20; fi
 done

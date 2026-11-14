@@ -281,7 +281,7 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True):
+    def notifications(self, turn, starts_child=True, pause=PAUSE):
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
         started, completed = [], []
@@ -304,7 +304,7 @@ class Scenario:
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
                 *replayed,
                 *child_started,
-                *started, diff, {"_sleep": PAUSE}, *completed,
+                *started, diff, {"_sleep": pause}, *completed,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
@@ -372,6 +372,15 @@ class Scenario:
                     or self.child_latest and self.child_latest["status"] == "inProgress"
                     and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
+            pause = PAUSE
+            pause_file = Path(codex_home) / "fixture-turn-pause"
+            if pause_file.is_file():
+                try:
+                    pause = float(pause_file.read_text())
+                    if not 0 <= pause <= 300:
+                        raise ValueError()
+                except ValueError:
+                    raise ValueError("fixture-turn-pause must hold seconds between 0 and 300") from None
             if params.get("model"):
                 self.model = params["model"]
             if "effort" in params:
@@ -384,7 +393,7 @@ class Scenario:
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child)
+            after = self.notifications(turn, starts_child, pause)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):

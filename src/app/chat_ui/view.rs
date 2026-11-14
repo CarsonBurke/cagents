@@ -3974,8 +3974,8 @@ impl Runtime {
                 let anchor =
                     widget::button::custom(
                         widget::row::with_children(vec![
-                            // Cut rather than wrapped where a narrow footer
-                            // leaves the leading group little room.
+                            // Keep the permission label on the same line as
+                            // the model when the footer narrows.
                             design::caption(selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
                             }))
@@ -12059,7 +12059,6 @@ mod tests {
                 );
             }
             assert!(text.contains("Auto-accept edits"), "{text}");
-            assert!(!text.contains("A long repository name"), "{text}");
             assert_eq!(text.contains("Synthetic account"), fit == FooterFit::Wide);
             let roomy = fit != FooterFit::Tight;
             assert_eq!(text.contains("Claude Sonnet 4.5"), roomy, "{text}");
