@@ -139,14 +139,11 @@ pub(super) fn overlay<'a>(
 ) -> Element<'a, Message> {
     let progress = progress.clamp(0.0, 1.0);
     let background = widget::container(iced::widget::Space::new())
-        .class(cosmic::theme::Container::custom(move |_| {
+        .class(cosmic::theme::Container::custom(move |theme| {
             iced::widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.0,
-                    0.0,
-                    0.0,
-                    design::SCRIM_ALPHA * progress,
-                ))),
+                background: Some(iced::Background::Color(
+                    design::modal_scrim(theme).scale_alpha(progress),
+                )),
                 ..Default::default()
             }
         }))
