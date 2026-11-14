@@ -11,7 +11,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -331,35 +331,76 @@ impl SidebarModel {
         })
     }
 
-    /// Rebuilds each project's [`SidebarProject::attention_cards`] from the
-    /// state's last attention projection. `title` names a card as its pane
-    /// does; a card it cannot name gets no row.
+    /// The projects whose [`SidebarProject::attention_cards`] no longer
+    /// match the state's last attention projection, or name a pane other
+    /// than `title` does now. A title report usually changes no row, so this
+    /// compares in place and allocates nothing per row; only the projects it
+    /// returns need [`Self::set_attention_cards`].
+    pub fn stale_attention_cards<'t>(
+        &self,
+        state: &SidebarState,
+        mut title: impl FnMut(CardId) -> Option<&'t str>,
+    ) -> Vec<ProjectId> {
+        let mut matched: HashMap<ProjectId, usize> = self
+            .projects
+            .iter()
+            .map(|project| (project.id, 0))
+            .collect();
+        let mut stale = BTreeSet::new();
+        for card in state.projected_cards() {
+            let Some(title) = title(card.card) else {
+                continue;
+            };
+            let Some(project) = self.project(card.project) else {
+                continue;
+            };
+            let Some(index) = matched.get_mut(&card.project) else {
+                continue;
+            };
+            if !project
+                .attention_cards
+                .get(*index)
+                .is_some_and(|row| row.shows(card, title))
+            {
+                stale.insert(card.project);
+            }
+            *index += 1;
+        }
+        for project in &self.projects {
+            if matched.get(&project.id) != Some(&project.attention_cards.len()) {
+                stale.insert(project.id);
+            }
+        }
+        stale.into_iter().collect()
+    }
+
+    /// Rebuilds the [`SidebarProject::attention_cards`] of `projects` from
+    /// the state's last attention projection; see
+    /// [`Self::stale_attention_cards`]. `title` names a card as its pane
+    /// does; a card it cannot name gets no row. Unchanged rows are kept.
     pub fn set_attention_cards(
         &mut self,
         state: &SidebarState,
+        projects: &[ProjectId],
         mut title: impl FnMut(CardId) -> Option<String>,
     ) {
         let projected = state.projected_cards();
-        for project in &mut self.projects {
-            let mut previous: std::collections::HashMap<_, _> =
-                std::mem::take(&mut project.attention_cards)
-                    .into_iter()
-                    .map(|row| (row.id, row))
-                    .collect();
+        for project in self
+            .projects
+            .iter_mut()
+            .filter(|project| projects.contains(&project.id))
+        {
+            let mut previous: HashMap<_, _> = std::mem::take(&mut project.attention_cards)
+                .into_iter()
+                .map(|row| (row.id, row))
+                .collect();
             project.attention_cards = projected
                 .iter()
                 .filter(|card| card.project == project.id)
                 .filter_map(|card| {
                     let title = title(card.card)?;
                     Some(match previous.remove(&card.card) {
-                        Some(row)
-                            if row.title == title
-                                && row.terminal == card.terminal
-                                && row.worktree == card.worktree
-                                && row.attention == card.summary =>
-                        {
-                            row
-                        }
+                        Some(row) if row.shows(card, &title) => row,
                         _ => SidebarCard::new(
                             card.card,
                             title,
@@ -624,6 +665,15 @@ impl SidebarCard {
         } else {
             Icon::Chat
         }
+    }
+
+    /// Whether the row already draws `card` as titled `title`.
+    fn shows(&self, card: &ProjectedCard, title: &str) -> bool {
+        self.id == card.card
+            && self.title == title
+            && self.terminal == card.terminal
+            && self.worktree == card.worktree
+            && self.attention == card.summary
     }
 
     /// How well the row matches a search: by its title, or by the checkout
@@ -14924,13 +14974,19 @@ pub(crate) mod tests {
         durable: &Arc<crate::model::WorkspaceState>,
     ) {
         state.refresh_attention_projection(durable, &model.projects);
-        model.set_attention_cards(state, |id| {
+        let title = |id| {
             durable
                 .cards
                 .iter()
                 .find(|card| card.id == id)
-                .map(|card| card.title.clone())
-        });
+                .map(|card| card.title.as_str())
+        };
+        let stale = model.stale_attention_cards(state, title);
+        model.set_attention_cards(state, &stale, |id| title(id).map(str::to_owned));
+        assert!(
+            model.stale_attention_cards(state, title).is_empty(),
+            "rebuilt rows match the projection they were built from"
+        );
     }
 
     #[test]
