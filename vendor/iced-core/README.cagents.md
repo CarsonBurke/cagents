@@ -42,3 +42,17 @@ depend on the number of enclosing wrappers. The patched Winit consumer uses
 `into_native_rectangles` to reverse once when registering the final native list.
 App regressions cover plain, nested surface, real Scrollable, file-drop scaling,
 and combined wrappers with a preceding root sibling.
+
+## Text cursor blink schedule
+
+`text::Blink` is the one schedule for every text cursor: an interval, and a
+timeout after the last input when the cursor rests visible and needs no more
+frames. Its default, 500 ms with a ten-second timeout, matches GTK's
+`gtk-cursor-blink-timeout`. iced's `TextEditor` and `TextInput`
+(`vendor/iced-widget`), libcosmic's `TextInput` (`vendor/libcosmic`), and the
+app's code editor and terminal use it, so a focused field stops repainting its
+window twice a second while nobody types.
+
+```sh
+cargo test --manifest-path vendor/iced-core/Cargo.toml text::blink
+```

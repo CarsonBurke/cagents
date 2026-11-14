@@ -1,12 +1,15 @@
 use super::*;
+use std::sync::mpsc;
 
-// The peer sends a complete, valid response, rather than causing EOF or an
-// invalid frame. Each fragment makes progress within the ordinary idle timeout.
-fn progressing_connected_peer(
+// The peer sends a complete, valid Connected response a byte at a time, each
+// within `interval`, rather than causing EOF or an invalid frame. It stops
+// once the client has given up. A client whose deadline each byte renewed
+// would read the whole frame and connect.
+fn trickling_connected_peer(
     mut stream: UnixStream,
     interval: Duration,
-) -> thread::JoinHandle<[Instant; 3]> {
-    stream.set_read_timeout(Some(IO_TIMEOUT * 2)).unwrap();
+    given_up: mpsc::Receiver<()>,
+) -> thread::JoinHandle<()> {
     stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
     thread::spawn(move || {
         let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
@@ -28,16 +31,32 @@ fn progressing_connected_peer(
             &connected_envelope(1, expected.clone(), expected),
         )
         .unwrap();
-        let origin = Instant::now();
-        stream.write_all(&frame[..2]).unwrap();
-        let first = Instant::now();
-        thread::sleep((origin + interval).saturating_duration_since(Instant::now()));
-        stream.write_all(&frame[2..5]).unwrap();
-        let second = Instant::now();
-        thread::sleep((origin + interval * 2).saturating_duration_since(Instant::now()));
-        stream.write_all(&frame[5..]).unwrap();
-        [first, second, Instant::now()]
+        for byte in frame {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            if !matches!(
+                given_up.recv_timeout(interval),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                break;
+            }
+        }
     })
+}
+
+/// Connect through a trickling peer and return how the handshake ended.
+fn handshake_through_trickle(
+    interval: Duration,
+    connect: impl FnOnce(UnixStream) -> Result<ControlClient, ControlError> + Send + 'static,
+) -> Result<(), ControlError> {
+    let (stream, peer_stream) = UnixStream::pair().unwrap();
+    let (give_up, given_up) = mpsc::channel();
+    let peer = trickling_connected_peer(peer_stream, interval, given_up);
+    let result = crate::test_timing::returns("the handshake", move || connect(stream).map(drop));
+    let _ = give_up.send(());
+    peer.join().unwrap();
+    result
 }
 
 #[test]
@@ -45,72 +64,26 @@ fn default_handshake_deadline_bounds_a_progressing_partial_connected_frame() {
     // This parent exercises the real local default, without changing device
     // selection or the production five-second budget.
     assert!(!crate::device::is_remote());
-    let (stream, peer_stream) = UnixStream::pair().unwrap();
-    // A timeout drops the constructor's FD. Keep the endpoint alive so the
-    // peer still completes its valid frame; an EOF/write error cannot pass.
-    let retained_endpoint = stream.try_clone().unwrap();
-    let peer = progressing_connected_peer(peer_stream, Duration::from_secs(3));
-    let started = Instant::now();
-    let result = ControlClient::from_stream(stream);
-    let constructor_elapsed = started.elapsed();
-    let peer_result = peer.join();
-    drop(retained_endpoint);
-
-    // Join and release the retained endpoint before evaluating either outcome,
-    // including the old implementation's unexpected successful constructor.
-    let writes = peer_result.expect("the valid Connected peer must finish");
-    assert!(writes[1].duration_since(writes[0]) < IO_TIMEOUT);
-    assert!(writes[2].duration_since(writes[1]) < IO_TIMEOUT);
-    assert!(writes[2].duration_since(writes[0]) > IO_TIMEOUT);
-    match result {
-        Err(ControlError::ReplyTimeout { timeout, .. }) => {
-            assert!(timeout <= IO_TIMEOUT);
-        }
-        Ok(client) => {
-            drop(client);
-            panic!(
-                "default handshake must reject a progressing Connected frame after its original five-second budget; constructor took {constructor_elapsed:?}"
-            );
-        }
-        Err(error) => panic!(
-            "expected the default handshake deadline, got {error} after {constructor_elapsed:?}"
+    match handshake_through_trickle(Duration::from_secs(3), ControlClient::from_stream) {
+        Err(ControlError::ReplyTimeout { timeout, .. }) => assert!(timeout <= IO_TIMEOUT),
+        Ok(()) => panic!(
+            "default handshake must reject a progressing Connected frame after its original five-second budget"
         ),
+        Err(error) => panic!("expected the default handshake deadline, got {error}"),
     }
 }
 
 #[test]
 fn explicit_handshake_deadline_is_not_renewed_by_partial_frame_progress() {
-    let (stream, peer_stream) = UnixStream::pair().unwrap();
-    let retained_endpoint = stream.try_clone().unwrap();
-    let peer = progressing_connected_peer(peer_stream, Duration::from_millis(60));
     let budget = Duration::from_millis(100);
-    let started = Instant::now();
-    let deadline = started + budget;
-    let result = ControlClient::from_stream_with_deadline(stream, deadline);
-    let constructor_elapsed = started.elapsed();
-    let peer_result = peer.join();
-    drop(retained_endpoint);
-
-    let writes = peer_result.expect("the valid Connected peer must finish");
-    // Distinguish an original absolute deadline from a renewed per-read budget.
-    // Scheduling that misses these windows fails the fixture, not the oracle.
-    assert!(writes[0] < deadline);
-    assert!(writes[1] < deadline);
-    assert!(writes[2] > deadline);
-    assert!(writes[1].duration_since(writes[0]) < budget);
-    assert!(writes[2].duration_since(writes[1]) < budget);
+    let result = handshake_through_trickle(Duration::from_millis(60), move |stream| {
+        ControlClient::from_stream_with_deadline(stream, Instant::now() + budget)
+    });
     match result {
-        Err(ControlError::ReplyTimeout { timeout, .. }) => {
-            assert!(timeout <= budget);
+        Err(ControlError::ReplyTimeout { timeout, .. }) => assert!(timeout <= budget),
+        Ok(()) => {
+            panic!("explicit handshake deadline must not renew on partial-frame progress")
         }
-        Ok(client) => {
-            drop(client);
-            panic!(
-                "explicit handshake deadline must not renew on partial-frame progress; constructor took {constructor_elapsed:?}"
-            );
-        }
-        Err(error) => panic!(
-            "expected the explicit handshake deadline, got {error} after {constructor_elapsed:?}"
-        ),
+        Err(error) => panic!("expected the explicit handshake deadline, got {error}"),
     }
 }

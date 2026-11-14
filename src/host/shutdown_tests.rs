@@ -563,7 +563,7 @@ while original is not None and identity()==original:
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?;
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
             while !root.join("late-ready").exists() {
                 if Instant::now() >= deadline {
                     return Err(io::Error::other("late writer did not start"));
@@ -888,16 +888,13 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
     state
         .finish_spawn(1, healthy_session, healthy.clone(), true)
         .unwrap();
-    let ready_by = Instant::now() + Duration::from_secs(5);
-    let pid: u32 = loop {
-        if let Ok(pid) = fs::read_to_string(root.join("root-pid"))
-            && let Ok(pid) = pid.trim().parse()
-        {
-            break pid;
-        }
-        assert!(Instant::now() < ready_by, "private PTY root did not start");
-        thread::sleep(Duration::from_millis(5));
-    };
+    let pid: u32 = crate::test_timing::wait_for("the private PTY root's start", || {
+        fs::read_to_string(root.join("root-pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    });
     let original_start = start_time(pid).unwrap();
     assert_eq!(fs::read_link(format!("/proc/{pid}/cwd")).unwrap(), root);
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -925,14 +922,13 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
         let mut release = ReleaseWorkers(releases);
         let mut root_pin = root_pin;
         let (finished, result) = mpsc::sync_channel(1);
-        let started = Instant::now();
         let batch = scope.spawn(move || {
             let _ = finished.send(finish_terminal_shutdown(&handles));
         });
-        // Both unfinished bodies precede the real PTY in terminal-ID order.
-        // They must not occupy the fixed join lanes or defer its shutdown.
-        let healthy_by = started + Duration::from_secs(3);
-        loop {
+        // The unfinished bodies precede the real PTY in terminal-ID order.
+        // They must not occupy the fixed join lanes or defer its shutdown
+        // until the batch's deadline.
+        crate::test_timing::eventually("the healthy PTY's reaping", || {
             let reaped = match start_time(pid) {
                 Ok(start) => start != original_start,
                 Err(error)
@@ -943,17 +939,15 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
                 }
                 Err(error) => panic!("could not inspect the private PTY root: {error}"),
             };
-            if reaped && healthy.worker_joined_for_test() {
-                assert!(root_pin.exit_ready().unwrap());
-                root_pin.retired = true;
-                break;
-            }
+            let done = reaped && healthy.worker_joined_for_test();
             assert!(
-                Instant::now() < healthy_by,
+                done || matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
                 "healthy PTY root and actual worker were not reaped while earlier bodies blocked"
             );
-            thread::sleep(Duration::from_millis(5));
-        }
+            done
+        });
+        assert!(root_pin.exit_ready().unwrap());
+        root_pin.retired = true;
         assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert!(healthy.is_completed());
         assert!(blocked.iter().all(|worker| !worker.is_completed()));
@@ -962,13 +956,11 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
                 .iter()
                 .all(|worker| !worker.worker_joined_for_test())
         );
-        let batch_by = started + Duration::from_secs(8);
+        // With a deadline per worker rather than one for the batch, enough
+        // blocked workers take longer than this.
         let outcomes = result
-            .recv_timeout(batch_by.saturating_duration_since(Instant::now()))
-            .expect(
-                "shutdown exceeded its single shared five-second deadline and settlement margin",
-            );
-        assert!(started.elapsed() < Duration::from_secs(8));
+            .recv_timeout(TerminalHandle::SHUTDOWN_TIMEOUT + crate::test_timing::EVENTUALLY)
+            .expect("shutdown exceeded its single shared deadline");
         assert_eq!(outcomes.len(), count + 1);
         for outcome in &outcomes[..count] {
             assert_eq!(*outcome, Err(TerminalSendError::Closed));
@@ -985,18 +977,10 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
                 .all(|worker| !worker.worker_joined_for_test())
         );
         release.0.clear();
-        let released_by = Instant::now() + Duration::from_secs(5);
-        while blocked
-            .iter()
-            .any(|worker| !worker.worker_joined_for_test())
-            || TerminalHandle::reserved_worker_joins_for_test() != baseline
-        {
-            assert!(
-                Instant::now() < released_by,
-                "released OS workers did not join"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_timing::eventually("the released OS workers' joins", || {
+            blocked.iter().all(|worker| worker.worker_joined_for_test())
+                && TerminalHandle::reserved_worker_joins_for_test() == baseline
+        });
         // These factories have no PTY completion to certify, even after their
         // actual threads joined. Cached handles do not retain admission tickets.
         for worker in &blocked {
@@ -1036,13 +1020,14 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
 }
 
 #[test]
-fn shutdown_batch_two_blocked_workers_do_not_starve_healthy_cleanup() {
-    const TEST: &str =
-        "host::shutdown_tests::shutdown_batch_two_blocked_workers_do_not_starve_healthy_cleanup";
+fn shutdown_batch_blocked_workers_share_one_deadline_and_do_not_starve_healthy_cleanup() {
+    const TEST: &str = "host::shutdown_tests::shutdown_batch_blocked_workers_share_one_deadline_and_do_not_starve_healthy_cleanup";
     let Some(root) = private_runtime(TEST) else {
         return;
     };
-    unfinished_workers_do_not_starve_healthy(&root, 2);
+    // More than both join lanes, and enough that five seconds for each would
+    // outlast the batch's wait.
+    unfinished_workers_do_not_starve_healthy(&root, 16);
 }
 
 #[test]
@@ -1063,14 +1048,9 @@ fn shutdown_batch_observes_a_real_worker_panic_without_retaining_its_ticket() {
     assert!(!worker.worker_joined_for_test());
     worker.request_shutdown();
     release.0.clear();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TerminalHandle::reserved_worker_joins_for_test() != baseline {
-        assert!(
-            Instant::now() < deadline,
-            "panicked worker join was not observed"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_timing::eventually("the panicked worker's join", || {
+        TerminalHandle::reserved_worker_joins_for_test() == baseline
+    });
     assert!(!worker.is_completed());
     assert!(
         !worker.worker_joined_for_test(),
@@ -1097,7 +1077,7 @@ fn shutdown_batch_requires_actual_join_after_a_completed_body_blocks_in_tls() {
     let (worker, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
     let mut release = ReleaseWorkers(vec![release]);
     entered
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::test_timing::EVENTUALLY)
         .expect("the actual OS thread did not enter its TLS destructor");
     // Body/process publication is not an OS-thread join receipt. This control
     // has no PTY; the preceding cases independently prove real root reaping.
@@ -1108,13 +1088,15 @@ fn shutdown_batch_requires_actual_join_after_a_completed_body_blocks_in_tls() {
         baseline + 1
     );
     let _cached_screen = worker.snapshot();
-    let started = Instant::now();
-    let unconfirmed = worker.close_checked(true);
+    // The TLS destructor stays blocked until released below, so a Close that
+    // waited for it would not return.
+    let closing = worker.clone();
+    let unconfirmed =
+        crate::test_timing::returns("the checked Close", move || closing.close_checked(true));
     assert!(
         matches!(&unconfirmed, crate::terminal_ipc::TerminalCloseResult::Unknown(detail) if !detail.is_empty()),
         "a blocked TLS destructor cannot certify Close: {unconfirmed:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(8));
     assert!(worker.is_completed());
     assert!(!worker.worker_joined_for_test());
     assert_eq!(
@@ -1122,16 +1104,10 @@ fn shutdown_batch_requires_actual_join_after_a_completed_body_blocks_in_tls() {
         baseline + 1
     );
     release.0.clear();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !worker.worker_joined_for_test()
-        || TerminalHandle::reserved_worker_joins_for_test() != baseline
-    {
-        assert!(
-            Instant::now() < deadline,
-            "released TLS thread did not actually join"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_timing::eventually("the released TLS thread's join", || {
+        worker.worker_joined_for_test()
+            && TerminalHandle::reserved_worker_joins_for_test() == baseline
+    });
     assert_eq!(
         worker.close_checked(true),
         crate::terminal_ipc::TerminalCloseResult::Closed
