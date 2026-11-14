@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import stat
@@ -1999,6 +2000,8 @@ class RemoteEvidence(unittest.TestCase):
             self.assertNotIn(b"inherited-token", data, sent)
             self.assertNotIn(b"CAGENTS_AGENT_AUTHORITY", data, sent)
         self.assertNotIn("inherited-token", environment)
+        for invocation in (self.logs / "ssh").read_text().splitlines():
+            self.assertIn("-o ControlMaster=no -o ControlPath=none", invocation)
         built = (self.remote_task / "built-after").read_text().strip()
         self.assertEqual(built, str(self.remote_repository / ".worktrees" / "cev-mytask-after"))
         self.assertEqual(self.git(Path(built), "rev-parse", "HEAD"), self.git(checkout, "rev-parse", "HEAD"))
@@ -2221,6 +2224,110 @@ class RemoteEvidence(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.tool_calls()[-1], "stop")
         self.assertNotIn("shot never", self.tool_calls())
+
+    def test_cancelling_the_local_wrapper_signals_and_reaps_only_its_ssh(self) -> None:
+        checkout = self.repository("after", {"src.rs": "old\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        blocker = self.logs / "block-ssh.py"
+        blocker.write_text(textwrap.dedent("""\
+            import os
+            import signal
+            import sys
+            from pathlib import Path
+            root = Path(os.environ["STUB_LOG"])
+            def stop(number, _frame):
+                (root / "ssh-signal").write_text(str(number))
+                sys.exit(128 + number)
+            for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(number, stop)
+            (root / "ssh-pid").write_text(str(os.getpid()))
+            signal.pause()
+        """))
+        # Block the connection itself, without leaving a pretend remote
+        # process behind. Real sshd's connection watcher owns that cleanup.
+        intercept = """
+        if [ "${STUB_SSH_STAGE:-}" = transport ] && [[ $* = *git-receive-pack* ]]; then
+            exec python3 "$STUB_LOG/block-ssh.py"
+        fi
+        if [ "$*" = "bash -s" ] && [ -n "${STUB_SSH_STAGE:-}" ]; then
+            script=$(cat)
+            block=false
+            case $STUB_SSH_STAGE in
+                build) [[ $script = *'remote_main build before '* ]] && block=true ;;
+                checkout) [[ $script = *'git -C "$repository" worktree add'* &&
+                              $script = *'remote_main before '* ]] && block=true ;;
+                status) [[ $script = *'evidence "$@"'* &&
+                            $script = *'remote_main status '* ]] && block=true ;;
+            esac
+            if $block; then exec python3 "$STUB_LOG/block-ssh.py"; fi
+            exec 0<<<"$script"
+        fi
+        """
+        ssh = REMOTE_STUBS["ssh"].replace(
+            '        # What travels to the host: its arguments, above, and its input.',
+            textwrap.dedent(intercept) + '\n        # What travels to the host: its arguments, above, and its input.',
+        )
+        write_executable(self.bin / "ssh", ssh, self.logs)
+        for stage in ("build", "checkout", "status", "transport", "stopped", "stopped-supervisor"):
+            for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                with self.subTest(stage=stage, signal=number):
+                    pid_file = self.logs / "ssh-pid"
+                    signal_file = self.logs / "ssh-signal"
+                    pid_file.unlink(missing_ok=True)
+                    signal_file.unlink(missing_ok=True)
+                    arguments = ["shot", "home"] if stage == "status" else ["build", "before", str(checkout)]
+                    with (self.logs / "cancel-output").open("w") as output:
+                        process = subprocess.Popen(
+                            [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), *arguments],
+                            env={**self.env, "STUB_SSH_STAGE": "build" if stage.startswith("stopped") else stage}, stdin=subprocess.DEVNULL,
+                            stdout=output, stderr=output, start_new_session=True,
+                        )
+                        child = None
+                        try:
+                            deadline = time.monotonic() + 10
+                            while not pid_file.exists() and process.poll() is None and time.monotonic() < deadline:
+                                time.sleep(0.02)
+                            self.assertTrue(pid_file.exists(), (self.logs / "cancel-output").read_text())
+                            child = int(pid_file.read_text())
+                            if stage.startswith("stopped"):
+                                stopped = child
+                                if stage == "stopped-supervisor":
+                                    children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                                    self.assertEqual(len(children), 1)
+                                    stopped = int(children[0])
+                                os.kill(stopped, signal.SIGSTOP)
+                                deadline = time.monotonic() + 2
+                                while time.monotonic() < deadline:
+                                    if Path(f"/proc/{stopped}/stat").read_text().rsplit(")", 1)[1].split()[0] == "T":
+                                        break
+                                    time.sleep(0.01)
+                                self.assertEqual(Path(f"/proc/{stopped}/stat").read_text().rsplit(")", 1)[1].split()[0], "T")
+                            # Signal the wrapper alone, as a worker cancelling
+                            # its own tool does; never its caller's group.
+                            process.send_signal(number)
+                            self.assertEqual(process.wait(timeout=5), 128 + number)
+                            self.assertEqual(signal_file.read_text(), str(signal.SIGTERM))
+                            self.assertFalse(Path(f"/proc/{child}").exists(), "SSH must be reaped before the wrapper exits")
+                            self.assertEqual(list(self.task.glob(".status.*")), [])
+                            self.assertEqual(list(self.task.glob(".connection.*")), [])
+                            child = None
+                        finally:
+                            if child is not None:
+                                try:
+                                    os.kill(child, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(timeout=5)
+
+    def test_a_failed_ssh_keeps_its_exit_status(self) -> None:
+        write_executable(self.bin / "ssh", "#!/bin/sh\nexit 37\n", self.logs)
+        result = self.run_tool("status", check=False)
+        self.assertEqual(result.returncode, 37)
 
     def test_an_unknown_host_fails_plainly(self) -> None:
         result = self.run_tool("status", check=False, extra={"CAGENTS_EVIDENCE_REMOTE": "elsewhere"},

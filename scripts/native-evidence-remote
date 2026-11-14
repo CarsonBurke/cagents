@@ -98,10 +98,82 @@ fi
 # tool and synthetic provider, as they do locally.
 tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
 
-ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+# The host's lifetime watcher needs this command's own connection, rather
+# than a channel of a user's longer-lived multiplexing master.
+ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ControlMaster=no -o ControlPath=none)
 # Git's own SSH connection, the first contact in a build, gets the same
 # options, so an unreachable host fails in seconds rather than prompting.
 git_ssh="${ssh_command[*]}"
+
+# Keep the supervised connection directly owned by this wrapper. In particular,
+# do not call on_host through a command substitution: Bash can defer the
+# wrapper's signal trap until that substitution finishes, leaving SSH alive.
+connection_pid=
+connection_dir=
+status_file=
+finish_connection() {
+    local signal=${1:-15} child
+    if [ -n "$connection_dir" ]; then
+        # The supervisor reads this before launching its command too, so
+        # cancellation while Python starts cannot miss the connection.
+        printf '%s\n' "$signal" >"$connection_dir/cancel"
+    fi
+    # The connection supervisor is this shell's only background job. Consult
+    # running and stopped jobs to cover a signal before assigning $!, and
+    # avoid signalling a PID already reaped by wait and possibly reused.
+    child=$(jobs -pr; jobs -ps)
+    child=${child%%$'\n'*}
+    if [ -n "$child" ]; then
+        # Resume a stopped supervisor so it can consume the cancellation.
+        # It drains only its unreaped descendants, including Git's SSH.
+        kill -s CONT "$child" 2>/dev/null || :
+        wait -f "$child" 2>/dev/null || :
+    elif [ -n "$connection_pid" ]; then
+        wait -f "$connection_pid" 2>/dev/null || :
+    fi
+    connection_pid=
+    if [ -n "$connection_dir" ]; then
+        rm -rf -- "$connection_dir"
+        connection_dir=
+    fi
+    if [ -n "$status_file" ]; then
+        rm -f -- "$status_file"
+        status_file=
+    fi
+}
+cancel_connection() {
+    local status=$1
+    # A second signal must not interrupt reaping the owned connection.
+    trap '' TERM HUP INT
+    finish_connection "$((status - 128))"
+    exit "$status"
+}
+trap 'cancel_connection 143' TERM
+trap 'cancel_connection 129' HUP
+trap 'cancel_connection 130' INT
+trap 'finish_connection' EXIT
+
+# An interruptible wait, including for Git while it uses its SSH transport.
+run_connected() {
+    local connection_stdin
+    connection_dir=$(mktemp -d "$task/.connection.XXXXXX")
+    # The existing owned-command subreaper gives Git a chance to exit, then
+    # drains and reaps any transport it leaves behind. This invokes no Cargo
+    # or build admission. It installs its own signal handlers; keep job
+    # control off so a caller's TOSTOP cannot suspend terminal output.
+    # Save stdin before Bash redirects asynchronous stdin to /dev/null.
+    exec {connection_stdin}<&0
+    /usr/bin/python3 "$tool_root/scripts/cargo-gate-command.py" "$connection_dir/cancel" "$@" \
+        0<&"$connection_stdin" {connection_stdin}<&- &
+    connection_pid=$!
+    exec {connection_stdin}<&-
+    local status=0
+    wait -f "$connection_pid" || status=$?
+    connection_pid=
+    rm -rf -- "$connection_dir"
+    connection_dir=
+    return "$status"
+}
 
 # Runs a Bash script on HOST in a fresh SSH login, which inherits nothing from
 # this shell. The login shell there may be fish, so the script travels on
@@ -115,7 +187,7 @@ on_host() {
     for argument in "$@"; do
         quoted+=" $(printf '%q' "$argument")"
     done
-    "${ssh_command[@]}" "$host" bash -s <<SCRIPT
+    run_connected "${ssh_command[@]}" "$host" bash -s <<SCRIPT
 set -euo pipefail
 remote_main() {
 $script
@@ -259,7 +331,7 @@ resolve_source() {
 # exactly that commit: untracked files left by an earlier copy are removed.
 sync_checkout() {
     local role=$1 checkout=$2 commit=$3
-    git -C "$checkout" -c core.sshCommand="$git_ssh" push --quiet --force --no-verify "ssh://$host$repository" \
+    run_connected git -C "$checkout" -c core.sshCommand="$git_ssh" push --quiet --force --no-verify "ssh://$host$repository" \
         "$commit:refs/native-evidence/$name/$role" ||
         die "could not copy $commit to $host:$repository"
     on_host "$remote_prelude"'
@@ -343,7 +415,8 @@ $remote_prelude"'
         *) exit "$running" ;;
     esac
     sync_tool
-    checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
+    sync_checkout "$side" "$source_checkout" "$source_commit" >/dev/null
+    checkout=$repository/.worktrees/cev-$name-$side
     if [ "$source_commit" != "$source_head" ]; then
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
@@ -438,7 +511,14 @@ case $command in
         [ "$#" -eq 1 ] || die 'shot needs a name' 2
         forward shot "$1" >/dev/null
         fetch_shots
-        side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
+        status_file=$(mktemp "$task/.status.XXXXXX")
+        if forward status >"$status_file"; then
+            side=$(sed -n 's/^session: \(before\|after\),.*/\1/p' "$status_file")
+        else
+            side=
+        fi
+        rm -f -- "$status_file"
+        status_file=
         if [ -n "$side" ]; then
             printf '%s\n' "$task/shots/$side-$1.webp"
         else

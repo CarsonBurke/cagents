@@ -1900,6 +1900,9 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-prs clean
 a native slot while other sessions hold them all. Run it in the background,
 or with a command timeout of at least an hour. A command killed by a short
 tool timeout drops the SSH connection, and that ends the work on the host too.
+TERM, HUP and INT sent to the local wrapper also end and reap its active SSH
+connection; the host then cancels that connection's build or comparison.
+A session detached by an explicit `start` keeps running until `stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
