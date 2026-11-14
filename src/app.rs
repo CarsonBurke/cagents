@@ -31943,6 +31943,50 @@ mod tests {
         assert!(rows.contains(&card_row), "{rows:?}");
     }
 
+    /// A plain New terminal records no scope: the workspace files it under
+    /// the checkout holding its launch directory, and its row goes there too
+    /// while checkouts are hidden. Without one the pane had no row and
+    /// nothing in the sidebar led to it.
+    #[test]
+    fn hidden_checkouts_list_a_plain_terminal_under_its_launch_checkout() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::All,
+        ))));
+        // New terminal opens in the selected checkout, through the update
+        // path that refreshes the sidebar.
+        app.active_workspace = Some(PathBuf::from("/repo/feature"));
+        drop(app.update(Message::NewTerminal));
+        let terminal = app.workspace.focused().unwrap();
+        assert_ne!(terminal, card);
+        assert!(
+            matches!(
+                &app.card_state(terminal).unwrap().kind,
+                CardKind::Terminal(session)
+                    if session.launch.working_directory == Path::new("/repo/feature")
+            ),
+            "a terminal launched in the checkout"
+        );
+        assert!(
+            !app.durable.card_scopes.contains_key(&terminal),
+            "a plain terminal records no scope"
+        );
+        assert!(attention_lists(&app, sidebar::SelectionRow::Card(terminal)));
+        let row = app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|entry| entry.id == project)
+            .and_then(|entry| entry.panes.iter().find(|row| row.id == terminal))
+            .expect("the terminal has a row in its project");
+        assert_eq!(row.worktree, Some(worktree));
+        assert!(row.terminal);
+    }
+
     /// Renaming a pane renames its row in the Attention list at once.
     #[test]
     fn renaming_a_pane_retitles_its_attention_row() {

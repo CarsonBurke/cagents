@@ -3111,6 +3111,12 @@ pub struct SidebarState {
     /// after its updates, never while drawing, so each row's read is one
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
+    /// The checkout row the workspace files each open pane outside every
+    /// channel under: its recorded scope, or else the checkout holding its
+    /// launch directory. Derived by the application after its updates, it
+    /// places a pane with nothing to show and no recorded scope, such as a
+    /// plain terminal, while checkouts are hidden.
+    pane_checkouts: BTreeMap<CardId, (ProjectId, WorktreeId)>,
     commit_draft: CommitDraft,
     parked_commit_drafts: BTreeMap<PathBuf, CommitDraft>,
     commit_generation: u64,
@@ -3635,6 +3641,18 @@ impl SidebarState {
         self.worktrees_with_panes = worktrees;
     }
 
+    /// Replace where open panes are filed. A change rebuilds the pane rows
+    /// at the next projection; an unchanged map costs one comparison.
+    pub fn set_pane_checkouts(&mut self, checkouts: BTreeMap<CardId, (ProjectId, WorktreeId)>) {
+        if self.pane_checkouts == checkouts {
+            return;
+        }
+        self.pane_checkouts = checkouts;
+        if let Some(projection) = &mut self.attention_projection {
+            projection.dirty = true;
+        }
+    }
+
     pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {
         self.worktrees_with_panes.contains(&(project, worktree))
     }
@@ -4133,7 +4151,9 @@ impl SidebarState {
         }
         // A conversation none of whose cards has anything to show still has
         // a pane, which the list names while its checkout is hidden. Only
-        // the checkout its cards are open in can place it.
+        // the checkout its cards are open in can place it: the recorded
+        // scope, or else the one the workspace files the launch directory
+        // under, as for a plain terminal opened in a checkout.
         let mut idle: BTreeMap<_, Option<(ProjectId, Option<WorktreeId>)>> = BTreeMap::new();
         for &(position, card, resource) in &quiet {
             if conversations.contains_key(&resource) || unowned.contains(&resource) {
@@ -4149,11 +4169,11 @@ impl SidebarState {
             ) {
                 continue;
             }
-            let Some((owner, worktree)) = durable
-                .card_scopes
-                .get(&card.id)
-                .and_then(|scope| roots.get(scope.as_path()).copied().flatten())
-                .filter(|(owner, _)| loaded.contains(owner))
+            let placed = match durable.card_scopes.get(&card.id) {
+                Some(scope) => roots.get(scope.as_path()).copied().flatten(),
+                None => self.pane_checkouts.get(&card.id).copied(),
+            };
+            let Some((owner, worktree)) = placed.filter(|owner| loaded_worktrees.contains(owner))
             else {
                 continue;
             };
