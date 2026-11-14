@@ -56,6 +56,23 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
 
+## A scoped UI caller
+
+Add `start SIDE --ui-scoped-fixture`, or pass `--ui-scoped-fixture` to a remote
+`pair`, to exercise permission refusals in the actual UI. The option starts
+the fixture's daemon as User, then adds the hardcoded invalid synthetic
+`native-evidence-invalid-session` authority only to the UI runner's environment.
+It accepts no credential value and forwards no caller authority. `env` and
+`cli` commands retain User authority so a scene can seed its private data.
+A later `start` without the option removes that selection; `relaunch` keeps
+the current session's selection.
+
+Run it through `--remote fw16` from a hosted session. The ordinary inherited
+authority refusal still applies before fixture setup. This fixture tests a
+rejected synthetic caller, not the permissions of a valid hosted session.
+It uses the same offline providers and isolated provider homes as other
+native-evidence scenes.
+
 ## An offline GitHub
 
 The app shows GitHub state, including a project's owner avatar in the sidebar,

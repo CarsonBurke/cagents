@@ -161,9 +161,14 @@ STUBS = {
             printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
             printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
+            env > "$STUB_LOG/ui-env"
             exec sleep 300
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
+        if [ "$*" = 'daemon start' ]; then
+            env > "$STUB_LOG/daemon-start-env"
+            [ ! -e "$STUB_LOG/daemon-start-fails" ] || exit 7
+        fi
         if [ "$*" = '--no-start daemon preflight' ]; then printf 'capability'; exit 0; fi
         if [ "${1:-}" = print-env ]; then env; fi
     """,
@@ -736,6 +741,50 @@ class Evidence(unittest.TestCase):
                 self.run_tool("start", "after", *options)
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
+
+    def test_scoped_ui_fixture_leaves_daemon_env_and_cli_as_user_and_resets_on_next_start(self) -> None:
+        self.built()
+        token = "native-evidence-invalid-session"
+        self.run_tool("start", "after", "--ui-scoped-fixture")
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "runner-env").read_text())
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "ui-env").read_text())
+        daemon_environment = (self.logs / "daemon-start-env").read_text()
+        fixture_environment = self.run_tool("env", "env").stdout
+        cli_environment = self.run_tool("cli", "print-env").stdout
+        for name in AUTHORITY_NAMES:
+            for environment in (daemon_environment, fixture_environment, cli_environment):
+                self.assertNotIn(f"{name}=", environment)
+        self.assertNotIn(token, daemon_environment + fixture_environment + cli_environment)
+        self.assertIn("daemon start", (self.logs / "cli").read_text().splitlines())
+        self.run_tool("stop")
+        (self.logs / "ui-ran").unlink()
+        (self.logs / "runner-env").unlink()
+        self.run_tool("start", "after")
+        self.assertEqual((self.task / "session/ui-scoped-fixture").read_text(), "\n")
+        for name in AUTHORITY_NAMES:
+            self.assertNotIn(f"{name}=", (self.logs / "runner-env").read_text())
+            self.assertNotIn(f"{name}=", (self.logs / "ui-env").read_text())
+        self.run_tool("stop")
+
+    def test_scoped_ui_fixture_still_refuses_inherited_authority_before_start(self) -> None:
+        for name in AUTHORITY_NAMES:
+            for value in ("", "inherited-caller-token"):
+                with self.subTest(name=name, value=value):
+                    result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False,
+                                           extra={name: value})
+                    self.assertEqual(result.returncode, 77)
+                    self.assertIn("genuine User shell", result.stderr)
+                    self.assertFalse(self.task.exists())
+        self.assertFalse((self.logs / "runner").exists())
+
+    def test_scoped_ui_fixture_daemon_start_failure_never_launches_the_ui(self) -> None:
+        self.built()
+        (self.logs / "daemon-start-fails").touch()
+        result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not start the User fixture daemon", result.stderr)
+        self.assertFalse((self.logs / "runner").exists())
+        self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
         for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
@@ -2061,12 +2110,12 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--ui-scoped-fixture")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --ui-scoped-fixture", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 

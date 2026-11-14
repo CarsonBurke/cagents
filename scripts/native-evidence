@@ -45,7 +45,7 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME] [--ui-trace]
+        [--instance NAME] [--ui-trace] [--ui-scoped-fixture]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -62,6 +62,10 @@ both use the same fixture data and selected providers.
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
                   tree's work, and every call over 50 ms.
+                  --ui-scoped-fixture starts the fixture daemon as User, then
+                  launches only the UI runner with a hardcoded invalid synthetic
+                  session authority. Fixture env and cli commands remain User;
+                  inherited caller authority is still refused.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -926,6 +930,15 @@ run_app() {
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
+        # Start the isolated daemon as User before adding the synthetic caller
+        # to the UI runner. It must not inherit even this invalid capability.
+        if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
+            printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+            return 1
+        fi
+        stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
+    fi
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless "${runner_instance[@]}" \
@@ -1012,7 +1025,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1030,6 +1043,7 @@ cmd_start() {
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --ui-trace) ui_trace=1; shift ;;
+            --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1076,6 +1090,7 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
