@@ -40,7 +40,8 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
         assert!(error.contains("deadline expired"), "{error}");
         let method = if close_only { "attach_close" } else { "attach" };
         assert!(error.contains(&format!("`{method}` request")), "{error}");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(start.elapsed() < TIMEOUT);
     }
     let start = Instant::now();
     let error = actor
@@ -51,7 +52,7 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
     assert!(error.contains("deadline expired"), "{error}");
     assert!(error.contains("`state` request"), "{error}");
     assert!(!error.contains("inspection"), "{error}");
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < TIMEOUT);
     let (_accepted, _) = listener.accept().unwrap();
     assert!(original.peer_addr().is_ok());
     assert_eq!(actor.identity().record, record);

@@ -2095,24 +2095,30 @@ mod tests {
         )
         .unwrap();
         let descriptor = tempfile::tempfile().unwrap();
+        let directory = pin_launch_directory(&command("true")).unwrap();
         let started = Instant::now();
-        let error = hand_over(
-            &holder,
-            descriptor.as_raw_fd(),
-            1,
-            &descriptor,
-            None,
-            "",
-            &vec![b'x'; DETACHED_OUTPUT],
-            None,
-            &mut None,
-            false,
-            &pin_launch_directory(&command("true")).unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "descriptor frame deadline expired");
+        // The successor stays open and never reads, so only the deadline can
+        // end the handover.
+        let error = crate::test_timing::returns("the handover", move || {
+            hand_over(
+                &holder,
+                descriptor.as_raw_fd(),
+                1,
+                &descriptor,
+                None,
+                "",
+                &vec![b'x'; DETACHED_OUTPUT],
+                None,
+                &mut None,
+                false,
+                &directory,
+            )
+            .unwrap_err()
+            .to_string()
+        });
+        assert_eq!(error, "descriptor frame deadline expired");
         assert!(started.elapsed() >= HANDOVER_TIMEOUT);
-        assert!(started.elapsed() < HANDOVER_TIMEOUT * 2 + Duration::from_secs(1));
+        drop(successor);
     }
 
     fn command(script: &str) -> CommandBuilder {
