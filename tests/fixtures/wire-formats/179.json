@@ -9633,6 +9633,10 @@
         [
           "chat_capacity",
           "Unit"
+        ],
+        [
+          "store_busy",
+          "Unit"
         ]
       ]
     },
