@@ -26,6 +26,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 use crate::editor_history::{self as history, Excerpt, TextChange};
 use cosmic::iced::advanced::text::{
+    Blink,
     editor::Editor as _,
     highlighter::{self, Highlighter},
 };
@@ -2010,8 +2011,6 @@ struct Focus {
 }
 
 impl Focus {
-    const CURSOR_BLINK_INTERVAL_MILLIS: u128 = 500;
-
     fn now() -> Self {
         let now = Instant::now();
 
@@ -2023,9 +2022,7 @@ impl Focus {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.is_window_focused
-            && ((self.now - self.updated_at).as_millis() / Self::CURSOR_BLINK_INTERVAL_MILLIS)
-                .is_multiple_of(2)
+        self.is_window_focused && Blink::DEFAULT.visible(self.now - self.updated_at)
     }
 }
 
@@ -2515,13 +2512,9 @@ where
                 {
                     focus.now = *now;
 
-                    let millis_until_redraw = Focus::CURSOR_BLINK_INTERVAL_MILLIS
-                        - (focus.now - focus.updated_at).as_millis()
-                            % Focus::CURSOR_BLINK_INTERVAL_MILLIS;
-
-                    shell.request_redraw_at(
-                        focus.now + Duration::from_millis(millis_until_redraw as u64),
-                    );
+                    if let Some(next) = Blink::DEFAULT.next_frame(focus.now - focus.updated_at) {
+                        shell.request_redraw_at(focus.now + next);
+                    }
                 }
             }
             _ => {}

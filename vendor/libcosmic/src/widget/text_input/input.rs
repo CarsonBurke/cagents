@@ -27,7 +27,7 @@ use iced_core::mouse::{self, click};
 use iced_core::overlay::Group;
 use iced_core::renderer::{self, Renderer as CoreRenderer};
 use iced_core::text::{self, Affinity, Paragraph, Renderer, Text};
-use iced_core::time::{Duration, Instant};
+use iced_core::time::Instant;
 use iced_core::widget::Id;
 use iced_core::widget::operation::{self, Operation};
 use iced_core::widget::tree::{self, Tree};
@@ -2350,12 +2350,11 @@ pub fn update<'a, Message: Clone + 'static>(
             if let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) {
                 focus.now = *now;
 
-                let millis_until_redraw = CURSOR_BLINK_INTERVAL_MILLIS
-                    - (*now - focus.updated_at).as_millis() % CURSOR_BLINK_INTERVAL_MILLIS;
-                shell.request_redraw_at(window::RedrawRequest::At(
-                    now.checked_add(Duration::from_millis(millis_until_redraw as u64))
-                        .unwrap_or(*now),
-                ));
+                if let Some(next) = text::Blink::DEFAULT.next_frame(*now - focus.updated_at) {
+                    shell.request_redraw_at(window::RedrawRequest::At(
+                        now.checked_add(next).unwrap_or(*now),
+                    ));
+                }
 
                 shell.request_input_method(&input_method(state, text_layout, unsecured_value));
             } else if always_active {
@@ -2790,8 +2789,7 @@ pub fn draw<'a, Message>(
                     state.scroll_offset,
                 );
                 let is_cursor_visible = handling_dnd_offer
-                    || ((focus.now - focus.updated_at).as_millis() / CURSOR_BLINK_INTERVAL_MILLIS)
-                        .is_multiple_of(2);
+                    || text::Blink::DEFAULT.visible(focus.now - focus.updated_at);
 
                 if is_cursor_visible && !dnd_icon {
                     (
@@ -3450,8 +3448,6 @@ fn replace_paragraph(
         ellipsize: text::Ellipsize::None,
     });
 }
-
-const CURSOR_BLINK_INTERVAL_MILLIS: u128 = 500;
 
 mod platform {
     use iced_core::keyboard;

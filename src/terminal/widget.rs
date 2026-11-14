@@ -15,7 +15,7 @@ use std::{
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::graphics::text::{self as graphics_text, cosmic_text, font_system};
-use cosmic::iced::advanced::text::Paragraph as _;
+use cosmic::iced::advanced::text::{Blink, Paragraph as _};
 use cosmic::{
     Element, Renderer, Theme,
     iced::{
@@ -49,6 +49,10 @@ const REVIEW_BAR_HEIGHT: f32 = 24.0;
 /// How long the cursor stays lit, and then dark, while it blinks. 530ms is
 /// what xterm and Ghostty both default to.
 const BLINK_PHASE: Duration = Duration::from_millis(530);
+
+/// The terminal cursor's blink, which rests lit once the cursor has held
+/// still for the shared text-cursor timeout, as VTE's does.
+const BLINK: Blink = Blink::new(BLINK_PHASE);
 
 /// How long a terminal's grid must hold still before its PTY follows it.
 ///
@@ -1021,6 +1025,9 @@ struct WidgetState {
     cursor_dark: bool,
     /// The cell the blink phase is anchored to.
     blink_anchor: Option<(u16, u16)>,
+    /// When the cursor stops blinking and rests lit: the blink's timeout
+    /// after it last moved or regained focus. `None` while nothing blinks.
+    blink_rests_at: Option<Instant>,
     /// Text being composed by the input method, held so the shell can paint it
     /// at the cursor until it is committed.
     preedit: Option<input_method::Preedit>,
@@ -1094,14 +1101,27 @@ impl WidgetState {
     }
 
     /// Advances the cursor-blink phase to the frame instant `now` and returns
-    /// the instant the next phase begins.
+    /// the instant the cursor next changes, or `None` once it rests lit.
     ///
     /// The phase is driven from the frame clock and one scheduled redraw per
     /// phase rather than a frame subscription, so a terminal sitting at an idle
     /// prompt wakes the compositor twice a second instead of sixty times - and
     /// an unfocused or steady-cursor terminal, which never calls this, wakes it
     /// not at all.
-    fn advance_blink(&mut self, now: Instant, anchor: Option<(u16, u16)>) -> Instant {
+    fn advance_blink(&mut self, now: Instant, anchor: Option<(u16, u16)>) -> Option<Instant> {
+        // Only the cursor moving or the blink starting afresh restarts the
+        // timeout; a frame drawn for something else must not wake a cursor
+        // that has come to rest.
+        let rests_at = match self.blink_rests_at {
+            Some(rests_at) if self.blink_anchor == anchor => rests_at,
+            _ => *self.blink_rests_at.insert(now + BLINK.timeout),
+        };
+        if now >= rests_at {
+            self.blink_since = None;
+            self.blink_anchor = anchor;
+            self.cursor_dark = false;
+            return None;
+        }
         // Frames stop entirely while a terminal is unfocused or occluded, so a
         // resumed cycle - or a cursor that just moved under the user's typing -
         // restarts lit rather than folding an unbounded number of phases.
@@ -1119,12 +1139,14 @@ impl WidgetState {
                 now
             }
         };
-        if now.saturating_duration_since(since) >= BLINK_PHASE {
+        let next = if now.saturating_duration_since(since) >= BLINK_PHASE {
             self.cursor_dark = !self.cursor_dark;
             self.blink_since = Some(since + BLINK_PHASE);
-            return since + BLINK_PHASE * 2;
-        }
-        since + BLINK_PHASE
+            since + BLINK_PHASE * 2
+        } else {
+            since + BLINK_PHASE
+        };
+        Some(next.min(rests_at))
     }
 
     /// Converts one wheel event's `travel` into the work it implies, carrying
@@ -2913,12 +2935,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     .filter(|caret| caret.visible && !self.read_only);
                 let anchor = caret.map(|caret| (caret.column, caret.row));
                 if self.model_focused && caret.is_some_and(|caret| caret.blinking) {
-                    shell.request_redraw_at(state.advance_blink(*now, anchor));
+                    if let Some(next) = state.advance_blink(*now, anchor) {
+                        shell.request_redraw_at(next);
+                    }
                 } else {
                     // Nothing to animate: drop the phase so the next blink
                     // starts lit, and ask for no further frames.
                     state.blink_since = None;
                     state.blink_anchor = anchor;
+                    state.blink_rests_at = None;
                     state.cursor_dark = false;
                 }
                 // The shell only honours an input-method request raised during
@@ -4255,19 +4280,22 @@ mod tests {
         let anchor = Some((3, 4));
         // The first frame lights the cursor and asks for exactly one redraw,
         // one phase out.
-        assert_eq!(state.advance_blink(start, anchor), start + BLINK_PHASE);
+        assert_eq!(
+            state.advance_blink(start, anchor),
+            Some(start + BLINK_PHASE)
+        );
         assert!(!state.cursor_dark);
         // Crossing a boundary flips the phase once.
         assert_eq!(
             state.advance_blink(start + BLINK_PHASE, anchor),
-            start + BLINK_PHASE * 2
+            Some(start + BLINK_PHASE * 2)
         );
         assert!(state.cursor_dark);
         // A frame inside the phase changes nothing and does not move the
         // deadline.
         assert_eq!(
             state.advance_blink(start + BLINK_PHASE + BLINK_PHASE / 2, anchor),
-            start + BLINK_PHASE * 2
+            Some(start + BLINK_PHASE * 2)
         );
         assert!(state.cursor_dark);
         // A long gap - unfocused, occluded - restarts the cycle lit instead of
@@ -4280,6 +4308,35 @@ mod tests {
         // A cursor that moved - the user typed - is lit again immediately.
         state.advance_blink(resumed + BLINK_PHASE, Some((3, 5)));
         assert!(!state.cursor_dark);
+    }
+
+    #[test]
+    fn a_still_cursor_stops_blinking_lit_until_it_moves() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((3, 4));
+        let mut frame = start;
+        let mut frames = 0;
+        // Follow every redraw the blink asks for, as the shell would.
+        while let Some(next) = state.advance_blink(frame, anchor) {
+            assert!(next > frame);
+            frame = next;
+            frames += 1;
+            assert!(frames < 100, "the blink never came to rest");
+        }
+        assert_eq!(frame, start + BLINK.timeout);
+        assert!(!state.cursor_dark);
+        // Frames drawn for something else leave the resting cursor lit.
+        let later = frame + BLINK_PHASE * 7;
+        assert_eq!(state.advance_blink(later, anchor), None);
+        assert!(!state.cursor_dark);
+        // Moving the cursor starts a fresh blink with a fresh timeout.
+        assert_eq!(
+            state.advance_blink(later, Some((3, 5))),
+            Some(later + BLINK_PHASE)
+        );
+        state.advance_blink(later + BLINK_PHASE, Some((3, 5)));
+        assert!(state.cursor_dark);
     }
 
     #[test]

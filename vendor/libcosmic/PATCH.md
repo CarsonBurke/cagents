@@ -34,3 +34,10 @@ own button does.
 The application regressions raise a tooltip and a popover from a control in an
 offset `button::custom` and check that each overlay is anchored to its control,
 with any ancestor translation applied once.
+
+# Text input cursors stop blinking
+
+`TextInput` blinks with `iced_core::text::Blink` (see `vendor/iced-core`). Ten
+seconds after its last input, the cursor rests visible and the input asks for
+no more redraws. Upstream it repainted the window every 500 ms for as long as it
+kept focus.
