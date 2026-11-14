@@ -12445,50 +12445,83 @@ mod tests {
 
     #[test]
     fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
-        use iced::runtime::user_interface::{Cache, UserInterface};
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        #[derive(Default)]
+        struct HeaderBounds {
+            panel: Option<iced::Rectangle>,
+            toggle: Option<iced::Rectangle>,
+            controls: Vec<iced::Rectangle>,
+            panel_id: Option<widget::Id>,
+            toggle_id: Option<widget::Id>,
+        }
+        impl Operation for HeaderBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == self.panel_id.as_ref() {
+                    self.panel = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == self.toggle_id.as_ref() {
+                    self.toggle = Some(bounds);
+                } else {
+                    self.controls.push(bounds);
+                }
+            }
+        }
         let (mut app, card) = inspector_chat_fixture(1440.0);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         app.open_pane_inspector_now(card);
-        let mut renderer = crate::app::tests::headless_renderer();
-        let ui = UserInterface::build(
-            app.card_view(card, true, false),
-            iced::Size::new(1440.0, 800.0),
-            Cache::new(),
-            &mut renderer,
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.card_view(card, true, false);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1440.0, 800.0)),
         );
-        let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
-        let nodes = accessible
-            .root()
+        let mut bounds = HeaderBounds {
+            panel_id: Some(card_control_id(card, "inspector.panel")),
+            toggle_id: Some(card_control_id(card, "inspector.toggle")),
+            ..Default::default()
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let panel = bounds.panel.expect("mounted inspector");
+        let toggle = bounds.toggle.expect("header toggle");
+        let adjacent = bounds
+            .controls
             .iter()
-            .chain(accessible.children())
-            .collect::<Vec<_>>();
-        let header = nodes
-            .iter()
-            .find(|node| {
-                node.node()
-                    .label()
-                    .is_some_and(|label| label == "Show files")
+            .filter(|control| {
+                control.x >= panel.x
+                    && control.x < toggle.x
+                    && control.y < toggle.y + toggle.height
+                    && control.y + control.height > toggle.y
             })
-            .and_then(|node| node.node().bounds())
-            .expect("last header control before the inspector toggle");
-        let toggle = nodes
-            .iter()
-            .find(|node| {
-                node.node()
-                    .label()
-                    .is_some_and(|label| label.starts_with("Toggle inspector"))
-            })
-            .and_then(|node| node.node().bounds())
-            .expect("inspector toggle button");
+            .max_by(|a, b| (a.x + a.width).total_cmp(&(b.x + b.width)))
+            .expect("an actual adjacent header control, not just its short label");
         assert!(
-            toggle.x0 - header.x1 >= f64::from(step::GAP_S) - 0.1,
-            "adjacent control {header:?} stops a standard gap before toggle {toggle:?}"
+            toggle.x - adjacent.x - adjacent.width >= step::GAP_S - 0.1,
+            "control {adjacent:?} stops a standard gap before toggle {toggle:?}"
         );
     }
 
     #[test]
     fn inspector_saved_admission_actions_clear_the_floating_toggle() {
         use iced::runtime::user_interface::{Cache, UserInterface};
-        for width in [420.0, 720.0] {
+        for width in [300.0, 420.0, 720.0] {
             let (mut app, card) = inspector_chat_fixture(width);
             let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
                 panic!("fixture chat")
@@ -12565,8 +12598,7 @@ mod tests {
                         .map(|id| app.card_view(id, true, false)),
                 )
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
+                .height(Length::Fill),
                 iced::Size::new(width, 800.0),
                 cache,
                 renderer,
