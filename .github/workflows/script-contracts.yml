@@ -80,6 +80,11 @@ jobs:
           python3 -I -B tests/check_older_clients.py -v
           python3 -I -B scripts/check-older-clients
 
+      - name: Check every protocol main served is a live-update source or retired
+        run: |
+          python3 -I -B tests/check_update_sources.py -v
+          python3 -I -B scripts/check-update-sources
+
       - name: Verify the source remains unchanged
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
