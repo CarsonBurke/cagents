@@ -6,6 +6,13 @@ mkdir -p "$fx/casmi" "$config"
 printf '1\n' >"$config/fixture-first-turn-seconds"
 printf 'Fixture reply.\n' >"$config/fixture-reply.md"
 rm -f "$config/fixture-run-once"
+parent_tab() {
+    evidence drive move 500,22 >/dev/null
+    evidence drive scroll horizontal -100 >/dev/null
+    sleep 1
+    evidence drive click 310,22 >/dev/null
+    sleep 2
+}
 shot() {
     evidence drive move 1,1 >/dev/null
     sleep 1
@@ -24,7 +31,11 @@ sleep 3
 spawn --name jitter --prompt 'Check the jitter range against the spec.' >/dev/null
 sleep 5
 evidence drive observe
+evidence drive key ctrl+shift+i
+sleep 2
 evidence drive click 'Backoff implementation'
+sleep 2
+parent_tab
 sleep 4
 evidence drive observe
 shot spawn-start
@@ -32,6 +43,7 @@ printf '%s\n' "cagents agent spawn --name reviewer --model haiku --surface chat 
 evidence cli agent send "$parent" 'Start a reviewer on the one-row cards.'
 sleep 10
 evidence cli --json channel list
+evidence cli --json agent list
 evidence drive observe
 shot same-project
 if [ "$SIDE" = after ]; then
@@ -39,12 +51,13 @@ if [ "$SIDE" = after ]; then
     sleep 3
     evidence drive observe
     shot same-project-opened
-    evidence drive key alt+1
-    sleep 2
 fi
+parent_tab
+sleep 2
 printf '%s\n' "cagents agent spawn --name casmi-reviewer --model haiku --surface chat --project '$fx/casmi' 'Review the casmi build'" >"$config/fixture-run-once"
 evidence cli agent send "$parent" 'Start a reviewer on the casmi build.'
 sleep 10
 evidence cli --json channel list
+evidence cli --json agent list
 evidence drive observe
 shot cross-project

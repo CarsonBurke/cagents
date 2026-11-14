@@ -915,12 +915,16 @@ impl Runtime {
             && !run.agent.is_empty()
         {
             heading.push(
-                widget::button::custom(design::caption("Open"))
-                    .class(crate::ui_controls::control_style(false, None))
-                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                    .name(format!("Open agent {}", run.agent))
-                    .on_press(action(Action::OpenAgent(run.agent.clone())))
-                    .into(),
+                widget::button::custom(design::caption("Open").class(cosmic::theme::Text::Custom(
+                    |theme| cosmic::iced::widget::text::Style {
+                        color: Some(design::accent_color(theme)),
+                    },
+                )))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .name(format!("Open agent {}", run.agent))
+                .on_press(action(Action::OpenAgent(run.agent.clone())))
+                .into(),
             );
         }
         let mut rows = vec![
