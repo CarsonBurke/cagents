@@ -6935,7 +6935,7 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return Task::none();
         };
-        if self.chat_start_pending(card) {
+        if self.chat_start_pending(card) || self.pane_content_inputs_blocked(card) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -18831,6 +18831,11 @@ mod tests {
             _ => panic!("the draft stays a chat"),
         };
         let before = composer(&app);
+        drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
+        assert!(
+            chat_runtime(&app, card).model_picker.is_none(),
+            "a shortcut cannot open a picker behind the inspector"
+        );
         drop(app.update(press()));
         assert_eq!(
             composer(&app),
@@ -19675,7 +19680,13 @@ mod tests {
     fn captured_escape_closes_model_search_without_closing_the_inspector() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
+        let resize = app.workspace.resize_viewport(1600.0);
+        drop(app.apply_viewport(resize, false, DurableChange::None));
         app.open_pane_inspector_now(card);
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Docked)
+        );
         drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
         assert!(chat_runtime(&app, card).model_picker.is_some());
         drop(app.update(Message::KeyEvent {
