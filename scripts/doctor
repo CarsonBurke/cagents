@@ -83,9 +83,9 @@ def check_git(report):
 def check_python(report):
     found = sys.version_info[:2]
     if found < MINIMUM_PYTHON:
-        report.fail("python3", f"{found[0]}.{found[1]} is older than 3.11; repository tests need tomllib")
+        report.fail("Python", f"{found[0]}.{found[1]} is older than 3.11; repository tests need tomllib")
     else:
-        report.ok("python3", f"{found[0]}.{found[1]}")
+        report.ok("Python", f"{found[0]}.{found[1]}")
 
 
 def check_rust(report):
