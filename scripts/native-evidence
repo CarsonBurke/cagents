@@ -646,9 +646,11 @@ wait_for_native_lock() {
     done <"$state/slot-paths"
     # In the background, so a signal reaches this shell's trap at once. The
     # waiter stays in the kernel's queue the whole time: retrying with a short
-    # timeout loses to every blocked waiter.
+    # timeout loses to every blocked waiter. Its parent is this shell, which
+    # the background job replaces with it.
+    local parent=$BASHPID
     /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" acquire "${arguments[@]}" \
-        --wait "$wait_lock" --stop "$state/stop" --starter "$starter" --parent-pid "$BASHPID" \
+        --wait "$wait_lock" --stop "$state/stop" --starter "$starter" --parent-pid "$parent" \
         >"$state/slot" 9>&- &
     lock_waiter=$!
     wait "$lock_waiter" || status=$?
