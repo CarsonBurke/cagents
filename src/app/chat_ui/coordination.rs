@@ -918,6 +918,7 @@ impl Runtime {
                 widget::button::custom(design::caption("Open").class(cosmic::theme::Text::Custom(
                     |theme| cosmic::iced::widget::text::Style {
                         color: Some(design::accent_color(theme)),
+                        ..Default::default()
                     },
                 )))
                 .class(crate::ui_controls::control_style(false, None))
