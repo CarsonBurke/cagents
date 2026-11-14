@@ -27562,6 +27562,7 @@ mod tests {
                     label: "Running".into(),
                     reasoning: Some("low".into()),
                     default_reasoning: Some("low".into()),
+                    aliases: Vec::new(),
                 });
             app.remember_chat_model(provider, Some("staged".into()), Some("high".into()));
             drop(app.update(Message::ChatUi(Action::Reasoning(

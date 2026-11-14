@@ -1343,6 +1343,7 @@ impl Codex {
                         .map_or_else(|| id.clone(), |model| model.label.clone()),
                     reasoning: self.running_reasoning.clone(),
                     default_reasoning: self.default_reasoning.get(id).cloned(),
+                    aliases: Vec::new(),
                 }
             })));
     }

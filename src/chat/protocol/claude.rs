@@ -1543,11 +1543,19 @@ impl Claude {
                             .map(|model| model.label.clone())
                     })
                     .unwrap_or_else(|| id.clone());
+                let mut aliases: Vec<_> = self
+                    .resolved
+                    .iter()
+                    .filter_map(|(alias, resolved)| (resolved == id).then(|| alias.clone()))
+                    .collect();
+                aliases.sort_unstable();
+                aliases.dedup();
                 chat::ActiveModel {
                     id: id.clone(),
                     label,
                     reasoning: self.running_reasoning.clone(),
                     default_reasoning: None,
+                    aliases,
                 }
             });
         step.events.push(Event::ActiveModel(active));
@@ -18412,11 +18420,79 @@ mod tests {
         assert_eq!(adapter.selected.as_deref(), Some("opusplan"));
         assert_eq!(adapter.models[0].label, "Opus Plan");
         assert!(step.events.iter().any(|event| matches!(event,
-            Event::ActiveModel(Some(model)) if model.id == "claude-sonnet-5-5" && model.label == "Sonnet 5.5")));
+            Event::ActiveModel(Some(model)) if model.id == "claude-sonnet-5-5"
+                && model.label == "Sonnet 5.5" && model.aliases == ["opusplan", "sonnet"])));
         let mut unknown = Step::default();
         adapter.metadata(&json!({"model":"claude-new-family-7"}), &mut unknown);
         assert!(unknown.events.iter().any(|event| matches!(event,
-            Event::ActiveModel(Some(model)) if model.id == "claude-new-family-7" && model.label == model.id)));
+            Event::ActiveModel(Some(model)) if model.id == "claude-new-family-7"
+                && model.label == model.id && model.aliases.is_empty())));
+    }
+
+    #[test]
+    fn active_model_aliases_follow_only_reported_resolution_while_busy() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            selected: Some("opusplan".into()),
+            reasoning: Some("high".into()),
+            ..Claude::default()
+        };
+        let mut initial = Step::default();
+        adapter.metadata(
+            &json!({"models":[
+                {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+                {"value":"default","resolvedModel":"claude-sonnet-5-5","displayName":"Default (recommended)"},
+                {"value":"custom-route","resolvedModel":"claude-sonnet-5-5","displayName":"Personal choice"},
+                {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"},
+                {"value":"misleading","resolvedModel":"claude-opus-5-5","displayName":"Sonnet 5.5",
+                    "supportsEffort":true,"supportedEffortLevels":["high"]},
+                {"value":"unmapped","displayName":"Sonnet 5.5"},
+                {"value":"claude-sonnet-5-5","displayName":"Sonnet 5.5"},
+                {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"}
+            ],"model":"claude-sonnet-5-5"}),
+            &mut initial,
+        );
+        let running = initial
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::ActiveModel(Some(model)) => Some(model.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(running.id, "claude-sonnet-5-5");
+        assert_eq!(running.label, "Sonnet 5.5");
+        assert_eq!(running.reasoning.as_deref(), Some("high"));
+        assert_eq!(
+            running.aliases,
+            ["custom-route", "default", "opusplan", "sonnet"]
+        );
+        let change = adapter
+            .command(Command::SetModel {
+                model: "misleading".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        let changed = adapter
+            .receive(reply(
+                change.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(adapter.selected.as_deref(), Some("misleading"));
+        assert_eq!(adapter.running.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(changed.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model == &running)));
+        let applied = adapter
+            .receive(reply(
+                changed.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(applied.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model == &running)));
+        assert!(adapter.busy);
     }
 
     #[test]

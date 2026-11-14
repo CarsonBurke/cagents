@@ -3447,6 +3447,7 @@ mod tests {
             label: "Actual model".into(),
             reasoning: Some("high".into()),
             default_reasoning: Some("medium".into()),
+            aliases: Vec::new(),
         };
         assert!(publications.active_model(2, Some(model.clone()), &body));
         assert!(

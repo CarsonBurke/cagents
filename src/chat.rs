@@ -2472,6 +2472,9 @@ pub struct ActiveModel {
     pub label: String,
     pub reasoning: Option<String>,
     pub default_reasoning: Option<String>,
+    /// Provider-advertised aliases resolved to this concrete model ID.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2552,8 +2555,18 @@ impl Model {
 
 #[cfg(test)]
 mod model_label_tests {
-    use super::Model;
+    use super::{ActiveModel, Model};
     use serde_json::json;
+
+    #[test]
+    fn legacy_active_model_json_defaults_to_no_reported_aliases() {
+        let model: ActiveModel = serde_json::from_value(json!({
+            "id":"claude-sonnet-5-5","label":"Sonnet 5.5",
+            "reasoning":"high","default_reasoning":null
+        }))
+        .unwrap();
+        assert!(model.aliases.is_empty());
+    }
 
     #[test]
     fn unresolved_custom_model_does_not_take_a_malformed_alias_label() {

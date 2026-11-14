@@ -4267,7 +4267,7 @@ impl Runtime {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
         if !self.is_draft()
-            && let Some(choice) = staged_model_choice(&self.snapshot, self.session.launch.provider)
+            && let Some(choice) = staged_model_choice(&self.snapshot)
         {
             tooltip = format!("{choice} applies from the next turn");
         }
@@ -4353,7 +4353,7 @@ impl Runtime {
             && let Some(model) = selected_chat_model(&self.snapshot)
             && !model.reasoning.is_empty()
         {
-            let default_effort = reasoning_default(&self.snapshot, provider, model, catalog);
+            let default_effort = reasoning_default(&self.snapshot, model, catalog);
             let mut choices = vec![picker_section_header(
                 widget::row::with_children(vec![
                     iced::widget::Space::new()
@@ -6245,43 +6245,31 @@ fn reasoning_rows<'a>(
         .collect()
 }
 
-fn model_matches_active(
-    provider: Provider,
-    model: &chat::Model,
-    active: &chat::ActiveModel,
-) -> bool {
-    model.id == active.id
-        || (provider == Provider::Claude
-            && matches!(
-                model.id.as_str(),
-                "default" | "opus" | "sonnet" | "haiku" | "opusplan"
-            )
-            && (model.label == active.label
-                || (model.id == "default" && model.label == format!("Default ({})", active.label))))
+fn model_matches_active(model: &chat::Model, active: &chat::ActiveModel) -> bool {
+    model.id == active.id || active.aliases.contains(&model.id)
 }
 
 fn reasoning_default<'a>(
     snapshot: &'a chat::Snapshot,
-    provider: Provider,
     model: &chat::Model,
     catalog: Option<&'a crate::account::cache::Catalog>,
 ) -> Option<&'a str> {
     snapshot
         .active_model
         .as_ref()
-        .filter(|active| model_matches_active(provider, model, active))
+        .filter(|active| model_matches_active(model, active))
         .and_then(|active| active.default_reasoning.as_deref())
         .or_else(|| catalog.and_then(|catalog| catalog.default_effort(Some(&model.id))))
 }
 
-fn staged_model_choice(snapshot: &chat::Snapshot, provider: Provider) -> Option<String> {
+fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
     let active = snapshot.active_model.as_ref()?;
     let model = selected_chat_model(snapshot);
     let selected = model
         .map(|model| model.id.as_str())
         .or(snapshot.selected_model.as_deref());
     let model_changed = selected.is_some_and(|id| id != active.id)
-        && !model.is_some_and(|model| model_matches_active(provider, model, active));
+        && !model.is_some_and(|model| model_matches_active(model, active));
     let default = active.default_reasoning.as_deref();
     let effort_changed =
         snapshot.reasoning.as_deref().or(default) != active.reasoning.as_deref().or(default);
@@ -12304,6 +12292,7 @@ mod tests {
         snapshot.selected_model = Some("claude-sonnet-4-5".into());
         snapshot.reasoning = Some("medium".into());
         snapshot.active_model = Some(chat::ActiveModel {
+            aliases: Vec::new(),
             id: "claude-sonnet-4-5".into(),
             label: "Claude Sonnet 4.5".into(),
             reasoning: Some("medium".into()),
@@ -15716,47 +15705,54 @@ mod tests {
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = None;
         snapshot.active_model = Some(chat::ActiveModel {
+            aliases: vec!["default".into(), "opus".into()],
             id: "claude-opus-5-5".into(),
             label: "Opus 5.5".into(),
             reasoning: None,
             default_reasoning: Some("medium".into()),
         });
-        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
+        assert_eq!(staged_model_choice(snapshot), None);
         snapshot.models.push(model("opus", "Opus 5.5"));
         snapshot.selected_model = Some("opus".into());
         assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude),
+            staged_model_choice(snapshot),
             None,
             "ordinary aliases also resolve to the running model"
         );
         snapshot.selected_model = None;
-        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
+        assert_eq!(staged_model_choice(snapshot), None);
         snapshot.models[0].label = "Default (Another model)".into();
+        snapshot
+            .active_model
+            .as_mut()
+            .unwrap()
+            .aliases
+            .retain(|alias| alias != "default");
         assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            staged_model_choice(snapshot).as_deref(),
             Some("Default (Another model)")
         );
         snapshot.models[0].label = "Default (Opus 5.5)".into();
+        snapshot
+            .active_model
+            .as_mut()
+            .unwrap()
+            .aliases
+            .push("default".into());
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = Some("high".into());
-        assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude).as_deref(),
-            Some("High")
-        );
+        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("High"));
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
             "Opus 5.5"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
-        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
+        assert_eq!(staged_model_choice(snapshot), None);
         snapshot.reasoning = None;
-        assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude).as_deref(),
-            Some("Default")
-        );
+        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("Default"));
         snapshot.selected_model = Some("next".into());
         assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            staged_model_choice(snapshot).as_deref(),
             Some("Next model · Default")
         );
         let catalog = crate::account::cache::Catalog {
@@ -15766,35 +15762,22 @@ mod tests {
             reasoning_defaults: [("next".into(), "high".into())].into(),
         };
         assert_eq!(
-            reasoning_default(
-                snapshot,
-                Provider::Claude,
-                &snapshot.models[1],
-                Some(&catalog)
-            ),
+            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
             Some("high")
         );
-        assert_eq!(
-            reasoning_default(snapshot, Provider::Claude, &snapshot.models[1], None),
-            None
-        );
+        assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
         snapshot.models[1].label = "Opus 5.5".into();
         assert_eq!(
-            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            staged_model_choice(snapshot).as_deref(),
             Some("Opus 5.5 · Default"),
             "distinct concrete models can share a display name"
         );
         assert_eq!(
-            reasoning_default(
-                snapshot,
-                Provider::Claude,
-                &snapshot.models[1],
-                Some(&catalog)
-            ),
+            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
             Some("high")
         );
         snapshot.active_model = None;
-        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
+        assert_eq!(staged_model_choice(snapshot), None);
         snapshot.selected_model = Some("default".into());
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
@@ -15810,6 +15793,34 @@ mod tests {
     }
 
     #[test]
+    fn footer_staged_model_uses_reported_aliases_even_when_their_names_differ() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![
+            model("opusplan", "Opus Plan"),
+            model("deployment-current", "Team model"),
+        ];
+        snapshot.reasoning = None;
+        snapshot.active_model = Some(chat::ActiveModel {
+            id: "claude-sonnet-5-5".into(),
+            label: "Sonnet 5.5".into(),
+            aliases: vec!["deployment-current".into(), "opusplan".into()],
+            reasoning: None,
+            default_reasoning: None,
+        });
+        for alias in ["opusplan", "deployment-current"] {
+            snapshot.selected_model = Some(alias.into());
+            assert_eq!(staged_model_choice(snapshot), None);
+        }
+        snapshot.active_model.as_mut().unwrap().aliases.clear();
+        assert_eq!(
+            staged_model_choice(snapshot).as_deref(),
+            Some("Team model"),
+            "an unreported alias resolution cannot be inferred from its display name"
+        );
+    }
+
+    #[test]
     fn footer_model_label_names_active_model_and_keeps_draft_alias() {
         let (mut runtime, _handle) = furnished_runtime();
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
@@ -15817,6 +15828,7 @@ mod tests {
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = None;
         snapshot.active_model = Some(chat::ActiveModel {
+            aliases: Vec::new(),
             id: "claude-opus-5-5".into(),
             label: "Opus 5.5".into(),
             reasoning: None,
@@ -15875,6 +15887,7 @@ mod tests {
             reasoning: vec!["medium".into(), "high".into()],
         }];
         let active = chat::ActiveModel {
+            aliases: Vec::new(),
             id: "offline-mini".into(),
             label: "Offline Mini".into(),
             reasoning: None,
@@ -15973,6 +15986,7 @@ mod tests {
         let (mut runtime, _handle) = furnished_runtime();
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.active_model = Some(chat::ActiveModel {
+            aliases: Vec::new(),
             id: "resolved".into(),
             label: "Resolved model".into(),
             reasoning: None,

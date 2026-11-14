@@ -6447,6 +6447,7 @@ exec /bin/sleep 60
             label: name.into(),
             reasoning: None,
             default_reasoning: None,
+            aliases: Vec::new(),
         };
         let mut older = actor.state().as_ref().clone();
         older.active_model_revision = 5;

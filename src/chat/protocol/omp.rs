@@ -1186,6 +1186,7 @@ impl Adapter for Omp {
                                 .clone()
                                 .or_else(|| data["thinkingLevel"].as_str().map(str::to_owned)),
                             default_reasoning: None,
+                            aliases: Vec::new(),
                         });
                         step.events
                             .push(Event::ActiveModel(self.active_model.clone()));

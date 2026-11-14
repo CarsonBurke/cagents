@@ -2360,6 +2360,7 @@ mod tests {
             label: "Opus 5.5".into(),
             reasoning: Some("high".into()),
             default_reasoning: None,
+            aliases: vec!["opusplan".into()],
         };
         let mut snapshot = crate::chat::Snapshot::default();
         let before = postcard::to_allocvec(&snapshot).unwrap();
