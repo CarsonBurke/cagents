@@ -25,7 +25,7 @@ open_point() {
 width=int(sys.argv[1]); right=260+(width-270)//2; found=[]
 for line in sys.stdin:
  m=re.search(r"\[t\d+\]\s+(\d+),\s+(\d+)\s+(\d+)x(\d+)",line)
- if m and 260<int(m[1])<right and 120<int(m[2])<700 and "reviewer" in line.lower():
+ if m and 296<=int(m[1])<=325 and 120<int(m[2])<700 and any(name in line.lower() for name in ("reviewer", "casm")) and "cagents" not in line.lower():
   found.append(tuple(map(int,m.groups())))
 assert found, "missing reviewer spawn row"
 x,y,w,h=max(found,key=lambda row:row[1]); print(f"{right-26},{y+h//2}")' "${SCENE_WIDTH:-1500}"
@@ -75,12 +75,18 @@ if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
     sleep 2
     evidence shot same-project-hover
     evidence drive move 1,1
-    evidence drive key shift+Tab shift+Tab
+    for _ in $(seq 1 "${SPAWN_ACTION_REVERSE_TABS:-2}"); do
+        evidence drive key shift+Tab
+    done
     sleep 1
     evidence shot same-project-keyboard
 fi
 if [ "$SIDE" = after ] || [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
-    open_spawn
+    if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+        evidence drive key Return
+    else
+        open_spawn
+    fi
     sleep 3
     evidence drive observe
     shot same-project-opened
