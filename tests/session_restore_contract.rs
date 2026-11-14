@@ -91,6 +91,7 @@ impl RestoreFixture {
             active_worktree: Some(worktree_path.clone()),
             worktree_focus: HashMap::from([(worktree_path.clone(), terminal_card_id)]),
             workspace_history: Vec::new(),
+            workspace_visits: Vec::new(),
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,

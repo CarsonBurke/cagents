@@ -3394,6 +3394,7 @@ mod tests {
             chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
+            workspace_visits: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),

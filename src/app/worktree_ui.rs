@@ -263,7 +263,7 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
     }
 }
 
-fn belongs_to_scope(
+pub(super) fn belongs_to_scope(
     card: &CardState,
     scope: &Path,
     roots: &[&Path],
@@ -278,6 +278,27 @@ fn belongs_to_scope(
             },
             |owner| owner == scope,
         )
+}
+
+/// The pane a scope focuses when it opens: `preferred` while the scope still
+/// holds it, else its first terminal or conversation, else its first editor.
+pub(super) fn scope_focus<'a>(
+    cards: impl Iterator<Item = &'a CardState> + Clone,
+    preferred: Option<CardId>,
+) -> Option<CardId> {
+    let first = |kind: fn(&CardKind) -> bool| {
+        cards
+            .clone()
+            .find(|card| kind(&card.kind))
+            .map(|card| card.id)
+    };
+    preferred
+        .filter(|id| cards.clone().any(|card| card.id == *id))
+        .or_else(|| first(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_))))
+        .or_else(|| first(|kind| matches!(kind, CardKind::Repository(_))))
+        // A global-only strip still needs an active pane, without making that
+        // browser an ownership source or displacing a worktree's own panes.
+        .or_else(|| cards.clone().next().map(|card| card.id))
 }
 
 /// A view descriptor, not a replacement for the persisted workspace. Global
@@ -310,23 +331,7 @@ fn scope_descriptor(
             |channel| card.existence.is_open() && channel.cards.contains(&card.id),
         )
     });
-    let focused = preferred_focus
-        .filter(|id| cards.iter().any(|card| card.id == *id))
-        .or_else(|| {
-            cards
-                .iter()
-                .find(|card| matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_)))
-                .map(|card| card.id)
-        })
-        .or_else(|| {
-            cards
-                .iter()
-                .find(|card| matches!(&card.kind, CardKind::Repository(_)))
-                .map(|card| card.id)
-        })
-        // A global-only strip still needs an active pane, without making that
-        // browser an ownership source or displacing a worktree's own panes.
-        .or_else(|| cards.first().map(|card| card.id));
+    let focused = scope_focus(cards.iter(), preferred_focus);
     WorkspaceState {
         schema_version: state.schema_version,
         id: state.id,
@@ -346,6 +351,7 @@ fn scope_descriptor(
         chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
+        workspace_visits: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
