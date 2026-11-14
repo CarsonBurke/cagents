@@ -408,6 +408,18 @@ interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
 main-thread CPU and the UI thread trace's update and frame times over the edit
 interval on both sides.
 
+Start the native evidence session with `--ui-trace --workspace-trace` to
+record both inclusive update time and the selected/full projection decisions.
+`scripts/native-evidence open-window window-2` opens the peer through the
+development runner using the same recorded binaries, without compiling under
+the native lock. Its trace is `logs/ui-SIDE-window-2.log`; the primary trace
+is `logs/ui-SIDE.log`.
+
+The current-main comparison for the UI half of this work is tracked in
+[#2789](https://github.com/CarsonBurke/cagents/pull/2789). Its measurement table
+identifies the actual application revisions, workload, raw receipts and
+qualifications; historical #2573 results are not measurements of this branch.
+
 ## Native chat viewport
 
 Run the headless viewport contract with optimized application code, separately
