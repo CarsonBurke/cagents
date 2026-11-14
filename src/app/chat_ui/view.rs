@@ -1397,6 +1397,23 @@ fn delivery_command_failed(heading: &str) -> bool {
     delivery_command_outcome(heading).is_some_and(|(_, outcome)| outcome.starts_with("failed"))
 }
 
+fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str, &'a str)> {
+    if !from.is_empty()
+        || !["Agent ", "Workflow "]
+            .iter()
+            .any(|prefix| heading.starts_with(prefix))
+    {
+        return None;
+    }
+    [" was stopped", " finished", " failed"]
+        .into_iter()
+        .find_map(|outcome| {
+            heading
+                .strip_suffix(outcome)
+                .map(|title| (title, outcome.trim()))
+        })
+}
+
 impl Runtime {
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
@@ -5484,10 +5501,14 @@ impl Runtime {
             || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
             |notice| notice.body.full.len() != 0,
         );
-        // Only the adapter's explicit background-command outcome is an error.
-        // A peer's prose mentioning a failure is ordinary delivered content.
+        // Only explicit command/report outcomes are errors. A peer's prose
+        // mentioning a failure is ordinary delivered content.
+        let report_outcome = (*kind == chat::DeliveryKind::Report)
+            .then(|| delivery_report_outcome(from, first))
+            .flatten();
         let failed =
-            *kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading);
+            (*kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading))
+                || report_outcome.is_some_and(|(_, outcome)| outcome == "failed");
         let glyph = if failed {
             Icon::Error
         } else if *kind == chat::DeliveryKind::Notice
@@ -5503,22 +5524,8 @@ impl Runtime {
         let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
             delivery_command_outcome(first)
                 .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
-        } else if *kind == chat::DeliveryKind::Report
-            && from.is_empty()
-            && ["Agent ", "Workflow "]
-                .iter()
-                .any(|prefix| first.starts_with(prefix))
-        {
-            [" was stopped", " finished", " failed"]
-                .into_iter()
-                .find_map(|outcome| {
-                    first
-                        .strip_suffix(outcome)
-                        .map(|title| (title, Some(outcome.trim())))
-                })
-                .unwrap_or((first, None))
         } else {
-            (first, None)
+            report_outcome.map_or((first, None), |(title, outcome)| (title, Some(outcome)))
         };
         // Bound synchronous text shaping. The original remains in the tooltip,
         // copy action and expanded detail; fades never introduce an ellipsis.
@@ -5547,12 +5554,21 @@ impl Runtime {
                 && !sender.is_empty()
                 && !heading.contains(sender)
             {
-                rows.push(selectable_prose::plain(
-                    format!("Sender: {sender}"),
-                    design::TEXT_CAPTION,
-                    iced::Font::MONOSPACE,
-                    self.target,
-                ));
+                rows.push(
+                    widget::container(selectable_prose::text(
+                        vec![
+                            iced::widget::text::Span::new(format!("Sender: {sender}"))
+                                .color(design::muted_color(&cosmic::theme::active())),
+                        ]
+                        .into(),
+                        design::TEXT_CAPTION.into(),
+                        iced::Font::default(),
+                        self.target,
+                        self.find.as_deref(),
+                    ))
+                    .padding([0, step::GAP_M as u16])
+                    .into(),
+                );
             }
             if expanded && !remainder.is_empty() {
                 rows.push(selectable_prose::plain(
@@ -12938,6 +12954,29 @@ mod tests {
             "casmi GPU jobs finishing",
         ] {
             assert!(!delivery_command_failed(heading), "{heading}");
+        }
+    }
+
+    #[test]
+    fn report_outcomes_require_a_canonical_task_heading() {
+        for (heading, title, outcome) in [
+            ("Agent \"Review\" failed", "Agent \"Review\"", "failed"),
+            ("Agent \"Review\" finished", "Agent \"Review\"", "finished"),
+            (
+                "Workflow \"Build\" was stopped",
+                "Workflow \"Build\"",
+                "was stopped",
+            ),
+        ] {
+            assert_eq!(delivery_report_outcome("", heading), Some((title, outcome)));
+            assert_eq!(delivery_report_outcome("Teammate", heading), None);
+        }
+        for heading in [
+            "Build failed while testing",
+            "Message from tester: failed",
+            "Agent failed to start",
+        ] {
+            assert_eq!(delivery_report_outcome("", heading), None);
         }
     }
 
