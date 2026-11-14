@@ -1212,17 +1212,19 @@ impl Cagents {
                 // its own first; a started conversation only among its own
                 // provider's models.
                 let current = runtime.session.launch.provider;
-                let offers = if runtime.choosing() {
+                let offers = if runtime.is_draft() {
                     std::iter::once(current)
                         .chain(MODEL_FAMILIES.into_iter().filter(|provider| {
                             *provider != current && self.account_ui.offers(*provider)
                         }))
-                        .map(|provider| Offer {
-                            provider,
-                            models: self
-                                .account_ui
-                                .catalog(provider)
-                                .map_or(&[][..], |catalog| catalog.models.as_slice()),
+                        .map(|provider| {
+                            let catalog = self.account_ui.catalog(provider);
+                            Offer {
+                                provider,
+                                models: catalog
+                                    .map_or(&[][..], |catalog| catalog.models.as_slice()),
+                                catalog,
+                            }
                         })
                         .collect()
                 } else {
@@ -1322,6 +1324,7 @@ struct Offer<'a> {
     /// What the provider listed last, under its default model. Empty where
     /// it never has, and then the picker offers the default alone.
     models: &'a [chat::Model],
+    catalog: Option<&'a crate::account::cache::Catalog>,
 }
 
 /// What a provider is called where its models are listed.
@@ -3944,7 +3947,18 @@ impl Runtime {
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
-            let label = footer_model_label(snapshot, draft, self.session.launch.provider, fit);
+            let default_effort = offers
+                .iter()
+                .find(|offer| offer.provider == self.session.launch.provider)
+                .and_then(|offer| offer.catalog)
+                .and_then(|catalog| catalog.default_effort(snapshot.selected_model.as_deref()));
+            let label = footer_model_label(
+                snapshot,
+                draft,
+                self.session.launch.provider,
+                fit,
+                default_effort,
+            );
             if transitioning {
                 controls.push(bounded(
                     design::caption(Self::short_description(&label, fit.label_limit())).into(),
@@ -4288,6 +4302,7 @@ impl Runtime {
             vec![Offer {
                 provider,
                 models: &self.snapshot.models,
+                catalog: None,
             }]
         };
         let models = model_list(
@@ -6083,12 +6098,13 @@ fn effort_label(effort: &str) -> String {
     }
 }
 
-fn footer_model_label(
-    snapshot: &chat::Snapshot,
+fn footer_model_label<'a>(
+    snapshot: &'a chat::Snapshot,
     draft: bool,
     provider: Provider,
     fit: FooterFit,
-) -> Cow<'_, str> {
+    draft_default_effort: Option<&str>,
+) -> Cow<'a, str> {
     let selected = snapshot.models.iter().find(|model| {
         Some(&model.id) == snapshot.selected_model.as_ref()
             || (draft && snapshot.selected_model.is_none() && model.id == "default")
@@ -6111,7 +6127,8 @@ fn footer_model_label(
     };
     let chosen = (draft || provider == Provider::Omp)
         .then_some(snapshot.reasoning.as_deref())
-        .flatten();
+        .flatten()
+        .filter(|effort| Some(*effort) != draft_default_effort);
     let effort = active.map_or(chosen, |active| {
         active
             .reasoning
@@ -14647,6 +14664,7 @@ mod tests {
         let offers = [Offer {
             provider: Provider::Claude,
             models: &models,
+            catalog: None,
         }];
         assert_eq!(
             listed(&model_rows(&offers, "", true)),
@@ -14669,32 +14687,147 @@ mod tests {
         });
         for fit in [FooterFit::Wide, FooterFit::Narrow, FooterFit::Tight] {
             assert_eq!(
-                footer_model_label(snapshot, false, Provider::Claude, fit),
+                footer_model_label(snapshot, false, Provider::Claude, fit, None),
                 "Opus 5.5"
             );
             assert_eq!(
-                footer_model_label(snapshot, true, Provider::Claude, fit),
+                footer_model_label(snapshot, true, Provider::Claude, fit, None),
                 "Default (Opus 5.5)"
             );
         }
         snapshot.selected_model = None;
         assert_eq!(
-            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide),
+            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
             "Default (Opus 5.5)"
         );
         snapshot.selected_model = Some("next-turn-model".into());
         assert_eq!(
-            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide),
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
             "Opus 5.5"
         );
         snapshot.active_model = None;
         assert_eq!(
-            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide),
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
             "Model"
         );
         assert_eq!(
-            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide),
+            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
             "next-turn-model"
+        );
+    }
+
+    #[test]
+    fn draft_default_effort_stays_hidden_while_attachment_choice_is_pending() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, value: &str) {
+                self.0.push(value.to_owned());
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let models = vec![chat::Model {
+            id: "offline-mini".into(),
+            label: "Offline Mini".into(),
+            reasoning: vec!["medium".into(), "high".into()],
+        }];
+        let active = chat::ActiveModel {
+            id: "offline-mini".into(),
+            label: "Offline Mini".into(),
+            reasoning: None,
+            default_reasoning: Some("medium".into()),
+        };
+        drop(app.observe_listed_models(Provider::Codex, models.clone(), Some(&active)));
+        let card = super::super::tests::draft_chat_for_provider(&mut app, Provider::Codex);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("draft");
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = models;
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("medium".into());
+        runtime.attachment_chooser_pending = Some(uuid::Uuid::new_v4());
+        assert!(runtime.is_draft());
+        assert!(!runtime.choosing());
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut view = app.chat_view(card);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 900.0)),
+        );
+        let mut texts = Texts(Vec::new());
+        view.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        assert!(
+            texts.0.iter().any(|text| text == "Offline Mini"),
+            "{:?}",
+            texts.0
+        );
+        assert!(
+            !texts.0.iter().any(|text| text.contains("Medium")),
+            "{:?}",
+            texts.0
+        );
+    }
+
+    #[test]
+    fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![model("offline-mini", "Offline Mini")];
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("medium".into());
+        let catalog = crate::account::cache::Catalog {
+            models: snapshot.models.clone(),
+            observed_at: 1,
+            default_model: Some("offline-mini".into()),
+            reasoning_defaults: [("offline-mini".into(), "medium".into())].into(),
+        };
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(snapshot.selected_model.as_deref())
+            ),
+            "Offline Mini"
+        );
+        assert_eq!(
+            footer_model_label(snapshot, true, Provider::Codex, FooterFit::Wide, None),
+            "Offline Mini · Medium",
+            "an unknown default does not erase the explicit choice"
+        );
+        snapshot.selected_model = None;
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(None)
+            ),
+            "ChatGPT · Default model"
+        );
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("high".into());
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(snapshot.selected_model.as_deref())
+            ),
+            "Offline Mini · High"
         );
     }
 
@@ -14713,17 +14846,17 @@ mod tests {
         for provider in [Provider::Claude, Provider::Codex] {
             snapshot.active_model.as_mut().unwrap().reasoning = None;
             assert_eq!(
-                footer_model_label(snapshot, false, provider, FooterFit::Wide),
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
                 "Resolved model"
             );
             snapshot.active_model.as_mut().unwrap().reasoning = Some("medium".into());
             assert_eq!(
-                footer_model_label(snapshot, false, provider, FooterFit::Wide),
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
                 "Resolved model"
             );
             snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
             assert_eq!(
-                footer_model_label(snapshot, false, provider, FooterFit::Wide),
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
                 "Resolved model · High"
             );
         }
@@ -14741,10 +14874,12 @@ mod tests {
             Offer {
                 provider: Provider::Codex,
                 models: &codex,
+                catalog: None,
             },
             Offer {
                 provider: Provider::Claude,
                 models: &[],
+                catalog: None,
             },
         ];
         assert_eq!(
@@ -14776,6 +14911,7 @@ mod tests {
         let offers = [Offer {
             provider: Provider::Omp,
             models: &omp,
+            catalog: None,
         }];
         for query in ["omp", "Other", "mod"] {
             assert_eq!(
@@ -14816,6 +14952,7 @@ mod tests {
         let offers = [Offer {
             provider: Provider::Codex,
             models: &models,
+            catalog: None,
         }];
         let mut element = model_list(target, &offers, false, (Provider::Codex, None), "");
         let mut tree = Tree::new(element.as_widget());

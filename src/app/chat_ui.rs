@@ -9647,6 +9647,11 @@ impl Cagents {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             snapshot.models.hash(&mut hasher);
+            snapshot
+                .active_model
+                .as_ref()
+                .map(|model| (&model.id, &model.default_reasoning))
+                .hash(&mut hasher);
             hasher.finish()
         };
         if snapshot.models.is_empty()
@@ -9655,7 +9660,11 @@ impl Cagents {
             return Task::none();
         }
         let provider = runtime.session.launch.provider;
-        self.observe_listed_models(provider, snapshot.models.clone())
+        self.observe_listed_models(
+            provider,
+            snapshot.models.clone(),
+            snapshot.active_model.as_ref(),
+        )
     }
 
     pub(super) fn start_chat(
@@ -27399,6 +27408,7 @@ mod tests {
                 fixture_model("gpt-a", &[]),
                 fixture_model("gpt-b", &["low", "high"]),
             ],
+            None,
         );
         let card = draft_chat(app);
         let target = chat_runtime(app, card).target;

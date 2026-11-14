@@ -81,24 +81,45 @@ prompt() {
     "$ne" drive type "$1"
     "$ne" drive key Return
 }
+dismiss_inspector() {
+    local observed
+    observed=$("$ne" drive observe)
+    if rg -F 'Source control' <<<"$observed" >/dev/null; then
+        # Escape closes a narrow modal inspector. A remaining wide dock
+        # uses its ordinary toggle. Scope transitions can show either.
+        "$ne" drive key Escape
+        observed=$("$ne" drive observe)
+        if rg -F 'Source control' <<<"$observed" >/dev/null; then
+            "$ne" drive key ctrl+shift+i
+        fi
+    fi
+    "$ne" drive wait 'Source control' --gone --timeout 20
+}
+open_new_channel() {
+    local at
+    dismiss_inspector
+    "$ne" drive key ctrl+shift+g
+    "$ne" drive wait channel --timeout 30
+    dismiss_inspector
+    # Select the first new channel in the fixture's 260px sidebar. An
+    # automatic worktree draft must not satisfy the empty-chat assertion.
+    at=$("$ne" drive observe | rg -i 'new[[:space:]]*channel' |
+        sed -nE 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
+        awk '$1 < 260 && $2 >= 80 && !found {printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2; found = 1}')
+    [ -n "$at" ] || { echo 'Could not locate the new fixture channel in the sidebar.' >&2; return 1; }
+    "$ne" drive click "$at"
+    dismiss_inspector
+    "$ne" drive wait 'conversation appears' --timeout 30
+}
 
-# Narrow windows begin with the inspector as a modal overlay. Escape closes
-# it; the wide docked inspector uses its ordinary toggle. Establish the
-# resulting state before asking the workspace to handle any shortcuts.
-"$ne" drive key Escape
-observed=$("$ne" drive observe)
-if rg -F 'Source control' <<<"$observed" >/dev/null; then
-    "$ne" drive key ctrl+shift+i
-fi
-"$ne" drive wait 'Source control' --gone --timeout 20
+dismiss_inspector
 "$ne" cli project open "$fixture/project" >/dev/null
 "$ne" drive wait main --timeout 30
 "$ne" drive click main
 for provider in claude codex; do
     # Separate channels keep the tested footer at the full conversation pane
     # width instead of adding the second provider as a neighbouring column.
-    "$ne" drive key ctrl+shift+g
-    "$ne" drive wait 'conversation appears' --timeout 30
+    open_new_channel
     "$ne" drive key ctrl+shift+m
     "$ne" drive wait models --timeout 20
     "$ne" drive type "$provider"

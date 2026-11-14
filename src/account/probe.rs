@@ -344,6 +344,8 @@ fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
     (!models.is_empty()).then_some(Catalog {
         models,
         observed_at,
+        default_model: None,
+        reasoning_defaults: Default::default(),
     })
 }
 
@@ -1174,20 +1176,34 @@ async fn probe_codex_with_path(
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
+fn codex_catalog(answer: &Observed<Result<Value, String>>) -> Option<Catalog> {
+    let result = answer.value.as_ref().ok()?;
+    let entries = result["data"].as_array();
+    let mut catalog =
+        observed_catalog(self::models(entries, Model::from_codex), answer.observed_at)?;
+    for entry in entries.into_iter().flatten() {
+        let Some(id) = entry["model"].as_str() else {
+            continue;
+        };
+        if entry["isDefault"].as_bool() == Some(true) {
+            catalog.default_model = Some(id.to_owned());
+        }
+        if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
+            catalog
+                .reasoning_defaults
+                .insert(id.to_owned(), effort.to_owned());
+        }
+    }
+    Some(catalog)
+}
+
 fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, String> {
     let CodexSession {
         account: account_read,
         limits: limits_read,
         models,
     } = result?;
-    let catalog = models.and_then(|answer| {
-        answer.value.ok().and_then(|result| {
-            observed_catalog(
-                self::models(result["data"].as_array(), Model::from_codex),
-                answer.observed_at,
-            )
-        })
-    });
+    let catalog = models.as_ref().and_then(codex_catalog);
     let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
@@ -1610,6 +1626,24 @@ mod tests {
             }]
         );
         assert!(models(None, Model::from_codex).is_empty());
+    }
+
+    #[test]
+    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
+        let answer = Observed {
+            observed_at: 7,
+            value: Ok(json!({"data": [
+                {"model":"mini", "displayName":"Mini", "isDefault":true,
+                 "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
+                     {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}]},
+                {"model":"other", "defaultReasoningEffort":"high"}
+            ]})),
+        };
+        let catalog = codex_catalog(&answer).unwrap();
+        assert_eq!(catalog.default_effort(None), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("other")), Some("high"));
+        assert_eq!(catalog.observed_at, 7);
     }
 
     #[test]
