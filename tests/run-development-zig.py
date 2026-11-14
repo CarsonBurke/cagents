@@ -368,6 +368,19 @@ exit 83
         )
         self.assert_compiling_is_forbidden(result, guard_calls)
 
+    def test_a_launch_below_any_native_slot_cannot_compile(self):
+        guard_calls = self.fake_cargo_reports_its_guard()
+        lock = self.root / "native-lock"
+        lock.touch()
+        slot = self.root / "native-lock.2"
+        slot.touch()
+        result = subprocess.run(
+            ["flock", "--close", str(slot), "sh", "-c", f'"{self.runner}" --browserless; exit $?'],
+            cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assert_compiling_is_forbidden(result, guard_calls)
+
     def test_a_symlinked_lock_path_is_the_same_lock(self):
         guard_calls = self.fake_cargo_reports_its_guard()
         lock = self.root / "real-lock"
