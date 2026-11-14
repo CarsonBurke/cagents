@@ -25432,6 +25432,18 @@ mod tests {
         );
         let _ = app.update(escape());
         assert!(!app.pane_inspectors.is_open(card));
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay),
+            "the closing panel must not squeeze the content into a docked row"
+        );
+        assert!(
+            app.pane_content_inputs_blocked(card),
+            "the slide still covers content"
+        );
+        app.settle_pane_inspectors();
+        assert_eq!(app.pane_inspector_layout(card), None);
+        assert!(!app.pane_content_inputs_blocked(card));
     }
 
     #[test]

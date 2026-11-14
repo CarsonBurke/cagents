@@ -155,7 +155,10 @@ impl PaneInspectors {
         }
         pane.open = open;
         pane.narrowed = false;
-        pane.opened_narrow = open && narrow;
+        if open {
+            pane.opened_narrow = narrow;
+        }
+        // Closing keeps its mounting mode until the panel has slid away.
         pane.transition = Some(InspectorTransition {
             started_at: now,
             from,
@@ -173,6 +176,9 @@ impl PaneInspectors {
                 .is_some_and(|transition| transition.is_complete(now))
             {
                 pane.transition = None;
+                if !pane.open {
+                    pane.opened_narrow = false;
+                }
                 finished = true;
             }
         }
