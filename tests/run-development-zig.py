@@ -857,9 +857,10 @@ exit 83
             "owner_name=fixture-agent\nhosted=true\n")
         lock = runtime / "cagents-development-fx1/cagentsd.lock"
         lock.parent.mkdir()
-        # Like a daemon, it keeps its instance's lock open.
+        # Like a daemon, it keeps its instance's lock open until fixture cleanup.
+        # Listing repeatedly may take longer than a short sleep under host load.
         process = subprocess.Popen(
-            ["/bin/sh", "-c", 'exec 9>>"$1" && exec "$2" 30', "sh", str(lock), str(daemon)],
+            ["/bin/sh", "-c", 'exec 9>>"$1" && exec "$2" infinity', "sh", str(lock), str(daemon)],
             env={"XDG_RUNTIME_DIR": str(runtime), "CAGENTS_DEVELOPMENT_INSTANCE": "fx1"})
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
