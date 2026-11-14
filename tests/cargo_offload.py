@@ -961,6 +961,40 @@ class StandInHost(unittest.TestCase):
         # Nothing was built here.
         self.assertFalse((self.root / "local-build").exists())
 
+    def test_host_helper_and_artifact_reader_travel_to_a_workspace_without_scripts(self):
+        for name in ("cargo-host-test-helper.py", "cargo_artifacts.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.gate.parent / name)
+        (self.crate / "Cargo.toml").write_text(textwrap.dedent("""
+            [package]
+            name = "cagents"
+            version = "0.1.0"
+            edition = "2021"
+            [workspace]
+            [features]
+            host = []
+            [[bin]]
+            name = "cagentsd"
+            path = "src/main.rs"
+        """))
+        (self.crate / "src/lib.rs").write_text(textwrap.dedent('''
+            #[test]
+            fn matched_helper_was_prepared() {
+                let helper = std::env::var("CAGENTS_TEST_RETAINED_ACTOR_HELPER").unwrap();
+                assert!(std::path::Path::new(&helper).is_absolute());
+                let output = std::process::Command::new(helper).output().unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"probe\\n");
+            }
+        '''))
+        result = self.gate_run("test", "--features", "host", "--lib", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("matched_helper_was_prepared ... ok", result.stdout)
+        slot = self.host_home / ".cache/cagents-offload/crate/slot-0"
+        self.assertEqual((slot / "cargo_artifacts.py").read_bytes(),
+                         (ROOT / "scripts/cargo_artifacts.py").read_bytes())
+        self.assertFalse((slot / "src/scripts").exists())
+        self.assertFalse((self.root / "local-build").exists())
+
     def assert_test_memory_cap(self, env):
         # Prove a real scope is available, without compiling or allocating.
         cap = ROOT / "scripts/memory-capped"
