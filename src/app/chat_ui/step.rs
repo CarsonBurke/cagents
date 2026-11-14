@@ -466,14 +466,14 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let mut rows: Vec<Element<'static, Message>> = Vec::new();
-        // Messages a coordinating step collected read as messages, ahead of
-        // the command and output they were printed in.
-        if let Some(coordinated) = cached
-            .coordination
-            .as_deref()
-            .filter(|coordinated| !coordinated.is_card())
-        {
-            rows.extend(self.arrived(item, cached, coordinated, "From", settings));
+        // What a coordinating step said and collected reads as messages,
+        // ahead of the command and output they were printed in.
+        if let Some(coordinated) = cached.coordination.as_deref() {
+            if coordinated.is_card() {
+                rows.extend(self.row_detail(item, cached, coordinated, settings));
+            } else {
+                rows.extend(self.arrived(item, cached, coordinated, "From", settings));
+            }
         }
         match &item.content {
             // A notice's body is a log line or a raw result, drawn verbatim.
