@@ -18,13 +18,17 @@
 # The conversation's first turn replays message-card-scene/frames.jsonl, as
 # Claude Code 2.1 streams it: an Agent call started in the background
 # ("Relocate the repo", agent ID a1892b93e88999a7d), then four SendMessage
-# calls and the JSON each returned:
+# calls and the JSON each returned,
 #
 #   moved        a short message to that agent, queued for its next step
 #   steps        a long message to it, which the card folds
 #   unreachable  a message to a name no agent has, which Claude refuses
 #   earlier      a message that resumed an agent this conversation does not
 #                list, as one an earlier transcript started
+#
+# and a Bash call checking the moved checkout, an ordinary step whose row
+# lines up with the messages' rows. It comes last, so the keys scene reaches
+# the messages' rows with the same keys.
 #
 # Scenes, each shooting with the side's prefix as native-evidence does:
 #
