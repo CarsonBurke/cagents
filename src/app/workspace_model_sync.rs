@@ -330,6 +330,18 @@ fn publish_with_client(
                             operation: *operation,
                             error: error.to_string(),
                         });
+                        if matches!(
+                            &request,
+                            ModelEdit::ChangeView {
+                                change: crate::workspace_model::views::Change::RemoveSource { .. },
+                                ..
+                            }
+                        ) {
+                            let model = client
+                                .read_workspace_model()
+                                .map_err(|error| error.to_string())?;
+                            let _ = updates.send_blocking(ModelUpdate::Read(model));
+                        }
                     }
                     if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
                         let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
@@ -414,6 +426,22 @@ fn send(
                 }
                 std::thread::sleep(Duration::from_millis(20 * conflicts));
                 let model = client.read_workspace_model()?;
+                if let ModelEdit::ChangeView {
+                    scope,
+                    operation,
+                    change: change @ crate::workspace_model::views::Change::RemoveSource { .. },
+                    ..
+                } = &request
+                    && !crate::workspace_model::views::removal_source_current(&model, scope, change)
+                {
+                    let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                        scope: scope.clone(),
+                        operation: *operation,
+                        error: error.to_string(),
+                    });
+                    let _ = updates.send_blocking(ModelUpdate::Read(model));
+                    return Ok(());
+                }
                 if let ModelEdit::ChangeView {
                     scope,
                     operation,

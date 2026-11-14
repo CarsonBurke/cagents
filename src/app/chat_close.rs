@@ -25,6 +25,14 @@ pub(super) struct ChatCloseConfirm {
 impl Cagents {
     /// A close the reader asked for, from anywhere a chat pane can be closed.
     pub(super) fn request_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.reset_shared_removal_for_new_close(card);
+        self.continue_chat_close(card)
+    }
+
+    pub(super) fn continue_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if !self.prepare_shared_removal(card) {
+            return Task::none();
+        }
         self.chat_close_question(card)
             .unwrap_or_else(|| self.begin_chat_close(card))
     }
@@ -56,6 +64,9 @@ impl Cagents {
 
     pub(super) fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
         let (session, certain) = self.chat_close_would_ask(card)?;
+        if !self.prepare_shared_removal(card) {
+            return Some(Task::none());
+        }
         let restore_keyboard_nav = self.core.keyboard_nav();
         self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
@@ -123,6 +134,7 @@ impl Cagents {
             return Task::none();
         };
         self.dismiss_confirmation(QUESTION);
+        self.shared_views.removals.remove(&intent.card);
         let card = intent
             .restore_card
             .filter(|card| self.workspace.order().any(|id| id == *card))

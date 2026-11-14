@@ -103,6 +103,10 @@ impl TerminalSurface {
         self.handle.events()
     }
 
+    pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
+    }
+
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.handle.input(bytes)
     }

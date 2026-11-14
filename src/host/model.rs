@@ -350,11 +350,28 @@ impl Registry {
     }
 
     pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
+        self.apply_delta_guarded(edit, |_| Ok(()))
+    }
+
+    /// Acquire SQL writer admission before retaining resident serialization.
+    /// The guard outlives commit, but never waits for BEGIN IMMEDIATE.
+    pub(crate) fn apply_delta_guarded<G>(
+        &mut self,
+        edit: &ModelEdit,
+        guard: impl FnOnce(bool) -> Result<G, String>,
+    ) -> Result<DeltaApplied, String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current(&transaction)?;
+        let seen = match edit {
+            ModelEdit::ChangeView { operation, .. } => {
+                views::operation_seen(&transaction, *operation)?
+            }
+            _ => false,
+        };
+        let resident_guard = guard(seen)?;
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
@@ -610,6 +627,7 @@ impl Registry {
         #[cfg(test)]
         pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
+        drop(resident_guard);
         #[cfg(test)]
         pause(Pause::AfterCommit);
         Ok(DeltaApplied {

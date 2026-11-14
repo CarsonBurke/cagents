@@ -1660,6 +1660,16 @@ impl ControlClient {
         }
     }
 
+    pub fn terminal_removal_basis(
+        &mut self,
+        source: crate::model::TerminalSession,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadTerminalRemovalBasis { source })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("terminal removal basis", &response)),
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,
@@ -1992,7 +2002,11 @@ impl ControlClient {
                 });
             }
             match envelope.message {
-                ServerMessage::Redraw {
+                ServerMessage::TerminalWorker {
+                    terminal_id: actual,
+                    ..
+                }
+                | ServerMessage::Redraw {
                     terminal_id: actual,
                     ..
                 }
@@ -2268,6 +2282,7 @@ impl ControlClient {
     /// request they interrupt.
     fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
         match message {
+            ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -2529,7 +2544,8 @@ fn response_from_message(message: ServerMessage) -> Result<ServerResponse, Contr
 
 fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
     match message {
-        ServerMessage::Redraw { terminal_id, .. }
+        ServerMessage::TerminalWorker { terminal_id, .. }
+        | ServerMessage::Redraw { terminal_id, .. }
         | ServerMessage::Snapshot { terminal_id, .. }
         | ServerMessage::TerminalObserved { terminal_id, .. }
         | ServerMessage::Event { terminal_id, .. } => *terminal_id == expected,
@@ -2554,6 +2570,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
 
 fn message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::TerminalWorker { .. } => "terminal_worker",
         ServerMessage::Response { .. } => "response",
         ServerMessage::Redraw { .. } => "redraw",
         ServerMessage::Snapshot { .. } => "snapshot",
@@ -2579,6 +2596,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::TerminalRemovalBasis(_) => "terminal_removal_basis",
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",

@@ -548,6 +548,72 @@ fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) 
 }
 
 #[test]
+fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
+    let Some(root) = isolated("shared_chat_removal_accepts_only_its_original_native_cleanup")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let mut spawned = Spawned::new(&fixture.source);
+    struct Cleanup(chat::native_holder::Detached);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.close();
+        }
+    }
+    let owner = Cleanup(spawned.detach());
+    let pane = crate::workspace_model::views::Pane {
+        id: crate::model::CardId::new(),
+        title: "Original chat".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        scope: None,
+        kind: crate::model::CardKind::Chat(fixture.source.clone()),
+    };
+    let mut replacement = fixture.source.clone();
+    replacement.launch.session_id = Some("replacement-conversation".into());
+    for (source, blocked) in [(fixture.source.clone(), false), (replacement, true)] {
+        let mut state = fixture.host.lock().unwrap();
+        state.native_closing.insert(
+            fixture.source.id,
+            native_cleanup::NativeClose::adopted(source, owner.0.clone(), false),
+        );
+        assert_eq!(shared_removal_in_transition(&state, &pane), blocked);
+    }
+    let launch = fixture.source.launch.recipe.clone();
+    let paired = crate::model::TerminalSession {
+        id: TerminalId::new(),
+        launch: launch.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+    };
+    let mut paired_owner = fixture.source.clone();
+    paired_owner.id = TerminalId::new();
+    paired_owner.terminal = Some(paired.clone());
+    let mut state = fixture.host.lock().unwrap();
+    state.native_closing.clear();
+    state.native_closing.insert(
+        paired_owner.id,
+        native_cleanup::NativeClose::adopted(paired_owner, owner.0.clone(), false),
+    );
+    assert!(terminal_claim_pending(&state, paired.id));
+    assert!(
+        state.terminal_removal_basis(&paired).is_err(),
+        "a different chat ID's pending paired cleanup cannot prove terminal absence"
+    );
+    drop(state);
+    owner.0.close().unwrap();
+}
+
+#[test]
 fn a_pending_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_pending_close_whose_owner_then_ended_closes") else {
         return;

@@ -582,6 +582,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "chat_limit", 160),
     ("ServerMessage", "chat_agent_addresses", 173),
+    ("ServerMessage", "terminal_worker", 178),
 ];
 
 /// One source qualification for lifecycle control and migration inspection.
@@ -627,6 +628,11 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     ReleasedSource {
         protocol: 175,
         release: "0.1.3+local.c73002744",
+        family: ClientFamily::Current,
+    },
+    ReleasedSource {
+        protocol: 177,
+        release: "main at a0c25dae3 (protocol 177)",
         family: ClientFamily::Current,
     },
 ];
