@@ -652,6 +652,29 @@ fn muted_glyph(icon: Icon) -> Element<'static, Message> {
         .into()
 }
 
+/// A card caption stays one line; the fade handles the space the pane offers.
+/// Keep shaping bounded while the tooltip retains the complete source text.
+fn faded_caption(text: String, title: bool, tooltip: String) -> Element<'static, Message> {
+    let preview = turn::headline(text);
+    let text = if title {
+        chat_title(preview)
+    } else {
+        design::caption(preview)
+    };
+    crate::interaction::tooltip(
+        crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
+            widget::scrollable(text.wrapping(iced::widget::text::Wrapping::None))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill)
+                .height(design::LINE_BODY),
+            design::raised,
+        )),
+        tooltip,
+    )
+}
+
 /// How a card's status line reads.
 #[derive(Clone, Copy)]
 enum Tone {
@@ -727,10 +750,11 @@ impl Runtime {
             .find(|agent| agent.id == listed)
     }
 
-    /// The name an agent's tab shows, where this conversation lists it.
+    /// A listed agent's full name and distinguishing ordinal. Transcript rows
+    /// bound their own visible previews while retaining this accessible name.
     pub(super) fn listed_agent_name(&self, address: &str) -> Option<String> {
         self.subagent(address)
-            .map(|agent| self.child_label(agent, 80).into_owned())
+            .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
     /// The agents a step names that this conversation lists, each once.
@@ -910,12 +934,9 @@ impl Runtime {
                 .filter(|task| !task.is_empty() && *task != recipient.name),
             _ => None,
         };
-        let caption = match task {
-            Some(task) => Self::short_description(task, 80),
-            None => message.summary.trim().to_owned(),
-        };
+        let caption = task.unwrap_or(message.summary.trim()).to_owned();
         if !caption.is_empty() {
-            rows.push(design::caption(caption).into());
+            rows.push(faded_caption(caption.clone(), false, caption));
         }
         rows.extend(self.text_block(
             item,
@@ -1024,19 +1045,15 @@ impl Runtime {
         rows.push(
             widget::row::with_children(vec![
                 indicator,
-                crate::interaction::tooltip(
-                    chat_title(Self::short_description(
-                        primary
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                            .unwrap_or(&primary),
-                        80,
-                    ))
-                    .width(Length::Fill),
-                    task,
-                )
-                .into(),
+                faded_caption(
+                    primary.clone(),
+                    true,
+                    if primary == task {
+                        task
+                    } else {
+                        format!("{primary}\n{task}")
+                    },
+                ),
             ])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -1465,6 +1482,128 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    #[test]
+    fn agent_card_captions_fade_without_injecting_ellipsis_or_mutating_source() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Captions(Vec<String>);
+        impl Operation for Captions {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let name = format!("Reviewer {}", "界".repeat(300));
+        let task = format!("Verify {}\nRetain the full task", "permissions ".repeat(80));
+        let items = [
+            (
+                "spawn",
+                "Agent",
+                serde_json::json!({
+                    "subagent_type": name,
+                    "description": task,
+                    "prompt": "Review the fixture"
+                }),
+            ),
+            (
+                "message",
+                "SendMessage",
+                serde_json::json!({
+                    "to": "spawn",
+                    "message": "Review the fixture",
+                    "summary": "Review request"
+                }),
+            ),
+        ]
+        .map(|(id, tool, input)| chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: tool.into(),
+                input: input.to_string(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        });
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&items);
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "spawn".into(),
+                kind: name.clone(),
+                description: task.clone(),
+                status: ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: Vec::new(),
+            });
+        let renderer = crate::app::tests::headless_renderer();
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        for (index, item) in items.iter().enumerate() {
+            let cached = &runtime.cache[&item.id];
+            let coordinated = cached.coordination.as_deref().unwrap();
+            let mut rows = Vec::new();
+            match &coordinated.reading.kind {
+                Kind::Spawn(spawn) => runtime.spawn_rows(
+                    &mut rows,
+                    item,
+                    cached,
+                    coordinated,
+                    spawn,
+                    ToolStatus::Succeeded,
+                    "",
+                    settings,
+                ),
+                Kind::Message(message) => runtime.message_rows(
+                    &mut rows,
+                    item,
+                    cached,
+                    coordinated,
+                    message,
+                    ToolStatus::Succeeded,
+                    "",
+                    settings,
+                ),
+                _ => panic!("fixture is an agent card"),
+            }
+            let mut element = rows.swap_remove(index);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+            );
+            let mut captions = Captions(Vec::new());
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut captions,
+            );
+            let source = if index == 0 { &name } else { &task };
+            assert_eq!(captions.0, [turn::headline(source.clone())]);
+            assert!(!captions.0[0].contains('…'));
+            assert!(!captions.0[0].contains('\n'));
+            assert!(captions.0[0].chars().count() > 80);
+            assert!(node.size().height <= design::LINE_BODY);
+            assert_eq!(runtime.snapshot.items[index].as_ref(), item);
+        }
+        assert_eq!(runtime.snapshot.subagents[0].kind, name);
+        assert_eq!(runtime.snapshot.subagents[0].description, task);
+        assert_eq!(
+            runtime.listed_agent_name("spawn").as_deref(),
+            Some(name.as_str())
+        );
     }
 
     #[test]
