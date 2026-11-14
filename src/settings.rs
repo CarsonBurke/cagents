@@ -2014,6 +2014,7 @@ impl AppSettings {
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
         self.palette_recents.truncate(24);
+        adopt_current_preview_rows(&mut self.usage_preview_rows);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -2165,6 +2166,24 @@ impl AppSettings {
 /// Validates the flattened language-server mapping. An empty list is valid and
 /// disables LSP. Nothing here touches the filesystem, resolves an executable,
 /// or invokes a shell.
+/// Renames the status-bar rows a selection saved against a window key that
+/// Claude has since renamed, so the bar keeps showing the window chosen.
+/// Two names for the same window become one row, in the place of its first.
+fn adopt_current_preview_rows(rows: &mut HashMap<String, Vec<String>>) {
+    let Some(rows) = rows.get_mut(crate::agent::Provider::Claude.executable()) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    *rows = std::mem::take(rows)
+        .into_iter()
+        .map(|row| match row.strip_prefix("window:") {
+            Some(key) => format!("window:{}", crate::account::claude::stable_window_key(key)),
+            None => row,
+        })
+        .filter(|row| seen.insert(row.clone()))
+        .collect();
+}
+
 fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), SettingsError> {
     let mut identifiers: HashSet<&str> = HashSet::new();
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
@@ -3427,6 +3446,52 @@ mod tests {
             .insert("codex".into(), Vec::new());
         let decoded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.usage_preview_rows, settings.usage_preview_rows);
+    }
+
+    /// Settings saved before Claude's live Fable window was renamed hold
+    /// its retired key; loading them keeps that window in the status bar.
+    #[test]
+    fn loading_renames_retired_claude_preview_rows() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Value::try_from(AppSettings::default()).unwrap();
+        document.as_table_mut().unwrap().insert(
+            "usage_preview_rows".into(),
+            toml::toml! {
+                claude = [
+                    "window:weekly_overage",
+                    "window:session",
+                    "window:weekly_scoped:Fable 5.1",
+                    "credits",
+                ]
+                codex = ["window:weekly_overage"]
+            }
+            .into(),
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&path)
+            .unwrap()
+            .write_all(toml::to_string(&document).unwrap().as_bytes())
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.usage_preview_rows["claude"],
+            ["window:weekly_scoped:Fable", "window:session", "credits"]
+        );
+        // Another provider's keys are its own.
+        assert_eq!(
+            loaded.usage_preview_rows["codex"],
+            ["window:weekly_overage"]
+        );
+        save(&path, &loaded).unwrap();
+        assert_eq!(
+            load(&path).unwrap().usage_preview_rows,
+            loaded.usage_preview_rows
+        );
     }
 
     #[test]

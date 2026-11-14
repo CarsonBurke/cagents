@@ -235,7 +235,9 @@ entry, as Claude Code's does. To give the account check figures, write a
 account check and each conversation read it whenever they ask. A live usage change is a
 `rate_limit_event` frame in `fixture-frames.jsonl`, such as
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
-reported.
+reported. The login the account check reads is `fixture@example.test` on a
+Pro plan; to report another, such as one in an organization, write it to
+`fixture-auth-status.json` as below, adding `orgName`.
 
 For multiple synthetic accounts, put an `auth status --json` response in each
 account's `fixture-auth-status.json`, such as
