@@ -15,6 +15,8 @@ pub use theme::{TerminalPalette, TerminalTheme, ThemeColor};
 #[cfg(feature = "ui")]
 mod widget;
 #[cfg(feature = "ui")]
+pub use widget::SnapshotPreview;
+#[cfg(feature = "ui")]
 pub(crate) use widget::monospace_font;
 #[cfg(feature = "host")]
 mod worker;
