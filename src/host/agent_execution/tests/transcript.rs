@@ -438,17 +438,23 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
-    retained_identity_case(false);
+    retained_identity_case(false, false);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn confirmed_identity_retries_after_census_publication_failure() {
-    retained_identity_case(true);
+    retained_identity_case(true, false);
 }
 
 #[cfg(target_os = "linux")]
-fn retained_identity_case(fail_census: bool) {
+#[test]
+fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
+    retained_identity_case(false, true);
+}
+
+#[cfg(target_os = "linux")]
+fn retained_identity_case(fail_census: bool, shutdown_before_confirmation: bool) {
     if super::retained_automation::isolated_retained() {
         return;
     }
@@ -459,7 +465,10 @@ fn retained_identity_case(fail_census: bool) {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let (host, request, path) = fixture();
+    let (host, mut request, path) = fixture();
+    if shutdown_before_confirmation {
+        request.prompt = "HOLD_CLEANUP_BUSY".into();
+    }
     let root = path.parent().unwrap();
     let proof = host.lock().unwrap().proof().clone();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -507,12 +516,34 @@ fn retained_identity_case(fail_census: bool) {
             .all(|(client, visible)| *client == EXECUTION_CLIENT && !visible),
         "no window displayed this chat"
     );
+    if shutdown_before_confirmation {
+        wait(
+            || root.join("cleanup-busy").exists(),
+            "provider never reached its confirmation fence",
+        );
+        assert!(handle.confirmed_session_id().is_none());
+        let (terminals, _) = host.lock().unwrap().graceful_shutdown();
+        assert!(terminals.is_empty());
+        wait(
+            || !crate::host::chat::retained_actor::broker_running(&host),
+            "background broker did not stop before confirmation",
+        );
+        std::fs::write(root.join("cleanup-release"), "").unwrap();
+    }
     wait(
         || handle.confirmed_session_id().is_some(),
         "provider never confirmed its conversation",
     );
     let confirmed = handle.confirmed_session_id().unwrap();
     save_claude_transcript(&host, id, root);
+    if shutdown_before_confirmation {
+        let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+        assert!(
+            matches!(agent.session, Some(HostedSession::Chat(source)) if source.launch.session_id.is_none()),
+            "the stopped broker must leave confirmation for synchronous shutdown"
+        );
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
     // Confirmation must be durable without any UI pane publication.
     wait(
         || {
@@ -585,7 +616,9 @@ fn retained_identity_case(fail_census: bool) {
     assert_eq!(pane.launch.session_id.as_deref(), Some(confirmed.as_str()));
     assert_eq!(provider_session.as_deref(), Some(confirmed.as_str()));
     // Use the daemon's real stop boundary, then reopen only its durable model.
-    crate::host::finish_chat_shutdown(&host).unwrap();
+    if !shutdown_before_confirmation {
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
     assert!(!handle.owns_work());
     wait(
         || !identity.record.root.is_current() && !identity.record.holder.is_current(),

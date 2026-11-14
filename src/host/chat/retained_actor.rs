@@ -37,6 +37,17 @@ pub(in crate::host) struct Broker(Arc<Inbox>);
 struct Inbox {
     pending: Mutex<BTreeSet<TerminalId>>,
     wake: Condvar,
+    #[cfg(test)]
+    worker_lifetime: Weak<()>,
+}
+
+#[cfg(test)]
+pub(in crate::host) fn broker_running(host: &SharedHost) -> bool {
+    host.lock()
+        .unwrap()
+        .native_actor_outcomes
+        .as_ref()
+        .is_some_and(|broker| broker.0.worker_lifetime.strong_count() > 0)
 }
 
 pub(super) fn wake(host: &SharedHost, id: TerminalId) {
@@ -47,15 +58,23 @@ pub(super) fn wake(host: &SharedHost, id: TerminalId) {
     let broker = match state.native_actor_outcomes.clone() {
         Some(broker) => broker,
         None => {
+            #[cfg(test)]
+            let worker_lifetime = Arc::new(());
             let inbox = Arc::new(Inbox {
                 pending: Mutex::new(BTreeSet::new()),
                 wake: Condvar::new(),
+                #[cfg(test)]
+                worker_lifetime: Arc::downgrade(&worker_lifetime),
             });
             let weak = Arc::downgrade(host);
             let worker = inbox.clone();
             if let Err(error) = thread::Builder::new()
                 .name("cagents-actor-outcomes".into())
-                .spawn(move || run(weak, worker))
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _lifetime = worker_lifetime;
+                    run(weak, worker)
+                })
             {
                 tracing::error!(%error, "cannot start retained actor outcome broker; helper outbox remains unacknowledged");
                 return;
@@ -2610,6 +2629,24 @@ pub(in crate::host) fn finish_close(
         );
     }
     handle.refresh_retained_state()?;
+    let target = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&requested.id)
+            .filter(|record| record.handle.same_attachment(handle))
+            .ok_or("Actor close ownership changed before final acknowledgement")?;
+        SemanticTarget {
+            handle: handle.clone(),
+            source: record.session.clone(),
+            identity: identity.clone(),
+            notifications: notifications.clone(),
+        }
+    };
+    // Shutdown may already have stopped the background broker, and the
+    // provider can confirm its conversation while Close is in progress.
+    // Flush that final identity before acknowledging outcomes or retirement.
+    persist_confirmed_identity(host, &target, &registry)?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let execution = !loss.affected_runs.is_empty();
