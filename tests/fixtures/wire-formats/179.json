@@ -9518,6 +9518,27 @@
               [
                 "allow_active",
                 "Bool"
+              ],
+              [
+                "capture",
+                {
+                  "Option": {
+                    "Container": "cagents::workspace_model::views::CapturedTerminalSource"
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "ReadCapturedTerminalRemovalBasis",
+          {
+            "Struct": [
+              [
+                "capture",
+                {
+                  "Container": "cagents::workspace_model::views::CapturedTerminalSource"
+                }
               ]
             ]
           }
@@ -9989,6 +10010,17 @@
                     "Container": "cagents::chat::AgentAddress"
                   }
                 }
+              ]
+            ]
+          }
+        ],
+        [
+          "automation_proposals_changed",
+          {
+            "Struct": [
+              [
+                "repository",
+                "Str"
               ]
             ]
           }
@@ -13815,6 +13847,38 @@
         ]
       ]
     },
+    "cagents::workspace_model::views::CapturedTerminalSource": {
+      "Struct": [
+        [
+          "registry",
+          "Bytes"
+        ],
+        [
+          "repository",
+          "Str"
+        ],
+        [
+          "scope",
+          {
+            "Container": "cagents::workspace_model::views::Scope"
+          }
+        ],
+        [
+          "view_revision",
+          "U64"
+        ],
+        [
+          "model_sequence",
+          "U64"
+        ],
+        [
+          "before",
+          {
+            "Container": "cagents::workspace_model::views::Pane"
+          }
+        ]
+      ]
+    },
     "cagents::workspace_model::views::Change": {
       "Enum": [
         [
@@ -13943,6 +14007,39 @@
                   "Option": {
                     "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
                   }
+                }
+              ],
+              [
+                "capture",
+                {
+                  "Option": {
+                    "Container": "cagents::workspace_model::views::CapturedTerminalSource"
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "UpdateTerminalSource",
+          {
+            "Struct": [
+              [
+                "before",
+                {
+                  "Container": "cagents::workspace_model::views::Pane"
+                }
+              ],
+              [
+                "pane",
+                {
+                  "Container": "cagents::workspace_model::views::Pane"
+                }
+              ],
+              [
+                "worker",
+                {
+                  "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
                 }
               ]
             ]
