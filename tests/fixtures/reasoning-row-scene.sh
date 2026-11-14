@@ -179,7 +179,7 @@ tools_details() {
 # Keep the failed command's original diagnostic alongside a running group and
 # its nested success/running commands. No command is executed by this fixture.
 outcome_details() {
-    local prefix=$1 mixed_parent=false
+    local prefix=$1 mixed_parent=false failure_pattern='exit ?1' failure_index=0
     scroll_top
     # The baseline filters the empty thought and merges this failure into
     # the mixed group. Newer UI preserves the thought and its group boundary.
@@ -188,14 +188,18 @@ outcome_details() {
         mixed_parent=true
     else
         click_row '(Ran printf|Tried to run)'
+        # New headers keep one full preview; a long command can fade the
+        # appended exit status, so use the common outer/nested prefix.
+        failure_pattern='(Ran printf|Tried to run)'
+        failure_index=1
     fi
-    align_row 'exit ?1'
-    if ! text_visible '\bRefused\b'; then click_row 'exit ?1'; fi
+    align_row "$failure_pattern" "$failure_index"
+    if ! text_visible '\bRefused\b'; then click_row "$failure_pattern" "$failure_index"; fi
     find_row '\bRefused\b' >/dev/null
     # OCR may split the leading verb from the stable count.
     if ! text_visible 'fixture.log.ready'; then click_row '2 commands'; fi
     local point y steps
-    point=$(find_row 'exit ?1')
+    point=$(find_row "$failure_pattern" "$failure_index")
     y=${point#*,}
     if [ "$y" -gt 200 ]; then
         steps=$(( (y - 160) / 60 ))
@@ -204,7 +208,7 @@ outcome_details() {
     fi
     shot "${prefix}rows-outcomes-expanded"
     click_row '2 commands'
-    click_row 'exit ?1'
+    click_row "$failure_pattern" "$failure_index"
     scroll_top
     if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row '(Ran printf|Tried to run)'; fi
     scroll_top
