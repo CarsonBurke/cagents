@@ -347,6 +347,7 @@ impl Runtime {
                 }
                 let mut file_rows: Vec<Element<'_, Message>> = vec![
                     crate::ui_controls::fade_text(&file.key.path)
+                        .edge(crate::ui_controls::FadeEdge::Start)
                         .font(iced::Font::MONOSPACE)
                         .width(Length::Fill)
                         .into(),
@@ -358,8 +359,17 @@ impl Runtime {
                         .into(),
                 ];
                 if let chat::ChangeKind::Renamed { from } = &file.kind {
-                    file_rows
-                        .push(crate::ui_controls::FadeText::caption(format!("from {from}")).into());
+                    file_rows.push(
+                        widget::row::with_children(vec![
+                            design::caption("from").into(),
+                            crate::ui_controls::FadeText::caption(from.as_str())
+                                .edge(crate::ui_controls::FadeEdge::Start)
+                                .width(Length::Fill)
+                                .into(),
+                        ])
+                        .spacing(space::XS)
+                        .into(),
+                    );
                 }
                 files.push(crate::interaction::tooltip(
                     widget::button::custom(widget::column::with_children(file_rows).spacing(2))

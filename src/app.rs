@@ -19497,6 +19497,7 @@ impl Application for Cagents {
                 .into(),
                 crate::interaction::tooltip(
                     crate::ui_controls::FadeText::caption(display_path(&directory).into_owned())
+                        .edge(crate::ui_controls::FadeEdge::Start)
                         .width(Length::Fill),
                     directory.display().to_string(),
                 ),

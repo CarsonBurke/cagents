@@ -1118,10 +1118,14 @@ impl Cagents {
             && !state.directory.as_os_str().is_empty()
         {
             rows.push(crate::interaction::tooltip(
-                crate::ui_controls::FadeText::caption(format!(
-                    "Current: {}",
-                    state.directory.display()
-                ))
+                widget::row::with_children(vec![
+                    design::caption("Current:").into(),
+                    crate::ui_controls::FadeText::caption(state.directory.display().to_string())
+                        .edge(crate::ui_controls::FadeEdge::Start)
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
                 .width(Length::Fill),
                 format!(
                     "File and Git operations use {} until navigation succeeds",

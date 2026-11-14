@@ -9220,36 +9220,35 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             text.edge(crate::ui_controls::FadeEdge::Start)
         };
         let mut label: Vec<Element<'_, RepositoryAction>> = Vec::new();
-        if !runtime.standalone {
+        let caption = linked.map(|source| {
+            if runtime.standalone {
+                format!(
+                    "{} \u{2192} {}",
+                    file_name(&selected.path),
+                    file_name(source)
+                )
+            } else {
+                format!("\u{2192} {}", file_name(source))
+            }
+        });
+        let caption =
+            caption.map(|caption| one_line(crate::ui_controls::FadeText::caption(caption)));
+        if runtime.standalone {
+            label.extend(caption.map(Element::from));
+        } else {
             label.push(crate::file_icon::icon(&selected.path).into());
-            // The name gives way to the caption only when there is one; on
-            // its own it fills the slot as it always has.
-            label.push(
-                one_line(crate::ui_controls::fade_text(
-                    selected.path.to_string_lossy().into_owned(),
-                ))
-                .width(if linked.is_some() {
-                    Length::Shrink
-                } else {
-                    Length::Fill
-                })
-                .into(),
-            );
+            let path = one_line(crate::ui_controls::fade_text(
+                selected.path.to_string_lossy().into_owned(),
+            ));
+            // The path gives way to the caption when there is one; on its
+            // own it fills the slot as it always has.
+            label.push(match caption {
+                Some(caption) => crate::ui_controls::trailing(path, caption, space::S),
+                None => path.width(Length::Fill).into(),
+            });
         }
         let tooltip = match linked {
-            Some(source) => {
-                let caption = if runtime.standalone {
-                    format!(
-                        "{} \u{2192} {}",
-                        file_name(&selected.path),
-                        file_name(source)
-                    )
-                } else {
-                    format!("\u{2192} {}", file_name(source))
-                };
-                label.push(one_line(crate::ui_controls::FadeText::caption(caption)).into());
-                format!("{} \u{2192} {}", selected.path.display(), source.display())
-            }
+            Some(source) => format!("{} \u{2192} {}", selected.path.display(), source.display()),
             None => selected.path.to_string_lossy().into_owned(),
         };
         widget::container(crate::interaction::tooltip(
