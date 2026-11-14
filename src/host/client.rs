@@ -370,6 +370,7 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         let _close_reply = if matches!(
             &request,
             ClientRequest::CloseTerminalChecked { .. }
+                | ClientRequest::CloseTerminalSource { .. }
                 | ClientRequest::ReleaseCompletedTerminal { .. }
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
@@ -512,6 +513,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::CloseTerminalSource { .. }
     ) {
         return Ok(());
     }
@@ -587,6 +589,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::CloseTerminalSource { .. }
             | ClientRequest::ChatCloseRetained { .. }
             | ClientRequest::ChatLostProcesses { .. }
     );
@@ -1174,12 +1177,74 @@ fn process_wire_request(
     Ok((response.into(), extras, shutdown))
 }
 
+fn validate_cleanup_source(
+    state: &super::state::HostState,
+    expected: Option<&(
+        crate::model::TerminalSession,
+        crate::workspace_model::views::TerminalRemovalBasis,
+    )>,
+) -> Result<(), ProtocolError> {
+    if let Some((source, basis)) = expected {
+        let valid = match basis {
+            crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance } => {
+                owner == state.proof()
+                    && owner.is_complete()
+                    && !instance.is_nil()
+                    && state.terminals.get(&source.id).is_some_and(|record| {
+                        if record.handle.execution_instance() != *instance {
+                            return false;
+                        }
+                        state.descriptor(0, source.id).is_ok_and(|descriptor| {
+                            let mut current = descriptor.session;
+                            current.continuity = source.continuity.clone();
+                            current == *source
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The terminal changed or still owns work; nothing was closed",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn process_admitted_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
     _shared: Option<std::sync::RwLockReadGuard<'_, ()>>,
 ) -> Result<RequestOutcome, ProtocolError> {
+    // Adapt the additive request to the established close paths. Its original
+    // source is checked under the same lock that selects the resident handle;
+    // the existing close reservation then retains that exact handle.
+    let (request, cleanup_source) = match request {
+        ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+        } => {
+            let request = if completed_only {
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: session.clone(),
+                    allow_active,
+                }
+            } else {
+                ClientRequest::CloseTerminalChecked {
+                    terminal_id: session.id,
+                    allow_active,
+                }
+            };
+            (request, Some((session, basis)))
+        }
+        request => (request, None),
+    };
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -2110,6 +2175,7 @@ fn process_admitted_request(
             }
             let (handle, paired, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_cleanup_source(&state, cleanup_source.as_ref())?;
                 state.ensure_retention_available(&[session.id])?;
                 let handle = match state.terminals.get(&session.id) {
                     None => {
@@ -2186,6 +2252,7 @@ fn process_admitted_request(
         } => {
             let (handle, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_cleanup_source(&state, cleanup_source.as_ref())?;
                 state.ensure_retention_available(&[terminal_id])?;
                 (
                     state.history_handle(client_id, terminal_id)?,
@@ -2235,6 +2302,7 @@ fn process_admitted_request(
                 false,
             ))
         }
+        ClientRequest::CloseTerminalSource { .. } => unreachable!("source close normalized above"),
         ClientRequest::Shutdown => {
             let outcome = host
                 .lock()
@@ -2895,6 +2963,7 @@ pub(in crate::host) mod tests {
                 let closing = matches!(
                     &request,
                     ClientRequest::CloseTerminalChecked { .. }
+                        | ClientRequest::CloseTerminalSource { .. }
                         | ClientRequest::ReleaseCompletedTerminal { .. }
                         | ClientRequest::ShutdownTerminal { .. }
                 );
@@ -3618,6 +3687,76 @@ pub(in crate::host) mod tests {
     }
 
     #[test]
+    fn source_checked_close_cannot_retarget_a_completed_replacement_after_basis_read() {
+        let (host, _directory, _, original) = retention_client_host("source-close-race");
+        let id = host
+            .lock()
+            .unwrap()
+            .terminals
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        let session = host.lock().unwrap().descriptor(1, id).unwrap().session;
+        let basis = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        // B publishes after the metadata reply and before the destructive RPC.
+        let replacement =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !replacement.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let mut state = host.lock().unwrap();
+            drop(state.retire_terminal(id));
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), replacement.clone(), false)
+                .unwrap();
+        }
+        for completed_only in [false, true] {
+            for allow_active in [false, true] {
+                assert!(
+                    process_request(
+                        &host,
+                        1,
+                        ClientRequest::CloseTerminalSource {
+                            session: session.clone(),
+                            basis: basis.clone(),
+                            completed_only,
+                            allow_active,
+                        }
+                    )
+                    .is_err()
+                );
+                let state = host.lock().unwrap();
+                assert!(state.terminals[&id].handle.same_worker(&replacement));
+                assert!(!state.terminal_retirements.contains_key(&id));
+            }
+        }
+        let current = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        retry_retirement_close(&host, || ClientRequest::CloseTerminalSource {
+            session: session.clone(),
+            basis: current.clone(),
+            completed_only: true,
+            allow_active: false,
+        });
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        original.shutdown().unwrap();
+        replacement.shutdown().unwrap();
+    }
+
+    #[test]
     fn explicit_close_retains_registered_original_until_actual_holder_receipt() {
         use std::os::unix::{
             ffi::{OsStrExt, OsStringExt},
@@ -4266,8 +4405,15 @@ pub(in crate::host) mod tests {
                 },
             );
         }
-        let request = |allow_active| ClientRequest::ReleaseCompletedTerminal {
+        let basis = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        let request = |allow_active| ClientRequest::CloseTerminalSource {
             session: session.clone(),
+            basis: basis.clone(),
+            completed_only: true,
             allow_active,
         };
         assert!(matches!(

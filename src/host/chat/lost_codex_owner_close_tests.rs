@@ -555,13 +555,18 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
     };
     let fixture = Fixture::new(&root);
     let mut spawned = Spawned::new(&fixture.source);
-    struct Cleanup(chat::native_holder::Detached);
+    struct Cleanup(chat::native_holder::Detached, Record);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = self.0.close();
+            for process in [&self.1.holder, &self.1.root] {
+                if process.is_current() {
+                    kill(process);
+                }
+            }
         }
     }
-    let owner = Cleanup(spawned.detach());
+    let record = Spawned::record(&fixture.source);
+    let owner = Cleanup(spawned.detach(), record.clone());
     let pane = crate::workspace_model::views::Pane {
         id: crate::model::CardId::new(),
         title: "Original chat".into(),
@@ -610,7 +615,8 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
         "a different chat ID's pending paired cleanup cannot prove terminal absence"
     );
     drop(state);
-    owner.0.close().unwrap();
+    drop(owner);
+    assert!(!record.holder.is_current() && !record.root.is_current());
 }
 
 #[test]

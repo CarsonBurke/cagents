@@ -15,6 +15,12 @@ pub(in crate::app) enum TerminalCleanupAuthority {
 }
 
 impl TerminalCleanupAuthority {
+    pub(in crate::app) fn worker(&self) -> Option<&TerminalRemovalBasis> {
+        match self {
+            Self::Shared(Some(basis @ TerminalRemovalBasis::Worker { .. })) => Some(basis),
+            _ => None,
+        }
+    }
     pub(in crate::app) fn requires_absence(&self) -> bool {
         matches!(
             self,

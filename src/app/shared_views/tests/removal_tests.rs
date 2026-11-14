@@ -12,7 +12,11 @@ fn completed_shared_close_cannot_adopt_a_replacement_worker_receipt() {
             occurred_at_unix_ms: 1,
         }),
     };
-    let (mut app, _, _, pane) = channel_move_fixture_with_kind(Some(CardKind::Terminal(source)));
+    let (mut app, _, _, mut pane) = channel_move_fixture();
+    pane.kind = CardKind::Terminal(source);
+    app.workspace_model.views[0].panes[0] = pane.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.cards.remove(&pane.id);
     assert!(app.capture_shared_removal(pane.id));
     let replacement = TerminalRemovalBasis::Worker {
         owner: HostSessionProof {

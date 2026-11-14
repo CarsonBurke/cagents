@@ -635,6 +635,11 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         release: "main at a0c25dae3 (protocol 177)",
         family: ClientFamily::Current,
     },
+    ReleasedSource {
+        protocol: 178,
+        release: "development at 45ee39662 (protocol 178)",
+        family: ClientFamily::Current,
+    },
 ];
 
 /// Protocols main served since the oldest pinned source that live updates

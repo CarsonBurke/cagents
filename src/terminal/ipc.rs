@@ -241,7 +241,7 @@ use crate::{
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
 /// Version 178 fences shared Close on its original pane and terminal worker,
 /// and appends attachment metadata and completed/absent removal-basis reads.
-pub const PROTOCOL_VERSION: u16 = 178;
+pub const PROTOCOL_VERSION: u16 = 179;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -649,6 +649,14 @@ pub enum ClientRequest {
     /// process proof. This never closes, starts or attaches a terminal.
     ReadTerminalRemovalBasis {
         source: TerminalSession,
+    },
+    /// Close only the worker captured by the original pane gesture. Completed
+    /// release and checked live close share the same resident-generation fence.
+    CloseTerminalSource {
+        session: TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
     },
 }
 

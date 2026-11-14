@@ -454,6 +454,7 @@ impl Cagents {
                         ControlClient::connect(&socket).map_err(|error| error.to_string())?;
                     let basis = client
                         .terminal_removal_basis(source.clone())
+                        .or_else(|error| authority.worker().cloned().ok_or(error))
                         .map_err(|error| error.to_string())?;
                     if matches!(basis, crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }) {
                         return super::daemon_recovery::prove_not_hosted(&source, &[])
@@ -463,10 +464,12 @@ impl Cagents {
                     if !authority.permits(&basis) {
                         return Err("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
                     }
-                    match client
-                        .release_completed_terminal(source, allow_active)
-                        .map_err(|error| error.to_string())?
-                    {
+                    let outcome = if let Some(basis) = authority.worker() {
+                        client.close_terminal_source(source, basis.clone(), true, allow_active)
+                    } else {
+                        client.release_completed_terminal(source, allow_active)
+                    }.map_err(|error| error.to_string())?;
+                    match outcome {
                         TerminalCloseResult::Closed => {
                             Ok(CompletedCloseOutcome::ClosedWithBasis(basis))
                         }
@@ -971,6 +974,7 @@ impl Cagents {
         let still_saved = intent
             .saved_source
             .as_ref()
+            .or(intent.completed_source.as_ref())
             .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
         let starting = self.terminal_start_in_flight(card);
         match outcome {
@@ -2214,57 +2218,71 @@ mod tests {
 
     #[test]
     fn completed_terminal_with_live_conversation_uses_fenced_close_confirmation() {
-        let mut app = super::super::tests::context_inspector_test_app(true);
-        let card = app.workspace.focused().unwrap();
-        app.set_residency(card, Residency::Hot);
-        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
-            unreachable!()
-        };
-        session.continuity = TerminalContinuity::Exited {
-            last_exit: crate::model::TerminalExit {
-                code: Some(0),
-                signal: None,
-                occurred_at_unix_ms: 1,
-            },
-        };
-        let source = session.clone();
-        let proof = HostSessionProof {
-            host_session_id: HostSessionId::new("paired"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        };
-        let _ = app.begin_card_close(card);
-        let opening = app.update(Message::CompletedTerminalClosed {
-            card,
-            session: source.clone(),
-            result: Ok(CompletedCloseOutcome::Active(proof.clone())),
-        });
-        // A routine question opens on its answer, so Enter closes the pane.
-        assert_eq!(
-            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
-            Some(confirm_id())
-        );
-        assert!(matches!(
-            super::super::dialog_ui::tests::enter_control(
-                app.terminal_close_dialog().unwrap(),
-                confirm_id()
-            ),
-            Message::ConfirmTerminalClose
-        ));
-        assert!(app.card_state(card).unwrap().existence.is_open());
-        let _ = app.update(Message::ConfirmTerminalClose);
-        let intent = app.terminal_close.as_ref().unwrap().clone();
-        assert!(intent.pending);
-        assert_eq!(intent.completed_source, Some(source));
-        assert_eq!(intent.proof, proof);
-        let _ = app.update(Message::TerminalCloseFinished {
-            card,
-            terminal: intent.terminal,
-            proof: intent.proof,
-            generation: intent.generation,
-            outcome: CloseOutcome::Closed,
-        });
-        assert!(app.closed_terminal_cards.contains(&card));
+        for proven_gone in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let card = app.workspace.focused().unwrap();
+            app.set_residency(card, Residency::Hot);
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+            let source = session.clone();
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("paired"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            };
+            let _ = app.begin_card_close(card);
+            let opening = app.update(Message::CompletedTerminalClosed {
+                card,
+                session: source.clone(),
+                result: Ok(CompletedCloseOutcome::Active(proof.clone())),
+            });
+            // A routine question opens on its answer, so Enter closes the pane.
+            assert_eq!(
+                super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
+                Some(confirm_id())
+            );
+            assert!(matches!(
+                super::super::dialog_ui::tests::enter_control(
+                    app.terminal_close_dialog().unwrap(),
+                    confirm_id()
+                ),
+                Message::ConfirmTerminalClose
+            ));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            let _ = app.update(Message::ConfirmTerminalClose);
+            let intent = app.terminal_close.as_ref().unwrap().clone();
+            assert!(intent.pending);
+            assert_eq!(intent.completed_source, Some(source));
+            assert_eq!(intent.proof, proof);
+            let outcome = if proven_gone {
+                CloseOutcome::NotHostedWithBasis(
+                    crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                        owner: proof,
+                        latest_worker: None,
+                        history_epoch: 0,
+                    },
+                )
+            } else {
+                CloseOutcome::Closed
+            };
+            let _ = app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            });
+            assert!(app.closed_terminal_cards.contains(&card));
+            assert_eq!(app.proven_gone_cards.contains(&card), proven_gone);
+        }
     }
 
     #[test]
@@ -2483,6 +2501,7 @@ fn revalidate_and_close(
             }
             let basis = client
                 .terminal_removal_basis(source.clone())
+                .or_else(|error| authority.worker().cloned().ok_or(error))
                 .map_err(|error| error.to_string())?;
             if matches!(
                 basis,
@@ -2498,21 +2517,31 @@ fn revalidate_and_close(
             if !authority.permits(&basis) {
                 return Ok(CloseOutcome::Stale);
             }
-            client
-                .release_completed_terminal(source.clone(), allow_active)
-                .map_err(|error| error.to_string())
-                .map(|outcome| match outcome {
-                    TerminalCloseResult::Closed => CloseOutcome::ClosedWithBasis(basis),
-                    TerminalCloseResult::Active => CloseOutcome::Active,
-                    TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
-                })
+            (if let Some(basis) = authority.worker() {
+                client.close_terminal_source(source.clone(), basis.clone(), true, allow_active)
+            } else {
+                client.release_completed_terminal(source.clone(), allow_active)
+            })
+            .map_err(|error| error.to_string())
+            .map(|outcome| match outcome {
+                TerminalCloseResult::Closed => CloseOutcome::ClosedWithBasis(basis),
+                TerminalCloseResult::Active => CloseOutcome::Active,
+                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+            })
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
     let mut basis = None;
     let outcome = close_or_prove_gone(
         intent,
-        || close_hosted_terminal(intent.terminal, &intent.proof, allow_active),
+        || {
+            if let (Some(source), Some(basis)) = (intent.saved_source.as_ref(), authority.worker())
+            {
+                close_hosted_terminal_source(source, basis, allow_active)
+            } else {
+                close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+            }
+        },
         |source, leave| {
             basis = Some(super::daemon_recovery::prove_not_hosted(source, leave)?);
             Ok(())
@@ -2546,6 +2575,33 @@ fn close_or_prove_gone(
         Ok(()) => CloseOutcome::NotHosted,
         Err(kept) => CloseOutcome::Kept(kept),
     }
+}
+
+fn close_hosted_terminal_source(
+    source: &TerminalSession,
+    basis: &crate::workspace_model::views::TerminalRemovalBasis,
+    allow_active: bool,
+) -> CloseOutcome {
+    let run = || -> Result<CloseOutcome, String> {
+        let crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, .. } = basis
+        else {
+            return Ok(CloseOutcome::Stale);
+        };
+        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+        if client.proof() != owner || !owner.is_complete() {
+            return Ok(CloseOutcome::Stale);
+        }
+        client
+            .close_terminal_source(source.clone(), basis.clone(), false, allow_active)
+            .map_err(|error| error.to_string())
+            .map(|outcome| match outcome {
+                TerminalCloseResult::Closed => CloseOutcome::Closed,
+                TerminalCloseResult::Active => CloseOutcome::Active,
+                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+            })
+    };
+    run().unwrap_or_else(CloseOutcome::Unreachable)
 }
 
 /// Asks the daemon to close `terminal`, provided the daemon is still the one

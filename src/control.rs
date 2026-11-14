@@ -1670,6 +1670,49 @@ impl ControlClient {
         }
     }
 
+    pub fn close_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let terminal_id = session.id;
+        if !completed_only {
+            self.attach_and_synchronize(terminal_id)?;
+        }
+        let request = ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+        };
+        let result = (if completed_only {
+            self.request_with_deadline(request, Instant::now() + CHAT_CLOSE_TIMEOUT)
+        } else {
+            self.request_attached_with_deadline(
+                request,
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+        })
+        .and_then(|response| match response {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id: actual,
+                outcome,
+            } if actual == terminal_id => Ok(outcome),
+            response => Err(unexpected_response(
+                "a source-checked terminal close",
+                &response,
+            )),
+        });
+        if completed_only || matches!(result, Ok(terminal::ipc::TerminalCloseResult::Closed)) {
+            result
+        } else {
+            self.finish_attachment(terminal_id, result)
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,
