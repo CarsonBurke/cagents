@@ -130,6 +130,10 @@ impl State {
     pub(super) fn flow_readiness(&self) -> Option<bool> {
         self.flow.as_ref().map(|_| self.flow_ready.is_some())
     }
+    #[cfg(test)]
+    pub(super) fn mounted_typography(&self) -> Option<(iced::Font, iced::Pixels)> {
+        self.shape.map(|shape| (shape.font, shape.size))
+    }
     fn paragraph(&self) -> &ParagraphBuffer {
         debug_assert!(
             self.flow.is_none(),

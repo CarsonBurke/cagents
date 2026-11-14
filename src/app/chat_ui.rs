@@ -82,6 +82,7 @@ mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod disclosure;
 mod failure;
 mod find;
 mod find_navigation;
@@ -102,6 +103,7 @@ mod prompt;
 mod prose;
 mod prose_document;
 mod pull_request_links;
+mod reasoning;
 pub(super) use pull_request_links::Board as PullRequestBoard;
 mod reader_source;
 mod retained;
@@ -1760,6 +1762,7 @@ struct CachedItem {
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
+    reasoning: Option<reasoning::Preview>,
     document: Option<prose_document::Document>,
     prompt: Option<Box<prompt::Prepared>>,
     literal: Option<literal_content::Content>,
@@ -1961,6 +1964,10 @@ impl CachedItem {
                 .values()
                 .map(prose::CodeBlock::retained_bytes)
                 .sum::<usize>()
+            + self
+                .reasoning
+                .as_ref()
+                .map_or(0, reasoning::Preview::retained_bytes)
             + self.preview.retained_bytes()
             + self
                 .tool_input
@@ -2229,6 +2236,7 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
+            reasoning: reasoning::Preview::of(content),
             document: None,
             prompt: None,
             literal,
@@ -2362,6 +2370,9 @@ impl CachedItem {
     /// can still require full trailing-block reparsing. Large changed prose
     /// uses the background preparation engine rather than this UI helper.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
+        if self.reasoning.is_some() {
+            self.reasoning = Some(reasoning::Preview::new(body));
+        }
         {
             let _stage = chat_stage::scope(Stage::Parse);
             match self.source.advance_append(body, growing) {
