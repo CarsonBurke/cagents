@@ -1100,13 +1100,26 @@ fn write_from(
                 _ => None,
             })
         };
-        if primary(before) != primary(view) {
+        let previous = primary(before);
+        let current = primary(view);
+        let learned_thread = matches!(
+            (&previous, &current),
+            (
+                Some((old_card, old_session, old_provider, None)),
+                Some((card, session, provider, Some(_))),
+            ) if old_card == card && old_session == session && old_provider == provider
+        );
+        if previous != current && !learned_thread {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
+            // The first pane realizes the task that already named an accepted
+            // agent's channel; keep that prompt fallback until useful metadata
+            // improves it. Learning its first thread ID is not a replacement.
+            let first_adoption = previous.is_none() && current.is_some();
             if db
                 .execute(
-                    "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
-                    [id.to_string()],
+                    "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2 AND (?2=0 OR title_source<>0)",
+                    params![id.to_string(), first_adoption],
                 )
                 .map_err(|error| error.to_string())?
                 > 0
@@ -1434,6 +1447,208 @@ mod tests {
         }
     }
 
+    fn live_chat_pane(thread: Option<&str>) -> Pane {
+        let mut pane = live_source_pane();
+        let CardKind::Terminal(terminal) = pane.kind else {
+            unreachable!()
+        };
+        pane.kind = CardKind::Chat(crate::chat::Session {
+            id: terminal.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: terminal.launch.clone(),
+                session_id: thread.map(str::to_owned),
+            },
+            proof: terminal.continuity.live_proof(),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        });
+        pane
+    }
+
+    fn assert_canonical_channel_title(
+        registry: &Registry,
+        channel: ChannelId,
+        title: &str,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        let model = registry.model().unwrap();
+        let canonical = model.channel(channel).unwrap();
+        assert_eq!(
+            (canonical.title.as_str(), canonical.title_source),
+            (title, source)
+        );
+        let retained: String = registry
+            .db
+            .query_row(
+                "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                params![channel.to_string(), canonical.ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained, title,
+            "the retained work home follows the canonical title"
+        );
+    }
+
+    #[test]
+    fn first_primary_adoption_and_thread_metadata_keep_the_accepted_channel_title() {
+        use crate::model::ChannelTitleSource::{Manual, Prompt, Provider};
+        for source in [Prompt, Provider, Manual] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Review the accepted task".into(),
+                    title_source: source,
+                })
+                .unwrap();
+            let original = live_chat_pane(None);
+            seed(&mut registry, channel, vec![original.clone()]);
+            // A provider name with no previous primary is still discarded as
+            // before; only the accepted prompt fallback is newly retained.
+            assert_canonical_channel_title(
+                &registry,
+                channel,
+                if source == Provider {
+                    ""
+                } else {
+                    "Review the accepted task"
+                },
+                if source == Provider { Prompt } else { source },
+            );
+            if source == Provider {
+                registry
+                    .apply(&ModelEdit::SuggestChannelTitle {
+                        id: channel,
+                        title: "Provider named task".into(),
+                        source: Provider,
+                    })
+                    .unwrap();
+            }
+            let mut initialized = original.clone();
+            let CardKind::Chat(chat) = &mut initialized.kind else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some("first-thread".into());
+            let change = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: initialized,
+                },
+            );
+            registry.apply(&change).unwrap();
+            assert_canonical_channel_title(
+                &registry,
+                channel,
+                if source == Provider {
+                    "Provider named task"
+                } else {
+                    "Review the accepted task"
+                },
+                source,
+            );
+        }
+    }
+
+    #[test]
+    fn primary_replacements_and_removal_still_reset_only_inferred_channel_titles() {
+        use crate::model::ChannelTitleSource::{Manual, Prompt, Provider};
+        for source in [Prompt, Provider, Manual] {
+            for transition in [
+                "pane",
+                "runtime",
+                "provider",
+                "thread",
+                "thread-lost",
+                "removed",
+            ] {
+                let (mut registry, _directory, _, _) = setup();
+                let channel = ChannelId::new();
+                registry
+                    .apply(&ModelEdit::CreateChannel {
+                        id: channel,
+                        repository: "/repo".into(),
+                        title: "Accepted task".into(),
+                        title_source: Prompt,
+                    })
+                    .unwrap();
+                let original = live_chat_pane(Some("first-thread"));
+                seed(&mut registry, channel, vec![original.clone()]);
+                if source == Manual {
+                    registry
+                        .apply(&ModelEdit::RetitleChannel {
+                            id: channel,
+                            title: "Chosen task".into(),
+                        })
+                        .unwrap();
+                } else if source == Provider {
+                    registry
+                        .apply(&ModelEdit::SuggestChannelTitle {
+                            id: channel,
+                            title: "Chosen task".into(),
+                            source,
+                        })
+                        .unwrap();
+                }
+                let mut replacement = original.clone();
+                let CardKind::Chat(chat) = &mut replacement.kind else {
+                    unreachable!()
+                };
+                let change = match transition {
+                    "pane" => Change::Insert {
+                        pane: live_chat_pane(Some("other-thread")),
+                        before: Some(original.id),
+                    },
+                    "runtime" => {
+                        chat.id = crate::model::TerminalId::new();
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "provider" => {
+                        chat.launch.provider = crate::agent::Provider::Claude;
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "thread" => {
+                        chat.launch.session_id = Some("other-thread".into());
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "thread-lost" => {
+                        chat.launch.session_id = None;
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "removed" => Change::Remove { id: original.id },
+                    _ => unreachable!(),
+                };
+                let update = edit(&mut registry, channel, change);
+                registry.apply(&update).unwrap();
+                assert_canonical_channel_title(
+                    &registry,
+                    channel,
+                    if source == Manual { "Chosen task" } else { "" },
+                    if source == Manual { Manual } else { Prompt },
+                );
+            }
+        }
+    }
+
     #[test]
     fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
         for manual in [false, true] {
@@ -1449,22 +1664,7 @@ mod tests {
                     title_source: crate::model::ChannelTitleSource::Prompt,
                 })
                 .unwrap();
-            let mut original = live_source_pane();
-            let CardKind::Terminal(terminal) = original.kind else {
-                unreachable!()
-            };
-            original.kind = CardKind::Chat(crate::chat::Session {
-                id: terminal.id,
-                launch: crate::chat::Launch {
-                    provider: crate::agent::Provider::Codex,
-                    recipe: terminal.launch.clone(),
-                    session_id: Some("first-thread".into()),
-                },
-                proof: terminal.continuity.live_proof(),
-                terminal: None,
-                owned_codex_listener: None,
-                native_continuity: Default::default(),
-            });
+            let original = live_chat_pane(Some("first-thread"));
             seed(&mut registry, channel, vec![original.clone()]);
             registry
                 .apply(&if manual {
