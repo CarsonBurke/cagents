@@ -61,15 +61,25 @@ const MODELS_GRACE: Duration = Duration::from_secs(3);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Variables that would make a probe behave unlike the user's own shell:
-/// Claude Code's markers for "running inside Claude Code", and cagents' own
-/// launch handshake.
+/// cagents' own launch handshake. A provider session's markers, such as
+/// Claude Code's "running inside Claude Code", go too (see [`scrub`]).
 const SCRUBBED_ENVIRONMENT: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
     crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV,
 ];
+
+/// Removes [`SCRUBBED_ENVIRONMENT`], `extra` and every provider session
+/// variable this process holds from `command`'s environment.
+fn scrub(command: &mut Command, extra: &[&str]) {
+    for variable in SCRUBBED_ENVIRONMENT.iter().chain(extra) {
+        command.env_remove(variable);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(crate::agent::is_session_variable) {
+            command.env_remove(name);
+        }
+    }
+}
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
 /// else of its environment, after [`SHELL_PATH_MARKER`] and its length in
@@ -499,12 +509,7 @@ pub async fn refresh_search_path() -> Option<OsString> {
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args(["-i", "-c", SHELL_PATH_COMMAND]);
-    for variable in SCRUBBED_ENVIRONMENT
-        .iter()
-        .chain(SHELL_SCRUBBED_ENVIRONMENT)
-    {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }
@@ -601,9 +606,7 @@ fn command(account: &Account, program: &Path) -> Command {
 
 fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in SCRUBBED_ENVIRONMENT {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, &[]);
     match account.probe_environment() {
         Some((variable, home)) => {
             command.env(variable, home);
@@ -1509,6 +1512,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A window started inside an agent's session must not probe as that
+    /// session's child, nor hand the CLI its messaging socket.
+    #[tokio::test]
+    async fn a_probe_never_runs_inside_the_session_cagents_was_started_from() {
+        const CHILD: &str = "CAGENTS_PROBE_SESSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::a_probe_never_runs_inside_the_session_cagents_was_started_from",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", directory.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("CLAUDECODE", "1")
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", "/run/parent.sock")
+                .env("CODEX_ESCALATE_SOCKET", "/run/parent-escalate.sock")
+                .env("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION", "10")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let script = "[ -z \"${CLAUDECODE+x}${CLAUDE_CODE_MESSAGING_SOCKET+x}${CODEX_ESCALATE_SOCKET+x}\" ] || exit 17\n\
+                      [ \"$CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION\" = 10 ] || exit 18";
+        let output = command(&Account::system(Provider::Claude), Path::new("/bin/sh"))
+            .args(["-c", script])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
     }
 
     #[test]

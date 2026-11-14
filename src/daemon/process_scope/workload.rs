@@ -15,11 +15,20 @@
 //!
 //! The provider starts its commands, so they begin in its leaf. A sweeper
 //! moves each one into its own leaf shortly after it starts: within
-//! [`FAST`] while the provider is active, and [`SLOW`] otherwise. Memory a
+//! [`FAST`] while the provider is active, [`SLOW`] otherwise, and up to
+//! [`QUIET`] for a provider that has long been quiet (below). Memory a
 //! command allocated before it moved stays charged to the provider leaf,
-//! because cgroup v2 does not move charges, so the provider is woken early
-//! whenever it reports activity. Command leaves are checked for memory kills
-//! and collected once they empty every [`SLOW`].
+//! because cgroup v2 does not move charges, so the sweeper is woken early
+//! whenever the provider reports activity. Command leaves are checked for
+//! memory kills and collected once they empty every [`SLOW`].
+//!
+//! cgroup v2 reports no process creation, so this polls. A provider whose
+//! owner reports all its activity, its output and the input it is sent, does
+//! not start commands unannounced: once it has been quiet for a while with no
+//! command running, sweeps slow towards [`QUIET`]. A provider idle for hours
+//! then wakes this thread rarely instead of every second. What it might still
+//! start unannounced while quiet, such as an idle-time hook, moves within
+//! [`QUIET`].
 //!
 //! The scope's `OOMPolicy=continue` keeps an OOM kill in one leaf from
 //! stopping the whole scope, which `stop` would do.
@@ -55,6 +64,9 @@ const COMMAND: &str = "command-";
 const FAST: Duration = Duration::from_millis(50);
 const SLOW: Duration = Duration::from_secs(1);
 const FAST_FOR: Duration = Duration::from_secs(5);
+/// Longest sweep interval for a quiet provider whose owner reports activity
+/// and that runs no command. Reached after it has been quiet about as long.
+const QUIET: Duration = Duration::from_secs(8);
 /// Ancestors examined to find the command a process belongs to.
 const DEPTH: usize = 64;
 
@@ -185,6 +197,18 @@ impl ProviderScope {
     /// after the provider has exited; oomd marks a cgroup before killing it.
     pub(crate) fn provider_killer(&self) -> Option<Killer> {
         killer(&self.provider)
+    }
+
+    /// The owner will [`Self::poke`] on all of the provider's output and on
+    /// the input it sends, so a quiet provider is not about to start a
+    /// command and sweeps may slow while it stays quiet.
+    pub(crate) fn reports_activity(&self) {
+        if let Some(sweeper) = &self.sweeper {
+            sweeper
+                .shared
+                .activity_reported
+                .store(true, Ordering::Release);
+        }
     }
 
     /// The provider reported activity: it may be about to start a command.
@@ -489,6 +513,9 @@ struct Shared {
     stop: AtomicBool,
     /// Milliseconds since `epoch` until which sweeps stay frequent.
     fast_until: AtomicU64,
+    /// Whether the owner pokes on every output and input, so quiet means no
+    /// command is about to start.
+    activity_reported: AtomicBool,
     epoch: Instant,
     stops: Mutex<Vec<CommandStop>>,
     wake: Mutex<Option<UnixStream>>,
@@ -501,11 +528,19 @@ impl Shared {
         previous <= self.epoch.elapsed().as_millis() as u64
     }
 
-    fn interval(&self) -> Duration {
-        if self.fast_until.load(Ordering::Acquire) > self.epoch.elapsed().as_millis() as u64 {
+    /// How long to wait before the next sweep. `commands` is whether any
+    /// command leaf remains to watch for memory kills and collection.
+    fn interval(&self, commands: bool) -> Duration {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        let fast_until = self.fast_until.load(Ordering::Acquire);
+        if fast_until > now {
             FAST
-        } else {
+        } else if commands || !self.activity_reported.load(Ordering::Acquire) {
             SLOW
+        } else {
+            // Wait about as long as the provider has been quiet: each sweep
+            // doubles the wait, until QUIET.
+            Duration::from_millis(now - fast_until).clamp(SLOW, QUIET)
         }
     }
 }
@@ -521,6 +556,7 @@ impl Sweeper {
             stop: AtomicBool::new(false),
             // The provider is starting and may start commands at once.
             fast_until: AtomicU64::new(FAST_FOR.as_millis() as u64),
+            activity_reported: AtomicBool::new(false),
             epoch: Instant::now(),
             stops: Mutex::new(Vec::new()),
             wake: Mutex::new(wake),
@@ -558,7 +594,7 @@ impl Sweeper {
                             let _ = wake.write(&[1]);
                         }
                     }
-                    thread::park_timeout(sweep.interval());
+                    thread::park_timeout(sweep.interval(!leaves.by_head.is_empty()));
                 }
             })?;
         Ok(Self {
@@ -769,16 +805,43 @@ mod tests {
 
     #[test]
     fn sweeps_hasten_after_a_poke_and_settle_afterwards() {
-        let shared = Shared {
-            stop: AtomicBool::new(false),
-            fast_until: AtomicU64::new(0),
-            epoch: Instant::now() - FAST_FOR * 2,
-            stops: Mutex::new(Vec::new()),
-            wake: Mutex::new(None),
-        };
-        assert_eq!(shared.interval(), SLOW);
+        let shared = shared(FAST_FOR * 2, false);
+        assert_eq!(shared.interval(false), SLOW);
         assert!(shared.hasten(), "the first poke wakes a slow sweeper");
         assert!(!shared.hasten(), "later pokes only extend the fast period");
-        assert_eq!(shared.interval(), FAST);
+        assert_eq!(shared.interval(false), FAST);
+    }
+
+    fn shared(age: Duration, activity_reported: bool) -> Shared {
+        Shared {
+            stop: AtomicBool::new(false),
+            fast_until: AtomicU64::new(0),
+            activity_reported: AtomicBool::new(activity_reported),
+            epoch: Instant::now() - age,
+            stops: Mutex::new(Vec::new()),
+            wake: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn sweeps_slow_only_for_a_quiet_reported_provider_with_no_command() {
+        // Quiet for a minute: a long while, but not enough to stop sweeping.
+        let quiet = shared(Duration::from_secs(60), true);
+        assert_eq!(quiet.interval(false), QUIET);
+        assert_eq!(quiet.interval(true), SLOW, "a running command is watched");
+        let unreported = shared(Duration::from_secs(60), false);
+        assert_eq!(
+            unreported.interval(false),
+            SLOW,
+            "an owner that does not report activity may miss a start"
+        );
+        // Just after the fast period the wait starts at SLOW and grows.
+        let recent = shared(Duration::from_millis(500), true);
+        assert_eq!(recent.interval(false), SLOW);
+        let later = shared(Duration::from_secs(3), true);
+        let wait = later.interval(false);
+        assert!(wait > SLOW && wait < QUIET, "{wait:?}");
+        assert!(later.hasten(), "a poke wakes a slowed sweeper at once");
+        assert_eq!(later.interval(false), FAST);
     }
 }

@@ -227,6 +227,68 @@ fn pending_then_exact_absence_keeps_the_original_descriptor_and_clears_start_sta
 }
 
 #[test]
+fn reconnect_keeps_saved_terminal_controls_in_place_while_checking() {
+    use cosmic::iced::Size;
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    use iced_accessibility::accesskit::{Rect, Role};
+
+    let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let bounds = |app: &Cagents, card, width| -> HashMap<String, Rect> {
+        let mut view = app.saved_terminal_view(card).unwrap();
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 900.0)),
+        );
+        let accessible =
+            view.as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|entry| {
+                let node = entry.node();
+                (node.role() == Role::Button)
+                    .then(|| (node.label().unwrap().to_owned(), node.bounds().unwrap()))
+            })
+            .collect()
+    };
+    for width in [500.0, 1400.0] {
+        for absent in [true, false] {
+            let (mut app, card, source) = fixture();
+            let request = pending(&mut app, card, &source);
+            drop(app.update_saved_terminal(complete(
+                card,
+                source,
+                request,
+                if absent {
+                    Ok(None)
+                } else {
+                    Err("inventory unavailable".into())
+                },
+            )));
+            let idle = bounds(&app, card, width);
+            assert_eq!(
+                idle.contains_key("Explicitly relaunch the saved terminal"),
+                absent
+            );
+            drop(app.inspect_saved_terminal(card));
+            assert!(
+                !app.saved_terminal_ready(card),
+                "relaunch stays fenced while checking"
+            );
+            assert_eq!(
+                bounds(&app, card, width),
+                idle,
+                "controls moved at {width}px, absent={absent}"
+            );
+        }
+    }
+}
+
+#[test]
 fn inventory_failure_is_actionable_and_never_dormant_ready() {
     let (mut app, card, source) = fixture();
     let request = pending(&mut app, card, &source);
