@@ -1137,83 +1137,49 @@ impl Runtime {
     ) {
         let reading = &coordinated.reading;
         let background = self.background_state(coordinated);
-        // Use the observed task state while a native launch tool is still
-        // settling, but keep an explicit launch failure visible.
-        let indicator = match background
-            .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
-        {
-            Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
-            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
-            Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
-            None => self.card_indicator(status, Icon::Agent),
-        };
-        // The agent is named as its tab names it. Its task describes it in
-        // the tooltip but never stands in for an absent name; agent origin
-        // and launch options belong on their own secondary line.
         let primary = match reading.subagents.as_slice() {
             [id] => self.listed_agent_name(id),
             _ => None,
         }
         .unwrap_or_else(|| started(spawn));
-        let task = match spawn.agents.as_slice() {
-            [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
-            _ => primary.clone(),
-        };
-        let mut heading = vec![
-            indicator,
-            crate::interaction::tooltip(
-                chat_title(Self::short_description(
-                    primary
-                        .lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .unwrap_or(&primary),
-                    80,
-                )),
-                task,
-            )
-            .into(),
-        ];
-        let run = reading.outcome.run.as_ref();
-        if let Some(placed) = run.and_then(|run| run.placed_in.as_ref()) {
-            heading.push(
-                design::caption(match &placed.title {
-                    Some(title) => format!("in channel \u{201c}{title}\u{201d}"),
-                    None => "in another channel".to_owned(),
-                })
-                .into(),
-            );
-        }
-        heading.push(widget::Space::new().width(Length::Fill).into());
-        // A separate session has a tab of its own, which this opens.
-        if reading.cli
-            && let Some(agent) = run.map(|run| run.agent.as_str())
-            && !agent.is_empty()
-            && !matches!(status, ToolStatus::Failed | ToolStatus::Denied)
-        {
-            heading.push(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        design::caption("Open").into(),
-                        muted_glyph(Icon::Jump),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                .name(format!("Open agent {agent}"))
-                .on_press(action(Action::OpenAgent(agent.to_owned())))
-                .into(),
-            );
-        }
-        rows.push(
-            widget::row::with_children(heading)
+        // CLI details sit beneath their existing compact heading. Native
+        // subagents retain their original heading and transcript controls.
+        if !reading.cli {
+            let indicator = match background
+                .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
+            {
+                Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+                Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
+                Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
+                None => self.card_indicator(status, Icon::Agent),
+            };
+            let task = match spawn.agents.as_slice() {
+                [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
+                _ => primary.clone(),
+            };
+            rows.push(
+                widget::row::with_children(vec![
+                    indicator,
+                    crate::interaction::tooltip(
+                        chat_title(Self::short_description(
+                            primary
+                                .lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .unwrap_or(&primary),
+                            80,
+                        ))
+                        .width(Length::Fill),
+                        task,
+                    )
+                    .into(),
+                ])
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
-                .wrap()
                 .into(),
-        );
+            );
+        }
+        let run = reading.outcome.run.as_ref();
         let observed_model = if !reading.cli {
             match reading.subagents.as_slice() {
                 [id] => self.subagent(id).and_then(|agent| agent.model.as_deref()),
