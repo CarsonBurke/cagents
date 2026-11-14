@@ -736,19 +736,19 @@ fn row<'a>(
                 Column::Session => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Session)),
                     now,
-                    stale,
+                    account,
                     app.settings.account_usage_display,
                 ),
                 Column::Weekly => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Weekly)),
                     now,
-                    stale,
+                    account,
                     app.settings.account_usage_display,
                 ),
                 Column::Model => {
                     let window = snapshot
                         .and_then(|snapshot| window_of(snapshot, account::WindowKind::Scoped));
-                    let cell = usage_cell(window, now, stale, app.settings.account_usage_display);
+                    let cell = usage_cell(window, now, account, app.settings.account_usage_display);
                     match window {
                         Some(window) => crate::interaction::tooltip(cell, window.label.clone()),
                         None => cell,
@@ -993,21 +993,17 @@ fn account_cell<'a>(
 fn usage_cell<'a>(
     window: Option<&UsageWindow>,
     now: Millis,
-    stale: bool,
+    account: &AccountState,
     mode: AccountUsageDisplay,
 ) -> Element<'a, Message> {
     let Some(window) = window else {
         return dash();
     };
     let figure = usage_figure(window.used, mode);
-    let tone = if stale {
-        design::Tone::Themed(design::muted_color)
-    } else {
-        design::Tone::Themed(design::budget_tone(window.used))
-    };
+    let tone = account.usage_tone(window, now);
     let mut figures: Vec<Element<'a, Message>> = vec![
         design::caption(figure.text)
-            .class(cosmic::theme::Text::Default)
+            .class(tone.text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .into(),
         iced::widget::Space::new().width(Length::Fill).into(),
@@ -1023,7 +1019,7 @@ fn usage_cell<'a>(
         widget::row::with_children(figures)
             .spacing(space::XS)
             .into(),
-        crate::ui_controls::budget_bar(figure.fraction, tone),
+        crate::ui_controls::budget_bar(figure.fraction, tone.bar_tone()),
     ])
     .spacing(space::XS)
     .width(Length::Fill)

@@ -538,13 +538,26 @@ const RETIRED_FABLE: &str = "weekly_overage";
 /// Whether a scoped window is Fable's, under any name Claude has given it:
 /// `Fable`, or a version of it such as `Fable 5.1`.
 fn is_fable(window: &UsageWindow) -> bool {
-    window.kind == WindowKind::Scoped
-        && window_scope(window).is_some_and(|scope| {
-            scope
-                .split_whitespace()
-                .next()
-                .is_some_and(|family| family.eq_ignore_ascii_case("fable"))
-        })
+    window.kind == WindowKind::Scoped && window_scope(window).is_some_and(is_fable_scope)
+}
+
+fn is_fable_scope(scope: &str) -> bool {
+    scope
+        .split_whitespace()
+        .next()
+        .is_some_and(|family| family.eq_ignore_ascii_case("fable"))
+}
+
+/// The key a saved choice of window names it by, which outlasts Claude's
+/// renames of it: the Fable window under its retired live key, or scoped to
+/// a version of the name such as `Fable 5.1`, is `weekly_scoped:Fable`, the
+/// key a live report gives it. Every other key is its own.
+pub fn stable_window_key(key: &str) -> &str {
+    let fable = key == RETIRED_FABLE
+        || key
+            .strip_prefix("weekly_scoped:")
+            .is_some_and(is_fable_scope);
+    if fable { FABLE } else { key }
 }
 
 /// The windows a conversation's `rate_limit_event` reports.
@@ -1117,6 +1130,29 @@ mod tests {
                 ("weekly_scoped:Opus", 30)
             ]
         );
+    }
+
+    /// A status-bar choice saved against the retired live key, or against a
+    /// versioned Fable scope, names the window a live report keys `Fable`.
+    #[test]
+    fn every_name_claude_gave_the_fable_window_is_one_stable_key() {
+        for key in [
+            RETIRED_FABLE,
+            FABLE,
+            "weekly_scoped:Fable 5.1",
+            "weekly_scoped:fable",
+        ] {
+            assert_eq!(stable_window_key(key), FABLE, "{key}");
+        }
+        for key in [
+            "session",
+            "weekly_all",
+            "weekly_scoped:Opus",
+            "weekly_scoped:Fableish",
+            "codex:primary",
+        ] {
+            assert_eq!(stable_window_key(key), key);
+        }
     }
 
     /// A reading cached by an earlier build holds the live Fable window under

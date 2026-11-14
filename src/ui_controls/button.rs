@@ -229,6 +229,13 @@ fn paint(weight: Weight, status: Status, theme: &cosmic::Theme) -> Paint {
     }
 }
 
+/// The quiet weight's look for a control with content of its own, such as
+/// a checkbox row: no surface until hovered, ordinary ink and the shared
+/// focus ring.
+pub fn quiet_class() -> cosmic::theme::Button {
+    style(Weight::Quiet)
+}
+
 fn style(weight: Weight) -> cosmic::theme::Button {
     let appearance = move |status: Status, focused: bool, theme: &cosmic::Theme| {
         let Paint { fill, edge, ink } = paint(weight, status, theme);
@@ -242,8 +249,15 @@ fn style(weight: Weight) -> cosmic::theme::Button {
             },
             border_color: edge.unwrap_or(iced::Color::TRANSPARENT),
             // Keyboard focus is a ring outside the control, so it reads the
-            // same on a filled button as on a quiet one.
-            outline_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+            // same on a filled button as on a quiet one. Beside a bright
+            // fill a hairline disappears, so a filled button's ring is
+            // twice as wide: in a question that answers Enter, which choice
+            // has focus is the thing to see.
+            outline_width: match (focused, weight) {
+                (false, _) => 0.0,
+                (true, Weight::Primary | Weight::Destructive) => 2.0 * design::BORDER_WIDTH,
+                (true, Weight::Secondary | Weight::Quiet) => design::BORDER_WIDTH,
+            },
             outline_color: if focused {
                 design::accent_color(theme)
             } else {

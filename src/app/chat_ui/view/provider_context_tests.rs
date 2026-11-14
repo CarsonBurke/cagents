@@ -338,8 +338,8 @@ fn provider_context_closed_widget_and_catalog_preserve_literal_body() {
             assert!(
                 catalog
                     .text(selection::logical_identity("user-notice-control", &[2]))
-                    .is_some(),
-                "existing User notice previews stay selectable"
+                    .is_none(),
+                "collapsed User notice details stay out of selection"
             );
             drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
         }
