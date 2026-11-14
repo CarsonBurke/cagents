@@ -310,7 +310,10 @@ fn memory_pressure_waits_without_hiding_a_shown_preview() {
         figures.complete(id, request.attempt, Outcome::Deferred(pressure.clone())),
         Next::Wait(_)
     ));
-    assert!(matches!(figures.store().entries[&id].state, State::Waiting));
+    assert!(matches!(
+        figures.store().entries[&id].state,
+        State::Waiting { size: None }
+    ));
     let request = figures
         .begin(id, false, false)
         .expect("memory freed, it loads again");
@@ -454,6 +457,66 @@ fn a_preview_keeps_to_the_reading_measure_and_its_height_cap() {
             "{url} keeps its aspect ratio: {preview:?}"
         );
     }
+}
+
+#[test]
+fn a_released_preview_keeps_its_rendered_room_during_reads_and_memory_waits() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 3,
+    };
+    let figures = Figures::default();
+    let root = Path::new("/work");
+    figures.sync(root, None, true);
+    let shared = figures.shared(false);
+    let url = "/wide.png";
+    let id = figures.store().id(Key {
+        url: uri(url),
+        child: false,
+    });
+    let request = figures.begin(id, false, false).unwrap();
+    figures.complete(
+        id,
+        request.attempt,
+        Outcome::Ready {
+            handle: handle(1200, 300),
+            path: url.into(),
+            stamp: None,
+        },
+    );
+    let (_, _, shown) = laid_out(&shared, target, url);
+    let room = shown.size();
+    assert_eq!(room, Size::new(600.0, 151.0));
+    let keeps_room = || {
+        let (_, _, node) = laid_out(&shared, target, url);
+        assert_eq!(node.size(), room, "rebuilding the view keeps its footprint");
+    };
+
+    figures.sync(root, None, false);
+    figures.sync(root, None, true);
+    keeps_room();
+    let request = figures.begin(id, false, false).unwrap();
+    keeps_room();
+    let Loaded::Deferred(pressure) = super::super::deferred_for_test() else {
+        unreachable!()
+    };
+    figures.complete(id, request.attempt, Outcome::Deferred(pressure));
+    keeps_room();
+    // A new widget for a waiting preview must not bypass the memory waiter.
+    let (mut element, mut tree, node) = laid_out(&shared, target, url);
+    let viewport = Rectangle::new(iced::Point::ORIGIN, Size::new(600.0, 800.0));
+    assert!(redraw(&mut element, &mut tree, &node, viewport).is_empty());
+
+    // Hiding during either the memory wait or the read also preserves size.
+    figures.sync(root, None, false);
+    figures.sync(root, None, true);
+    keeps_room();
+    figures.begin(id, false, false).unwrap();
+    figures.sync(root, None, false);
+    figures.sync(root, None, true);
+    keeps_room();
+    figures.begin(id, false, false).unwrap();
+    keeps_room();
 }
 
 fn asks(messages: &[Message], target: Target) -> bool {

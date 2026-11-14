@@ -96,7 +96,9 @@ enum State {
     Unseen {
         size: Option<(u32, u32)>,
     },
-    Loading,
+    Loading {
+        size: Option<(u32, u32)>,
+    },
     Ready {
         handle: iced::widget::image::Handle,
         path: PathBuf,
@@ -112,7 +114,9 @@ enum State {
         at: Instant,
     },
     /// Waiting for image memory another preview holds.
-    Waiting,
+    Waiting {
+        size: Option<(u32, u32)>,
+    },
 }
 
 struct Entry {
@@ -276,8 +280,8 @@ impl Figures {
             for entry in store.entries.values_mut() {
                 match entry.state {
                     State::Ready { .. } => release(entry),
-                    State::Loading | State::Waiting => {
-                        entry.state = State::Unseen { size: None };
+                    State::Loading { size } | State::Waiting { size } => {
+                        entry.state = State::Unseen { size };
                         entry.checking = false;
                         entry.attempt = entry.attempt.wrapping_add(1);
                     }
@@ -321,11 +325,11 @@ impl Figures {
             return None;
         }
         let known = match &entry.state {
-            State::Unseen { .. } | State::Waiting => {
-                entry.state = State::Loading;
+            State::Unseen { size } | State::Waiting { size } => {
+                entry.state = State::Loading { size: *size };
                 None
             }
-            State::Loading => return None,
+            State::Loading { .. } => return None,
             _ if entry.checking => return None,
             State::Ready { checked, stamp, .. }
                 if !remote && stamp.is_some() && checked.elapsed() >= REVALIDATE =>
@@ -400,7 +404,11 @@ impl Figures {
             // memory; it is checked again the next time it is seen.
             Outcome::Deferred(_) if checking => false,
             Outcome::Deferred(pressure) => {
-                entry.state = State::Waiting;
+                let size = match entry.state {
+                    State::Loading { size } | State::Waiting { size } => size,
+                    _ => None,
+                };
+                entry.state = State::Waiting { size };
                 store.changed();
                 return Next::Wait(pressure);
             }
@@ -758,9 +766,9 @@ impl Shared {
             let shown = match &entry.state {
                 State::Ready { handle, .. } => Shown::Ready(handle.clone()),
                 State::Failed { reason, detail, .. } => Shown::Failed(*reason, detail.clone()),
-                State::Waiting => Shown::Waiting,
+                State::Waiting { size } => Shown::Waiting(*size),
                 State::Unseen { size } => Shown::Pending(*size),
-                State::Loading => Shown::Pending(None),
+                State::Loading { size } => Shown::Pending(*size),
             };
             (id, entry.kind, entry.sight, shown)
         };
@@ -812,7 +820,16 @@ impl Shared {
                 mark(),
             ])
             .into(),
-            (Kind::Local, Shown::Waiting) => {
+            (Kind::Local, Shown::Waiting(Some((width, height)))) => {
+                // The memory waiter starts the next read. Keep the preview's
+                // room, including its sensor's pixel, without asking early.
+                widget::column::with_children(vec![
+                    super::preview::room(width, height),
+                    iced::widget::Space::new().width(1).height(1).into(),
+                ])
+                .into()
+            }
+            (Kind::Local, Shown::Waiting(None)) => {
                 line(Icon::Image, None, Some("Waiting for image memory…"))
             }
             (Kind::Local, Shown::Failed(reason, detail)) => widget::column::with_children(vec![
@@ -851,7 +868,7 @@ fn clipped(text: &str, limit: usize) -> std::borrow::Cow<'_, str> {
 enum Shown {
     Ready(iced::widget::image::Handle),
     Failed(Reason, String),
-    Waiting,
+    Waiting(Option<(u32, u32)>),
     Pending(Option<(u32, u32)>),
 }
 
