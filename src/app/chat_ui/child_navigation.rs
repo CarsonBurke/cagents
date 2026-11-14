@@ -113,8 +113,22 @@ fn direct_tabs<'a>(
     rows.into_iter().map(|(_, child)| child).collect()
 }
 
+/// How many characters of its name a child's tab shows.
+pub(super) const TAB_CHARS: usize = 24;
+
+/// What a tab shows of `name` before any number: the name itself, or its
+/// first [`TAB_CHARS`] characters when the tab cuts it, which is then marked.
+/// Two names that read the same there are namesakes, so two tasks that start
+/// alike are told apart by their numbers.
+fn tab_namesake(name: &str) -> (&str, bool) {
+    match name.char_indices().nth(TAB_CHARS) {
+        Some((end, _)) => (name[..end].trim_end(), true),
+        None => (name, false),
+    }
+}
+
 /// The number each child's name carries, so two Explore agents read
-/// "Explore" and "Explore 2". A child keeps its number from the publication
+/// "Explore" and "Explore 2", and so do two tasks a tab cuts to one text. A child keeps its number from the publication
 /// it first appears in under that name: re-sorting the tabs, trimming older
 /// children or renaming another child never renumbers it.
 ///
@@ -138,9 +152,13 @@ impl Ordinals {
         // A child that left, or now goes by another name, frees its number.
         self.0
             .retain(|id, (name, _)| names.get(id.as_str()) == Some(&name.as_str()));
-        let mut taken: HashMap<String, HashSet<usize>> = HashMap::new();
+        let mut taken: HashMap<(String, bool), HashSet<usize>> = HashMap::new();
+        let namesake = |name: &str| {
+            let (shown, cut) = tab_namesake(name);
+            (shown.to_owned(), cut)
+        };
         for (name, ordinal) in self.0.values() {
-            taken.entry(name.clone()).or_default().insert(*ordinal);
+            taken.entry(namesake(name)).or_default().insert(*ordinal);
         }
         let literal: HashSet<&str> = names.values().copied().collect();
         for child in children {
@@ -148,7 +166,7 @@ impl Ordinals {
                 continue;
             }
             let name = Runtime::native_child_name(child);
-            let taken = taken.entry(name.to_owned()).or_default();
+            let taken = taken.entry(namesake(name)).or_default();
             // Skip a number another child already carries in its own name,
             // so a second Explore beside a real "Explore 2" reads "Explore 3".
             let ordinal = (1..)
@@ -183,10 +201,11 @@ pub(super) fn child_label<'a>(
     // A publication the pane has not installed yet, such as one a test built
     // in place, numbers by earlier namesakes: one pass with no allocation.
     let ordinal = ordinals.get(child).unwrap_or_else(|| {
+        let namesake = tab_namesake(name);
         1 + children
             .iter()
             .take_while(|other| other.id != child.id)
-            .filter(|other| Runtime::native_child_name(other) == name)
+            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
             .count()
     });
     let cut = name.chars().nth(limit).is_some();
@@ -287,7 +306,7 @@ impl Runtime {
     /// which tells apart rows whose names and tasks read the same.
     pub(super) fn child_choice_name(child: &chat::Subagent, label: &str) -> String {
         let status = Self::native_child_status(child);
-        match Self::native_child_task(child) {
+        match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
                 "{label} · {status} · Task: {} · {}",
                 Self::short_description(task, 120),
@@ -313,7 +332,7 @@ impl Runtime {
                 let description = self.child_description(child, &self.child_label(child, 80));
                 let tab = crate::ui_controls::view_tab(
                     crate::ui_controls::ViewTab {
-                        label: self.child_label(child, 24),
+                        label: self.child_label(child, TAB_CHARS),
                         description: description.into(),
                         count: None,
                         selected: selected == Some(child.id.as_str()),
@@ -603,7 +622,7 @@ mod tests {
         chat::Subagent {
             id: id.into(),
             kind: format!("Agent {id}"),
-            description: "A long task description is not an agent name".into(),
+            description: "A long task description told apart from its name".into(),
             status,
             waiting,
             model: None,
@@ -673,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_lead_with_working_agents_by_name_and_keep_the_task_for_their_description() {
+    fn tabs_lead_with_working_agents_by_name_and_name_an_unnamed_one_by_its_task() {
         use chat::ToolStatus::*;
         let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
@@ -696,18 +715,28 @@ mod tests {
             ("asking", "Planner · Waiting · "),
             ("broken", "Builder · Failed · "),
             ("done", "Reviewer · Finished · "),
-            ("unnamed", "Subagent · Stopped · "),
         ] {
             let (_, label) = tabs.iter().find(|(tab, _)| tab == id).unwrap();
             assert!(label.starts_with(starts), "{id}: {label}");
             assert!(
-                label.ends_with("Task: A long task description is not an agent name"),
+                label.ends_with("Task: A long task description told apart from its name"),
                 "{label}"
             );
         }
+        // An agent with no name goes by its task, which its description then
+        // does not repeat; its tab cuts it short.
+        let (_, unnamed) = tabs.iter().find(|(tab, _)| tab == "unnamed").unwrap();
+        assert!(
+            unnamed.starts_with("A long task description told apart from its name · Stopped · "),
+            "{unnamed}"
+        );
+        assert!(!unnamed.contains("Task:"), "{unnamed}");
         let children = &runtime.snapshot.subagents;
         assert_eq!(runtime.child_label(&children[4], 24), "Explore 2");
-        assert_eq!(runtime.child_label(&children[5], 24), "Subagent");
+        assert_eq!(
+            runtime.child_label(&children[5], 24),
+            "A long task description…"
+        );
         assert!(
             runtime.child_cache.is_empty(),
             "naming tabs must not prepare any hidden transcript"
@@ -749,6 +778,38 @@ mod tests {
             labels(&children, &Ordinals::default()),
             ["Explore", "Explore 2", "Explore 3"]
         );
+    }
+
+    #[test]
+    fn tasks_a_tab_cuts_to_one_text_are_numbered_apart() {
+        use chat::ToolStatus::*;
+        let children = vec![
+            named(
+                "a",
+                "Review persistence stage 4 of the plan",
+                Running,
+                false,
+            ),
+            named(
+                "b",
+                "Review persistence stage 5 of the plan",
+                Running,
+                false,
+            ),
+            named("c", "Review persistence", Running, false),
+        ];
+        let mut ordinals = Ordinals::default();
+        ordinals.observe(&children);
+        for ordinals in [&ordinals, &Ordinals::default()] {
+            assert_eq!(
+                labels(&children, ordinals),
+                [
+                    "Review persistence stage…",
+                    "Review persistence stage… 2",
+                    "Review persistence",
+                ]
+            );
+        }
     }
 
     #[test]
@@ -999,6 +1060,12 @@ mod tests {
         );
         assert_eq!(Runtime::native_child_name(&children[0]), "Agent done");
         children[0].kind = " \t".into();
+        assert_eq!(
+            Runtime::native_child_name(&children[0]),
+            "A long task description told apart from its name",
+            "an unnamed agent goes by its task"
+        );
+        children[0].description = " \n".into();
         assert_eq!(Runtime::native_child_name(&children[0]), "Subagent");
     }
 
