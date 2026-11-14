@@ -2501,7 +2501,6 @@ mod tests {
                         labels(&mut peer, &model);
                     }
                 }
-                drop(labels);
                 write_frame(
                     &mut peer,
                     &ServerEnvelope {
@@ -4046,6 +4045,7 @@ mod tests {
             app.card_chrome[&pane.id].title, label,
             "tabs, sidebar and overflow use shared chrome"
         );
+        drop(app.select_channel(destination));
         drop(app.focus_workspace_card(pane.id));
         drop(app.sync_window_title());
         assert!(
