@@ -11,6 +11,27 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// Authorization refusals remain distinct from registry/record failures until
+/// the request dispatcher assigns a protocol error code.
+#[derive(Debug, thiserror::Error)]
+pub(in crate::host) enum AuthorityError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for AuthorityError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl From<&str> for AuthorityError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 /// The host proves this actor state before inspecting or retiring authority.
 #[derive(Clone, Copy)]
 pub(in crate::host) enum ResidentRelease {
@@ -860,12 +881,17 @@ impl Registry {
         Ok(claimed)
     }
 
-    pub(crate) fn execution_origin(&self, authority: &Authority) -> Result<Origin, String> {
+    pub(in crate::host) fn execution_origin(
+        &self,
+        authority: &Authority,
+    ) -> Result<Origin, AuthorityError> {
         let Some(token) = authority.token() else {
             return Ok(Origin::User);
         };
         if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
-            return Err("Invalid agent session authority".into());
+            return Err(AuthorityError::Denied(
+                "Invalid agent session authority".into(),
+            ));
         }
         // A session owns what its whole lineage started.
         let lineage: String = self
@@ -877,7 +903,13 @@ impl Registry {
                 [token],
                 |row| row.get(0),
             )
-            .map_err(|_| "This agent session authority is no longer registered".to_owned())?;
+            .optional()
+            .map_err(|error| AuthorityError::Failed(error.to_string()))?
+            .ok_or_else(|| {
+                AuthorityError::Denied(
+                    "This agent session authority is no longer registered".into(),
+                )
+            })?;
         Ok(Origin::Child {
             parent: Lineage(
                 lineage
@@ -893,6 +925,14 @@ impl Registry {
         &self,
         authority: &Authority,
     ) -> Result<Option<HostedSession>, String> {
+        self.checked_agent_authority_source(authority)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn checked_agent_authority_source(
+        &self,
+        authority: &Authority,
+    ) -> Result<Option<HostedSession>, AuthorityError> {
         self.execution_origin(authority)?;
         authority
             .token()
@@ -904,10 +944,14 @@ impl Registry {
                         [token],
                         |row| row.get(0),
                     )
-                    .map_err(|_| {
-                        "This agent session authority is no longer registered".to_owned()
+                    .optional()
+                    .map_err(|error| AuthorityError::Failed(error.to_string()))?
+                    .ok_or_else(|| {
+                        AuthorityError::Denied(
+                            "This agent session authority is no longer registered".into(),
+                        )
                     })?;
-                decode(&source)
+                decode(&source).map_err(AuthorityError::Failed)
             })
             .transpose()
     }

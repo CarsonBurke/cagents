@@ -40,7 +40,7 @@ pub(super) mod console_relaunch;
 mod execution;
 mod execution_deltas;
 pub(super) mod floor;
-pub(super) use execution::ResidentRelease;
+pub(super) use execution::{AuthorityError, ResidentRelease};
 mod lineage;
 mod mailbox;
 pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
