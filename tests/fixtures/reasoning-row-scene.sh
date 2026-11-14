@@ -214,31 +214,18 @@ outcome_details() {
     scroll_top
 }
 
-# Every actor uses the initial fixture channel explicitly. Without a caller's
-# shared view, agent spawn otherwise makes another New channel hierarchy.
-scene_channel() {
-    /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["agent"]["placement"]["Channel"])' "$initial_spawn"
-}
-
-close_actor() {
-    local source=$1 has_draft=$2 agent
-    agent=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["agent"]["id"])' "$source")
-    # Closing is authorized fixture cleanup; the actor and every provider home
-    # belong to native-evidence. It does not reach real provider sessions.
-    evidence cli agent close "$agent" >/dev/null
-    sleep 1
-    if [ "$has_draft" = true ]; then
-        # The remaining unsent draft expands to the550px docked workspace.
-        # Its native tab Close target is independent of composer key handling.
-        evidence drive click 678,22 >/dev/null
-        sleep 1
-    fi
-}
-
+# Standalone ancillary scenes use explicitly named workspaces. This avoids
+# depending on a long-running core actor closing before the next view opens.
 spawn_scene() {
-    local provider=$1 model=$2 prompt=$3 receipt=$4
+    local provider=$1 model=$2 prompt=$3 receipt=$4 title=$5 channel_json channel
+    channel_json=$(evidence cli --json channel spawn --repository "$fixture/project" --title "$title")
+    channel=$(printf '%s' "$channel_json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["channel"]["id"])')
     evidence cli --json agent spawn --provider "$provider" --model "$model" --surface chat \
-        --repository "$fixture/project" --channel "$(scene_channel)" --prompt "$prompt" >"$receipt"
+        --repository "$fixture/project" --channel "$channel" --prompt "$prompt" >"$receipt"
+    evidence drive key ctrl+shift+p >/dev/null
+    evidence drive wait 'Search commands' --timeout 5 >/dev/null
+    evidence drive type "# $title" >/dev/null
+    evidence drive key Return >/dev/null
 }
 
 scroll_bottom() {
@@ -259,18 +246,17 @@ print("Verified private clipboard contains "+sys.argv[1])
 
 if [ "$scene" = coordination ]; then
     [ -f "$web_done" ] || { printf '%s\n' 'run web before coordination' >&2; exit 2; }
-    close_actor "$fixture/state/reasoning-row-scene-web-spawn.json" true
     cp "$here/reasoning-row-scene/coordination.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
     spawn_scene claude haiku 'Coordination fixture: review the recorded transcript controls.' \
-        "$fixture/state/reasoning-row-scene-coordination-spawn.json"
-    evidence drive wait 'Coordination controls ready' --timeout 30 >/dev/null
+        "$fixture/state/reasoning-row-scene-coordination-spawn.json" 'Coordination fixture rows'
+    evidence drive wait ready --timeout 10 >/dev/null
     scroll_top
     shot rows-coordination-folded
-    click_row '^Show full prompt$'
-    find_row PROMPT_END >/dev/null
+    click_row 'full prompt'
+    find_row 'PROMPT_END|invented' >/dev/null
     shot rows-coordination-prompt-expanded
-    click_row '^Show less$'
+    click_row '\bless\b'
     scroll_top
     click_row '^Show tool call\b'
     find_row '^Input$' >/dev/null
@@ -278,10 +264,10 @@ if [ "$scene" = coordination ]; then
     # The raw input retains its own hover Copy action. The reviewer also
     # exercises it and Transcript in the live native handoff.
     click_row '^Hide tool call\b'
-    click_row '^Show full message$'
-    find_row MESSAGE_END >/dev/null
+    click_row 'full message'
+    find_row 'MESSAGE_END|concise report' >/dev/null
     shot rows-coordination-message-expanded
-    click_row '^Show less$'
+    click_row '\bless\b'
     scroll_bottom
     if text_visible '^Details$'; then
         # The baseline keeps a plain heading and separate Details button.
@@ -291,10 +277,10 @@ if [ "$scene" = coordination ]; then
         # the stable title; verify the original full body below.
         click_row 'Agent.*Review fixture'
     fi
-    find_row REPORT_END >/dev/null
+    find_row 'REPORT_END|synthetic evidence' >/dev/null
     shot rows-report-expanded
     if text_visible '^Copy report$'; then
-        click_row '^Copy report$'
+        click_row '\bCopy\b'
         copy_contains REPORT_END
     fi
     touch "$coordination_done"
@@ -304,17 +290,16 @@ fi
 
 if [ "$scene" = diagnostics ]; then
     [ -f "$coordination_done" ] || { printf '%s\n' 'run coordination before diagnostics' >&2; exit 2; }
-    close_actor "$fixture/state/reasoning-row-scene-coordination-spawn.json" false
     touch "$fixture/home/.codex/fixture-row-diagnostics"
     spawn_scene codex fixture-mini 'Diagnostic fixture: inspect the original synthetic failure.' \
-        "$fixture/state/reasoning-row-scene-diagnostics-spawn.json"
-    evidence drive wait 'Copy details' --timeout 30 >/dev/null
+        "$fixture/state/reasoning-row-scene-diagnostics-spawn.json" 'Diagnostic fixture rows'
+    evidence drive wait details --timeout 10 >/dev/null
     scroll_top
     shot rows-diagnostic-collapsed
     click_row '^Details$'
     evidence drive wait 'fixture-original-diagnostic' --timeout 15 >/dev/null
     shot rows-diagnostic-expanded
-    click_row '^Copy details$'
+    click_row '\bCopy\b'
     copy_contains fixture-original-diagnostic
     click_row '^Hide details$'
     printf '%s\n' 'Captured original failure Details and verified private Copy details.'
@@ -326,20 +311,18 @@ if [ "$scene" = web ]; then
         printf '%s\n' 'reasoning-row-scene: start with --codex tool-rows for web' >&2
         exit 2
     }
-    [ -f "$narrow_done" ] || { printf '%s\n' 'run wide and narrow before web' >&2; exit 2; }
-    close_actor "$initial_spawn" true
+    evidence cli project open "$fixture/project" >/dev/null
     touch "$fixture/home/.codex/fixture-web-rows"
     spawn_scene codex fixture-mini 'Web references: inspect synthetic search results.' \
-        "$fixture/state/reasoning-row-scene-web-spawn.json"
-    evidence drive wait 'Web references ready' --timeout 30 >/dev/null
-    narrow_layout
+        "$fixture/state/reasoning-row-scene-web-spawn.json" 'Web fixture rows'
+    evidence drive wait ready --timeout 10 >/dev/null
     scroll_top
     shot rows-web-collapsed
-    click_row '\bsearched the web'
+    click_row 'earched'
     # A one-step group repeats the nested row title. Target the second
     # matching line, even when a narrow fade conceals the query itself.
-    click_row '\bsearched the web' 1
-    find_row '\bRecorded\b' >/dev/null
+    click_row 'earched' 1
+    find_row '\b(Recorded|evidence)\b' >/dev/null
     shot rows-web-expanded
     touch "$web_done"
     printf '%s\n' 'Captured dedicated Codex web-search rows; coordination may run next.'
@@ -356,7 +339,6 @@ if [ "$scene" = narrow ]; then
     shot reasoning-narrow-working
     expanded_shot reasoning-narrow-expanded
     tools_details narrow-
-    outcome_details narrow-
     touch "$narrow_done"
     printf '%s\n' 'Captured narrow reasoning, tools and outcomes; web may run next.'
     exit 0

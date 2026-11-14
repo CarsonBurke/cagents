@@ -324,17 +324,16 @@ hosted chat, one on the draft). The panes share the docked workspace at roughly
 270px each. It captures reasoning and the same tools/outcomes at that width.
 The blank draft sends no prompt and starts no provider.
 
-`web` stops the fixture Claude actor, closes its unsent draft, and starts the offline Codex peer's opt-in `fixture-web-rows` mode. This sends
-a dedicated app-server `webSearch` item with two synthetic results; Claude's
-WebSearch tool uses the generic Tool representation and cannot cover this row.
-Every subsequent actor explicitly uses the initial fixture channel, avoiding
-another sidebar hierarchy when a CLI call has no selected view. It captures the group collapsed and its nested result detail expanded at the
-same narrow width. The peer does not launch a child or publish unrelated tool
-or diff rows in this mode. Result links use `example.test`; no search is sent.
+`web` can also run immediately after a fresh `start --codex tool-rows`,
+without a core conversation. It creates a named workspace through the CLI,
+spawns its synthetic Codex actor explicitly there, and opens that workspace
+through the native command palette. Its dedicated app-server `webSearch` item
+contains two invented results. It captures collapsed and expanded rows at the
+550px docked chat width. No web request is sent.
 
 Keep the native window at 1200x900: below the docked inspector's minimum
-workspace width it becomes an overlay that hides the transcript. Run each
-mode once, in order. For a remote `pair`, its steps file contains:
+workspace width it becomes an overlay that hides the transcript. Run each core mode once, in order. Ancillary modes use separate named
+workspaces and need no initial600-second reasoning actor or close request. For a remote `pair`, its steps file contains:
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
@@ -342,8 +341,8 @@ CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" web
 ```
 
-For the neighboring disclosure controls, continue with `coordination` then
-`diagnostics` in that same session. The first atomically stages
+For the neighboring disclosure controls, run `web`, `coordination`, then
+`diagnostics` in that same session or in a fresh ancillary-only session. The first atomically stages
 [`coordination.jsonl`](../tests/fixtures/reasoning-row-scene/coordination.jsonl)
 and starts another offline Claude conversation. It captures folded cards, the
 full Agent prompt, raw tool call, full SendMessage body and delivered report.
