@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Refuse a saved channel's seed in a native-evidence fixture's real registry.
+
+Run `arm CHANNEL` after closing only the native UI, leaving its daemon alive;
+run `allow` before pressing Retry. The SQLite trigger creates a real definitive
+registry refusal, without replacing transport or simulating a UI update.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import uuid
+
+TRIGGER = "fixture_seed_refusal"
+REASON = "The workspace could not store these panes"
+
+
+def registry_path():
+    raw = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
+    if not raw:
+        raise ValueError("run through native-evidence env inside its private fixture")
+    root = Path(raw).resolve(strict=True)
+    if not (root / "bin").is_dir() or not (root / "project" / ".git").exists():
+        raise ValueError("the fixture must contain its provider bin and project repository")
+    if root.stat().st_uid != os.getuid() or stat.S_IMODE(root.stat().st_mode) & 0o077:
+        raise ValueError("the fixture root must be private and owned by this user")
+    if Path(os.environ.get("HOME", "")).resolve() != root / "home":
+        raise ValueError("HOME must be the fixture's private home")
+    data = Path(os.environ.get("XDG_DATA_HOME", "")).resolve(strict=True)
+    if data != root / "data":
+        raise ValueError("XDG_DATA_HOME must be the fixture's data directory")
+    paths = list(data.glob("cagents-development*/workspace-model.sqlite3"))
+    if len(paths) != 1:
+        raise ValueError("expected exactly one development registry in this fixture")
+    path = paths[0].resolve(strict=True)
+    if not path.is_relative_to(data):
+        raise ValueError("the registry must remain inside fixture data")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["arm", "allow", "status"])
+    parser.add_argument("channel", nargs="?")
+    args = parser.parse_args()
+    path = registry_path()
+    db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+    db.execute("PRAGMA foreign_keys=ON")
+    with db:
+        if args.action == "arm":
+            if not args.channel:
+                parser.error("arm needs the fixture channel UUID")
+            channel = str(uuid.UUID(args.channel))
+            if db.execute("SELECT title FROM channels WHERE id=?", (channel,)).fetchone() is None:
+                raise ValueError("the requested channel is not in this fixture registry")
+            panes = db.execute("SELECT p.id, p.kind FROM panes p JOIN view_scopes s ON p.scope=s.id WHERE s.channel=?", (channel,)).fetchall()
+            if not panes or not any(kind == "chat" for _, kind in panes):
+                raise ValueError("the fixture channel must already contain a saved chat pane")
+            db.execute(f"DROP TRIGGER IF EXISTS {TRIGGER}")
+            db.execute("DELETE FROM view_scopes WHERE channel=?", (channel,))
+            # The UUID is parsed above; the reason is a fixed fixture sentence.
+            db.execute(f"CREATE TRIGGER {TRIGGER} BEFORE INSERT ON view_scopes WHEN NEW.channel='{channel}' BEGIN SELECT RAISE(ABORT, '{REASON}'); END")
+            print(json.dumps({"armed": True, "channel": channel, "panes": len(panes), "reason": REASON}))
+        elif args.action == "allow":
+            db.execute(f"DROP TRIGGER IF EXISTS {TRIGGER}")
+            print(json.dumps({"armed": False}))
+        else:
+            armed = db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?", (TRIGGER,)).fetchone() is not None
+            print(json.dumps({"armed": armed}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, sqlite3.Error) as error:
+        raise SystemExit(f"seed-refusal-registry: {error}") from error

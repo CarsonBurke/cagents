@@ -1828,6 +1828,9 @@ impl Cagents {
                 if self.refused_terminal_recovery_target().is_some() {
                     ring.push(Cow::Borrowed("session-recovery.open"));
                 }
+                if self.can_retry_view_seeds() {
+                    ring.push(Cow::Borrowed(super::shared_views::seed_refusal::RETRY_ID));
+                }
                 ring
             }
         }
@@ -2229,6 +2232,7 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
+            || self.has_refused_view_seeds()
             || self
                 .save_health
                 .as_ref()
@@ -2332,7 +2336,14 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let recorded_severity = self.notices.severity().max(health_severity);
+        let seed_severity = self
+            .has_refused_view_seeds()
+            .then_some(NoticeSeverity::Warning);
+        let recorded_severity = self
+            .notices
+            .severity()
+            .max(health_severity)
+            .max(seed_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2567,6 +2578,7 @@ impl Cagents {
                         self.session_recovery_action(),
                     ));
                 }
+                notices.extend(self.refused_view_seeds_notice());
                 let mut heading_children = vec![
                     design::heading("Application notices")
                         .width(Length::Fill)

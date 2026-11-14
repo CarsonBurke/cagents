@@ -30,7 +30,22 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const REPLAY_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// An edit taken from the window, and when it was first sent.
-type Unsent = (ModelEdit, std::time::SystemTime);
+type Unsent = (ModelRequest, std::time::SystemTime);
+
+/// Local publication identity never crosses the daemon protocol. A scope may
+/// be seeded again before an earlier receipt reaches the UI.
+#[derive(Debug, Clone)]
+pub(super) struct ModelRequest {
+    pub(super) edit: ModelEdit,
+    pub(super) seed_attempt: Option<uuid::Uuid>,
+}
+
+impl From<ModelEdit> for ModelRequest {
+    fn from(edit: ModelEdit) -> Self {
+        let seed_attempt = matches!(&edit, ModelEdit::SeedView { .. }).then(uuid::Uuid::new_v4);
+        Self { edit, seed_attempt }
+    }
+}
 
 /// Whether `edit`, first sent at `first`, may still be sent `now`. A clock
 /// that moved backwards past the first send proves nothing, so it may not.
@@ -97,6 +112,16 @@ pub enum ModelUpdate {
     TitleDeferred(ModelEdit),
     PaneTransferFailed {
         operation: uuid::Uuid,
+        error: String,
+    },
+    SeedApplied {
+        scope: crate::workspace_model::views::Scope,
+        attempt: uuid::Uuid,
+        model: WorkspaceModel,
+    },
+    SeedRefused {
+        scope: crate::workspace_model::views::Scope,
+        attempt: uuid::Uuid,
         error: String,
     },
     ViewRefused {
@@ -216,7 +241,7 @@ fn observe_with_client(
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelEdit>,
+    requests: async_channel::Receiver<ModelRequest>,
 ) {
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
@@ -240,7 +265,7 @@ pub(super) fn publish_workspace_model(
 
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<ModelRequest>,
     pending: &mut Option<Unsent>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
@@ -253,20 +278,20 @@ fn publish(
 
 fn publish_with_client(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<ModelRequest>,
     pending: &mut Option<Unsent>,
     client: &mut ControlClient,
 ) -> Result<(), String> {
     loop {
         let (request, first) = match pending.take() {
             Some((request, first)) => {
-                if !may_resend(&request, first, std::time::SystemTime::now()) {
+                if !may_resend(&request.edit, first, std::time::SystemTime::now()) {
                     tracing::warn!(
                         "a pane change waited too long for the daemon and was not resent"
                     );
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
-                    } = &request
+                    } = &request.edit
                     {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
@@ -289,7 +314,9 @@ fn publish_with_client(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some((request.clone(), first));
-        match send(client, request.clone(), updates) {
+        let seed_attempt = request.seed_attempt;
+        let request = request.edit;
+        match send(client, request.clone(), seed_attempt, updates) {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -331,6 +358,17 @@ fn publish_with_client(
                             error: error.to_string(),
                         });
                     }
+                    if let (
+                        ModelEdit::SeedView { scope, .. },
+                        ControlError::Remote { message, .. },
+                    ) = (&request, &error)
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::SeedRefused {
+                            scope: scope.clone(),
+                            attempt: seed_attempt.expect("a seed publication has an attempt"),
+                            error: message.clone(),
+                        });
+                    }
                     if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
                         let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
                             channel: home.channel,
@@ -357,6 +395,7 @@ fn publish_with_client(
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
+    seed_attempt: Option<uuid::Uuid>,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
     let reordered = matches!(
@@ -451,11 +490,20 @@ fn send(
         }
     };
     if let Some((scope, operation)) = view_edit {
-        let _ = updates.send_blocking(ModelUpdate::ViewApplied {
-            scope,
-            operation,
-            model: model.clone(),
-        });
+        let update = if let Some(attempt) = seed_attempt {
+            ModelUpdate::SeedApplied {
+                scope,
+                attempt,
+                model: model.clone(),
+            }
+        } else {
+            ModelUpdate::ViewApplied {
+                scope,
+                operation,
+                model: model.clone(),
+            }
+        };
+        let _ = updates.send_blocking(update);
     }
     // The originating client is deliberately not sent its own echo, so this
     // response is how the window that minted the channel learns the rank the
@@ -693,6 +741,31 @@ impl Cagents {
             } => self.refuse_conflicting_view_update(scope, operation, change, model, error),
             ModelUpdate::PaneTransferFailed { operation, error } => {
                 self.reject_pane_transfer(operation, error);
+                self.reconcile_shared_views()
+            }
+            ModelUpdate::SeedApplied {
+                scope,
+                attempt,
+                model,
+            } => {
+                if self.shared_views.seed_attempts.get(&scope) != Some(&attempt) {
+                    return Task::none();
+                }
+                self.apply_workspace_model_update_inner(ModelUpdate::ViewApplied {
+                    scope,
+                    operation: None,
+                    model,
+                })
+            }
+            ModelUpdate::SeedRefused {
+                scope,
+                attempt,
+                error,
+            } => {
+                if !self.refuse_view_seed(scope.clone(), attempt, error.clone()) {
+                    return Task::none();
+                }
+                tracing::warn!(?scope, %error, "the registry refused a view seed");
                 self.reconcile_shared_views()
             }
             ModelUpdate::ViewRefused {
@@ -987,6 +1060,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        let failed_seeds = std::mem::take(&mut self.shared_views.seed_failures);
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
@@ -995,6 +1069,7 @@ impl Cagents {
             channel.shared = false;
         }
         self.persist();
+        self.shared_views.seed_failures = failed_seeds;
     }
 
     /// Mirrors the cached shared model into this window's own store.
@@ -1835,15 +1910,49 @@ impl Cagents {
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
-        if let Err(error) = self.workspace_model_tx.try_send(edit) {
+        let request = ModelRequest::from(edit);
+        let seed = match &request.edit {
+            ModelEdit::SeedView { scope, .. } => {
+                Some((scope.clone(), request.seed_attempt.unwrap()))
+            }
+            _ => None,
+        };
+        if let Err(error) = self.workspace_model_tx.try_send(request) {
+            if let Some((scope, _)) = seed {
+                self.shared_views.seeding.remove(&scope);
+                self.shared_views
+                    .seed_failures
+                    .insert(scope, "The workspace connection is unavailable".into());
+            }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
                 self.status = Some(TransientNotice::warning(
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
+        } else if let Some((scope, attempt)) = seed {
+            self.shared_views.seed_attempts.insert(scope, attempt);
         }
     }
+}
+
+/// Inspect model edits in fixtures without coupling their assertions to local
+/// publisher correlation metadata. The real request still enters the same queue.
+#[cfg(test)]
+pub(in crate::app) struct TestModelRequests(async_channel::Receiver<ModelRequest>);
+
+#[cfg(test)]
+impl TestModelRequests {
+    pub(in crate::app) fn try_recv(&self) -> Result<ModelEdit, async_channel::TryRecvError> {
+        self.0.try_recv().map(|request| request.edit)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::app) fn test_model_channel()
+-> (async_channel::Sender<ModelRequest>, TestModelRequests) {
+    let (sender, requests) = async_channel::unbounded();
+    (sender, TestModelRequests(requests))
 }
 
 #[cfg(test)]
@@ -1906,6 +2015,50 @@ mod tests {
     }
 
     #[test]
+    fn refused_seed_is_reported_to_the_window() {
+        let seed = ModelRequest::from(ModelEdit::SeedView {
+            scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
+            panes: vec![],
+            closed: vec![],
+        });
+        let attempt = seed.seed_attempt.unwrap();
+        let expected = seed.edit.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: expected }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Fixture registry refused the saved panes",
+                    false,
+                )),
+            );
+        });
+        let (requests, receiver) = async_channel::unbounded();
+        requests.try_send(seed).unwrap();
+        let mut pending = None;
+        drop(requests);
+        let (updates, received) = async_channel::unbounded();
+        let _ = publish_with_client(&updates, &receiver, &mut pending, &mut client);
+        drop(client);
+        server.join().unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), ModelUpdate::SeedRefused { attempt: actual, error, .. }
+            if actual == attempt && error == "Fixture registry refused the saved panes")
+        );
+        assert!(
+            pending.is_none(),
+            "a definitive refusal must not be replayed"
+        );
+    }
+
+    #[test]
     fn failed_title_restore_reconnects_before_sending_later_edits() {
         let id = ChannelId::new();
         let title = ModelEdit::SuggestConversationTitle {
@@ -1957,8 +2110,8 @@ mod tests {
         });
         let (updates, _received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
-        queued.send_blocking(title).unwrap();
-        queued.send_blocking(next.clone()).unwrap();
+        queued.send_blocking(title.into()).unwrap();
+        queued.send_blocking(next.clone().into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -1970,7 +2123,7 @@ mod tests {
             pending.is_none(),
             "the definitive title refusal must not be replayed"
         );
-        assert_eq!(requests.try_recv().unwrap(), next);
+        assert_eq!(requests.try_recv().unwrap().edit, next);
     }
 
     #[test]
@@ -2012,13 +2165,16 @@ mod tests {
         let (updates, received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
         queued
-            .send_blocking(ModelEdit::SuggestChannelTitle {
-                id,
-                title: "First prompt".into(),
-                source: crate::model::ChannelTitleSource::Prompt,
-            })
+            .send_blocking(
+                ModelEdit::SuggestChannelTitle {
+                    id,
+                    title: "First prompt".into(),
+                    source: crate::model::ChannelTitleSource::Prompt,
+                }
+                .into(),
+            )
             .unwrap();
-        queued.send_blocking(next.clone()).unwrap();
+        queued.send_blocking(next.clone().into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -2026,7 +2182,10 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert_eq!(error, ControlError::ConnectionClosed.to_string());
-        assert_eq!(pending.as_ref().map(|(edit, _)| edit), Some(&next));
+        assert_eq!(
+            pending.as_ref().map(|(request, _)| &request.edit),
+            Some(&next)
+        );
         assert!(received.is_empty());
 
         let expected = next.clone();
@@ -2167,9 +2326,9 @@ mod tests {
         let (updates, received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
         for title in titles {
-            queued.send_blocking(title).unwrap();
+            queued.send_blocking(title.into()).unwrap();
         }
-        queued.send_blocking(next).unwrap();
+        queued.send_blocking(next.into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -2541,7 +2700,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (sender, updates) = async_channel::unbounded();
-        send(&mut client, edit, &sender).unwrap();
+        send(&mut client, edit, None, &sender).unwrap();
         let ModelUpdate::Ranked { channel, model } = updates.try_recv().unwrap() else {
             panic!("a successful create forwards its canonical receipt")
         };
@@ -2663,12 +2822,12 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client).unwrap();
         let (sender, updates) = async_channel::unbounded();
-        send(&mut client, title.clone(), &sender).unwrap();
+        send(&mut client, title.clone(), None, &sender).unwrap();
         assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::Read(_)));
         assert!(
             matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title)
         );
-        send(&mut client, manual, &sender).unwrap();
+        send(&mut client, manual, None, &sender).unwrap();
         drop(client);
         server.join().unwrap();
     }
@@ -2805,7 +2964,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         let (tx, rx) = async_channel::unbounded();
-        send(&mut client, first_edit, &tx).unwrap();
+        send(&mut client, first_edit, None, &tx).unwrap();
         assert!(
             matches!(rx.try_recv().unwrap(), ModelUpdate::ViewConflicted {
             operation, change: actual, model, ..
@@ -2815,7 +2974,7 @@ mod tests {
             rx.try_recv().is_err(),
             "a refused source edit has no ViewApplied receipt"
         );
-        send(&mut client, next_edit, &tx).unwrap();
+        send(&mut client, next_edit, None, &tx).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::ViewApplied {
             operation: Some(operation), ..
         } if operation == next));
@@ -3343,7 +3502,7 @@ mod tests {
                 id
             });
             app.workspace_model = model.clone();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             // This view already exists and its real seed acknowledgement has
             // completed before the daemon announces the new live Agent.
@@ -4315,13 +4474,13 @@ mod tests {
 
     /// Replaces the publish queue with one the test can read, which is how the
     /// window's side of a publish is observed without a daemon.
-    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
-        let (tx, rx) = async_channel::unbounded();
+    fn intercept_publishes(app: &mut Cagents) -> TestModelRequests {
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         rx
     }
 
-    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+    fn drain(rx: &TestModelRequests) -> Vec<ModelEdit> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 

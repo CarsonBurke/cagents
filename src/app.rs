@@ -56,6 +56,8 @@ mod terminal_ui;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
+#[cfg(test)]
+use workspace_model_sync::{TestModelRequests, test_model_channel};
 mod workspace_switcher;
 mod worktree_dialog;
 mod worktree_operations;
@@ -4761,6 +4763,7 @@ pub enum Message {
     Lsp(LspEvent),
     LanguageServersReaped,
     RetrySessionSave,
+    RetrySharedViewSeeds,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
     DismissStatus,
@@ -5323,7 +5326,7 @@ pub struct Cagents {
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
-    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
+    workspace_model_tx: async_channel::Sender<workspace_model_sync::ModelRequest>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
     attention_focus_epoch: u64,
@@ -18054,6 +18057,10 @@ impl Application for Cagents {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
+                Task::none()
+            }
+            Message::RetrySharedViewSeeds => {
+                self.retry_view_seeds();
                 Task::none()
             }
             Message::RetrySessionSave => {

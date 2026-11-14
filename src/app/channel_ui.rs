@@ -1350,7 +1350,7 @@ impl Cagents {
                 home: captured,
                 expected_view_revision: view.revision,
             };
-            if self.workspace_model_tx.try_send(edit).is_ok() {
+            if self.workspace_model_tx.try_send(edit.into()).is_ok() {
                 self.channel_ui.retire_candidates.remove(&captured);
                 self.channel_ui
                     .retiring
@@ -1710,6 +1710,7 @@ impl Cagents {
         else {
             return Task::none();
         };
+        self.forget_view_seed(&crate::workspace_model::views::Scope::Channel(id));
         let was_active = self.durable.active_channel == Some(id);
         let (project_id, successor) = self.channel_successor(index);
         let fallback = self.project_primary_worktree(project_id);
@@ -2243,7 +2244,7 @@ mod tests {
             original,
         ] {
             let mut app = super::super::tests::context_inspector_test_app(false);
-            let (send, received) = async_channel::unbounded();
+            let (send, received) = test_model_channel();
             app.workspace_model_tx = send;
             app.workspace_model = model_with_empty_channel(current);
             app.channel_ui.retire_candidates.insert(original);
