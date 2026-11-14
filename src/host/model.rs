@@ -350,6 +350,20 @@ impl Registry {
     }
 
     pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
+        // Native evidence can refuse this one save after the real worker is
+        // published, without changing the registry's admitted SQL schema.
+        #[cfg(feature = "development")]
+        if matches!(edit, ModelEdit::ChangeView {
+            change: crate::workspace_model::views::Change::Update { before, pane }, ..
+        } if before.pending_terminal_start && !pane.pending_terminal_start)
+            && std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
+                PathBuf::from(root)
+                    .join("home/.config/fixture-pending-terminal-save-error")
+                    .exists()
+            })
+        {
+            return Err("fixture refused the pending terminal completion save".into());
+        }
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

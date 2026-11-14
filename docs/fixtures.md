@@ -182,6 +182,19 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
+## A failed automatic terminal completion
+
+Development builds under `native-evidence` refuse a pending terminal's completion
+save while `home/.config/fixture-pending-terminal-save-error` exists in
+`CAGENTS_EVIDENCE_FIXTURE`. Create the file before opening a terminal. Its worker
+starts normally; the fixture refuses only the edit that clears the pane's pending
+flag. Remove the file and use the terminal's existing Retry control to exercise
+completion of that same worker.
+
+This simulates a save error in the actual daemon and native UI. It does not
+simulate SQLite contention or an execution retirement, and contacts no provider.
+The fault is absent from builds without the `development` feature.
+
 ## An offline Codex
 
 A session started with `--codex PEER`, or a `pair` given it, has a `codex` on
