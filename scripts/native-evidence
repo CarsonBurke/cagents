@@ -627,7 +627,7 @@ native_slot_paths() {
     /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock"
 }
 
-# Waits in arrival order for one of the host's native slots and keeps it on
+# Waits in line for one of the host's native slots and keeps it on
 # descriptor 9; every other descriptor it opened is closed again. Gives up if
 # asked to stop, or if the start command that wanted this session is gone:
 # nobody would drive or stop a session that began after that.
@@ -637,10 +637,19 @@ wait_for_native_lock() {
         printf 'could not list the native slots; see %s\n' "$logs/session-$(cat "$state/side").log" >"$state/failed"
         return 1
     }
-    exec {queue_descriptor}>>"$native_lock.queue"
+    exec {queue_descriptor}>>"$native_lock.queue" || {
+        printf 'could not open %s\n' "$native_lock.queue" >"$state/failed"
+        return 1
+    }
     arguments+=(--queue-fd "$queue_descriptor")
     while IFS= read -r path; do
-        exec {descriptor}>>"$path"
+        exec {descriptor}>>"$path" || {
+            printf 'could not open %s\n' "$path" >"$state/failed"
+            for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+                exec {descriptor}>&-
+            done
+            return 1
+        }
         slot_descriptors+=("$descriptor")
         arguments+=(--slot-fd "$descriptor")
     done <"$state/slot-paths"
@@ -668,7 +677,7 @@ wait_for_native_lock() {
     done
     case $status in
         0) ;;
-        1)
+        69)
             printf 'every native slot stayed busy for %s seconds (see scripts/lock-holders %s)\n' \
                 "$wait_lock" "$(tr '\n' ' ' <"$state/slot-paths" | sed 's/ $//')" >"$state/failed"
             return 1
@@ -718,6 +727,8 @@ run_session() {
     # A waiter left in the queue would take the lock for a moment later on.
     trap '[ -z "$lock_waiter" ] || kill -KILL "$lock_waiter" 2>/dev/null; end_session; mark_used; exit 143' TERM INT HUP
     wait_for_native_lock "$wait_lock" "$starter" || return 1
+    # The limit runs from taking the slot, so preparing the session counts.
+    local deadline=$((SECONDS + limit)) stop_deadline=
     settle_session_processes 9>&-
     # A document portal can leave a FUSE mount in the runtime directory.
     if [ -d "$runtime" ]; then
@@ -780,7 +791,6 @@ RULES
         "$self --task $task __inner $side $width $startup_timeout" \
         >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
-    local deadline=$((SECONDS + limit)) stop_deadline=
     while kill -0 "$compositor" 2>/dev/null; do
         # A session that can't start has nothing to wait for.
         if [ -e "$state/failed" ]; then

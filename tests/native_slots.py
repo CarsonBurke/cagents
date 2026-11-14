@@ -115,7 +115,7 @@ class NativeSlots(unittest.TestCase):
         self.assertTrue(held(self.slot(0)) and held(self.slot(1)))
         self.assertFalse(held(Path(f"{self.lock}.queue")))
         busy = self.take(2, wait="0")
-        self.assertEqual(self.outcome(busy), "status 1")
+        self.assertEqual(self.outcome(busy), "status 69")
         self.release(first)
         self.assertEqual(self.outcome(self.take(2, wait="0"))[:5], "slot ")
 
@@ -165,7 +165,7 @@ class NativeSlots(unittest.TestCase):
         self.outcome(holder)
         self.outcome(other)
         late = self.take(2, wait="1")
-        self.assertEqual(self.outcome(late), "status 1")
+        self.assertEqual(self.outcome(late), "status 69")
         self.release(holder)
         self.release(other)
         for path in (self.slot(0), self.slot(1), Path(f"{self.lock}.queue")):

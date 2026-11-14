@@ -398,9 +398,9 @@ run_desktop() {
     local paths path descriptor queue_descriptor slot_descriptors=() arguments=() lock_status=0 index
     paths=$(/usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock") ||
         die 'could not list the native slots'
-    exec {queue_descriptor}>>"$native_lock.queue"
+    exec {queue_descriptor}>>"$native_lock.queue" || die "could not open $native_lock.queue"
     while IFS= read -r path; do
-        exec {descriptor}>>"$path"
+        exec {descriptor}>>"$path" || die "could not open $path"
         slot_descriptors+=("$descriptor")
         arguments+=(--fd "$descriptor")
     done <<<"$paths"
@@ -422,6 +422,8 @@ run_desktop() {
     fi
     [ ! -e "$desktop/stop" ] || return 0
     printf 'holding native slot %s\n' "$index"
+    # The limit runs from taking the slot, so preparing the desktop counts.
+    local deadline=$((SECONDS + limit))
     : >"$desktop/locked"
     local runtime_desktop=$desktop/rt
     mkdir -m 700 -p -- "$runtime_desktop"
@@ -440,7 +442,7 @@ run_desktop() {
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
         --width 1596 --height 929 --exit-with-session \
         "$self --root $root __inner" >"$logs/kwin.log" 2>&1 9>&- &
-    local compositor=$! deadline=$((SECONDS + limit))
+    local compositor=$!
     while kill -0 "$compositor" 2>/dev/null; do
         if [ -e "$desktop/stop" ] || [ "$SECONDS" -ge "$deadline" ]; then
             [ -e "$desktop/stop" ] || printf 'desktop reached its %ss limit\n' "$limit"

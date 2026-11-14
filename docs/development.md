@@ -1802,11 +1802,11 @@ harness, it provides:
   native slots, `CAGENTS_EVIDENCE_NATIVE_SLOTS` of them (default 3, at most 8):
   slot 0 is `/var/tmp/cagents-fw16-native.lock` (override with
   `CAGENTS_EVIDENCE_NATIVE_LOCK`) and slot N is that path with `.N` added.
-  Waiters take slots in the order they arrived, through `LOCK.queue`; update
+  Waiters take slots in about the order they arrived, through `LOCK.queue`; update
   rehearsals' desktops take the same slots, and tools from before slots wait
   for slot 0 alone. `status` shows which slots are held.
-- **Short sessions.** A session releases its slot after `--limit` seconds,
-  900 by default, even if its owner has gone, and `start` refuses a limit over
+- **Short sessions.** A session releases its slot `--limit` seconds after
+  taking it, 900 by default, even if its owner has gone, and `start` refuses a limit over
   1800 seconds, so no session keeps the others waiting for long. Stop as soon
   as you have the evidence. A measurement that needs longer is several
   sessions: `relaunch` restarts the UI within one, and a seed carries data

@@ -1,12 +1,14 @@
 #!/usr/bin/python3
-"""Take one of the build host's native session slots, in arrival order.
+"""Take one of the build host's native session slots, in about the order asked.
 
 Native evidence sessions and update rehearsals each run a private desktop.
 They share N slots: slot 0 is the original lock file, which tools from before
 slots queue on with a plain `flock`, and slot K is `LOCK.K`. Waiters line up
 on `LOCK.queue` in the kernel's order. The one at its head stays queued for
 slot 0 too, in a child that shares its descriptor, so it keeps its place
-among plain `flock` waiters there, and polls the other slots meanwhile.
+among plain `flock` waiters there, and polls the other slots meanwhile. The
+order is not strict: a release wakes every blocked waiter, so one arriving at
+that moment can take the queue or slot 0 ahead of them.
 
 The caller opens every descriptor and owns the open files: a lock taken here
 is the caller's, and stays after this exits. Only the chosen slot remains
@@ -25,8 +27,8 @@ DEFAULT_SLOTS = 3
 MAXIMUM_SLOTS = 8
 POLL_SECONDS = 0.2
 
-# Exit statuses the shell callers read.
-BUSY = 1
+# Exit statuses the shell callers read; a crash exits 1, so neither is that.
+BUSY = 69
 CANCELLED = 75
 
 
