@@ -811,6 +811,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                 .enumerate()
             {
                 if self.front_exclusive && index == 0 {
+                    // The retained subtree must not keep a second focused
+                    // control when the chooser takes the keyboard.
+                    child.as_widget_mut().operate(
+                        tree,
+                        layout,
+                        renderer,
+                        &mut operation::focusable::unfocus::<()>(),
+                    );
                     continue;
                 }
                 child

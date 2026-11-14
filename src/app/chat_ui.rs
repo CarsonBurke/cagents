@@ -18884,6 +18884,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reachable() {
+        use iced::advanced::widget::operation::{self, Focusable};
+        use iced::advanced::{Layout, Operation, Shell, clipboard, layout, widget::Tree};
+
+        #[derive(Default)]
+        struct Controls {
+            ids: Vec<widget::Id>,
+            focused: Vec<widget::Id>,
+        }
+        impl Operation for Controls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.ids.push(id.clone());
+                    if state.is_focused() {
+                        self.focused.push(id.clone());
+                    }
+                }
+            }
+        }
+        fn view(app: &Cagents, card: CardId) -> Element<'_, Message> {
+            widget::row::with_children(vec![
+                widget::container(app.card_view(card, true, false))
+                    .width(500)
+                    .into(),
+                crate::ui_controls::button::secondary("Other pane")
+                    .id(widget::Id::new("inspector-test.other-pane"))
+                    .on_press(Message::ToggleContextInspector)
+                    .into(),
+            ])
+            .into()
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, Provider::Claude);
+        let resize = app.workspace.resize_viewport(500.0);
+        drop(app.apply_viewport(resize, false, DurableChange::None));
+        write(&mut app, card, "keep");
+        let composer = card_control_id(card, "chat-composer");
+        let sibling = widget::Id::new("inspector-test.other-pane");
+        let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 720.0));
+        let mut tree = Tree::new(&view(&app, card));
+        {
+            let mut element = view(&app, card);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(composer.clone()),
+            );
+            let mut controls = Controls::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut controls,
+            );
+            assert!(
+                controls.focused.contains(&composer),
+                "start with the real editor focused"
+            );
+        }
+        let key = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("x".into()),
+            modified_key: keyboard::Key::Character("x".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("x".into()),
+            repeat: false,
+        });
+        for phase in 0..3 {
+            match phase {
+                0 => app.open_pane_inspector_now(card),
+                1 => drop(app.set_pane_inspector_open(card, false)),
+                _ => app.settle_pane_inspectors(),
+            }
+            let covered = phase < 2;
+            let mut messages = Vec::new();
+            {
+                let mut element = view(&app, card);
+                element.as_widget_mut().diff(&mut tree);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                );
+                let mut controls = Controls::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut controls,
+                );
+                assert_eq!(controls.ids.contains(&composer), !covered, "phase {phase}");
+                assert!(
+                    controls.ids.contains(&sibling),
+                    "another pane stays in Tab traversal"
+                );
+                assert!(
+                    !controls.focused.contains(&composer),
+                    "covered focus cannot return after closing"
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(sibling.clone()),
+                );
+                let mut controls = Controls::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut controls,
+                );
+                assert!(
+                    controls.focused.contains(&sibling),
+                    "the inspector does not trap another pane's keyboard"
+                );
+                // A forced focus request must not make a covered native editor
+                // reachable; the same request works once the slide has ended.
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(composer.clone()),
+                );
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &key,
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            for message in messages {
+                drop(app.update(message));
+            }
+            assert_eq!(
+                chat_runtime(&app, card).composer.text().trim(),
+                if covered { "keep" } else { "keepx" },
+                "phase {phase}"
+            );
+        }
+    }
+
     pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
         let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();

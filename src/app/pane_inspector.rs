@@ -475,7 +475,12 @@ impl Cagents {
         let row = widget::row::with_children(vec![content, docked])
             .width(Length::Fill)
             .height(Length::Fill);
-        crate::interaction::layer(row.into(), crate::interaction::layer(splitter, front))
+        let front = crate::interaction::layer(splitter, front);
+        if layout == Some(InspectorLayout::Overlay) {
+            crate::interaction::exclusive_layer(row.into(), Some(front))
+        } else {
+            crate::interaction::layer(row.into(), front)
+        }
     }
 
     fn pane_inspector_splitter(&self, card: CardId, width: f32) -> Element<'_, Message> {
