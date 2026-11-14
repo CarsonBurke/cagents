@@ -168,7 +168,7 @@ if mode=='failed':
         for family in ("workspace", "manifest"):
             for mode in ("missing", "ambiguous"):
                 with self.subTest(family=family, mode=mode), self.fixture(mode=mode) as (root, calls, executed):
-                    with self.assertRaisesRegex(RuntimeError, "exactly one Cargo executable"):
+                    with self.assertRaisesRegex(RuntimeError, "exactly one executable"):
                         self.invoke(root, family)
                     self.assertEqual(len(calls.read_text().splitlines()), 1)
                     self.assertFalse(executed.exists())

@@ -1022,6 +1022,33 @@ impl EditorSyntaxTheme {
     }
 }
 
+/// A routine question the person may choose not to be asked again: its
+/// action is common and what it ends can be reopened. Questions about
+/// something that can't be undone are not listed, so they always ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Confirmation {
+    /// Closing a chat that may still be working; its conversation stays in
+    /// history.
+    StopWorkingChat,
+    /// Closing a terminal whose processes are still running.
+    CloseActiveTerminal,
+}
+
+impl Confirmation {
+    pub const ALL: [Self; 2] = [Self::StopWorkingChat, Self::CloseActiveTerminal];
+
+    /// The question's stable name: its key under `[confirmations]`, and in
+    /// widget ids. The terminal question is stored in the older top-level
+    /// `confirm_terminal_close` instead, which builds before this table
+    /// still read, so `close_active_terminal` never appears in the file.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::StopWorkingChat => "stop_working_chat",
+            Self::CloseActiveTerminal => "close_active_terminal",
+        }
+    }
+}
+
 /// The pane opened when visiting an empty worktree or channel.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1231,12 +1258,22 @@ pub struct AppSettings {
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
     pub notifications: crate::notifications::Preferences,
+    /// Routine questions the person chose not to be asked again, by
+    /// [`Confirmation::key`]; an absent key asks. Read through
+    /// [`AppSettings::asks`]. A table rather than a list, so windows that
+    /// each skip a different question merge by key instead of the last save
+    /// replacing the others, and a newer build's keys survive an older one.
+    /// Always written, even empty, so turning the last question back on
+    /// removes only its own key from what another window saved.
+    #[serde(default)]
+    pub confirmations: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             notifications: crate::notifications::Preferences::default(),
+            confirmations: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -1925,6 +1962,33 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    /// Whether to ask before the routine action `confirmation` guards.
+    pub fn asks(&self, confirmation: Confirmation) -> bool {
+        match confirmation {
+            // Older builds read this field, which predates the table, so it
+            // stays the one place this answer is kept.
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close,
+            _ => self
+                .confirmations
+                .get(confirmation.key())
+                .copied()
+                .unwrap_or(true),
+        }
+    }
+
+    pub fn set_asks(&mut self, confirmation: Confirmation, ask: bool) {
+        match confirmation {
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close = ask,
+            _ if ask => {
+                self.confirmations.remove(confirmation.key());
+            }
+            _ => {
+                self.confirmations
+                    .insert(confirmation.key().to_owned(), false);
+            }
+        }
+    }
+
     pub fn editor_font_size(&self) -> f32 {
         self.editor_font_size.unwrap_or(self.terminal_font_size)
     }
@@ -1950,6 +2014,7 @@ impl AppSettings {
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
         self.palette_recents.truncate(24);
+        adopt_current_preview_rows(&mut self.usage_preview_rows);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -2101,6 +2166,24 @@ impl AppSettings {
 /// Validates the flattened language-server mapping. An empty list is valid and
 /// disables LSP. Nothing here touches the filesystem, resolves an executable,
 /// or invokes a shell.
+/// Renames the status-bar rows a selection saved against a window key that
+/// Claude has since renamed, so the bar keeps showing the window chosen.
+/// Two names for the same window become one row, in the place of its first.
+fn adopt_current_preview_rows(rows: &mut HashMap<String, Vec<String>>) {
+    let Some(rows) = rows.get_mut(crate::agent::Provider::Claude.executable()) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    *rows = std::mem::take(rows)
+        .into_iter()
+        .map(|row| match row.strip_prefix("window:") {
+            Some(key) => format!("window:{}", crate::account::claude::stable_window_key(key)),
+            None => row,
+        })
+        .filter(|row| seen.insert(row.clone()))
+        .collect();
+}
+
 fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), SettingsError> {
     let mut identifiers: HashSet<&str> = HashSet::new();
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
@@ -3363,6 +3446,52 @@ mod tests {
             .insert("codex".into(), Vec::new());
         let decoded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.usage_preview_rows, settings.usage_preview_rows);
+    }
+
+    /// Settings saved before Claude's live Fable window was renamed hold
+    /// its retired key; loading them keeps that window in the status bar.
+    #[test]
+    fn loading_renames_retired_claude_preview_rows() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Value::try_from(AppSettings::default()).unwrap();
+        document.as_table_mut().unwrap().insert(
+            "usage_preview_rows".into(),
+            toml::toml! {
+                claude = [
+                    "window:weekly_overage",
+                    "window:session",
+                    "window:weekly_scoped:Fable 5.1",
+                    "credits",
+                ]
+                codex = ["window:weekly_overage"]
+            }
+            .into(),
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&path)
+            .unwrap()
+            .write_all(toml::to_string(&document).unwrap().as_bytes())
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.usage_preview_rows["claude"],
+            ["window:weekly_scoped:Fable", "window:session", "credits"]
+        );
+        // Another provider's keys are its own.
+        assert_eq!(
+            loaded.usage_preview_rows["codex"],
+            ["window:weekly_overage"]
+        );
+        save(&path, &loaded).unwrap();
+        assert_eq!(
+            load(&path).unwrap().usage_preview_rows,
+            loaded.usage_preview_rows
+        );
     }
 
     #[test]
@@ -5805,5 +5934,40 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn skipped_confirmations_merge_per_key_and_keep_unknown_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut base = AppSettings::default();
+        assert!(Confirmation::ALL.into_iter().all(|kind| base.asks(kind)));
+        // A newer build's question survives this build's saves.
+        base.confirmations.insert("future_question".into(), false);
+        save(&path, &base).unwrap();
+
+        // Two windows each skip a different question from the same base.
+        let mut chat = base.clone();
+        chat.set_asks(Confirmation::StopWorkingChat, false);
+        save_merged(&path, &base, &chat).unwrap();
+        let mut terminal = base.clone();
+        terminal.set_asks(Confirmation::CloseActiveTerminal, false);
+        save_merged(&path, &base, &terminal).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        // The terminal question stays where older builds read it.
+        assert!(!saved.confirm_terminal_close);
+        assert!(!saved.confirmations.contains_key("close_active_terminal"));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
+
+        // Asking again removes only that question's key.
+        let mut again = chat.clone();
+        again.set_asks(Confirmation::StopWorkingChat, true);
+        save_merged(&path, &chat, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
     }
 }

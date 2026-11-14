@@ -18,6 +18,9 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifactError, CargoArtifacts
+
 MAX_BYTES = 4 * 1024 * 1024
 REFRESH = 120
 BUILD_RETRY = 600
@@ -141,28 +144,15 @@ def build(common, revision, key):
                     command = [str(source / "scripts/cargo-gate"), "build", "--locked",
                                "--no-default-features", "--bin", "cagents",
                                "--message-format=json-render-diagnostics"]
-                    products = set()
+                    artifacts = CargoArtifacts()
                     with subprocess.Popen(command, cwd=source, stdout=subprocess.PIPE,
                                           stderr=log, text=True, pass_fds=(build_flight,)) as child:
                         for line in child.stdout:
                             log.write(line.encode())
-                            try:
-                                message = json.loads(line)
-                            except ValueError:
-                                continue
-                            target = message.get("target", {})
-                            if (message.get("reason") == "compiler-artifact"
-                                    and target.get("name") == "cagents"
-                                    and "bin" in target.get("kind", [])
-                                    and message.get("executable")):
-                                products.add(message["executable"])
+                            artifacts.read(line)
                         if child.wait():
                             raise OSError("cargo-gate build failed; see build.log")
-                    if len(products) != 1:
-                        raise OSError("Cargo did not report one cagents executable")
-                    product = Path(products.pop())
-                    if not product.is_absolute():
-                        raise OSError("Cargo reported a relative executable")
+                    product = artifacts.executable("cagents")
                     subprocess.run([str(product), "gh", "pr-status", "--help"],
                                    stdout=log, stderr=log, check=True)
                     temporary = destination / "cagents.new"
@@ -171,7 +161,7 @@ def build(common, revision, key):
                     os.replace(temporary, binary)
                     store(destination / "source.json", {"revision": revision, "key": key})
                     store(attempt, {"key": key, "revision": revision, "retry_at": 0})
-                except (OSError, subprocess.SubprocessError) as error:
+                except (OSError, subprocess.SubprocessError, CargoArtifactError) as error:
                     log.write((str(error) + "\n").encode())
                     store(attempt, {"key": key, "revision": revision,
                                     "retry_at": int(time.time()) + BUILD_RETRY})

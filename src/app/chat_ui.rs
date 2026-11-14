@@ -357,6 +357,7 @@ pub enum Action {
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
     SubagentPicker(Target, bool),
+    SubagentFailures(Target),
     SubagentQuery(Target, String),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
@@ -747,6 +748,7 @@ impl Action {
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
             Self::SubagentPicker(..) => "SubagentPicker",
+            Self::SubagentFailures(..) => "SubagentFailures",
             Self::SubagentQuery(..) => "SubagentQuery",
             Self::ToggleFailure(..) => "ToggleFailure",
             Self::CopyFailure(..) => "CopyFailure",
@@ -1329,6 +1331,7 @@ impl ChangeToken {
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
             chat::ToolStatus::Waiting => 5,
+            chat::ToolStatus::Ended => 6,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -1581,6 +1584,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::Ended => "Ended",
         chat::ToolStatus::Waiting => "Waiting on background work",
     }
 }
@@ -8287,21 +8291,32 @@ impl Cagents {
             })
             .map(|(card, pending)| (*card, &pending.candidate))
             .collect::<HashMap<_, _>>();
-        if defaults.is_empty()
-            && draft_starts.is_empty()
-            && admission_sources.is_empty()
-            && chat_drafts == self.durable.chat_drafts
-            && chat_draft_attachments == self.durable.chat_draft_attachments
-            && chat_waiting_messages == self.durable.chat_waiting_messages
-            && repository_navigation == self.durable.repository_navigation
-        {
+        // Durable holds what was last saved of these too, as it does unread
+        // state: a draft written once would otherwise differ from durable at
+        // every later save, each of which then copied the whole workspace.
+        if chat_drafts != self.durable.chat_drafts {
+            Arc::make_mut(&mut self.durable).chat_drafts = chat_drafts;
+        }
+        if chat_draft_attachments != self.durable.chat_draft_attachments {
+            Arc::make_mut(&mut self.durable).chat_draft_attachments = chat_draft_attachments;
+        }
+        if chat_waiting_messages != self.durable.chat_waiting_messages {
+            Arc::make_mut(&mut self.durable).chat_waiting_messages = chat_waiting_messages;
+        }
+        if repository_navigation != self.durable.repository_navigation {
+            let durable = Arc::make_mut(&mut self.durable);
+            let previous =
+                std::mem::replace(&mut durable.repository_navigation, repository_navigation);
+            for (card, navigation) in previous {
+                if !durable.repository_navigation.contains_key(&card) {
+                    self.released_repository_navigation.insert(card, navigation);
+                }
+            }
+        }
+        if defaults.is_empty() && draft_starts.is_empty() && admission_sources.is_empty() {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
-        saved.chat_drafts = chat_drafts;
-        saved.chat_draft_attachments = chat_draft_attachments;
-        saved.chat_waiting_messages = chat_waiting_messages;
-        saved.repository_navigation = repository_navigation;
         for card in &mut saved.cards {
             if let Some(pending) = draft_starts.get(&card.id) {
                 // Only the writer sees B before its receipt. Autosaves of A
@@ -13570,6 +13585,18 @@ impl Cagents {
             }
             Action::FailureCopied(target, key, request, result) => {
                 return self.finish_failure_copy(target, key, request, result);
+            }
+            Action::SubagentFailures(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let mut picker = child_navigation::Picker::new(&runtime.snapshot.subagents);
+                    picker.filter = child_navigation::Filter::Failed;
+                    runtime.child_picker = Some(picker);
+                    return widget::text_input::focus(card_control_id(
+                        target.card,
+                        "chat-subagent-search",
+                    ))
+                    .map(cosmic::Action::App);
+                }
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -20354,6 +20381,89 @@ mod tests {
             !app.persistent_workspace()
                 .chat_drafts
                 .contains_key(&stashed)
+        );
+    }
+
+    /// A draft is copied into the saved workspace when it changes. Saves
+    /// after that which change nothing hand the writer the workspace already
+    /// held instead of a fresh copy of every card in it.
+    #[test]
+    fn saves_after_a_draft_change_copy_the_workspace_only_when_it_changes_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "kept draft");
+        let first = app.persistent_workspace();
+        assert_eq!(first.chat_drafts[&card], "kept draft");
+        assert!(
+            Arc::ptr_eq(&first, &app.durable),
+            "durable holds the draft it saved"
+        );
+        let again = app.persistent_workspace();
+        assert!(
+            Arc::ptr_eq(&again, &first),
+            "an unchanged save copies nothing"
+        );
+
+        write(&mut app, card, " and more");
+        let changed = app.persistent_workspace();
+        assert!(!Arc::ptr_eq(&changed, &first));
+        assert_eq!(changed.chat_drafts[&card], "kept draft and more");
+        assert_eq!(
+            first.chat_drafts[&card], "kept draft",
+            "a snapshot already handed to the writer stays as it was saved"
+        );
+        assert!(Arc::ptr_eq(&app.persistent_workspace(), &changed));
+
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("expected live chat runtime");
+        };
+        runtime.replace_draft(text_editor::Content::new());
+        let cleared = app.persistent_workspace();
+        assert!(!cleared.chat_drafts.contains_key(&card));
+        assert!(!app.durable.chat_drafts.contains_key(&card));
+        assert!(Arc::ptr_eq(&app.persistent_workspace(), &cleared));
+    }
+
+    /// Repeatable measurement for #2633: what a save that changes nothing
+    /// costs once a draft has been written, in a workspace holding as many
+    /// cards as a long-used desktop one.
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture under --profile dev-runtime"]
+    fn measure_unchanged_saves_after_a_draft_at_desktop_inventory_scale() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "kept draft");
+        let durable = Arc::make_mut(&mut app.durable);
+        for index in 0..555 {
+            let mut closed = crate::app::tests::terminal_card_state();
+            closed.existence = Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("closed inventory fixture".into()),
+                },
+            };
+            durable.card_scopes.insert(
+                closed.id,
+                PathBuf::from(format!("/workspace/scope-{index}")),
+            );
+            durable.cards.push(closed);
+        }
+        let mut held = app.persistent_workspace();
+        const SAVES: u32 = 200;
+        let started = std::time::Instant::now();
+        let mut copies = 0;
+        for _ in 0..SAVES {
+            let saved = app.persistent_workspace();
+            copies += usize::from(!Arc::ptr_eq(&saved, &held));
+            // The writer holds the latest snapshot until a newer one replaces it.
+            held = saved;
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "unchanged saves: {SAVES} in {:.3} ms, {:.1} us each, {copies} copied the workspace",
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / f64::from(SAVES),
         );
     }
 

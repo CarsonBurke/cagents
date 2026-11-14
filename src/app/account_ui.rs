@@ -1008,6 +1008,24 @@ impl AccountState {
         self.headline()?;
         selection_window(self.snapshot.as_ref()?)
     }
+
+    /// Urgency follows consumed allowance, independent of the display mode.
+    /// Old figures and failed checks must not look like current warnings.
+    fn usage_tone(&self, window: &UsageWindow, now: Millis) -> ChipTone {
+        match &self.snapshot {
+            Some(snapshot)
+                if self.failure.is_none()
+                    && !is_stale(snapshot, now)
+                    && matches!(
+                        snapshot.status,
+                        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+                    ) =>
+            {
+                ChipTone::of_usage(snapshot.status, window.used)
+            }
+            _ => ChipTone::Stale,
+        }
+    }
 }
 
 /// A sign-in running in a terminal, for an account that is not yet in the
@@ -1374,7 +1392,7 @@ fn reset_countdown(window: &UsageWindow, now: Millis) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChipTone {
+pub(super) enum ChipTone {
     Current,
     /// Current figures running low: worth a glance before starting work.
     Low,
@@ -1402,7 +1420,7 @@ impl ChipTone {
     }
 
     /// The color the chip's gauge takes, or `None` for the neutral stroke.
-    fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
+    pub(super) fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
         match self {
             Self::Low | Self::Attention => Some(design::warning_color),
             Self::Exhausted => Some(design::destructive_color),
@@ -1411,7 +1429,7 @@ impl ChipTone {
     }
 
     /// The chip's text in the same tone as its gauge.
-    fn text_class(self) -> cosmic::theme::Text {
+    pub(super) fn text_class(self) -> cosmic::theme::Text {
         match self {
             Self::Current => cosmic::theme::Text::Default,
             Self::Low | Self::Attention => cosmic::theme::Text::Custom(design::warning_text),
@@ -1419,6 +1437,16 @@ impl ChipTone {
             // A caption's own muted ink.
             Self::Stale => cosmic::theme::Text::Custom(design::muted_text),
         }
+    }
+
+    /// Detailed bars retain their accent while current and healthy.
+    fn bar_tone(self) -> design::Tone {
+        design::Tone::Themed(match self {
+            Self::Current => design::accent_color,
+            Self::Stale => design::muted_color,
+            Self::Low | Self::Attention => design::warning_color,
+            Self::Exhausted => design::destructive_color,
+        })
     }
 }
 
@@ -1453,19 +1481,44 @@ fn headline_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
     )
 }
 
-fn preview_window_key(window: &UsageWindow) -> String {
-    format!("window:{}", window.key)
+/// The status-bar row `window` is saved as: `window:` and its key, under the
+/// name that outlasts the provider's renames of it.
+fn preview_window_key(provider: Provider, window: &UsageWindow) -> String {
+    let key = match provider {
+        Provider::Claude => account::claude::stable_window_key(&window.key),
+        Provider::Codex | Provider::Omp => &window.key,
+    };
+    format!("window:{key}")
 }
 
 fn preview_row_included(
+    provider: Provider,
     snapshot: &UsageSnapshot,
     selected: Option<&Vec<String>>,
     key: &str,
 ) -> bool {
     selected.map_or_else(
-        || headline_window(snapshot).is_some_and(|window| preview_window_key(window) == key),
+        || {
+            headline_window(snapshot)
+                .is_some_and(|window| preview_window_key(provider, window) == key)
+        },
         |rows| rows.iter().any(|row| row == key),
     )
+}
+
+/// What the reader knows a saved status-bar row as, for one the account no
+/// longer reports and so has no label for.
+fn preview_row_name(row: &str) -> String {
+    if row == "credits" {
+        return "Extra usage".into();
+    }
+    let key = row.strip_prefix("window:").unwrap_or(row);
+    match key.split_once(':') {
+        _ if key == "session" => "Session".into(),
+        _ if key == "weekly_all" => "Weekly".into(),
+        Some(("weekly_scoped", scope)) => format!("Weekly · {scope}"),
+        _ => account::humanize(key),
+    }
 }
 
 fn preview_chips(
@@ -1487,10 +1540,11 @@ fn preview_chips(
     ) {
         return vec![chip(account, name, now, mode)];
     }
+    let provider = account.account.provider;
     let windows: Vec<_> = snapshot
         .windows
         .iter()
-        .filter(|window| selected.contains(&preview_window_key(window)))
+        .filter(|window| selected.contains(&preview_window_key(provider, window)))
         .collect();
     let multiple = windows.len() > 1 || selected.iter().any(|key| key == "credits");
     let mut chips: Vec<_> = windows
@@ -1532,6 +1586,34 @@ fn preview_chips(
             tooltip: format!("{name} · {text}"),
         });
     }
+    let shown: Vec<String> = snapshot
+        .windows
+        .iter()
+        .map(|window| preview_window_key(provider, window))
+        .chain(snapshot.credits.is_some().then(|| "credits".to_owned()))
+        .collect();
+    let missing: Vec<String> = selected
+        .iter()
+        .filter(|row| !shown.contains(row))
+        .map(|row| preview_row_name(row))
+        .collect();
+    if missing.is_empty() {
+        return chips;
+    }
+    // A selection the account no longer reports - a limit the provider
+    // dropped or renamed - leaves its headline in the bar rather than none.
+    if chips.is_empty() {
+        let mut summary = chip(account, name, now, mode);
+        if let Some(window) = headline_window(snapshot) {
+            summary.text = format!("{}: {}", window.label, summary.text);
+        }
+        chips.push(summary);
+    }
+    chips[0].tooltip.push_str(&format!(
+        "\n{} {} not reported for this account",
+        missing.join(", "),
+        if missing.len() == 1 { "is" } else { "are" },
+    ));
     chips
 }
 
@@ -1649,11 +1731,7 @@ fn chip_with_window(
                     usage_figure(scoped.used, mode).text
                 ));
             }
-            let tone = if stale || account.failure.is_some() {
-                ChipTone::Stale
-            } else {
-                ChipTone::of_usage(snapshot.status, window.used)
-            };
+            let tone = account.usage_tone(window, now);
             Chip {
                 text,
                 usage_fraction: Some(figure.fraction),
@@ -1834,6 +1912,7 @@ pub(super) struct ChatAccount {
     pub selected: bool,
     /// The displayed usage fraction of the selection window, for its ring.
     pub usage_fraction: Option<f32>,
+    pub tone: ChipTone,
 }
 
 /// One account the settings pane offers as a provider's default.
@@ -2882,16 +2961,17 @@ impl Cagents {
                 let Some(snapshot) = account.snapshot.as_ref() else {
                     return Task::none();
                 };
+                let provider = account.account.provider;
                 let known = key == "credits" && snapshot.credits.is_some()
                     || snapshot
                         .windows
                         .iter()
-                        .any(|window| preview_window_key(window) == key);
+                        .any(|window| preview_window_key(provider, window) == key);
                 if !known {
                     return Task::none();
                 }
                 let automatic = headline_window(snapshot)
-                    .map(preview_window_key)
+                    .map(|window| preview_window_key(provider, window))
                     .into_iter()
                     .collect();
                 let rows = self
@@ -4860,9 +4940,12 @@ impl Cagents {
                 if let Some(plan) = account.plan() {
                     detail.push(plan);
                 }
-                let usage = account
-                    .selection_window()
+                let window = account.selection_window();
+                let usage = window
                     .map(|window| usage_figure(window.used, self.settings.account_usage_display));
+                let tone = window.map_or(ChipTone::Stale, |window| {
+                    account.usage_tone(window, state.now_ms)
+                });
                 match (&account.snapshot, &usage) {
                     (_, Some(figure)) => detail.push(figure.text.clone()),
                     (Some(snapshot), None) if snapshot.status == UsageStatus::NeedsLogin => {
@@ -4879,6 +4962,7 @@ impl Cagents {
                     detail: detail.join(" · "),
                     selected: current.is_some_and(|current| current.id == account.id),
                     usage_fraction: usage.map(|figure| figure.fraction),
+                    tone,
                 }
             })
             .collect();
@@ -4991,9 +5075,33 @@ impl Cagents {
         )
     }
 
-    /// A provider's chip: its default account's figures - or, while that
-    /// account has nothing to report, the first account that does - and how
-    /// many more accounts the popover lists.
+    /// The account a provider's chip reports, and how many more the popover
+    /// lists: the one new conversations use. That is the chosen default, or,
+    /// in Automatic mode while the default cannot take work, the signed-in
+    /// plan new work switches to. An account that is only still being
+    /// checked leads as itself; failing that, the first listed.
+    fn chip_lead(&self, provider: Provider) -> Option<(&AccountState, usize)> {
+        let state = &self.account_ui;
+        let present: Vec<&AccountState> = state
+            .of(provider)
+            .filter(|account| state.shown_in_switcher(account))
+            .collect();
+        let used = self.default_account(provider).id();
+        let lead = present
+            .iter()
+            .find(|account| account.id == used)
+            .or_else(|| {
+                present
+                    .iter()
+                    .find(|account| state.registry.is_default(&account.account))
+            })
+            .or_else(|| present.first())
+            .copied()?;
+        Some((lead, present.len() - 1))
+    }
+
+    /// A provider's chip: [`Self::chip_lead`]'s figures, for the rows the
+    /// reader chose to preview.
     fn provider_chip(
         &self,
         provider: Provider,
@@ -5002,16 +5110,7 @@ impl Cagents {
     ) -> Option<Element<'_, Message>> {
         let mode = self.settings.account_usage_display;
         let state = &self.account_ui;
-        let present: Vec<&AccountState> = state
-            .of(provider)
-            .filter(|account| state.shown_in_switcher(account))
-            .collect();
-        let lead = present
-            .iter()
-            .find(|account| state.registry.is_default(&account.account))
-            .or_else(|| present.first())
-            .copied()?;
-        let others = present.len() - 1;
+        let (lead, others) = self.chip_lead(provider)?;
         let name = if others > 0 {
             format!("{} ({})", lead.name(), state.display_name(lead))
         } else {
@@ -5019,27 +5118,14 @@ impl Cagents {
         };
         let selected = self.settings.usage_preview_rows.get(provider.executable());
         let mut previews = preview_chips(lead, &name, now, selected, mode);
-        let mut summary = previews.first().cloned().unwrap_or_else(|| {
-            let unavailable = selected.is_some_and(|rows| !rows.is_empty());
-            Chip {
-                text: if unavailable {
-                    "Selected limits unavailable".into()
-                } else {
-                    lead.name().to_owned()
-                },
-                usage_fraction: None,
-                tone: if unavailable {
-                    ChipTone::Stale
-                } else {
-                    ChipTone::Current
-                },
-                essential: !unavailable,
-                tooltip: if unavailable {
-                    format!("{name} does not currently report the selected preview rows")
-                } else {
-                    format!("{name} usage · no preview rows selected")
-                },
-            }
+        // Only a deliberately empty selection leaves no preview: the chip is
+        // then just the provider.
+        let mut summary = previews.first().cloned().unwrap_or_else(|| Chip {
+            text: lead.name().to_owned(),
+            usage_fraction: None,
+            tone: ChipTone::Current,
+            essential: true,
+            tooltip: format!("{name} usage · no preview rows selected"),
         });
         if previews.len() > 1 {
             summary.tooltip = previews
@@ -5177,7 +5263,10 @@ impl Cagents {
                     .then_some(summary.usage_fraction)
                     .flatten()
                 {
-                    Some(fraction) => items.push(crate::ui_controls::budget_radial(fraction)),
+                    Some(fraction) => items.push(crate::ui_controls::budget_radial_toned(
+                        fraction,
+                        summary.tone.color().map(design::Tone::Themed),
+                    )),
                     None => items.push(
                         iced::widget::Space::new()
                             .width(design::RADIAL_GAUGE_SIZE)
@@ -5206,6 +5295,7 @@ impl Cagents {
                             .as_ref()
                             .map_or_else(|| summary.text, |conflict| conflict.label().to_owned()),
                     )
+                    .class(summary.tone.text_class())
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
                     .into(),
                 );
@@ -5243,7 +5333,6 @@ impl Cagents {
         let spacing = space::S;
         let mut rows: Vec<Element<'a, Message>> =
             vec![self.account_header(account, now, placement)];
-        rows.push(design::caption(self.account_ui.account_origin(account)).into());
         if let Some(conflict) = self.account_ui.login_conflict(account) {
             rows.push(
                 design::body(conflict.label())
@@ -5292,13 +5381,6 @@ impl Cagents {
                     .into(),
             );
         }
-        if let Some(line) = account.identity.as_ref().and_then(identity_line) {
-            rows.push(
-                design::caption(line)
-                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
-                    .into(),
-            );
-        }
         match &account.snapshot {
             None if account.failure.is_none() => {
                 rows.push(design::caption("Checking usage…").into());
@@ -5342,10 +5424,11 @@ impl Cagents {
                     );
                 }
                 UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
-                    let stale = is_stale(snapshot, now);
                     rows.extend(snapshot.windows.iter().map(|window| {
-                        let key = preview_window_key(window);
+                        let provider = account.account.provider;
+                        let key = preview_window_key(provider, window);
                         let included = preview_row_included(
+                            provider,
                             snapshot,
                             self.settings
                                 .usage_preview_rows
@@ -5356,7 +5439,7 @@ impl Cagents {
                         usage_window_row(
                             window,
                             now,
-                            stale,
+                            account.usage_tone(window, now),
                             toggle,
                             self.settings.account_usage_display,
                         )
@@ -5374,6 +5457,7 @@ impl Cagents {
                                     account,
                                     "credits".into(),
                                     preview_row_included(
+                                        account.account.provider,
                                         snapshot,
                                         self.settings
                                             .usage_preview_rows
@@ -5463,7 +5547,14 @@ impl Cagents {
             .filter(|other| other.present)
             .count()
             > 1;
-        if several || !account.account.is_system() {
+        // The header is where the card names its login: by the name the
+        // reader gave it, else its address. A lone system account with
+        // neither is just the provider.
+        if several
+            || !account.account.is_system()
+            || account.email(&state.registry).is_some()
+            || state.registry.label(&account.account).is_some()
+        {
             title.push(
                 design::caption(state.display_name(account))
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -5721,38 +5812,22 @@ fn refresh_control<'a>(
         .on_press_maybe(ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))))
 }
 
-fn identity_line(identity: &Identity) -> Option<String> {
-    let parts: Vec<&str> = [identity.email.as_deref(), identity.organization.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
 fn usage_window_row<'a>(
     window: &'a UsageWindow,
     now: Millis,
-    stale: bool,
+    tone: ChipTone,
     toggle: Element<'a, Message>,
     mode: AccountUsageDisplay,
 ) -> Element<'a, Message> {
     let figure = usage_figure(window.used, mode);
-    let tone = if stale {
-        design::Tone::Themed(design::muted_color)
-    } else {
-        design::Tone::Themed(design::budget_tone(window.used))
-    };
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
             toggle,
-            design::caption(figure.text)
-                .class(cosmic::theme::Text::Default)
-                .into(),
+            design::caption(figure.text).class(tone.text_class()).into(),
         ])
         .align_y(Alignment::Center)
         .into(),
-        crate::ui_controls::budget_bar(figure.fraction, tone),
+        crate::ui_controls::budget_bar(figure.fraction, tone.bar_tone()),
     ];
     if let Some(line) = reset_line(window, now) {
         rows.push(design::caption(line).into());
@@ -6235,6 +6310,38 @@ mod tests {
         assert_eq!(app.default_account(Provider::Codex), system);
     }
 
+    /// The status bar reports the account new conversations use: in
+    /// Automatic mode, the signed-in plan they switch to while the default
+    /// is signed out; once an account is pinned, that one, whatever it says.
+    #[test]
+    fn the_status_bar_reports_the_account_new_work_uses() {
+        let mut app = context_inspector_test_app(false);
+        let system = Account::system(Provider::Codex);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 102);
+        app.account_ui.account_mut(&system.id()).unwrap().present = true;
+        let now = now_ms();
+        let lead = |app: &Cagents| {
+            let (lead, others) = app.chip_lead(Provider::Codex).unwrap();
+            (lead.id.clone(), others)
+        };
+        // Neither has reported yet: the default leads as itself.
+        assert_eq!(lead(&app), (system.id(), 1));
+        app.account_ui.account_mut(&system.id()).unwrap().snapshot = Some(UsageSnapshot::state(
+            UsageStatus::NeedsLogin,
+            "signed out",
+            now,
+        ));
+        assert_eq!(lead(&app), (system.id(), 1));
+        app.account_ui.account_mut(&managed).unwrap().snapshot =
+            Some(account::codex::parse_rate_limits(
+                &serde_json::json!({"ordinaryUsageAllowed": true}),
+                now,
+            ));
+        assert_eq!(lead(&app), (managed.clone(), 1));
+        app.account_ui.registry.set_default(&system);
+        assert_eq!(lead(&app), (system.id(), 1));
+    }
+
     #[test]
     fn device_system_home_is_preserved_in_defaults_and_resuming() {
         let mut app = context_inspector_test_app(false);
@@ -6321,8 +6428,19 @@ mod tests {
         fable.kind = WindowKind::Scoped;
         let state = state_with(Some(snapshot(vec![window(0.1, None), weekly, fable], NOW)));
         let usage = state.snapshot.as_ref().unwrap();
-        assert!(preview_row_included(usage, None, "window:seven_day"));
-        assert!(!preview_row_included(usage, None, "window:seven_day_fable"));
+        let claude = Provider::Claude;
+        assert!(preview_row_included(
+            claude,
+            usage,
+            None,
+            "window:seven_day"
+        ));
+        assert!(!preview_row_included(
+            claude,
+            usage,
+            None,
+            "window:seven_day_fable"
+        ));
         assert_eq!(
             preview_chips(&state, "Claude", NOW, None, AccountUsageDisplay::Left),
             vec![chip(&state, "Claude", NOW, AccountUsageDisplay::Left)]
@@ -6355,10 +6473,84 @@ mod tests {
             .is_empty()
         );
         assert!(!preview_row_included(
+            claude,
             usage,
             Some(&empty),
             "window:seven_day"
         ));
+    }
+
+    /// A selection the account no longer reports - a Fable window saved
+    /// under a key since renamed, say - keeps the account's headline in the
+    /// bar, in its usual tone, and the tooltip says what is missing.
+    #[test]
+    fn an_unreported_selection_falls_back_to_the_headline() {
+        let mut weekly = window(0.84, Some(unix_seconds(NOW) + 2 * 86_400));
+        weekly.key = "weekly_all".into();
+        weekly.label = "Weekly".into();
+        weekly.kind = WindowKind::Weekly;
+        let state = state_with(Some(snapshot(vec![window(0.2, None), weekly], NOW)));
+        let selected = vec!["window:weekly_overage".to_owned()];
+        let chips = preview_chips(
+            &state,
+            "Claude",
+            NOW,
+            Some(&selected),
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(chips.len(), 1);
+        let headline = chip(&state, "Claude", NOW, AccountUsageDisplay::Left);
+        assert_eq!(chips[0].text, format!("Weekly: {}", headline.text));
+        assert_eq!(chips[0].tone, headline.tone);
+        assert_eq!(chips[0].usage_fraction, headline.usage_fraction);
+        assert!(
+            chips[0]
+                .tooltip
+                .ends_with("\nWeekly overage is not reported for this account"),
+            "{}",
+            chips[0].tooltip
+        );
+
+        // A reported selection stays as chosen; only what is missing is named.
+        let selected = vec![
+            "window:session".to_owned(),
+            "window:weekly_scoped:Opus".to_owned(),
+            "credits".to_owned(),
+        ];
+        let chips = preview_chips(
+            &state,
+            "Claude",
+            NOW,
+            Some(&selected),
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(chips.len(), 1);
+        assert!(chips[0].text.starts_with("Session:"), "{}", chips[0].text);
+        assert!(
+            chips[0]
+                .tooltip
+                .ends_with("\nWeekly · Opus, Extra usage are not reported for this account"),
+            "{}",
+            chips[0].tooltip
+        );
+
+        // A versioned Fable scope is the window a live report keys `Fable`.
+        let mut fable = window(0.5, None);
+        fable.key = "weekly_scoped:Fable 5.1".into();
+        fable.label = "Weekly · Fable 5.1".into();
+        fable.kind = WindowKind::Scoped;
+        let state = state_with(Some(snapshot(vec![window(0.2, None), fable], NOW)));
+        let selected = vec!["window:weekly_scoped:Fable".to_owned()];
+        let chips = preview_chips(
+            &state,
+            "Claude",
+            NOW,
+            Some(&selected),
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(chips.len(), 1);
+        assert!(chips[0].text.starts_with("Weekly · Fable 5.1:"));
+        assert!(!chips[0].tooltip.contains("not reported"));
     }
 
     #[test]
@@ -6451,6 +6643,7 @@ mod tests {
                     "Claude",
                     NOW,
                     Some(&vec![preview_window_key(
+                        Provider::Claude,
                         &state.snapshot.as_ref().unwrap().windows[0],
                     )]),
                     mode,
@@ -6462,8 +6655,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_account_rings_match_both_usage_modes() {
+    fn composer_account_rings_match_both_usage_modes_and_tones() {
         let mut app = context_inspector_test_app(false);
+        app.account_ui.now_ms = NOW;
         let id = app.account_ui.add_managed_fixture(Provider::Codex, 2736);
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
@@ -6472,15 +6666,23 @@ mod tests {
             working_directory: PathBuf::from("/w"),
             environment: BTreeMap::new(),
         };
-        for (used, left_percent, used_percent) in [
-            (1.0, 0, 100),
-            (0.63, 37, 63),
-            (0.01, 99, 1),
-            (0.0, 100, 0),
-            (1.3, 0, 130),
+        for (used, left_percent, used_percent, status, tone) in [
+            (1.0, 0, 100, UsageStatus::Ok, ChipTone::Exhausted),
+            (0.9, 10, 90, UsageStatus::Ok, ChipTone::Low),
+            (0.63, 37, 63, UsageStatus::Ok, ChipTone::Current),
+            (0.01, 99, 1, UsageStatus::Ok, ChipTone::Current),
+            (0.0, 100, 0, UsageStatus::Ok, ChipTone::Current),
+            (1.3, 0, 130, UsageStatus::Ok, ChipTone::Exhausted),
+            (0.5, 50, 50, UsageStatus::Warning, ChipTone::Low),
+            (0.5, 50, 50, UsageStatus::Limited, ChipTone::Exhausted),
         ] {
-            app.account_ui.account_mut(&id).unwrap().snapshot =
-                Some(snapshot(vec![window(used, None)], NOW));
+            let mut weekly = window(used, None);
+            weekly.kind = WindowKind::Weekly;
+            weekly.key = "weekly".into();
+            // Choices compare weekly allowances even when a session binds.
+            let mut reading = snapshot(vec![window(1.0, None), weekly], NOW);
+            reading.status = status;
+            app.account_ui.account_mut(&id).unwrap().snapshot = Some(reading);
             for (mode, percent, suffix) in [
                 (AccountUsageDisplay::Left, left_percent, "left"),
                 (AccountUsageDisplay::Used, used_percent, "used"),
@@ -6494,6 +6696,51 @@ mod tests {
                     .unwrap();
                 assert!(choice.detail.contains(&format!("{percent}% {suffix}")));
                 assert_eq!(choice.usage_fraction, Some(percent as f32 / 100.0));
+                assert_eq!(choice.tone, tone);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_account_tones_do_not_warn_on_stale_failed_or_unknown_usage() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.now_ms = NOW;
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 2770);
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        let current = snapshot(vec![window(1.0, None)], NOW);
+        let old = snapshot(
+            vec![window(1.0, None)],
+            NOW - schedule::DISPLAY_STALE_AFTER - 1,
+        );
+        let reset = snapshot(vec![window(1.0, Some(unix_seconds(NOW) - 1))], NOW - 2_000);
+        let mut unavailable = current.clone();
+        unavailable.status = UsageStatus::Unavailable;
+        for (reading, failure, has_ring) in [
+            (Some(old), None, true),
+            (Some(reset), None, true),
+            (Some(current), Some("Check failed".into()), true),
+            (Some(unavailable), None, false),
+            (None, None, false),
+        ] {
+            let account = app.account_ui.account_mut(&id).unwrap();
+            account.snapshot = reading;
+            account.failure = failure;
+            for mode in [AccountUsageDisplay::Left, AccountUsageDisplay::Used] {
+                app.settings.account_usage_display = mode;
+                let accounts = app.chat_accounts(Provider::Codex, &recipe).unwrap();
+                let choice = accounts
+                    .choices
+                    .iter()
+                    .find(|choice| choice.id == id)
+                    .unwrap();
+                assert_eq!(choice.tone, ChipTone::Stale);
+                assert_eq!(choice.usage_fraction.is_some(), has_ring);
             }
         }
     }
