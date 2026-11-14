@@ -66,6 +66,7 @@ pub enum CompletedCloseOutcome {
     Closed,
     ClosedWithBasis(crate::workspace_model::views::TerminalRemovalBasis),
     Active(HostSessionProof),
+    SourceChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,21 +459,28 @@ impl Cagents {
                         .terminal_removal_basis(source.clone())
                         .or_else(|error| authority.worker().cloned().ok_or(error))
                         .map_err(|error| error.to_string())?;
-                    if matches!(basis, crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }) {
+                    if matches!(
+                        basis,
+                        crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+                    ) {
                         return super::daemon_recovery::prove_not_hosted(&source, &[])
                             .map(CompletedCloseOutcome::ClosedWithBasis)
                             .map_err(|kept| kept.reason);
                     }
                     if !authority.permits(&basis) {
-                        return Err("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
+                        return Ok(CompletedCloseOutcome::SourceChanged);
                     }
                     let outcome = if let Some(basis) = authority.worker() {
                         client.close_terminal_source(source, basis.clone(), true, allow_active)
                     } else {
                         client.release_completed_terminal(source, allow_active)
-                    }.map_err(|error| if is_source_close_refusal(&error) {
-                        "This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into()
-                    } else { error.to_string() })?;
+                    };
+                    let outcome = match outcome {
+                        Err(error) if is_source_close_refusal(&error) => {
+                            return Ok(CompletedCloseOutcome::SourceChanged);
+                        }
+                        result => result.map_err(|error| error.to_string())?,
+                    };
                     match outcome {
                         TerminalCloseResult::Closed => {
                             Ok(CompletedCloseOutcome::ClosedWithBasis(basis))
@@ -554,6 +562,12 @@ impl Cagents {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
         }) {
+            if matches!(&result, Ok(CompletedCloseOutcome::SourceChanged)) {
+                return Task::batch([
+                    self.readmit_shared_terminal_after_source_refusal(card),
+                    self.next_queued_card_close(),
+                ]);
+            }
             return self.next_queued_card_close();
         }
         let result = result.and_then(|outcome| match outcome {
@@ -568,6 +582,15 @@ impl Cagents {
         });
         match result {
             Ok(CompletedCloseOutcome::ClosedWithBasis(_)) => unreachable!(),
+            Ok(CompletedCloseOutcome::SourceChanged) => {
+                self.status = Some(TransientNotice::warning(
+                    "This terminal changed before it could close, so the pane was kept. Try closing it again.",
+                ));
+                Task::batch([
+                    self.readmit_shared_terminal_after_source_refusal(card),
+                    self.next_queued_card_close(),
+                ])
+            }
             Ok(CompletedCloseOutcome::Closed) => {
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
@@ -1015,6 +1038,7 @@ impl Cagents {
                 self.open_confirmation(QUESTION, cancel_id(), confirm_id())
             }
             outcome => {
+                let source_changed = matches!(&outcome, CloseOutcome::SourceChanged);
                 // `Stale` and a mismatched identity both mean the request was
                 // never applied to the card's terminal, so nothing is left
                 // outstanding for the fence to hold.
@@ -1049,7 +1073,14 @@ impl Cagents {
                     }
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus()
+                Task::batch([
+                    close_focus(),
+                    if source_changed {
+                        self.readmit_shared_terminal_after_source_refusal(card)
+                    } else {
+                        Task::none()
+                    },
+                ])
             }
         }
     }
@@ -1435,6 +1466,14 @@ mod tests {
         assert!(matches!(
             source_close_outcome(Err(ControlError::ConnectionClosed)),
             CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(ControlError::Remote {
+                code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
+                message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                retryable: false,
+            })),
+            CloseOutcome::Stale
         ));
         assert!(matches!(
             source_close_outcome(Ok(TerminalCloseResult::Unknown("retained".into()))),
@@ -2559,6 +2598,11 @@ fn source_close_outcome(
         Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
         Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
         Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
+        Err(crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
+            message,
+            retryable: false,
+        }) if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT => CloseOutcome::Stale,
         Err(error) => CloseOutcome::Unreachable(error.to_string()),
     }
 }
@@ -2598,7 +2642,7 @@ fn revalidate_and_close(
                 );
             }
             if !authority.permits(&basis) {
-                return Ok(CloseOutcome::Stale);
+                return Ok(CloseOutcome::SourceChanged);
             }
             let result = if let Some(basis) = authority.worker() {
                 client.close_terminal_source(source.clone(), basis.clone(), true, allow_active)

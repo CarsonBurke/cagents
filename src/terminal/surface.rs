@@ -107,6 +107,11 @@ impl TerminalSurface {
         self.handle.execution_instance()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.handle.set_worker_receipt_for_test(owner, worker);
+    }
+
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.handle.input(bytes)
     }

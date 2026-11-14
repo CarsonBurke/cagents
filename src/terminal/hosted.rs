@@ -1343,6 +1343,16 @@ impl HostedTerminalHandle {
         self.inner.stop.request();
     }
 
+    /// A stopped surface with an authenticated receipt for reducer fixtures.
+    /// Framed-socket tests exercise transport authentication separately.
+    #[cfg(test)]
+    pub(crate) fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.inner.stop.request();
+        assert!(self.inner.published.pin_proof(owner));
+        assert!(self.inner.published.observe_worker(worker));
+        self.inner.published.confirm_attachment(owner);
+    }
+
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();

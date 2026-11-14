@@ -1,6 +1,92 @@
 use super::*;
 
 #[test]
+fn refused_shared_close_readmits_only_its_obsolete_surface_without_retargeting_intent() {
+    use crate::workspace_model::views::TerminalRemovalBasis;
+    for newer_surface in [false, true] {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut app, _, _, mut pane) = channel_move_fixture();
+        let owner = HostSessionProof {
+            host_session_id: "fixture".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
+        };
+        let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: owner.host_session_id.clone(),
+            boot_id: owner.boot_id.clone(),
+            host_incarnation: owner.host_incarnation.clone(),
+        };
+        pane.kind = CardKind::Terminal(source.clone());
+        app.workspace_model.views[0].panes[0] = pane.clone();
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+        let original_worker = uuid::Uuid::new_v4();
+        let surface = crate::app::tests::unconnected_surface(directory.path(), source.id);
+        surface.set_worker_receipt_for_test(&owner, original_worker);
+        app.cards.insert(pane.id, CardRuntime::Terminal(surface));
+        assert!(app.capture_shared_removal(pane.id));
+        let original_basis = TerminalRemovalBasis::Worker {
+            owner: owner.clone(),
+            instance: original_worker,
+        };
+        assert_eq!(
+            app.terminal_cleanup_authority(pane.id).worker(),
+            Some(&original_basis)
+        );
+        // A's surface can retain its exit after the canonical source is B.
+        if let CardKind::Terminal(local) = &mut app.card_state_mut(pane.id).unwrap().kind {
+            local.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+        }
+        let replacement_worker = uuid::Uuid::new_v4();
+        if newer_surface {
+            app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+            let current = crate::app::tests::unconnected_surface(directory.path(), source.id);
+            current.set_worker_receipt_for_test(&owner, replacement_worker);
+            app.cards.insert(pane.id, CardRuntime::Terminal(current));
+        }
+        let (tx, published) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.readmit_shared_terminal_after_source_refusal(pane.id));
+        assert_eq!(
+            app.terminal_cleanup_authority(pane.id).worker(),
+            Some(&original_basis),
+            "refreshing display never grants B to the old Close"
+        );
+        if newer_surface {
+            let Some(CardRuntime::Terminal(current)) = app.cards.get(&pane.id) else {
+                panic!("new surface must survive")
+            };
+            assert_eq!(current.execution_instance(), Some(replacement_worker));
+            app.reset_shared_removal_for_new_close(pane.id);
+            assert!(app.capture_shared_removal(pane.id));
+            assert_eq!(
+                app.terminal_cleanup_authority(pane.id).worker(),
+                Some(&TerminalRemovalBasis::Worker {
+                    owner: owner.clone(),
+                    instance: replacement_worker,
+                })
+            );
+        } else {
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Loading)
+            ));
+            assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        }
+        assert!(
+            published.try_recv().is_err(),
+            "readmission is not pane deletion or execution"
+        );
+    }
+}
+
+#[test]
 fn completed_shared_close_cannot_adopt_a_replacement_worker_receipt() {
     use crate::workspace_model::views::TerminalRemovalBasis;
     let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());

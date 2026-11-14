@@ -157,8 +157,8 @@ impl Cagents {
         valid
     }
 
-    /// A cleanup receipt may fill missing worker evidence, but cannot replace
-    /// an original known worker. A new daemon's positive absence is separate.
+    /// Positive absence may fill missing authority. A current inventory read
+    /// never grants an unknown worker to the original Close.
     pub(in crate::app) fn shared_removal_terminal_basis(
         &mut self,
         card: CardId,
@@ -242,6 +242,82 @@ impl Cagents {
             })) => TerminalCleanupAuthority::Shared(terminal.clone()),
             _ => TerminalCleanupAuthority::Shared(None),
         }
+    }
+
+    /// Reattach an obsolete surface without granting its original Close any
+    /// authority over the successor. A newer surface is never replaced here.
+    pub(in crate::app) fn readmit_shared_terminal_after_source_refusal(
+        &mut self,
+        card: CardId,
+    ) -> Task<Message> {
+        let Some(Some(RemovalSource {
+            scope,
+            change:
+                Change::RemoveSource {
+                    registry,
+                    repository,
+                    before,
+                    terminal: Some(basis @ TerminalRemovalBasis::Worker { owner, instance }),
+                },
+        })) = self.shared_views.removals.get(&card)
+        else {
+            return Task::none();
+        };
+        let CardKind::Terminal(original) = &before.kind else {
+            return Task::none();
+        };
+        if self.pane_transfer_pending(card) || self.terminal_start_in_flight(card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Terminal(surface)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        if surface.execution_instance() != Some(*instance)
+            || surface.host_proof().as_ref() != Some(owner)
+        {
+            return Task::none();
+        }
+        let mut owners = self.workspace_model.views.iter().filter_map(|view| {
+            view.panes
+                .iter()
+                .find(|pane| pane.id == card)
+                .map(|pane| (&view.scope, pane))
+        });
+        let Some((current_scope, canonical)) = owners.next() else {
+            return Task::none();
+        };
+        if owners.next().is_some() || current_scope != scope || canonical.pending_terminal_start {
+            return Task::none();
+        }
+        let CardKind::Terminal(current) = &canonical.kind else {
+            return Task::none();
+        };
+        if current.id != original.id
+            || !self.card_state(card).is_some_and(|card| {
+                card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Terminal(local) if local.id == current.id)
+            })
+        {
+            return Task::none();
+        }
+        let current_basis = Change::RemoveSource {
+            registry: *registry,
+            repository: repository.clone(),
+            before: canonical.clone(),
+            terminal: Some(basis.clone()),
+        };
+        if !views::removal_source_current(&self.workspace_model, current_scope, &current_basis) {
+            return Task::none();
+        }
+        let terminal = original.id;
+        let kind = canonical.kind.clone();
+        self.card_state_mut(card).unwrap().kind = kind;
+        self.saved_terminals.entries.remove(&card);
+        self.shared_views.attached.insert(card);
+        self.terminal_recovery_attempts.remove(&terminal);
+        let exposure = self.exposure(card);
+        self.readmit_held_terminal(card, exposure);
+        self.lifecycle_sweep()
     }
 
     pub(in crate::app) fn shared_removal_ready(&mut self, card: CardId) -> bool {
