@@ -33,6 +33,20 @@ x,y,w,h=max(found,key=lambda row:row[1]); print(f"{right-26},{y+h//2}")' "${SCEN
 open_spawn() {
     evidence drive click "$(open_point)"
 }
+assert_agent_focus() {
+    evidence env python3 - "$1" <<'CHECK'
+import os, sqlite3, sys
+from pathlib import Path
+fixture = Path(os.environ['CAGENTS_EVIDENCE_FIXTURE']).resolve()
+root = Path(os.environ['XDG_DATA_HOME']).resolve() / 'cagents-development'
+assert root.is_relative_to(fixture), 'focus checks require the private fixture'
+model = sqlite3.connect(f'file:{root / "workspace-model.sqlite3"}?mode=ro', uri=True)
+window = sqlite3.connect(f'file:{root / "sessions.sqlite3"}?mode=ro', uri=True)
+agent = model.execute("SELECT id FROM agents WHERE json_extract(record, '$.name')=? ORDER BY rowid DESC LIMIT 1", (sys.argv[1],)).fetchone()
+focus = [row[0] for row in window.execute('SELECT focused_card_id FROM workspaces')]
+assert agent and agent[0] in focus, (sys.argv[1], 'did not receive keyboard activation', focus)
+CHECK
+}
 evidence cli project open "$fx/project"
 evidence cli project open "$fx/casmi"
 channel=$(evidence cli --json channel spawn --repository "$fx/project" --title 'Backoff implementation' | jq -er '.data.channel.id')
@@ -89,6 +103,9 @@ if [ "$SIDE" = after ] || [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
     fi
     sleep 3
     evidence drive observe
+    if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+        assert_agent_focus reviewer
+    fi
     shot same-project-opened
 fi
 if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
