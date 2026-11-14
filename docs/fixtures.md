@@ -332,8 +332,11 @@ contains two invented results. It captures collapsed and expanded rows at the
 550px docked chat width. No web request is sent.
 
 Keep the native window at 1200x900: below the docked inspector's minimum
-workspace width it becomes an overlay that hides the transcript. Run each core mode once, in order. Ancillary modes use separate named
-workspaces and need no initial 600-second reasoning actor or close request. For a remote `pair`, its steps file contains:
+workspace width it becomes an overlay that hides the transcript. Run `wide`
+then `narrow` once per session. The ancillary modes `web`, `coordination` and
+`diagnostics` each use a separate named workspace and can run independently;
+they need no core reasoning actor or close request. For a remote `pair`, its
+steps file contains:
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
@@ -341,8 +344,9 @@ CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" web
 ```
 
-For the neighboring disclosure controls, run `web`, `coordination`, then
-`diagnostics` in that same session or in a fresh ancillary-only session. The first atomically stages
+For the neighboring disclosure controls, run `coordination` and `diagnostics`
+in that same session or in a fresh ancillary-only session. `coordination`
+atomically stages
 [`coordination.jsonl`](../tests/fixtures/reasoning-row-scene/coordination.jsonl)
 and starts another offline Claude conversation. It captures folded cards, the
 full Agent prompt, raw tool call, full SendMessage body and delivered report.
@@ -353,12 +357,20 @@ Copy action is checked against its final `REPORT_END` paragraph where that
 control exists. The diagnostic mode switches the offline Codex peer to
 `fixture-row-diagnostics`, emitting an original root error followed by a failed
 turn. It captures Details closed/open and checks Copy details through the
-nested compositor's private clipboard. Neither mode reaches the host clipboard.
+nested compositor's private clipboard, leaving Details open for live review.
+Neither mode reaches the host clipboard.
+
+The OCR locator joins adjacent spans on the same visual line, so split control
+labels and end markers still identify the intended row. Repeated outer/nested
+rows keep distinct indices, and separate panes are never joined. Run its
+source contracts with
+`python3 -I tests/fixtures/reasoning-row-scene/test_locate.py`.
 
 All provider settings and transcripts stay inside the task's private fixture;
 no live model, provider account or real provider home is used. Stop afterward:
-the final thought deliberately stays active for 600 seconds. Run the ancillary scenes separately when a longer live review is needed. The background
-command is a recorded protocol acknowledgement, not a sleeping process.
+the final thought deliberately stays active for 600 seconds. Run the ancillary
+scenes separately when a longer live review is needed. The background command
+is a recorded protocol acknowledgement, not a sleeping process.
 `--ui-trace` retains UI-thread summaries and calls over 50ms. Compare these and
 bounded CPU/RSS samples during the same captures, and exercise hover/scroll
 while the latest-line delta arrives. This short fixture has one working

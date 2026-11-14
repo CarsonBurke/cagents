@@ -26,6 +26,8 @@ set -euo pipefail
 
 scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics}
 case "$scene" in wide|narrow|web|coordination|diagnostics) ;; *) exit 2 ;; esac
+transcript_right=810
+if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a ready native-evidence task}"
@@ -76,19 +78,8 @@ expanded_shot() {
 # OCR references are derived again after every disclosure or scroll, since
 # native layout can move the header. Overlapping OCR runs on one line count once.
 locate_row() {
-    evidence drive --json observe | /usr/bin/python3 -c '
-import json,re,sys
-pattern=re.compile(sys.argv[1],re.I);index=int(sys.argv[2])
-runs=sorted((r for r in json.load(sys.stdin)["runs"]
-             if 270 <= r["x"] < 810 and 55 < r["y"] < 780 and (pattern.search(r["text"]) or pattern.search(re.sub(r"^[^A-Za-z0-9]+", "", r["text"])))),
-            key=lambda r:(r["y"],r["x"]))
-rows=[]
-for r in runs:
-    if not rows or r["y"]-rows[-1]["y"]>8: rows.append(r)
-if len(rows)<=index: raise SystemExit(1)
-r=rows[index]
-print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
-' "$1" "${2:-0}"
+    evidence drive --json observe |
+        /usr/bin/python3 "$here/reasoning-row-scene/locate.py" "$1" "${2:-0}" "$transcript_right"
 }
 
 scroll_top() {
@@ -253,10 +244,10 @@ if [ "$scene" = coordination ]; then
     evidence drive wait ready --timeout 10 >/dev/null
     scroll_top
     shot rows-coordination-folded
-    click_row 'full prompt'
-    find_row 'PROMPT_END|invented' >/dev/null
+    click_row '^Show full prompt\b'
+    find_row 'PROMPT[ _]?END\b|invented' >/dev/null
     shot rows-coordination-prompt-expanded
-    click_row '\bless\b'
+    click_row '^Show less\b'
     scroll_top
     click_row '^Show tool call\b'
     find_row '^Input$' >/dev/null
@@ -264,10 +255,10 @@ if [ "$scene" = coordination ]; then
     # The raw input retains its own hover Copy action. The reviewer also
     # exercises it and Transcript in the live native handoff.
     click_row '^Hide tool call\b'
-    click_row 'full message'
-    find_row 'MESSAGE_END|concise report' >/dev/null
+    click_row '^Show full message\b'
+    find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
     shot rows-coordination-message-expanded
-    click_row '\bless\b'
+    click_row '^Show less\b'
     scroll_bottom
     if text_visible '^Details$'; then
         # The baseline keeps a plain heading and separate Details button.
@@ -277,7 +268,7 @@ if [ "$scene" = coordination ]; then
         # the stable title; verify the original full body below.
         click_row 'Agent.*Review fixture'
     fi
-    find_row 'REPORT_END|synthetic evidence' >/dev/null
+    find_row 'REPORT[ _]?END\b|synthetic evidence' >/dev/null
     shot rows-report-expanded
     if text_visible '^Copy report$'; then
         click_row '\bCopy\b'
@@ -339,7 +330,7 @@ if [ "$scene" = narrow ]; then
     expanded_shot reasoning-narrow-expanded
     tools_details narrow-
     touch "$narrow_done"
-    printf '%s\n' 'Captured narrow reasoning, tools and outcomes; web may run next.'
+    printf '%s\n' 'Captured narrow reasoning and mixed tools; web may run next.'
     exit 0
 fi
 
