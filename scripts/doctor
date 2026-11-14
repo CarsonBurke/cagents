@@ -109,7 +109,12 @@ def check_rust(report):
 
 def check_zig(report):
     pinned = tomllib.loads((ROOT / "mise.toml").read_text())["tools"]["zig"]
-    found = output(["zig", "version"])
+    # scripts/run-development builds with CAGENTS_ZIG when it is set.
+    zig = os.environ.get("CAGENTS_ZIG") or "zig"
+    found = output([zig, "version"])
+    if found is None and zig != "zig":
+        report.fail("zig", f"CAGENTS_ZIG={zig} does not run; point it at Zig {pinned} or unset it")
+        return
     if found is None:
         report.fail("zig", f"not found; run `mise run setup` for Zig {pinned}, or install it on PATH")
     elif found != pinned:

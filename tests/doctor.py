@@ -120,6 +120,18 @@ class Doctor(unittest.TestCase):
                 self.assertIn(message, result.stdout)
                 (self.bin / name).write_text(original)
 
+    def test_an_explicit_zig_is_the_one_checked(self):
+        explicit = self.root / "zig-explicit"
+        explicit.write_text("#!/bin/sh\necho 0.15.2\n")
+        explicit.chmod(0o755)
+        (self.bin / "zig").unlink()
+        result = self.doctor(environment={"CAGENTS_ZIG": str(explicit)})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ok   zig: 0.15.2", result.stdout)
+        result = self.doctor(environment={"CAGENTS_ZIG": str(self.root / "missing")})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL zig: CAGENTS_ZIG=", result.stdout)
+
     def test_a_missing_tool_is_named_rather_than_raised(self):
         for name, message in (("zig", "FAIL zig: not found"), ("rustup", "FAIL rust: rustup not found"),
                               ("git", "FAIL git: not found")):
