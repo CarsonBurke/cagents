@@ -1421,10 +1421,12 @@ mod tests {
             QueuedCardClose {
                 card: moving,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: next,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1450,10 +1452,12 @@ mod tests {
             QueuedCardClose {
                 card: turn,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: behind,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1480,10 +1484,12 @@ mod tests {
             QueuedCardClose {
                 card: turn,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: behind,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1622,6 +1628,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: behind,
             unasked: false,
+            preserve_source: false,
         });
         app.device_ui.open = true;
         drop(app.next_queued_card_close());
@@ -1750,6 +1757,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: behind,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.update(Message::CloseCard(first)));
         assert!(app.dirty_repository_close.is_some());
@@ -1778,6 +1786,7 @@ mod tests {
             app.queued_card_closes.push_back(QueuedCardClose {
                 card,
                 unasked: true,
+                preserve_source: false,
             });
         }
         drop(app.next_queued_card_close());
@@ -1808,11 +1817,13 @@ mod tests {
             app.queued_card_closes.push_back(QueuedCardClose {
                 card,
                 unasked: true,
+                preserve_source: false,
             });
         }
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.next_queued_card_close());
         assert!(app.pane_close_owned(next));
@@ -1841,6 +1852,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.next_queued_card_close());
         assert_eq!(app.queued_card_closes.len(), 1);
@@ -1859,6 +1871,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.request_card_removal(unknown));
         assert!(!app.closed_terminal_cards.contains(&unknown));
@@ -1874,6 +1887,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.completed_terminal_closed(
             first,
@@ -1890,6 +1904,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.completed_terminal_closed(first, current, Err("daemon went away".into())));
         assert!(app.card_state(first).unwrap().existence.is_open());
@@ -1906,6 +1921,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         // Nothing reserved this removal, so the workspace turns it down.
         drop(app.update(Message::CommitClose(first)));
@@ -1978,6 +1994,7 @@ mod tests {
         let queued_intent = QueuedCardClose {
             card: queued,
             unasked: true,
+            preserve_source: false,
         };
         assert_eq!(app.queued_card_closes.front(), Some(&queued_intent));
         // Both clicks were taken, and neither pane has a dialog to say so.
@@ -2406,6 +2423,7 @@ mod tests {
             Some(QueuedCardClose {
                 card: login,
                 unasked: true,
+                preserve_source: false,
             }),
             "a later explicit cancellation upgrades a queued ordinary close"
         );
