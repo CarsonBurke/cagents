@@ -2216,12 +2216,11 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = model_with_empty_channel(home);
         app.workspace_model.sequence = 8;
-        let (_, projection) =
-            app.apply_workspace_model_update_projection(ModelUpdate::Changed {
-                sequence: 10,
-                edit: ModelEdit::ChannelWorkChanged { home },
-                changes: Default::default(),
-            });
+        let (_, projection) = app.apply_workspace_model_update_projection(ModelUpdate::Changed {
+            sequence: 10,
+            edit: ModelEdit::ChannelWorkChanged { home },
+            changes: Default::default(),
+        });
         assert!(
             matches!(projection, super::super::Projection::Unchanged),
             "channel work is not shown, so its invalidation projects nothing"
