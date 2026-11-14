@@ -942,7 +942,11 @@ impl Runtime {
             )
             .into()
         } else {
-            widget::Space::with_width(design::COMPACT_ICON_SIZE as f32 + 2.0 * step::GAP_S).into()
+            widget::Space::new()
+                .width(Length::Fixed(
+                    design::COMPACT_ICON_SIZE as f32 + 2.0 * step::GAP_S,
+                ))
+                .into()
         };
         heading.push(open);
         let mut rows = vec![

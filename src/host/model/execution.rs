@@ -5892,7 +5892,9 @@ mod tests {
                 labels: expected,
             }
         );
-        registry.interrupt_unproven_agent_runs(3).unwrap();
+        for run in registry.unfinished_agent_runs(accepted.agent.id).unwrap() {
+            registry.cancel_agent_run_at_close(&run, 3).unwrap();
+        }
         registry
             .close_agent(&Origin::User, accepted.agent.id)
             .unwrap();
