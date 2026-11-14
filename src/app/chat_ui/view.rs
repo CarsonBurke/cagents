@@ -5495,7 +5495,7 @@ impl Runtime {
             if long {
                 widget::column::with_children(vec![
                     text,
-                    disclosure::row_on(
+                    disclosure::row(
                         if expanded { "Show less" } else { "Show more" }.into(),
                         if expanded { "Show less" } else { "Show more" }.into(),
                         Icon::Chat,
@@ -5503,7 +5503,6 @@ impl Runtime {
                         None,
                         Some(expanded),
                         Some(Action::Toggle(self.target, item.id.clone())),
-                        design::accent_wash,
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -5796,7 +5795,7 @@ impl Runtime {
                 "Thinking".to_owned()
             };
             let name = format!("Reasoning: {label}");
-            let header = disclosure::row_on(
+            let header = disclosure::row(
                 label,
                 name,
                 Icon::Agent,
@@ -5804,13 +5803,6 @@ impl Runtime {
                 elapsed,
                 has_text.then_some(expanded),
                 has_text.then(|| Action::Toggle(target, item.id.clone())),
-                move |theme| {
-                    if expanded {
-                        design::sunken(theme)
-                    } else {
-                        theme.current_container().base.into()
-                    }
-                },
             );
             let mut rows = vec![header];
             if expanded {

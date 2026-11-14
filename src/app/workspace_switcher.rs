@@ -110,31 +110,9 @@ fn age(seconds: u64) -> String {
     }
 }
 
-/// `over` painted on `under`, for a fade that must end in the exact colour
-/// behind it.
-fn composite(under: iced::Color, over: iced::Color) -> iced::Color {
-    let alpha = over.a;
-    iced::Color {
-        r: under.r * (1.0 - alpha) + over.r * alpha,
-        g: under.g * (1.0 - alpha) + over.g * alpha,
-        b: under.b * (1.0 - alpha) + over.b * alpha,
-        a: under.a.max(alpha),
-    }
-}
-
-/// The panel's background, which a row's text fades into.
+/// The panel's background, which the scrolled list and the footer fade into.
 fn panel_color(theme: &Theme) -> iced::Color {
     theme.current_container().component.base.into()
-}
-
-fn row_color(theme: &Theme, selected: bool) -> iced::Color {
-    let component = &theme.current_container().component;
-    let base = component.base.into();
-    if selected {
-        composite(base, component.selected_state_color().into())
-    } else {
-        base
-    }
 }
 
 /// A hairline between the panel's parts.
@@ -977,16 +955,13 @@ impl Cagents {
             },
             sidebar::project_chip,
         );
-        let fade = move |theme: &Theme| row_color(theme, selected);
         let text = widget::column::with_children(vec![
-            crate::interaction::fade_overflow(
-                design::body(row.name.as_str()).wrapping(iced::widget::text::Wrapping::None),
-                fade,
-            ),
-            crate::interaction::fade_overflow(
-                design::caption(row.place.as_str()).wrapping(iced::widget::text::Wrapping::None),
-                fade,
-            ),
+            crate::ui_controls::fade_text(row.name.as_str())
+                .width(Length::Fill)
+                .into(),
+            crate::ui_controls::FadeText::caption(row.place.as_str())
+                .width(Length::Fill)
+                .into(),
         ])
         .spacing(space::XXS)
         .width(Length::Fill);
@@ -1075,19 +1050,16 @@ impl Cagents {
         let header = widget::row::with_children(vec![
             project.map_or_else(|| iced::widget::Space::new().into(), sidebar::project_chip),
             widget::column::with_children(vec![
-                crate::interaction::fade_overflow(
-                    design::title(row.name.as_str()).wrapping(iced::widget::text::Wrapping::None),
-                    panel_color,
-                ),
-                crate::interaction::fade_overflow(
-                    design::caption(if attention.is_empty() {
-                        row.place.clone()
-                    } else {
-                        format!("{} · {attention}", row.place)
-                    })
-                    .wrapping(iced::widget::text::Wrapping::None),
-                    panel_color,
-                ),
+                crate::ui_controls::FadeText::title(row.name.as_str())
+                    .width(Length::Fill)
+                    .into(),
+                crate::ui_controls::FadeText::caption(if attention.is_empty() {
+                    row.place.clone()
+                } else {
+                    format!("{} · {attention}", row.place)
+                })
+                .width(Length::Fill)
+                .into(),
             ])
             .width(Length::Fill)
             .into(),
@@ -1199,15 +1171,17 @@ impl Cagents {
                 .map(|chrome| chrome.caption.clone())
                 .or_else(|| state.map(|state| card_kind_caption(&state.kind).into_owned()))
         });
-        let mut text = vec![crate::interaction::fade_overflow(
-            design::body(title).wrapping(iced::widget::text::Wrapping::None),
-            panel_color,
-        )];
+        let mut text = vec![
+            crate::ui_controls::fade_text(title)
+                .width(Length::Fill)
+                .into(),
+        ];
         if let Some(caption) = caption.filter(|caption| !caption.is_empty()) {
-            text.push(crate::interaction::fade_overflow(
-                design::caption(caption).wrapping(iced::widget::text::Wrapping::None),
-                panel_color,
-            ));
+            text.push(
+                crate::ui_controls::FadeText::caption(caption)
+                    .width(Length::Fill)
+                    .into(),
+            );
         }
         let mut row = vec![
             self.card_icon(card)
