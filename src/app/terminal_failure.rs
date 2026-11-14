@@ -341,7 +341,11 @@ impl Cagents {
         } else {
             Details::capture(session, Some(self.residency(card)))
         };
-        if self.completed_terminal_has_native_owner(card) {
+        if self.pending_terminal_reservation(card).is_some() {
+            // Retry completes the accepted start, reusing its worker when it
+            // exists. A pending recipe is not a fresh relaunch instruction.
+            details.consequence = "Retry to reconnect or start it again.";
+        } else if self.completed_terminal_has_native_owner(card) {
             details.consequence = "Open the existing conversation in the chat view.";
         }
         // An explicitly filed card can name its known worktree. A launch
@@ -807,6 +811,22 @@ mod tests {
         );
         (app, card, session)
     }
+    #[test]
+    fn pending_start_failure_does_not_promise_a_fresh_terminal() {
+        let (mut app, card, _) = app_and_session();
+        let mut pane =
+            crate::workspace_model::views::Pane::from_card(app.card_state(card).unwrap(), None)
+                .unwrap();
+        pane.pending_terminal_start = true;
+        let mut view = crate::workspace_model::views::View::empty(crate::model::ChannelId::new());
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        app.fail_runtime(card, "completion save refused".into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.consequence, "Retry to reconnect or start it again.");
+        assert!(!details.copy_text().contains("new terminal"));
+    }
+
     #[test]
     fn diagnostics_copy_uses_known_fields_and_never_raw_errors_or_launch_secrets() {
         let (_, _, mut session) = app_and_session();
