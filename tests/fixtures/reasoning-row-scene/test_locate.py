@@ -31,6 +31,19 @@ class Locator(unittest.TestCase):
         with self.assertRaises(ValueError):
             locator.locate(runs, "Searched", 2)
 
+    def test_notice_identity_survives_icon_noise_and_filename_punctuation(self):
+        # These overlapping title spans came from the native notice row.
+        title = [run("@ Check", 282, 300, 48), run("< k-pool result", 330, 302, 78)]
+        self.assertEqual(locator.locate(title, r"\bpool result\b"), (345, 308))
+        # The body wait needs its distinguishing word, not OCR's treatment of
+        # punctuation. Keep accepting either a single filename or split spans.
+        for body in ([run("summary.txt", 285, 345, 80)],
+                     [run("summary.", 285, 345, 55), run("txt", 344, 345, 20)]):
+            with self.subTest(body=body):
+                point = locator.locate(body, r"\bsummary\b")
+                self.assertTrue(285 <= point[0] <= 365)
+                self.assertEqual(point[1], 352)
+
     def test_different_panes_and_lines_do_not_form_a_control(self):
         for runs in ([run("Show full", 300, 150), run("prompt", 590, 150)],
                      [run("Show full", 300, 150), run("prompt", 300, 175)]):

@@ -275,10 +275,12 @@ if [ "$scene" = refresh-notices ]; then
     align_row 'Wait for k.?gather'
     shot refresh-notices-collapsed
     click_row 'Wait for k.?gather'
-    click_row 'Check k.?pool'
-    find_row 'summary.txt' >/dev/null
+    # Native OCR can mix the leading icon into "Check" and separate filename
+    # punctuation. Match the distinguishing words inside the title and body.
+    click_row '\bpool result\b'
+    find_row '\bsummary\b' >/dev/null
     shot refresh-command-notices-expanded
-    click_row 'Check k.?pool'
+    click_row '\bpool result\b'
     click_row 'Wait for k.?gather'
     align_row 'casmi GPU jobs finishing'
     click_row 'casmi GPU jobs finishing'

@@ -330,11 +330,23 @@ notification is recorded input: no command, child agent or monitor executes,
 and no live provider is contacted.
 All provider files stay under the evidence task's private home.
 
-Allow about three minutes for the seven captures, then reserve three minutes
-for live review. Check whole-row targets, keyboard disclosure retention,
+Allow about five minutes for the seven captures, then reserve three minutes
+for live review. Hand the session to the reviewer by six minutes even if a
+locator needs manual completion. Check whole-row targets, keyboard disclosure
+retention,
 hover/fade continuity and wheel scrolling before stopping. Keep bounded
 CPU/RSS samples and the task's UI trace; this fixture has one working actor,
 one finished actor and an unsent draft, not a large concurrent workload.
+
+If Before filters empty reasoning, its failed command shares the preceding
+mixed step group; After keeps a separate group boundary. The expanded outcome
+screens then show different surrounding disclosures and should be labeled as
+supplementary states, not presented as a matched pair. The other six states
+still provide matching comparisons. During the refreshed native run, the
+notice title's leading icon contaminated its OCR spans, and an exact filename
+wait failed despite the command being visible. The locators now use the
+distinguishing interior words `pool result` and `summary`; the latter does not
+depend on how OCR splits filename punctuation.
 
 Run `wide`, `narrow`, then `web` in the same 1200x900 session on each side:
 
