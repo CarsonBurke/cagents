@@ -1,4 +1,4 @@
-//! One coalescing semantic-outcome broker for all helper-owned actors. Provider
+//! One coalescing persistence broker for all helper-owned actors. Provider
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
@@ -361,8 +361,95 @@ impl AnswerSync {
     }
 }
 
+/// Persist only the helper's exact confirmed projection. Keep the resident
+/// launch alias unchanged so concurrent controls retain their original process
+/// fences. Failed writes stay on the broker's retry set, without a UI client.
+fn persist_confirmed_identity(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+) -> Result<(), String> {
+    if target.handle.is_close_only() {
+        return Ok(());
+    }
+    let Some(confirmed) = target.handle.confirmed_session_id() else {
+        return Ok(());
+    };
+    let (ownership, bound) = {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            registry.native_actor_ownership(target.identity.instance)?,
+            registry
+                .agent_for_session(target.source.id)?
+                .and_then(|agent| agent.session),
+        )
+    };
+    // Cleanup intent can report attention without installed writer authority.
+    // Keep its existing semantic drain; it cannot publish a new identity.
+    let Some(ownership) = ownership.filter(|owner| !owner.is_pending()) else {
+        return Ok(());
+    };
+    if ownership.source().launch.session_id.as_deref() == Some(confirmed.as_str())
+        && bound.as_ref().is_none_or(|session| {
+            matches!(session,
+            crate::agent_execution::HostedSession::Chat(source)
+                if source.launch.session_id.as_deref() == Some(confirmed.as_str()))
+        })
+    {
+        return Ok(());
+    }
+    let owner = ExecutionOwner::authenticate(
+        Some(ownership),
+        &target.identity,
+        &target.source,
+        target.handle.launch_account_scope(),
+        |sources| target.handle.recognize_retained_sources(sources),
+    )?;
+    let mut projected = target.source.clone();
+    projected.launch.session_id = Some(confirmed);
+    target
+        .handle
+        .recognize_retained_sources(std::slice::from_ref(&projected))?;
+    target.require_current(host)?;
+    let mut aliases = vec![owner.0.source().clone(), target.source.clone()];
+    // A startup reply may have bound an earlier issued conversation after the
+    // census advanced. Authenticate that durable alias too before replacing it.
+    if let Some(crate::agent_execution::HostedSession::Chat(bound)) = bound
+        && !aliases.contains(&bound)
+    {
+        target
+            .handle
+            .recognize_retained_sources(std::slice::from_ref(&bound))?;
+        aliases.push(bound);
+    }
+    let aliases = aliases
+        .into_iter()
+        .map(crate::agent_execution::HostedSession::Chat)
+        .collect::<Vec<_>>();
+    let (changed, registered) = {
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        require_execution_owner(&registry, Some(&owner), true)?;
+        let changed = registry.adopt_authenticated_agent_session(
+            &aliases,
+            &crate::agent_execution::HostedSession::Chat(projected.clone()),
+        )?;
+        let registered = registry.register_native_actor_ownership(
+            target.identity.instance,
+            &target.identity.record,
+            &projected,
+            target.handle.launch_account_scope(),
+        );
+        (changed, registered)
+    };
+    // Adoption may have committed even if census publication needs retry.
+    if changed {
+        super::super::agent_execution::announce(host, registry);
+    }
+    registered
+}
+
 fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
-    let (handle, source, identity, notifications) = {
+    let target = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state.chats.get(&id) else {
             return Ok(false);
@@ -370,24 +457,31 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         let Some(identity) = record.handle.actor_identity() else {
             return Ok(false);
         };
-        (
-            record.handle.clone(),
-            record.session.clone(),
+        SemanticTarget {
+            handle: record.handle.clone(),
+            source: record.session.clone(),
             identity,
-            state.notifications.clone(),
-        )
+            notifications: state.notifications.clone(),
+        }
     };
     let registry = super::super::agent_execution::registry(host)?;
     let mut execution_owner = None;
-    handle.refresh_retained_state()?;
+    target.handle.refresh_retained_state()?;
+    persist_confirmed_identity(host, &target, &registry)?;
+    let SemanticTarget {
+        handle,
+        source,
+        identity,
+        ..
+    } = &target;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let execution = !loss.affected_runs.is_empty();
         let owner = capture_execution_owner(
             &registry,
-            &handle,
-            &identity,
-            &source,
+            handle,
+            identity,
+            source,
             execution,
             &mut execution_owner,
         )?;
@@ -397,7 +491,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             registry.commit_native_actor_loss(
                 identity.instance,
                 &identity.record,
-                &source,
+                source,
                 &loss.affected_runs,
                 &loss.reason,
                 chat::now_ms().unwrap_or(0),
@@ -412,9 +506,9 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             .chats
             .get(&id)
             .is_some_and(|record| {
-                record.handle.same_attachment(&handle)
+                record.handle.same_attachment(handle)
                     && record.execution_instance == identity.instance
-                    && record.session == source
+                    && record.session == *source
             });
         if !current {
             return Err("Retained actor changed before continuity-loss acknowledgement".into());
@@ -425,12 +519,6 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     // cannot prove that a notification committed before a previous daemon died.
     let page = handle.uncommitted_outcomes()?;
     let more = !page.is_empty();
-    let target = SemanticTarget {
-        handle,
-        source,
-        identity,
-        notifications,
-    };
     let deadline = Instant::now() + Duration::from_secs(30);
     for entry in page {
         commit_semantic_entry(

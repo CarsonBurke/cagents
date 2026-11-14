@@ -1406,8 +1406,11 @@ impl RemoteActor {
             {
                 updates.push(Update::PromptAvailable);
             }
-            if (resident.outbox_latest > resident.outbox_ack
-                && resident.outbox_latest != state.outbox_latest)
+            // Conversation identity is durable daemon metadata even when no
+            // window subscribes and no semantic outcome accompanies it.
+            if identity_changed
+                || (resident.outbox_latest > resident.outbox_ack
+                    && resident.outbox_latest != state.outbox_latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -6398,6 +6401,29 @@ exec /bin/sleep 60
         assert_eq!(actor.state().native_continuity, installed.native_continuity);
         assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
+    #[test]
+    fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
+        let mut actor = RemoteActor::fixture();
+        let (sent, received) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            sent.send(update).unwrap();
+        });
+        let mut confirmed = actor.state().as_ref().clone();
+        confirmed.confirmed_session = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(confirmed.outbox_latest, confirmed.outbox_ack);
+        assert!(actor.publish_resident(confirmed.clone()));
+        assert!(
+            received
+                .try_iter()
+                .any(|update| matches!(update, Update::RetainedOutcomes))
+        );
+        assert!(actor.publish_resident(confirmed));
+        assert!(
+            received.try_iter().next().is_none(),
+            "unchanged metadata must not churn the broker"
+        );
+    }
+
     #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();

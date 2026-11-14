@@ -434,3 +434,177 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
     let live = directory(&host, &Authority::default(), Scope::All).unwrap();
     assert!(live.sessions.iter().all(|entry| entry.id != session.id));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
+    retained_identity_case(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn confirmed_identity_retries_after_census_publication_failure() {
+    retained_identity_case(true);
+}
+
+#[cfg(target_os = "linux")]
+fn retained_identity_case(fail_census: bool) {
+    if super::retained_automation::isolated_retained() {
+        return;
+    }
+    fn wait(mut condition: impl FnMut() -> bool, reason: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{reason}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let proof = host.lock().unwrap().proof().clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = crate::host::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    if fail_census {
+        db.execute_batch("CREATE TRIGGER reject_confirmed_census BEFORE UPDATE ON native_actor_ownerships WHEN json_extract(NEW.ownership, '$.source.launch.session_id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture census publication failure'); END;").unwrap();
+    }
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let store = registry(&host).unwrap();
+    wait(
+        || {
+            store
+                .lock()
+                .unwrap()
+                .agent(accepted.agent.id)
+                .unwrap()
+                .session
+                .is_some()
+        },
+        "agent never bound its provider",
+    );
+    let session = store
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap();
+    let id = session.id();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle
+        .actor_identity()
+        .expect("real retained Claude helper");
+    assert!(
+        host.lock().unwrap().chats[&id]
+            .subscribers
+            .iter()
+            .all(|(client, visible)| *client == EXECUTION_CLIENT && !visible),
+        "no window displayed this chat"
+    );
+    wait(
+        || handle.confirmed_session_id().is_some(),
+        "provider never confirmed its conversation",
+    );
+    let confirmed = handle.confirmed_session_id().unwrap();
+    save_claude_transcript(&host, id, root);
+    // Confirmation must be durable without any UI pane publication.
+    wait(
+        || {
+            let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+            matches!(agent.session, Some(HostedSession::Chat(saved)) if saved.launch.session_id.as_deref() == Some(confirmed.as_str()))
+        },
+        "daemon never persisted the confirmed conversation ID",
+    );
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    if fail_census {
+        let ownership = store
+            .lock()
+            .unwrap()
+            .native_actor_ownership(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ownership.source().launch.session_id,
+            None,
+            "the injected census write must fail after agent adoption"
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .agent_run(accepted.run.id)
+                .unwrap()
+                .state
+                .is_terminal(),
+            "uncommitted identity must not acknowledge the run outcome"
+        );
+        db.execute_batch("DROP TRIGGER reject_confirmed_census;")
+            .unwrap();
+    }
+    wait(
+        || {
+            store
+                .lock()
+                .unwrap()
+                .native_actor_ownership(identity.instance)
+                .unwrap()
+                .unwrap()
+                .source()
+                .launch
+                .session_id
+                .as_deref()
+                == Some(confirmed.as_str())
+        },
+        "confirmed census publication was not retried",
+    );
+    let ownership = store
+        .lock()
+        .unwrap()
+        .native_actor_ownership(identity.instance)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ownership.owner(), &identity.record);
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let pane_id = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
+    let (descriptor, provider_session): (String, Option<String>) = db
+        .query_row(
+            "SELECT descriptor, provider_session FROM panes WHERE id=?1",
+            [pane_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let crate::model::CardKind::Chat(pane) = serde_json::from_str(&descriptor).unwrap() else {
+        panic!("saved chat pane");
+    };
+    assert_eq!(pane.launch.session_id.as_deref(), Some(confirmed.as_str()));
+    assert_eq!(provider_session.as_deref(), Some(confirmed.as_str()));
+    // Use the daemon's real stop boundary, then reopen only its durable model.
+    crate::host::finish_chat_shutdown(&host).unwrap();
+    assert!(!handle.owns_work());
+    wait(
+        || !identity.record.root.is_current() && !identity.record.holder.is_current(),
+        "daemon stop left retained processes alive",
+    );
+    let mut restarted = HostState::new(proof);
+    restarted.install_model(Registry::at(&path).unwrap());
+    assert!(restarted.chats.is_empty());
+    let restarted = Arc::new(crate::host::state::HostLock::new(restarted));
+    for query_id in [id.to_string(), confirmed[..8].to_owned()] {
+        let page = read(
+            &restarted,
+            &Authority::default(),
+            query(&query_id, None, 10),
+        )
+        .unwrap();
+        assert!(page.session.exited);
+        assert!(
+            matches!(&page.entries.last().unwrap().content, Content::User(text) if text.text == "Now open a PR")
+        );
+    }
+}
