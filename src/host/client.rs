@@ -1337,6 +1337,9 @@ fn process_admitted_request(
                     crate::agent_execution::AcceptanceError::Invalid(message) => {
                         ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
                     }
+                    crate::agent_execution::AcceptanceError::StoreBusy(message) => {
+                        ProtocolError::new(ProtocolErrorCode::StoreBusy, message, true)
+                    }
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
                     }

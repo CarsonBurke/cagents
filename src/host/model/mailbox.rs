@@ -15,6 +15,17 @@ use rusqlite::{
     types::{ToSql, ToSqlOutput},
 };
 
+// Preserve SQLite's primary error class before its diagnostic becomes text.
+// Busy snapshots and shared-cache locks have extended codes in these classes.
+fn store_error(error: rusqlite::Error) -> AcceptanceError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            AcceptanceError::StoreBusy(error.to_string())
+        }
+        _ => AcceptanceError::Invalid(error.to_string()),
+    }
+}
+
 pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
 const _: () = assert!(
     const_str_eq(MESSAGE_RUN_KEY, "cagents-message:"),
@@ -253,7 +264,7 @@ fn select_messages(
     db: &Connection,
     recipient: Option<Lineage>,
     query: &Inbox,
-) -> Result<Vec<Message>, String> {
+) -> Result<Vec<Message>, AcceptanceError> {
     let recent = query.all && query.replies_to.is_none();
     let (filter, limit) = match (&query.replies_to, query.all) {
         (Some(_), _) => (
@@ -271,7 +282,7 @@ fn select_messages(
             "SELECT {COLUMNS} FROM messages WHERE recipient_lineage IS ?1 {filter}
              ORDER BY created_ms {order}, rowid {order} LIMIT ?3"
         ))
-        .map_err(|error| error.to_string())?;
+        .map_err(store_error)?;
     let rows = statement
         .query_map(
             params![
@@ -281,11 +292,11 @@ fn select_messages(
             ],
             message,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(store_error)?;
     let mut messages = Vec::new();
     let mut bytes = 0;
     for row in rows {
-        let message = row.map_err(|error| error.to_string())?;
+        let message = row.map_err(store_error)?;
         let size =
             postcard::experimental::serialized_size(&message).map_err(|error| error.to_string())?;
         if size > INBOX_MESSAGE_BYTES - bytes {
@@ -293,7 +304,8 @@ fn select_messages(
                 return Err(format!(
                     "Message {} cannot fit in an inbox reply; its state is unchanged",
                     message.id
-                ));
+                )
+                .into());
             }
             break;
         }
@@ -325,7 +337,10 @@ impl Registry {
     /// so each sender has its own allowance there and one cannot use up
     /// everyone's.
     pub(crate) fn post_message(&mut self, message: &Message) -> Result<(), AcceptanceError> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         let pending: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM messages
@@ -337,7 +352,7 @@ impl Registry {
                 ],
                 |row| row.get(0),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(store_error)?;
         if pending as usize >= MAX_PENDING {
             return Err(AcceptanceError::MailboxFull(match message.to.lineage {
                 Some(_) => format!(
@@ -349,6 +364,8 @@ impl Registry {
                 ),
             }));
         }
+        #[cfg(test)]
+        super::pause(super::Pause::MailboxRead);
         tx.execute(
             "INSERT INTO messages(id, sender_lineage, sender_session, sender_title,
                  recipient_lineage, reply_to, body, wait_until_ms, state, created_ms)
@@ -365,7 +382,7 @@ impl Registry {
                 message.created_ms as i64,
             ],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(store_error)?;
         if let Some(lineage) = message.to.lineage {
             tx.execute(
                 "INSERT INTO mailbox_attention_heads(lineage,message)
@@ -379,9 +396,9 @@ impl Registry {
                     message.created_ms as i64
                 ],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(store_error)?;
         }
-        tx.commit().map_err(|error| error.to_string().into())
+        tx.commit().map_err(store_error)
     }
 
     /// Actual unread recipients, including temporarily held replies. This
@@ -451,10 +468,10 @@ impl Registry {
         &self,
         recipient: Option<Lineage>,
         handle: &str,
-    ) -> Result<Message, String> {
+    ) -> Result<Message, AcceptanceError> {
         let handle = handle.to_ascii_lowercase();
         if !handle.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-            return Err(format!("No message {handle} was left for you"));
+            return Err(format!("No message {handle} was left for you").into());
         }
         let mut statement = self
             .db
@@ -463,17 +480,19 @@ impl Registry {
                  WHERE recipient_lineage IS ?1 AND substr(id, 1, length(?2)) = ?2
                  LIMIT 2"
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(store_error)?;
         let found: Vec<Message> = statement
             .query_map(params![Recipient(recipient), handle], message)
             .and_then(Iterator::collect)
-            .map_err(|error| error.to_string())?;
+            .map_err(store_error)?;
         match <[Message; 1]>::try_from(found) {
             Ok([message]) => Ok(message),
-            Err(found) if found.is_empty() => Err(format!("No message {handle} was left for you")),
-            Err(_) => Err(format!(
-                "Several messages begin with {handle}; give more of the ID"
-            )),
+            Err(found) if found.is_empty() => {
+                Err(format!("No message {handle} was left for you").into())
+            }
+            Err(_) => {
+                Err(format!("Several messages begin with {handle}; give more of the ID").into())
+            }
         }
     }
 
@@ -630,7 +649,7 @@ impl Registry {
         &self,
         recipient: Option<Lineage>,
         query: &Inbox,
-    ) -> Result<Vec<Message>, String> {
+    ) -> Result<Vec<Message>, AcceptanceError> {
         select_messages(&self.db, recipient, query)
     }
 
@@ -642,19 +661,24 @@ impl Registry {
         session: Option<TerminalId>,
         receipt: &Receipt,
         now: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), AcceptanceError> {
         receipt.validate()?;
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         for id in &receipt.ids {
             let foreign: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 AND recipient_lineage IS NOT ?2)",
                 params![id.to_string(), Recipient(recipient)],
                 |row| row.get(0),
-            ).map_err(|error| error.to_string())?;
+            ).map_err(store_error)?;
             if foreign {
                 return Err("A mailbox receipt may acknowledge only the caller's messages".into());
             }
         }
+        #[cfg(test)]
+        super::pause(super::Pause::MailboxRead);
         for id in &receipt.ids {
             tx.execute(
                 "UPDATE messages SET state = 'read', delivered_session = ?2, settled_ms = ?3
@@ -666,9 +690,9 @@ impl Registry {
                     Recipient(recipient)
                 ],
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(store_error)?;
         }
-        tx.commit().map_err(|error| error.to_string())
+        tx.commit().map_err(store_error)
     }
 
     /// The messages `recipient` asks for, oldest first. Those it had not yet
@@ -679,9 +703,14 @@ impl Registry {
         session: Option<TerminalId>,
         query: &Inbox,
         now: u64,
-    ) -> Result<Vec<Message>, String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+    ) -> Result<Vec<Message>, AcceptanceError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         let mut messages = select_messages(&tx, recipient, query)?;
+        #[cfg(test)]
+        super::pause(super::Pause::MailboxRead);
         for message in &mut messages {
             if message.state != State::Pending {
                 continue;
@@ -695,17 +724,20 @@ impl Registry {
                     now as i64
                 ],
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(store_error)?;
             message.state = State::Read;
             message.to.session = session;
         }
-        tx.commit().map_err(|error| error.to_string())?;
+        tx.commit().map_err(store_error)?;
         Ok(messages)
     }
 
     /// Forgets messages sent before `before`, whatever became of them.
     pub(crate) fn prune_messages(&mut self, before: u64) -> Result<usize, String> {
-        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let removed = tx
             .execute(
                 "DELETE FROM messages WHERE created_ms < ?1",
@@ -796,6 +828,200 @@ mod tests {
             },
         };
         crate::terminal::ipc::write_frame(&mut Vec::new(), &envelope).unwrap();
+    }
+
+    // The rival commits after the actual read on a deferred transaction. An
+    // immediate transaction must already own the writer reservation instead.
+    fn mailbox_read_reserves_writer(operation: impl FnOnce(&mut Registry, &Message)) {
+        use std::{cell::Cell, rc::Rc, time::Duration};
+        let (mut registry, _directory) = registry();
+        let entry = message(party(Lineage(TerminalId::new())), Party::user(), 1);
+        registry.post_message(&entry).unwrap();
+        let rival = Connection::open(&registry.path).unwrap();
+        rival.busy_timeout(Duration::ZERO).unwrap();
+        let committed = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&committed);
+        super::super::pause_at(super::super::Pause::MailboxRead, move || {
+            match rival.execute("UPDATE messages SET body = 'rival commit'", []) {
+                Ok(1) => observed.set(true),
+                Err(error) => assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                ),
+                result => panic!("unexpected rival result: {result:?}"),
+            }
+        });
+        operation(&mut registry, &entry);
+        assert!(
+            !committed.get(),
+            "another writer committed after the mailbox read"
+        );
+    }
+
+    #[test]
+    fn sqlite_contention_uses_primary_codes_instead_of_diagnostic_text() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("opaque diagnostic".into()),
+            );
+            assert!(
+                matches!(store_error(error), AcceptanceError::StoreBusy(message) if message == "opaque diagnostic")
+            );
+        }
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is locked".into()),
+        );
+        assert!(matches!(store_error(error), AcceptanceError::Invalid(_)));
+    }
+
+    #[test]
+    fn post_message_reserves_writer_before_read() {
+        mailbox_read_reserves_writer(|registry, entry| {
+            let next = message(entry.from.clone(), Party::user(), 2);
+            registry.post_message(&next).unwrap();
+            assert_eq!(registry.message(next.id).unwrap().unwrap().body, next.body);
+        });
+    }
+
+    #[test]
+    fn acknowledge_messages_reserves_writer_before_read() {
+        mailbox_read_reserves_writer(|registry, entry| {
+            registry
+                .acknowledge_messages(
+                    None,
+                    None,
+                    &Receipt {
+                        ids: vec![entry.id],
+                    },
+                    2,
+                )
+                .unwrap();
+            assert_eq!(
+                registry.message(entry.id).unwrap().unwrap().state,
+                State::Read
+            );
+        });
+    }
+
+    #[test]
+    fn read_messages_reserves_writer_before_read() {
+        mailbox_read_reserves_writer(|registry, entry| {
+            let messages = registry
+                .read_messages(
+                    None,
+                    None,
+                    &Inbox {
+                        all: false,
+                        replies_to: None,
+                    },
+                    2,
+                )
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, entry.id);
+            assert_eq!(messages[0].state, State::Read);
+        });
+    }
+
+    #[test]
+    fn mailbox_writes_wait_for_contending_writer_and_succeed() {
+        use std::{sync::mpsc, time::Duration};
+        for operation in ["post", "acknowledge", "read", "prune"] {
+            let (mut registry, _directory) = registry();
+            let entry = message(party(Lineage(TerminalId::new())), Party::user(), 1);
+            registry.post_message(&entry).unwrap();
+            let mut rival = Connection::open(&registry.path).unwrap();
+            let tx = rival
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE messages SET body = 'committed before mailbox write'",
+                [],
+            )
+            .unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = match operation {
+                    "post" => registry
+                        .post_message(&message(entry.from.clone(), Party::user(), 2))
+                        .map_err(|e| e.to_string()),
+                    "acknowledge" => registry
+                        .acknowledge_messages(
+                            None,
+                            None,
+                            &Receipt {
+                                ids: vec![entry.id],
+                            },
+                            2,
+                        )
+                        .map_err(|e| e.to_string()),
+                    "read" => registry
+                        .read_messages(
+                            None,
+                            None,
+                            &Inbox {
+                                all: false,
+                                replies_to: None,
+                            },
+                            2,
+                        )
+                        .map(|messages| {
+                            assert_eq!(messages[0].body, "committed before mailbox write");
+                            assert_eq!(messages[0].state, State::Read);
+                        })
+                        .map_err(|e| e.to_string()),
+                    "prune" => registry
+                        .prune_messages(2)
+                        .map(|removed| assert_eq!(removed, 1)),
+                    _ => unreachable!(),
+                };
+                done_tx.send(result).unwrap();
+                registry
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let premature = done_rx.recv_timeout(Duration::from_millis(100));
+            // Always release and join, including when the regression fails.
+            tx.commit().unwrap();
+            let registry = worker.join().unwrap();
+            assert!(
+                matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+                "{operation} failed instead of waiting: {premature:?}"
+            );
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            match operation {
+                "post" => assert_eq!(
+                    registry
+                        .peek_messages(
+                            None,
+                            &Inbox {
+                                all: false,
+                                replies_to: None
+                            }
+                        )
+                        .unwrap()
+                        .len(),
+                    2
+                ),
+                "acknowledge" | "read" => assert_eq!(
+                    registry.message(entry.id).unwrap().unwrap().state,
+                    State::Read
+                ),
+                "prune" => assert!(registry.message(entry.id).unwrap().is_none()),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -1272,6 +1498,7 @@ mod tests {
             registry
                 .peek_messages(None, &query)
                 .unwrap_err()
+                .to_string()
                 .contains("state is unchanged")
         );
         assert!(registry.read_messages(None, None, &query, 1).is_err());
