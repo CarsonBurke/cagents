@@ -4772,8 +4772,9 @@ fn start_terminal_view_owned_reserved(
         .as_ref()
         .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
     let reservation = pending_reservation.map(|reservation| {
-        reservation.current_revision(pending_registry.as_deref().expect("pending writer"))?;
-        Ok(reservation)
+        reservation
+            .current_revision(pending_registry.as_deref().expect("pending writer"))
+            .map(|_| reservation)
     });
     let descriptor = {
         let mut state = shared
