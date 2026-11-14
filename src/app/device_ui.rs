@@ -24,6 +24,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::SearchChanged(_)
             | SidebarAction::SetFilter(_)
             | SidebarAction::HideReadAttention
+            | SidebarAction::ToggleInProgress
             | SidebarAction::ToggleControls
             | SidebarAction::OpenFirstSearchResult
             | SidebarAction::FocusFirstSearchResult
@@ -32,6 +33,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::ScrollProjects(_)
             | SidebarAction::NavigateRow { .. }
             | SidebarAction::OpenChannel { .. }
+            | SidebarAction::OpenCard { .. }
             | SidebarAction::SelectRows { .. }
             | SidebarAction::ClearRowSelection
             | SidebarAction::OpenRepository { .. }
@@ -1873,6 +1875,7 @@ mod tests {
             SidebarAction::SearchChanged(String::new()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
             SidebarAction::HideReadAttention,
+            SidebarAction::ToggleInProgress,
             SidebarAction::ToggleControls,
             SidebarAction::FocusFirstSearchResult,
             SidebarAction::OpenFirstSearchResult,
