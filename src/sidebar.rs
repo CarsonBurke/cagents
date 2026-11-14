@@ -3425,6 +3425,13 @@ impl SidebarState {
         });
     }
 
+    /// Whether an agent in any pane this window holds is in a turn.
+    pub fn any_agent_working(&self) -> bool {
+        self.agent_activity
+            .values()
+            .any(|entry| entry.activity.state == crate::agent::ActivityState::Working)
+    }
+
     pub fn card_activity(&self, card: CardId) -> Option<crate::agent::Activity> {
         self.agent_activity.get(&card).map(|entry| entry.activity)
     }

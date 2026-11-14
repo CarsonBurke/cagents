@@ -24,18 +24,19 @@ pub(super) struct State {
     restore_keyboard_nav: Option<bool>,
 }
 
-/// How often a focused window reads pending requests while one is offered,
-/// or just after something that could have made one.
+/// How often a focused window reads pending requests while one could
+/// appear at any moment: one is offered, an agent is working, or the window
+/// has not yet read the project it shows.
 const READ_INTERVAL: Duration = Duration::from_secs(2);
-/// The longest a focused window waits between reads while nothing is
-/// pending. Agents make requests, and an agent's turn ending, the window
-/// regaining focus or another project being opened reads again sooner.
+/// The longest a focused window waits between reads while none could. Only
+/// an agent makes a request, so this bounds how late one made by an agent
+/// this window doesn't show is offered.
 const IDLE_READ_INTERVAL: Duration = Duration::from_secs(16);
 
 impl State {
     /// [`READ_INTERVAL`], doubling with each read that found nothing up to
     /// [`IDLE_READ_INTERVAL`].
-    fn read_interval(&self) -> Duration {
+    fn idle_read_interval(&self) -> Duration {
         READ_INTERVAL
             .saturating_mul(1 << self.idle_reads.min(8))
             .min(IDLE_READ_INTERVAL)
@@ -106,7 +107,8 @@ fn pending_proposal(
 /// Runs `read` on the connection `slot` holds, connecting first when it holds
 /// none. A connection the daemon answered on is kept, refusals included; one
 /// that failed is dropped. When a kept connection turns out to have closed,
-/// as when the daemon restarted, one new connection reads at once instead.
+/// as when the daemon restarted, one new connection reads at once instead; a
+/// daemon too slow to answer is not asked again until the next read.
 fn with_connection<C, T>(
     slot: &mut Option<C>,
     connect: impl FnOnce() -> Result<C, String>,
@@ -116,6 +118,10 @@ fn with_connection<C, T>(
         match read(client) {
             Ok(value) => return Ok(value),
             Err(error @ ControlError::Remote { .. }) => return Err(error.to_string()),
+            Err(error) if !closed(&error) => {
+                *slot = None;
+                return Err(error.to_string());
+            }
             Err(_) => *slot = None,
         }
     }
@@ -126,6 +132,23 @@ fn with_connection<C, T>(
         }
         error.to_string()
     })
+}
+
+/// Whether `error` says the daemon closed the connection: it stopped, or
+/// another daemon took over and told it to go first.
+fn closed(error: &ControlError) -> bool {
+    match error {
+        ControlError::ConnectionClosed
+        | ControlError::ConnectionRejected { .. }
+        | ControlError::UnexpectedMessage { .. } => true,
+        ControlError::Frame(crate::terminal_ipc::FrameError::Io(error)) => matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 fn placement_description(proposal: &Proposal) -> String {
@@ -208,10 +231,25 @@ impl Cagents {
 
     pub(super) fn automation_approval_subscription(&self) -> Subscription<Message> {
         if self.refresh_ui.focused && !self.sidebar_model.projects.is_empty() {
-            cosmic::iced::time::every(self.automation_approval.read_interval())
+            cosmic::iced::time::every(self.automation_approval_read_interval())
                 .map(|_| Message::AutomationApproval(Action::Tick))
         } else {
             Subscription::none()
+        }
+    }
+
+    /// How long until the next read of pending requests. An agent asking
+    /// for approval waits in its turn for the answer, so while any agent
+    /// works, reads keep the quick pace that offers its request at once.
+    fn automation_approval_read_interval(&self) -> Duration {
+        let state = &self.automation_approval;
+        if state.available.is_some()
+            || self.sidebar_state.any_agent_working()
+            || self.approval_repository() != state.read_repository.as_deref()
+        {
+            READ_INTERVAL
+        } else {
+            state.idle_read_interval()
         }
     }
 
@@ -300,7 +338,12 @@ impl Cagents {
                 let reader = Arc::clone(&self.automation_approval.reader);
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let mut reader = reader.lock().unwrap_or_else(|p| p.into_inner());
+                        // A read that panicked may have left a reply unread.
+                        let mut reader = reader.lock().unwrap_or_else(|poisoned| {
+                            let mut reader = poisoned.into_inner();
+                            *reader = None;
+                            reader
+                        });
                         with_connection(
                             &mut reader,
                             || {
@@ -771,6 +814,17 @@ mod tests {
         );
         assert_eq!(with_connection(&mut slot, never, read), Ok(2));
 
+        // A daemon too slow to answer is not asked again on another
+        // connection; the next read connects afresh.
+        let slow = |_: &mut Connection| {
+            Err::<u32, _>(ControlError::ReplyTimeout {
+                timeout: Duration::from_secs(5),
+                error: crate::terminal_ipc::FrameError::Io(std::io::ErrorKind::TimedOut.into()),
+            })
+        };
+        assert!(with_connection(&mut slot, never, slow).is_err());
+        assert!(slot.is_none());
+
         // A new connection that fails is not tried again until the next read.
         slot = None;
         let closed = |_: &mut Connection| Err::<u32, _>(ControlError::ConnectionClosed);
@@ -784,8 +838,9 @@ mod tests {
     }
 
     /// A focused window with nothing to review reads less and less often,
-    /// and quickly again once a request is offered or anything could have
-    /// made one.
+    /// and quickly again while a request could appear: one is offered, an
+    /// agent is working, another project opened or anything could have made
+    /// one.
     #[test]
     fn idle_approval_reads_back_off_until_something_could_have_changed() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -804,6 +859,7 @@ mod tests {
         }
         app.active_workspace = Some("/fixture".into());
         app.refresh_ui.focused = true;
+        let interval = |app: &Cagents| app.automation_approval_read_interval().as_secs();
         let read = |app: &mut Cagents, result: Result<Vec<Proposal>, String>| {
             drop(app.update_automation_approval(Action::Tick));
             let generation = app.automation_approval.generation;
@@ -811,9 +867,9 @@ mod tests {
                 generation,
                 result: Arc::new(result),
             }));
-            app.automation_approval.read_interval().as_secs()
+            interval(app)
         };
-        assert_eq!(app.automation_approval.read_interval().as_secs(), 2);
+        assert_eq!(interval(&app), 2);
         let idle = (0..5)
             .map(|_| read(&mut app, Ok(Vec::new())))
             .collect::<Vec<_>>();
@@ -825,18 +881,33 @@ mod tests {
         assert_eq!(read(&mut app, Ok(Vec::new())), 4);
         assert_eq!(read(&mut app, Ok(Vec::new())), 8);
 
+        // An agent asking for approval waits in its turn for the answer.
+        let agent = CardId::new();
+        let activity = |state| crate::agent::Activity {
+            provider: crate::agent::Provider::Claude,
+            state,
+        };
+        app.sidebar_state
+            .set_card_activity(agent, activity(crate::agent::ActivityState::Working));
+        assert_eq!(interval(&app), 2);
+        assert_eq!(read(&mut app, Ok(Vec::new())), 2);
+        app.sidebar_state
+            .set_card_activity(agent, activity(crate::agent::ActivityState::Idle));
+        assert_eq!(interval(&app), 16);
+
         // An agent's turn ended: the window's notifications changed.
         drop(
             app.update_notifications(super::super::notification_ui::Action::Snapshot(
                 crate::notifications::Snapshot::default(),
             )),
         );
-        assert_eq!(app.automation_approval.read_interval().as_secs(), 2);
+        assert_eq!(interval(&app), 2);
         assert_eq!(read(&mut app, Ok(Vec::new())), 4);
         assert_eq!(read(&mut app, Ok(Vec::new())), 8);
 
-        // Another project's requests are read from the quick pace.
+        // Another project's requests are read at once at the quick pace.
         app.active_workspace = Some("/second".into());
+        assert_eq!(interval(&app), 2);
         assert_eq!(read(&mut app, Ok(Vec::new())), 4);
     }
 
