@@ -133,7 +133,13 @@ for provider in claude codex; do
 
     prompt "Show the $provider footer using the offline provider default."
     if [ "$provider" = claude ]; then
-        "$ne" drive wait 'offline footer' --timeout 30
+        # Match the retained Before comparison states: the narrow live
+        # session is between turns; the wide session is still responding.
+        if [ "$scene" = narrow ]; then
+            "$ne" drive wait inished --timeout 45
+        else
+            "$ne" drive wait espond --timeout 30
+        fi
     else
         "$ne" drive wait 'Offline' --timeout 30
     fi

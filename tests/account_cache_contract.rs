@@ -41,6 +41,8 @@ fn catalog(label: &str) -> Catalog {
             reasoning: vec!["low".into()],
         }],
         observed_at: NOW,
+        default_model: None,
+        reasoning_defaults: Default::default(),
     }
 }
 
