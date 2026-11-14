@@ -360,6 +360,8 @@ winit-wayland = { path = "vendor/winit-wayland" }
 libcosmic = { path = "vendor/libcosmic" }
 iced_core = { path = "vendor/iced-core" }
 iced_graphics = { path = "vendor/iced-graphics" }
+# Sample upright SVG icons texel-for-pixel and rotated ones filtered; see vendor/iced-wgpu/README.cagents.md.
+iced_wgpu = { path = "vendor/iced-wgpu" }
 iced_accessibility = { path = "vendor/iced-accessibility" }
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_winit = { path = "vendor/iced-winit" }

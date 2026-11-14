@@ -22,7 +22,7 @@ ANCHOR = f'const _: Option<&str> = option_env!("{IDENTITY}");\n'
 OLD_TIME = 946684800
 VENDOR_BUILD_HOOKS = (
     "vendor/iced-core", "vendor/iced-runtime", "vendor/iced-winit",
-    "vendor/libcosmic", "vendor/libsqlite3-sys",
+    "vendor/libcosmic", "vendor/libsqlite3-sys", "vendor/iced-wgpu",
 )
 VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
