@@ -3058,6 +3058,7 @@ pub enum SettingsField {
     ChatContentFraction,
     DefaultNativePaneFraction,
     ShowStatusBar,
+    AccountUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
     RelaunchAgentsOnUpgrade,
@@ -3216,6 +3217,7 @@ impl SettingsField {
             Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
+            Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
@@ -3250,6 +3252,7 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
+            Self::AccountUsageDisplay => SettingsCategory::Accounts,
             Self::AppTheme
             | Self::UiScale
             | Self::ShowStatusBar
@@ -3476,6 +3479,7 @@ struct SettingsDraft {
     chat_content_fraction: String,
     default_native_pane_fraction: String,
     show_status_bar: bool,
+    account_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
     relaunch_agents_on_upgrade: bool,
@@ -3540,6 +3544,7 @@ impl SettingsDraft {
             chat_content_fraction: settings.chat_content_fraction.to_string(),
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
+            account_usage_display: settings.account_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
@@ -3604,6 +3609,11 @@ impl SettingsDraft {
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
             SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
+            SettingsField::AccountUsageDisplay => {
+                if let Some(display) = settings::AccountUsageDisplay::from_key(&value) {
+                    self.account_usage_display = display;
+                }
+            }
             SettingsField::ShowWorktreeChangesIcons => {
                 self.show_worktree_changes_icons = value == "true"
             }
@@ -3857,6 +3867,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
             .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
+        SettingsField::AccountUsageDisplay => settings::AccountUsageDisplay::from_key(value)
+            .map(|display| next.account_usage_display = display)
+            .ok_or_else(|| "Choose Left or Used.".to_owned()),
         SettingsField::ShowWorktreeChangesIcons => value
             .parse::<bool>()
             .map(|enabled| next.show_worktree_changes_icons = enabled)
@@ -4444,7 +4457,10 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
-    SidebarPreferencesObserved(AppSettings),
+    SharedPreferencesObserved {
+        generation: u64,
+        settings: AppSettings,
+    },
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -16798,22 +16814,30 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::SidebarPreferencesObserved(settings) => {
+            Message::SharedPreferencesObserved { generation, settings } => {
                 // A local edit owns these fields until its save is acknowledged.
-                if self.settings_save_generation == self.settings_ack_generation {
+                // A read queued by an earlier subscription can arrive after that
+                // acknowledgment; only the current save generation may apply.
+                if generation == self.settings_ack_generation
+                    && self.settings_save_generation == self.settings_ack_generation
+                {
                     // Never wait for a disk save on the event loop. An in-flight
                     // save's acknowledgment restarts this observation.
                     let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
                     if let Some(saved) = lane.as_mut() {
                         saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
                         saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                        saved.settings.account_usage_display = settings.account_usage_display;
                     }
                     drop(lane);
                     self.settings.sidebar_worktrees = settings.sidebar_worktrees;
                     self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings.account_usage_display = settings.account_usage_display;
                     self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
                     self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_base.account_usage_display = settings.account_usage_display;
                     self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings_draft.account_usage_display = settings.account_usage_display;
                     self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
                     self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
@@ -18848,13 +18872,19 @@ impl Application for Cagents {
                     _ => None,
                 }),
         );
-        subscriptions.push(
-            Subscription::run_with(
-                (self.settings_path.clone(), self.settings_ack_generation),
-                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
-            )
-            .map(Message::SidebarPreferencesObserved),
-        );
+        subscriptions.push(Subscription::run_with(
+            (self.settings_path.clone(), self.settings_ack_generation),
+            |(path, generation)| {
+                use cosmic::iced::futures::StreamExt;
+                let generation = *generation;
+                settings_ui::shared_preferences_stream(path.clone()).map(move |settings| {
+                    Message::SharedPreferencesObserved {
+                        generation,
+                        settings,
+                    }
+                })
+            },
+        ));
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
@@ -30763,7 +30793,10 @@ mod tests {
             .sidebar_worktree_overrides
             .insert(project, settings::SidebarWorktrees::Expanded);
         settings::save(&path, &external).unwrap();
-        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        drop(app.update(Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: external,
+        }));
         assert_eq!(
             app.sidebar_state.worktree_display(project),
             settings::SidebarWorktrees::Expanded
@@ -32789,6 +32822,173 @@ mod tests {
         };
         assert_eq!(updated.terminal_font_size, 16.0);
         assert_eq!(updated.sidebar_width, settings.sidebar_width);
+    }
+
+    #[test]
+    fn account_usage_display_edits_apply_to_settings_and_draft() {
+        let settings = AppSettings::default();
+        let field = SettingsField::AccountUsageDisplay;
+        assert_eq!(field.category(), SettingsCategory::Accounts);
+        assert_eq!(
+            settings_update(&settings, field, "left"),
+            SettingsDecision::Unchanged
+        );
+        let SettingsDecision::Persist(updated) = settings_update(&settings, field, "used") else {
+            panic!("changing account usage display must request persistence");
+        };
+        assert_eq!(
+            updated.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+        let mut draft = SettingsDraft::from_settings(&settings);
+        draft.set(field, "used".into());
+        assert_eq!(draft, SettingsDraft::from_settings(&updated));
+        assert!(matches!(
+            settings_update(&updated, field, "unknown"),
+            SettingsDecision::Invalid(_)
+        ));
+        draft.set(field, "unknown".into());
+        assert_eq!(draft, SettingsDraft::from_settings(&updated));
+    }
+
+    #[test]
+    fn shared_preferences_read_before_a_local_save_cannot_revert_it_after_acknowledgment() {
+        use settings::AccountUsageDisplay::{Left, Used};
+        use settings::SidebarWorktrees::{Expanded, Grouped, Hidden};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let stale = Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        };
+        let project = ProjectId::new();
+        app.settings
+            .sidebar_worktree_overrides
+            .insert(project, Expanded);
+        drop(app.update(Message::SettingsChanged {
+            field: SettingsField::SidebarWorktrees,
+            value: "hidden".into(),
+        }));
+        let task = app.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "used".into(),
+        });
+        settle_settings_task(&mut app, task);
+        assert_eq!(app.settings_save_generation, app.settings_ack_generation);
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Used);
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+
+        // Deliver the old watcher output after the successful save. Neither
+        // visible settings nor any baseline used by a later save may regress.
+        drop(app.update(stale));
+        assert_eq!(app.settings.account_usage_display, Used);
+        assert_eq!(app.settings_draft.account_usage_display, Used);
+        assert_eq!(app.settings_draft.sidebar_worktrees, Hidden);
+        for settings in [&app.settings, &app.settings_base] {
+            assert_eq!(settings.account_usage_display, Used);
+            assert_eq!(settings.sidebar_worktrees, Hidden);
+            assert_eq!(
+                settings.sidebar_worktree_overrides.get(&project),
+                Some(&Expanded)
+            );
+        }
+        {
+            let lane = app.settings_save_lane.lock().unwrap();
+            let baseline = &lane.as_ref().unwrap().settings;
+            assert_eq!(baseline.account_usage_display, Used);
+            assert_eq!(baseline.sidebar_worktrees, Hidden);
+            assert_eq!(
+                baseline.sidebar_worktree_overrides.get(&project),
+                Some(&Expanded)
+            );
+        }
+        assert_eq!(app.sidebar_state.worktree_display(project), Expanded);
+        assert_eq!(app.sidebar_state.worktree_display(ProjectId::new()), Hidden);
+
+        // The next click back to Left must persist a change, rather than look
+        // unchanged because the stale observation already changed local state.
+        let task = app.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "left".into(),
+        });
+        settle_settings_task(&mut app, task);
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Left);
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+
+        // A current-generation external observation is still accepted.
+        let mut external = saved;
+        external.sidebar_worktrees = Grouped;
+        external.account_usage_display = Used;
+        drop(app.update(Message::SharedPreferencesObserved {
+            generation: app.settings_ack_generation,
+            settings: external,
+        }));
+        assert_eq!(app.settings.account_usage_display, Used);
+        assert_eq!(app.settings_draft.sidebar_worktrees, Grouped);
+    }
+
+    #[test]
+    fn account_usage_display_syncs_between_windows_and_keeps_local_edits_until_saved() {
+        use settings::AccountUsageDisplay::{Left, Used};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut first = context_inspector_test_app(false);
+        let mut second = context_inspector_test_app(false);
+        for app in [&mut first, &mut second] {
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+        }
+        let task = first.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "used".into(),
+        });
+        settle_settings_task(&mut first, task);
+        let observed = settings::load(&path).unwrap();
+        assert_eq!(observed.account_usage_display, Used);
+        drop(second.update(Message::SharedPreferencesObserved {
+            generation: second.settings_ack_generation,
+            settings: observed,
+        }));
+        assert_eq!(second.settings.account_usage_display, Used);
+        assert_eq!(second.settings_draft.account_usage_display, Used);
+        assert_eq!(second.settings_base.account_usage_display, Used);
+
+        // A later unrelated save must retain the observed preference, including
+        // the baseline cached in this window's save lane.
+        let task = second.update(Message::SettingsChanged {
+            field: SettingsField::TerminalFontSize,
+            value: "18".into(),
+        });
+        settle_settings_task(&mut second, task);
+        assert_eq!(settings::load(&path).unwrap().account_usage_display, Used);
+        let task = second.update(Message::SettingsChanged {
+            field: SettingsField::AccountUsageDisplay,
+            value: "left".into(),
+        });
+        drop(second.update(Message::SharedPreferencesObserved {
+            generation: second.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        }));
+        assert_eq!(second.settings.account_usage_display, Left);
+        assert_eq!(second.settings_draft.account_usage_display, Left);
+        settle_settings_task(&mut second, task);
+        drop(first.update(Message::SharedPreferencesObserved {
+            generation: first.settings_ack_generation,
+            settings: settings::load(&path).unwrap(),
+        }));
+        assert_eq!(first.settings.account_usage_display, Left);
+        assert_eq!(first.settings_draft.account_usage_display, Left);
+        assert_eq!(first.settings_base.account_usage_display, Left);
+        first.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.account_usage_display, Left);
+        assert_eq!(saved.terminal_font_size, 18.0);
     }
 
     #[test]

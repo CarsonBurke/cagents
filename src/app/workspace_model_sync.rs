@@ -752,7 +752,9 @@ impl Cagents {
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
-                Task::batch([closed, self.reconcile_workspace_model()])
+                let reconciled = self.reconcile_workspace_model();
+                self.sweep_empty_channels();
+                Task::batch([closed, reconciled])
             }
             ModelUpdate::RetirementAnswered { .. } => {
                 unreachable!("a retirement answer is applied as the snapshot it carries")

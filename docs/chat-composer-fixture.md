@@ -237,6 +237,16 @@ account check and each conversation read it whenever they ask. A live usage chan
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
 reported.
 
+For multiple synthetic accounts, put an `auth status --json` response in each
+account's `fixture-auth-status.json`, such as
+`{"loggedIn":true,"email":"account-one@example.test","subscriptionType":"pro"}`.
+The fixture reads it from `CLAUDE_CONFIG_DIR`, or `HOME/.claude` when no config
+directory is selected. Give each account a distinct email so the app treats
+the homes as separate sign-ins, and put its usage response in that home's
+`fixture-usage.json`. Without an auth file, the fixture keeps its default
+`fixture@example.test` identity. Keep all these homes inside the isolated fixture;
+never write them into a real provider home.
+
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads
 anything: the number of seconds on the file's first line, such as `1.5`, or

@@ -835,9 +835,14 @@ the build host also keeps one apart from its target directory. Either way
 they arrive at the paths Cargo's messages, and its JSON messages
 (`--message-format=json...`), name here. `run` builds there and runs the program here, with Cargo's `CARGO_*`
 settings. `doc` copies `target/doc` back, per `--target`, and `--open` opens it
-here. `--timings` copies the report back. `fix` and `clippy --fix` apply their
-fixes here, to the files they changed there, after the same uncommitted-change
-checks Cargo makes. Path options inside the checkout, such as
+here. `--timings` copies the report back. Whatever any command writes in the
+checkout there, such as a lockfile Cargo updates, comes back to the same files
+here, whether or not it succeeds:
+`fix` and `clippy --fix` apply their fixes after the same uncommitted-change
+checks Cargo makes, and a test that records a fixture, such as
+`CAGENTS_RECORD_WIRE_FORMAT=1`, leaves it in this checkout. A file edited here
+while the command ran keeps that edit, and a new file this checkout ignores
+stays there. Path options inside the checkout, such as
 `--manifest-path`, `--target-dir` and `--artifact-dir`, are translated, and a
 `CAGENTS_` setting naming a file in the checkout or its target, such as
 `CAGENTS_TEST_RETAINED_ACTOR_HELPER`, names the host's copy of it there; a
@@ -2029,6 +2034,19 @@ The scenario verifies its mapped window too. The default seed includes Claude
 chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
+
+Use `--scale-chats 120` to rehearse a daemon that has run for days: it also
+opens that many chats, every third one Codex, across both projects. Each opens
+with `--scale-entries` earlier messages (default 400) of about `--scale-bytes`
+each (default 1536), then settles idle, so the update records long transcript
+pages without treating the chats as working. The Claude fake reads
+`fixture-long-history` and `fixture-first-turn-seconds` at launch, and the
+Codex peer reads `history` from `codex-fixture.json`; the seed removes those
+settings once every scale chat is idle, so later launches are unaffected.
+Spawns wait for a free slot, as the daemon runs at most eight agents a person
+starts at once, so seeding 120 chats takes several minutes; it therefore cannot
+be combined with the working or natural-idle cases, whose Codex turn would end
+first. `scale-seed.json` records the counts and seeding time.
 
 Use `--codex-pause 90` to keep the offline Codex turn active at the update
 prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a

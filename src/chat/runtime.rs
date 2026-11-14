@@ -430,7 +430,7 @@ impl LocalHandle {
         resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -1810,7 +1810,13 @@ fn spawn_provider(
         .args(&spec.arguments)
         .current_dir(&spec.working_directory)
         .env_clear()
-        .envs(&spec.environment)
+        // Callers withhold these already; no path may hand a provider the
+        // session its daemon or a saved recipe came from.
+        .envs(
+            spec.environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
@@ -2466,6 +2472,10 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
+        // Every read and write of the provider's pipes below pokes the scope.
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.reports_activity();
+        }
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
@@ -2729,6 +2739,9 @@ impl Actor {
                     match stdin.write(&line[self.offset..]) {
                         Ok(0) => return Err("Provider closed stdin".into()),
                         Ok(n) => {
+                            // Input can start a command before any output,
+                            // such as a hook run on a submitted prompt.
+                            self.poke_scope();
                             self.offset += n;
                             self.queued -= n;
                             if self.offset == line.len() {
@@ -2760,9 +2773,7 @@ impl Actor {
                         reserve_frame(&mut self.output, n)?;
                         self.output.extend_from_slice(&buffer[..n]);
                         // Output often announces a command: move it soon.
-                        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
-                            scope.poke();
-                        }
+                        self.poke_scope();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stdout: {e}")),
@@ -2772,6 +2783,7 @@ impl Actor {
                 match stderr.read(&mut buffer) {
                     Ok(0) => stderr_eof = true,
                     Ok(n) => {
+                        self.poke_scope();
                         for byte in &buffer[..n] {
                             if self.stderr.len() == 16384 {
                                 self.stderr.pop_front();
@@ -2785,6 +2797,14 @@ impl Actor {
             }
         }
     }
+    /// The provider read input or wrote output, so it may be about to start
+    /// a command: move it to a leaf of its own soon.
+    fn poke_scope(&self) {
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.poke();
+        }
+    }
+
     /// Say so when the system stopped one of the provider's commands
     /// because memory ran out. The provider is still running.
     fn report_command_stops(&mut self) {
@@ -9362,6 +9382,50 @@ for line in sys.stdin:
                 provider.child.try_wait().unwrap().unwrap(),
                 observed,
                 "non-reaping observation must match the real Child exit status for {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_is_never_handed_a_parent_session() {
+        use std::io::Read;
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/env".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
+            environment: [
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+            ]
+            .into(),
+            unset_environment: Default::default(),
+        };
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+            .unwrap()
+            .unwrap();
+        let mut output = String::new();
+        provider
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        provider.terminate().unwrap();
+        let received = output.lines().collect::<Vec<_>>();
+        assert!(received.contains(&"CLAUDE_CONFIG_DIR=/home/a/.claude"));
+        for name in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_SOCKET="] {
+            assert!(
+                !received.iter().any(|line| line.starts_with(name)),
+                "{name} reached the provider"
             );
         }
     }

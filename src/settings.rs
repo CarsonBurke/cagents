@@ -159,6 +159,37 @@ pub enum TerminalCursorStyle {
     Underline,
 }
 
+/// Whether account allowance labels and gauges describe what remains or was used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountUsageDisplay {
+    #[default]
+    Left,
+    Used,
+}
+
+impl AccountUsageDisplay {
+    pub const ALL: [Self; 2] = [Self::Left, Self::Used];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Used => "used",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Used => "Used",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|display| display.key() == key)
+    }
+}
+
 const fn default_ui_scale() -> f32 {
     1.0
 }
@@ -1124,11 +1155,14 @@ pub struct AppSettings {
     #[serde(default = "default_native_fraction")]
     pub default_native_pane_fraction: f32,
     /// Whether the window keeps a status bar along its bottom edge, which
-    /// reports how much of each signed-in provider account's usage limits
-    /// is left. Hiding it also stops the account probes that feed it while
+    /// reports each signed-in provider account's usage limits.
+    /// Hiding it also stops the account probes that feed it while
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// What account allowance labels and gauges show throughout the app.
+    #[serde(default)]
+    pub account_usage_display: AccountUsageDisplay,
     /// Preview rows by provider: `window:<provider key>` or `credits`.
     /// An absent provider retains its automatic headline; an empty list
     /// deliberately shows only the provider control.
@@ -1247,6 +1281,7 @@ impl Default for AppSettings {
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
+            account_usage_display: AccountUsageDisplay::default(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             show_mentioned_pull_requests: false,
@@ -3261,6 +3296,48 @@ mod tests {
         assert!(restored.language_servers.is_empty());
         assert_eq!(restored.editor_find_options, settings.editor_find_options);
         assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
+    fn account_usage_display_defaults_to_left_and_round_trips_both_choices() {
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.account_usage_display, AccountUsageDisplay::Left);
+        let mut legacy = toml::Value::try_from(&defaults).unwrap();
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("account_usage_display");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.account_usage_display, AccountUsageDisplay::Left);
+
+        for display in AccountUsageDisplay::ALL {
+            let settings = AppSettings {
+                account_usage_display: display,
+                ..defaults.clone()
+            };
+            let encoded = toml::to_string(&settings).unwrap();
+            assert!(encoded.contains(&format!("account_usage_display = {:?}", display.key())));
+            let restored: AppSettings = toml::from_str(&encoded).unwrap();
+            assert_eq!(restored.account_usage_display, display);
+        }
+    }
+
+    #[test]
+    fn account_usage_display_survives_another_windows_unrelated_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let mut first = base.clone();
+        first.account_usage_display = AccountUsageDisplay::Used;
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = base.clone();
+        second.terminal_font_size = 18.0;
+        save_merged(&path, &base, &second).unwrap();
+        save_merged(&path, &base, &base).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.account_usage_display, AccountUsageDisplay::Used);
+        assert_eq!(restored.terminal_font_size, 18.0);
     }
 
     #[test]
