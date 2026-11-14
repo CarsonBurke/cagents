@@ -3419,6 +3419,18 @@ impl SidebarState {
         }
     }
 
+    /// The news a row draws. The Attention list's main section holds rows
+    /// for what needs the user, and its In progress section is where the work
+    /// spinner means something; a spinner above it would say the row is
+    /// listed for its work. Rows elsewhere draw everything.
+    fn shown_attention(&self, attention: AttentionSummary) -> AttentionSummary {
+        if self.filter == SidebarFilter::Attention {
+            attention.without_work()
+        } else {
+            attention
+        }
+    }
+
     /// Whether the Attention list's main section lists `card`: it needs the
     /// user, or was dealt with there and is kept until hidden.
     fn lists_card(&self, card: &SidebarCard) -> bool {
@@ -6986,7 +6998,9 @@ fn project_view<'a>(
             && project.state.worktree_display(project_id)
                 == crate::settings::SidebarWorktrees::Hidden)
     {
-        project.state.project_attention(project_id)
+        project
+            .state
+            .shown_attention(project.state.project_attention(project_id))
     } else if attention_list {
         AttentionSummary::default()
     } else {
@@ -7116,6 +7130,7 @@ fn project_view<'a>(
                     channel_view(
                         channel,
                         project.state.channel_listing(channel),
+                        project.state.shown_attention(channel.attention),
                         modal_open,
                         false,
                         project
@@ -7318,7 +7333,7 @@ fn compact_project_identity(
             grid.rail(
                 chip,
                 if badged {
-                    rail::Badges::attention(attention.summary)
+                    rail::Badges::attention(state.shown_attention(attention.summary))
                 } else {
                     rail::Badges::default()
                 },
@@ -7370,6 +7385,7 @@ fn compact_project<'a>(
                 channel_view(
                     channel,
                     project.state.channel_listing(channel),
+                    project.state.shown_attention(channel.attention),
                     modal_open,
                     true,
                     project
@@ -7628,9 +7644,12 @@ fn worktree_glyph_tone(pull_request: Option<PullRequestTone>, ink: RowInk) -> Gl
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(channel.attention)
-        .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
+fn channel_indicator(
+    attention: AttentionSummary,
+    chats: usize,
+) -> Option<Element<'static, SidebarAction>> {
+    attention_indicator(attention)
+        .or_else(|| (chats > 1).then(|| design::caption(chats.to_string()).into()))
 }
 
 /// Waiting is a live state, independent of whether its notification was read.
@@ -7769,9 +7788,11 @@ fn with_deletion_name<'a>(
     }
 }
 
+/// `attention` is the news the row draws; see [`SidebarState::shown_attention`].
 fn channel_view(
     channel: &SidebarChannel,
     listing: Listing,
+    attention: AttentionSummary,
     modal_open: bool,
     compact: bool,
     selection_count: Option<usize>,
@@ -7782,7 +7803,7 @@ fn channel_view(
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let glyph = child_glyph(Icon::Channel, channel_glyph_tone(channel, listing), compact);
     let mut content = if compact {
-        grid.rail(glyph, rail_deletion_badges(deletion, channel.attention))
+        grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
         let label = search_label(
             &channel.title,
@@ -7793,7 +7814,7 @@ fn channel_view(
         );
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            _ => channel_indicator(channel),
+            _ => channel_indicator(attention, channel.chats),
         };
         grid.content(glyph, Some(label), indicator)
     };
@@ -7933,13 +7954,14 @@ fn card_view(
     let ink = RowInk::Full.listed(listing);
     let checkout = card.checkout(project);
     let glyph = child_glyph(card.icon(), GlyphTone::Ink(ink), compact);
+    let shown = state.shown_attention(card.attention);
     let content = if compact {
-        grid.rail(glyph, rail::Badges::attention(card.attention))
+        grid.rail(glyph, rail::Badges::attention(shown))
     } else {
         grid.content(
             glyph,
             Some(titled_label(&card.title, checkout, &state.query, ink)),
-            attention_indicator(card.attention),
+            attention_indicator(shown),
         )
     };
     let place = checkout.map_or_else(String::new, |checkout| format!(" in {checkout}"));
@@ -16160,7 +16182,15 @@ pub(crate) mod tests {
             )
             .with_attention(summary);
             let case = format!("{summary:?}");
-            let mut element = channel_view(&channel, Listing::Live, false, true, Some(1), "");
+            let mut element = channel_view(
+                &channel,
+                Listing::Live,
+                channel.attention,
+                false,
+                true,
+                Some(1),
+                "",
+            );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -16196,7 +16226,15 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, Listing::Live, modal, compact, Some(1), "");
+            let mut element = channel_view(
+                &channel,
+                Listing::Live,
+                channel.attention,
+                modal,
+                compact,
+                Some(1),
+                "",
+            );
             let mut tree = Tree::new(&element);
             let width = if compact { rail::CELL_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -16355,7 +16393,15 @@ pub(crate) mod tests {
         let width = 240.0;
         let hover = cosmic::iced::Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
         let (control, glyphs) = icon_glyphs_in_control(
-            channel_view(&channel, Listing::Live, false, false, Some(1), ""),
+            channel_view(
+                &channel,
+                Listing::Live,
+                channel.attention,
+                false,
+                false,
+                Some(1),
+                "",
+            ),
             Size::new(width, WORKTREE_ROW_HEIGHT),
             hover,
             label,
@@ -17462,7 +17508,15 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, Listing::Live, false, false, Some(1), "");
+            let mut element = channel_view(
+                channel,
+                Listing::Live,
+                channel.attention,
+                false,
+                false,
+                Some(1),
+                "",
+            );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -20339,6 +20393,41 @@ pub(crate) mod tests {
 
     /// One open terminal pane per card, each scoped to its checkout, as the
     /// workspace holds unchanneled panes.
+    /// One project's header and rows as the list draws them, without the
+    /// rest of the list, In progress included.
+    fn project_section(
+        model: &SidebarModel,
+        state: &SidebarState,
+        project: ProjectId,
+        compact: bool,
+    ) -> Element<'static, SidebarAction> {
+        let projects = filtered_projects(model, state, compact);
+        let entry = projects
+            .iter()
+            .find(|entry| entry.project.id == project)
+            .expect("the list holds the project");
+        project_view(
+            entry,
+            !state.collapsed_projects.contains(&project),
+            compact,
+            state.drawn_selection(),
+            false,
+            row_interaction::StickyViewport::default(),
+        )
+    }
+
+    /// Whether `element` draws the work spinner anywhere.
+    fn draws_work_spinner(element: &Element<'_, SidebarAction>) -> bool {
+        fn contains(tree: &Tree, tag: cosmic::iced::advanced::widget::tree::Tag) -> bool {
+            tree.tag == tag || tree.children.iter().any(|child| contains(child, tag))
+        }
+        let spinner = crate::ui_controls::activity_spinner::<SidebarAction>(
+            f32::from(ROW_ICON_SIZE),
+            design::warning_color,
+        );
+        contains(&Tree::new(element), spinner.as_widget().tag())
+    }
+
     fn pane_workspace(panes: &[(CardId, &Path)]) -> Arc<crate::model::WorkspaceState> {
         Arc::new(crate::model::WorkspaceState {
             cards: panes
@@ -20712,6 +20801,25 @@ pub(crate) mod tests {
             )),
             "the collapsed project button describes its waiting indicator: {names:?}"
         );
+        // The working pane's own row, under In progress, draws a spinner;
+        // the project's header and rows must not.
+        assert!(
+            !draws_work_spinner(&project_section(&model, &state, project, false)),
+            "the collapsed header must not mask the wait with a working spinner"
+        );
+        let mut all = state.clone();
+        all.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+        assert!(
+            !draws_work_spinner(&project_section(&model, &all, project, false)),
+            "All and Attention share the waiting priority"
+        );
+        assert!(
+            accessible_names(
+                &headless_renderer(),
+                project_section(&model, &all, project, false)
+            )
+            .contains(&model.projects[0].chrome.open_name.to_string())
+        );
         state.apply(&SidebarAction::ToggleProject(project));
         for compact in [false, true] {
             assert!(visible_selection_rows(&model, &state, compact).contains(&row));
@@ -20966,6 +21074,90 @@ pub(crate) mod tests {
         assert_eq!(
             state.selected_rows(&visible),
             vec![SelectionRow::Channel(channel_id)]
+        );
+    }
+
+    /// The Attention list's main section lists a row for what needs the
+    /// user, and its indicator says which. A row with unread news whose agent
+    /// is also working shows the news: the spinner means In progress there.
+    /// All keeps its one ranking, in which work outranks unread news.
+    #[test]
+    fn attention_rows_show_why_they_are_listed_never_the_work_spinner() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let channel_id = ChannelId::from_uuid(Uuid::from_u128(85));
+        let mut entry = project();
+        entry.channels.push(
+            SidebarChannel::new(
+                channel_id,
+                "TLS renewals".into(),
+                false,
+                Some(ActivityState::Working),
+                true,
+                1,
+                true,
+                1,
+            )
+            .with_attention(AttentionSummary::card(
+                Some(ActivityState::Working),
+                true,
+                false,
+            )),
+        );
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let project = project_id(1);
+        let feature = model.projects[0].worktrees[1].clone();
+        let busy = CardId::from_uuid(Uuid::from_u128(86));
+        let durable = pane_workspace(&[(busy, &feature.path)]);
+        let mut state = expanded_worktree_state();
+        state.observe_agent_update(busy, project, feature.id);
+        state.set_agent_activity(
+            busy,
+            project,
+            feature.id,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Working,
+            },
+        );
+        refresh_attention(&mut state, &mut model, &durable);
+        assert!(draws_work_spinner(&project_section(
+            &model, &state, project, false
+        )));
+
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        assert!(in_progress_rows(&model, &state, false).is_empty());
+        for compact in [false, true] {
+            assert_eq!(
+                visible_selection_rows(&model, &state, compact),
+                vec![
+                    SelectionRow::Project(project),
+                    SelectionRow::Channel(channel_id),
+                    SelectionRow::Card(busy),
+                ],
+                "compact={compact}"
+            );
+            assert!(
+                !draws_work_spinner(&project_section(&model, &state, project, compact)),
+                "compact={compact}"
+            );
+        }
+        let names = accessible_names(
+            &headless_renderer(),
+            project_section(&model, &state, project, false),
+        );
+        assert_eq!(
+            names.iter().filter(|name| *name == "1").count(),
+            2,
+            "each row shows its unread count instead: {names:?}"
+        );
+        // Folded, the header gives the same reason.
+        state.apply(&SidebarAction::ToggleProject(project));
+        let header = project_section(&model, &state, project, false);
+        assert!(!draws_work_spinner(&header));
+        let names = accessible_names(&headless_renderer(), header);
+        assert!(
+            names.contains(&model.projects[0].chrome.open_name.to_string()),
+            "{names:?}"
         );
     }
 
