@@ -1,8 +1,9 @@
 //! A hosted proposal never authorizes itself. The window presents the saved
 //! configuration and answers with its exact immutable request revision.
+use super::automation_ui::transport;
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
-use crate::control::{ControlClient, ControlError};
+use crate::control::ControlError;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -12,7 +13,7 @@ pub(super) struct State {
     /// The daemon connection every read of pending requests reuses. A focused
     /// window reads every two seconds, and a connection apiece had the daemon
     /// accept, authenticate and serve a new one each time.
-    reader: Arc<std::sync::Mutex<Option<ControlClient>>>,
+    reader: Arc<std::sync::Mutex<Option<transport::Connection>>>,
     /// Reads in a row that found nothing to review for `read_repository`,
     /// which space the next read out; see [`State::read_interval`].
     idle_reads: u32,
@@ -73,32 +74,25 @@ pub enum Action {
 
 /// The pending request for `repository` a window offers for review, if any.
 fn pending_proposal(
-    client: &mut ControlClient,
+    client: &mut transport::Connection,
     repository: &Path,
 ) -> Result<Vec<Proposal>, ControlError> {
     let unexpected = |actual| ControlError::UnexpectedResponse {
         expected: "automation approval listing",
         actual,
     };
-    let Response::Proposals(proposals) = client.automation(
-        crate::agent_execution::Authority::default(),
-        Request::PendingProposals {
-            repository: repository.to_path_buf(),
-            after: None,
-            limit: 1,
-        },
-    )?
+    let Response::Proposals(proposals) = client.request(Request::PendingProposals {
+        repository: repository.to_path_buf(),
+        after: None,
+        limit: 1,
+    })?
     else {
         return Err(unexpected("another automation response"));
     };
     let Some(visible) = proposals.first() else {
         return Ok(Vec::new());
     };
-    let Response::Proposal(proposal) = client.automation(
-        crate::agent_execution::Authority::default(),
-        Request::Proposal { id: visible.id },
-    )?
-    else {
+    let Response::Proposal(proposal) = client.request(Request::Proposal { id: visible.id })? else {
         return Err(unexpected("another automation response"));
     };
     Ok(vec![*proposal])
@@ -336,6 +330,7 @@ impl Cagents {
                     self.automation_approval.generation.wrapping_add(1);
                 let generation = self.automation_approval.generation;
                 let reader = Arc::clone(&self.automation_approval.reader);
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         // A read that panicked may have left a reply unread.
@@ -346,11 +341,7 @@ impl Cagents {
                         });
                         with_connection(
                             &mut reader,
-                            || {
-                                let socket = crate::terminal::ensure_daemon_ready()
-                                    .map_err(|error| error.to_string())?;
-                                ControlClient::connect(&socket).map_err(|error| error.to_string())
-                            },
+                            || context.connect(),
                             |client| pending_proposal(client, &repository),
                         )
                     })
@@ -457,23 +448,14 @@ impl Cagents {
                 state.deciding = true;
                 state.error = None;
                 let generation = state.generation;
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        match client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::ResolveProposal {
-                                    id,
-                                    revision,
-                                    approved,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?
-                        {
+                        match context.request(Request::ResolveProposal {
+                            id,
+                            revision,
+                            approved,
+                        })? {
                             Response::Proposal(proposal) => Ok(*proposal),
                             _ => Err("Unexpected automation approval result".into()),
                         }
