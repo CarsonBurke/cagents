@@ -811,7 +811,7 @@ impl Cagents {
                     (blocked == 0).then_some(Message::SidebarSelection(Action::Confirm)),
                 ),
         ));
-        Some(dialog_ui::surface(
+        Some(dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
             500.0,
         ))
