@@ -135,7 +135,7 @@ fn install_codex(root: &Path) {
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
