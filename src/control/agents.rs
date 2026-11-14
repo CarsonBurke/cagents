@@ -434,7 +434,12 @@ impl ControlClient {
         // budget than an ordinary reply; a caller's own deadline still bounds it.
         let budget = match &operation {
             Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
-            Operation::Submit(_)
+            Operation::SendMessage(_)
+            | Operation::Send(_)
+            | Operation::Inbox(_)
+            | Operation::PeekInbox(_)
+            | Operation::AcknowledgeInbox(_)
+            | Operation::Submit(_)
             | Operation::Console {
                 command: crate::agent_execution::ConsoleCommand::Submit { .. },
                 ..
@@ -1719,6 +1724,73 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_requests_wait_for_store_replies_beyond_the_ordinary_socket_timeout() {
+        use crate::agent_execution::mailbox::{Inbox, Outgoing, Receipt, To};
+        use crate::terminal::ipc::ProtocolError;
+        let outgoing = Outgoing {
+            to: To::Session("27420000".into()),
+            body: "fixture message".into(),
+            wait_ms: None,
+        };
+        for operation in [
+            Operation::SendMessage(outgoing.clone()),
+            Operation::Send(outgoing),
+            Operation::Inbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::PeekInbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::AcknowledgeInbox(Receipt {
+                ids: vec![crate::model::MessageId::new()],
+            }),
+        ] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                // Make the ordinary socket timeout elapse before the store
+                // reply, without spending a real five seconds per operation.
+                thread::sleep(Duration::from_millis(100));
+                let _ = write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::StoreBusy,
+                            "fixture contention",
+                            true,
+                        )),
+                    },
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let result = client.agent(Authority::default(), operation);
+            server.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::StoreBusy,
+                        retryable: true,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        }
+    }
 
     #[test]
     fn only_the_daemons_limit_refusal_reads_as_agent_limited_and_names_its_reset() {

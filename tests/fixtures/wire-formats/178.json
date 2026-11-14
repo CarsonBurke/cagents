@@ -9481,19 +9481,6 @@
               ]
             ]
           }
-        ],
-        [
-          "ReadTerminalRemovalBasis",
-          {
-            "Struct": [
-              [
-                "source",
-                {
-                  "Container": "cagents::model::TerminalSession"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -9605,6 +9592,10 @@
         ],
         [
           "chat_capacity",
+          "Unit"
+        ],
+        [
+          "store_busy",
           "Unit"
         ]
       ]
@@ -9958,21 +9949,6 @@
                     "Container": "cagents::chat::AgentAddress"
                   }
                 }
-              ]
-            ]
-          }
-        ],
-        [
-          "terminal_worker",
-          {
-            "Struct": [
-              [
-                "terminal_id",
-                "Bytes"
-              ],
-              [
-                "instance",
-                "Bytes"
               ]
             ]
           }
@@ -10582,14 +10558,6 @@
           {
             "Newtype": {
               "Container": "cagents::workspace_model::metadata::Reply"
-            }
-          }
-        ],
-        [
-          "terminal_removal_basis",
-          {
-            "Newtype": {
-              "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
             }
           }
         ]
@@ -13887,35 +13855,6 @@
               ]
             ]
           }
-        ],
-        [
-          "RemoveSource",
-          {
-            "Struct": [
-              [
-                "registry",
-                "Bytes"
-              ],
-              [
-                "repository",
-                "Str"
-              ],
-              [
-                "before",
-                {
-                  "Container": "cagents::workspace_model::views::Pane"
-                }
-              ],
-              [
-                "terminal",
-                {
-                  "Option": {
-                    "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
-                  }
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -13976,50 +13915,6 @@
               [
                 "path",
                 "Str"
-              ]
-            ]
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::views::TerminalRemovalBasis": {
-      "Enum": [
-        [
-          "Worker",
-          {
-            "Struct": [
-              [
-                "owner",
-                {
-                  "Container": "cagents::model::HostSessionProof"
-                }
-              ],
-              [
-                "instance",
-                "Bytes"
-              ]
-            ]
-          }
-        ],
-        [
-          "Absent",
-          {
-            "Struct": [
-              [
-                "owner",
-                {
-                  "Container": "cagents::model::HostSessionProof"
-                }
-              ],
-              [
-                "latest_worker",
-                {
-                  "Option": "Bytes"
-                }
-              ],
-              [
-                "history_epoch",
-                "U64"
               ]
             ]
           }

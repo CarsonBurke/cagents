@@ -823,17 +823,17 @@ fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
         instance: uuid::Uuid::new_v4(),
     };
     let index = super::variant_index(&marker).unwrap();
-    assert_eq!(index + 1, variant_count(&recorded(178), "ServerMessage"));
+    assert_eq!(index + 1, variant_count(&recorded(179), "ServerMessage"));
     assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
         "ServerMessage",
         "terminal_worker",
-        178
+        179
     )));
     for client in OLDER_CLIENTS {
         assert!(!client.admits_message(&marker));
     }
     for protocol in
-        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 178)
+        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 179)
     {
         assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
     }

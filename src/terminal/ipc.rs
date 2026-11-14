@@ -239,8 +239,10 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-/// Version 178 fences shared Close on its original pane and terminal worker,
-/// and appends attachment metadata and completed/absent removal-basis reads.
+/// Version 178 appends retryable `StoreBusy` errors for mailbox contention.
+/// Older clients cannot decode the new error code; replace the matched set.
+/// Version 179 fences shared Close on its original pane and terminal worker,
+/// with attachment metadata, removal-basis reads and source-checked cleanup.
 pub const PROTOCOL_VERSION: u16 = 179;
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
@@ -1233,11 +1235,32 @@ pub enum ShutdownOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct ProtocolError {
     pub code: ProtocolErrorCode,
     pub message: String,
     pub retryable: bool,
+}
+
+impl Serialize for ProtocolError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Carried CLIs know Internal for transient daemon contention. Preserve
+        // the diagnostic and retryability without sending a new enum variant.
+        let code = match self.code {
+            ProtocolErrorCode::StoreBusy
+                if older_clients::encoding_before(older_clients::STORE_BUSY_ERROR) =>
+            {
+                ProtocolErrorCode::Internal
+            }
+            code => code,
+        };
+        let mut error = serializer.serialize_struct("ProtocolError", 3)?;
+        error.serialize_field("code", &code)?;
+        error.serialize_field("message", &self.message)?;
+        error.serialize_field("retryable", &self.retryable)?;
+        error.end()
+    }
 }
 
 impl ProtocolError {
@@ -1267,6 +1290,7 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    StoreBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

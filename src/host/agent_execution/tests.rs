@@ -6395,3 +6395,86 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
         );
     }
 }
+
+#[test]
+fn locked_mailbox_requests_are_retryable_without_accepting_or_consuming_mail() {
+    use crate::{
+        agent_execution::{
+            Lineage,
+            mailbox::{Inbox, Message, Outgoing, Party, Receipt, State as Delivery, To},
+        },
+        model::MessageId,
+        terminal::ipc::{ClientRequest, ProtocolErrorCode},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mailbox.sqlite3");
+    let host = crate::host::service::test_host();
+    host.lock()
+        .unwrap()
+        .install_model(Registry::at(&path).unwrap());
+    let store = registry(&host).unwrap();
+    let incoming = Message {
+        id: MessageId::new(),
+        from: Party {
+            lineage: Some(Lineage(TerminalId::new())),
+            session: None,
+            title: None,
+        },
+        to: Party::user(),
+        reply_to: None,
+        body: "fixture message".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms: now(),
+    };
+    store.lock().unwrap().post_message(&incoming).unwrap();
+    let outgoing = Outgoing {
+        to: To::Sender(incoming.id.to_string()),
+        body: "fixture reply".into(),
+        wait_ms: None,
+    };
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    let invoke = |operation| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority: Authority::default(),
+                operation,
+            },
+        )
+    };
+    for operation in [
+        Operation::SendMessage(outgoing.clone()),
+        Operation::Send(outgoing.clone()),
+        Operation::Deliver(outgoing),
+        Operation::Inbox(query.clone()),
+        Operation::AcknowledgeInbox(Receipt {
+            ids: vec![incoming.id],
+        }),
+    ] {
+        let mut rival = rusqlite::Connection::open(&path).unwrap();
+        let tx = rival
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let refusal = invoke(operation).unwrap_err();
+        tx.rollback().unwrap();
+        assert_eq!(refusal.code, ProtocolErrorCode::StoreBusy, "{refusal:?}");
+        assert!(refusal.retryable, "{refusal:?}");
+        assert_eq!(
+            store.lock().unwrap().peek_messages(None, &query).unwrap(),
+            vec![incoming.clone()]
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .peek_messages(incoming.from.lineage, &query)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
