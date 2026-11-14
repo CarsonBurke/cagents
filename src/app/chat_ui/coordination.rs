@@ -857,7 +857,10 @@ impl Runtime {
         raw: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let expanded = self.item_expanded(&item.id);
-        let name = started(spawn);
+        let name = match spawn.agents.as_slice() {
+            [only] if only.name.is_empty() => "an agent".to_owned(),
+            _ => started(spawn),
+        };
         let task = spawn.agents.first().and_then(|agent| {
             agent
                 .prompt
