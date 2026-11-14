@@ -720,7 +720,9 @@ mod tests {
             );
             (watching, unwatched)
         };
+        // Everything sent so far, without waiting for more.
         let told = |delivery: &crate::host::delivery::DeliveryQueue| {
+            delivery.close_after_drain();
             std::iter::from_fn(|| delivery.pop())
                 .filter_map(|outbound| match outbound.message {
                     crate::terminal_ipc::ServerMessage::AutomationProposalsChanged {
