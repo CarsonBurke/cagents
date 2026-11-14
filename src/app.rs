@@ -9109,7 +9109,7 @@ impl Cagents {
                 .workspace
                 .visibility(card)
                 .is_some_and(VisibilityClass::is_mounted)
-            && !self.workspace_inputs_blocked()
+            && !self.pane_content_inputs_blocked(card)
     }
 
     fn restore_repository_editor_focus(&mut self) -> Task<Message> {
@@ -9297,6 +9297,9 @@ impl Cagents {
 
     /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
+        if self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay) {
+            return card_control_id(card, "inspector.toggle");
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_)) => self
                 .card_chrome
@@ -10510,7 +10513,8 @@ impl Cagents {
         // typing aimed at the dialog and write it into a shell, which runs
         // what it is given. An overlay inspector additionally hides the workspace, so
         // that shell would not even be on screen.
-        let card_focused = focused && self.refresh_ui.focused && !self.workspace_inputs_blocked();
+        let card_focused =
+            focused && self.refresh_ui.focused && !self.pane_content_inputs_blocked(id);
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
             let address = chrome
@@ -10676,7 +10680,7 @@ impl Cagents {
                     // typed into a shell the reader cannot see.
                     self.ended_terminal(id).is_none()
                         && !self.terminal_close_pending(id)
-                        && !self.workspace_inputs_blocked(),
+                        && !self.pane_content_inputs_blocked(id),
                     move |payload| Message::TerminalDropped { card: id, payload },
                 );
                 let terminal = crate::ui_controls::popover(
@@ -10702,10 +10706,7 @@ impl Cagents {
             // The page's native surface draws over the application, so an
             // inspector covering a narrow pane's content hides it.
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
-                .obscured(
-                    self.workspace_inputs_blocked()
-                        || self.pane_inspector_layout(id) == Some(InspectorLayout::Overlay),
-                )
+                .obscured(self.pane_content_inputs_blocked(id))
                 .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
@@ -13027,6 +13028,9 @@ impl Cagents {
     /// before it reaches anything behind it.
     fn focused_repository_card_with_find(&self) -> Option<CardId> {
         let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) if runtime.find_is_open() => Some(card),
             _ => None,
@@ -13170,6 +13174,13 @@ impl Cagents {
 
     fn workspace_inputs_blocked(&self) -> bool {
         self.modal_is_open() || self.chrome_ui.is_open() || self.palette.is_open()
+    }
+
+    /// A pane's overlay takes input from its covered content, while the other
+    /// panes and the inspector's own controls remain usable.
+    fn pane_content_inputs_blocked(&self, card: CardId) -> bool {
+        self.workspace_inputs_blocked()
+            || self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
     }
 
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
@@ -17763,6 +17774,7 @@ impl Application for Cagents {
                     && !modifiers.logo()
                     && key.eq_ignore_ascii_case("s")
                     && let Some(card) = self.workspace.focused()
+                    && !self.pane_content_inputs_blocked(card)
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
                 {
                     let stage = runtime.selected_staging_selection(true).is_some();
@@ -17853,7 +17865,7 @@ impl Application for Cagents {
                 // The model search field captures Escape to blur itself. Close
                 // its picker in the same press, while dialogs retain priority.
                 if is_escape_press(&event)
-                    && !self.workspace_inputs_blocked()
+                    && self.workspace.focused().is_some_and(|card| !self.pane_content_inputs_blocked(card))
                     && self.dismiss_chat_picker()
                 {
                     return self.workspace.focused().map_or_else(Task::none, |card| {
@@ -17947,6 +17959,7 @@ impl Application for Cagents {
                     return task;
                 }
                 if let Some(card) = self.workspace.focused()
+                    && !self.pane_content_inputs_blocked(card)
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
@@ -17988,6 +18001,7 @@ impl Application for Cagents {
                 #[cfg(feature = "integrated-browser")]
                 if !captured
                     && let Some(card) = self.workspace.focused()
+                    && !self.pane_content_inputs_blocked(card)
                     && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
                     && let Some(message) = browser_shortcut(card, &event)
                 {
@@ -17998,6 +18012,7 @@ impl Application for Cagents {
                 }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
+                    && !self.pane_content_inputs_blocked(card)
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {
                     return cosmic::task::message(Message::Repository(RepositoryAction::Save {
@@ -25398,6 +25413,18 @@ mod tests {
             app.pane_inspector_layout(card),
             Some(InspectorLayout::Overlay)
         );
+        assert!(
+            !app.card_holds_keyboard(card),
+            "covered content cannot take input"
+        );
+        assert!(!app.workspace_inputs_blocked(), "other panes stay usable");
+        assert_eq!(
+            app.card_keyboard_focus(card),
+            card_control_id(card, "inspector.toggle"),
+            "a pane focus request lands in the inspector, not its hidden content"
+        );
+        assert_eq!(app.focus_pane_keyboard_after_press(card).units(), 0);
+        assert_eq!(app.focus_pane_keyboard_after_rest(card).units(), 0);
         resize(&mut app, 520.0);
         assert!(
             app.pane_inspectors.is_open(card),

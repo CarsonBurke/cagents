@@ -233,6 +233,22 @@ impl Cagents {
             .any(|card| self.pane_conversation(card) == Some(conversation))
     }
 
+    /// Conversations with a current list in a mounted inspector. Compute this
+    /// once per label sync, rather than scanning every inspector for each chat.
+    pub(super) fn listed_watched_conversations(&self) -> HashSet<TerminalId> {
+        let listed: HashSet<_> = self
+            .pull_request_inspector
+            .conversations
+            .values()
+            .filter_map(conversation::State::latest_list)
+            .map(|(conversation, _, _)| conversation)
+            .collect();
+        self.mounted_inspectors()
+            .filter_map(|card| self.pane_conversation(card))
+            .filter(|conversation| listed.contains(conversation))
+            .collect()
+    }
+
     /// Follows each mounted inspector's conversation, and forgets the panes
     /// that have left the workspace.
     pub(super) fn sync_pull_request_inspector(&mut self) {

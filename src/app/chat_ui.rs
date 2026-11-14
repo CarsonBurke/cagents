@@ -6797,6 +6797,7 @@ impl Cagents {
         // A conversation counts as watched once the shown inspector holds a
         // list taken since it last turned to it, not merely while it is shown:
         // until then what a chat took earlier may no longer be true.
+        let watched = self.listed_watched_conversations();
         let stale = self
             .cards
             .iter()
@@ -6807,11 +6808,7 @@ impl Cagents {
                         board,
                         worktrees,
                         conversation,
-                        watched: self.inspector_watches(conversation)
-                            && self
-                                .pull_request_inspector
-                                .conversation_list(conversation)
-                                .is_some(),
+                        watched: watched.contains(&conversation),
                     };
                     (runtime.pull_request_labels_built_from != Some(built_from))
                         .then_some((*card, built_from))
@@ -7012,6 +7009,7 @@ impl Cagents {
     pub(super) fn chat_picker_owns_keyboard(&self) -> bool {
         self.workspace
             .focused()
+            .filter(|card| !self.pane_content_inputs_blocked(*card))
             .and_then(|card| self.cards.get(&card))
             .is_some_and(|card| {
                 matches!(card, CardRuntime::Chat(runtime)
@@ -7026,6 +7024,9 @@ impl Cagents {
             return None;
         }
         let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
         let CardRuntime::Chat(runtime) = self.cards.get(&card)? else {
             return None;
         };
@@ -8005,6 +8006,9 @@ impl Cagents {
             return None;
         }
         let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return None;
         };
@@ -18799,6 +18803,82 @@ mod tests {
     fn draft_chat(app: &mut Cagents) -> CardId {
         draft_chat_for_provider(app, Provider::Codex)
     }
+    #[test]
+    fn a_pane_inspector_overlay_keeps_typing_out_of_the_covered_chat() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, crate::agent::Provider::Claude);
+        let resize = app.workspace.resize_viewport(500.0);
+        drop(app.apply_viewport(resize, false, DurableChange::None));
+        app.open_pane_inspector_now(card);
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        let press = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            },
+            captured: false,
+        };
+        let composer = |app: &Cagents| match app.cards.get(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.composer.text(),
+            _ => panic!("the draft stays a chat"),
+        };
+        let before = composer(&app);
+        drop(app.update(press()));
+        assert_eq!(
+            composer(&app),
+            before,
+            "the hidden composer must not receive typing"
+        );
+        assert_eq!(app.focus_pane_keyboard_on_activation().units(), 0);
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.picker_keyboard = true;
+            runtime.account_picker = true;
+        }
+        assert!(
+            !app.chat_picker_owns_keyboard(),
+            "the covered picker cannot trap Tab"
+        );
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(
+            !app.pane_inspectors.is_open(card),
+            "Escape closes the visible inspector"
+        );
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            assert!(
+                runtime.account_picker,
+                "Escape leaves the covered picker alone"
+            );
+            runtime.account_picker = false;
+            runtime.picker_keyboard = false;
+        }
+        drop(app.set_pane_inspector_open(card, false));
+        app.settle_pane_inspectors();
+        drop(app.update(press()));
+        assert!(
+            composer(&app).starts_with('x'),
+            "unclaimed typing works after closing the overlay"
+        );
+    }
+
     pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
         let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();
