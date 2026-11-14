@@ -6246,8 +6246,11 @@ fn reasoning_rows<'a>(
 
 fn model_matches_active(model: &chat::Model, active: &chat::ActiveModel) -> bool {
     model.id == active.id
-        || model.label == active.label
-        || (model.id == "default" && model.label == format!("Default ({})", active.label))
+        || (matches!(
+            model.id.as_str(),
+            "default" | "opus" | "sonnet" | "haiku" | "opusplan"
+        ) && (model.label == active.label
+            || (model.id == "default" && model.label == format!("Default ({})", active.label))))
 }
 
 fn reasoning_default<'a>(
@@ -15695,6 +15698,16 @@ mod tests {
             Some("high")
         );
         assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
+        snapshot.models[1].label = "Opus 5.5".into();
+        assert_eq!(
+            staged_model_choice(snapshot).as_deref(),
+            Some("Opus 5.5 · Default"),
+            "distinct concrete models can share a display name"
+        );
+        assert_eq!(
+            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
+            Some("high")
+        );
         snapshot.active_model = None;
         assert_eq!(staged_model_choice(snapshot), None);
         snapshot.selected_model = Some("default".into());
