@@ -1304,6 +1304,38 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
             .is_some_and(|index| index + 1 < items.len())
 }
 
+/// The thought's own timestamps describe its work. Older providers without an
+/// end can use the next observation in this same stream, or its recorded end.
+fn reasoning_elapsed(
+    item: &chat::Item,
+    items: &[Arc<chat::Item>],
+    finished: bool,
+    finished_at: Option<u64>,
+) -> Option<String> {
+    if !finished {
+        return None;
+    }
+    let start = item.started_at?;
+    let end = item
+        .started_at
+        .and(item.at)
+        .or_else(|| {
+            items
+                .iter()
+                .skip_while(|candidate| candidate.id != item.id)
+                .skip(1)
+                .next()
+                .and_then(|candidate| candidate.started_at.or(candidate.at))
+        })
+        .or_else(|| {
+            items
+                .last()
+                .filter(|last| last.id == item.id)
+                .and(finished_at)
+        })?;
+    Some(disclosure::duration(end.saturating_sub(start)))
+}
+
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
 const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
@@ -2028,6 +2060,43 @@ impl Runtime {
         }
     }
 
+    fn child_item_revision(
+        &self,
+        agent: &chat::Subagent,
+        item: &chat::Item,
+        cached: &CachedItem,
+        dark: bool,
+        now: Option<u64>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut revision = std::hash::DefaultHasher::new();
+        (
+            cached.revision,
+            self.item_expanded(&item.id),
+            self.child_find_revision(),
+            dark,
+        )
+            .hash(&mut revision);
+        if item.content.is_step() {
+            disclosure::item_duration_ms(item, now)
+                .map(|millis| millis / 1_000)
+                .hash(&mut revision);
+        }
+        if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
+            let finished = reasoning_finished(
+                &agent.items,
+                agent.status == chat::ToolStatus::Running,
+                &item.id,
+            );
+            (
+                finished,
+                reasoning_elapsed(item, &agent.items, finished, None),
+            )
+                .hash(&mut revision);
+        }
+        revision.finish()
+    }
+
     fn child_find_revision(&self) -> Option<(u64, u64)> {
         self.find.as_ref().map(|_| {
             (
@@ -2203,14 +2272,8 @@ impl Runtime {
                 use std::hash::{Hash, Hasher};
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
-                let mut revision = std::hash::DefaultHasher::new();
-                (
-                    cached.revision,
-                    self.item_expanded(&item.id),
-                    self.child_find_revision(),
-                    dark,
-                )
-                    .hash(&mut revision);
+                let revision =
+                    self.child_item_revision(agent, item, cached, dark, self.source_now_ms());
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0))
                         .ceil()
@@ -2220,7 +2283,7 @@ impl Runtime {
                 });
                 let row_index = transcript.lazy(
                     key.finish(),
-                    revision.finish(),
+                    revision,
                     estimate,
                     vec![scroll::item_id(&item.id), self.find_anchor(&item.id)],
                     step::GAP_L,
@@ -4451,24 +4514,31 @@ impl Runtime {
                 self.item_expanded(&item.id),
             )
                 .hash(&mut hasher);
+            if item.content.is_step() {
+                disclosure::item_duration_ms(item, now)
+                    .map(|millis| millis / 1_000)
+                    .hash(&mut hasher);
+            }
             if slot == Some(turn::Slot::Thinking) {
                 // A newer turn starting does not revive old reasoning that
                 // already has another item after it.
-                reasoning_finished(
+                let finished = reasoning_finished(
                     &self.snapshot.items,
                     self.snapshot.busy && !self.snapshot.has_later,
                     &item.id,
+                );
+                (
+                    finished,
+                    reasoning_elapsed(
+                        item,
+                        &self.snapshot.items,
+                        finished,
+                        self.snapshot
+                            .finished_at
+                            .filter(|_| !self.snapshot.has_later),
+                    ),
                 )
-                .hash(&mut hasher);
-                if !self.snapshot.has_later
-                    && self
-                        .snapshot
-                        .items
-                        .last()
-                        .is_some_and(|last| last.id == item.id)
-                {
-                    self.snapshot.finished_at.hash(&mut hasher);
-                }
+                    .hash(&mut hasher);
             }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
@@ -5223,14 +5293,16 @@ impl Runtime {
             if long {
                 widget::column::with_children(vec![
                     text,
-                    widget::button::custom(design::caption(if expanded {
-                        "Show less"
-                    } else {
-                        "Show more"
-                    }))
-                    .class(crate::ui_controls::control_style(false, None))
-                    .on_press(action(Action::Toggle(self.target, item.id.clone())))
-                    .into(),
+                    disclosure::row_on(
+                        if expanded { "Show less" } else { "Show more" }.into(),
+                        if expanded { "Show less" } else { "Show more" }.into(),
+                        Icon::Chat,
+                        None,
+                        None,
+                        Some(expanded),
+                        Some(Action::Toggle(self.target, item.id.clone())),
+                        design::accent_wash,
+                    ),
                 ])
                 .spacing(step::GAP_S)
                 .into()
@@ -5286,11 +5358,18 @@ impl Runtime {
             return self.prompt_view(item);
         };
         let expanded = self.item_expanded(&item.id);
-        let toggle = |label: &'static str| -> Element<'static, Message> {
-            widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Toggle(self.target, item.id.clone())))
-                .into()
+        let toggle = |label: &'static str, surface: fn(&cosmic::Theme) -> iced::Color| {
+            let label = if expanded { "Show less" } else { label };
+            disclosure::row_on(
+                label.into(),
+                label.into(),
+                Icon::Chat,
+                None,
+                None,
+                Some(expanded),
+                Some(Action::Toggle(self.target, item.id.clone())),
+                surface,
+            )
         };
         let glyph = |name: Icon| -> Element<'static, Message> {
             widget::icon(name.handle())
@@ -5304,28 +5383,18 @@ impl Runtime {
         };
         if *kind == chat::DeliveryKind::Report {
             let heading = chat::delivery_heading(*kind, from, sender, summary);
-            // Preserve an explicit task outcome even when its name needs to
-            // shorten. This is report presentation, not failure inference:
-            // arbitrary report prose never becomes a parent account error.
-            let short = [" was stopped", " finished", " failed"]
-                .into_iter()
-                .find_map(|ending| {
-                    heading
-                        .strip_suffix(ending)
-                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
-                })
-                .unwrap_or_else(|| Self::short_description(&heading, 96));
-            let disclosure = widget::button::custom(design::caption(if expanded {
-                "Hide details"
-            } else {
-                "Details"
-            }))
-            .name(format!(
-                "{} report details: {heading}",
-                if expanded { "Hide" } else { "Show" }
-            ))
-            .class(crate::ui_controls::control_style(false, None))
-            .on_press(action(Action::Toggle(self.target, item.id.clone())));
+            let disclosure = disclosure::row(
+                heading.clone(),
+                format!(
+                    "{} report details: {heading}",
+                    if expanded { "Hide" } else { "Show" }
+                ),
+                Icon::Chat,
+                None,
+                None,
+                Some(expanded),
+                Some(Action::Toggle(self.target, item.id.clone())),
+            );
             let copy = widget::button::custom(design::caption("Copy report"))
                 .name(format!("Copy original report: {heading}"))
                 .class(crate::ui_controls::control_style(false, None))
@@ -5334,22 +5403,7 @@ impl Runtime {
                     item.id.clone(),
                     CopyPart::Text,
                 )));
-            let mut rows = vec![
-                widget::row::with_children(vec![
-                    glyph(Icon::Chat),
-                    crate::interaction::tooltip(
-                        design::caption(short).width(Length::Fill),
-                        heading.clone(),
-                    )
-                    .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-                widget::row::with_children(vec![disclosure.into(), copy.into()])
-                    .spacing(step::GAP_S)
-                    .into(),
-            ];
+            let mut rows = vec![disclosure, copy.into()];
             if expanded {
                 if !sender.is_empty() && !heading.contains(sender) {
                     rows.push(selectable_prose::plain(
@@ -5400,7 +5454,9 @@ impl Runtime {
                     self, item, cached, settings, None,
                 ));
                 if notice.body.long {
-                    rows.push(toggle("Show more"));
+                    rows.push(toggle("Show more", |theme| {
+                        theme.current_container().base.into()
+                    }));
                 }
             }
             return widget::container(message_actions(
@@ -5445,11 +5501,7 @@ impl Runtime {
         if !body.is_empty() {
             rows.push(fold::fold(
                 prose::view(cached, settings, self.target, self.find.as_deref()),
-                toggle(if *kind == chat::DeliveryKind::Report {
-                    "Show full report"
-                } else {
-                    "Show full message"
-                }),
+                toggle("Show full message", design::sunken),
                 !expanded,
                 DELIVERY_FOLDED_HEIGHT,
                 step::GAP_S,
@@ -5543,21 +5595,7 @@ impl Runtime {
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
             let expanded = has_text && self.item_expanded(&item.id);
-            let elapsed = item.started_at.or(item.at).and_then(|start| {
-                items
-                    .iter()
-                    .skip_while(|candidate| candidate.id != item.id)
-                    .skip(1)
-                    .find_map(|candidate| candidate.started_at.or(candidate.at))
-                    .or_else(|| {
-                        items
-                            .last()
-                            .filter(|last| last.id == item.id)
-                            .and(finished_at)
-                    })
-                    .map(|end| format_duration(end.saturating_sub(start)))
-            });
-            let elapsed = elapsed.filter(|_| finished);
+            let elapsed = reasoning_elapsed(item, items, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
                 if finished {
@@ -5567,74 +5605,31 @@ impl Runtime {
                 }
                 .clone()
             } else if finished {
-                elapsed.as_ref().map_or_else(
-                    || "Thought process".to_owned(),
-                    |elapsed| format!("Thought for {elapsed}"),
-                )
+                if elapsed.is_some() {
+                    "Thought for".to_owned()
+                } else {
+                    "Thought process".to_owned()
+                }
             } else {
                 "Thinking".to_owned()
             };
-            // Keep the preview on one line with the same fade as other overflow
-            // strips. Its wheel gestures belong to the transcript, not this line.
-            let text = crate::interaction::parent_wheel(crate::interaction::overflow_fade_x(
-                widget::scrollable(
-                    design::body(label.clone())
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .wrapping(iced::widget::text::Wrapping::None),
-                )
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    iced::widget::scrollable::Scrollbar::hidden(),
-                ))
-                .width(Length::Fill)
-                .height(design::LINE_BODY),
-            ));
-            let mut line = vec![
-                // Step headers have a disclosure before their status icon.
-                widget::Space::new().width(design::COMPACT_ICON_SIZE).into(),
-                crate::ui_controls::passive_icon(Icon::Agent, design::COMPACT_ICON_SIZE),
-                text,
-            ];
-            if !finished {
-                line.push(crate::ui_controls::activity_spinner(
-                    f32::from(design::COMPACT_ICON_SIZE),
-                    design::muted_color,
-                ));
-            } else if has_text && let Some(elapsed) = &elapsed {
-                line.push(design::caption(elapsed.clone()).into());
-            }
-            if has_text {
-                line.push(crate::ui_controls::passive_icon(
+            let name = format!("Reasoning: {label}");
+            let header = disclosure::row_on(
+                label,
+                name,
+                Icon::Agent,
+                (!finished).then_some(chat::ToolStatus::Running),
+                elapsed,
+                has_text.then_some(expanded),
+                has_text.then(|| Action::Toggle(target, item.id.clone())),
+                move |theme| {
                     if expanded {
-                        Icon::ChevronDown
+                        design::sunken(theme)
                     } else {
-                        Icon::ChevronRight
-                    },
-                    design::COMPACT_ICON_SIZE,
-                ));
-            }
-            let line = widget::row::with_children(line)
-                .width(Length::Fill)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center);
-            let name = match (&elapsed, has_text) {
-                (Some(elapsed), true) => format!("Reasoning: {label} · {elapsed}"),
-                _ => format!("Reasoning: {label}"),
-            };
-            // Empty/redacted thoughts have no hidden content and no toggle.
-            // Keep the button path stable for live text and disclosure changes.
-            let header: Element<'static, Message> = if has_text {
-                widget::button::custom(line)
-                    .name(name)
-                    .class(crate::ui_controls::control_style(false, None))
-                    .width(Length::Fill)
-                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                    .on_press(action(Action::Toggle(target, item.id.clone())))
-                    .into()
-            } else {
-                widget::container(line)
-                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                    .into()
-            };
+                        theme.current_container().base.into()
+                    }
+                },
+            );
             let mut rows = vec![header];
             if expanded {
                 rows.push(
@@ -11066,7 +11061,7 @@ mod tests {
                     .iter()
                     .chain(accessible.children())
                     .any(|node| node.node().role() == Role::Button
-                        && node.node().label() == Some("Tried to write docs/large-report.md")),
+                        && node.node().label() == Some(name)),
                 "the row names the file it tried to write ({name})"
             );
         }
@@ -11147,43 +11142,37 @@ mod tests {
                 .size()
                 .height
         };
-        let mut element = runtime.step_strip(turn, Vec::new);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 1000.0)),
-        );
-        assert_eq!(
-            node.size().height,
-            one_line,
-            "the strip stays one line tall"
-        );
-        // The strip is a button around the row of its parts; the last of
-        // them pairs the summary with the duration that follows it.
-        let layout = Layout::new(&node);
-        let line = layout
-            .children()
-            .next()
-            .and_then(|button| button.children().next())
-            .expect("the strip's row");
-        let pair = line.children().last().unwrap();
-        let summary = pair.children().next().unwrap().bounds();
-        let duration = pair.children().last().unwrap().bounds();
-        assert!(duration.width > 0.0);
-        // The summary was shaped wider than the pane and cut to the room the
-        // duration leaves it, rather than measured as nothing.
-        assert!(
-            summary.width > 150.0,
-            "the summary is {} wide",
-            summary.width
-        );
-        assert!(summary.x + summary.width < duration.x);
-        assert!(
-            duration.x + duration.width <= 320.0,
-            "the duration ends at {} in a 320 pane",
-            duration.x + duration.width
-        );
+        for width in [200.0, 320.0, 960.0] {
+            let mut element = runtime.step_strip(turn, Vec::new);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
+            );
+            assert_eq!(node.size().height, one_line, "one row at width {width}");
+            assert_eq!(node.size().width, width, "the whole row is clickable");
+            let line = Layout::new(&node)
+                .children()
+                .next()
+                .and_then(|button| button.children().next())
+                .expect("the strip's header row");
+            let cells: Vec<_> = line.children().map(|cell| cell.bounds()).collect();
+            assert_eq!(cells.len(), 4, "kind, preview, elapsed time, chevron");
+            let [icon, summary, duration, chevron] = cells.as_slice() else {
+                unreachable!();
+            };
+            assert!(icon.x + icon.width < summary.x);
+            assert!(summary.width > 0.0, "the preview keeps visible space");
+            assert!(summary.x + summary.width < duration.x);
+            assert!(duration.width > 0.0);
+            assert!(duration.x + duration.width < chevron.x);
+            assert!(chevron.x + chevron.width <= width);
+            assert!(
+                (width - chevron.x - chevron.width - step::GAP_S).abs() < 1.0,
+                "the chevron stays at the trailing control inset"
+            );
+        }
     }
 
     #[test]
@@ -11219,11 +11208,20 @@ mod tests {
                 started_at: None,
                 at: None,
             };
-            let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
             assert_eq!(runtime.cache[&item.id].preview.text, target);
             assert_eq!(runtime.turns[0].summary, name);
             for open in [false, true] {
-                let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
+                if open {
+                    runtime.expanded.insert(item.id.clone());
+                } else {
+                    runtime.expanded.remove(&item.id);
+                }
+                let mut element = runtime.step_view(
+                    &item,
+                    &runtime.cache[&item.id],
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                );
                 let renderer = crate::app::tests::headless_renderer();
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(
@@ -11258,9 +11256,12 @@ mod tests {
                 let copy = nodes
                     .iter()
                     .find(|node| node.node().label() == Some("Copy this message"))
-                    .unwrap()
-                    .id()
-                    .clone();
+                    .map(|node| node.id().clone());
+                assert_eq!(
+                    copy.is_some(),
+                    open,
+                    "copy remains available in the expanded detail"
+                );
                 use iced_accessibility::{
                     A11yId,
                     accesskit::{Action as A11yAction, ActionRequest, TreeId},
@@ -11298,7 +11299,10 @@ mod tests {
                 assert!(dispatch(event(unknown, A11yAction::Focus)).is_empty());
                 let mut mismatched = event(row.clone(), A11yAction::Click);
                 if let iced::Event::A11y(_, request) = &mut mismatched {
-                    request.target_node = copy.clone().into();
+                    request.target_node = copy
+                        .clone()
+                        .unwrap_or_else(|| A11yId::from(iced::advanced::widget::Id::unique()))
+                        .into();
                 }
                 assert!(dispatch(mismatched).is_empty());
                 let mut wrong_tree = event(row.clone(), A11yAction::Click);
@@ -11312,6 +11316,9 @@ mod tests {
                     matches!(&toggled[0], Message::ChatUi(Action::Toggle(actual, id))
                     if *actual == runtime.target && id == &item.id)
                 );
+                let Some(copy) = copy else {
+                    continue;
+                };
                 let copied = dispatch(event(copy.clone(), A11yAction::Click));
                 assert_eq!(copied.len(), 1);
                 assert!(
@@ -13359,6 +13366,167 @@ mod tests {
     }
 
     #[test]
+    fn finished_reasoning_uses_its_own_end_before_successor_or_turn_timing() {
+        let mut thought = chat::Item {
+            id: "timed-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: String::new(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: Some(1_000),
+            at: Some(13_000),
+        };
+        let later = Arc::new(chat::Item {
+            id: "delayed-tool".into(),
+            started_at: Some(90_000),
+            at: Some(100_000),
+            ..thought.clone()
+        });
+        for text in ["", "[Redacted thinking]", "A readable thought"] {
+            if let ItemContent::Text { text: body, .. } = &mut thought.content {
+                *body = text.into();
+            }
+            for items in [
+                vec![Arc::new(thought.clone())],
+                vec![Arc::new(thought.clone()), later.clone()],
+            ] {
+                assert_eq!(
+                    reasoning_elapsed(&thought, &items, true, Some(200_000)).as_deref(),
+                    Some("12s")
+                );
+                assert_eq!(
+                    reasoning_elapsed(&thought, &items, false, Some(200_000)),
+                    None
+                );
+            }
+        }
+        thought.at = thought.started_at;
+        assert_eq!(
+            reasoning_elapsed(&thought, &[], true, None).as_deref(),
+            Some("0s")
+        );
+        thought.at = None;
+        let items = vec![Arc::new(thought.clone()), later];
+        assert_eq!(
+            reasoning_elapsed(&thought, &items, true, None).as_deref(),
+            Some("1m 29s")
+        );
+        let items = vec![Arc::new(thought.clone())];
+        assert_eq!(
+            reasoning_elapsed(&thought, &items, true, Some(66_000)).as_deref(),
+            Some("1m 5s")
+        );
+        assert_eq!(reasoning_elapsed(&thought, &items, true, None), None);
+        thought.started_at = None;
+        thought.at = Some(13_000);
+        assert_eq!(
+            reasoning_elapsed(&thought, &[Arc::new(thought.clone())], true, None),
+            None,
+            "a last-update timestamp alone does not establish a zero-length interval"
+        );
+    }
+
+    #[test]
+    fn reasoning_own_end_changes_invalidate_parent_and_mounted_child_rows() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let thought = chat::Item {
+            id: "metadata-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Recorded thought".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: Some(1_000),
+            at: Some(13_000),
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
+        let before = fingerprints(&runtime, true);
+        let content_revision = runtime.cache[&thought.id].revision;
+        Arc::make_mut(&mut Arc::make_mut(&mut runtime.snapshot).items[0]).at = Some(25_000);
+        assert_eq!(runtime.cache[&thought.id].revision, content_revision);
+        assert_ne!(
+            before,
+            fingerprints(&runtime, true),
+            "own-end metadata changes the retained parent row"
+        );
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                items: vec![Arc::new(thought.clone())],
+                status: chat::ToolStatus::Succeeded,
+                ..native_child_fixture()
+            });
+        runtime.selected_subagent = Some("native-child".into());
+        let snapshot = runtime.snapshot.clone();
+        runtime.prepare_child_cache(&snapshot);
+        preparation::drain_fixture(&mut runtime);
+        assert!(runtime.child_cache.contains_key(&thought.id));
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut tree = Tree::empty();
+        let render = |runtime: &Runtime, tree: &mut Tree| {
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "project".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            tree.diff(&mut element);
+            let node = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 900.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let before = render(&runtime, &mut tree);
+        assert!(
+            before
+                .iter()
+                .any(|name| name == "Reasoning: Recorded thought · 12s"),
+            "{before:?}"
+        );
+        let revision = runtime.child_cache[&thought.id].revision;
+        Arc::make_mut(&mut Arc::make_mut(&mut runtime.snapshot).subagents[0].items[0]).at =
+            Some(25_000);
+        assert_eq!(runtime.child_cache[&thought.id].revision, revision);
+        let after = render(&runtime, &mut tree);
+        assert!(
+            after
+                .iter()
+                .any(|name| name == "Reasoning: Recorded thought · 24s"),
+            "{after:?}"
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|name| name == "Reasoning: Recorded thought · 12s")
+        );
+    }
+
+    #[test]
     fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced_accessibility::accesskit::Role;
@@ -13371,7 +13539,7 @@ mod tests {
                 phase: chat::Phase::Commentary,
             },
             started_at: Some(1_000),
-            at: Some(1_000),
+            at: Some(13_000),
         };
         let next = chat::Item {
             id: "command".into(),
@@ -13434,7 +13602,7 @@ mod tests {
             .push(Arc::new(next));
         assert_eq!(
             label(&runtime),
-            "Reasoning: First thought · 24.0s",
+            "Reasoning: First thought · 12s",
             "a child's tool call finishes its previous thought while the child runs"
         );
         let child = &mut Arc::make_mut(&mut runtime.snapshot).subagents[0];
@@ -13442,7 +13610,7 @@ mod tests {
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(
             label(&runtime),
-            "Reasoning: First thought",
+            "Reasoning: First thought · 12s",
             "parent busy state cannot revive a completed child"
         );
     }
@@ -13461,7 +13629,7 @@ mod tests {
                     phase: chat::Phase::Commentary,
                 },
                 started_at: Some(1_000),
-                at: Some(1_000),
+                at: Some(13_000),
             };
             let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
             let snapshot = Arc::make_mut(&mut runtime.snapshot);
@@ -13493,9 +13661,9 @@ mod tests {
                     .filter_map(|node| node.node().label())
                     .collect::<Vec<_>>();
                 let expected = if body.is_empty() {
-                    "Thought process"
+                    "Thought for"
                 } else {
-                    "Reasoning: Earlier thought"
+                    "Reasoning: Earlier thought · 12s"
                 };
                 assert!(labels.contains(&expected), "older page labels: {labels:?}");
                 assert!(
@@ -13527,11 +13695,11 @@ mod tests {
                 phase: chat::Phase::Commentary,
             },
             started_at: Some(1_000),
-            at: Some(1_000),
+            at: Some(13_000),
         };
         let next = chat::Item {
             id: "command".into(),
-            started_at: Some(13_000),
+            started_at: Some(1_000),
             at: Some(13_000),
             content: ItemContent::Tool {
                 name: "Read".into(),
@@ -13590,7 +13758,7 @@ mod tests {
                     assert_eq!(buttons.len(), 1);
                     assert_eq!(
                         buttons[0].node().label(),
-                        Some("Reasoning: First thought · 12.0s")
+                        Some("Reasoning: First thought · 12s")
                     );
                 } else {
                     assert!(
@@ -13602,7 +13770,15 @@ mod tests {
                             .root()
                             .iter()
                             .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("Thought for 12.0s"))
+                            .any(|node| node.node().label() == Some("Thought for"))
+                    );
+                    assert!(
+                        accessible
+                            .root()
+                            .iter()
+                            .chain(accessible.children())
+                            .any(|node| node.node().label() == Some("12s")),
+                        "empty/redacted finished reasoning retains its right-aligned duration"
                     );
                 }
             }
@@ -14089,6 +14265,54 @@ mod tests {
             runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(4000)),
             runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(60000)),
             "completed durations stay fixed",
+        );
+    }
+
+    #[test]
+    fn quiet_coordination_and_child_tool_rows_advance_only_on_elapsed_seconds() {
+        let item = chat::Item {
+            id: "quiet-call".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Task".into(),
+                input: r#"{"prompt":"Inspect the changes","subagent_type":"Explore"}"#.into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: Some(1_000),
+            at: Some(1_500),
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let turn = &runtime.turns[0];
+        assert!(
+            turn.steps.is_empty(),
+            "coordination cards render among prose"
+        );
+        assert_eq!(
+            runtime.turn_fingerprint_at(turn, true, Some(2_500)),
+            runtime.turn_fingerprint_at(turn, true, Some(2_999))
+        );
+        assert_ne!(
+            runtime.turn_fingerprint_at(turn, true, Some(2_500)),
+            runtime.turn_fingerprint_at(turn, true, Some(3_000)),
+            "a quiet raw-call timer must keep advancing"
+        );
+        let mut agent = native_child_fixture();
+        agent.items = vec![Arc::new(item.clone())];
+        let cached = &runtime.cache[&item.id];
+        let revision = |item: &chat::Item, now| {
+            runtime.child_item_revision(&agent, item, cached, true, Some(now))
+        };
+        assert_eq!(revision(&item, 2_500), revision(&item, 2_999));
+        assert_ne!(revision(&item, 2_500), revision(&item, 3_000));
+        let mut waiting = item;
+        if let ItemContent::Tool { status, .. } = &mut waiting.content {
+            *status = chat::ToolStatus::Waiting;
+        }
+        assert_eq!(
+            revision(&waiting, 3_000),
+            revision(&waiting, 90_000),
+            "background waiting retains its observed work interval"
         );
     }
 

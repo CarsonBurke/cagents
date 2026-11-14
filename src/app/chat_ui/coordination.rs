@@ -1069,7 +1069,15 @@ impl Runtime {
             );
         }
         if let Some(brief) = &coordinated.brief {
-            rows.push(self.folded_markdown(item, cached, "brief", brief, "Shared brief", settings));
+            rows.push(self.folded_markdown(
+                item,
+                cached,
+                "brief",
+                brief,
+                "Shared brief",
+                settings,
+                design::raised,
+            ));
         }
         let several = spawn.agents.len() > 1;
         for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
@@ -1196,9 +1204,15 @@ impl Runtime {
     ) -> Option<Element<'static, Message>> {
         Some(match (text, content) {
             (Text::Inline(text), _) if text.trim().is_empty() => return None,
-            (Text::Inline(_), Some(content)) => {
-                self.folded_markdown(item, cached, part, content, unfold, settings)
-            }
+            (Text::Inline(_), Some(content)) => self.folded_markdown(
+                item,
+                cached,
+                part,
+                content,
+                unfold,
+                settings,
+                design::raised,
+            ),
             (Text::File(path), _) => design::caption(format!("The contents of {path}")).into(),
             _ => design::caption("Read from standard input, which the transcript does not show")
                 .into(),
@@ -1215,20 +1229,28 @@ impl Runtime {
         content: &markdown::Content,
         unfold: &'static str,
         settings: markdown::Settings,
+        surface: fn(&cosmic::Theme) -> iced::Color,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
         let open = self.part_unfolded(&key);
-        let toggle =
-            widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Unfold(self.target, key)));
+        let label = if open { "Show less" } else { unfold }.to_owned();
+        let toggle = disclosure::row_on(
+            label.clone(),
+            label,
+            Icon::Chat,
+            None,
+            None,
+            Some(open),
+            Some(Action::Unfold(self.target, key)),
+            surface,
+        );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
             toggle,
             !open,
             view::DELIVERY_FOLDED_HEIGHT,
             step::GAP_S,
-            design::raised,
+            surface,
         )
     }
 
@@ -1282,7 +1304,15 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-                self.folded_markdown(item, cached, part, content, "Show more", settings),
+                self.folded_markdown(
+                    item,
+                    cached,
+                    part,
+                    content,
+                    "Show more",
+                    settings,
+                    design::sunken,
+                ),
             ])
             .spacing(step::GAP_XS),
         )
@@ -1316,12 +1346,13 @@ impl Runtime {
             controls.push(
                 widget::button::custom(
                     widget::row::with_children(vec![
-                        design::caption(label).into(),
+                        design::caption(label.clone()).into(),
                         muted_glyph(Icon::Jump),
                     ])
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
                 )
+                .name(label)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(Action::SelectSubagent(
@@ -1332,20 +1363,28 @@ impl Runtime {
             );
         }
         let open = self.item_expanded(&item.id);
-        let source = match &item.content {
-            ItemContent::Command { .. } => "command",
-            _ => "tool call",
+        let (source, icon) = match &item.content {
+            ItemContent::Command { .. } => ("command", Icon::Terminal),
+            _ => ("tool call", Icon::Utilities),
         };
-        controls.push(
-            widget::button::custom(design::caption(if open {
-                format!("Hide {source}")
+        let label = if open {
+            format!("Hide {source}")
+        } else {
+            format!("Show {source}")
+        };
+        let disclosure = disclosure::row_on(
+            label.clone(),
+            label,
+            icon,
+            Some(if overruled {
+                ToolStatus::Failed
             } else {
-                format!("Show {source}")
-            }))
-            .class(crate::ui_controls::control_style(open, None))
-            .padding([step::GAP_XS as u16, step::GAP_S as u16])
-            .on_press(action(Action::Toggle(self.target, item.id.clone())))
-            .into(),
+                item.content.status().unwrap_or(ToolStatus::Succeeded)
+            }),
+            disclosure::item_duration(item, self.source_now_ms()),
+            Some(open),
+            Some(Action::Toggle(self.target, item.id.clone())),
+            design::raised,
         );
         // A step the CLI said failed is not "Completed" for its exit status,
         // and an agent left running in the background is not done because
@@ -1385,9 +1424,19 @@ impl Runtime {
                     .into(),
             );
         }
-        widget::row::with_children(controls)
+        let mut rows = Vec::new();
+        if !controls.is_empty() {
+            rows.push(
+                widget::row::with_children(controls)
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        rows.push(disclosure);
+        widget::column::with_children(rows)
             .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
             .width(Length::Fill)
             .into()
     }
@@ -1411,6 +1460,87 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    #[test]
+    fn raw_tool_disclosure_preserves_transcript_link_and_elapsed_in_a_narrow_card() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let item = chat::Item {
+            id: "toolu_send".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "SendMessage".into(),
+                input: serde_json::json!({
+                    "to": "a1892b93e88999a7d",
+                    "message": "Review the change",
+                    "summary": "Review request"
+                })
+                .to_string(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: Some(1_000),
+            at: Some(13_000),
+        };
+        let (mut runtime, _handle) =
+            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "toolu_reviewer".into(),
+                kind: "reviewer".into(),
+                description: "Review the change".into(),
+                status: ToolStatus::Running,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            });
+        runtime.agent_addresses =
+            Arc::new([("a1892b93e88999a7d".into(), "toolu_reviewer".into())].into());
+        let renderer = crate::app::tests::headless_renderer();
+        for open in [false, true] {
+            if open {
+                runtime.expanded.insert(item.id.clone());
+            } else {
+                runtime.expanded.remove(&item.id);
+            }
+            let cached = &runtime.cache[&item.id];
+            let coordinated = cached.coordination.as_deref().unwrap();
+            let mut element = runtime.card_footer(&item, cached, coordinated, false);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 800.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let buttons = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| node.node().role() == Role::Button)
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 2);
+            assert_eq!(buttons[0].node().label(), Some("Transcript"));
+            assert_eq!(
+                buttons[1].node().label(),
+                Some(if open {
+                    "Hide tool call · 12s"
+                } else {
+                    "Show tool call · 12s"
+                })
+            );
+            let bounds = buttons[1].node().bounds().unwrap();
+            assert_eq!(bounds.width(), 240.0);
+        }
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the

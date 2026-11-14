@@ -403,6 +403,19 @@ pub fn overflow_fade_x<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(OverflowFadeX {
         content: content.into(),
+        surface: None,
+    })
+}
+
+/// Fade into the actual surface behind a strip, including an enclosing
+/// control's hover/focus paint. The surface is resolved at draw time.
+pub fn overflow_fade_x_on<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    surface: impl Fn(&Theme) -> Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(OverflowFadeX {
+        content: content.into(),
+        surface: Some(Box::new(surface)),
     })
 }
 
@@ -1210,6 +1223,7 @@ fn overflow_edges(offset: f32, viewport: f32, content: f32) -> (bool, bool) {
 
 struct OverflowFadeX<'a, Message> {
     content: Element<'a, Message>,
+    surface: Option<Box<dyn Fn(&Theme) -> Color + 'a>>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1397,8 +1411,12 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
-        // Match the chrome behind the tabs, not the component fill sitting on it.
-        let mut color: Color = theme.current_container().base.into();
+        // Tab strips use container chrome; embedded controls supply their
+        // resolved surface so the fade follows hover, press and keyboard focus.
+        let mut color: Color = self.surface.as_ref().map_or_else(
+            || theme.current_container().base.into(),
+            |surface| surface(theme),
+        );
         color.a = 1.0;
         let mut clear = color;
         clear.a = 0.0;

@@ -82,6 +82,7 @@ mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod disclosure;
 mod failure;
 mod find;
 mod find_navigation;
