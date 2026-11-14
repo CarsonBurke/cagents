@@ -338,3 +338,45 @@ fn a_resolved_receipt_cannot_fill_another_gestures_missing_authority() {
     assert!(!app.shared_removal_terminal_receipt(pane.id, receipt));
     assert!(!app.shared_removal_ready(pane.id));
 }
+
+#[test]
+fn close_capture_uses_only_complete_authority_for_its_scope() {
+    let (mut app, _, _, pane) = channel_move_fixture();
+    let scope = app.workspace_model.views[0].scope.clone();
+    app.shared_views.snapshot_sequence = 10;
+    app.workspace_model.sequence = 900; // metadata alone did not read the pane
+    app.shared_views.view_sequences.insert(scope, 20);
+    let terminal = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap()));
+    app.workspace_model.views[0].panes[0].kind = terminal.clone();
+    app.card_state_mut(pane.id).unwrap().kind = terminal;
+    app.cards.insert(pane.id, CardRuntime::Completed);
+    assert!(app.capture_shared_removal(pane.id));
+    assert_eq!(app.terminal_cleanup_authority(pane.id).capture().unwrap().model_sequence, 20);
+}
+
+#[test]
+fn a_refused_close_readmits_an_ended_successor_as_retained_output_only() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let (mut app, _, _, mut pane) = channel_move_fixture();
+    let owner = HostSessionProof { host_session_id: "fixture".into(), boot_id: "boot".into(), host_incarnation: "daemon".into() };
+    let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+    source.continuity = TerminalContinuity::Live {
+        host_session_id: owner.host_session_id.clone(), boot_id: owner.boot_id.clone(), host_incarnation: owner.host_incarnation.clone(),
+    };
+    pane.kind = CardKind::Terminal(source.clone());
+    app.workspace_model.views[0].panes[0] = pane.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let old = uuid::Uuid::new_v4();
+    let surface = crate::app::tests::unconnected_surface(directory.path(), source.id);
+    surface.set_worker_receipt_for_test(&owner, old);
+    app.cards.insert(pane.id, CardRuntime::Terminal(surface));
+    assert!(app.capture_shared_removal(pane.id));
+    source.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
+        code: Some(0), signal: None, occurred_at_unix_ms: 42,
+    }};
+    app.workspace_model.views[0].panes[0].kind = CardKind::Terminal(source.clone());
+    drop(app.readmit_shared_terminal_after_source_refusal(pane.id));
+    assert!(matches!(app.cards.get(&pane.id), Some(CardRuntime::Completed)));
+    assert_eq!(app.card_state(pane.id).unwrap().kind, CardKind::Terminal(source));
+    assert_eq!(app.terminal_cleanup_authority(pane.id).worker(), Some(&views::TerminalRemovalBasis::Worker { owner, instance: old }));
+}

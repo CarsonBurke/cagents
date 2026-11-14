@@ -156,14 +156,14 @@ fn edit_then<T>(
                     unreachable!()
                 };
                 let CardKind::Terminal(source) = &before.kind else {
-                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 };
                 if state
                     .terminal_removal_basis(source)
-                    .map_err(|_| Registry::VIEW_SOURCE_CONFLICT.to_owned())?
+                    .map_err(|_| Registry::VIEW_REMOVAL_CONFLICT.to_owned())?
                     != *worker
                 {
-                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 }
             }
             Ok(Some(state))

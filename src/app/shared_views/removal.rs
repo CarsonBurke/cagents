@@ -170,7 +170,8 @@ impl Cagents {
                             .find(|v| &v.scope == scope)
                             .unwrap()
                             .revision,
-                        model_sequence: self.shared_views.snapshot_sequence,
+                        model_sequence: self.shared_views.snapshot_sequence.max(
+                        self.shared_views.view_sequences.get(scope).copied().unwrap_or(0)),
                         before: before.clone(),
                     }
                 }),
@@ -360,13 +361,12 @@ impl Cagents {
         if self.pane_transfer_pending(card) || self.terminal_start_in_flight(card) {
             return Task::none();
         }
-        let Some(CardRuntime::Terminal(surface)) = self.cards.get(&card) else {
-            return Task::none();
-        };
-        if surface.execution_instance() != Some(*instance)
-            || surface.host_proof().as_ref() != Some(owner)
-        {
-            return Task::none();
+        match self.cards.get(&card) {
+            Some(CardRuntime::Terminal(surface))
+                if surface.execution_instance() == Some(*instance)
+                    && surface.host_proof().as_ref() == Some(owner) => {}
+            Some(CardRuntime::Completed | CardRuntime::Failed(_)) => {}
+            _ => return Task::none(),
         }
         let mut owners = self.workspace_model.views.iter().filter_map(|view| {
             view.panes
@@ -409,6 +409,12 @@ impl Cagents {
         self.shared_views.ended_terminal_workers.remove(&card);
         self.shared_views.attached.insert(card);
         self.terminal_recovery_attempts.remove(&terminal);
+        if matches!(self.card_state(card).map(|s| &s.kind), Some(CardKind::Terminal(s)) if terminal_ended(s)) {
+            self.cards.insert(card, CardRuntime::Completed);
+            self.lifecycle.remove(card);
+            self.set_residency(card, Residency::Hibernated);
+            return self.attach_retained_outputs([card]);
+        }
         let exposure = self.exposure(card);
         self.readmit_held_terminal(card, exposure);
         self.lifecycle_sweep()

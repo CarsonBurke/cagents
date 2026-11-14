@@ -682,7 +682,7 @@ pub(super) fn apply_recorded(
                     .and_then(|b| b.basis)
                     .is_some_and(|original| &original != worker)
                 {
-                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 }
             }
             changed = match change {
