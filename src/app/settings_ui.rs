@@ -468,7 +468,7 @@ fn settings_category_controls<'a>(
             );
             let sidebar_worktrees = settings_choice(
                 "Checkouts in sidebar",
-                "Group worktrees after channels, or list them directly. Hidden lists each open pane under its project instead of the checkouts it runs in. Projects can override this default, except while it is Hidden.",
+                "Show each project's checkouts after its channels, grouped or listed directly. Hidden hides every checkout, the repository's root checkout too, and lists each open pane under its project instead. Projects can override this default, except while it is Hidden.",
                 SettingsField::SidebarWorktrees,
                 settings::SidebarWorktrees::ALL
                     .map(|mode| (mode.label(), mode.key(), draft.sidebar_worktrees == mode)),
