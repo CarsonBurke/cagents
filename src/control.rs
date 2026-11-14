@@ -1679,7 +1679,22 @@ impl ControlClient {
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let terminal_id = session.id;
         if !completed_only {
-            self.attach_and_synchronize(terminal_id)?;
+            if let Err(error) = self.attach_and_synchronize(terminal_id) {
+                // The cleanup request has not been sent. Keep disappearance
+                // distinct from an unconfirmed reply after cleanup admission.
+                return Err(match error {
+                    ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        retryable: false,
+                        ..
+                    } => ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                        retryable: false,
+                    },
+                    error => error,
+                });
+            }
         }
         let request = ClientRequest::CloseTerminalSource {
             session,
@@ -8566,6 +8581,28 @@ mod tests {
                     after_event_sequence: 0,
                 } if terminal_id == id
             ));
+            if peer_case == "attach-missing" {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(2),
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalNotFound,
+                        "fixture terminal disappeared before Attach",
+                        false,
+                    )),
+                );
+                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(3),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed { terminals: vec![] },
+                    },
+                );
+                return;
+            }
             reply(
                 &mut server_stream,
                 &pinned,
@@ -8722,6 +8759,11 @@ mod tests {
             let result = public_terminal_close_exchange_source(true, case, true);
             assert_eq!(result.is_ok(), case != "remote-error", "{case}: {result:?}");
         }
+        assert!(
+            matches!(public_terminal_close_exchange_source(true, "attach-missing", true),
+            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, message, retryable: false })
+                if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT)
+        );
     }
 
     #[test]

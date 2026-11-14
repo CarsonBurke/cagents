@@ -1185,6 +1185,13 @@ fn validate_cleanup_source(
     )>,
 ) -> Result<(), ProtocolError> {
     if let Some((source, basis)) = expected {
+        if !state.terminals.contains_key(&source.id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalNotFound,
+                crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT,
+                false,
+            ));
+        }
         let valid = match basis {
             crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance } => {
                 owner == state.proof()
@@ -2264,7 +2271,14 @@ fn process_admitted_request(
             drop(_shared);
             let mut close =
                 reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
-            let outcome = handle.close_checked(allow_active);
+            let outcome = if cleanup_source.is_some()
+                && !allow_active
+                && paired.as_ref().is_some_and(|actor| actor.owns_work())
+            {
+                crate::terminal_ipc::TerminalCloseResult::Active
+            } else {
+                handle.close_checked(allow_active)
+            };
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -3688,16 +3702,15 @@ pub(in crate::host) mod tests {
 
     #[test]
     fn source_checked_close_cannot_retarget_a_completed_replacement_after_basis_read() {
-        let (host, _directory, _, original) = retention_client_host("source-close-race");
-        let id = host
-            .lock()
-            .unwrap()
-            .terminals
-            .keys()
-            .next()
-            .copied()
-            .unwrap();
-        let session = host.lock().unwrap().descriptor(1, id).unwrap().session;
+        let (host, _directory, mut session, original) = retention_client_host("source-close-race");
+        let id = session.id;
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
         let basis = host
             .lock()
             .unwrap()
@@ -3715,6 +3728,25 @@ pub(in crate::host) mod tests {
         {
             let mut state = host.lock().unwrap();
             drop(state.retire_terminal(id));
+        }
+        let absent = process_request(
+            &host,
+            1,
+            ClientRequest::CloseTerminalSource {
+                session: session.clone(),
+                basis: basis.clone(),
+                completed_only: true,
+                allow_active: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(absent.code, ProtocolErrorCode::TerminalNotFound);
+        assert_eq!(
+            absent.message,
+            crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT
+        );
+        {
+            let mut state = host.lock().unwrap();
             state.reserve_spawn(id).unwrap();
             state
                 .finish_spawn(1, session.clone(), replacement.clone(), false)
@@ -3722,18 +3754,21 @@ pub(in crate::host) mod tests {
         }
         for completed_only in [false, true] {
             for allow_active in [false, true] {
-                assert!(
-                    process_request(
-                        &host,
-                        1,
-                        ClientRequest::CloseTerminalSource {
-                            session: session.clone(),
-                            basis: basis.clone(),
-                            completed_only,
-                            allow_active,
-                        }
-                    )
-                    .is_err()
+                let error = process_request(
+                    &host,
+                    1,
+                    ClientRequest::CloseTerminalSource {
+                        session: session.clone(),
+                        basis: basis.clone(),
+                        completed_only,
+                        allow_active,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT
                 );
                 let state = host.lock().unwrap();
                 assert!(state.terminals[&id].handle.same_worker(&replacement));
@@ -4296,6 +4331,15 @@ pub(in crate::host) mod tests {
     }
 
     fn assert_completed_native_confirmation(provider: crate::agent::Provider) {
+        for completed_only in [true, false] {
+            assert_completed_native_confirmation_case(provider, completed_only);
+        }
+    }
+
+    fn assert_completed_native_confirmation_case(
+        provider: crate::agent::Provider,
+        completed_only: bool,
+    ) {
         use crate::{
             chat::{
                 self,
@@ -4413,7 +4457,7 @@ pub(in crate::host) mod tests {
         let request = |allow_active| ClientRequest::CloseTerminalSource {
             session: session.clone(),
             basis: basis.clone(),
-            completed_only: true,
+            completed_only,
             allow_active,
         };
         assert!(matches!(
