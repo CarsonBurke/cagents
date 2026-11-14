@@ -63,6 +63,7 @@ STUBS = {
             case ${args[i]} in
                 --root) root=${args[i + 1]} ;;
                 --cmd) cmd=${args[i + 1]} ;;
+                --portal) portal=${args[i + 1]} ;;
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
@@ -86,6 +87,8 @@ STUBS = {
         if [ -n "${cmd:-}" ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
+            # Like the real harness, a portal session runs the app on its own bus.
+            [ -z "${portal:-}" ] || export DBUS_SESSION_BUS_ADDRESS=stub-portal-bus XDG_CONFIG_HOME=$root/xdg-config
             NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
@@ -158,7 +161,8 @@ STUBS = {
         #!/bin/bash
         if [ "${0##*/}" = cagents-ui ]; then
             rm -f "$STUB_LOG/ui-absent"
-            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
+            # Replace atomically: a polling reader must never see it empty.
+            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid.$$" && mv -f "$STUB_LOG/ui-pid.$$" "$STUB_LOG/ui-pid"
             printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             exec sleep 300
@@ -1087,6 +1091,17 @@ class Evidence(unittest.TestCase):
         self.assertEqual(len(starts), 2, starts)
         self.assertNotIn("--portal", starts[0])
         self.assertIn("--portal gtk", starts[1])
+
+    def test_nested_commands_reach_the_bus_and_settings_the_app_reads(self) -> None:
+        self.built()
+        show = ("sh", "-c", 'printf "%s %s" "$DBUS_SESSION_BUS_ADDRESS" "$XDG_CONFIG_HOME"')
+        self.run_tool("start", "after")
+        self.assertTrue(self.run_tool("nested", *show).stdout.startswith("stub "))
+        self.run_tool("stop")
+        self.run_tool("start", "after", "--portal", "gtk")
+        self.assertEqual(self.run_tool("nested", *show).stdout,
+                         f"stub-portal-bus {self.task}/niri/xdg-config")
+        self.run_tool("stop")
 
     def test_an_unknown_portal_is_refused_before_the_lock(self) -> None:
         self.built()

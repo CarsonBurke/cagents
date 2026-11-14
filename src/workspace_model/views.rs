@@ -540,7 +540,7 @@ pub enum Change {
         repository: PathBuf,
         before: Pane,
         terminal: Option<TerminalRemovalBasis>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         capture: Option<CapturedTerminalSource>,
     },
     /// A runtime receipt cannot publish a predecessor's exit over its replacement.

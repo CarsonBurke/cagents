@@ -838,3 +838,24 @@ fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
         assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
     }
 }
+
+#[test]
+fn automation_request_changes_are_beyond_every_older_recording() {
+    let changed = ServerMessage::AutomationProposalsChanged {
+        repository: "/fixture".into(),
+    };
+    let index = super::variant_index(&changed).unwrap();
+    const SINCE: u16 = 178;
+    assert_eq!(index + 1, variant_count(&recorded(SINCE), "ServerMessage"));
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}

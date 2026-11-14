@@ -9593,10 +9593,6 @@
         [
           "chat_capacity",
           "Unit"
-        ],
-        [
-          "store_busy",
-          "Unit"
         ]
       ]
     },
@@ -9949,6 +9945,17 @@
                     "Container": "cagents::chat::AgentAddress"
                   }
                 }
+              ]
+            ]
+          }
+        ],
+        [
+          "automation_proposals_changed",
+          {
+            "Struct": [
+              [
+                "repository",
+                "Str"
               ]
             ]
           }

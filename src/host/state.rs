@@ -693,6 +693,23 @@ impl HostState {
         }
     }
 
+    /// Tells every window watching notifications that `repository`'s pending
+    /// automation requests changed, so one offering them reads them again.
+    pub(in crate::host) fn automation_proposals_changed(&self, repository: &std::path::Path) {
+        for client in self.notification_watchers.keys() {
+            if let Some(delivery) = self.clients.get(client) {
+                let _ = delivery.push(ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: self.proof().clone(),
+                    message: ServerMessage::AutomationProposalsChanged {
+                        repository: repository.to_path_buf(),
+                    },
+                });
+            }
+        }
+    }
+
     pub(super) fn notifications_changed(&self) {
         for client in self.notification_watchers.keys() {
             if let Some(delivery) = self.clients.get(client) {

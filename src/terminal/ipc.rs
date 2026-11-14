@@ -665,7 +665,7 @@ pub enum ClientRequest {
         basis: crate::workspace_model::views::TerminalRemovalBasis,
         completed_only: bool,
         allow_active: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
     },
     /// Resolve only the canonical generation from the original complete view.
@@ -955,6 +955,11 @@ pub enum ServerMessage {
     ChatAgentAddresses {
         chat_id: TerminalId,
         addresses: Vec<crate::chat::AgentAddress>,
+    },
+    /// The project gained or resolved a pending automation request.
+    /// Notification subscribers read the pending requests again.
+    AutomationProposalsChanged {
+        repository: std::path::PathBuf,
     },
     /// Exact attachment metadata, separate from the frozen descriptor used by
     /// historical update sources. This UUID never authorizes process cleanup.

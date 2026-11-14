@@ -411,6 +411,9 @@ impl Preferences {
 pub enum Update {
     Changed,
     Activated(Target),
+    /// The pending automation requests of the project at this repository
+    /// changed.
+    AutomationProposalsChanged(std::path::PathBuf),
 }
 
 impl Preferences {

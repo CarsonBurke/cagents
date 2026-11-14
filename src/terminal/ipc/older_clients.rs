@@ -640,6 +640,26 @@ mod tests {
         assert!(variant_index(&addresses).unwrap() >= CANDIDATE_LINE.server_messages);
     }
 
+    /// A change to a project's pending automation requests is told only to a
+    /// window of this protocol. No listed older client could decode it, so it
+    /// is withheld, and such a window keeps finding requests by reading them.
+    #[test]
+    fn automation_request_changes_are_withheld_from_every_older_client() {
+        let changed = ServerMessage::AutomationProposalsChanged {
+            repository: "/fixture".into(),
+        };
+        assert!(!OLDER_CLIENTS.is_empty());
+        for client in OLDER_CLIENTS {
+            assert!(client.protocol < 178);
+            assert!(
+                !client.admits_message(&changed),
+                "protocol {} clients cannot decode it",
+                client.protocol
+            );
+        }
+        assert!(variant_index(&changed).unwrap() >= CANDIDATE_LINE.server_messages);
+    }
+
     #[test]
     fn a_work_reply_after_the_older_protocol_is_refused() {
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();

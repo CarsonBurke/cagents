@@ -44,6 +44,8 @@ pub(crate) mod daemon_health;
 pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
 pub mod design;
+#[cfg(feature = "ui")]
+pub(crate) mod desktop_cursor_blink;
 pub mod device;
 pub mod device_service;
 pub mod diagnostics;
