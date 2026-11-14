@@ -17,14 +17,27 @@ impl Runtime {
         let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
             .align_items(Alignment::Center)
             .spacing(space::M as u16);
-        let draft = widget::container(view::body(text))
-            .width(Length::Fill)
-            .padding(space::M)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_M; 4],
-                false,
-            ));
+        // A long draft scrolls inside its card, so it fades into the card's
+        // own fill at the card's edges. The vertical inset scrolls with the
+        // text; the side inset keeps the fade clear of the rounded corners.
+        let draft = widget::container(crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::container(view::body(text))
+                    .width(Length::Fill)
+                    .padding(design::with_vertical_rail(iced::Padding::from([
+                        space::M,
+                        0.0,
+                    ]))),
+            ),
+            design::sunken,
+        ))
+        .width(Length::Fill)
+        .padding([0.0, space::M])
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_M; 4],
+            false,
+        ));
         // Files and images wait with the text; their names say they were kept.
         let attached = self
             .unsent_attachments()
@@ -35,10 +48,7 @@ impl Runtime {
             [
                 header.into(),
                 design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into(),
-                crate::interaction::overflow_fade_y(
-                    widget::scrollable(draft).height(Length::Fill),
-                    design::base,
-                ),
+                draft.into(),
             ]
             .into_iter()
             .chain((!attached.is_empty()).then(|| {

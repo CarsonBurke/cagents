@@ -299,7 +299,10 @@ impl cosmic::Application for Window {
                     widget::scrollable(
                         widget::column::with_children(body)
                             .spacing(space::L)
-                            .padding([space::L, 0.0])
+                            .padding(crate::design::with_vertical_rail(iced::Padding::from([
+                                space::L,
+                                0.0,
+                            ])))
                             .width(iced::Length::Fill),
                     )
                     .height(iced::Length::Fill),

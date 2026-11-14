@@ -421,18 +421,22 @@ impl Runtime {
         // Both lists stop at the card's inset; what passes that edge fades
         // into the card rather than being cut there.
         let list = crate::interaction::overflow_fade_y(
-            widget::scrollable(widget::column::with_children(files).spacing(2))
-                .id(card_control_id(target.card, "chat-changes-files"))
-                .on_scroll(move |viewport| {
-                    action(Action::ChangeListScrolled(
-                        target,
-                        summary.request_id,
-                        list_epoch,
-                        narrow,
-                        viewport.absolute_offset().y,
-                    ))
-                })
-                .height(Length::Fill),
+            widget::scrollable(
+                widget::column::with_children(files)
+                    .spacing(2)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+            )
+            .id(card_control_id(target.card, "chat-changes-files"))
+            .on_scroll(move |viewport| {
+                action(Action::ChangeListScrolled(
+                    target,
+                    summary.request_id,
+                    list_epoch,
+                    narrow,
+                    viewport.absolute_offset().y,
+                ))
+            })
+            .height(Length::Fill),
             design::component_base,
         );
         let list = scroll_restore::on_mount(
@@ -597,9 +601,13 @@ impl Runtime {
             .into(),
         );
         crate::interaction::overflow_fade_y(
-            widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
-                .id(card_control_id(target.card, "chat-changes-detail"))
-                .height(Length::Fill),
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .spacing(space::XS)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+            )
+            .id(card_control_id(target.card, "chat-changes-detail"))
+            .height(Length::Fill),
             design::component_base,
         )
     }

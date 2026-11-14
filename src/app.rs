@@ -11427,7 +11427,8 @@ impl Cagents {
                         widget::container(crate::interaction::overflow_fade_y(
                             widget::scrollable(
                                 widget::column::with_children(rows)
-                                    .spacing(WORKSPACE_SWITCHER_ROW_GAP),
+                                    .spacing(WORKSPACE_SWITCHER_ROW_GAP)
+                                    .padding(design::with_vertical_rail(Padding::ZERO)),
                             )
                             .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
                             .height(Length::Shrink),
