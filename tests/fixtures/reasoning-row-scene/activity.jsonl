@@ -16,3 +16,6 @@
 {"type":"stream_event","event":{"type":"content_block_stop","index":0}}
 {"type":"stream_event","event":{"type":"message_stop"}}
 {"type":"user","uuid":"activity-receipt-notice-@TURN@","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<task-id>activity-receipt-@TURN@</task-id>\n<tool-use-id>activity-wait-@TURN@</tool-use-id>\n<status>completed</status>\n<summary>Background command &quot;Wait for the fixture receipt&quot; completed (exit code 0)</summary>\n</task-notification>"}}
+{"type":"assistant","uuid":"activity-answer-@TURN@","message":{"id":"activity-answer-@TURN@","role":"assistant","content":[{"type":"text","text":"The receipt arrived and the fixture worktree is still clean."}]}}
+{"type":"result","uuid":"activity-result-@TURN@","subtype":"success","is_error":false}
+{"_end":true}

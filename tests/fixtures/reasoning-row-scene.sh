@@ -299,7 +299,7 @@ if [ "$scene" = activity ]; then
     sleep 4
     scroll_top
     shot activity-working
-    evidence drive wait 'receipt has arrived' --timeout 60 >/dev/null
+    evidence drive wait 'receipt arrived' --timeout 60 >/dev/null
     scroll_top
     shot activity-finished
     printf '%s\n' 'Captured a working turn and the same turn finished.'
