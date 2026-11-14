@@ -2,6 +2,7 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Activity spinner cost](#activity-spinner-cost)
+- [Idle UI wakeups](#idle-ui-wakeups)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
@@ -95,6 +96,48 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+## Idle UI wakeups
+
+A focused text cursor blinks for ten seconds after the last input, then rests
+visible and asks for no more frames, following GTK's
+`gtk-cursor-blink-timeout`. Every cursor shares that schedule:
+`iced_core::text::Blink` in `vendor/iced-core`, used by iced's text editor and
+text input (`vendor/iced-widget`), libcosmic's text input, the app's code editor
+and the terminal. Before, each focused cursor repainted the whole window every
+500 ms for as long as it held focus, and the chat composer holds focus after a
+chat opens or a message is sent.
+
+To measure it, seed a fixture with 30 settled chats, start a session with
+`scripts/native-evidence start SIDE --ui-trace`, spawn three agents whose
+first turn stays busy, then interrupt them. Leave the composer focused and the
+pointer still. Sample each UI thread's `voluntary_ctxt_switches` and
+`schedstat` CPU time from `/proc/PID/task/*` over 60 s, 30 s after spawning
+and 20 s after interrupting. The `ui-trace` summaries give the redraw count and
+time per five-second window.
+
+Local reference: fw16 (Ryzen 7 7840HS), `dev-runtime` build, headless nested
+session at 1500x900. Before is `374370965`; after is `2aec4b05c`. CPU is a
+percentage of one core:
+
+| State | Before | After |
+| --- | --- | --- |
+| Agents settled, composer focused: UI thread | 7.0 wakeups/s, 2.0% | 1.7 wakeups/s, 1.1% |
+| Agents settled, composer focused: redraws | 2.7/s | 0.8/s |
+| Agents settled, composer focused: clipboard thread | 6.2 wakeups/s | 2.2 wakeups/s |
+| Three agents working: UI thread | 26.4 wakeups/s, 6.1% | 23.5 wakeups/s, 5.5% |
+
+With agents working, the spinners already ask for ten frames a second, so the
+cursor's frames made little difference there. Neither side logged a UI-thread
+call over 50 ms after startup. The remaining settled redraws follow the app's
+own updates.
+
+`dev-runtime` builds also turn off wgpu-core's debug assertions. With them,
+WGPU captured a backtrace whenever it took its snatch lock, on every frame, and
+the runner's `RUST_BACKTRACE=1` made that a real stack walk: about 16% of the
+UI thread's profile samples with three agents working. Release builds never
+paid it. The CPU difference in the working row is within the noise of the
+shared build host.
 
 ## UI thread trace
 
