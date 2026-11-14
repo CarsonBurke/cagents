@@ -109,6 +109,19 @@ A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.
+Each five-second report also covers the frames the shell presented, on any of its surfaces: how many, the
+p50/p95/p99/max **work** of each, and the same quantiles of the **interval**
+between consecutive presentations, as `ui-trace   Frames n=N work ...` and
+`ui-trace   Frames interval ...`. A frame's work is the wall time the shell
+spent handling events since it presented the previous frame, up to presenting
+this one: the updates, view, layout, drawing and presentation it took, but not
+time spent waiting for events, nor winit's own dispatch outside the shell's
+event handler. The first frame also carries startup, including creating the
+compositor. The interval shows pacing against the display's refresh. A
+window with no frames and no other traced work prints nothing, so an idle UI
+that draws nothing stays silent. The shell reports frames through
+`iced_runtime::frame`, a hook in the vendored runtime; see
+`vendor/iced-winit/README.cagents.md`.
 `scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
 the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
 flag, and other builds compile the trace out.

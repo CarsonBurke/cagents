@@ -12,6 +12,7 @@
 pub mod clipboard;
 pub mod dnd;
 pub mod font;
+pub mod frame;
 pub mod image;
 pub mod keyboard;
 pub mod platform_specific;
