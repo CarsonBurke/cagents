@@ -12,6 +12,28 @@ evidence cli project open "$fx/project"
 sleep 3
 evidence drive click main
 sleep 5
+# Navigation and the first default pane are asynchronous. Verify that the
+# native app published the exact worktree before asking the daemon to use it.
+worktree_ready() {
+    evidence env python3 - <<'CHECK'
+import os, sqlite3
+from pathlib import Path
+fixture = Path(os.environ['CAGENTS_EVIDENCE_FIXTURE']).resolve()
+root = Path(os.environ['XDG_DATA_HOME']).resolve() / 'cagents-development'
+assert root.is_relative_to(fixture), 'requires a private fixture'
+db = sqlite3.connect(f'file:{root / "workspace-model.sqlite3"}?mode=ro', uri=True)
+project = fixture / 'project'
+ready, = db.execute('SELECT EXISTS(SELECT 1 FROM view_scopes WHERE repository=? AND worktree=?)',
+                    (str(project / '.git'), str(project))).fetchone()
+raise SystemExit(0 if ready else 1)
+CHECK
+}
+if ! worktree_ready; then
+    evidence drive move 400,300
+    evidence drive click main
+    sleep 3
+    worktree_ready
+fi
 spawn() {
     evidence cli --json agent spawn --provider claude --model haiku --surface chat \
         --project "$fx/project" --worktree "$fx/project" "$@"
