@@ -207,7 +207,7 @@ accepted provider commands, so a queued prompt cannot masquerade as idle.
 The candidate drives qualified source daemons through a frozen lifecycle subset:
 the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
 protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
-(`c73002744`), 177 (`374370965`) and 178 (`065017d22`), and the
+(`c73002744`), 177 (`374370965`) and 178 (`3b1e81a4d`), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
 Other source protocols, including 160, 165, 174 and 176, are refused before preparation,

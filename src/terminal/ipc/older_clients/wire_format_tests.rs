@@ -809,12 +809,34 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
-    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
         .chain(crate::update::source::current_client_protocols())
         .filter(|&protocol| protocol < AGENT_ADDRESSES_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
+#[test]
+fn automation_request_changes_are_beyond_recordings_before_their_introduction() {
+    let changed = ServerMessage::AutomationProposalsChanged {
+        repository: "/fixture".into(),
+    };
+    let index = super::variant_index(&changed).unwrap();
+    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < 178);
     for protocol in older {
         assert!(
             variant_count(&recorded(protocol), "ServerMessage") <= index,
