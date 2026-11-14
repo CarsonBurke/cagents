@@ -322,6 +322,133 @@ mid-turn, and `{"_end": true}` to end the turn on the frames' own result. A
 `fixture-slow-start` file holds a conversation's provider at start-up. See
 [the synthetic provider](chat-composer-fixture.md) for each.
 
+## Reasoning and step rows
+
+[`tests/fixtures/reasoning-row-scene.sh`](../tests/fixtures/reasoning-row-scene.sh)
+loads an offline Claude conversation into the actual native app. Its reasoning
+is interleaved with three successful commands, a mixed Read/Search/Edit/MCP
+group, a failed command and a group with an acknowledged background command.
+It includes finished empty reasoning, active empty reasoning and a live thought
+that gains a new last line. The Edit input maps to the app's Changes item;
+its patch is synthetic. None of the described commands or tools executes.
+
+For a short comparison against main after the background-notice changes, run
+`refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
+each revision. Build both revisions before starting either session, use
+`--ui-trace`, and keep the same scale and theme. These modes capture seven
+states: working reasoning with finished durations, expanded failed/running
+commands, narrow working reasoning, collapsed notices, expanded background
+command outcomes, a full monitor event, and expanded finished/failed reports.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" refresh-core
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" refresh-notices
+```
+
+`refresh-core` uses the original reasoning frames and waits for the latest live
+line before capturing. Its narrow state adds an unsent blank thread, as below.
+`refresh-notices` opens a separate named workspace and loads
+[`notices.jsonl`](../tests/fixtures/reasoning-row-scene/notices.jsonl), derived
+from the delivery-notices fixture. It preserves successful and failed
+background command notifications, extends the monitor log beyond its preview,
+and adds a failed Agent report beside the finished report. A peer message
+mentions a failure without being a failed report. Its explicit synthetic
+sender ID also exercises sender captions. Every call, acknowledgement and
+notification is recorded input: no command, child agent or monitor executes,
+and no live provider is contacted.
+All provider files stay under the evidence task's private home.
+
+Allow about five minutes for the seven captures, then reserve three minutes
+for live review. Hand the session to the reviewer by six minutes even if a
+locator needs manual completion. Check whole-row targets, keyboard disclosure
+retention,
+hover/fade continuity and wheel scrolling before stopping. Keep bounded
+CPU/RSS samples and the task's UI trace; this fixture has one working actor,
+one finished actor and an unsent draft, not a large concurrent workload.
+
+If Before filters empty reasoning, its failed command shares the preceding
+mixed step group; After keeps a separate group boundary. The expanded outcome
+screens then show different surrounding disclosures and should be labeled as
+supplementary states, not presented as a matched pair. The other six states
+still provide matching comparisons. During the refreshed native run, the
+notice title's leading icon contaminated its OCR spans, and an exact filename
+wait failed despite the command being visible. The locators now use the
+distinguishing interior words `pool result` and `summary`; the latter does not
+depend on how OCR splits filename punctuation.
+
+Run `wide`, `narrow`, then `web` in the same 1200x900 session on each side:
+
+```sh
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-step-rows
+scripts/native-evidence start before --width 1200 --height 900 --limit 900 \
+    --ui-trace --codex tool-rows
+tests/fixtures/reasoning-row-scene.sh wide
+tests/fixtures/reasoning-row-scene.sh narrow
+tests/fixtures/reasoning-row-scene.sh web
+scripts/native-evidence stop
+```
+
+`wide` captures empty active, expanded and updated live reasoning, followed by
+expanded mixed tools and failed/running commands. `narrow` reuses that
+conversation, adds an unsent blank thread with Ctrl+T, focuses its native tabs,
+and uses Alt+R to select one-third width preferences (three cycles on the
+hosted chat, one on the draft). The panes share the docked workspace at roughly
+270px each. It captures reasoning and the expanded mixed tools at that width.
+The blank draft sends no prompt and starts no provider.
+
+`web` can also run immediately after a fresh `start --codex tool-rows`,
+without a core conversation. It creates a named workspace through the CLI,
+spawns its synthetic Codex actor explicitly there, and opens that workspace
+through the native command palette. Its dedicated app-server `webSearch` item
+contains two invented results. It captures collapsed and expanded rows at the
+550px docked chat width. No web request is sent.
+
+Keep the native window at 1200x900: below the docked inspector's minimum
+workspace width it becomes an overlay that hides the transcript. Run `wide`
+then `narrow` once per session. The ancillary modes `web`, `coordination` and
+`diagnostics` each use a separate named workspace and can run independently;
+they need no core reasoning actor or close request. For a remote `pair`, its
+steps file contains:
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" web
+```
+
+For the neighboring disclosure controls, run `coordination` and `diagnostics`
+in that same session or in a fresh ancillary-only session. `coordination`
+atomically stages
+[`coordination.jsonl`](../tests/fixtures/reasoning-row-scene/coordination.jsonl)
+and starts another offline Claude conversation. It captures folded cards, the
+full Agent prompt, raw tool call, full SendMessage body and delivered report.
+The report comes from a completed task notification; the child transcript is
+also populated by a live child frame. Exercise the raw Input block's hover
+Copy action and the footer's Transcript link during live review. The report's
+Copy action is checked against its final `REPORT_END` paragraph where that
+control exists. The diagnostic mode switches the offline Codex peer to
+`fixture-row-diagnostics`, emitting an original root error followed by a failed
+turn. It captures Details closed/open and checks Copy details through the
+nested compositor's private clipboard, leaving Details open for live review.
+Neither mode reaches the host clipboard.
+
+The OCR locator joins adjacent spans on the same visual line, so split control
+labels and end markers still identify the intended row. Repeated outer/nested
+rows keep distinct indices, and separate panes are never joined. Run its
+source contracts with
+`python3 -I tests/fixtures/reasoning-row-scene/test_locate.py`.
+
+All provider settings and transcripts stay inside the task's private fixture;
+no live model, provider account or real provider home is used. Stop afterward:
+the final thought deliberately stays active for 600 seconds. Run the ancillary
+scenes separately when a longer live review is needed. The background command
+is a recorded protocol acknowledgement, not a sleeping process.
+`--ui-trace` retains UI-thread summaries and calls over 50ms. Compare these and
+bounded CPU/RSS samples during the same captures, and exercise hover/scroll
+while the latest-line delta arrives. This short fixture has one working
+conversation, a blank draft and later a second synthetic conversation; it does
+not establish performance for long histories or many concurrent agents.
+
 ## Adding a scene to evidence
 
 Write the scene as steps, not as instructions in a PR comment, so the next

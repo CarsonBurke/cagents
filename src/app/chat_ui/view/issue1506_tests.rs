@@ -1620,6 +1620,136 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
 }
 
 #[test]
+fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    const BODY: &str = "Readable delivered body with the original contents preserved.";
+    const SENDER: &str = "opaque-transcript-sender-7f31";
+    #[derive(Default)]
+    struct Paragraphs {
+        sender: Option<iced::Rectangle>,
+        body: Option<iced::Rectangle>,
+    }
+    impl Operation for Paragraphs {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            let Some(text) = state.downcast_ref::<selectable_prose::State>() else {
+                return;
+            };
+            if text.plain.as_ref() == format!("Sender: {SENDER}") {
+                assert_eq!(
+                    text.mounted_typography(),
+                    Some((iced::Font::default(), design::TEXT_CAPTION.into())),
+                    "sender metadata uses the regular caption face"
+                );
+                let spans = text.spans.as_ref().expect("mounted sender spans");
+                assert!(spans.iter().all(|span| {
+                    span.font.unwrap_or_default() == iced::Font::default()
+                        && span.size.unwrap_or(design::TEXT_CAPTION.into())
+                            == design::TEXT_CAPTION.into()
+                        && span.color == Some(design::muted_color(&cosmic::theme::active()))
+                }));
+                assert_eq!(text.copied(0..text.plain.len()), text.plain.as_ref());
+                assert!(text.target.is_some(), "metadata stays selectable");
+                self.sender = Some(bounds);
+            } else if text.plain.as_ref() == BODY {
+                self.body = Some(bounds);
+            }
+        }
+    }
+
+    let renderer = crate::app::tests::headless_renderer();
+    for kind in [chat::DeliveryKind::Report, chat::DeliveryKind::Message] {
+        let delivered = chat::Item {
+            id: "sender-metadata".into(),
+            role: Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Delivery {
+                kind,
+                from: if kind == chat::DeliveryKind::Message {
+                    "Fixture peer".into()
+                } else {
+                    String::new()
+                },
+                sender: SENDER.into(),
+                summary: "Agent fixture finished".into(),
+                body: BODY.into(),
+            },
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&delivered));
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, delivered.id.clone())));
+        for searching in [false, true] {
+            if searching {
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    SENDER.into(),
+                ));
+            }
+            let live = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(live);
+            assert!(live.item_expanded(&delivered.id));
+            if searching {
+                assert!(
+                    !live.find_matches.is_empty(),
+                    "Find retains the opaque sender"
+                );
+            }
+            for width in [275.0, 960.0] {
+                let mut element = live.delivery_view(
+                    &delivered,
+                    &live.presentation_cache()[&delivered.id],
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 4_000.0)),
+                );
+                let mut paragraphs = Paragraphs::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut paragraphs,
+                );
+                let sender = paragraphs.sender.expect("expanded selectable sender");
+                let body = paragraphs.body.expect("expanded delivered body");
+                assert!(
+                    (sender.x - body.x).abs() < 0.1,
+                    "kind={kind:?}, width={width}"
+                );
+                assert!((sender.x - step::GAP_M).abs() < 0.1);
+                assert!(sender.y + sender.height <= body.y);
+                assert!(sender.x + sender.width <= node.size().width + 0.1);
+            }
+        }
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .item_expanded(&delivered.id),
+            "closing Find preserves the reader's explicit disclosure"
+        );
+    }
+}
+
+#[test]
 fn report_async_disclosure_closes_without_resurrection_from_queued_preparation() {
     let report = task_report(
         "queued-report",

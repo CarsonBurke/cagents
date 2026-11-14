@@ -511,6 +511,37 @@ fn repaint_ticks_skip_the_projection_tail() {
     assert_eq!((counts(), CHROME_SYNCS.get()), ((1, 1), 1));
 }
 
+/// Background polls keep to their own state, so neither the poll nor its
+/// answer rebuilds the projection: each did, at several milliseconds of the
+/// UI thread, a few times a second while agents worked.
+#[test]
+fn background_polls_skip_the_projection_tail() {
+    use super::{account_ui, automation_approval};
+    let (mut app, _card, _peer) = fixture();
+    reset();
+    let durable = Arc::clone(&app.durable);
+    for _ in 0..4 {
+        drop(app.update(Message::AutomationApproval(
+            automation_approval::Action::Tick,
+        )));
+        drop(app.update(Message::AutomationApproval(
+            automation_approval::Action::Read {
+                generation: 0,
+                result: Arc::new(Ok(Vec::new())),
+            },
+        )));
+        drop(app.update(Message::AccountUi(account_ui::Action::Tick)));
+        drop(app.update(Message::AccountUi(account_ui::Action::OmpRead(
+            crate::account::omp::History::Missing,
+        ))));
+    }
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    // Any other message still projects.
+    drop(app.update(Message::ReportedTitleSaveDue));
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((1, 1), 1));
+}
+
 /// `card_indices` is a function of the durable card order alone, so it is
 /// rebuilt only for a workspace it was not built from.
 #[test]
