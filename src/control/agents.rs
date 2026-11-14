@@ -46,6 +46,12 @@ pub enum AgentCommand {
         /// for a caller that never belonged to a channel, gets a new channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Place the agent among the panes of this open checkout, the
+        /// project's own folder or one of its linked worktrees, instead of
+        /// in a channel. It is also the working directory unless --directory
+        /// names another.
+        #[arg(long, conflicts_with = "channel")]
+        worktree: Option<PathBuf>,
         #[arg(long)]
         #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
@@ -593,12 +599,12 @@ impl ControlClient {
 }
 
 /// Where an agent the caller starts goes, and why, when that is not beside
-/// the caller. An explicit channel wins. Otherwise the agent joins the
+/// the caller. An explicit channel or checkout wins. Otherwise the agent joins the
 /// caller's exact view or, where that is missing or ambiguous, the channel the
 /// caller's lineage last belonged to. Only an agent for another project, or a
 /// caller whose lineage never belonged to a channel, gets a new channel.
 fn spawn_placement(
-    explicit: Option<ChannelId>,
+    explicit: Option<crate::agent_execution::Placement>,
     caller: Option<&crate::agent_execution::directory::Entry>,
     repository: &std::path::Path,
 ) -> (
@@ -607,8 +613,8 @@ fn spawn_placement(
 ) {
     use crate::agent_execution::Placement;
     const ELSEWHERE: &str = "The caller's view belongs to another project; the agent was placed in a new channel for the target project.";
-    if let Some(channel) = explicit {
-        return (Some(Placement::Channel(channel)), None);
+    if let Some(placement) = explicit {
+        return (Some(placement), None);
     }
     let Some(caller) = caller else {
         return (None, None);
@@ -991,6 +997,7 @@ pub(super) fn execute_with_context(
             repository,
             directory,
             channel,
+            worktree,
             account,
             surface,
             model,
@@ -1001,24 +1008,30 @@ pub(super) fn execute_with_context(
             show,
         } => {
             let prompt = prompt.read()?;
-            let absolute =
-                |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let given = if crate::device::is_remote() {
-                directory
-                    .map(|directory| {
-                        if directory.is_absolute() {
-                            Ok(directory)
-                        } else {
-                            Err(AppError::new(
-                                "target",
-                                "remote working directory must be absolute",
-                            ))
-                        }
-                    })
-                    .transpose()?
-            } else {
-                directory.map(absolute).transpose()?
+            let absolute = |path: PathBuf, flag: &str| {
+                if crate::device::is_remote() {
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Err(AppError::new(
+                            "target",
+                            format!("remote {flag} must be absolute"),
+                        ))
+                    }
+                } else {
+                    std::path::absolute(path).map_err(|e| AppError::new("target", e))
+                }
             };
+            // The daemon looks the checkout's view up by its exact path, so a
+            // trailing separator or `.` from the shell must not miss it.
+            let worktree = worktree
+                .map(|path| absolute(path, "--worktree"))
+                .transpose()?
+                .map(|path| path.components().collect::<PathBuf>());
+            let given = directory
+                .map(|path| absolute(path, "working directory"))
+                .transpose()?
+                .or_else(|| worktree.clone());
             let here = match &given {
                 Some(directory) => directory.clone(),
                 None => {
@@ -1105,11 +1118,17 @@ pub(super) fn execute_with_context(
                     }
                 }
             };
-            let (placement, placement_warning) = spawn_placement(
-                channel,
-                caller.as_ref(),
-                channel_repository.as_deref().unwrap_or(&repository),
-            );
+            let owner = channel_repository.as_deref().unwrap_or(&repository);
+            // The daemon refuses a checkout whose view it does not hold.
+            let explicit = channel
+                .map(crate::agent_execution::Placement::Channel)
+                .or_else(|| {
+                    worktree.map(|path| crate::agent_execution::Placement::Worktree {
+                        repository: owner.to_owned(),
+                        path,
+                    })
+                });
+            let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
             let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
             let provider = provider
                 .or(caller.and_then(|caller| caller.provider))
@@ -3317,6 +3336,33 @@ mod tests {
             Cli::try_parse_from(["cagents", "agent", "spawn", "a", "--prompt", "b"]).is_err(),
             "one prompt source"
         );
+        let AgentCommand::Spawn {
+            worktree,
+            directory,
+            ..
+        } = parse(&["spawn", "--worktree", "/repo-linked", "work"])
+        else {
+            panic!("agent spawn")
+        };
+        assert_eq!(worktree.as_deref(), Some(Path::new("/repo-linked")));
+        assert!(
+            directory.is_none(),
+            "the checkout supplies it when spawning"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "agent",
+                "spawn",
+                "--worktree",
+                "/repo",
+                "--channel",
+                &ChannelId::new().to_string(),
+                "work",
+            ])
+            .is_err(),
+            "one placement"
+        );
         let AgentCommand::Spawn { prompt, wait, .. } =
             parse(&["spawn", "--wait", "- fix the parser\n- add tests"])
         else {
@@ -3766,7 +3812,11 @@ mod tests {
             (Some(Placement::Channel(channel)), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository),
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            ),
             (Some(Placement::Channel(explicit)), None)
         );
         caller.project = Some("/other-cwd-project".into());
@@ -3787,8 +3837,27 @@ mod tests {
             (Some(strip), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository).0,
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
             Some(Placement::Channel(explicit))
+        );
+        // A checkout named for it wins over the caller's view, as a channel does.
+        let named = Placement::Worktree {
+            repository: repository.into(),
+            path: "/repo".into(),
+        };
+        assert_eq!(
+            spawn_placement(Some(named.clone()), Some(&caller), repository),
+            (Some(named.clone()), None)
+        );
+        assert_eq!(
+            spawn_placement(Some(named.clone()), None, repository),
+            (Some(named), None),
+            "an external caller can name a checkout as it names a channel"
         );
         let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
         assert!(scope.is_none());
@@ -3805,7 +3874,7 @@ mod tests {
             (Some(Placement::Channel(lineage)), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository).0,
+            spawn_placement(Some(Placement::Channel(explicit)), Some(&caller), repository).0,
             Some(Placement::Channel(explicit)),
             "an explicit channel still wins over the lineage's"
         );

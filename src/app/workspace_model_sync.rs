@@ -3988,10 +3988,14 @@ mod tests {
         (app, agent, pane, destination)
     }
 
-    #[test]
-    fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
-        use crate::agent_execution::{HostedSession, Surface, agent_label};
-        let (mut app, mut agent, pane, destination) = managed_display_fixture();
+    fn unloaded_chat_label_fixture() -> (
+        Cagents,
+        crate::agent_execution::Agent,
+        crate::workspace_model::views::Pane,
+        ChannelId,
+    ) {
+        use crate::agent_execution::{HostedSession, Surface};
+        let (mut app, mut agent, mut pane, destination) = managed_display_fixture();
         let CardKind::Terminal(console) = pane.kind else {
             unreachable!()
         };
@@ -4024,6 +4028,14 @@ mod tests {
         app.workspace_model.agents = vec![agent.clone()];
         app.workspace_model.views.clear();
         app.chrome_ui.agent_labels.clear();
+        pane.kind = CardKind::Chat(session);
+        (app, agent, pane, destination)
+    }
+
+    #[test]
+    fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
+        use crate::agent_execution::agent_label;
+        let (mut app, agent, pane, destination) = unloaded_chat_label_fixture();
         assert!(
             app.adopt_execution_agent(&agent).is_none(),
             "unloaded agent waits for its accepted label"
@@ -4081,6 +4093,87 @@ mod tests {
             app.card_display_title(app.card_state(pane.id).unwrap()),
             "Replacement conversation"
         );
+    }
+
+    #[test]
+    fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
+        use crate::agent_execution::{Placement, agent_label};
+        let (mut app, mut agent, mut pane, _) = unloaded_chat_label_fixture();
+        let project = app.sidebar_model.projects[0].id;
+        let worktree = crate::model::WorktreeId::new();
+        let path = PathBuf::from("/repo");
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                worktree,
+                path.clone(),
+                Some("main".into()),
+            ),
+        );
+        let placement = Placement::Worktree {
+            repository: agent.spec.target.repository.clone(),
+            path: path.clone(),
+        };
+        agent.placement = placement.clone();
+        agent.spec.target.placement = Some(placement.clone());
+        pane.title = chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
+        pane.scope = Some(path.clone());
+        app.workspace_model.channels.clear();
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: placement,
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        Arc::make_mut(&mut app.durable).channels.clear();
+        let label = agent_label("reviewer", Some("Review the one-row cards"));
+        app.chrome_ui.agent_labels.insert(agent.id, label.clone());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        Arc::make_mut(&mut app.durable).card_scopes.insert(pane.id, path);
+        app.sidebar_state.observe_agent_update(pane.id, project, worktree);
+        drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SetFilter(
+            crate::sidebar::SidebarFilter::Attention,
+        ))));
+        app.refresh_sidebar_channels();
+        let row_title = |app: &Cagents| {
+            app.sidebar_model.projects.iter()
+                .flat_map(|project| &project.attention_cards)
+                .find(|row| row.id == pane.id)
+                .expect("the unloaded unchanneled agent has an attention row")
+                .title.clone()
+        };
+        assert!(app.chat_start_pending(pane.id));
+        assert_eq!(row_title(&app), label);
+
+        // A restored pane may arrive before accepted metadata. Its row must
+        // refresh even when the label is the only new observation.
+        app.chrome_ui.agent_labels.remove(&agent.id);
+        app.card_state_mut(pane.id).unwrap().title = pane.title.clone();
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), pane.title);
+        let sequence = app.workspace_model.sequence;
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::AgentLabels(vec![
+            (agent.id, label.clone()),
+        ]))));
+        assert_eq!(app.workspace_model.sequence, sequence);
+        assert_eq!(row_title(&app), label);
+        assert!(app.chat_start_pending(pane.id));
+        assert!(!app.apply_reported_title(pane.id, "Review the one-row cards".into()));
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), label);
+
+        drop(app.update_chrome(super::super::chrome_ui::Action::Rename(pane.id)));
+        drop(app.update_chrome(super::super::chrome_ui::Action::RenameChanged("My reviewer".into())));
+        drop(app.update_chrome(super::super::chrome_ui::Action::RenameSubmit));
+        assert_eq!(row_title(&app), "My reviewer");
+        app.chrome_ui.user_titles.remove(&pane.id);
+        let CardKind::Chat(current) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            unreachable!()
+        };
+        current.id = TerminalId::new();
+        assert!(app.apply_reported_title(pane.id, "Replacement conversation".into()));
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), "Replacement conversation");
     }
 
     #[test]
