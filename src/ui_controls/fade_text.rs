@@ -2,13 +2,15 @@
 
 use std::borrow::Cow;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use cosmic::iced::advanced::{
-    Clipboard, Layout, Shell, Widget, layout, renderer,
-    text::Paragraph as _,
+    Clipboard, Layout, Shell, Widget, layout,
+    renderer::{self, Renderer as _},
     widget::{Id, Operation, Tree, tree},
 };
 use cosmic::iced::widget::text::{Catalog as _, LineHeight, Wrapping};
-use cosmic::iced::{Event, Font, Length, Pixels, Rectangle, Size, mouse};
+use cosmic::iced::{Event, Font, Length, Pixels, Rectangle, Size, Vector, mouse};
 use cosmic::{Element, Renderer, Theme};
 
 use crate::design;
@@ -70,6 +72,7 @@ enum Role {
     Body,
     Caption,
     Heading,
+    Title,
 }
 
 /// One line of body text; see [`FadeText`].
@@ -101,6 +104,14 @@ impl<'a> FadeText<'a> {
     pub fn heading(content: impl Into<Cow<'a, str>>) -> Self {
         Self {
             role: Role::Heading,
+            ..fade_text(content)
+        }
+    }
+
+    /// A [`design::title`].
+    pub fn title(content: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            role: Role::Title,
             ..fade_text(content)
         }
     }
@@ -138,7 +149,8 @@ impl<'a> FadeText<'a> {
         self
     }
 
-    /// Shows at most `chars` characters, fading out the last of them when
+    /// Shows at most `chars` characters (grapheme clusters, so an emoji or
+    /// an accented letter is never split), fading out the last of them when
     /// there were more, for a label held to a budget of its own rather than
     /// to the room its row has left.
     pub fn limit(mut self, chars: usize) -> Self {
@@ -154,14 +166,11 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
             Role::Body => design::body(content),
             Role::Caption => design::caption(content),
             Role::Heading => design::heading(content),
+            Role::Title => design::title(content),
         }
         .wrapping(Wrapping::None)
         .ellipsize(cosmic::iced::widget::text::Ellipsize::None)
         .width(text.width)
-        .align_x(match text.edge {
-            FadeEdge::End => cosmic::iced::alignment::Horizontal::Left,
-            FadeEdge::Start => cosmic::iced::alignment::Horizontal::Right,
-        })
         // The colour is applied by the fade, step by step.
         .class(cosmic::theme::Text::Default);
         if let Some(size) = text.size {
@@ -222,10 +231,10 @@ fn one_line(content: Cow<'_, str>) -> Cow<'_, str> {
     )
 }
 
-/// `content` held to `limit` characters, and whether any were cut. A cut
+/// `content` held to `limit` grapheme clusters, and whether any were cut. A cut
 /// leaves no trailing space for the fade to spend itself on.
 fn within(content: Cow<'_, str>, limit: Option<usize>) -> (Cow<'_, str>, bool) {
-    let Some((end, _)) = limit.and_then(|limit| content.char_indices().nth(limit)) else {
+    let Some((end, _)) = limit.and_then(|limit| content.grapheme_indices(true).nth(limit)) else {
         return (content, false);
     };
     let kept = content[..end].trim_end();
@@ -271,6 +280,39 @@ fn steps(fade: Rectangle, edge: FadeEdge) -> impl Iterator<Item = (Rectangle, f3
         };
         (clip, alpha)
     })
+}
+
+/// The part of `bounds` a line overflowing it is drawn whole in, and the
+/// part it fades over at `edge`.
+///
+/// The fade reaches [`FADE`] into the line, but never past half its width,
+/// so even a very narrow slot keeps its first glyphs at full strength.
+fn split(bounds: Rectangle, edge: FadeEdge) -> (Rectangle, Rectangle) {
+    let depth = FADE.min(bounds.width / 2.0);
+    let solid = Rectangle {
+        width: bounds.width - depth,
+        ..bounds
+    };
+    let fade = Rectangle {
+        width: depth,
+        ..bounds
+    };
+    match edge {
+        FadeEdge::End => (
+            solid,
+            Rectangle {
+                x: bounds.x + bounds.width - depth,
+                ..fade
+            },
+        ),
+        FadeEdge::Start => (
+            Rectangle {
+                x: bounds.x + depth,
+                ..solid
+            },
+            fade,
+        ),
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
@@ -394,22 +436,20 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        // Text clips to the viewport it is handed, not its own bounds, so
-        // without this an overflowing line would run over its siblings.
-        let Some(visible) = bounds.intersection(viewport) else {
+        if bounds.intersection(viewport).is_none() {
             return;
-        };
+        }
         let color = self
             .class
             .as_ref()
             .and_then(|class| theme.style(class).color)
             .unwrap_or(style.text_color);
-        let draw = |renderer: &mut Renderer, clip: &Rectangle, alpha: f32| {
+        let Natural(natural) = *tree.state.downcast_ref::<Natural>();
+        // Text that fits is drawn as any text is, clipped only to the
+        // viewport, so ink above or below its line box is kept.
+        if !self.cut && natural <= bounds.width + 0.5 {
             let style = renderer::Style {
-                text_color: cosmic::iced::Color {
-                    a: color.a * alpha,
-                    ..color
-                },
+                text_color: color,
                 ..*style
             };
             self.line.as_widget().draw(
@@ -419,46 +459,52 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
                 &style,
                 layout,
                 cursor,
-                clip,
+                viewport,
             );
-        };
-        let Natural(natural) = *tree.state.downcast_ref::<Natural>();
-        if !self.cut && natural <= bounds.width + 0.5 {
-            draw(renderer, &visible, 1.0);
             return;
         }
-        let depth = FADE.min(bounds.width);
-        let (solid, fade) = match self.edge {
-            FadeEdge::End => (
-                Rectangle {
-                    width: bounds.width - depth,
-                    ..bounds
-                },
-                Rectangle {
-                    x: bounds.x + bounds.width - depth,
-                    width: depth,
-                    ..bounds
-                },
-            ),
-            FadeEdge::Start => (
-                Rectangle {
-                    x: bounds.x + depth,
-                    width: bounds.width - depth,
-                    ..bounds
-                },
-                Rectangle {
-                    width: depth,
-                    ..bounds
-                },
-            ),
+        // A line that fades at its start is laid out from its start like any
+        // other, and drawn moved back so that its end meets the far edge.
+        let shift = match self.edge {
+            FadeEdge::End => 0.0,
+            FadeEdge::Start => (natural - bounds.width).max(0.0),
         };
-        if let Some(clip) = solid.intersection(viewport) {
-            draw(renderer, &clip, 1.0);
-        }
-        for (step, alpha) in steps(fade, self.edge) {
-            if let Some(clip) = step.intersection(viewport) {
-                draw(renderer, &clip, alpha);
+        // Each clip bounds the line across only; up and down the viewport
+        // decides, as it does for text that fits.
+        let draw = |renderer: &mut Renderer, across: Rectangle, alpha: f32| {
+            let Some(clip) = Rectangle {
+                y: viewport.y,
+                height: viewport.height,
+                ..across
             }
+            .intersection(viewport) else {
+                return;
+            };
+            let style = renderer::Style {
+                text_color: cosmic::iced::Color {
+                    a: color.a * alpha,
+                    ..color
+                },
+                ..*style
+            };
+            renderer.with_translation(Vector::new(-shift, 0.0), |renderer| {
+                // The clip is given before the move, which applies to it too.
+                let clip = clip + Vector::new(shift, 0.0);
+                self.line.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    &style,
+                    layout,
+                    cursor,
+                    &clip,
+                );
+            });
+        };
+        let (solid, fade) = split(bounds, self.edge);
+        draw(renderer, solid, 1.0);
+        for (step, alpha) in steps(fade, self.edge) {
+            draw(renderer, step, alpha);
         }
     }
 
@@ -518,6 +564,9 @@ mod tests {
         let (kept, cut) = within("feature/a much longer branch".into(), Some(10));
         assert_eq!((kept.as_ref(), cut), ("feature/a", true));
         assert!(matches!(within("Unbounded".into(), None), (_, false)));
+        // A flag is one character to the reader, two to Rust.
+        let (kept, cut) = within("ab\u{1F1EB}\u{1F1F7}cd".into(), Some(3));
+        assert_eq!((kept.as_ref(), cut), ("ab\u{1F1EB}\u{1F1F7}", true));
     }
 
     #[test]
@@ -547,6 +596,31 @@ mod tests {
         let (natural, width) = measure(fade_overflow(rich, FadeEdge::End), 80.0);
         assert!((natural - plain).abs() < 1.0, "{natural} vs {plain}");
         assert!(width <= 80.0);
+    }
+
+    #[test]
+    fn a_narrow_slot_keeps_its_first_half_solid() {
+        let bounds = Rectangle {
+            x: 10.0,
+            y: 0.0,
+            width: 20.0,
+            height: 18.0,
+        };
+        let (solid, fade) = split(bounds, FadeEdge::End);
+        assert_eq!((solid.x, solid.width), (10.0, 10.0));
+        assert_eq!((fade.x, fade.width), (20.0, 10.0));
+        let (solid, fade) = split(bounds, FadeEdge::Start);
+        assert_eq!((fade.x, fade.width), (10.0, 10.0));
+        assert_eq!((solid.x, solid.width), (20.0, 10.0));
+        let wide = Rectangle {
+            width: 200.0,
+            ..bounds
+        };
+        let (solid, fade) = split(wide, FadeEdge::End);
+        assert_eq!(
+            (solid.width, fade.x, fade.width),
+            (200.0 - FADE, 210.0 - FADE, FADE)
+        );
     }
 
     #[test]
