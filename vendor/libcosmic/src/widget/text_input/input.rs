@@ -2346,6 +2346,20 @@ pub fn update<'a, Message: Clone + 'static>(
                 return;
             }
         },
+        // Returning to the window restarts a resting cursor's blink, as
+        // iced's own TextInput does. Only the input that holds focus does, and
+        // it keeps holding it.
+        Event::Window(window::Event::Focused) => {
+            if let Some(focus) = state
+                .is_focused
+                .as_mut()
+                .filter(|f| f.focused && f.updated_at == LAST_FOCUS_UPDATE.with(|last| last.get()))
+            {
+                focus.updated_at = Instant::now();
+                LAST_FOCUS_UPDATE.with(|x| x.set(focus.updated_at));
+                shell.request_redraw();
+            }
+        }
         Event::Window(window::Event::RedrawRequested(now)) => {
             if let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) {
                 focus.now = *now;

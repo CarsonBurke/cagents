@@ -127,8 +127,10 @@ percentage of one core:
 | Agents settled, composer focused: clipboard thread | 6.2 wakeups/s | 2.2 wakeups/s |
 | Three agents working: UI thread | 26.4 wakeups/s, 6.1% | 23.5 wakeups/s, 5.5% |
 
-With agents working, the spinners already ask for ten frames a second, so the
-cursor's frames made little difference there. Neither side logged a UI-thread
+The after build also has the wgpu-core change below, which makes every frame
+cheaper, so the CPU columns credit both changes. The wakeups and redraws are
+the cursor's alone. With agents working, the spinners already ask for ten
+frames a second, so the cursor's frames made little difference there. Neither side logged a UI-thread
 call over 50 ms after startup. The remaining settled redraws follow the app's
 own updates.
 

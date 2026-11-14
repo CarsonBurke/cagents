@@ -40,4 +40,5 @@ with any ancestor translation applied once.
 `TextInput` blinks with `iced_core::text::Blink` (see `vendor/iced-core`). Ten
 seconds after its last input, the cursor rests visible and the input asks for
 no more redraws. Upstream it repainted the window every 500 ms for as long as it
-kept focus.
+kept focus. Typing, a click, an input-method commit or returning to the window
+restarts the blink; the last is new, since upstream's blink never stopped.

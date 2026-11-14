@@ -2549,6 +2549,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 outcome = if text.is_some() { "some" } else { "none" });
                             if let Some(text) = text {
                                 self.paste(&text, shell);
+                                if state.restart_blink() {
+                                    shell.request_redraw();
+                                }
                             }
                         }
                     }
@@ -2706,6 +2709,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 position,
                                 agent_drag,
                             );
+                            state.restart_blink();
                             shell.request_redraw();
                         }
                         IcedMouseButton::Middle if ours => {
@@ -2720,6 +2724,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 outcome = if text.is_some() { "some" } else { "none" });
                             if let Some(text) = text {
                                 self.paste(&text, shell);
+                                if state.restart_blink() {
+                                    shell.request_redraw();
+                                }
                             }
                         }
                         button => {
@@ -2938,6 +2945,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     }
                 }
                 shell.capture_event();
+            }
+            // Coming back to the window restarts the blink, as VTE does on
+            // focus-in, so the cursor shows where typing will land.
+            Event::Window(window::Event::Focused) => {
+                if state.restart_blink() {
+                    shell.request_redraw();
+                }
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 // Every viewport move folded since the last frame is applied
