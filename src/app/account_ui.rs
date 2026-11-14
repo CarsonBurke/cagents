@@ -724,12 +724,15 @@ impl State {
     /// A known stamp beyond the current clock's slack follows a clock rollback
     /// and must not prevent a current list, just as with quota and disk cache.
     /// Whether it was taken.
-    fn take_catalog(&mut self, provider: Provider, catalog: Catalog, now: Millis) -> bool {
+    fn take_catalog(&mut self, provider: Provider, mut catalog: Catalog, now: Millis) -> bool {
         if self.catalogs.get(&provider).is_some_and(|known| {
             known.observed_at > catalog.observed_at
                 && known.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
         }) {
             return false;
+        }
+        if let Some(previous) = self.catalogs.get(&provider) {
+            catalog.inherit_defaults(previous);
         }
         self.catalogs.insert(provider, catalog);
         true
@@ -2615,12 +2618,22 @@ impl Cagents {
         &mut self,
         provider: Provider,
         models: Vec<crate::chat::Model>,
+        active: Option<&crate::chat::ActiveModel>,
     ) -> Task<Message> {
         let now = now_ms();
-        let catalog = Catalog {
+        let mut catalog = Catalog {
             models,
             observed_at: now,
+            default_model: None,
+            reasoning_defaults: Default::default(),
         };
+        if let Some(active) = active
+            && let Some(effort) = active.default_reasoning.as_ref()
+        {
+            catalog
+                .reasoning_defaults
+                .insert(active.id.clone(), effort.clone());
+        }
         if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog, now) {
             return Task::none();
         }
@@ -9115,6 +9128,8 @@ mod app_tests {
                 label: name.into(),
                 reasoning: Vec::new(),
             }],
+            default_model: None,
+            reasoning_defaults: Default::default(),
         };
         let known_catalog = catalog(
             if matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog) {
@@ -10111,6 +10126,8 @@ mod app_tests {
                 label: id.into(),
                 reasoning: Vec::new(),
             }],
+            default_model: None,
+            reasoning_defaults: Default::default(),
         };
         for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
             let mut state = State::default();
@@ -10153,6 +10170,8 @@ mod app_tests {
         let catalog = |observed_at, id: &str| Catalog {
             observed_at,
             models: vec![model(id)],
+            default_model: None,
+            reasoning_defaults: Default::default(),
         };
         for provider in [Provider::Claude, Provider::Codex] {
             for source in ["loaded", "probe", "live"] {
@@ -10199,7 +10218,7 @@ mod app_tests {
                             },
                         }))
                     }
-                    "live" => app.observe_listed_models(provider, vec![model("current")]),
+                    "live" => app.observe_listed_models(provider, vec![model("current")], None),
                     _ => unreachable!(),
                 };
                 // Apply the actual reducers, but never poll a provider, cache,
@@ -10232,6 +10251,8 @@ mod app_tests {
         let catalog = |observed_at, id: &str| Catalog {
             models: vec![model(id)],
             observed_at,
+            default_model: None,
+            reasoning_defaults: Default::default(),
         };
         let now = now_ms();
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
@@ -10275,9 +10296,9 @@ mod app_tests {
         );
 
         // A conversation's list is newer still, and is queued for the cache.
-        let _ = app.observe_listed_models(Provider::Omp, Vec::new());
+        let _ = app.observe_listed_models(Provider::Omp, Vec::new(), None);
         assert!(app.account_ui.catalog(Provider::Omp).is_none(), "no list");
-        let _ = app.observe_listed_models(Provider::Codex, vec![model("live")]);
+        let _ = app.observe_listed_models(Provider::Codex, vec![model("live")], None);
         assert_eq!(listed(&app, Provider::Codex).as_deref(), Some("live"));
         assert!(app.account_ui.saving_live);
         let catalogs = app.account_ui.take_live_catalogs();

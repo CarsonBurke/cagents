@@ -466,10 +466,12 @@ impl Publication {
 
     fn next(
         base: &Self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         resident: bool,
         lineage: append::Lineage,
     ) -> Arc<Self> {
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         if resident {
@@ -526,6 +528,8 @@ impl Publications {
         final_body: bool,
     ) -> Option<bool> {
         let (base, revision) = self.capture();
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
@@ -546,6 +550,48 @@ impl Publications {
         #[cfg(test)]
         tests::pause_before_replacement(self as *const Self as usize);
         self.publish(&base, revision, body, Some(full), metadata, final_body)
+    }
+
+    fn active_model(
+        &self,
+        revision: u64,
+        model: Option<super::ActiveModel>,
+        body: &AtomicBool,
+    ) -> bool {
+        loop {
+            let (base, policy_revision) = self.capture();
+            if revision <= base.snapshot.active_model_revision {
+                return false;
+            }
+            let mut snapshot = (*base.snapshot).clone();
+            snapshot.active_model = model.clone();
+            snapshot.active_model_revision = revision;
+            let next = if base.resident {
+                Publication::resident(
+                    snapshot,
+                    base.clock,
+                    base.lineage.clone(),
+                    base.source_thread.clone(),
+                )
+            } else {
+                Publication::owned(
+                    snapshot,
+                    base.clock,
+                    false,
+                    append::Lineage::default(),
+                    None,
+                    base.source_thread.clone(),
+                )
+            };
+            let metadata = next.hidden.as_ref().unwrap_or(&next).clone();
+            let full = base.resident.then_some(next);
+            if self
+                .publish(&base, policy_revision, body, full, metadata, false)
+                .is_some()
+            {
+                return true;
+            }
+        }
     }
 
     /// The connection reader is the only source writer; visibility is a second
@@ -2339,7 +2385,8 @@ impl ClientHandle {
         let mut early_usage = AccountUsage::default();
         let mut early_limit = None;
         let mut early_addresses = AgentAddresses::default();
-        let (session, initial) = loop {
+        let mut early_model = None;
+        let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -2376,6 +2423,18 @@ impl ClientHandle {
                     if chat_id == id && envelope.request_id.is_none() =>
                 {
                     early_observed.observe(epoch);
+                }
+                ServerMessage::ChatActiveModel {
+                    chat_id,
+                    revision,
+                    model,
+                } if chat_id == id && envelope.request_id.is_none() => {
+                    if early_model
+                        .as_ref()
+                        .is_none_or(|(known, _)| *known < revision)
+                    {
+                        early_model = Some((revision, model));
+                    }
                 }
                 ServerMessage::ChatAccountUsage {
                     chat_id,
@@ -2417,6 +2476,10 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
+        if let Some((revision, model)) = early_model {
+            initial.active_model_revision = revision;
+            initial.active_model = model;
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
@@ -2649,6 +2712,9 @@ impl ClientHandle {
                         let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
                             .observe(generation, state);
                         if changed { wake(Wake::Activity); }
+                    },
+                    ServerMessage::ChatActiveModel { chat_id, revision, model } if chat_id == id => {
+                        if publication.active_model(revision, model, &body_requested) { wake(Wake::Changed); }
                     },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
                         let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
@@ -3368,6 +3434,76 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_model_sidechannel_survives_snapshots_patches_and_hidden_publications() {
+        let publications = Publications::new(Snapshot {
+            generation: 4,
+            ..Snapshot::default()
+        });
+        let body = AtomicBool::new(true);
+        let model = super::super::ActiveModel {
+            id: "actual".into(),
+            label: "Actual model".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: Some("medium".into()),
+        };
+        assert!(publications.active_model(2, Some(model.clone()), &body));
+        assert!(
+            !publications.active_model(1, None, &body),
+            "late attach status cannot rewind a live update"
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 5,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        let base = publications.current.load_full();
+        assert_eq!(base.snapshot.active_model.as_ref(), Some(&model));
+        assert_eq!(base.snapshot.active_model_revision, 2);
+        let patch = Publication::next(
+            &base,
+            Snapshot {
+                generation: 6,
+                ..Snapshot::default()
+            },
+            true,
+            append::Lineage::default(),
+        );
+        assert_eq!(patch.snapshot.active_model.as_ref(), Some(&model));
+        body.store(false, Ordering::Release);
+        assert!(publications.active_model(3, None, &body));
+        assert!(!publications.current.load().resident);
+        assert!(publications.current.load().snapshot.active_model.is_none());
+        assert!(publications.active_model(4, Some(model.clone()), &body));
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 7,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+    }
 
     /// The daemon tells a surface every address it knows, as it learns one
     /// and once on attaching, in whichever order those arrive.

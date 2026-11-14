@@ -329,9 +329,9 @@ fn composer_editor_style(
 /// How much of the footer a chat pane's width affords.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterFit {
-    /// The conversation's place, the account by name and every figure.
+    /// The branch, the account by name and every figure.
     Wide,
-    /// A split pane: the place gives way and the account shows as its avatar.
+    /// A split pane: the branch gives way and the account shows as its avatar.
     Narrow,
     /// Narrower still: the model shows as its provider's icon, and the
     /// context ring stands without its figure, which joins the cost in the
@@ -1180,36 +1180,16 @@ fn model_hits<'a>(models: &'a [chat::Model], query: &str) -> Vec<&'a chat::Model
         .filter(|model| {
             query.is_empty()
                 || model.id.to_lowercase().contains(&query)
-                || model.label.to_lowercase().contains(&query)
+                || model_choice_label(model).to_lowercase().contains(&query)
         })
         .collect()
 }
 
 impl Cagents {
-    /// Where a conversation is working, as the status line reports it.
-    ///
-    /// A chat pane names no location of its own, so a reader with several
-    /// panes open could not tell which worktree an agent was about to change.
-    /// The directory's own name is used rather than its path, because the path
-    /// is long, repetitive between worktrees, and already in the tab tooltip.
-    fn chat_place(&self, directory: &Path, card: CardId) -> Place {
+    /// The branch the conversation works on; its channel and project are
+    /// already named in the tabs and sidebar.
+    fn chat_place(&self, directory: &Path) -> Place {
         Place {
-            channel: self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.cards.contains(&card))
-                .map(|channel| {
-                    channel_ui::channel_display_title(
-                        channel,
-                        self.sidebar_model.project(channel.project_id),
-                    )
-                    .into_owned()
-                }),
-            name: directory
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
             branch: self
                 .sidebar_model
                 .projects
@@ -1223,7 +1203,7 @@ impl Cagents {
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
-                let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
+                let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
                 let accounts = self.chat_accounts(
                     runtime.session.launch.provider,
                     &runtime.session.launch.recipe,
@@ -1232,17 +1212,19 @@ impl Cagents {
                 // its own first; a started conversation only among its own
                 // provider's models.
                 let current = runtime.session.launch.provider;
-                let offers = if runtime.choosing() {
+                let offers = if runtime.is_draft() {
                     std::iter::once(current)
                         .chain(MODEL_FAMILIES.into_iter().filter(|provider| {
                             *provider != current && self.account_ui.offers(*provider)
                         }))
-                        .map(|provider| Offer {
-                            provider,
-                            models: self
-                                .account_ui
-                                .catalog(provider)
-                                .map_or(&[][..], |catalog| catalog.models.as_slice()),
+                        .map(|provider| {
+                            let catalog = self.account_ui.catalog(provider);
+                            Offer {
+                                provider,
+                                models: catalog
+                                    .map_or(&[][..], |catalog| catalog.models.as_slice()),
+                                catalog,
+                            }
                         })
                         .collect()
                 } else {
@@ -1361,6 +1343,7 @@ struct Offer<'a> {
     /// What the provider listed last, under its default model. Empty where
     /// it never has, and then the picker offers the default alone.
     models: &'a [chat::Model],
+    catalog: Option<&'a crate::account::cache::Catalog>,
 }
 
 /// What a provider is called where its models are listed.
@@ -1374,8 +1357,6 @@ fn family_label(provider: Provider) -> &'static str {
 
 /// The worktree a conversation runs in.
 struct Place {
-    channel: Option<String>,
-    name: String,
     branch: Option<String>,
 }
 
@@ -3265,7 +3246,6 @@ impl Runtime {
                     if snapshot.busy
                         && available
                         && self.model_picker.is_none()
-                        && !self.reasoning_picker
                         && !self.account_picker
                         && !self.permission_picker
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
@@ -3390,40 +3370,11 @@ impl Runtime {
             action(Action::ComposerActions(target, false)),
         ));
         let usage = &snapshot.usage;
-        // Prefer a wider chat over hiding its settings behind a scrollbar.
-        // A narrow pane keeps every control a reader acts on in the footer
-        // and gives up what is said elsewhere first: the place is in the
-        // sidebar and the inspector, and the account is its avatar, named on
-        // hover. Nothing moves into a menu, where it could only be found by
-        // opening it. What the agent is doing is not repeated here either: it
-        // closes the transcript, where it scrolls with the turns it belongs to.
-        //
-        // The leading group says where the conversation is and who acts in it
-        // under which permissions; the trailing group what it runs on and
-        // what that has cost.
+        // Keep the branch and account together; model and permissions share
+        // the trailing group with usage at every footer width.
         let fit = FooterFit::for_width(content_width);
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         if fit == FooterFit::Wide {
-            if let Some(channel) = &place.channel {
-                status.push(
-                    crate::interaction::tooltip_above(
-                        design::caption(format!("# {}", Self::short_description(channel, 24)))
-                            .wrapping(iced::widget::text::Wrapping::None),
-                        format!("Channel: {channel}"),
-                    )
-                    .into(),
-                );
-            }
-            if !place.name.is_empty() {
-                status.push(bounded(
-                    design::caption(Self::short_description(&place.name, FOOTER_LABEL))
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into(),
-                    &place.name,
-                    "Project",
-                    FOOTER_LABEL,
-                ));
-            }
             if let Some(branch) = &place.branch {
                 status.push(bounded(
                     widget::row::with_children(vec![
@@ -3585,9 +3536,8 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
-            // One line: the trailing controls keep their width and the
-            // leading group gives up what is left, cutting its permission
-            // label before either group is pushed out of the pane.
+            // The trailing controls keep their width while the account
+            // group gives up the remaining space.
             // The filling container holds the trailing group at the far
             // edge, as in a wide pane, while the shrinkable inside it keeps
             // the leading group at its natural width.
@@ -4023,9 +3973,8 @@ impl Runtime {
     /// The account, model, reasoning effort, and permission mode, at the
     /// status line's own scale.
     ///
-    /// They come back in two groups: who acts and under which permissions,
-    /// which belong with the conversation's place, and what the agent runs
-    /// on, which sits with its usage at the footer's trailing edge.
+    /// They come back in two groups: the account beside the branch, and the
+    /// model followed by its permission mode at the footer's trailing edge.
     ///
     /// These were three full-size dropdowns stacked above the composer, which
     /// gave settings a reader changes occasionally more room than the message
@@ -4049,27 +3998,18 @@ impl Runtime {
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
-            let label: Cow<'a, str> = match snapshot
-                .models
+            let default_effort = offers
                 .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
-            {
-                Some(model) => model.label.as_str().into(),
-                None => match &snapshot.selected_model {
-                    // A model the provider no longer lists is still the one
-                    // chosen, so it is named rather than hidden.
-                    Some(id) => id.as_str().into(),
-                    // The picker draws the provider's icon; a narrow footer
-                    // leaves the family to it.
-                    None if draft && fit != FooterFit::Wide => "Default model".into(),
-                    None if draft => format!(
-                        "{} · Default model",
-                        family_label(self.session.launch.provider)
-                    )
-                    .into(),
-                    None => "Model".into(),
-                },
-            };
+                .find(|offer| offer.provider == self.session.launch.provider)
+                .and_then(|offer| offer.catalog)
+                .and_then(|catalog| catalog.default_effort(snapshot.selected_model.as_deref()));
+            let label = footer_model_label(
+                snapshot,
+                draft,
+                self.session.launch.provider,
+                fit,
+                default_effort,
+            );
             if transitioning {
                 controls.push(bounded(
                     design::caption(Self::short_description(&label, fit.label_limit())).into(),
@@ -4081,79 +4021,13 @@ impl Runtime {
                 controls.push(self.model_picker(label, offers, shortcuts, fit));
             }
         }
-        if snapshot.capabilities.reasoning_selection
-            && let Some(model) = snapshot
-                .models
-                .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
-            && !model.reasoning.is_empty()
-        {
-            let selected = model
-                .reasoning
-                .iter()
-                .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
-            if transitioning {
-                controls.push(
-                    design::caption(
-                        selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                    )
-                    .into(),
-                );
-            } else {
-                let open = self.reasoning_picker;
-                let anchor = widget::button::custom(design::caption(
-                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                ))
-                .name("Choose reasoning effort")
-                .id(card_control_id(target.card, "chat-reasoning-picker"))
-                .class(crate::ui_controls::control_style(open, None))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::ReasoningPicker(target, !open)));
-                let choices = open.then(|| {
-                    widget::column::with_children(
-                        model
-                            .reasoning
-                            .iter()
-                            .enumerate()
-                            .map(|(index, reasoning)| {
-                                widget::button::custom(design::body(reasoning.as_str()))
-                                    .name(reasoning.as_str())
-                                    .id(card_control_id(
-                                        target.card,
-                                        &format!("chat-reasoning-choice-{index}"),
-                                    ))
-                                    .class(crate::ui_controls::control_style(
-                                        Some(index) == selected,
-                                        None,
-                                    ))
-                                    .width(Length::Fill)
-                                    .on_press(action(Action::Reasoning(
-                                        target,
-                                        model.id.clone(),
-                                        reasoning.clone(),
-                                    )))
-                                    .into()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .width(160)
-                    .into()
-                });
-                controls.push(crate::ui_controls::popover(
-                    anchor,
-                    choices,
-                    widget::popover::Position::Top,
-                    action(Action::ReasoningPicker(target, false)),
-                ));
-            }
-        }
         if !snapshot.capabilities.permission_modes.is_empty() {
             let modes = &snapshot.capabilities.permission_modes;
             let selected = modes
                 .iter()
                 .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
-                context.push(
+                controls.push(
                     design::caption(
                         selected
                             .map_or("Permissions", |index| permission_mode_label(&modes[index])),
@@ -4165,8 +4039,8 @@ impl Runtime {
                 let anchor =
                     widget::button::custom(
                         widget::row::with_children(vec![
-                            // Cut rather than wrapped where a narrow footer
-                            // leaves the leading group little room.
+                            // Keep the permission label on the same line as
+                            // the model when the footer narrows.
                             design::caption(selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
                             }))
@@ -4187,7 +4061,7 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                context.push(crate::interaction::tooltip_above(
+                controls.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
                         crate::workspace_widget::GlobalShortcut::ChatPermissions,
@@ -4479,6 +4353,7 @@ impl Runtime {
             vec![Offer {
                 provider,
                 models: &self.snapshot.models,
+                catalog: None,
             }]
         };
         let models = model_list(
@@ -4488,8 +4363,52 @@ impl Runtime {
             (provider, self.snapshot.selected_model.as_deref()),
             query,
         );
+        let mut sections = vec![models];
+        if self.snapshot.capabilities.reasoning_selection
+            && let Some(model) = self
+                .snapshot
+                .models
+                .iter()
+                .find(|model| Some(&model.id) == self.snapshot.selected_model.as_ref())
+            && !model.reasoning.is_empty()
+        {
+            let mut choices = vec![
+                design::caption("Reasoning effort")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ];
+            choices.extend(model.reasoning.iter().enumerate().map(|(index, effort)| {
+                widget::button::custom(design::body(effort_label(effort)))
+                    .name(effort_label(effort))
+                    .id(card_control_id(
+                        self.target.card,
+                        &format!("chat-reasoning-choice-{index}"),
+                    ))
+                    .class(crate::ui_controls::control_style(
+                        Some(effort) == self.snapshot.reasoning.as_ref(),
+                        None,
+                    ))
+                    .width(Length::Fill)
+                    .on_press(action(Action::Reasoning(
+                        self.target,
+                        model.id.clone(),
+                        effort.clone(),
+                    )))
+                    .into()
+            }));
+            sections.push(
+                widget::column::with_children(choices)
+                    .spacing(step::GAP_XS)
+                    .into(),
+            );
+        }
         let Some(mode) = &self.snapshot.fast_mode else {
-            return Some(models);
+            return Some(
+                widget::column::with_children(sections)
+                    .width(design::MODEL_POPUP_WIDTH)
+                    .spacing(step::GAP_S)
+                    .into(),
+            );
         };
         let available = !self.disconnected
             && !self.snapshot.exited
@@ -4515,8 +4434,10 @@ impl Runtime {
             })),
             fast_mode_tooltip(mode),
         );
+        sections.push(control);
         Some(
-            widget::column::with_children(vec![models, control])
+            widget::column::with_children(sections)
+                .width(design::MODEL_POPUP_WIDTH)
                 .spacing(step::GAP_XS)
                 .into(),
         )
@@ -6199,6 +6120,66 @@ pub(super) fn answer_control_id(
     )
 }
 
+/// Keep the provider's alias as a choice while naming the model it resolves to.
+fn model_choice_label(model: &chat::Model) -> Cow<'_, str> {
+    if model.id == "default" && !model.label.to_lowercase().starts_with("default") {
+        format!("Default ({})", model.label).into()
+    } else {
+        model.label.as_str().into()
+    }
+}
+
+fn effort_label(effort: &str) -> String {
+    let mut chars = effort.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn footer_model_label<'a>(
+    snapshot: &'a chat::Snapshot,
+    draft: bool,
+    provider: Provider,
+    fit: FooterFit,
+    draft_default_effort: Option<&str>,
+) -> Cow<'a, str> {
+    let selected = snapshot.models.iter().find(|model| {
+        Some(&model.id) == snapshot.selected_model.as_ref()
+            || (draft && snapshot.selected_model.is_none() && model.id == "default")
+    });
+    let active = (!draft).then_some(snapshot.active_model.as_ref()).flatten();
+    let label = if let Some(active) = active {
+        active.label.as_str().into()
+    } else {
+        match selected {
+            Some(model) if draft => model_choice_label(model),
+            // Other-model providers use their selected entry as status.
+            Some(model) if provider == Provider::Omp => model.label.as_str().into(),
+            None if draft => match &snapshot.selected_model {
+                Some(id) => id.as_str().into(),
+                None if fit != FooterFit::Wide => "Default model".into(),
+                None => format!("{} · Default model", family_label(provider)).into(),
+            },
+            _ => "Model".into(),
+        }
+    };
+    let chosen = (draft || provider == Provider::Omp)
+        .then_some(snapshot.reasoning.as_deref())
+        .flatten()
+        .filter(|effort| Some(*effort) != draft_default_effort);
+    let effort = active.map_or(chosen, |active| {
+        active
+            .reasoning
+            .as_deref()
+            .filter(|effort| Some(*effort) != active.default_reasoning.as_deref())
+    });
+    match effort.filter(|effort| !effort.is_empty()) {
+        Some(effort) => format!("{label} · {}", effort_label(effort)).into(),
+        None => label,
+    }
+}
+
 /// One row of the model list: a model, or a provider's default where it has
 /// not listed any.
 struct ModelRow<'a> {
@@ -6236,7 +6217,8 @@ fn model_rows<'a>(
         .filter_map(|offer| {
             // A letter alone begins too many names to mean one provider.
             let named = needle.chars().count() > 1 && names_provider(offer.provider, &needle);
-            let default = (draft || offer.models.is_empty())
+            let default = ((draft && !offer.models.iter().any(|model| model.id == "default"))
+                || offer.models.is_empty())
                 && (needle.is_empty() || named || "default".starts_with(&needle));
             let rows: Vec<ModelRow<'a>> = default
                 .then_some(ModelRow {
@@ -6335,18 +6317,18 @@ fn model_list<'a>(
                 provider == current.0 && row.model.map(|model| model.id.as_str()) == current.1;
             let (title, id, name) = match row.model {
                 Some(model) => (
-                    model.label.as_str(),
+                    model_choice_label(model),
                     Some(model.id.as_str()),
-                    Cow::Borrowed(model.label.as_str()),
+                    model_choice_label(model),
                 ),
                 None => (
-                    "Default model",
+                    Cow::Borrowed("Default model"),
                     None,
                     Cow::Owned(format!("{} default model", family_label(provider))),
                 ),
             };
             let mut label: Vec<Element<'a, Message>> = vec![
-                design::body(title)
+                design::body(title.clone())
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             ];
@@ -6357,7 +6339,7 @@ fn model_list<'a>(
                 .iter()
                 .any(|offer| offer.provider == provider && !offer.models.is_empty());
             let detail = match id {
-                Some(id) if id != title => Some(id),
+                Some(id) if id != title.as_ref() => Some(id),
                 Some(_) => None,
                 None if listed => Some("Whichever it would choose itself"),
                 None => Some("Its models are listed once it has run"),
@@ -6541,11 +6523,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
-                Place {
-                    name: "Fixture".into(),
-                    channel: None,
-                    branch: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -7450,11 +7428,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
-                Place {
-                    channel: None,
-                    name: "Spacing fixture".into(),
-                    branch: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
@@ -8104,11 +8078,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
-                Place {
-                    name: "project".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -8324,11 +8294,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
-                Place {
-                    name: "project".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -8542,11 +8508,7 @@ mod tests {
                 true,
                 shortcuts,
                 600.0,
-                Place {
-                    name: "fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -9218,11 +9180,7 @@ mod tests {
             true,
             &shortcuts,
             600.0,
-            Place {
-                name: "project".into(),
-                branch: None,
-                channel: Some("Review".into()),
-            },
+            Place { branch: None },
             true,
             None,
             vec![],
@@ -9317,11 +9275,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
-                Place {
-                    name: "restore-fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -9517,11 +9471,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
-                    Place {
-                        name: "restore-fixture".into(),
-                        branch: None,
-                        channel: None,
-                    },
+                    Place { branch: None },
                     true,
                     None,
                     vec![],
@@ -9959,11 +9909,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
-                Place {
-                    name: "restore-fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -10466,11 +10412,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
-                    Place {
-                        name: "restore-fixture".into(),
-                        branch: None,
-                        channel: None,
-                    },
+                    Place { branch: None },
                     true,
                     None,
                     vec![],
@@ -10773,11 +10715,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 360.0,
-                Place {
-                    name: "native-fixture".into(),
-                    branch: None,
-                    channel: Some("Review".into()),
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
@@ -11702,11 +11640,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width.min(super::super::layout::READING_COLUMN),
-                Place {
-                    channel: None,
-                    name: "Fixture".into(),
-                    branch: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -11744,7 +11678,85 @@ mod tests {
     }
 
     #[test]
-    fn narrow_footer_keeps_model_and_reasoning_pickers_in_the_footer() {
+    fn footer_model_picker_bounds_reasoning_with_and_without_fast_mode() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Efforts {
+            ids: Vec<widget::Id>,
+            bounds: Vec<iced::Rectangle>,
+        }
+        impl Operation for Efforts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id.is_some_and(|id| self.ids.contains(id)) {
+                    self.bounds.push(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        for fast in [false, true] {
+            for width in [900.0, 1500.0] {
+                let (mut runtime, _handle) = furnished_runtime();
+                runtime.model_picker = Some(String::new());
+                Arc::make_mut(&mut runtime.snapshot).fast_mode = fast.then_some(chat::FastMode {
+                    state: chat::FastModeState::Off,
+                    disabled_reason: Some("preference".into()),
+                });
+                let mut menu = runtime.model_search(Vec::new()).expect("open model picker");
+                let mut tree = Tree::new(menu.as_widget());
+                let node = menu.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 900.0)),
+                );
+                assert_eq!(
+                    node.size().width,
+                    design::MODEL_POPUP_WIDTH,
+                    "combined model and reasoning menu at window width {width}, fast {fast}"
+                );
+                let mut efforts = Efforts {
+                    ids: (0..3)
+                        .map(|index| {
+                            card_control_id(
+                                runtime.target.card,
+                                &format!("chat-reasoning-choice-{index}"),
+                            )
+                        })
+                        .collect(),
+                    bounds: Vec::new(),
+                };
+                menu.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut efforts,
+                );
+                assert_eq!(
+                    efforts.bounds.len(),
+                    3,
+                    "all advertised effort choices remain mounted"
+                );
+                for bounds in efforts.bounds {
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= design::MODEL_POPUP_WIDTH,
+                        "effort stays inside the model menu at width {width}, fast {fast}: {bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_footer_model_picker_contains_model_and_reasoning_choices() {
         use iced::advanced::{
             clipboard,
             widget::{Operation, operation::Focusable},
@@ -11767,11 +11779,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 450.0,
-                Place {
-                    name: "fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
@@ -11780,6 +11788,7 @@ mod tests {
             struct Bounds {
                 id: widget::Id,
                 rect: Option<iced::Rectangle>,
+                focused: bool,
             }
             impl Operation for Bounds {
                 fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -11789,16 +11798,18 @@ mod tests {
                     &mut self,
                     id: Option<&widget::Id>,
                     bounds: iced::Rectangle,
-                    _: &mut dyn Focusable,
+                    state: &mut dyn Focusable,
                 ) {
                     if id == Some(&self.id) {
                         self.rect = Some(bounds);
+                        self.focused = state.is_focused();
                     }
                 }
             }
             let mut bounds = Bounds {
                 id: card_control_id(target.card, role),
                 rect: None,
+                focused: false,
             };
             // Unlike a11y_nodes in pinned COSMIC, operate also traverses the
             // actual nested overlay layouts and their live focusable controls.
@@ -11807,9 +11818,50 @@ mod tests {
                 .rect
                 .unwrap_or_else(|| panic!("missing mounted control {role}"));
             let pointer = iced::Point::new(rect.center_x(), rect.center_y());
-            let mut messages = Vec::new();
-            ui.update(
-                &[
+            let keyboard = role.starts_with("chat-reasoning-choice-");
+            let events = if keyboard {
+                ui.operate(
+                    renderer,
+                    &mut iced::advanced::widget::operation::focusable::focus::<()>(
+                        card_control_id(target.card, "chat-model-search"),
+                    ),
+                );
+                // Traverse from the search, as Tab does in the native menu.
+                // A direct focus of the effort would miss unreachable rows.
+                for _ in 0..16 {
+                    let mut next: Box<dyn Operation> =
+                        Box::new(iced::advanced::widget::operation::focusable::focus_next::<()>());
+                    loop {
+                        ui.operate(renderer, next.as_mut());
+                        match next.finish() {
+                            iced::advanced::widget::operation::Outcome::Chain(chained) => {
+                                next = chained
+                            }
+                            _ => break,
+                        }
+                    }
+                    ui.operate(renderer, &mut bounds);
+                    if bounds.focused {
+                        break;
+                    }
+                }
+                assert!(
+                    bounds.focused,
+                    "reasoning must be reachable from the model search with Tab"
+                );
+                vec![iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                })]
+            } else {
+                vec![
                     iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
                     iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
                         iced::mouse::Button::Left,
@@ -11817,8 +11869,16 @@ mod tests {
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
                     )),
-                ],
-                iced::mouse::Cursor::Available(pointer),
+                ]
+            };
+            let mut messages = Vec::new();
+            ui.update(
+                &events,
+                if keyboard {
+                    iced::mouse::Cursor::Unavailable
+                } else {
+                    iced::mouse::Cursor::Available(pointer)
+                },
                 renderer,
                 &mut clipboard::Null,
                 &mut messages,
@@ -11855,13 +11915,12 @@ mod tests {
             .insert(target.card, CardRuntime::Chat(Box::new(live)));
         let mut renderer = crate::app::tests::headless_renderer();
         let mut cache = Cache::new();
-        // Each picker is pressed where it sits in the narrow footer: nothing
-        // has to be opened first to reach it.
-        for picker in ["chat-model-picker", "chat-reasoning-picker"] {
-            let (next, messages) = click(&app, target, cache, &mut renderer, picker);
+        // Both choices are reached through the model picker in the footer.
+        for reasoning in [false, true] {
+            let (next, messages) = click(&app, target, cache, &mut renderer, "chat-model-picker");
             cache = next;
             apply(&mut app, messages);
-            let label = if picker == "chat-model-picker" {
+            let label = if !reasoning {
                 "chat-model-choice-Claude-named-model-b"
             } else {
                 "chat-reasoning-choice-1"
@@ -11878,6 +11937,7 @@ mod tests {
                 }),
                 "picker must publish its selection"
             );
+            drop(app.update(action(Action::ModelPicker(target, false))));
         }
         // The keyboard command opens the model popup over its visible anchor.
         drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
@@ -11953,8 +12013,6 @@ mod tests {
             &shortcuts,
             width,
             Place {
-                channel: Some("A long conversation name".into()),
-                name: "A long repository name".into(),
                 branch: Some("feature/a-long-branch-name".into()),
             },
             true,
@@ -12043,6 +12101,12 @@ mod tests {
         }];
         snapshot.selected_model = Some("claude-sonnet-4-5".into());
         snapshot.reasoning = Some("medium".into());
+        snapshot.active_model = Some(chat::ActiveModel {
+            id: "claude-sonnet-4-5".into(),
+            label: "Claude Sonnet 4.5".into(),
+            reasoning: Some("medium".into()),
+            default_reasoning: Some("medium".into()),
+        });
         snapshot.usage.context_limit = 200_000;
         snapshot.usage.context_tokens = 84_000;
         snapshot.usage.cost_microusd = Some(1_234_567);
@@ -12133,16 +12197,16 @@ mod tests {
 
     #[test]
     fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
-        let roles = [
-            "chat-model-picker",
-            "chat-reasoning-picker",
-            "chat-permission-picker",
-        ];
+        let roles = ["chat-model-picker", "chat-permission-picker"];
         for width in [280.0_f32, 320.0, 439.0, 440.0, 470.0, 599.0, 600.0, 900.0] {
             let (runtime, _handle) = furnished_runtime();
             let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
             let footer = laid.footer;
             let fit = FooterFit::for_width(width);
+            assert!(
+                laid.controls["chat-model-picker"].x < laid.controls["chat-permission-picker"].x,
+                "model precedes permissions at {width}"
+            );
             for role in roles {
                 let control = laid
                     .controls
@@ -12169,10 +12233,6 @@ mod tests {
                 );
             }
             assert!(text.contains("Auto-accept edits"), "{text}");
-            assert_eq!(
-                text.contains("A long repository name"),
-                fit == FooterFit::Wide
-            );
             assert_eq!(text.contains("Synthetic account"), fit == FooterFit::Wide);
             let roomy = fit != FooterFit::Tight;
             assert_eq!(text.contains("Claude Sonnet 4.5"), roomy, "{text}");
@@ -12245,11 +12305,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width,
-                    Place {
-                        channel: None,
-                        name: "Fixture".into(),
-                        branch: None,
-                    },
+                    Place { branch: None },
                     true,
                     None,
                     vec![],
@@ -12359,11 +12415,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width.min(super::super::layout::READING_COLUMN),
-                    Place {
-                        channel: None,
-                        name: "Fixture".into(),
-                        branch: None,
-                    },
+                    Place { branch: None },
                     true,
                     None,
                     vec![],
@@ -13872,11 +13924,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
-                Place {
-                    name: "project".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 vec![],
@@ -15365,6 +15413,211 @@ mod tests {
     /// one, so the default heads each provider's group; a started
     /// conversation can only switch to a model it names.
     #[test]
+    fn model_search_matches_the_visible_default_alias_label() {
+        let models = [model("default", "Opus 5.5")];
+        assert_eq!(model_hits(&models, "Default (Opus")[0].id, "default");
+        let offers = [Offer {
+            provider: Provider::Claude,
+            models: &models,
+            catalog: None,
+        }];
+        assert_eq!(
+            listed(&model_rows(&offers, "", true)),
+            [(Provider::Claude, vec!["default"])]
+        );
+    }
+
+    #[test]
+    fn footer_model_label_names_active_model_and_keeps_draft_alias() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![model("default", "Default (Opus 5.5)")];
+        snapshot.selected_model = Some("default".into());
+        snapshot.reasoning = None;
+        snapshot.active_model = Some(chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: None,
+            default_reasoning: None,
+        });
+        for fit in [FooterFit::Wide, FooterFit::Narrow, FooterFit::Tight] {
+            assert_eq!(
+                footer_model_label(snapshot, false, Provider::Claude, fit, None),
+                "Opus 5.5"
+            );
+            assert_eq!(
+                footer_model_label(snapshot, true, Provider::Claude, fit, None),
+                "Default (Opus 5.5)"
+            );
+        }
+        snapshot.selected_model = None;
+        assert_eq!(
+            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+            "Default (Opus 5.5)"
+        );
+        snapshot.selected_model = Some("next-turn-model".into());
+        assert_eq!(
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+            "Opus 5.5"
+        );
+        snapshot.active_model = None;
+        assert_eq!(
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+            "Model"
+        );
+        assert_eq!(
+            footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+            "next-turn-model"
+        );
+    }
+
+    #[test]
+    fn draft_default_effort_stays_hidden_while_attachment_choice_is_pending() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, value: &str) {
+                self.0.push(value.to_owned());
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let models = vec![chat::Model {
+            id: "offline-mini".into(),
+            label: "Offline Mini".into(),
+            reasoning: vec!["medium".into(), "high".into()],
+        }];
+        let active = chat::ActiveModel {
+            id: "offline-mini".into(),
+            label: "Offline Mini".into(),
+            reasoning: None,
+            default_reasoning: Some("medium".into()),
+        };
+        drop(app.observe_listed_models(Provider::Codex, models.clone(), Some(&active)));
+        let card = super::super::tests::draft_chat_for_provider(&mut app, Provider::Codex);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("draft");
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = models;
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("medium".into());
+        runtime.attachment_chooser_pending = Some(uuid::Uuid::new_v4());
+        assert!(runtime.is_draft());
+        assert!(!runtime.choosing());
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut view = app.chat_view(card);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 900.0)),
+        );
+        let mut texts = Texts(Vec::new());
+        view.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        assert!(
+            texts.0.iter().any(|text| text == "Offline Mini"),
+            "{:?}",
+            texts.0
+        );
+        assert!(
+            !texts.0.iter().any(|text| text.contains("Medium")),
+            "{:?}",
+            texts.0
+        );
+    }
+
+    #[test]
+    fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![model("offline-mini", "Offline Mini")];
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("medium".into());
+        let catalog = crate::account::cache::Catalog {
+            models: snapshot.models.clone(),
+            observed_at: 1,
+            default_model: Some("offline-mini".into()),
+            reasoning_defaults: [("offline-mini".into(), "medium".into())].into(),
+        };
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(snapshot.selected_model.as_deref())
+            ),
+            "Offline Mini"
+        );
+        assert_eq!(
+            footer_model_label(snapshot, true, Provider::Codex, FooterFit::Wide, None),
+            "Offline Mini · Medium",
+            "an unknown default does not erase the explicit choice"
+        );
+        snapshot.selected_model = None;
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(None)
+            ),
+            "ChatGPT · Default model"
+        );
+        snapshot.selected_model = Some("offline-mini".into());
+        snapshot.reasoning = Some("high".into());
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                true,
+                Provider::Codex,
+                FooterFit::Wide,
+                catalog.default_effort(snapshot.selected_model.as_deref())
+            ),
+            "Offline Mini · High"
+        );
+    }
+
+    #[test]
+    fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.active_model = Some(chat::ActiveModel {
+            id: "resolved".into(),
+            label: "Resolved model".into(),
+            reasoning: None,
+            default_reasoning: Some("medium".into()),
+        });
+        // A pending selection must not change what the running turn displays.
+        snapshot.reasoning = Some("low".into());
+        for provider in [Provider::Claude, Provider::Codex] {
+            snapshot.active_model.as_mut().unwrap().reasoning = None;
+            assert_eq!(
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+                "Resolved model"
+            );
+            snapshot.active_model.as_mut().unwrap().reasoning = Some("medium".into());
+            assert_eq!(
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+                "Resolved model"
+            );
+            snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
+            assert_eq!(
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+                "Resolved model · High"
+            );
+        }
+    }
+
+    #[test]
     fn a_draft_offers_each_providers_default_ahead_of_its_models() {
         let model = |id: &str| chat::Model {
             id: id.into(),
@@ -15376,10 +15629,12 @@ mod tests {
             Offer {
                 provider: Provider::Codex,
                 models: &codex,
+                catalog: None,
             },
             Offer {
                 provider: Provider::Claude,
                 models: &[],
+                catalog: None,
             },
         ];
         assert_eq!(
@@ -15411,6 +15666,7 @@ mod tests {
         let offers = [Offer {
             provider: Provider::Omp,
             models: &omp,
+            catalog: None,
         }];
         for query in ["omp", "Other", "mod"] {
             assert_eq!(
@@ -15451,6 +15707,7 @@ mod tests {
         let offers = [Offer {
             provider: Provider::Codex,
             models: &models,
+            catalog: None,
         }];
         let mut element = model_list(target, &offers, false, (Provider::Codex, None), "");
         let mut tree = Tree::new(element.as_widget());
@@ -15664,11 +15921,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
-                Place {
-                    name: "fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
@@ -15899,11 +16152,7 @@ mod tests {
                 true,
                 &shortcuts,
                 viewport.width,
-                Place {
-                    name: "fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
@@ -16001,11 +16250,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     width,
-                    Place {
-                        name: "fixture".into(),
-                        branch: None,
-                        channel: None,
-                    },
+                    Place { branch: None },
                     true,
                     None,
                     Vec::new(),
@@ -16059,11 +16304,7 @@ mod tests {
                         true,
                         &shortcuts,
                         width,
-                        Place {
-                            name: "Fixture".into(),
-                            channel: None,
-                            branch: None,
-                        },
+                        Place { branch: None },
                         true,
                         None,
                         vec![],

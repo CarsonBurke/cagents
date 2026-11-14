@@ -186,6 +186,10 @@ pub(crate) struct Resident {
     /// that predates them reports none.
     #[serde(default)]
     pub agent_addresses: Vec<chat::AgentAddress>,
+    #[serde(default)]
+    pub active_model: Option<chat::ActiveModel>,
+    #[serde(default)]
+    pub active_model_revision: u64,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -486,6 +490,8 @@ impl RemoteActor {
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
+            active_model: None,
+            active_model_revision: 0,
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -778,13 +784,17 @@ impl RemoteActor {
                 resident.idle = false;
                 resident.busy = false;
                 let (changed, generation) = (resident.changed, resident.generation);
+                let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
                 if !self.publish_resident_inner(resident, true) {
                     // Another refresh, such as the outcome broker's while a
                     // close drains the outbox, can publish a newer closed
                     // reply first. This older one is then only stale.
                     let current = self.state();
                     if !(current.completed
-                        && (current.changed > changed || current.generation > generation))
+                        && (current.changed > changed
+                            || current.generation > generation
+                            || (current.close.actor_id == active_model_clock.0
+                                && current.active_model_revision > active_model_clock.1)))
                     {
                         return Err("Closed actor metadata was superseded during refresh".into());
                     }
@@ -1368,6 +1378,10 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // A model update can precede its change callback while both
+                // general clocks still match an older in-flight sample.
+                || (resident.close.actor_id == state.close.actor_id
+                    && resident.active_model_revision < state.active_model_revision)
                 // Installation is acknowledged independently of observer
                 // revisions. A state RPC issued before commit can arrive
                 // after its ACK with equal changed/generation values.
@@ -1426,6 +1440,12 @@ impl RemoteActor {
             if resident.agent_addresses != state.agent_addresses {
                 updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
             }
+            if resident.active_model_revision != state.active_model_revision {
+                updates.push(Update::ActiveModel {
+                    revision: resident.active_model_revision,
+                    model: resident.active_model.clone(),
+                });
+            }
             *state = Arc::new(resident);
             updates
         };
@@ -1454,6 +1474,12 @@ impl RemoteActor {
             if state.installed {
                 resident.installed = true;
                 resident.native_continuity = state.native_continuity.clone();
+            }
+            if resident.close.actor_id == state.close.actor_id
+                && resident.active_model_revision < state.active_model_revision
+            {
+                resident.active_model = state.active_model.clone();
+                resident.active_model_revision = state.active_model_revision;
             }
             *state = Arc::new(resident);
         }
@@ -2717,6 +2743,8 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
+        let active_model = state.active_model.clone();
+        let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
         let prompt_eligible =
@@ -2811,6 +2839,8 @@ impl Server {
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),
+            active_model,
+            active_model_revision,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -6398,6 +6428,51 @@ exec /bin/sleep 60
         assert_eq!(actor.state().native_continuity, installed.native_continuity);
         assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
+    #[test]
+    fn retained_active_model_status_rejects_equal_clock_stale_revisions() {
+        let mut actor = RemoteActor::fixture();
+        let (published, publications) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            let _ = published.send(update);
+        });
+        let model = |name: &str| chat::ActiveModel {
+            id: name.into(),
+            label: name.into(),
+            reasoning: None,
+            default_reasoning: None,
+        };
+        let mut older = actor.state().as_ref().clone();
+        older.active_model_revision = 5;
+        older.active_model = Some(model("older"));
+        let mut newer = older.clone();
+        newer.active_model_revision = 6;
+        newer.active_model = Some(model("newer"));
+        assert_eq!(older.changed, newer.changed);
+        assert_eq!(older.generation, newer.generation);
+        assert!(actor.publish_resident(older.clone()));
+        assert!(actor.publish_resident(newer.clone()));
+        for revision in [5, 6] {
+            assert!(matches!(publications.recv_timeout(TIMEOUT).unwrap(),
+                Update::ActiveModel { revision: actual, .. } if actual == revision));
+        }
+        assert!(!actor.publish_resident(older.clone()));
+        assert!(publications.try_recv().is_err());
+        let attached = actor.state();
+        assert_eq!(attached.active_model_revision, 6);
+        assert_eq!(attached.active_model, newer.active_model);
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Snapshot::default()
+            },
+            Some(older),
+        );
+        let closed = actor.state();
+        assert!(closed.completed);
+        assert_eq!(closed.active_model_revision, 6);
+        assert_eq!(closed.active_model, newer.active_model);
+    }
+
     #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();

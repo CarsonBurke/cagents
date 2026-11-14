@@ -1635,6 +1635,7 @@ fn process_admitted_request(
                 // so it is told those known already. They only accumulate, so
                 // this and a concurrent change may arrive in either order.
                 extras.extend(super::chat::agent_addresses(host, session.id));
+                extras.extend(super::chat::active_model(host, session.id));
             }
             Ok((response, extras, false))
         }

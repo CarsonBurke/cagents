@@ -799,7 +799,11 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
-    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    // It was appended when introduced; later protocols may append more.
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AGENT_ADDRESSES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)

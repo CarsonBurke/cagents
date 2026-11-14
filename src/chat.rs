@@ -1317,6 +1317,13 @@ pub struct Snapshot {
     pub capabilities: Capabilities,
     pub models: Vec<Model>,
     pub selected_model: Option<String>,
+    /// Provider-confirmed model status arrives independently of the frozen
+    /// snapshot wire layout, including when this chat is hidden.
+    #[serde(skip)]
+    pub active_model: Option<ActiveModel>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub active_model_revision: u64,
     pub reasoning: Option<String>,
     #[serde(default)]
     pub fast_mode: Option<FastMode>,
@@ -2459,6 +2466,14 @@ pub struct Request {
     /// Explicit provider decisions; no implicit approval or permissive default.
     pub actions: Vec<Choice>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveModel {
+    pub id: String,
+    pub label: String,
+    pub reasoning: Option<String>,
+    pub default_reasoning: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -2480,6 +2495,44 @@ impl Model {
         })
     }
 
+    /// Name the model Claude's default menu choice resolves to while keeping
+    /// its alias and command ID recognizable in every catalog consumer.
+    pub fn resolve_claude_labels(models: &mut [Self], values: &[serde_json::Value]) {
+        for model in models.iter_mut().filter(|model| model.id == "default") {
+            let Some(resolved) = values.iter().find_map(|value| {
+                (value["value"].as_str() == Some(model.id.as_str()))
+                    .then(|| value["resolvedModel"].as_str())
+                    .flatten()
+            }) else {
+                continue;
+            };
+            let label = Self::claude_model_label(values, resolved);
+            model.label = format!("Default ({label})");
+        }
+    }
+
+    /// A concrete Claude model's canonical name, independent of whichever
+    /// menu alias selected it. Special aliases may resolve to another family.
+    pub fn claude_model_label(values: &[serde_json::Value], resolved: &str) -> String {
+        let family = resolved
+            .strip_prefix("claude-")
+            .and_then(|id| id.split('-').next());
+        values
+            .iter()
+            .find(|value| value["value"].as_str() == Some(resolved))
+            .or_else(|| {
+                family.and_then(|family| {
+                    values.iter().find(|value| {
+                        value["value"].as_str() == Some(family)
+                            && value["resolvedModel"].as_str() == Some(resolved)
+                    })
+                })
+            })
+            .and_then(|value| value["displayName"].as_str())
+            .unwrap_or(resolved)
+            .to_owned()
+    }
+
     /// One entry of the Codex app server's `model/list` page.
     ///
     /// An entry that does not describe its efforts, or does not name itself
@@ -2494,6 +2547,63 @@ impl Model {
                 effort["reasoningEffort"].as_str()
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use super::Model;
+    use serde_json::json;
+
+    #[test]
+    fn unresolved_custom_model_does_not_take_a_malformed_alias_label() {
+        let entries = json!([{"resolvedModel":"custom-model","displayName":"Unidentified alias"}]);
+        assert_eq!(
+            Model::claude_model_label(entries.as_array().unwrap(), "custom-model"),
+            "custom-model"
+        );
+    }
+
+    #[test]
+    fn default_alias_uses_a_resolved_peer_label_or_the_reported_id() {
+        for (entries, expected) in [
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},
+                    {"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5"}
+                ]),
+                "Default (Opus 5.5)",
+            ),
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-sonnet-5-5","displayName":"Default (recommended)"},
+                    {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+                    {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"}
+                ]),
+                "Default (Sonnet 5.5)",
+            ),
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-unknown-6","displayName":"Default (recommended)"}
+                ]),
+                "Default (claude-unknown-6)",
+            ),
+            (
+                json!([
+                    {"value":"default","displayName":"Default (recommended)"}
+                ]),
+                "Default (recommended)",
+            ),
+        ] {
+            let entries = entries.as_array().unwrap();
+            let mut models = entries
+                .iter()
+                .filter_map(Model::from_claude)
+                .collect::<Vec<_>>();
+            Model::resolve_claude_labels(&mut models, entries);
+            assert_eq!(models[0].id, "default");
+            assert_eq!(models[0].label, expected);
+        }
     }
 }
 
@@ -2674,6 +2784,7 @@ pub enum Event {
         selected: Option<String>,
         reasoning: Option<String>,
     },
+    ActiveModel(Option<ActiveModel>),
     FastMode(FastMode),
     Commands(Vec<SlashCommand>),
     Skills(Vec<Skill>),

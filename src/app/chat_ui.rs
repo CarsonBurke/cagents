@@ -530,7 +530,6 @@ pub enum Action {
     Scrolled(Target, Option<String>, view::Scroll, bool),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
-    ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
     ModelQuery(Target, String),
 }
@@ -855,7 +854,6 @@ impl Action {
             Self::DismissCloseRefusal(..) => "DismissCloseRefusal",
             Self::Scrolled(..) => "Scrolled",
             Self::ModelPicker(..) => "ModelPicker",
-            Self::ReasoningPicker(..) => "ReasoningPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
             Self::ModelQuery(..) => "ModelQuery",
         }
@@ -3003,7 +3001,6 @@ pub(super) struct Runtime {
     /// when the latest page next arrives.
     unplaced_failures: Vec<String>,
     failure_ui: failure::State,
-    reasoning_picker: bool,
     permission_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
@@ -4089,7 +4086,6 @@ impl Runtime {
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
-            reasoning_picker: false,
             permission_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
@@ -6075,7 +6071,6 @@ impl Runtime {
     pub(super) fn has_open_menu(&self) -> bool {
         self.child_picker.is_some()
             || self.model_picker.is_some()
-            || self.reasoning_picker
             || self.permission_picker
             || self.account_picker
             || self.composer_actions
@@ -7879,7 +7874,6 @@ impl Cagents {
             // Pickers listed the earlier provider's choices.
             runtime.model_picker = None;
             runtime.account_picker = false;
-            runtime.reasoning_picker = false;
             runtime.permission_picker = false;
             runtime.snapshot = Arc::new(fresh);
         } else if rehomed {
@@ -8418,12 +8412,10 @@ impl Cagents {
             return false;
         };
         let open = runtime.model_picker.take().is_some()
-            || runtime.reasoning_picker
             || runtime.permission_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
-        runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
@@ -9666,6 +9658,11 @@ impl Cagents {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             snapshot.models.hash(&mut hasher);
+            snapshot
+                .active_model
+                .as_ref()
+                .map(|model| (&model.id, &model.default_reasoning))
+                .hash(&mut hasher);
             hasher.finish()
         };
         if snapshot.models.is_empty()
@@ -9674,7 +9671,11 @@ impl Cagents {
             return Task::none();
         }
         let provider = runtime.session.launch.provider;
-        self.observe_listed_models(provider, snapshot.models.clone())
+        self.observe_listed_models(
+            provider,
+            snapshot.models.clone(),
+            snapshot.active_model.as_ref(),
+        )
     }
 
     pub(super) fn start_chat(
@@ -10309,7 +10310,6 @@ impl Cagents {
         runtime.error = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
-        runtime.reasoning_picker = false;
         runtime.session = pending.candidate.clone();
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
@@ -10843,6 +10843,7 @@ impl Cagents {
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
+            | Action::Reasoning(target, _, _)
             | Action::PermissionMode(target, _) => {
                 self.cards.get(&target.card).and_then(|card| match card {
                     CardRuntime::Chat(runtime)
@@ -11135,7 +11136,6 @@ impl Cagents {
                     runtime.picker_keyboard = false;
                     runtime.account_picker = open && runtime.choosing();
                     runtime.model_picker = None;
-                    runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
                 }
             }
@@ -11710,7 +11710,6 @@ impl Cagents {
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
-                            runtime.reasoning_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             runtime.pending = None;
@@ -12935,7 +12934,6 @@ impl Cagents {
                     runtime.permission_picker = open;
                     if open {
                         runtime.model_picker = None;
-                        runtime.reasoning_picker = false;
                         runtime.account_picker = false;
                         runtime.permissions_form.page = permissions::Page::Blocked;
                         if runtime.session.launch.provider == Provider::Claude
@@ -14264,7 +14262,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                runtime.reasoning_picker = false;
+                runtime.model_picker = None;
                 let Some(model) = runtime.snapshot.models.iter().find(|model| {
                     model.id == model_id
                         && Some(&model.id) == runtime.snapshot.selected_model.as_ref()
@@ -14724,7 +14722,6 @@ impl Cagents {
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(String::new);
-                runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
                 if open {
@@ -14742,16 +14739,6 @@ impl Cagents {
                     && let Some(current) = runtime.model_picker.as_mut()
                 {
                     *current = query;
-                }
-            }
-            Action::ReasoningPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.composer_actions = false;
-                    runtime.branch_picker = false;
-                    runtime.reasoning_picker = open;
-                    runtime.model_picker = None;
-                    runtime.account_picker = false;
-                    runtime.permission_picker = false;
                 }
             }
         }
@@ -27432,6 +27419,7 @@ mod tests {
                 fixture_model("gpt-a", &[]),
                 fixture_model("gpt-b", &["low", "high"]),
             ],
+            None,
         );
         let card = draft_chat(app);
         let target = chat_runtime(app, card).target;

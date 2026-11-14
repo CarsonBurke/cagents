@@ -131,6 +131,8 @@ class Scenario:
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self.model = "fixture-mini"
+        self.reasoning = None
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
         # Replayed once, by the thread's first turn.
@@ -152,6 +154,7 @@ class Scenario:
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
                                   "latest": self.latest, "child_latest": self.child_latest,
+                                  "model": self.model, "reasoning": self.reasoning,
                                   "interrupting": sorted(self.interrupting)})
 
     def restore(self, state):
@@ -163,6 +166,8 @@ class Scenario:
         self.thread, self.child = state["thread"], state["child"]
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
+        self.model = state.get("model", "fixture-mini")
+        self.reasoning = state.get("reasoning")
         self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
         for thread in (self.thread, self.child):
@@ -296,7 +301,7 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True, *, web_rows=False, diagnostics=False):
+    def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False):
         starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
@@ -306,7 +311,7 @@ class Scenario:
                    "Original diagnostic detail: no provider or network was contacted.\n"
                    "Recover by reviewing the recorded receipt; no files changed.")
             return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
-                    {"_sleep": PAUSE},
+                    {"_sleep": pause},
                     notify("error", turnId=turn, error={"message": raw}, willRetry=False),
                     notify("turn/completed", turn={"id": turn, "status": "failed", "items": [],
                                                    "error": {"message": raw}})]
@@ -332,7 +337,7 @@ class Scenario:
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
                 *replayed,
                 *child_started,
-                *started, *([] if web_rows else [diff]), {"_sleep": PAUSE}, *completed,
+                *started, *([] if web_rows else [diff]), {"_sleep": pause}, *completed,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
@@ -357,14 +362,19 @@ class Scenario:
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self.latest if thread == self.thread else self.child_latest
-            result = {"thread": self.metadata(thread), "model": "fixture-mini",
+            if method == "thread/start":
+                catalog = self.models(codex_home)["data"]
+                default = next((model for model in catalog if model.get("isDefault")), catalog[0])
+                self.model = params.get("model") or default["model"]
+                self.reasoning = params.get("config", {}).get("model_reasoning_effort")
+            result = {"thread": self.metadata(thread), "model": self.model,
+                      "reasoningEffort": self.reasoning,
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
         elif method == "thread/read":
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
-            result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
-                       "displayName": "Offline fixture"}], "nextCursor": None}
+            result = self.models(codex_home)
         elif method == "thread/list":
             result = {"data": [] if any((Path(codex_home) / marker).is_file()
                                        for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
@@ -397,6 +407,19 @@ class Scenario:
                     or self.child_latest and self.child_latest["status"] == "inProgress"
                     and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
+            pause = PAUSE
+            pause_file = Path(codex_home) / "fixture-turn-pause"
+            if pause_file.is_file():
+                try:
+                    pause = float(pause_file.read_text())
+                    if not 0 <= pause <= 300:
+                        raise ValueError()
+                except ValueError:
+                    raise ValueError("fixture-turn-pause must hold seconds between 0 and 300") from None
+            if params.get("model"):
+                self.model = params["model"]
+            if "effort" in params:
+                self.reasoning = params["effort"]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
@@ -407,7 +430,8 @@ class Scenario:
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child, web_rows=web_rows, diagnostics=diagnostics)
+            after = self.notifications(turn, starts_child, pause=pause,
+                                       web_rows=web_rows, diagnostics=diagnostics)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
@@ -432,6 +456,20 @@ class Scenario:
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
         return [{"id": identifier, "result": result}, *after]
+
+    def models(self, codex_home):
+        """Optional recorded model/list result, private to this fixture's home."""
+        models = Path(codex_home) / "fixture-models.json"
+        if models.is_file():
+            catalog = json.loads(models.read_text())
+            if not isinstance(catalog.get("data"), list) or not catalog["data"]:
+                raise ValueError("fixture-models.json must hold a nonempty model/list result")
+            if any(not isinstance(model.get("model"), str) or not model["model"]
+                   for model in catalog["data"]):
+                raise ValueError("every fixture-models.json model must have a nonempty model ID")
+            return catalog
+        return {"data": [{"id": "fixture-mini", "model": "fixture-mini",
+                          "displayName": "Offline fixture"}], "nextCursor": None}
 
 
 def serve(connection, codex_home, scenario, request_lock):
