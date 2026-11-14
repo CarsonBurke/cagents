@@ -239,7 +239,9 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-pub const PROTOCOL_VERSION: u16 = 177;
+/// Version 178 fences shared Close on its original pane and terminal worker,
+/// and appends attachment metadata and completed/absent removal-basis reads.
+pub const PROTOCOL_VERSION: u16 = 178;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -643,6 +645,11 @@ pub enum ClientRequest {
     ReadWorkspaceMetadata {
         query: crate::workspace_model::metadata::Query,
     },
+    /// An exact source worker, or an absence stamp captured before Close's
+    /// process proof. This never closes, starts or attaches a terminal.
+    ReadTerminalRemovalBasis {
+        source: TerminalSession,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -927,6 +934,12 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         addresses: Vec<crate::chat::AgentAddress>,
     },
+    /// Exact attachment metadata, separate from the frozen descriptor used by
+    /// historical update sources. This UUID never authorizes process cleanup.
+    TerminalWorker {
+        terminal_id: TerminalId,
+        instance: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1065,6 +1078,7 @@ pub enum ServerResponse {
     },
     WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
     WorkspaceMetadata(crate::workspace_model::metadata::Reply),
+    TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

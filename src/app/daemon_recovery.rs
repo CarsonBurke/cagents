@@ -379,7 +379,7 @@ impl From<&str> for KeptPane {
 pub(super) fn prove_not_hosted(
     session: &TerminalSession,
     leave: &[UnreadableProcess],
-) -> Result<(), KeptPane> {
+) -> Result<crate::workspace_model::views::TerminalRemovalBasis, KeptPane> {
     // A remote or agent-scoped window sees neither this daemon's lease nor the
     // processes behind it, so nothing it can read here would prove an absence.
     if crate::device::is_remote()
@@ -393,12 +393,21 @@ pub(super) fn prove_not_hosted(
         );
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|_| UNREACHABLE)?;
-    prove_not_hosted_at(
+    prove_not_hosted_with(
         session,
         &socket,
         Path::new("/proc"),
         registered_holder,
         leave,
+        |client| {
+            let basis = client
+                .terminal_removal_basis(session.clone())
+                .map_err(|_| KeptPane::from(STILL_HOSTED))?;
+            match basis {
+                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. } => Ok(basis),
+                _ => Err(STILL_HOSTED.into()),
+            }
+        },
     )
 }
 
@@ -439,6 +448,7 @@ fn unadopted_refusal(pid: i32) -> String {
     )
 }
 
+#[cfg(test)]
 fn prove_not_hosted_at(
     session: &TerminalSession,
     socket: &Path,
@@ -446,6 +456,17 @@ fn prove_not_hosted_at(
     holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
     leave: &[UnreadableProcess],
 ) -> Result<(), KeptPane> {
+    prove_not_hosted_with(session, socket, proc_root, holder, leave, |_| Ok(()))
+}
+
+fn prove_not_hosted_with<T>(
+    session: &TerminalSession,
+    socket: &Path,
+    proc_root: &Path,
+    holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
+    leave: &[UnreadableProcess],
+    capture: impl FnOnce(&mut ControlClient) -> Result<T, KeptPane>,
+) -> Result<T, KeptPane> {
     session
         .continuity
         .live_proof()
@@ -471,6 +492,7 @@ fn prove_not_hosted_at(
     // A daemon stuck in startup recovery still answers inventory reads, and that
     // inventory can be partial. This request is refused until it admits work.
     client.daemon_version().map_err(|_| UNREACHABLE)?;
+    let basis = capture(&mut client)?;
     let terminals = client.list().map_err(|_| UNREACHABLE)?;
     let chats = client.list_chats().map_err(|_| UNREACHABLE)?;
     let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
@@ -567,7 +589,7 @@ fn prove_not_hosted_at(
             return Err(open_agent_refusal(agent, &chats, &current.boot_id).into());
         }
     }
-    Ok(())
+    Ok(basis)
 }
 
 const NOTHING_STARTED: &str = "so nothing was started";

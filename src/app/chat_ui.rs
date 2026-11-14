@@ -9369,6 +9369,9 @@ impl Cagents {
         ) {
             return Task::none();
         }
+        if !self.prepare_shared_removal(card) {
+            return Task::none();
+        }
         if let Some(Phase::Returning {
             close_requested, ..
         }) = self.chat_ui.phases.get_mut(&card)
@@ -14535,7 +14538,7 @@ impl Cagents {
                     let close = if self.chat_has_parked_runtime(target.card) {
                         self.begin_chat_close(target.card)
                     } else {
-                        self.begin_card_close(target.card)
+                        self.continue_card_close(target.card, false)
                     };
                     Task::batch([task, close])
                 } else {
@@ -14600,7 +14603,7 @@ impl Cagents {
                             "The chat could not be confirmed stopped: {error}"
                         )));
                     }
-                    return self.begin_card_close(target.card);
+                    return self.continue_card_close(target.card, false);
                 }
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(error));
@@ -25037,6 +25040,14 @@ mod tests {
             let destination = ChannelId::new();
             let project = ProjectId::new();
             app.workspace_model.identity = uuid::Uuid::new_v4();
+            app.workspace_model
+                .projects
+                .push(crate::workspace_model::ModelProject {
+                    repository: repository.clone(),
+                    name: "Fixture".into(),
+                    kind: Default::default(),
+                    ordinal: 1,
+                });
             app.workspace_model.channels = [source, destination]
                 .into_iter()
                 .map(|id| ModelChannel {
@@ -25100,6 +25111,130 @@ mod tests {
                 assert!(rx.try_recv().is_err());
             }
         }
+    }
+
+    fn share_close_source(app: &mut Cagents, card: CardId) -> crate::workspace_model::views::Pane {
+        use crate::workspace_model::{
+            ModelProject,
+            views::{Pane, Scope, View},
+        };
+        let repository = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.launch.recipe.working_directory.clone(),
+            CardKind::Terminal(session) => session.launch.working_directory.clone(),
+            _ => unreachable!(),
+        };
+        let scope = Scope::Worktree {
+            repository: repository.clone(),
+            path: repository.clone(),
+        };
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![ModelProject {
+            repository,
+            name: "Fixture".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        let original = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        app.workspace_model.views = vec![View {
+            panes: vec![original.clone()],
+            ..View::empty(scope)
+        }];
+        original
+    }
+
+    #[test]
+    fn retained_shared_chat_close_never_recaptures_a_replacement_after_cleanup() {
+        use crate::workspace_model::{ModelEdit, views::Change};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let saved = app.chat_return_session(card).unwrap();
+        let original = share_close_source(&mut app, card);
+        let (tx, published) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.begin_chat_close(card));
+        let target = app.chat_ui.phases[&card].target();
+        let mut replacement = original.clone();
+        if let CardKind::Chat(session) = &mut replacement.kind {
+            session.id = TerminalId::new();
+        }
+        app.workspace_model.views[0].panes[0] = replacement.clone();
+        app.workspace_model.views[0].revision += 1;
+        drop(app.handle_chat_ui(Action::RetainedCloseFinished(target, saved, Ok(()))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.workspace_model.views[0].panes[0], replacement);
+        assert!(
+            !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView {
+                    change: Change::Remove { .. } | Change::RemoveSource { .. },
+                    ..
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn retained_shared_chat_close_parked_continuation_cannot_close_a_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat runtime");
+        };
+        let target = runtime.target;
+        let proof = runtime.session.proof.clone().unwrap();
+        app.chat_ui.parked.insert(card, runtime);
+        let CardKind::Terminal(mut terminal) = crate::app::tests::terminal_card_state().kind else {
+            unreachable!()
+        };
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(terminal);
+        app.cards.insert(card, CardRuntime::Completed);
+        let original = share_close_source(&mut app, card);
+        drop(app.begin_chat_close(card));
+        assert!(app.chat_close_owned(card));
+        let mut replacement = original.clone();
+        if let CardKind::Terminal(session) = &mut replacement.kind {
+            session.id = TerminalId::new();
+        }
+        app.workspace_model.views[0].panes[0] = replacement.clone();
+        app.card_state_mut(card).unwrap().kind = replacement.kind;
+        drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.terminal_close.is_none());
+        assert!(app.completed_release.is_none());
+    }
+
+    #[test]
+    fn retained_shared_chat_close_queued_continuation_cannot_recapture_a_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let saved = app.chat_return_session(card).unwrap();
+        let original = share_close_source(&mut app, card);
+        let other = saved_terminal_pane(&mut app);
+        app.workspace.request_close(other).unwrap();
+        drop(app.begin_chat_close(card));
+        let target = app.chat_ui.phases[&card].target();
+        drop(app.handle_chat_ui(Action::RetainedCloseFinished(target, saved, Ok(()))));
+        assert!(app.terminal_close_in_progress(card));
+        let mut replacement = original.clone();
+        if let CardKind::Chat(session) = &mut replacement.kind {
+            session.id = TerminalId::new();
+        }
+        app.workspace_model.views[0].panes[0] = replacement.clone();
+        app.card_state_mut(card).unwrap().kind = replacement.kind;
+        app.workspace.cancel_close(other).unwrap();
+        drop(app.next_queued_card_close());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        assert!(app.workspace.pending_close().is_none());
     }
 
     #[test]
@@ -32845,6 +32980,7 @@ mod tests {
                     super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
                 )));
             }
+
             let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
                 target,
                 Ready(Arc::new(Mutex::new(Some(Ok(handle))))),

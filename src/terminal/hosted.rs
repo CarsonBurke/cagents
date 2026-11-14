@@ -215,6 +215,7 @@ impl InputRejectionReason {
 }
 
 struct HostedPublishedState {
+    execution_instance: Mutex<Option<uuid::Uuid>>,
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
     ///
@@ -258,6 +259,19 @@ struct HostedPublishedState {
 }
 
 impl HostedPublishedState {
+    fn observe_worker(&self, instance: uuid::Uuid) -> bool {
+        let mut current = self
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if instance.is_nil() || current.is_some_and(|current| current != instance) {
+            return false;
+        }
+        *current = Some(instance);
+        self.request_semantic_wake();
+        true
+    }
+
     fn new(
         expected_host: Option<HostSessionProof>,
         visible: bool,
@@ -265,6 +279,7 @@ impl HostedPublishedState {
     ) -> Self {
         let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
         Self {
+            execution_instance: Mutex::new(None),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             retained: ArcSwapOption::empty(),
             generation: AtomicU64::new(0),
@@ -1088,6 +1103,15 @@ impl HostedTerminalHandle {
 
     pub fn terminal_id(&self) -> TerminalId {
         self.inner.terminal_id
+    }
+
+    pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> {
+        *self
+            .inner
+            .published
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Returns the fenced host identity only after the daemon accepted this terminal.
@@ -2603,6 +2627,7 @@ fn serve_connection(
             && matches!(
                 &envelope.message,
                 ServerMessage::TerminalObserved { terminal_id: id, .. }
+                    | ServerMessage::TerminalWorker { terminal_id: id, .. }
                     | ServerMessage::Redraw { terminal_id: id, .. }
                     | ServerMessage::Snapshot { terminal_id: id, .. }
                     | ServerMessage::Event { terminal_id: id, .. }
@@ -2629,6 +2654,23 @@ fn serve_connection(
         }
 
         match envelope.message {
+            ServerMessage::TerminalWorker {
+                terminal_id: id,
+                instance,
+            } if envelope.request_id.is_none() && id == terminal_id => {
+                if !published.observe_worker(instance) {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "The attached terminal worker changed",
+                            false,
+                        ),
+                    );
+                }
+            }
             ServerMessage::Response { response } => {
                 let Some(request_id) = envelope.request_id else {
                     return ConnectionEnd::Retry;
@@ -3162,6 +3204,17 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn attachment_worker_receipt_cannot_change_on_an_existing_surface() {
+        let state = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+        let original = uuid::Uuid::new_v4();
+        assert!(!state.observe_worker(uuid::Uuid::nil()));
+        assert!(state.observe_worker(original));
+        assert!(state.observe_worker(original));
+        state.mark_detached();
+        assert!(!state.observe_worker(uuid::Uuid::new_v4()));
+        assert_eq!(*state.execution_instance.lock().unwrap(), Some(original));
+    }
     #[test]
     fn stopping_an_attachment_interrupts_blocked_socket_io() {
         let stop = Arc::new(WorkerStop::default());

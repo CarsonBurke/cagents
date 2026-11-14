@@ -296,6 +296,23 @@ mid-turn, and `{"_end": true}` to end the turn on the frames' own result. A
 
 ## Adding a scene to evidence
 
+`examples/shared-removal-fixture.rs` scripts a competing window for shared
+Close races. Build it with `scripts/cargo-gate build --locked
+--no-default-features --example shared-removal-fixture`, then copy the executable
+to the evidence host. Run it through `native-evidence env`, after opening the
+fixture project, with the side's protocol number and `unconditional` for the
+old ID-only removal or `conditional` for source-checked removal. It refuses an
+environment outside native-evidence.
+
+The fixture creates a channel named **Shared Close race**, a repository pane
+and a short-lived shell pane. It captures Close, releases the original worker,
+replaces the terminal in the same card, then delivers the delayed removal at
+the new revision. The unconditional case must remove the replacement; the
+conditional case must preserve it. Open the channel and capture the settled
+state. This exercises the real daemon's mutation API and the native UI's
+projection, using fixture shells and no model provider. The competing window
+and delayed request are scripted; unit tests cover the UI's capture and queue.
+
 Write the scene as steps, not as instructions in a PR comment, so the next
 agent can rerun it:
 

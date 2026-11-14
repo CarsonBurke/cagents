@@ -799,7 +799,10 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
-    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AGENT_ADDRESSES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
@@ -810,5 +813,28 @@ fn agent_addresses_are_beyond_every_older_recording() {
             variant_count(&recorded(protocol), "ServerMessage") <= index,
             "protocol {protocol} already had a message at its position"
         );
+    }
+}
+
+#[test]
+fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
+    let marker = ServerMessage::TerminalWorker {
+        terminal_id: crate::model::TerminalId::new(),
+        instance: uuid::Uuid::new_v4(),
+    };
+    let index = super::variant_index(&marker).unwrap();
+    assert_eq!(index + 1, variant_count(&recorded(178), "ServerMessage"));
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "terminal_worker",
+        178
+    )));
+    for client in OLDER_CLIENTS {
+        assert!(!client.admits_message(&marker));
+    }
+    for protocol in
+        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 178)
+    {
+        assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
     }
 }

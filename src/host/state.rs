@@ -1,6 +1,7 @@
 #[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 mod presentation;
+mod removal;
 mod retention;
 pub(super) use retention::Retirement;
 mod setup_restore;
@@ -353,6 +354,7 @@ pub(crate) struct HostState {
     /// Its terminal may be the final startup owner blocking ordinary exit.
     checked_close_replies: BTreeSet<ClientId>,
     pub(super) inventory_generation: u64,
+    published_terminal_workers: removal::PublishedWorkers,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) native_chat_capacity: usize,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
@@ -489,6 +491,7 @@ impl HostState {
             ordinary_exit_registration_closed: false,
             checked_close_replies: BTreeSet::new(),
             inventory_generation: 0,
+            published_terminal_workers: Default::default(),
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
             chats: BTreeMap::new(),
@@ -861,6 +864,26 @@ impl HostState {
                     if current_title.as_ref() == Some(title) => {}
                 crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
                 _ => return Err(invalid()),
+            }
+        }
+        if matches!(
+            &edit,
+            ModelEdit::ChangeView {
+                change: crate::workspace_model::views::Change::RemoveSource { .. },
+                ..
+            }
+        ) {
+            let ModelEdit::ChangeView { operation, .. } = &edit else {
+                unreachable!()
+            };
+            if !self
+                .registry()?
+                .view_operation_seen(*operation)
+                .map_err(model_unavailable)?
+            {
+                self.validate_view_removal(&edit).map_err(|reason| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false)
+                })?;
             }
         }
         let applied = super::workspace::apply_delta(self.registry()?, &edit)?;
@@ -1270,6 +1293,10 @@ impl HostState {
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
         let record = self.terminals.remove(&terminal_id)?;
+        // A long-lived resident can outlast the bounded publication history.
+        // Retain this actual departing worker before absence becomes visible.
+        self.published_terminal_workers
+            .observe(terminal_id, record.handle.execution_instance());
         self.notification_closed.remove(&terminal_id);
         if let Some(notifications) = &self.notifications {
             notifications.retire(terminal_id);
@@ -1477,6 +1504,8 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
+        self.published_terminal_workers
+            .observe(terminal_id, handle.execution_instance());
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -1507,6 +1536,7 @@ impl HostState {
         self.subscriptions
             .attach(client_id, terminal_id, visibility);
         self.rearm_output(client_id, terminal_id);
+        self.publish_worker(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
     }
 

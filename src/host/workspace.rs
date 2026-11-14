@@ -134,7 +134,24 @@ fn edit_then<T>(
             return Ok((receipt, then(&registry)?));
         }
     }
-    let applied = apply_delta(&mut registry, &edit)?;
+    let applied = if matches!(
+        &edit,
+        ModelEdit::ChangeView {
+            change: Change::RemoveSource { .. },
+            ..
+        }
+    ) {
+        apply_delta_guarded(&mut registry, &edit, |seen| {
+            if seen {
+                return Ok(None);
+            }
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.validate_view_removal(&edit)?;
+            Ok(Some(state))
+        })?
+    } else {
+        apply_delta(&mut registry, &edit)?
+    };
     if applied.changed {
         let waiting = Instant::now();
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -187,6 +204,14 @@ pub(super) fn apply_delta(
     registry: &mut Registry,
     edit: &ModelEdit,
 ) -> Result<DeltaApplied, ProtocolError> {
+    apply_delta_guarded(registry, edit, |_| Ok(()))
+}
+
+fn apply_delta_guarded<G>(
+    registry: &mut Registry,
+    edit: &ModelEdit,
+    guard: impl FnOnce(bool) -> Result<G, String>,
+) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
         scope,
         expected_revision,
@@ -217,7 +242,10 @@ pub(super) fn apply_delta(
             }
         }
     }
-    registry.apply_delta(edit).map_err(|error| {
+    registry.apply_delta_guarded(edit, guard).map_err(|error| {
+        if error == Registry::VIEW_REMOVAL_CONFLICT {
+            return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
+        }
         if error == Registry::VIEW_SOURCE_CONFLICT || error == Registry::VIEW_REVISION_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
         }

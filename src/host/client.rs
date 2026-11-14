@@ -182,6 +182,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadWorkspaceView { .. }
             | ClientRequest::ReadWorkspaceSnapshot
             | ClientRequest::ReadWorkspaceMetadata { .. }
+            | ClientRequest::ReadTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -1668,6 +1669,17 @@ fn process_admitted_request(
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
+        ClientRequest::ReadTerminalRemovalBasis { source } => {
+            let basis = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminal_removal_basis(&source)?;
+            Ok((
+                ServerResponse::TerminalRemovalBasis(basis),
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::ReadWorkspaceMetadata { query } => {
             let metadata = super::workspace::metadata(host, query)?;
             Ok((
@@ -1761,22 +1773,24 @@ fn process_admitted_request(
             after_generation,
             after_event_sequence,
         } => {
-            let (terminal, events) = {
+            let (terminal, events, worker) = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let terminal = state.attach(client_id, terminal_id)?;
                 state.resume_presentation(client_id, terminal_id, after_generation);
                 let events = state.replay_events(terminal_id, after_event_sequence)?;
-                (terminal, events)
+                let worker = state.worker_marker(terminal_id)?;
+                (terminal, events, worker)
             };
             let snapshot =
                 super::state::client_snapshot(host, client_id, terminal_id, after_generation)?;
-            let extras = replay_messages(
+            let mut extras = replay_messages(
                 terminal_id,
                 events,
                 snapshot,
                 terminal.generation,
                 terminal.event_sequence,
             );
+            extras.insert(0, worker);
             Ok((ServerResponse::Attached { terminal }, extras, false))
         }
         ClientRequest::Detach { terminal_id } => {
@@ -2293,7 +2307,7 @@ fn prepare_resume(
         if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
             continue;
         }
-        let (terminal, events) = {
+        let (terminal, events, worker) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
                 continue;
@@ -2302,17 +2316,19 @@ fn prepare_resume(
             let events = state
                 .replay_events(cursor.terminal_id, cursor.event_sequence)
                 .unwrap_or_default();
-            (terminal, events)
+            let worker = state.worker_marker(cursor.terminal_id)?;
+            (terminal, events, worker)
         };
         let snapshot =
             super::state::client_snapshot(host, client_id, cursor.terminal_id, cursor.generation)?;
-        let messages = replay_messages(
+        let mut messages = replay_messages(
             cursor.terminal_id,
             events,
             snapshot,
             terminal.generation,
             terminal.event_sequence,
         );
+        messages.insert(0, worker);
         let prepared = (terminal, messages);
         resumed.push(prepared.0);
         replay.extend(prepared.1);

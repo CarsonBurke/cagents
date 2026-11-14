@@ -5,6 +5,7 @@ use crate::workspace_model::{
     ModelEdit,
     views::{self, Change, Pane, Scope, View},
 };
+mod removal;
 
 /// One immutable projection for a publication pass. Scope discovery includes
 /// historical directories, but their cards never become open shared panes.
@@ -119,6 +120,7 @@ fn view_scope_hold<'a>(
 
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) removals: HashMap<CardId, Option<removal::RemovalSource>>,
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
@@ -1489,6 +1491,15 @@ impl Cagents {
                     tracing::warn!(card = %id, ?scope, "not retiring a shared pane that is still open");
                     continue;
                 }
+                let change = if let Change::Remove { id } = &change {
+                    // Never turn a placement diff into source-free shared Close.
+                    let Some(change) = self.shared_removal_change(*id, &scope) else {
+                        continue;
+                    };
+                    change
+                } else {
+                    change
+                };
                 if let Change::Insert { pane, .. } = &change
                     && matches!(pane.kind, CardKind::Chat(_))
                 {
@@ -1919,6 +1930,7 @@ impl Cagents {
                 Change::Insert { pane, .. }
                 | Change::Update { pane, .. }
                 | Change::InsertIfEmpty { pane } => pane.id,
+                Change::RemoveSource { before, .. } => before.id,
                 Change::Remove { id } | Change::Move { id, .. } | Change::Transfer { id, .. } => {
                     *id
                 }
@@ -3150,6 +3162,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 mod tests {
     mod history_start;
     mod published_card_edits;
+    mod removal_tests;
     mod startup_admission;
     mod startup_terminals;
 
@@ -3222,6 +3235,22 @@ mod tests {
             });
         }
         app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: "/repo/.git".into(),
+            name: "Fixture".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = [a, b]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: "/repo/.git".into(),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
         app.shared_views
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);

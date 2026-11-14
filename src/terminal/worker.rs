@@ -439,6 +439,7 @@ impl InputOrder {
 }
 
 struct PublishedState {
+    execution_instance: uuid::Uuid,
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
     acknowledged_generation: AtomicU64,
@@ -544,6 +545,7 @@ impl PublishedState {
         let cleanup_pool = admission::CleanupPool::new(capture_tx.clone());
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
+            execution_instance: uuid::Uuid::new_v4(),
             published_generation: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
             capture_tx,
@@ -1596,6 +1598,10 @@ impl TerminalHandle {
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn execution_instance(&self) -> uuid::Uuid {
+        self.inner.published.execution_instance
     }
 
     pub(crate) fn begin_completed_retirement(&self) -> Result<(), &'static str> {

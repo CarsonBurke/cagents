@@ -452,6 +452,21 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TerminalRemovalBasis {
+    Worker {
+        owner: crate::model::HostSessionProof,
+        instance: uuid::Uuid,
+    },
+    /// Captured before the positive process-absence check, never refreshed
+    /// after that check. Eviction also invalidates an absence observation.
+    Absent {
+        owner: crate::model::HostSessionProof,
+        latest_worker: Option<uuid::Uuid>,
+        history_epoch: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Change {
     Insert {
         pane: Pane,
@@ -475,6 +490,14 @@ pub enum Change {
     },
     InsertIfEmpty {
         pane: Pane,
+    },
+    /// Close consent belongs to this original source, across revision retries.
+    /// Explicit administrative Remove retains its current-membership semantics.
+    RemoveSource {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+        before: Pane,
+        terminal: Option<TerminalRemovalBasis>,
     },
 }
 
@@ -566,6 +589,20 @@ impl View {
                     self.retired.push(*id);
                 }
             }
+            Change::RemoveSource { before, .. } => {
+                let mut sources = self.panes.iter().filter(|pane| pane.id == before.id);
+                if !sources
+                    .next()
+                    .is_some_and(|pane| same_removal_source(before, pane))
+                    || sources.next().is_some()
+                {
+                    return Err("workspace view removal source conflict".into());
+                }
+                self.panes.retain(|pane| pane.id != before.id);
+                if !self.retired.contains(&before.id) {
+                    self.retired.push(before.id);
+                }
+            }
             Change::Move { id, before } => {
                 if before != &Some(*id) {
                     if let Some(index) = self.panes.iter().position(|pane| pane.id == *id) {
@@ -593,6 +630,110 @@ pub fn updates_source(before: &Pane, pane: &Pane) -> bool {
     before.kind != pane.kind
         || before.pending_terminal_start != pane.pending_terminal_start
         || before.scope != pane.scope
+}
+
+/// Presentation edits do not renew Close consent. An original terminal may
+/// finish, and a native conversation may stop, without becoming a successor.
+pub fn same_removal_source(before: &Pane, current: &Pane) -> bool {
+    before.id == current.id
+        && before.scope == current.scope
+        && before.pending_terminal_start == current.pending_terminal_start
+        && match (&before.kind, &current.kind) {
+            (CardKind::Terminal(before), CardKind::Terminal(current)) => {
+                let mut comparable = current.clone();
+                comparable.continuity = before.continuity.clone();
+                comparable == *before
+                    && current
+                        .continuity
+                        .live_proof()
+                        .is_none_or(|proof| before.continuity.live_proof() == Some(proof))
+            }
+            (CardKind::Chat(before), CardKind::Chat(current)) => {
+                let mut comparable = current.clone();
+                comparable.native_continuity = before.native_continuity.clone();
+                comparable == *before
+            }
+            (before, current) => shared_kind(before) == shared_kind(current),
+        }
+}
+
+pub fn removal_source_current(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+) -> bool {
+    let Change::RemoveSource {
+        registry,
+        repository,
+        before,
+        ..
+    } = change
+    else {
+        return false;
+    };
+    let owner = match scope {
+        Scope::Channel(id) => model.channel(*id).map(|channel| &channel.repository),
+        Scope::Worktree { repository, .. } => Some(repository),
+    };
+    if *registry == super::NO_REGISTRY
+        || *registry != model.identity
+        || owner != Some(repository)
+        || !model
+            .projects
+            .iter()
+            .any(|project| &project.repository == repository)
+    {
+        return false;
+    }
+    let mut owners = model.views.iter().flat_map(|view| {
+        view.panes
+            .iter()
+            .filter(move |pane| pane.id == before.id)
+            .map(move |pane| (&view.scope, pane))
+    });
+    owners.next().is_some_and(|(current_scope, pane)| {
+        current_scope == scope && same_removal_source(before, pane)
+    }) && owners.next().is_none()
+}
+
+/// Exact cleanup can retire the original pane before its UI reply arrives.
+/// A successor or transfer with the same card ID is never an acknowledgement.
+pub fn removal_source_retired(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+) -> bool {
+    let Change::RemoveSource {
+        registry,
+        repository,
+        before,
+        ..
+    } = change
+    else {
+        return false;
+    };
+    *registry != super::NO_REGISTRY
+        && model.identity == *registry
+        && match scope {
+            Scope::Channel(id) => model
+                .channel(*id)
+                .is_some_and(|channel| &channel.repository == repository),
+            Scope::Worktree {
+                repository: owner, ..
+            } => owner == repository,
+        }
+        && model
+            .projects
+            .iter()
+            .any(|project| &project.repository == repository)
+        && !model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == before.id))
+        && model
+            .views
+            .iter()
+            .any(|view| &view.scope == scope && view.retired.contains(&before.id))
 }
 
 pub fn changes(previous: &[Pane], desired: &[Pane]) -> Vec<Change> {
@@ -787,6 +928,45 @@ mod wire_kind {
 mod wire_tests {
     use super::*;
     use crate::model::*;
+    #[test]
+    fn delayed_close_does_not_remove_a_replacement_source() {
+        let original = Pane {
+            id: CardId::new(),
+            title: "original".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let removal = Change::RemoveSource {
+            registry: uuid::Uuid::new_v4(),
+            repository: "/repo".into(),
+            before: original.clone(),
+            terminal: None,
+        };
+        let mut replacement = original.clone();
+        if let CardKind::Browser(browser) = &mut replacement.kind {
+            browser.id = BrowserId::new();
+        }
+        let mut view = View::empty(ChannelId::new());
+        view.panes = vec![replacement.clone()];
+        assert!(
+            view.apply(&removal).is_err(),
+            "queued Close must refuse its replaced source"
+        );
+        assert_eq!(view.panes, vec![replacement]);
+        assert!(view.retired.is_empty());
+    }
+
     #[test]
     fn nonempty_views_round_trip_through_ipc_and_persistent_json() {
         use std::os::unix::ffi::OsStringExt;
