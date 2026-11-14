@@ -1498,7 +1498,8 @@ mod tests {
         drop(original_directory);
     }
 
-    /// Context switches of this process's native watcher threads, by thread.
+    /// Voluntary context switches, the times a thread slept and was woken,
+    /// of this process's native watcher threads, by thread ID.
     fn watcher_thread_switches() -> BTreeMap<String, u64> {
         std::fs::read_dir("/proc/self/task")
             .unwrap()
@@ -1511,9 +1512,10 @@ mod tests {
                 let switches = std::fs::read_to_string(task.join("status"))
                     .ok()?
                     .lines()
-                    .filter(|line| line.contains("ctxt_switches"))
-                    .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
-                    .sum();
+                    .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
                 Some((task.file_name()?.to_string_lossy().into_owned(), switches))
             })
             .collect()
@@ -1531,6 +1533,7 @@ mod tests {
         let file = source.join("main.rs");
         std::fs::write(&file, "first").unwrap();
         std::fs::write(worktree.git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let others = watcher_thread_switches();
         let (wake, woken) = mpsc::sync_channel(1);
         let monitor = (
             Monitor::start(move || {
@@ -1543,9 +1546,13 @@ mod tests {
         wait_for(&monitor, project.id, "initial configuration", |change| {
             change.coverage == Some(true) && change.error.is_none()
         });
+        // This monitor's watcher thread, and any that other tests started
+        // meanwhile, but none that were already running.
+        let mut before = watcher_thread_switches();
+        before.retain(|thread, _| !others.contains_key(thread));
+        assert!(!before.is_empty(), "the watcher thread was not found");
         // What Git status and a compiler do to a checkout: open its files and
         // list its directories, many times over, without changing anything.
-        let before = watcher_thread_switches();
         for _ in 0..200 {
             std::fs::read(&file).unwrap();
             std::fs::read(worktree.git_dir.join("HEAD")).unwrap();
@@ -1553,10 +1560,14 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         thread::sleep(Duration::from_millis(100));
-        // Other tests' watchers may wake meanwhile, but not hundreds of times.
-        let woke: u64 = watcher_thread_switches()
-            .into_iter()
-            .map(|(thread, switches)| switches - before.get(&thread).copied().unwrap_or(0))
+        let after = watcher_thread_switches();
+        let woke: u64 = before
+            .iter()
+            .map(|(thread, switches)| {
+                after
+                    .get(thread)
+                    .map_or(0, |after| after.saturating_sub(*switches))
+            })
             .sum();
         assert!(woke < 40, "the watcher woke {woke} times for reads alone");
         // A change still arrives.

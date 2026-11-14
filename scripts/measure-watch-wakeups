@@ -10,7 +10,10 @@
 # Work board has read it, the project's CLI is checked through the build gate
 # over and over for SECONDS (default 120), touching a source file before each
 # check so the compiler reads the crate again. The daemon's threads are
-# measured meanwhile from /proc. Nothing outside the fixture is touched.
+# measured meanwhile from /proc by scripts/measure-idle-wakeups. Run it on the
+# build host, so the compiler reads the fixture rather than a synced copy. The
+# daemon's processes and directories are removed on exit; the build is the
+# caller's own, through the gate's usual target directory.
 set -euo pipefail
 
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
@@ -43,7 +46,9 @@ fixture_processes() {
     grep -lzx "XDG_RUNTIME_DIR=$runtime" /proc/[0-9]*/environ 2>/dev/null |
         cut -d/ -f3 | grep -vx "$$" || true
 }
+measurer=
 cleanup() {
+    [ -z "$measurer" ] || kill "$measurer" 2>/dev/null || true
     fixture "$bin/cagents" --no-start daemon stop >/dev/null 2>&1 || true
     local pids
     pids=$(fixture_processes)
@@ -66,58 +71,19 @@ done | head -n 1)
 build() {
     # Outside the fixture's environment: the build is the user's own.
     (cd "$project" && scripts/cargo-gate check --locked --no-default-features --bin cagents) \
-        >/dev/null 2>&1
+        >"$root/build.log" 2>&1 || {
+        tail -n 20 "$root/build.log" >&2
+        printf '%s\n' 'The fixture build failed' >&2
+        exit 1
+    }
 }
 printf '%s\n' 'warming the build'
 build
 # The board learns of the project within a model refresh, then reads it.
 sleep 60
 printf 'building for %s s\n' "$seconds"
-/usr/bin/python3 -I - "$daemon" "$seconds" <<'EOF' &
-import os, sys, time
-
-daemon, seconds = sys.argv[1], float(sys.argv[2])
-ticks = os.sysconf("SC_CLK_TCK")
-
-
-def threads():
-    found = {}
-    for tid in os.listdir(f"/proc/{daemon}/task"):
-        base = f"/proc/{daemon}/task/{tid}"
-        try:
-            name = open(f"{base}/comm").read().strip()
-            switches = sum(
-                int(line.split()[1])
-                for line in open(f"{base}/status")
-                if line.startswith(("voluntary_ctxt", "nonvoluntary_ctxt"))
-            )
-            on_cpu = int(open(f"{base}/schedstat").read().split()[0])
-        except (OSError, ValueError, IndexError):
-            continue
-        found[tid] = (name, switches, on_cpu)
-    return found
-
-
-def own():
-    fields = open(f"/proc/{daemon}/stat").read().rsplit(")", 1)[1].split()
-    return int(fields[11]) + int(fields[12])
-
-
-before, cpu = threads(), own()
-time.sleep(seconds)
-after, now_cpu = threads(), own()
-watched = {"notify-rs inoti", "git-watch", "work-scanner", "work-scan"}
-for name in sorted(watched):
-    switches = on_cpu = 0
-    for tid, (thread, count, used) in after.items():
-        if thread != name:
-            continue
-        _, old_count, old_used = before.get(tid, (thread, 0, 0))
-        switches += count - old_count
-        on_cpu += used - old_used
-    print(f"{name:16} wakeups/s {switches / seconds:9.2f}  cpu % core {100 * on_cpu / 1e9 / seconds:6.3f}")
-print(f"daemon cpu % core {100 * (now_cpu - cpu) / ticks / seconds:.2f}")
-EOF
+/usr/bin/python3 -I "$checkout/scripts/measure-idle-wakeups" --pattern cagentsd \
+    --environ "XDG_RUNTIME_DIR=$runtime" --seconds "$seconds" &
 measurer=$!
 checks=0
 while kill -0 "$measurer" 2>/dev/null; do
@@ -126,4 +92,5 @@ while kill -0 "$measurer" 2>/dev/null; do
     checks=$((checks + 1))
 done
 wait "$measurer"
+measurer=
 printf 'checks=%s\n' "$checks"
