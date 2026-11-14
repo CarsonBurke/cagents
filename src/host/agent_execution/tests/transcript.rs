@@ -490,9 +490,7 @@ fn retained_identity_case(
         }
     }
     let (host, mut request, path) = fixture();
-    if shutdown_before_confirmation {
-        request.prompt = "HOLD_CLEANUP_BUSY".into();
-    }
+    request.prompt = "HOLD_CLEANUP_BUSY".into();
     let root = path.parent().unwrap();
     let proof = host.lock().unwrap().proof().clone();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -540,12 +538,52 @@ fn retained_identity_case(
             .all(|(client, visible)| *client == EXECUTION_CLIENT && !visible),
         "no window displayed this chat"
     );
+    wait(
+        || root.join("cleanup-busy").exists(),
+        "provider never reached its confirmation fence",
+    );
+    assert!(handle.confirmed_session_id().is_none());
+    let HostedSession::Chat(unconfirmed) = &session else {
+        panic!("managed native conversation");
+    };
+    assert!(unconfirmed.launch.session_id.is_none());
+    let pane_id = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
+    // Model an existing saved pane without displaying or attaching its chat.
+    // The fixture only publishes the initial, still-unconfirmed descriptor.
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: accepted.agent.placement.clone(),
+            closed: vec![],
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Unshown managed conversation".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: crate::model::CardKind::Chat(unconfirmed.clone()),
+                scope: None,
+            }],
+        })
+        .unwrap();
+    let saved_pane = || {
+        let (descriptor, provider_session): (String, Option<String>) = db
+            .query_row(
+                "SELECT descriptor, provider_session FROM panes WHERE id=?1",
+                [pane_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let crate::model::CardKind::Chat(pane) = serde_json::from_str(&descriptor).unwrap() else {
+            panic!("saved chat pane");
+        };
+        (pane, provider_session)
+    };
+    let (before, provider_session) = saved_pane();
+    assert!(before.launch.session_id.is_none());
+    assert!(provider_session.is_none());
     if shutdown_before_confirmation {
-        wait(
-            || root.join("cleanup-busy").exists(),
-            "provider never reached its confirmation fence",
-        );
-        assert!(handle.confirmed_session_id().is_none());
         let (terminals, _) = host.lock().unwrap().graceful_shutdown();
         assert!(terminals.is_empty());
         wait(
@@ -559,8 +597,8 @@ fn retained_identity_case(
                 std::fs::create_dir(root.join("home/.claude")).unwrap();
             }
         }
-        std::fs::write(root.join("cleanup-release"), "").unwrap();
     }
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
     wait(
         || handle.confirmed_session_id().is_some(),
         "provider never confirmed its conversation",
@@ -577,7 +615,7 @@ fn retained_identity_case(
         );
         crate::host::finish_chat_shutdown(&host).unwrap();
     }
-    // Confirmation must be durable without any UI pane publication.
+    // No window publishes the later confirmed descriptor.
     wait(
         || {
             let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
@@ -635,17 +673,7 @@ fn retained_identity_case(
         .unwrap();
     assert_eq!(ownership.owner(), &identity.record);
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
-    let pane_id = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
-    let (descriptor, provider_session): (String, Option<String>) = db
-        .query_row(
-            "SELECT descriptor, provider_session FROM panes WHERE id=?1",
-            [pane_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    let crate::model::CardKind::Chat(pane) = serde_json::from_str(&descriptor).unwrap() else {
-        panic!("saved chat pane");
-    };
+    let (pane, provider_session) = saved_pane();
     assert_eq!(pane.launch.session_id.as_deref(), Some(confirmed.as_str()));
     assert_eq!(provider_session.as_deref(), Some(confirmed.as_str()));
     // Use the daemon's real stop boundary, then reopen only its durable model.
