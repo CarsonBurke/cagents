@@ -626,6 +626,18 @@ impl SidebarCard {
         }
     }
 
+    /// How well the row matches a search: by its title, or by the checkout
+    /// it runs in, as that checkout's own row would.
+    fn search_rank(&self, project: &SidebarProject, query: &str) -> Option<usize> {
+        let checkout = self
+            .worktree
+            .and_then(|id| project.worktrees.iter().find(|row| row.id == id));
+        search_score(&self.folded_title, query)
+            .into_iter()
+            .chain(checkout.and_then(|row| row.search_rank(query)))
+            .min()
+    }
+
     /// The checkout the pane runs in, as that checkout's own row names it. A
     /// Folder project's root is the project itself, whose header is the row
     /// above, so it adds nothing.
@@ -12237,7 +12249,7 @@ fn navigation_search_ranks(
         .chain(project.attention_cards.iter().map(|card| {
             (
                 SelectionRow::Card(card.id),
-                search_score(&card.folded_title, query).unwrap_or(usize::MAX),
+                card.search_rank(project, query).unwrap_or(usize::MAX),
             )
         }))
         .collect()
@@ -12396,7 +12408,7 @@ fn filtered_projects<'a>(
                     project.attention_cards.iter().filter(|card| {
                         state.lists_card(card)
                             && (project_matches
-                                || search_score(&card.folded_title, query.as_ref()).is_some())
+                                || card.search_rank(project, query.as_ref()).is_some())
                     }),
                 )
             } else {
@@ -12428,9 +12440,7 @@ fn filtered_projects<'a>(
                 });
                 worktrees
                     .sort_by_key(|worktree| worktree.search_rank(&query).unwrap_or(usize::MAX));
-                cards.sort_by_key(|card| {
-                    search_score(&card.folded_title, &query).unwrap_or(usize::MAX)
-                });
+                cards.sort_by_key(|card| card.search_rank(project, &query).unwrap_or(usize::MAX));
             }
             let visible = match state.filter {
                 SidebarFilter::All => {
@@ -12473,7 +12483,7 @@ fn filtered_projects<'a>(
                     project
                         .cards
                         .iter()
-                        .filter_map(|card| search_score(&card.folded_title, &query)),
+                        .filter_map(|card| card.search_rank(project.project, &query)),
                 )
                 .min()
                 .unwrap_or(usize::MAX)
@@ -12678,7 +12688,7 @@ fn in_progress_rows<'a>(
                 project.attention_cards.iter().filter(|card| {
                     card.attention.only_working()
                         && !state.lists_card(card)
-                        && matches(&card.folded_title)
+                        && (project_matches || card.search_rank(project, query.as_ref()).is_some())
                 }),
             )
             .into_iter()
@@ -21328,6 +21338,49 @@ pub(crate) mod tests {
                 .any(|name| name == "Collapse In progress, 1 agent working"),
             "{names:?}"
         );
+    }
+
+    /// A pane row matches a search for the checkout it runs in, as that
+    /// checkout's own row did, in both sections of the Attention list.
+    #[test]
+    fn attention_search_finds_pane_rows_by_their_checkout() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let project = project_id(1);
+        let main = model.projects[0].worktrees[0].clone();
+        let feature = model.projects[0].worktrees[1].clone();
+        let waiting = CardId::from_uuid(Uuid::from_u128(89));
+        let working = CardId::from_uuid(Uuid::from_u128(90));
+        let durable = pane_workspace(&[(waiting, &feature.path), (working, &feature.path)]);
+        let activity = |state| Activity {
+            provider: Provider::Codex,
+            state,
+        };
+        let mut state = expanded_worktree_state();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.set_agent_activity(
+            waiting,
+            project,
+            feature.id,
+            activity(ActivityState::Waiting),
+        );
+        state.set_agent_activity(
+            working,
+            project,
+            feature.id,
+            activity(ActivityState::Working),
+        );
+        refresh_attention(&mut state, &mut model, &durable);
+        let everything = vec![
+            SelectionRow::Project(project),
+            SelectionRow::Card(waiting),
+            SelectionRow::Card(working),
+        ];
+        assert_eq!(visible_selection_rows(&model, &state, false), everything);
+        state.apply(&SidebarAction::SearchChanged(feature.label().to_owned()));
+        assert_eq!(visible_selection_rows(&model, &state, false), everything);
+        state.apply(&SidebarAction::SearchChanged(main.label().to_owned()));
+        assert!(visible_selection_rows(&model, &state, false).is_empty());
     }
 
     /// The title is what tells two rows apart, so the place beside it gives
