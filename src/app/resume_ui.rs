@@ -1575,20 +1575,10 @@ impl Cagents {
             .map(|&index| &state.rows[index])
             .enumerate()
         {
-            let line = |text: String| {
-                design::caption(text)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-            };
+            let line =
+                |text: String| crate::ui_controls::FadeText::caption(text).width(Length::Fill);
             let mut title: Vec<Element<'_, Message>> = vec![
-                design::heading(&row.title)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
+                crate::ui_controls::FadeText::heading(&row.title)
                     .width(Length::Fill)
                     .into(),
             ];
@@ -1812,11 +1802,7 @@ fn resume_details(row: &Row) -> String {
 fn resume_exchange(row: &Row) -> Option<Element<'_, Message>> {
     let summary = row.summary.as_deref()?;
     let line = |label: &str, text: &str| -> Element<'static, Message> {
-        design::caption(format!("{label}: {text}"))
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
+        crate::ui_controls::FadeText::caption(format!("{label}: {text}"))
             .width(Length::Fill)
             .into()
     };

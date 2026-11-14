@@ -1342,9 +1342,8 @@ impl Runtime {
         let (tip, name) = row.described();
         let label = row.shown.clone();
         // The preview fades out where the pane runs short, as a step row's
-        // summary does, into whatever the row is painted with; the agent
-        // keeps its tab's words, cut as the tab cuts them.
-        let painted = disclosure::Painted::on(transcript_surface);
+        // summary does, on whatever the row is painted with; the agent keeps
+        // its tab's words, cut as the tab cuts them.
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
             design::body(row.verb)
@@ -1355,10 +1354,10 @@ impl Runtime {
                 .size(design::TEXT_BODY)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            painted.fade(
-                design::body(row.preview.clone())
-                    .class(cosmic::theme::Text::Custom(design::muted_text)),
-            ),
+            crate::ui_controls::fade_text(row.preview.clone())
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .width(Length::Fill)
+                .into(),
         ];
         if row.state.live {
             line.push(crate::ui_controls::activity_spinner(
@@ -1425,7 +1424,7 @@ impl Runtime {
             .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
         let mut button = widget::button::custom(content)
             .name(name)
-            .class(painted.button_class())
+            .class(crate::ui_controls::control_style(false, None))
             .padding(padding)
             .width(Length::Fill)
             .on_press(action(pressed));
@@ -1615,7 +1614,7 @@ impl Runtime {
         let key = format!("{}#{part}", item.id);
         let open = self.part_unfolded(&key);
         let label = if open { "Show less" } else { unfold }.to_owned();
-        let toggle = disclosure::row_on(
+        let toggle = disclosure::row(
             label.clone(),
             label,
             Icon::Chat,
@@ -1623,7 +1622,6 @@ impl Runtime {
             None,
             Some(open),
             Some(Action::Unfold(self.target, key)),
-            surface,
         );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
