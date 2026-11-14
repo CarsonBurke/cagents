@@ -375,6 +375,8 @@ class Scenario:
                       "reasoningEffort": self.reasoning,
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
+            if (Path(codex_home) / "fixture-unconfirmed-model").is_file():
+                del result["model"]
         elif method == "thread/read":
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":

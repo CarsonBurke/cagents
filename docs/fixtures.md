@@ -227,6 +227,9 @@ one. Model and effort overrides sent with later turns are retained when the
 fixture thread resumes. Without the file, it keeps the usual `fixture-mini`
 catalog. This exercises catalog and selection handling, without checking
 which models or efforts a live account can use.
+With `home/.codex/fixture-unconfirmed-model` present, thread start/resume omits
+the model field while turns keep their ordinary activity and completion frames.
+Remove the marker to report the selected model on the next start/resume.
 `home/.codex/fixture-turn-pause` optionally holds a number of seconds from 0
 to 300 for the peer's busy turn, instead of its usual six-second pause.
 The footer scene uses 20 seconds so native capture can show confirmed running

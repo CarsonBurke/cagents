@@ -213,6 +213,27 @@ class CodexToolRowsFixture(unittest.TestCase):
                 "threadId": restored.thread}}, home)
             self.assertEqual(resumed["result"]["reasoningEffort"], "low")
 
+    def test_unconfirmed_model_preserves_busy_turn_and_reports_when_resumed_after_marker_removal(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            marker = Path(home, "fixture-unconfirmed-model")
+            marker.touch()
+            scenario = PEER["Scenario"]()
+            [started] = scenario.request({"id": 1, "method": "thread/start", "params": {}}, home)
+            self.assertNotIn("model", started["result"])
+            self.assertIn("thread", started["result"])
+            replies = scenario.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertTrue(any(frame.get("method") == "turn/started" for frame in replies))
+            self.assertEqual(scenario.latest["status"], "inProgress")
+            [unconfirmed] = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertNotIn("model", unconfirmed["result"])
+            marker.unlink()
+            [confirmed] = scenario.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual(confirmed["result"]["model"], "fixture-mini")
+            self.assertEqual(confirmed["result"]["initialTurnsPage"]["data"][0]["status"], "inProgress")
+
     def test_an_empty_fixture_model_catalog_reports_its_cause(self):
         import tempfile
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
