@@ -1362,10 +1362,15 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .contains(&format!("Copy original report: {heading}"))
         );
         assert!(!surface.text.iter().any(|text| text == &heading));
+        let prefix = match outcome {
+            " finished" => "Finished:",
+            " failed" => "Failed:",
+            _ => "Stopped:",
+        };
         assert!(
-            surface.text.iter().any(|text| text.ends_with(outcome)
-                && text.contains('…')
-                && text.chars().count() <= 73 + outcome.chars().count()),
+            surface.text.iter().any(|text| text.starts_with(prefix)
+                && !text.contains('…')
+                && text.len() < heading.len()),
             "compact task identity must preserve {outcome}: {:?}",
             surface.text
         );

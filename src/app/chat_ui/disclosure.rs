@@ -164,27 +164,30 @@ pub(super) fn row_on(
         let active_paint = paint.clone();
         let hovered_paint = paint.clone();
         let pressed_paint = paint.clone();
-        widget::button::custom(line)
-            .name(name)
-            .description(if expanded == Some(true) {
-                "Collapse details"
-            } else {
-                "Expand details"
-            })
-            .class(cosmic::theme::Button::Custom {
-                active: Box::new(move |focused, theme| active_paint(active(focused, theme), theme)),
-                disabled: Box::new(move |theme| paint(disabled(theme), theme)),
-                hovered: Box::new(move |focused, theme| {
-                    hovered_paint(hovered(focused, theme), theme)
-                }),
-                pressed: Box::new(move |focused, theme| {
-                    pressed_paint(pressed(focused, theme), theme)
-                }),
-            })
-            .width(Length::Fill)
-            .padding([step::GAP_XS as u16, step::GAP_S as u16])
-            .on_press(action(toggle))
-            .into()
+        crate::interaction::a11y_target(
+            widget::button::custom(line)
+                .name(name)
+                .description(if expanded == Some(true) {
+                    "Collapse details"
+                } else {
+                    "Expand details"
+                })
+                .class(cosmic::theme::Button::Custom {
+                    active: Box::new(move |focused, theme| {
+                        active_paint(active(focused, theme), theme)
+                    }),
+                    disabled: Box::new(move |theme| paint(disabled(theme), theme)),
+                    hovered: Box::new(move |focused, theme| {
+                        hovered_paint(hovered(focused, theme), theme)
+                    }),
+                    pressed: Box::new(move |focused, theme| {
+                        pressed_paint(pressed(focused, theme), theme)
+                    }),
+                })
+                .width(Length::Fill)
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .on_press(action(toggle)),
+        )
     } else {
         widget::container(line)
             .width(Length::Fill)

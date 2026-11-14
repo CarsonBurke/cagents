@@ -5382,8 +5382,22 @@ impl Runtime {
         };
         if *kind == chat::DeliveryKind::Report {
             let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // The outcome must survive a long task name fading out. This is
+            // report presentation, not inference of a parent account failure.
+            let preview = [
+                (" was stopped", "Stopped"),
+                (" finished", "Finished"),
+                (" failed", "Failed"),
+            ]
+            .into_iter()
+            .find_map(|(suffix, outcome)| {
+                heading
+                    .strip_suffix(suffix)
+                    .map(|subject| format!("{outcome}: {subject}"))
+            })
+            .unwrap_or_else(|| heading.clone());
             let disclosure = disclosure::row(
-                heading.clone(),
+                turn::headline(preview),
                 format!(
                     "{} report details: {heading}",
                     if expanded { "Hide" } else { "Show" }
@@ -7072,8 +7086,21 @@ mod tests {
     }
 
     #[test]
-    fn recorded_tool_timestamp_reserves_hover_space_at_narrow_and_wide_widths() {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
         let item = chat::Item {
             id: "dated-tool-command".into(),
             role: chat::Role::Assistant,
@@ -7090,10 +7117,21 @@ mod tests {
                 output: "all tests passed".into(),
             },
         };
-        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        runtime.expanded.insert(item.id.clone());
+        let stamp = runtime.cache[&item.id]
+            .stamp
+            .as_ref()
+            .expect("recorded command time is prepared")
+            .1
+            .clone();
         let renderer = crate::app::tests::headless_renderer();
         for width in [160.0, 240.0, 600.0] {
-            let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
+            let mut element = runtime.step_view(
+                &item,
+                &runtime.cache[&item.id],
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            );
             let mut tree = Tree::new(element.as_widget());
             let limits =
                 layout::Limits::new(iced::Size::new(width, 0.0), iced::Size::new(width, 1000.0));
@@ -7101,25 +7139,17 @@ mod tests {
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
             let layout = Layout::new(&node);
-            let mut children = layout.children();
-            let header = children.next().unwrap().bounds();
-            let actions = children.next().unwrap().bounds();
-            assert!(
-                header.intersection(&actions).is_none(),
-                "recorded time and Copy never cover the command/status"
-            );
-            assert!(actions.x >= 0.0 && actions.x + actions.width <= width + 0.1);
-            if width == 160.0 {
-                assert!(
-                    actions.y >= header.y + header.height,
-                    "narrow history dates use their own reserved line"
-                );
-            } else if width == 600.0 {
-                assert!(
-                    actions.x >= header.x + header.width,
-                    "wide rows keep actions beside the header"
-                );
-            }
+            let header = layout.children().next().unwrap().bounds();
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut texts);
+            let stamp_bounds = texts
+                .0
+                .iter()
+                .find(|(text, _)| text == &stamp)
+                .map(|(_, bounds)| bounds)
+                .expect("expanded detail retains the recorded time");
             let accessible =
                 element
                     .as_widget()
@@ -7136,6 +7166,18 @@ mod tests {
                 .node()
                 .bounds()
                 .unwrap();
+            assert!(
+                copy.y0 >= f64::from(header.y + header.height),
+                "Copy has reserved footer space below the header"
+            );
+            assert!(
+                stamp_bounds.y >= header.y + header.height,
+                "recorded time does not cover the command or duration"
+            );
+            assert!(stamp_bounds.x >= copy.x1 as f32);
+            assert!(stamp_bounds.x + stamp_bounds.width <= width + 0.1);
+            assert!(copy.x0 >= 0.0 && copy.x1 <= f64::from(width) + 0.1);
+            assert!(stamp_bounds.y + stamp_bounds.height <= node.size().height + 0.1);
             let cursor = iced::Point::new(
                 ((copy.x0 + copy.x1) / 2.0) as f32,
                 ((copy.y0 + copy.y1) / 2.0) as f32,
@@ -13441,7 +13483,7 @@ mod tests {
             started_at: Some(1_000),
             at: Some(13_000),
         };
-        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
+        let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
         let before = fingerprints(&runtime, true);
         let content_revision = runtime.cache[&thought.id].revision;
         Arc::make_mut(&mut Arc::make_mut(&mut runtime.snapshot).items[0]).at = Some(25_000);
@@ -13459,6 +13501,10 @@ mod tests {
                 ..native_child_fixture()
             });
         runtime.selected_subagent = Some("native-child".into());
+        let mut published = (*runtime.snapshot).clone();
+        published.generation += 1;
+        handle.publish_delta_snapshot_for_test(published);
+        runtime.refresh();
         let snapshot = runtime.snapshot.clone();
         runtime.prepare_child_cache(&snapshot);
         preparation::drain_fixture(&mut runtime);
