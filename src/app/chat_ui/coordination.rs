@@ -847,10 +847,11 @@ impl Runtime {
                 .filter(|text| !text.trim().is_empty())
                 .or_else(|| (!agent.description.is_empty()).then_some(agent.description.as_str()))
         });
-        let mut title = name;
+        let mut title = Self::short_description(&name, 60);
         if let Some(task) = task {
             title.push_str(" · ");
-            title.push_str(task.lines().next().unwrap_or(task));
+            let task = Self::short_description(task, 160);
+            title.push_str(task.lines().next().unwrap_or(&task));
         }
         let summary = widget::container(
             design::caption(Self::short_description(&title, 200))
