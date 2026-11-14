@@ -1890,6 +1890,49 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
         || state.chat_handoffs.contains_key(&terminal)
 }
 
+pub(super) fn shared_removal_in_transition(
+    state: &HostState,
+    before: &crate::workspace_model::views::Pane,
+) -> bool {
+    let crate::model::CardKind::Chat(source) = &before.kind else {
+        unreachable!("chat removal source")
+    };
+    let claims = |session: &crate::chat::Session| {
+        session.id == source.id
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == source.id)
+    };
+    let same = |session: &crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..before.clone()
+            },
+        )
+    };
+    state.spawning.contains(&source.id)
+        || state.chat_bindings.contains_key(&source.id)
+        || state.chat_handoffs.contains_key(&source.id)
+        || state
+            .chat_spawning
+            .values()
+            .filter(|session| claims(session))
+            .any(|session| {
+                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+            })
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state
+            .native_closing
+            .get(&source.id)
+            .is_some_and(|closing| !same(closing.source()))
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,

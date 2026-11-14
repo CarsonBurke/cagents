@@ -246,7 +246,9 @@ impl Cagents {
             // A delayed CardId-only message would leave Retry free to
             // replace its terminal between dequeue and dispatch.
             tasks.push(if preserve_source {
-                if self
+                if unasked {
+                    self.continue_card_close(card, true)
+                } else if self
                     .card_state(card)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
                     || self.chat_has_parked_runtime(card)

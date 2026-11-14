@@ -61,6 +61,9 @@ impl Reservation {
             return Err(error("Chat is already starting or closing"));
         }
         state.chat_spawning.insert(source.id, source.clone());
+        state
+            .chat_close_reservations
+            .insert(source.id, source.clone());
         state.inventory_generation += 1;
         Ok(Self {
             host: host.clone(),
@@ -185,6 +188,13 @@ impl Reservation {
         {
             return Err(error("Native chat admission reservation changed"));
         }
+        // Installation may retarget an admission. It is no longer evidence
+        // that only the original source's explicit Close is in flight.
+        if let Some(admission) = admission.as_ref()
+            && state.chat_close_reservations.get(&admission.source.id) == Some(&admission.source)
+        {
+            state.chat_close_reservations.remove(&admission.source.id);
+        }
         state.chat_spawning.insert(source.id, source.clone());
         if let Some(admission) = admission {
             admission.source = source.clone();
@@ -201,6 +211,9 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_close_reservations.get(&self.source.id) == Some(&self.source) {
+            state.chat_close_reservations.remove(&self.source.id);
+        }
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
@@ -240,6 +253,93 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             native_continuity: Default::default(),
+        }
+    }
+
+    #[test]
+    fn shared_chat_removal_allows_exact_cleanup_but_fences_identical_startup() {
+        use crate::{
+            host::{model::Registry, workspace},
+            model::{CardId, CardKind},
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        for cleanup in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let host = host();
+            host.lock()
+                .unwrap()
+                .install_model(Registry::at(&directory.path().join("workspace.sqlite")).unwrap());
+            workspace::edit(
+                &host,
+                0,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "Fixture".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+            let mut source = session();
+            source.proof = Some(host.lock().unwrap().proof().clone());
+            source.launch.recipe.working_directory = directory.path().into();
+            let scope = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            let pane = Pane {
+                id: CardId::new(),
+                title: "Original chat".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                scope: None,
+                kind: CardKind::Chat(source.clone()),
+            };
+            let model = workspace::edit(
+                &host,
+                0,
+                ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                },
+            )
+            .unwrap();
+            let operation = uuid::Uuid::new_v4();
+            let removal = ModelEdit::ChangeView {
+                scope,
+                expected_revision: model.views[0].revision,
+                operation,
+                change: Change::RemoveSource {
+                    registry: model.identity,
+                    repository: directory.path().into(),
+                    before: pane.clone(),
+                    terminal: None,
+                },
+            };
+            let reservation = if cleanup {
+                Reservation::closing(&host, &mut host.lock().unwrap(), &source).unwrap()
+            } else {
+                Reservation::new(&host, &source).unwrap().unwrap()
+            };
+            let result = workspace::edit(&host, 0, removal);
+            assert_eq!(result.is_ok(), cleanup, "cleanup={cleanup}: {result:?}");
+            let writer = workspace::writer(&host).unwrap();
+            assert_eq!(
+                writer
+                    .lock()
+                    .unwrap()
+                    .view_operation_seen(operation)
+                    .unwrap(),
+                cleanup
+            );
+            let current = workspace::snapshot(&host, None).unwrap();
+            assert_eq!(current.views[0].panes.contains(&pane), !cleanup);
+            drop(reservation);
+            assert!(host.lock().unwrap().chat_close_reservations.is_empty());
         }
     }
 

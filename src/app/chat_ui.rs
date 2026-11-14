@@ -25249,6 +25249,27 @@ mod tests {
     }
 
     #[test]
+    fn retained_shared_chat_close_queue_preserves_unasked_consent() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.waiting = true;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        share_close_source(&mut app, card);
+        assert!(app.chat_working_session(card).is_some());
+        assert!(app.capture_shared_removal(card));
+        app.queue_card_close(card, true);
+        drop(app.next_queued_card_close());
+        assert!(!app.chat_close_dialog_visible());
+        assert!(
+            app.workspace.pending_close().is_some()
+                || !app.card_state(card).unwrap().existence.is_open()
+        );
+    }
+
+    #[test]
     fn failed_retained_native_close_keeps_saved_identity_until_exact_acknowledgment() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);

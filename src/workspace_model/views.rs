@@ -36,6 +36,8 @@ impl From<ChannelId> for Scope {
 pub const OPERATION_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
+pub const REMOVAL_SOURCE_CONFLICT: &str = "workspace view removal source conflict";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: CardId,
@@ -596,7 +598,7 @@ impl View {
                     .is_some_and(|pane| same_removal_source(before, pane))
                     || sources.next().is_some()
                 {
-                    return Err("workspace view removal source conflict".into());
+                    return Err(REMOVAL_SOURCE_CONFLICT.into());
                 }
                 self.panes.retain(|pane| pane.id != before.id);
                 if !self.retired.contains(&before.id) {

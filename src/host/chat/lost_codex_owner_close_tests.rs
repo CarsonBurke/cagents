@@ -548,6 +548,36 @@ fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) 
 }
 
 #[test]
+fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
+    let Some(root) = isolated("shared_chat_removal_accepts_only_its_original_native_cleanup")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let mut spawned = Spawned::new(&fixture.source);
+    let owner = spawned.detach();
+    let pane = crate::workspace_model::views::Pane {
+        id: crate::model::CardId::new(),
+        title: "Original chat".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        scope: None,
+        kind: crate::model::CardKind::Chat(fixture.source.clone()),
+    };
+    let mut replacement = fixture.source.clone();
+    replacement.launch.session_id = Some("replacement-conversation".into());
+    for (source, blocked) in [(fixture.source.clone(), false), (replacement, true)] {
+        let mut state = fixture.host.lock().unwrap();
+        state.native_closing.insert(
+            fixture.source.id,
+            native_cleanup::NativeClose::adopted(source, owner.clone(), false),
+        );
+        assert_eq!(shared_removal_in_transition(&state, &pane), blocked);
+    }
+}
+
+#[test]
 fn a_pending_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_pending_close_whose_owner_then_ended_closes") else {
         return;

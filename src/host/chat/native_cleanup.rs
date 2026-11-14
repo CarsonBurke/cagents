@@ -11,6 +11,10 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
+    pub(in crate::host) fn source(&self) -> &Session {
+        &self.source
+    }
+
     /// A retained close of `source`'s unpaired owner, as Close records it once
     /// it adopts that owner, and once its Release is answered when `closed`.
     #[cfg(test)]

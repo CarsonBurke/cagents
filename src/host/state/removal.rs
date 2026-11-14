@@ -209,7 +209,7 @@ impl HostState {
         };
         let crate::model::CardKind::Terminal(source) = &before.kind else {
             if let crate::model::CardKind::Chat(source) = &before.kind {
-                if self.removal_in_transition(source.id) {
+                if super::super::chat::shared_removal_in_transition(self, before) {
                     return Err(conflict());
                 }
                 if let Some(record) = self.chats.get(&source.id) {

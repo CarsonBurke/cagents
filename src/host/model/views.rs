@@ -833,7 +833,8 @@ impl Registry {
     }
 
     pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
-    pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str = "workspace view removal source conflict";
+    pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str =
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT;
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(

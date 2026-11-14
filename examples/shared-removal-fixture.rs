@@ -7,24 +7,105 @@ use cagents::{
         TerminalContinuity, TerminalId, TerminalSession,
     },
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
-        TerminalCloseResult, TerminalDescriptor, TerminalSpawnOptions, daemon_socket_path,
-        read_frame, write_frame,
+        ClientEnvelope, ClientRequest, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+        ServerMessage, ServerResponse, TerminalCloseResult, TerminalDescriptor,
+        TerminalSpawnOptions, daemon_socket_path, read_frame, write_frame,
     },
     workspace_model::{
         ModelEdit, WorkspaceModel,
-        views::{Change, Pane, Scope},
+        views::{Change, Pane, REMOVAL_SOURCE_CONFLICT, Scope},
     },
 };
 use std::{
     error::Error,
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 cagents::stamp_version!();
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(Debug)]
+struct RemoteError(ProtocolError);
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.0.code, self.0.message)
+    }
+}
+impl Error for RemoteError {}
+
+fn fixture_socket(fixture: &Path, home: &Path, runtime: &Path, socket: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = fixture.canonicalize()?;
+    let expected_runtime = fixture.parent().ok_or("missing fixture task")?.join("rt");
+    if std::fs::symlink_metadata(&expected_runtime)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("fixture runtime must not be a symlink".into());
+    }
+    let runtime = runtime.canonicalize()?;
+    let home = home.canonicalize()?;
+    if runtime != expected_runtime.canonicalize()?
+        || home != fixture.join("home").canonicalize()?
+        || !home.starts_with(&fixture)
+    {
+        return Err("fixture HOME and runtime must belong to the same evidence task".into());
+    }
+    // SAFETY: geteuid takes no arguments and returns this process's effective UID.
+    let uid = unsafe { libc::geteuid() };
+    for directory in [&fixture, &runtime] {
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err("fixture requires private owned fixture/runtime directories".into());
+        }
+    }
+    let socket = socket.canonicalize()?;
+    if !socket.starts_with(&runtime) {
+        return Err("socket escaped the fixture runtime".into());
+    }
+    Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::net::UnixListener,
+    };
+
+    #[test]
+    fn fixture_refuses_other_runtime_and_socket_escapes() {
+        let task = tempfile::tempdir().unwrap();
+        let fixture = task.path().join("fixture");
+        let home = fixture.join("home");
+        let runtime = task.path().join("rt");
+        let other = task.path().join("other-runtime");
+        for directory in [&home, &runtime, &other] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for directory in [&fixture, &runtime, &other] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket = runtime.join("fixture.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            fixture_socket(&fixture, &home, &runtime, &socket).unwrap(),
+            socket.canonicalize().unwrap()
+        );
+        let foreign_socket = other.join("foreign.sock");
+        let _other_listener = UnixListener::bind(&foreign_socket).unwrap();
+        assert!(fixture_socket(&fixture, &home, &other, &foreign_socket).is_err());
+        let escaped = runtime.join("escaped.sock");
+        symlink(&foreign_socket, &escaped).unwrap();
+        assert!(fixture_socket(&fixture, &home, &runtime, &escaped).is_err());
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fixture_socket(&fixture, &home, &runtime, &socket).is_err());
+    }
+}
 
 struct Peer {
     stream: UnixStream,
@@ -60,7 +141,7 @@ impl Peer {
             }
             return match response.message {
                 ServerMessage::Response { response } => Ok(response),
-                ServerMessage::Error(error) => Err(error.message.into()),
+                ServerMessage::Error(error) => Err(Box::new(RemoteError(error))),
                 _ => Err("unexpected fixture response".into()),
             };
         }
@@ -78,19 +159,33 @@ impl Peer {
         }
     }
     fn change(&mut self, scope: &Scope, change: Change) -> Result<WorkspaceModel> {
-        let model = self.model()?;
-        let revision = model
-            .views
-            .iter()
-            .find(|view| &view.scope == scope)
-            .ok_or("missing fixture view")?
-            .revision;
-        self.edit(ModelEdit::ChangeView {
-            scope: scope.clone(),
-            expected_revision: revision,
-            operation: uuid::Uuid::new_v4(),
-            change,
-        })
+        let operation = uuid::Uuid::new_v4();
+        for _ in 0..8 {
+            let model = self.model()?;
+            let revision = model
+                .views
+                .iter()
+                .find(|view| &view.scope == scope)
+                .ok_or("missing fixture view")?
+                .revision;
+            let result = self.edit(ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: revision,
+                operation,
+                change: change.clone(),
+            });
+            if result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<RemoteError>())
+                .is_some_and(|error| error.0.code == ProtocolErrorCode::ViewConflict)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            return result;
+        }
+        Err("fixture view revision did not settle".into())
     }
     fn ended(&mut self, id: TerminalId) -> Result<TerminalDescriptor> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -161,7 +256,15 @@ fn main() -> Result<()> {
     if args.next().is_some() {
         return Err("unexpected fixture arguments".into());
     }
-    let stream = UnixStream::connect(daemon_socket_path()?)?;
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").ok_or("missing fixture runtime")?);
+    let socket = fixture_socket(
+        &fixture,
+        &fixture.join("home"),
+        &runtime,
+        &daemon_socket_path()?,
+    )?;
+    let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
     let mut peer = Peer {
@@ -177,11 +280,16 @@ fn main() -> Result<()> {
     else {
         return Err("expected fixture handshake".into());
     };
+    if !proof.is_complete() {
+        return Err("fixture daemon proof is incomplete".into());
+    }
     peer.proof = Some(proof);
     let model = peer.model()?;
+    let fixture_project = fixture.join("project").canonicalize()?;
     let project = model
         .projects
-        .first()
+        .iter()
+        .find(|project| project.repository.starts_with(&fixture_project))
         .ok_or("open the fixture project first")?;
     let repository = project.repository.clone();
     let channel = ChannelId::new();
@@ -298,8 +406,18 @@ fn main() -> Result<()> {
         Change::Remove { id: card }
     };
     let result = peer.change(&scope, removal);
-    if result.is_ok() == conditional {
-        return Err("delayed removal produced the wrong result".into());
+    if conditional {
+        let error = result
+            .err()
+            .ok_or("delayed source removal unexpectedly succeeded")?;
+        if !error.downcast_ref::<RemoteError>().is_some_and(|error| {
+            error.0.code == ProtocolErrorCode::InvalidRequest
+                && error.0.message == REMOVAL_SOURCE_CONFLICT
+        }) {
+            return Err(error);
+        }
+    } else {
+        result?;
     }
     let model = peer.model()?;
     let kept = model
@@ -307,7 +425,10 @@ fn main() -> Result<()> {
         .iter()
         .filter(|view| view.scope == scope)
         .flat_map(|view| &view.panes)
-        .any(|pane| pane.id == card);
+        .any(|pane| {
+            pane.id == card
+                && matches!(&pane.kind, CardKind::Terminal(session) if session.id == replacement.id)
+        });
     if kept != conditional {
         return Err("replacement membership did not match the removal result".into());
     }
