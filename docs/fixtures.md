@@ -319,11 +319,11 @@ hosted chat, one on the draft). The panes share the docked workspace at roughly
 270px each. It captures reasoning and the same tools/outcomes at that width.
 The blank draft sends no prompt and starts no provider.
 
-`web` closes those two cards, retaining their conversations in the sidebar,
-and starts the offline Codex peer's opt-in `fixture-web-rows` mode. This sends
+`web` stops the fixture Claude actor, closes its unsent draft, and starts the offline Codex peer's opt-in `fixture-web-rows` mode. This sends
 a dedicated app-server `webSearch` item with two synthetic results; Claude's
 WebSearch tool uses the generic Tool representation and cannot cover this row.
-It captures the group collapsed and its nested result detail expanded at the
+Every subsequent actor explicitly uses the initial fixture channel, avoiding
+another sidebar hierarchy when a CLI call has no selected view. It captures the group collapsed and its nested result detail expanded at the
 same narrow width. The peer does not launch a child or publish unrelated tool
 or diff rows in this mode. Result links use `example.test`; no search is sent.
 

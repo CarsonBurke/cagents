@@ -40,6 +40,7 @@ wide_ready=$fixture/state/reasoning-row-scene-wide
 narrow_done=$fixture/state/reasoning-row-scene-narrow
 web_done=$fixture/state/reasoning-row-scene-web
 coordination_done=$fixture/state/reasoning-row-scene-coordination
+initial_spawn=$fixture/state/reasoning-row-scene-spawn.json
 
 shot() {
     evidence drive move 1,1 >/dev/null
@@ -178,24 +179,23 @@ tools_details() {
 # Keep the failed command's original diagnostic alongside a running group and
 # its nested success/running commands. No command is executed by this fixture.
 outcome_details() {
-    local prefix=$1 mixed_parent=false failure_index=1
+    local prefix=$1 mixed_parent=false
     scroll_top
     # The baseline filters the empty thought and merges this failure into
     # the mixed group. Newer UI preserves the thought and its group boundary.
-    if ! text_visible 'optional.probe'; then
+    if ! text_visible '(Ran printf|Tried to run)'; then
         click_row '\bEdited\b'
         mixed_parent=true
-        failure_index=0
     else
-        click_row 'optional.probe'
+        click_row '(Ran printf|Tried to run)'
     fi
-    align_row 'optional.probe' "$failure_index"
-    if ! text_visible '\bRefused\b'; then click_row 'optional.probe' "$failure_index"; fi
+    align_row 'exit ?1'
+    if ! text_visible '\bRefused\b'; then click_row 'exit ?1'; fi
     find_row '\bRefused\b' >/dev/null
     # OCR may split the leading verb from the stable count.
     if ! text_visible 'fixture.log.ready'; then click_row '2 commands'; fi
     local point y steps
-    point=$(find_row 'optional.probe')
+    point=$(find_row 'exit ?1')
     y=${point#*,}
     if [ "$y" -gt 200 ]; then
         steps=$(( (y - 160) / 60 ))
@@ -204,30 +204,37 @@ outcome_details() {
     fi
     shot "${prefix}rows-outcomes-expanded"
     click_row '2 commands'
-    click_row 'optional.probe' "$failure_index"
+    click_row 'exit ?1'
     scroll_top
-    if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row 'optional.probe'; fi
+    if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row '(Ran printf|Tried to run)'; fi
     scroll_top
 }
 
-close_cards() {
-    for ((card=0; card<$1; card++)); do
-        evidence drive key ctrl+w >/dev/null
+# Every actor uses the initial fixture channel explicitly. Without a caller's
+# shared view, agent spawn otherwise makes another New channel hierarchy.
+scene_channel() {
+    /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["agent"]["placement"]["Channel"])' "$initial_spawn"
+}
+
+close_actor() {
+    local source=$1 has_draft=$2 agent
+    agent=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["agent"]["id"])' "$source")
+    # Closing is authorized fixture cleanup; the actor and every provider home
+    # belong to native-evidence. It does not reach real provider sessions.
+    evidence cli agent close "$agent" >/dev/null
+    sleep 1
+    if [ "$has_draft" = true ]; then
+        # The remaining unsent draft expands to the550px docked workspace.
+        # Its native tab Close target is independent of composer key handling.
+        evidence drive click 678,22 >/dev/null
         sleep 1
-    done
+    fi
 }
 
-open_spawned() {
-    local label=$1
-    for _ in 1 2 3 4 5 6 7 8; do
-        sleep 2
-        evidence drive move 1,1 >/dev/null
-        if evidence drive click "$label" >/dev/null 2>&1 ||
-            evidence drive click 'New channel' >/dev/null 2>&1 ||
-            evidence drive click 'Offline tool rows' >/dev/null 2>&1; then return; fi
-    done
-    printf 'reasoning-row-scene: conversation did not open: %s\n' "$label" >&2
-    return 1
+spawn_scene() {
+    local provider=$1 model=$2 prompt=$3 receipt=$4
+    evidence cli --json agent spawn --provider "$provider" --model "$model" --surface chat \
+        --repository "$fixture/project" --channel "$(scene_channel)" --prompt "$prompt" >"$receipt"
 }
 
 scroll_bottom() {
@@ -248,12 +255,11 @@ print("Verified private clipboard contains "+sys.argv[1])
 
 if [ "$scene" = coordination ]; then
     [ -f "$web_done" ] || { printf '%s\n' 'run web before coordination' >&2; exit 2; }
-    close_cards 2
+    close_actor "$fixture/state/reasoning-row-scene-web-spawn.json" true
     cp "$here/reasoning-row-scene/coordination.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
-    evidence cli --json agent spawn --provider claude --model haiku --surface chat \
-        --repository "$fixture/project" --prompt 'Coordination fixture: review the recorded transcript controls.' >/dev/null
-    open_spawned 'Coordination fixture'
+    spawn_scene claude haiku 'Coordination fixture: review the recorded transcript controls.' \
+        "$fixture/state/reasoning-row-scene-coordination-spawn.json"
     evidence drive wait 'Coordination controls ready' --timeout 30 >/dev/null
     scroll_top
     shot rows-coordination-folded
@@ -292,11 +298,10 @@ fi
 
 if [ "$scene" = diagnostics ]; then
     [ -f "$coordination_done" ] || { printf '%s\n' 'run coordination before diagnostics' >&2; exit 2; }
-    close_cards 1
+    close_actor "$fixture/state/reasoning-row-scene-coordination-spawn.json" false
     touch "$fixture/home/.codex/fixture-row-diagnostics"
-    evidence cli --json agent spawn --provider codex --model fixture-mini --surface chat \
-        --repository "$fixture/project" --prompt 'Diagnostic fixture: inspect the original synthetic failure.' >/dev/null
-    open_spawned 'Diagnostic fixture'
+    spawn_scene codex fixture-mini 'Diagnostic fixture: inspect the original synthetic failure.' \
+        "$fixture/state/reasoning-row-scene-diagnostics-spawn.json"
     evidence drive wait 'Copy details' --timeout 30 >/dev/null
     scroll_top
     shot rows-diagnostic-collapsed
@@ -316,23 +321,10 @@ if [ "$scene" = web ]; then
         exit 2
     }
     [ -f "$narrow_done" ] || { printf '%s\n' 'run wide and narrow before web' >&2; exit 2; }
-    # Close the two cards; their provider conversations remain in the sidebar.
-    close_cards 2
+    close_actor "$initial_spawn" true
     touch "$fixture/home/.codex/fixture-web-rows"
-    evidence cli --json agent spawn --provider codex --model fixture-mini --surface chat \
-        --repository "$fixture/project" --prompt 'Web references: inspect synthetic search results.' >/dev/null
-    opened=false
-    for _ in 1 2 3 4 5 6 7 8; do
-        sleep 2
-        evidence drive move 1,1 >/dev/null
-        if evidence drive click 'Web references' >/dev/null 2>&1 ||
-            evidence drive click 'Offline tool rows' >/dev/null 2>&1 ||
-            evidence drive click 'New channel' >/dev/null 2>&1; then
-            opened=true
-            break
-        fi
-    done
-    [ "$opened" = true ] || { printf '%s\n' 'web conversation did not open' >&2; exit 1; }
+    spawn_scene codex fixture-mini 'Web references: inspect synthetic search results.' \
+        "$fixture/state/reasoning-row-scene-web-spawn.json"
     evidence drive wait 'Web references ready' --timeout 30 >/dev/null
     narrow_layout
     scroll_top
@@ -368,7 +360,7 @@ cp "$here/reasoning-row-scene/frames.jsonl" "$config/fixture-frames.jsonl.next"
 mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
 evidence cli project open "$fixture/project" >/dev/null
 evidence cli --json agent spawn --provider claude --model haiku --surface chat \
-    --repository "$fixture/project" --prompt 'Fixture: retry the permission probe and verify cleanup.' >/dev/null
+    --repository "$fixture/project" --prompt 'Fixture: retry the permission probe and verify cleanup.' >"$initial_spawn"
 
 # Open the new channel after the provider starts. Its sidebar label may
 # already contain the prompt, depending on when title preparation finishes.
