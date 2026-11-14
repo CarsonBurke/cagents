@@ -4047,7 +4047,7 @@ mod tests {
         drop(app.sync_chrome());
         assert_eq!(
             app.card_chrome[&pane.id].title, label,
-            "tabs, sidebar and overflow use shared chrome"
+            "tabs and overflow use shared chrome"
         );
         drop(app.select_channel(destination));
         drop(app.focus_workspace_card(pane.id));
