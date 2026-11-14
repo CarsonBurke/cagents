@@ -47,7 +47,7 @@ impl CloseIntent {
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
-    ClosedWithBasis(crate::workspace_model::views::TerminalRemovalBasis),
+    ClosedWithBasis(super::shared_views::TerminalRemovalReceipt),
     Active,
     Stale,
     /// The owner correlated a refusal before any cleanup could take effect.
@@ -55,7 +55,7 @@ pub enum CloseOutcome {
     /// The owning daemon answered and the terminal is proven gone. Nothing was
     /// stopped: there is nothing left to stop.
     NotHosted,
-    NotHostedWithBasis(crate::workspace_model::views::TerminalRemovalBasis),
+    NotHostedWithBasis(super::shared_views::TerminalRemovalReceipt),
     /// Not proven gone, for the reason given. Nothing was sent to the terminal.
     Kept(KeptPane),
     Unreachable(String),
@@ -64,7 +64,7 @@ pub enum CloseOutcome {
 #[derive(Debug, Clone)]
 pub enum CompletedCloseOutcome {
     Closed,
-    ClosedWithBasis(crate::workspace_model::views::TerminalRemovalBasis),
+    ClosedWithBasis(super::shared_views::TerminalRemovalReceipt),
     Active(HostSessionProof),
     SourceChanged,
 }
@@ -446,32 +446,39 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    if authority.requires_absence() {
-                        return super::daemon_recovery::prove_not_hosted(&source, &[])
-                            .map(CompletedCloseOutcome::ClosedWithBasis)
-                            .map_err(|kept| kept.reason);
-                    }
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
                     let mut client =
                         ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                    let basis = client
-                        .terminal_removal_basis(source.clone())
-                        .or_else(|error| authority.worker().cloned().ok_or(error))
-                        .map_err(|error| error.to_string())?;
+                    let basis = match authority.read_basis(&mut client, &source) {
+                        Err(error) if is_source_close_refusal(&error) => {
+                            return Ok(CompletedCloseOutcome::SourceChanged);
+                        }
+                        result => result.map_err(|error| error.to_string())?,
+                    };
                     if matches!(
                         basis,
                         crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
                     ) {
-                        return super::daemon_recovery::prove_not_hosted(&source, &[])
-                            .map(CompletedCloseOutcome::ClosedWithBasis)
-                            .map_err(|kept| kept.reason);
+                        return super::daemon_recovery::prove_not_hosted_for(
+                            &source,
+                            &[],
+                            &authority,
+                        )
+                        .map(CompletedCloseOutcome::ClosedWithBasis)
+                        .map_err(|kept| kept.reason);
                     }
-                    if !authority.permits(&basis) {
+                    if !authority.permits_resolved(&basis) {
                         return Ok(CompletedCloseOutcome::SourceChanged);
                     }
-                    let outcome = if let Some(basis) = authority.worker() {
-                        client.close_terminal_source(source, basis.clone(), true, allow_active)
+                    let outcome = if authority.capture().is_some() || authority.worker().is_some() {
+                        client.close_captured_terminal_source(
+                            source,
+                            basis.clone(),
+                            true,
+                            allow_active,
+                            authority.capture().cloned(),
+                        )
                     } else {
                         client.release_completed_terminal(source, allow_active)
                     };
@@ -482,9 +489,9 @@ impl Cagents {
                         result => result.map_err(|error| error.to_string())?,
                     };
                     match outcome {
-                        TerminalCloseResult::Closed => {
-                            Ok(CompletedCloseOutcome::ClosedWithBasis(basis))
-                        }
+                        TerminalCloseResult::Closed => Ok(CompletedCloseOutcome::ClosedWithBasis(
+                            authority.receipt(basis),
+                        )),
                         TerminalCloseResult::Active => {
                             Ok(CompletedCloseOutcome::Active(client.proof().clone()))
                         }
@@ -572,7 +579,7 @@ impl Cagents {
         }
         let result = result.and_then(|outcome| match outcome {
             CompletedCloseOutcome::ClosedWithBasis(basis) => {
-                if self.shared_removal_terminal_basis(card, basis) {
+                if self.shared_removal_terminal_receipt(card, basis) {
                     Ok(CompletedCloseOutcome::Closed)
                 } else {
                     Err("The pane changed while Close was pending".into())
@@ -978,14 +985,14 @@ impl Cagents {
         }
         let outcome = match outcome {
             CloseOutcome::ClosedWithBasis(basis) => {
-                if self.shared_removal_terminal_basis(card, basis) {
+                if self.shared_removal_terminal_receipt(card, basis) {
                     CloseOutcome::Closed
                 } else {
                     CloseOutcome::Stale
                 }
             }
             CloseOutcome::NotHostedWithBasis(basis) => {
-                if self.shared_removal_terminal_basis(card, basis) {
+                if self.shared_removal_terminal_receipt(card, basis) {
                     CloseOutcome::NotHosted
                 } else {
                     CloseOutcome::Stale
@@ -1352,17 +1359,19 @@ mod tests {
         // This reducer fixture has no resident worker. Supply its simulated
         // positive-absence receipt before testing canonical Home retirement.
         assert!(app.capture_shared_removal(card));
-        assert!(app.shared_removal_terminal_basis(
+        assert!(app.shared_removal_terminal_receipt(
             card,
-            crate::workspace_model::views::TerminalRemovalBasis::Absent {
-                owner: HostSessionProof {
-                    host_session_id: "fixture".into(),
-                    boot_id: "boot".into(),
-                    host_incarnation: "incarnation".into()
-                },
-                latest_worker: None,
-                history_epoch: 0,
-            }
+            app.terminal_cleanup_authority(card).receipt(
+                crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                    owner: HostSessionProof {
+                        host_session_id: "fixture".into(),
+                        boot_id: "boot".into(),
+                        host_incarnation: "incarnation".into()
+                    },
+                    latest_worker: None,
+                    history_epoch: 0,
+                }
+            )
         ));
         (app, card, home)
     }
@@ -2368,13 +2377,13 @@ mod tests {
             assert_eq!(intent.completed_source, Some(source));
             assert_eq!(intent.proof, proof);
             let outcome = if proven_gone {
-                CloseOutcome::NotHostedWithBasis(
+                CloseOutcome::NotHostedWithBasis(app.terminal_cleanup_authority(card).receipt(
                     crate::workspace_model::views::TerminalRemovalBasis::Absent {
                         owner: proof,
                         latest_worker: None,
                         history_epoch: 0,
                     },
-                )
+                ))
             } else {
                 CloseOutcome::Closed
             };
@@ -2613,12 +2622,6 @@ fn revalidate_and_close(
     authority: &super::shared_views::TerminalCleanupAuthority,
 ) -> CloseOutcome {
     if let Some(source) = &intent.completed_source {
-        if authority.requires_absence() {
-            return match super::daemon_recovery::prove_not_hosted(source, &intent.leave) {
-                Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
-                Err(kept) => CloseOutcome::Kept(kept),
-            };
-        }
         let run = || -> Result<CloseOutcome, String> {
             let path =
                 crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
@@ -2626,31 +2629,43 @@ fn revalidate_and_close(
             if client.proof() != &intent.proof || !intent.proof.is_complete() {
                 return Ok(CloseOutcome::Stale);
             }
-            let basis = client
-                .terminal_removal_basis(source.clone())
-                .or_else(|error| authority.worker().cloned().ok_or(error))
-                .map_err(|error| error.to_string())?;
+            let basis = match authority.read_basis(&mut client, source) {
+                Err(error) if is_source_close_refusal(&error) => {
+                    return Ok(CloseOutcome::SourceChanged);
+                }
+                result => result.map_err(|error| error.to_string())?,
+            };
             if matches!(
                 basis,
                 crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
             ) {
                 return Ok(
-                    match super::daemon_recovery::prove_not_hosted(source, &intent.leave) {
+                    match super::daemon_recovery::prove_not_hosted_for(
+                        source,
+                        &intent.leave,
+                        authority,
+                    ) {
                         Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
                         Err(kept) => CloseOutcome::Kept(kept),
                     },
                 );
             }
-            if !authority.permits(&basis) {
+            if !authority.permits_resolved(&basis) {
                 return Ok(CloseOutcome::SourceChanged);
             }
-            let result = if let Some(basis) = authority.worker() {
-                client.close_terminal_source(source.clone(), basis.clone(), true, allow_active)
+            let result = if authority.capture().is_some() || authority.worker().is_some() {
+                client.close_captured_terminal_source(
+                    source.clone(),
+                    basis.clone(),
+                    true,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
             } else {
                 client.release_completed_terminal(source.clone(), allow_active)
             };
             Ok(match source_close_outcome(result) {
-                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(basis),
+                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(authority.receipt(basis)),
                 outcome => outcome,
             })
         };
@@ -2662,13 +2677,20 @@ fn revalidate_and_close(
         || {
             if let (Some(source), Some(basis)) = (intent.saved_source.as_ref(), authority.worker())
             {
-                close_hosted_terminal_source(source, basis, allow_active)
+                close_hosted_terminal_source(
+                    source,
+                    basis,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
             } else {
                 close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
             }
         },
         |source, leave| {
-            basis = Some(super::daemon_recovery::prove_not_hosted(source, leave)?);
+            basis = Some(super::daemon_recovery::prove_not_hosted_for(
+                source, leave, authority,
+            )?);
             Ok(())
         },
     );
@@ -2706,6 +2728,7 @@ fn close_hosted_terminal_source(
     source: &TerminalSession,
     basis: &crate::workspace_model::views::TerminalRemovalBasis,
     allow_active: bool,
+    capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
 ) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, .. } = basis
@@ -2717,11 +2740,12 @@ fn close_hosted_terminal_source(
         if client.proof() != owner || !owner.is_complete() {
             return Ok(CloseOutcome::Stale);
         }
-        Ok(source_close_outcome(client.close_terminal_source(
+        Ok(source_close_outcome(client.close_captured_terminal_source(
             source.clone(),
             basis.clone(),
             false,
             allow_active,
+            capture,
         )))
     };
     run().unwrap_or_else(CloseOutcome::Unreachable)

@@ -1,6 +1,6 @@
 //! Reproduce a delayed Close against a replacement in a native-evidence fixture.
 //! The ordinary daemon and UI run; only the competing window is scripted.
-//! Usage: shared-removal-fixture PROTOCOL unconditional|conditional|prepare-live|replace-live
+//! Usage: shared-removal-fixture PROTOCOL MODE
 use cagents::{
     model::{
         CardId, CardKind, ChannelId, HostSessionProof, LaunchRecipe, ProjectId, RepositoryView,
@@ -350,9 +350,9 @@ fn main() -> Result<()> {
     let mode = args.next().ok_or("missing fixture mode")?;
     let conditional = match mode.as_str() {
         "conditional" => true,
-        "unconditional" | "prepare-live" | "replace-live" => false,
+        "unconditional" | "prepare-live" | "replace-live" | "prepare-completed" => false,
         _ => {
-            return Err("expected conditional, unconditional, prepare-live or replace-live".into());
+            return Err("expected conditional, unconditional, prepare-live, replace-live or prepare-completed".into());
         }
     };
     if args.next().is_some() {
@@ -400,6 +400,28 @@ fn main() -> Result<()> {
     if mode == "prepare-live" && fixture.join("live-close-scene.json").exists() {
         return Err("live fixture scene already exists".into());
     }
+    // Restoration starts with an outcome, not a briefly exposed live pane.
+    // Finish and release this fixture shell before admitting its saved view.
+    let restored = if mode == "prepare-completed" {
+        let source = session(fixture.join("project"), "Completed fixture worker");
+        peer.request(ClientRequest::Spawn {
+            session: source.clone(),
+            options: TerminalSpawnOptions::default(),
+        })?;
+        let ended = peer.ended(source.id)?;
+        match peer.request(ClientRequest::ReleaseCompletedTerminal {
+            session: ended.session.clone(),
+            allow_active: false,
+        })? {
+            ServerResponse::TerminalCloseChecked {
+                outcome: TerminalCloseResult::Closed,
+                ..
+            } => Some(ended.session),
+            _ => return Err("completed fixture output was not released".into()),
+        }
+    } else {
+        None
+    };
     let channel = ChannelId::new();
     peer.edit(ModelEdit::CreateChannel {
         id: channel,
@@ -427,7 +449,9 @@ fn main() -> Result<()> {
             selected_file: None,
         }),
     };
-    let original = if mode == "prepare-live" {
+    let original = if let Some(saved) = &restored {
+        saved.clone()
+    } else if mode == "prepare-live" {
         live_session(fixture.join("project"))
     } else {
         session(fixture.join("project"), "Original worker")
@@ -437,7 +461,7 @@ fn main() -> Result<()> {
         id: card,
         title: "Original terminal".into(),
         user_title: Some("Original terminal".into()),
-        pending_terminal_start: true,
+        pending_terminal_start: restored.is_none(),
         width_fraction: 0.5,
         scope: None,
         kind: CardKind::Terminal(original.clone()),
@@ -447,6 +471,12 @@ fn main() -> Result<()> {
         panes: vec![anchor, victim],
         closed: vec![],
     })?;
+    if restored.is_some() {
+        println!(
+            "Completed Close fixture ready: its saved pane has no resident worker or final screen"
+        );
+        return Ok(());
+    }
     peer.request(ClientRequest::CompletePendingTerminal {
         pane: card,
         terminal_id: original.id,
@@ -486,6 +516,19 @@ fn main() -> Result<()> {
         .and_then(|view| view.panes.iter().find(|pane| pane.id == card))
         .ok_or("missing original fixture pane")?
         .clone();
+    let capture = cagents::workspace_model::views::CapturedTerminalSource {
+        registry: model.identity,
+        repository: repository.clone(),
+        scope: scope.clone(),
+        view_revision: model
+            .views
+            .iter()
+            .find(|v| v.scope == scope)
+            .unwrap()
+            .revision,
+        model_sequence: model.sequence,
+        before: before.clone(),
+    };
     let terminal = if conditional {
         let ServerResponse::TerminalRemovalBasis(basis) =
             peer.request(ClientRequest::ReadTerminalRemovalBasis {
@@ -543,6 +586,7 @@ fn main() -> Result<()> {
             repository,
             before,
             terminal,
+            capture: Some(capture),
         }
     } else {
         Change::Remove { id: card }

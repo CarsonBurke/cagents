@@ -40,6 +40,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ReadWorkspaceSnapshot
         | R::ReadWorkspaceMetadata { .. }
         | R::ReadTerminalRemovalBasis { .. }
+        | R::ReadCapturedTerminalRemovalBasis { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }

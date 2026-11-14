@@ -146,7 +146,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
+fn failed_pending_save_retains_the_worker_and_retry_reuses_it() {
     let fixture = Fixture::new();
     // A real schema object refuses only the completion save; reading the
     // reservation and starting the worker are unaffected.
@@ -156,7 +156,7 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
             "CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
         )
         .unwrap();
-    fixture.complete().unwrap();
+    assert!(fixture.complete().is_err());
     let original = fixture.host.lock().unwrap().terminals[&fixture.session.id]
         .handle
         .clone();

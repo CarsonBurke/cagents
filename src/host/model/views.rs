@@ -4,6 +4,7 @@ use crate::workspace_model::{
     views::{Change, Scope, View},
 };
 
+pub(in crate::host::model) mod bindings;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, operation_seen, read};
 
@@ -187,7 +188,7 @@ fn write_terminal_source(
     Ok(())
 }
 
-fn update_terminal_source(
+pub(super) fn update_terminal_source(
     db: &Connection,
     id: crate::model::CardId,
     claimed_before: &crate::model::CardKind,
@@ -676,6 +677,14 @@ pub(super) fn apply_recorded(
             if view.revision != *expected_revision {
                 return Err(Registry::VIEW_REVISION_CONFLICT.into());
             }
+            if let Change::UpdateTerminalSource { before, worker, .. } = change {
+                if bindings::read(transaction, before.id)?
+                    .and_then(|b| b.basis)
+                    .is_some_and(|original| &original != worker)
+                {
+                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                }
+            }
             changed = match change {
                 Change::Transfer {
                     id,
@@ -728,7 +737,8 @@ pub(super) fn apply_recorded(
                     }
                     view.apply(change)?
                 }
-                Change::Update { before, pane } => {
+                Change::Update { before, pane }
+                | Change::UpdateTerminalSource { before, pane, .. } => {
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
                     // separately against the authoritative pane.
@@ -766,7 +776,20 @@ pub(super) fn apply_recorded(
                     }
                     changed
                 }
-                Change::RemoveSource { before, .. } => {
+                Change::RemoveSource {
+                    before, capture, ..
+                } => {
+                    if matches!(before.kind, crate::model::CardKind::Terminal(_))
+                        && capture.is_none()
+                    {
+                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    }
+                    if let Some(capture) = capture {
+                        if capture.scope != *scope || capture.before != *before {
+                            return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                        }
+                        bindings::captured(transaction, capture, None)?;
+                    }
                     if owner(transaction, before.id)?.as_ref() != Some(scope) {
                         return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                     }
@@ -792,6 +815,21 @@ pub(super) fn apply_recorded(
         // Remove/SeedView record closure intent while applying it. Transfers
         // retire their source placement without closing its identity.
         write_from(transaction, &stored, &view, recorder)?;
+        if let ModelEdit::ChangeView {
+            change: Change::UpdateTerminalSource { pane, worker, .. },
+            ..
+        } = edit
+        {
+            let binding =
+                bindings::read(transaction, pane.id)?.ok_or(Registry::VIEW_SOURCE_CONFLICT)?;
+            bindings::write(
+                transaction,
+                pane,
+                binding.birth_sequence,
+                binding.birth_revision,
+                Some(worker),
+            )?;
+        }
     }
     if let Some((before, target, existed)) = deferred_target {
         recorder.revised(
@@ -899,7 +937,7 @@ fn resource_owner(
     store::resource_holder(db, pane)
 }
 
-fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
+pub(super) fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
     store::owner(db, id)
 }
 
@@ -999,6 +1037,7 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     // presentation, retirement and naming state outside the descriptor itself.
     terminal_retention::sync_view_pins(db, &view.panes)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
 }
 
@@ -1067,6 +1106,7 @@ pub(super) fn rebind_agent_pane(
     view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
 }
 
@@ -1122,7 +1162,7 @@ fn write(db: &Connection, view: &View, recorder: &mut Recorder) -> Result<(), St
 /// [`write`] from a `before` read earlier in the transaction, for a transfer:
 /// its pane row has already moved, but each view's derived state must still
 /// observe the transition from what the view held.
-fn write_from(
+pub(super) fn write_from(
     db: &Connection,
     before: &View,
     view: &View,
@@ -1159,6 +1199,7 @@ fn write_from(
     }
     // Pins hang off pane rows, so the rows come first.
     store::store(db, view)?;
+    bindings::sync(db, before, view)?;
     terminal_retention::sync_view_pins(db, &view.panes)
 }
 
@@ -1168,6 +1209,7 @@ mod tests {
     use crate::model::{BrowserId, BrowserSession, CardId, CardKind};
     use crate::workspace_model::views::Pane;
 
+    mod bindings;
     mod effects;
     fn setup() -> (Registry, tempfile::TempDir, ChannelId, ChannelId) {
         let dir = tempfile::tempdir().unwrap();
@@ -1243,6 +1285,7 @@ mod tests {
                 repository: "/repo".into(),
                 before: original.clone(),
                 terminal: None,
+                capture: None,
             },
         );
         let mut replacement = original.clone();
@@ -1293,6 +1336,7 @@ mod tests {
                 repository: "/repo".into(),
                 before: original.clone(),
                 terminal: None,
+                capture: None,
             };
             match mutation {
                 0 => {
@@ -1352,6 +1396,7 @@ mod tests {
             repository: "/repo".into(),
             before: original.clone(),
             terminal: None,
+            capture: None,
         };
         let mut removal = edit(&mut registry, channel, change);
         let mut titled = original.clone();

@@ -1670,12 +1670,33 @@ impl ControlClient {
         }
     }
 
+    pub fn captured_terminal_removal_basis(
+        &mut self,
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadCapturedTerminalRemovalBasis { capture })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("captured terminal source", &response)),
+        }
+    }
+
     pub fn close_terminal_source(
         &mut self,
         session: crate::model::TerminalSession,
         basis: crate::workspace_model::views::TerminalRemovalBasis,
         completed_only: bool,
         allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        self.close_captured_terminal_source(session, basis, completed_only, allow_active, None)
+    }
+
+    pub fn close_captured_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let terminal_id = session.id;
         if !completed_only {
@@ -1701,6 +1722,7 @@ impl ControlClient {
             basis,
             completed_only,
             allow_active,
+            capture,
         };
         let result = (if completed_only {
             self.request_with_deadline(request, Instant::now() + CHAT_CLOSE_TIMEOUT)
@@ -8630,6 +8652,7 @@ mod tests {
                         basis: peer_basis,
                         completed_only: false,
                         allow_active: false,
+                        capture: None,
                     }
                 } else if checked {
                     ClientRequest::CloseTerminalChecked {

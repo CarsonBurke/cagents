@@ -55,13 +55,14 @@ mod public_delta_tests;
 mod schema;
 mod terminal_owners;
 mod terminal_retention;
+pub(in crate::host) mod terminal_sources;
 #[cfg(test)]
 mod view_cost_bench;
 mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -351,7 +352,7 @@ impl Registry {
     }
 
     pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
-        self.apply_delta_guarded(edit, |_| Ok(()))
+        self.apply_delta_guarded(edit, |_, _| Ok(()))
     }
 
     /// Acquire SQL writer admission before retaining resident serialization.
@@ -359,7 +360,7 @@ impl Registry {
     pub(crate) fn apply_delta_guarded<G>(
         &mut self,
         edit: &ModelEdit,
-        guard: impl FnOnce(bool) -> Result<G, String>,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
         let transaction = self
             .db
@@ -372,7 +373,7 @@ impl Registry {
             }
             _ => false,
         };
-        let resident_guard = guard(seen)?;
+        let resident_guard = guard(seen, &transaction)?;
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
@@ -1014,6 +1015,10 @@ fn migrate_through(
         console_relaunch::migrate(tx)?;
         schema::migration_checkpoint(24)?;
     }
+    if version < 25 && target >= 25 {
+        views::bindings::migrate(tx)?;
+        schema::migration_checkpoint(25)?;
+    }
     Ok(())
 }
 
@@ -1555,7 +1560,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE console_relaunches;
+                "DROP TABLE terminal_pane_bindings;
+                 DROP TABLE console_relaunches;
                  DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;

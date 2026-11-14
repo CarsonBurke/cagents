@@ -491,10 +491,21 @@ impl TerminalRemovalBasis {
                 },
             ) => a != b || latest_worker == &Some(*instance),
             (Some(existing), next) => existing == next,
-            (None, Self::Absent { .. }) => true,
-            (None, Self::Worker { .. }) => false,
+            (None, _) => false,
         }
     }
+}
+
+/// The authoritative view the person saw when Close began. Revisions alone
+/// are insufficient across store conversions, so retain the model watermark too.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CapturedTerminalSource {
+    pub registry: uuid::Uuid,
+    pub repository: PathBuf,
+    pub scope: Scope,
+    pub view_revision: u64,
+    pub model_sequence: u64,
+    pub before: Pane,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -529,6 +540,14 @@ pub enum Change {
         repository: PathBuf,
         before: Pane,
         terminal: Option<TerminalRemovalBasis>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture: Option<CapturedTerminalSource>,
+    },
+    /// A runtime receipt cannot publish a predecessor's exit over its replacement.
+    UpdateTerminalSource {
+        before: Pane,
+        pane: Pane,
+        worker: TerminalRemovalBasis,
     },
 }
 
@@ -585,7 +604,7 @@ impl View {
                     self.panes.insert(index, pane.clone());
                 }
             }
-            Change::Update { before, pane } => {
+            Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. } => {
                 if before.id != pane.id {
                     return Err("pane identity cannot change".into());
                 }
@@ -1000,6 +1019,7 @@ mod wire_tests {
             repository: "/repo".into(),
             before: original.clone(),
             terminal: None,
+            capture: None,
         };
         let mut replacement = original.clone();
         if let CardKind::Browser(browser) = &mut replacement.kind {

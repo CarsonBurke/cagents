@@ -1,6 +1,6 @@
 //! Close retains its original shared source through asynchronous cleanup.
 use super::*;
-use crate::workspace_model::views::TerminalRemovalBasis;
+use crate::workspace_model::views::{CapturedTerminalSource, TerminalRemovalBasis};
 
 #[derive(Clone, Debug)]
 pub(in crate::app) struct RemovalSource {
@@ -8,31 +8,93 @@ pub(in crate::app) struct RemovalSource {
     change: Change,
 }
 
+/// A basis read for this immutable gesture, never an unscoped inventory reply.
+#[derive(Clone, Debug)]
+pub(in crate::app) struct TerminalRemovalReceipt {
+    pub basis: TerminalRemovalBasis,
+    pub capture: Option<CapturedTerminalSource>,
+}
+
+impl From<TerminalRemovalBasis> for TerminalRemovalReceipt {
+    fn from(basis: TerminalRemovalBasis) -> Self {
+        Self {
+            basis,
+            capture: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::app) enum TerminalCleanupAuthority {
     Local,
-    Shared(Option<TerminalRemovalBasis>),
+    Shared {
+        basis: Option<TerminalRemovalBasis>,
+        capture: Option<CapturedTerminalSource>,
+    },
 }
 
 impl TerminalCleanupAuthority {
+    pub(in crate::app) fn receipt(&self, basis: TerminalRemovalBasis) -> TerminalRemovalReceipt {
+        TerminalRemovalReceipt {
+            basis,
+            capture: self.capture().cloned(),
+        }
+    }
+    pub(in crate::app) fn capture(&self) -> Option<&CapturedTerminalSource> {
+        match self {
+            Self::Shared { capture, .. } => capture.as_ref(),
+            Self::Local => None,
+        }
+    }
+    pub(in crate::app) fn read_basis(
+        &self,
+        client: &mut crate::control::ControlClient,
+        source: &TerminalSession,
+    ) -> Result<TerminalRemovalBasis, crate::control::ControlError> {
+        if let Some(capture) = self.capture() {
+            client.captured_terminal_removal_basis(capture.clone())
+        } else {
+            client.terminal_removal_basis(source.clone())
+        }
+    }
     pub(in crate::app) fn worker(&self) -> Option<&TerminalRemovalBasis> {
         match self {
-            Self::Shared(Some(basis @ TerminalRemovalBasis::Worker { .. })) => Some(basis),
+            Self::Shared {
+                basis: Some(basis @ TerminalRemovalBasis::Worker { .. }),
+                ..
+            } => Some(basis),
             _ => None,
         }
     }
     pub(in crate::app) fn requires_absence(&self) -> bool {
         matches!(
             self,
-            Self::Shared(None | Some(TerminalRemovalBasis::Absent { .. }))
+            Self::Shared {
+                basis: None | Some(TerminalRemovalBasis::Absent { .. }),
+                ..
+            }
         )
+    }
+
+    /// Called only after read_basis validated the original canonical context.
+    pub(in crate::app) fn permits_resolved(&self, observed: &TerminalRemovalBasis) -> bool {
+        matches!(
+            self,
+            Self::Shared {
+                basis: None,
+                capture: Some(_)
+            }
+        ) || self.permits(observed)
     }
 
     pub(in crate::app) fn permits(&self, observed: &TerminalRemovalBasis) -> bool {
         match self {
             Self::Local => true,
-            Self::Shared(Some(expected)) => expected == observed,
-            Self::Shared(None) => false,
+            Self::Shared {
+                basis: Some(expected),
+                ..
+            } => observed.follows_captured(Some(expected)),
+            Self::Shared { basis: None, .. } => false,
         }
     }
 }
@@ -93,9 +155,25 @@ impl Cagents {
             };
             let change = Change::RemoveSource {
                 registry: self.workspace_model.identity,
-                repository,
+                repository: repository.clone(),
                 before: before.clone(),
                 terminal,
+                capture: matches!(before.kind, CardKind::Terminal(_)).then(|| {
+                    CapturedTerminalSource {
+                        registry: self.workspace_model.identity,
+                        repository,
+                        scope: scope.clone(),
+                        view_revision: self
+                            .workspace_model
+                            .views
+                            .iter()
+                            .find(|v| &v.scope == scope)
+                            .unwrap()
+                            .revision,
+                        model_sequence: self.shared_views.snapshot_sequence,
+                        before: before.clone(),
+                    }
+                }),
             };
             if !views::removal_source_current(&self.workspace_model, scope, &change) {
                 return Err(());
@@ -152,6 +230,31 @@ impl Cagents {
                     .is_some_and(|current| views::same_removal_source(before, &current))
         });
         if !valid {
+            self.shared_removal_refused();
+        }
+        valid
+    }
+
+    pub(in crate::app) fn shared_removal_terminal_receipt(
+        &mut self,
+        card: CardId,
+        receipt: TerminalRemovalReceipt,
+    ) -> bool {
+        let Some(Some(source)) = self.shared_views.removals.get_mut(&card) else {
+            return true;
+        };
+        let Change::RemoveSource {
+            terminal, capture, ..
+        } = &mut source.change
+        else {
+            unreachable!()
+        };
+        let valid = capture.as_ref() == receipt.capture.as_ref()
+            && ((terminal.is_none() && capture.is_some())
+                || receipt.basis.follows_captured(terminal.as_ref()));
+        if valid {
+            *terminal = Some(receipt.basis);
+        } else {
             self.shared_removal_refused();
         }
         valid
@@ -215,10 +318,19 @@ impl Cagents {
         match self.shared_views.removals.get(&card) {
             Some(None) => TerminalCleanupAuthority::Local,
             Some(Some(RemovalSource {
-                change: Change::RemoveSource { terminal, .. },
+                change:
+                    Change::RemoveSource {
+                        terminal, capture, ..
+                    },
                 ..
-            })) => TerminalCleanupAuthority::Shared(terminal.clone()),
-            _ => TerminalCleanupAuthority::Shared(None),
+            })) => TerminalCleanupAuthority::Shared {
+                basis: terminal.clone(),
+                capture: capture.clone(),
+            },
+            _ => TerminalCleanupAuthority::Shared {
+                basis: None,
+                capture: None,
+            },
         }
     }
 
@@ -236,6 +348,7 @@ impl Cagents {
                     repository,
                     before,
                     terminal: Some(basis @ TerminalRemovalBasis::Worker { owner, instance }),
+                    ..
                 },
         })) = self.shared_views.removals.get(&card)
         else {
@@ -283,6 +396,7 @@ impl Cagents {
             repository: repository.clone(),
             before: canonical.clone(),
             terminal: Some(basis.clone()),
+            capture: None,
         };
         if !views::removal_source_current(&self.workspace_model, current_scope, &current_basis) {
             return Task::none();
@@ -291,6 +405,8 @@ impl Cagents {
         let kind = canonical.kind.clone();
         self.card_state_mut(card).unwrap().kind = kind;
         self.saved_terminals.entries.remove(&card);
+        self.retained_outputs.remove(&terminal);
+        self.shared_views.ended_terminal_workers.remove(&card);
         self.shared_views.attached.insert(card);
         self.terminal_recovery_attempts.remove(&terminal);
         let exposure = self.exposure(card);

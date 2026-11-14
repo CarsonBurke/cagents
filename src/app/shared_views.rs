@@ -6,7 +6,7 @@ use crate::workspace_model::{
     views::{self, Change, Pane, Scope, View},
 };
 mod removal;
-pub(super) use removal::TerminalCleanupAuthority;
+pub(super) use removal::{TerminalCleanupAuthority, TerminalRemovalReceipt};
 
 /// One immutable projection for a publication pass. Scope discovery includes
 /// historical directories, but their cards never become open shared panes.
@@ -125,6 +125,13 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    pub(super) ended_terminal_workers: HashMap<
+        CardId,
+        (
+            TerminalId,
+            crate::workspace_model::views::TerminalRemovalBasis,
+        ),
+    >,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -146,6 +153,7 @@ pub(super) struct State {
     pub closed_chats: HashMap<CardId, crate::chat::Session>,
     /// Last actual canonical descriptors, before optimistic local edits.
     observed_chats: HashMap<CardId, crate::chat::Session>,
+    observed_terminals: HashMap<CardId, TerminalSession>,
     applying: bool,
     pub creating_default: bool,
     pub deferred_default: Option<PathBuf>,
@@ -1501,6 +1509,36 @@ impl Cagents {
                 } else {
                     change
                 };
+                let change = match change {
+                    Change::Update { before, mut pane }
+                        if matches!((&before.kind, &pane.kind),
+                            (CardKind::Terminal(a), CardKind::Terminal(b)) if a.id == b.id && a.launch == b.launch)
+                            && views::updates_source(&before, &pane) =>
+                    {
+                        let worker = match self.cards.get(&pane.id) {
+                            Some(CardRuntime::Terminal(handle)) => handle.execution_instance().zip(handle.host_proof())
+                                .map(|(instance, owner)| views::TerminalRemovalBasis::Worker { owner, instance }),
+                            _ => self.shared_views.ended_terminal_workers.get(&pane.id)
+                                .filter(|(id, _)| matches!(&pane.kind, CardKind::Terminal(s) if &s.id == id))
+                                .map(|(_, worker)| worker.clone()),
+                        };
+                        if let Some(worker) = worker {
+                            Change::UpdateTerminalSource {
+                                before,
+                                pane,
+                                worker,
+                            }
+                        } else {
+                            // A source without a surface receipt is saved locally,
+                            // but cannot overwrite another worker's canonical state.
+                            pane.kind = before.kind.clone();
+                            pane.pending_terminal_start = before.pending_terminal_start;
+                            pane.scope = before.scope.clone();
+                            Change::Update { before, pane }
+                        }
+                    }
+                    change => change,
+                };
                 if let Change::Insert { pane, .. } = &change
                     && matches!(pane.kind, CardKind::Chat(_))
                 {
@@ -1930,6 +1968,7 @@ impl Cagents {
             let id = match change {
                 Change::Insert { pane, .. }
                 | Change::Update { pane, .. }
+                | Change::UpdateTerminalSource { pane, .. }
                 | Change::InsertIfEmpty { pane } => pane.id,
                 Change::RemoveSource { before, .. } => before.id,
                 Change::Remove { id } | Change::Move { id, .. } | Change::Transfer { id, .. } => {
@@ -2559,7 +2598,7 @@ impl Cagents {
             let existing = self.card_state(pane.id).cloned();
             // The exit this window saw, read before a readmission below can
             // mark the card unstarted.
-            let observed_exit = self.ended_terminal(pane.id).cloned();
+            let mut observed_exit = self.ended_terminal(pane.id).cloned();
             // A restored shared terminal may have waited for the registry
             // while lifecycle hydration was admitted. Once its authoritative
             // descriptor arrives, admit that exact identity again.
@@ -2571,10 +2610,36 @@ impl Cagents {
             let waiting = matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))
                 && existing.is_some()
                 && matches!(self.residency(pane.id), Residency::Hydrating { .. });
+            let canonical_was_ended = match &pane.kind {
+                CardKind::Terminal(source) => self
+                    .shared_views
+                    .observed_terminals
+                    .insert(pane.id, source.clone())
+                    .is_none_or(|previous| terminal_ended(&previous)),
+                _ => {
+                    self.shared_views.observed_terminals.remove(&pane.id);
+                    false
+                }
+            };
+            let completed_became_live = no_start
+                && canonical_was_ended
+                && observed_exit.is_some()
+                && matches!(self.cards.get(&pane.id), Some(CardRuntime::Completed))
+                && matches!(&pane.kind, CardKind::Terminal(s) if s.continuity.live_proof().is_some())
+                && !pane.pending_terminal_start;
+            if completed_became_live {
+                if let CardKind::Terminal(s) = &pane.kind {
+                    self.retained_outputs.remove(&s.id);
+                }
+                self.shared_views.ended_terminal_workers.remove(&pane.id);
+                // The canonical live source attaches; saved exit state cannot
+                // turn its replacement back into the old Completed placeholder.
+                observed_exit = None;
+            }
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
             if matches!(pane.kind, CardKind::Terminal(_))
-                && ((no_start && (waiting || failed_pending))
+                && ((no_start && (waiting || failed_pending || completed_became_live))
                     || (leaves_saved
                         && matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))))
             {

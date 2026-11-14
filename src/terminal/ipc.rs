@@ -665,6 +665,12 @@ pub enum ClientRequest {
         basis: crate::workspace_model::views::TerminalRemovalBasis,
         completed_only: bool,
         allow_active: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    },
+    /// Resolve only the canonical generation from the original complete view.
+    ReadCapturedTerminalRemovalBasis {
+        capture: crate::workspace_model::views::CapturedTerminalSource,
     },
 }
 

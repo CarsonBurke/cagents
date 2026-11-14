@@ -134,19 +134,27 @@ fn assert_sqlite_progress(removing: bool) {
         )
         .unwrap();
         ModelEdit::ChangeView {
-            scope,
+            scope: scope.clone(),
             expected_revision: model.views[0].revision,
             operation: uuid::Uuid::new_v4(),
             change: Change::RemoveSource {
                 registry: model.identity,
                 repository: directory.path().to_owned(),
-                before: pane,
+                before: pane.clone(),
                 terminal: Some(
                     crate::workspace_model::views::TerminalRemovalBasis::Worker {
                         owner: host.lock().unwrap().proof().clone(),
                         instance: _terminal.0.execution_instance(),
                     },
                 ),
+                capture: Some(crate::workspace_model::views::CapturedTerminalSource {
+                    registry: model.identity,
+                    repository: directory.path().to_owned(),
+                    scope,
+                    view_revision: model.views[0].revision,
+                    model_sequence: model.sequence,
+                    before: pane,
+                }),
             },
         }
     } else {

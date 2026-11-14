@@ -449,6 +449,13 @@ The private scene file prevents delivering the replacement twice. These modes
 use a sleeping fixture shell and no model provider; stopping native-evidence
 cleans up its workers. Exercise a fresh native Close afterward as well.
 
+For a saved completed pane with no resident worker, use `prepare-completed`.
+The helper starts, finishes and releases its fixture shell before seeding its
+ended descriptor. Open **Shared Close race** and close **Original terminal**
+once. Its pane should disappear without starting a replacement or needing a
+retained final screen. This exercises the completed-source absence proof;
+fixtures do not exercise live provider cleanup.
+
 Write the scene as steps, not as instructions in a PR comment, so the next
 agent can rerun it:
 

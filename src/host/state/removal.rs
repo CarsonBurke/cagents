@@ -60,6 +60,7 @@ mod tests {
                     kind: CardKind::Terminal(source.clone()),
                 },
                 terminal: Some(basis),
+                capture: None,
             },
         };
         assert!(state.validate_view_removal(&removal).is_ok());
@@ -147,8 +148,10 @@ impl HostState {
         }
     }
 
-    fn removal_in_transition(&self, id: TerminalId) -> bool {
+    pub(in crate::host) fn removal_in_transition(&self, id: TerminalId) -> bool {
         self.spawning.contains(&id)
+            || self.startup_custody.contains(&id)
+            || self.publication_pending.contains_key(&id)
             || super::super::chat::terminal_claim_pending(self, id)
             || self.chat_handoffs.contains_key(&id)
             || self.chat_bindings.contains_key(&id)
@@ -198,6 +201,27 @@ impl HostState {
     }
 
     pub(in crate::host) fn validate_view_removal(&self, edit: &ModelEdit) -> Result<(), String> {
+        if let ModelEdit::ChangeView {
+            change: Change::UpdateTerminalSource { before, worker, .. },
+            ..
+        } = edit
+        {
+            let crate::model::CardKind::Terminal(source) = &before.kind else {
+                return Err(conflict());
+            };
+            if self.removal_in_transition(source.id) {
+                return Err(conflict());
+            }
+            if self.terminals.contains_key(&source.id)
+                && self
+                    .terminal_removal_basis(source)
+                    .map_err(|_| conflict())?
+                    != *worker
+            {
+                return Err(conflict());
+            }
+            return Ok(());
+        }
         let ModelEdit::ChangeView {
             change: Change::RemoveSource {
                 before, terminal, ..

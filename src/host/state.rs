@@ -250,6 +250,13 @@ impl Subscriptions {
     }
 }
 
+struct PendingPublication {
+    handle: TerminalHandle,
+    source: TerminalSession,
+    pane: Option<crate::model::CardId>,
+    original: Option<(crate::model::CardId, u64)>,
+}
+
 pub(crate) struct HostState {
     recover_holders: bool,
     /// Shared, never mutated: a redraw broadcast hands the same proof to every
@@ -264,6 +271,7 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    publication_pending: BTreeMap<TerminalId, PendingPublication>,
     /// Missing original owners after an acknowledged incomplete update. Their
     /// saved pane recipes are evidence, never automatic execution authority.
     paused_update_terminals: BTreeSet<TerminalId>,
@@ -457,6 +465,7 @@ impl HostState {
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
+            publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
@@ -1475,6 +1484,7 @@ impl HostState {
         self.detach(0, source.id)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
@@ -1482,10 +1492,45 @@ impl HostState {
         handle: TerminalHandle,
         initially_visible: bool,
     ) -> Result<TerminalDescriptor, ProtocolError> {
-        self.finish_spawn_with_execution(client_id, session, handle, initially_visible, None, None)
+        self.finish_spawn_with_execution(
+            super::model::terminal_sources::PublishedTerminal::fixture(),
+            client_id,
+            session,
+            handle,
+            initially_visible,
+            None,
+            None,
+        )
     }
 
+    #[cfg(test)]
     fn finish_spawn_with_execution(
+        &mut self,
+        _published: super::model::terminal_sources::PublishedTerminal,
+        client_id: ClientId,
+        session: TerminalSession,
+        handle: TerminalHandle,
+        initially_visible: bool,
+        execution_recipe: Option<crate::model::LaunchRecipe>,
+        execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
+        let id = session.id;
+        let instance = handle.execution_instance();
+        let descriptor = self.install_startup_parent(
+            client_id,
+            session,
+            handle,
+            initially_visible,
+            execution_recipe,
+            execution_environment,
+        )?;
+        self.published_terminal_workers.observe(id, instance);
+        self.rearm_output(client_id, id);
+        self.publish_worker(client_id, id);
+        Ok(descriptor)
+    }
+
+    fn install_startup_parent(
         &mut self,
         client_id: ClientId,
         mut session: TerminalSession,
@@ -1507,8 +1552,6 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
-        self.published_terminal_workers
-            .observe(terminal_id, handle.execution_instance());
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -1538,8 +1581,6 @@ impl HostState {
         };
         self.subscriptions
             .attach(client_id, terminal_id, visibility);
-        self.rearm_output(client_id, terminal_id);
-        self.publish_worker(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
     }
 
@@ -2136,6 +2177,13 @@ impl HostState {
                 .is_some_and(|record| record.handle.same_worker(handle))
         {
             self.startup_custody.remove(&id);
+            if self
+                .publication_pending
+                .get(&id)
+                .is_some_and(|p| p.handle.same_worker(handle))
+            {
+                self.publication_pending.remove(&id);
+            }
             if self.ordinary_exit_cleanup_pending {
                 // An adopted holder may have no local reaper credit. Exact
                 // checked Close must wake the exit caller even if its client
@@ -4329,6 +4377,28 @@ fn start_terminal_view_owned_reserved(
             false,
         ));
     }
+    validate_launch(&session)?;
+    validate_spawn_options(&options)?;
+    let repair = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .publication_pending
+            .get(&session.id)
+            .filter(|p| p.source == session && p.pane == pending_pane)
+            .map(|p| p.handle.clone())
+    };
+    if let Some(handle) = repair {
+        let descriptor =
+            publish_installed_terminal(shared, client_id, session.id, &handle, &options)?;
+        if execution_environment.is_some() {
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .subscriptions
+                .detach(client_id, session.id);
+        }
+        return Ok((descriptor, handle));
+    }
     let recovery = shared
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4343,8 +4413,7 @@ fn start_terminal_view_owned_reserved(
             false,
         ));
     }
-    validate_launch(&session)?;
-    validate_spawn_options(&options)?;
+
     if let Some(recipe) = &execution_recipe {
         if crate::upgrade::exact_conversation(recipe).is_none()
             || (adoption.is_some()
@@ -4420,10 +4489,13 @@ fn start_terminal_view_owned_reserved(
         .map_or_else(|| session.clone(), |previous| previous.source.clone());
     // Pane reservations are read on the workspace writer, which is always
     // locked before HostState and never while holding it.
-    let pending_writer = pending_pane
-        .map(|_| super::workspace::writer(shared))
-        .transpose()?;
-    let holder_recovery = {
+    let pending_writer = match super::workspace::writer(shared) {
+        Ok(writer) => Some(writer),
+        #[cfg(test)]
+        Err(_) if pending_pane.is_none() => None,
+        Err(error) => return Err(error),
+    };
+    let (holder_recovery, publication_source) = {
         let registry = pending_writer
             .as_ref()
             .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
@@ -4432,9 +4504,24 @@ fn start_terminal_view_owned_reserved(
             .zip(pending_pane)
             .map(|(registry, pane)| super::workspace::pending_terminal(registry, pane, terminal_id))
             .transpose()?;
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let publication_source = registry
+            .as_deref()
+            .map(|r| r.terminal_publication_source(terminal_id))
+            .transpose()
+            .map_err(model_unavailable)?
+            .flatten();
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(pending) = state.publication_pending.get(&terminal_id) {
+            if pending.source != session || pending.pane != pending_pane {
+                return Err(not_found(terminal_id));
+            }
+            let handle = pending.handle.clone();
+            drop(state);
+            drop(registry);
+            let descriptor =
+                publish_installed_terminal(shared, client_id, terminal_id, &handle, &options)?;
+            return Ok((descriptor, handle));
+        }
         if let Some(reservation) = reservation {
             // Completion is idempotent across clients, but an actor alone is
             // insufficient: its authoritative pane must still name it.
@@ -4477,7 +4564,7 @@ fn start_terminal_view_owned_reserved(
                 return Err(error);
             }
         }
-        state.recover_holders.then(|| {
+        let holder = state.recover_holders.then(|| {
             let mut source = session.clone();
             source.continuity = TerminalContinuity::DetachedSameBoot {
                 host_session_id: state.proof.host_session_id.clone(),
@@ -4499,7 +4586,8 @@ fn start_terminal_view_owned_reserved(
                 execution_environment: retained_environment.clone(),
                 execution_recipe: execution_recipe.clone(),
             }
-        })
+        });
+        (holder, publication_source)
     };
     // Fresh holders receive this exact daemon-issued source. Retain it after
     // successful startup instead of the caller's proofless relaunch projection.
@@ -4630,7 +4718,7 @@ fn start_terminal_view_owned_reserved(
             // This record, not the returned error, independently owns the
             // exact Handle before its thread may send CommitAdoption.
             state
-                .finish_spawn_with_execution(
+                .install_startup_parent(
                     client_id,
                     install_session,
                     handle.clone(),
@@ -4714,159 +4802,40 @@ fn start_terminal_view_owned_reserved(
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
     let redraw_handle = handle.clone();
-    // Hold writer admission from this check through the completion save.
-    let mut pending_registry = pending_writer
-        .as_ref()
-        .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
-    let reservation = pending_registry
-        .as_deref()
-        .zip(pending_pane)
-        .map(|(registry, pane)| {
-            super::workspace::pending_terminal(registry, pane, terminal_id).and_then(
-                |reservation| {
-                    if reservation.accepts(&session) {
-                        Ok(reservation)
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
-                },
-            )
-        });
-    let (descriptor, completion) = {
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if adopting && state.ordinary_exit_cleanup_pending() {
-            state.retain_startup_recovery(format!(
-                "Adopted terminal {terminal_id} finished startup after ordinary exit began"
-            ));
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                "Ordinary exit retained the original startup owner; explicitly Close that actor",
-                false,
-            ));
-        }
-        let reservation = match reservation.transpose() {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                if adopting {
-                    state.retain_startup_recovery(format!(
-                        "Adopted terminal {terminal_id} lost its pane reservation after commit: {}",
-                        error.message
-                    ));
-                    return Err(error);
-                }
-                state.cancel_spawn(terminal_id);
-                drop(state);
-                drop(pending_registry);
-                // The reservation was withdrawn while the worker was starting.
-                // Shut down only this unpublished worker, never an actor
-                // already attached by another client.
-                let _ = handle.shutdown();
-                drop(handle);
-                return Err(error);
-            }
-        };
-        let issued_hint = execution_recipe
-            .as_ref()
-            .map(|_| session.resume_hint.clone());
-        let mut descriptor = if adopting {
-            // Keep the independently installed original record and any error/
-            // semantic edges already published while commit was in flight.
-            if !state
-                .terminals
-                .get(&terminal_id)
-                .is_some_and(|record| record.handle.same_worker(&handle))
-            {
-                state.retain_startup_recovery(format!(
-                    "Adopted terminal {terminal_id} parent record changed after commit"
-                ));
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    "Adopted startup parent identity changed; original ownership remains unresolved",
-                    false,
-                ));
-            }
-            state
-                .set_visibility(
-                    client_id,
-                    terminal_id,
-                    if options.initially_visible {
-                        TerminalVisibility::Visible
-                    } else {
-                        TerminalVisibility::Hidden
-                    },
-                )
-                .and_then(|()| state.descriptor(client_id, terminal_id))
-        } else {
-            state.finish_spawn_with_execution(
+    {
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if !adopting {
+            if let Err(error) = state.install_startup_parent(
                 client_id,
                 registered_session,
-                handle,
-                options.initially_visible,
+                handle.clone(),
+                false,
                 execution_recipe.clone(),
                 retained_environment,
-            )
-        };
-        if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
-            state
-                .terminals
-                .get_mut(&terminal_id)
-                .expect("finished spawn")
-                .session
-                .resume_hint = hint.clone();
-            descriptor.session.resume_hint = hint;
-        }
-        let completion = reservation
-            .filter(|_| descriptor.is_ok())
-            .map(|reservation| (reservation, state.terminals[&terminal_id].session.clone()));
-        if descriptor.is_ok() {
-            state
-                .terminals
-                .get_mut(&terminal_id)
-                .expect("finished spawn")
-                .options = options.clone();
-            // Keep the independently installed parent through actual
-            // descriptor publication, not merely the worker startup ACK.
-            // Any earlier error leaves the exact original recoverable.
-            if adopting {
-                state.startup_custody.remove(&terminal_id);
+            ) {
+                drop(state);
+                let _ = handle.shutdown();
+                return Err(error);
             }
         }
-        if native_handoff {
-            // A chat connection cannot consume PTY events. The GUI attaches a
-            // terminal connection after checkpointing the returned live proof.
-            state.subscriptions.detach(client_id, terminal_id);
+        let record = state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("installed original parent");
+        record.options = options.clone();
+        if execution_recipe.is_some() {
+            record.session.resume_hint = session.resume_hint.clone();
         }
-        (descriptor, completion)
-    };
-    if let (Some(registry), Some((reservation, session))) =
-        (pending_registry.as_deref_mut(), completion)
-    {
-        super::workspace::complete_terminal(shared, registry, reservation, session);
+        state.publication_pending.insert(
+            terminal_id,
+            PendingPublication {
+                handle: handle.clone(),
+                source: session.clone(),
+                pane: pending_pane,
+                original: publication_source,
+            },
+        );
     }
-    drop(pending_registry);
-    let descriptor = match descriptor {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            if adopting {
-                shared
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .retain_startup_recovery(format!(
-                        "Adopted terminal {terminal_id} publication failed after commit: {}",
-                        error.message
-                    ));
-            } else {
-                let _ = redraw_handle.shutdown();
-            }
-            return Err(error);
-        }
-    };
-    // Initial publication can happen before the record is subscribable. Clear
-    // that edge after insertion; the Spawn response carries the same snapshot,
-    // and later generations can now produce a fresh wake.
-    redraw_handle.acknowledge_redraw(redraw_handle.generation());
     let activity_wake = Arc::clone(
         &shared
             .lock()
@@ -4884,7 +4853,111 @@ fn start_terminal_view_owned_reserved(
             broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
         }
     });
+
+    let descriptor = match publish_installed_terminal(
+        shared,
+        client_id,
+        terminal_id,
+        &handle,
+        &options,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            // Starting has effects even when SQL refuses publication. Keep this
+            // exact parent for inspect/explicit Close and an idempotent repair.
+            tracing::warn!(%terminal_id, message=%error.message, "terminal source publication retained its original worker");
+            return Err(error);
+        }
+    };
+    if native_handoff {
+        shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subscriptions
+            .detach(client_id, terminal_id);
+    }
     Ok((descriptor, redraw_handle))
+}
+
+fn publish_installed_terminal(
+    shared: &SharedHost,
+    client: ClientId,
+    id: TerminalId,
+    expected: &TerminalHandle,
+    options: &TerminalSpawnOptions,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    let writer = super::workspace::writer(shared);
+    #[cfg(test)]
+    let writer = writer.ok();
+    #[cfg(not(test))]
+    let writer = Some(writer?);
+    let mut registry = writer
+        .as_ref()
+        .map(|w| w.lock().unwrap_or_else(|p| p.into_inner()));
+    // Writer admission precedes resident serialization, including repair.
+    let sql = registry
+        .as_deref_mut()
+        .map(|r| r.source_admission())
+        .transpose()
+        .map_err(model_unavailable)?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = state
+        .publication_pending
+        .get(&id)
+        .filter(|p| p.handle.same_worker(expected))
+        .ok_or_else(|| not_found(id))?;
+    let original = pending.original;
+    let pane = pending.pane;
+    if state.shutting_down
+        || state.ordinary_exit_cleanup_pending()
+        || !state
+            .terminals
+            .get(&id)
+            .is_some_and(|r| r.handle.same_worker(expected))
+    {
+        return Err(not_found(id));
+    }
+    let canonical = state.descriptor_as(false, id)?.session;
+    let basis = crate::workspace_model::views::TerminalRemovalBasis::Worker {
+        owner: state.proof().clone(),
+        instance: expected.execution_instance(),
+    };
+    let (permit, edges) = match sql {
+        Some(sql) => sql
+            .publish(&canonical, &basis, pane, original)
+            .map_err(model_unavailable)?,
+        #[cfg(test)]
+        None => (
+            super::model::terminal_sources::PublishedTerminal::fixture(),
+            Vec::new(),
+        ),
+        #[cfg(not(test))]
+        None => return Err(missing_registry()),
+    };
+    let _permit = permit;
+    state
+        .published_terminal_workers
+        .observe(id, expected.execution_instance());
+    state.subscriptions.attach(
+        client,
+        id,
+        if options.initially_visible {
+            TerminalVisibility::Visible
+        } else {
+            TerminalVisibility::Hidden
+        },
+    );
+    state.rearm_output(client, id);
+    state.publish_worker(client, id);
+    let descriptor = state.descriptor(client, id)?;
+    for (edit, receipt) in edges {
+        state.announce_model_edit(0, receipt.sequence, &edit, &receipt.effects);
+    }
+    state.publication_pending.remove(&id);
+    state.startup_custody.remove(&id);
+    // Both an initial response and a repaired response carry the initial grid.
+    expected.acknowledge_redraw(expected.generation());
+    Ok(descriptor)
 }
 
 fn apply_visibility(

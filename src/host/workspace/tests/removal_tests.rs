@@ -58,7 +58,7 @@ fn prepared() -> (
     )
     .unwrap();
     let removal = ModelEdit::ChangeView {
-        scope,
+        scope: scope.clone(),
         expected_revision: model.views[0].revision,
         operation: uuid::Uuid::new_v4(),
         change: Change::RemoveSource {
@@ -68,6 +68,14 @@ fn prepared() -> (
             terminal: Some(TerminalRemovalBasis::Worker {
                 owner: host.lock().unwrap().proof().clone(),
                 instance: worker.handle.execution_instance(),
+            }),
+            capture: Some(crate::workspace_model::views::CapturedTerminalSource {
+                registry: model.identity,
+                repository: directory.path().to_owned(),
+                scope,
+                view_revision: model.views[0].revision,
+                model_sequence: model.sequence,
+                before: pane.clone(),
             }),
         },
     };

@@ -331,6 +331,7 @@ mod tests {
                     repository: directory.path().into(),
                     before: pane.clone(),
                     terminal: None,
+                    capture: None,
                 },
             };
             let reservation = if cleanup {

@@ -27008,15 +27008,17 @@ mod tests {
                         session: terminal_source.clone(),
                         result: Ok(
                             super::super::terminal_close::CompletedCloseOutcome::ClosedWithBasis(
-                                crate::workspace_model::views::TerminalRemovalBasis::Absent {
-                                    owner: HostSessionProof {
-                                        host_session_id: "fixture-host".into(),
-                                        boot_id: "fixture-boot".into(),
-                                        host_incarnation: "fixture-incarnation".into(),
+                                app.terminal_cleanup_authority(card).receipt(
+                                    crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                                        owner: HostSessionProof {
+                                            host_session_id: "fixture-host".into(),
+                                            boot_id: "fixture-boot".into(),
+                                            host_incarnation: "fixture-incarnation".into(),
+                                        },
+                                        latest_worker: None,
+                                        history_epoch: 0,
                                     },
-                                    latest_worker: None,
-                                    history_epoch: 0,
-                                },
+                                ),
                             ),
                         ),
                     });

@@ -8868,6 +8868,18 @@ impl Cagents {
         // first. A surface attached to a terminal that had already ended
         // replays that report; recording it again would move the exit to now
         // and announce it a second time.
+        if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+            && let Some((instance, owner)) = handle.execution_instance().zip(handle.host_proof())
+            && let Some(CardKind::Terminal(source)) = self.card_state(card).map(|s| &s.kind)
+        {
+            self.shared_views.ended_terminal_workers.insert(
+                card,
+                (
+                    source.id,
+                    crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance },
+                ),
+            );
+        }
         let already_ended = self.ended_terminal(card).is_some();
         if !already_ended
             && let Some(state) = self.card_state_mut(card)

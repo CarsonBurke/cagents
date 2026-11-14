@@ -137,16 +137,35 @@ fn edit_then<T>(
     let applied = if matches!(
         &edit,
         ModelEdit::ChangeView {
-            change: Change::RemoveSource { .. },
+            change: Change::RemoveSource { .. } | Change::UpdateTerminalSource { .. },
             ..
         }
     ) {
-        apply_delta_guarded(&mut registry, &edit, |seen| {
+        apply_delta_guarded(&mut registry, &edit, |seen, sql| {
             if seen {
                 return Ok(None);
             }
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             state.validate_view_removal(&edit)?;
+            if Registry::unbound_terminal_update(sql, &edit)? {
+                let ModelEdit::ChangeView {
+                    change: Change::UpdateTerminalSource { before, worker, .. },
+                    ..
+                } = &edit
+                else {
+                    unreachable!()
+                };
+                let CardKind::Terminal(source) = &before.kind else {
+                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                };
+                if state
+                    .terminal_removal_basis(source)
+                    .map_err(|_| Registry::VIEW_SOURCE_CONFLICT.to_owned())?
+                    != *worker
+                {
+                    return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                }
+            }
             Ok(Some(state))
         })?
     } else {
@@ -204,13 +223,13 @@ pub(super) fn apply_delta(
     registry: &mut Registry,
     edit: &ModelEdit,
 ) -> Result<DeltaApplied, ProtocolError> {
-    apply_delta_guarded(registry, edit, |_| Ok(()))
+    apply_delta_guarded(registry, edit, |_, _| Ok(()))
 }
 
 fn apply_delta_guarded<G>(
     registry: &mut Registry,
     edit: &ModelEdit,
-    guard: impl FnOnce(bool) -> Result<G, String>,
+    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
 ) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
         scope,
@@ -267,8 +286,6 @@ fn apply_delta_guarded<G>(
 pub(super) struct PendingTerminal {
     pub(super) session: TerminalSession,
     pane: Pane,
-    scope: Scope,
-    revision: u64,
 }
 
 impl PendingTerminal {
@@ -292,8 +309,6 @@ pub(super) fn pending_terminal(
                 return Ok(PendingTerminal {
                     session: session.clone(),
                     pane: candidate,
-                    scope: view.scope,
-                    revision: view.revision,
                 });
             }
         }
@@ -303,37 +318,4 @@ pub(super) fn pending_terminal(
         format!("terminal {terminal_id} was not found"),
         false,
     ))
-}
-
-/// Saves the published worker's source into its reserved pane. The caller
-/// holds writer admission from the reservation check; HostState is free.
-pub(super) fn complete_terminal(
-    host: &SharedHost,
-    registry: &mut Registry,
-    reservation: PendingTerminal,
-    session: TerminalSession,
-) {
-    let terminal_id = session.id;
-    let mut pane = reservation.pane.clone();
-    pane.pending_terminal_start = false;
-    pane.kind = CardKind::Terminal(session);
-    let edit = ModelEdit::ChangeView {
-        scope: reservation.scope,
-        expected_revision: reservation.revision,
-        operation: uuid::Uuid::new_v4(),
-        change: Change::Update {
-            before: reservation.pane,
-            pane,
-        },
-    };
-    match registry.apply_delta(&edit) {
-        Ok(applied) if applied.changed => host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(0, applied.receipt.sequence, &edit, &applied.receipt.effects),
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation")
-        }
-    }
 }

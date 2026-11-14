@@ -139,7 +139,10 @@ fn active_confirmation_preserves_the_captured_worker_authority() {
         owner,
         instance: uuid::Uuid::new_v4(),
     };
-    let authority = TerminalCleanupAuthority::Shared(Some(original.clone()));
+    let authority = TerminalCleanupAuthority::Shared {
+        basis: Some(original.clone()),
+        capture: None,
+    };
     assert!(authority.permits(&original));
     assert!(!authority.permits(&replacement));
 }
@@ -263,4 +266,75 @@ fn shared_close_publication_contains_the_original_source_and_registry() {
             .iter()
             .any(|(_, change)| matches!(change, Change::Remove { .. }))
     );
+}
+
+#[test]
+fn a_cold_completed_source_readmits_a_live_successor_without_retargeting_close() {
+    let (mut app, _, _, mut pane) = channel_move_fixture();
+    let mut source = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+    source.continuity = TerminalContinuity::Exited {
+        last_exit: crate::model::TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 1,
+        },
+    };
+    pane.kind = CardKind::Terminal(source.clone());
+    app.workspace_model.views[0].panes[0] = pane.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.cards.insert(pane.id, CardRuntime::Completed);
+    let owned = HashSet::from([pane.id]);
+    let ended = app.workspace_model.views[0].clone();
+    drop(app.project_shared_view(&ended, &owned));
+    assert!(app.capture_shared_removal(pane.id));
+    let captured = app.terminal_cleanup_authority(pane.id).capture().cloned();
+    source.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-daemon".into(),
+    };
+    let mut live = ended;
+    live.revision += 1;
+    live.panes[0].kind = CardKind::Terminal(source.clone());
+    app.workspace_model.views[0] = live.clone();
+    drop(app.project_shared_view(&live, &owned));
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Loading)
+    ));
+    assert!(app.ended_terminal(pane.id).is_none());
+    assert_eq!(
+        app.card_state(pane.id).unwrap().kind,
+        CardKind::Terminal(source)
+    );
+    assert_eq!(
+        app.terminal_cleanup_authority(pane.id).capture(),
+        captured.as_ref()
+    );
+}
+
+#[test]
+fn a_resolved_receipt_cannot_fill_another_gestures_missing_authority() {
+    use crate::workspace_model::views::TerminalRemovalBasis;
+    let (mut app, _, _, mut pane) = channel_move_fixture();
+    pane.kind = CardKind::Terminal(fresh_terminal_session(
+        LaunchRecipe::shell("/repo".into()).unwrap(),
+    ));
+    app.workspace_model.views[0].panes[0] = pane.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.cards.insert(pane.id, CardRuntime::Completed);
+    assert!(app.capture_shared_removal(pane.id));
+    let basis = TerminalRemovalBasis::Absent {
+        owner: HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-daemon".into(),
+        },
+        latest_worker: None,
+        history_epoch: 0,
+    };
+    let mut receipt = app.terminal_cleanup_authority(pane.id).receipt(basis);
+    receipt.capture.as_mut().unwrap().model_sequence += 1;
+    assert!(!app.shared_removal_terminal_receipt(pane.id, receipt));
+    assert!(!app.shared_removal_ready(pane.id));
 }

@@ -183,6 +183,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadWorkspaceSnapshot
             | ClientRequest::ReadWorkspaceMetadata { .. }
             | ClientRequest::ReadTerminalRemovalBasis { .. }
+            | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -782,10 +783,11 @@ fn reserve_terminal_close(
     source: &crate::model::TerminalSession,
     paired: Option<&crate::chat::runtime::Handle>,
     generation: Result<Option<String>, String>,
+    capture: Option<&crate::workspace_model::views::CapturedTerminalSource>,
 ) -> Result<TerminalCloseRetirement, ProtocolError> {
     let gate = control_gate(host);
     let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
-    let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
+    let reserve = |current: Result<Option<String>, String>| -> Result<TerminalCloseRetirement, ProtocolError> {
     ensure_terminal_close_open(host)?;
     let unavailable =
         |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
@@ -824,6 +826,7 @@ fn reserve_terminal_close(
                     .is_some_and(|handle| handle.same_worker(expected))
                     && paired.is_none_or(|actor| !record.handle.same_attachment(actor))
             })
+            || (capture.is_some() && state.removal_in_transition(terminal))
             || super::chat::terminal_claim_pending(&state, terminal)
         {
             return Err(ProtocolError::new(
@@ -870,6 +873,69 @@ fn reserve_terminal_close(
     };
     reservation.previous = previous;
     Ok(reservation)
+    };
+    if let Some(capture) = capture {
+        with_source_close_fence(host, &gate, terminal, deadline, capture, reserve)
+    } else {
+        let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
+        reserve(current)
+    }
+}
+
+fn source_cleanup_conflict() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::InvalidRequest,
+        crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
+        false,
+    )
+}
+
+/// Acquire SQL before State, and never wait for the control writer while holding
+/// SQL. Readers queued on the registry can therefore finish before the retry.
+fn with_source_close_fence<T>(
+    host: &SharedHost,
+    gate: &RwLock<()>,
+    terminal: crate::model::TerminalId,
+    deadline: Instant,
+    capture: &crate::workspace_model::views::CapturedTerminalSource,
+    reserve: impl FnOnce(Result<Option<String>, String>) -> Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let writer = super::workspace::writer(host)?;
+    loop {
+        let registry = match writer.try_lock() {
+            Ok(registry) => Some(registry),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut registry) = registry {
+            let sql = registry
+                .source_admission()
+                .map_err(|error| ProtocolError::new(ProtocolErrorCode::Internal, error, true))?;
+            let current = sql.retention_pin_generation(terminal);
+            let admission = match gate.try_write() {
+                Ok(a) => Some(a),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(_admission) = admission {
+                sql.validate(capture)
+                    .map_err(|_| source_cleanup_conflict())?;
+                if !matches!(&capture.before.kind, crate::model::CardKind::Terminal(s) if s.id == terminal)
+                {
+                    return Err(source_cleanup_conflict());
+                }
+                return reserve(current);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Cagents is busy; retry closing this terminal",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Joining can transfer a still-live original holder to the reaper. Check the
@@ -1230,13 +1296,16 @@ fn process_admitted_request(
     // Adapt the additive request to the established close paths. Its original
     // source is checked under the same lock that selects the resident handle;
     // the existing close reservation then retains that exact handle.
+    let mut cleanup_capture = None;
     let (request, cleanup_source) = match request {
         ClientRequest::CloseTerminalSource {
             session,
             basis,
             completed_only,
             allow_active,
+            capture,
         } => {
+            cleanup_capture = capture;
             let request = if completed_only {
                 ClientRequest::ReleaseCompletedTerminal {
                     session: session.clone(),
@@ -1744,6 +1813,35 @@ fn process_admitted_request(
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
+        ClientRequest::ReadCapturedTerminalRemovalBasis { capture } => {
+            let writer = super::workspace::writer(host)?;
+            let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+            let admission = registry
+                .source_admission()
+                .map_err(|error| ProtocolError::new(ProtocolErrorCode::Internal, error, true))?;
+            admission
+                .validate(&capture)
+                .map_err(|_| source_cleanup_conflict())?;
+            let crate::model::CardKind::Terminal(source) = &capture.before.kind else {
+                return Err(source_cleanup_conflict());
+            };
+            let basis = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminal_removal_basis(source)
+                .map_err(|error| {
+                    if error.message == super::model::Registry::VIEW_REMOVAL_CONFLICT {
+                        source_cleanup_conflict()
+                    } else {
+                        error
+                    }
+                })?;
+            Ok((
+                ServerResponse::TerminalRemovalBasis(basis),
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::ReadTerminalRemovalBasis { source } => {
             let basis = host
                 .lock()
@@ -2134,8 +2232,15 @@ fn process_admitted_request(
             let paired = terminal_close_pair(host, terminal_id, &handle)?;
             let pin = retention_pin_generation(host, terminal_id);
             drop(_shared);
-            let close =
-                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
+            let close = reserve_terminal_close(
+                host,
+                terminal_id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                None,
+            )?;
             // Explicit shutdown permits active work, but still needs the same
             // inspected family cleanup proof as a checked close. A plain worker
             // hangup/join cannot certify release of its original holder.
@@ -2237,8 +2342,15 @@ fn process_admitted_request(
                 ));
             }
             drop(_shared);
-            let close =
-                reserve_terminal_close(host, session.id, &handle, &source, paired.as_ref(), pin)?;
+            let close = reserve_terminal_close(
+                host,
+                session.id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                cleanup_capture.as_ref(),
+            )?;
             if let Some(paired) = paired {
                 super::chat::close_terminal_actor(host, session.id, &paired)?;
             }
@@ -2272,8 +2384,15 @@ fn process_admitted_request(
             let paired = terminal_close_pair(host, terminal_id, &handle)?;
             let pin = retention_pin_generation(host, terminal_id);
             drop(_shared);
-            let mut close =
-                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
+            let mut close = reserve_terminal_close(
+                host,
+                terminal_id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                cleanup_capture.as_ref(),
+            )?;
             let outcome = if cleanup_source.is_some()
                 && !allow_active
                 && paired.as_ref().is_some_and(|actor| actor.owns_work())
@@ -2617,7 +2736,8 @@ pub(in crate::host) mod tests {
         generation: Result<Option<String>, String>,
     ) -> Result<(), ProtocolError> {
         let source = host.lock().unwrap().terminals[&terminal].session.clone();
-        let close = reserve_terminal_close(host, terminal, handle, &source, None, generation)?;
+        let close =
+            reserve_terminal_close(host, terminal, handle, &source, None, generation, None)?;
         finish_terminal_close(host, close)
     }
 
@@ -3356,7 +3476,8 @@ pub(in crate::host) mod tests {
         drop(slow_request);
 
         let source = host.lock().unwrap().terminals[&id].session.clone();
-        let close = reserve_terminal_close(&host, id, &handle, &source, None, pin.clone()).unwrap();
+        let close =
+            reserve_terminal_close(&host, id, &handle, &source, None, pin.clone(), None).unwrap();
         super::super::agent_execution::registry(&host)
             .unwrap()
             .lock()
@@ -3454,7 +3575,8 @@ pub(in crate::host) mod tests {
                         &worker_handle,
                         &worker_source,
                         None,
-                        worker_generation
+                        worker_generation,
+                        None,
                     ))
                     .is_ok()
             );
@@ -3740,6 +3862,7 @@ pub(in crate::host) mod tests {
                 basis: basis.clone(),
                 completed_only: true,
                 allow_active: false,
+                capture: None,
             },
         )
         .unwrap_err();
@@ -3765,6 +3888,7 @@ pub(in crate::host) mod tests {
                         basis: basis.clone(),
                         completed_only,
                         allow_active,
+                        capture: None,
                     },
                 )
                 .unwrap_err();
@@ -3788,6 +3912,7 @@ pub(in crate::host) mod tests {
             basis: current.clone(),
             completed_only: true,
             allow_active: false,
+            capture: None,
         });
         assert!(!host.lock().unwrap().terminals.contains_key(&id));
         original.shutdown().unwrap();
@@ -3985,6 +4110,7 @@ pub(in crate::host) mod tests {
             &current_source,
             None,
             pin.clone(),
+            None,
         )
         .unwrap();
         let mut refused_recipe = source.launch.clone();
@@ -4462,6 +4588,7 @@ pub(in crate::host) mod tests {
             basis: basis.clone(),
             completed_only,
             allow_active,
+            capture: None,
         };
         assert!(matches!(
             process_request(&host, 1, request(false)).unwrap().0,
