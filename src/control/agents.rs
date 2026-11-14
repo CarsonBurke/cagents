@@ -3874,7 +3874,12 @@ mod tests {
             (Some(Placement::Channel(lineage)), None)
         );
         assert_eq!(
-            spawn_placement(Some(Placement::Channel(explicit)), Some(&caller), repository).0,
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
             Some(Placement::Channel(explicit)),
             "an explicit channel still wins over the lineage's"
         );

@@ -47,11 +47,14 @@ print('sidebar-unloaded-state ' + json.dumps({'agent': agent, 'placement': json.
 CHECK
 evidence drive move 1,1
 evidence shot label-sidebar-unloaded
-point=$(evidence drive observe | python3 -c 'import re,sys
+observation=$(evidence drive observe)
+printf '%s\n' "$observation"
+point=$(printf '%s\n' "$observation" | python3 -c 'import re,sys
 found=[]
 for line in sys.stdin:
  m=re.search(r"\[t\d+\]\s+(\d+),\s+(\d+)\s+(\d+)x(\d+)",line)
- if m and int(m[1])<120 and 80<int(m[2])<750 and ("reviewer" in line.lower() or "claude code agent" in line.lower()):
+ words=re.sub(r"[^a-z]", "", line.lower())
+ if m and int(m[1])<120 and 80<int(m[2])<750 and ("reviewer" in words or "claude" in words):
   found.append(tuple(map(int,m.groups())))
 assert found, "missing unopened reviewer Attention row"
 x,y,w,h=max(found,key=lambda row:row[1]); print(f"{min(200,x+w//2)},{y+h//2}")')

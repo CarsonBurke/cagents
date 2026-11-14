@@ -4129,18 +4129,26 @@ mod tests {
         let label = agent_label("reviewer", Some("Review the one-row cards"));
         app.chrome_ui.agent_labels.insert(agent.id, label.clone());
         assert!(app.adopt_execution_agent(&agent).is_some());
-        Arc::make_mut(&mut app.durable).card_scopes.insert(pane.id, path);
-        app.sidebar_state.observe_agent_update(pane.id, project, worktree);
-        drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SetFilter(
-            crate::sidebar::SidebarFilter::Attention,
-        ))));
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(pane.id, path);
+        app.sidebar_state
+            .observe_agent_update(pane.id, project, worktree);
+        drop(
+            app.update(Message::Sidebar(crate::sidebar::SidebarAction::SetFilter(
+                crate::sidebar::SidebarFilter::Attention,
+            ))),
+        );
         app.refresh_sidebar_channels();
         let row_title = |app: &Cagents| {
-            app.sidebar_model.projects.iter()
+            app.sidebar_model
+                .projects
+                .iter()
                 .flat_map(|project| &project.attention_cards)
                 .find(|row| row.id == pane.id)
                 .expect("the unloaded unchanneled agent has an attention row")
-                .title.clone()
+                .title
+                .clone()
         };
         assert!(app.chat_start_pending(pane.id));
         assert_eq!(row_title(&app), label);
@@ -4152,9 +4160,11 @@ mod tests {
         app.refresh_attention_card_rows();
         assert_eq!(row_title(&app), pane.title);
         let sequence = app.workspace_model.sequence;
-        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::AgentLabels(vec![
-            (agent.id, label.clone()),
-        ]))));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::AgentLabels(
+                vec![(agent.id, label.clone())],
+            ))),
+        );
         assert_eq!(app.workspace_model.sequence, sequence);
         assert_eq!(row_title(&app), label);
         assert!(app.chat_start_pending(pane.id));
@@ -4163,7 +4173,11 @@ mod tests {
         assert_eq!(row_title(&app), label);
 
         drop(app.update_chrome(super::super::chrome_ui::Action::Rename(pane.id)));
-        drop(app.update_chrome(super::super::chrome_ui::Action::RenameChanged("My reviewer".into())));
+        drop(
+            app.update_chrome(super::super::chrome_ui::Action::RenameChanged(
+                "My reviewer".into(),
+            )),
+        );
         drop(app.update_chrome(super::super::chrome_ui::Action::RenameSubmit));
         assert_eq!(row_title(&app), "My reviewer");
         app.chrome_ui.user_titles.remove(&pane.id);

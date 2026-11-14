@@ -34,6 +34,15 @@ pub const MAX_PARENT_DEPTH: usize = 8;
 /// loads. The accepted task supplies a stable preview, independent of provider
 /// titles; individual surfaces truncate this shared label to their own width.
 pub fn agent_label(name: &str, task: Option<&str>) -> String {
+    let (name, task) = agent_label_parts(name, task);
+    match task {
+        Some(task) => format!("{name} · {task}"),
+        None => name,
+    }
+}
+
+/// The name and first task line shared by pane titles and coordination rows.
+pub(crate) fn agent_label_parts(name: &str, task: Option<&str>) -> (String, Option<String>) {
     fn preview(text: &str, limit: usize) -> Option<String> {
         let text = crate::names::normalize_card_name(text)?;
         let mut chars = text.chars();
@@ -48,10 +57,7 @@ pub fn agent_label(name: &str, task: Option<&str>) -> String {
     let task = task
         .and_then(|task| task.trim().lines().next())
         .and_then(|task| preview(task, 160));
-    match task {
-        Some(task) => format!("{name} · {task}"),
-        None => name,
-    }
+    (name, task)
 }
 /// How the daemon begins refusing a follow-up run for an agent that a usage
 /// limit stops until a known reset; the CLI reports it as `agent_limited`.
