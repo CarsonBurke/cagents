@@ -6646,6 +6646,10 @@ impl Cagents {
                 session.transcript_path = transcript_path_for(&session.launch, session.id);
             }
             CardKind::Chat(session) => {
+                // A fresh conversation must not reconnect to the source's
+                // native owner or reuse its pane-specific Codex endpoint.
+                // Reset while the source identity still names that endpoint.
+                session.reset_owned_codex_listener();
                 let Some(recipe) =
                     crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
                 else {
@@ -27623,12 +27627,12 @@ mod tests {
     fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
         let mut app = context_inspector_test_app(true);
         let source_id = app.workspace.focused().unwrap();
-        let mut recipe = launch_recipe("/tmp");
+        let mut recipe = launch_recipe("/var/tmp");
         recipe.program = "claude".into();
         let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
         recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
         let original = crate::chat::Session {
-            native_continuity: Default::default(),
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
@@ -27636,9 +27640,14 @@ mod tests {
                 recipe,
                 session_id: Some(conversation.into()),
             },
-            proof: None,
+            proof: Some(HostSessionProof {
+                host_session_id: "source-holder".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "source-daemon".into(),
+            }),
             terminal: None,
         };
+        assert!(original.has_valid_native_continuity());
         app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(original.clone());
         let _unpolled = app.clone_focused_pane();
         let cloned = app.workspace.focused().unwrap();
@@ -27657,10 +27666,69 @@ mod tests {
         assert!(copy.launch.session_id.is_none());
         assert!(copy.proof.is_none());
         assert!(copy.terminal.is_none());
+        assert!(copy.is_unstarted());
+        assert!(copy.has_valid_native_continuity());
         assert_eq!(
             app.card_state(source_id).unwrap().kind,
             CardKind::Chat(original)
         );
+    }
+
+    #[test]
+    fn pane_clone_releases_owned_and_legacy_codex_endpoints_before_changing_identity() {
+        for owned in [true, false] {
+            let mut app = context_inspector_test_app(true);
+            let source_id = app.workspace.focused().unwrap();
+            let id = TerminalId::new();
+            let socket = PathBuf::from("/var/tmp")
+                .join(format!("cagents-codex-{id}"))
+                .join("control.sock");
+            let proof = HostSessionProof {
+                host_session_id: "source-holder".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "source-daemon".into(),
+            };
+            let mut recipe = launch_recipe("/var/tmp");
+            recipe.program = "codex".into();
+            recipe.arguments = vec!["--remote".into(), format!("unix://{}", socket.display())];
+            let original = crate::chat::Session {
+                id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe,
+                    session_id: Some("source-conversation".into()),
+                },
+                proof: Some(proof.clone()),
+                terminal: None,
+                native_continuity: if owned {
+                    crate::chat::NativeContinuity::Durable {
+                        provider_version: "0.157.1".into(),
+                    }
+                } else {
+                    crate::chat::NativeContinuity::ReconnectOnly
+                },
+                owned_codex_listener: owned.then_some(crate::chat::OwnedCodexListener {
+                    socket,
+                    allocator: proof,
+                }),
+            };
+            assert!(original.has_valid_native_continuity());
+            app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(original.clone());
+            drop(app.clone_focused_pane());
+            let cloned = app.workspace.focused().unwrap();
+            assert_ne!(cloned, source_id);
+            let CardKind::Chat(copy) = &app.card_state(cloned).unwrap().kind else {
+                panic!("cloned conversation must stay native");
+            };
+            assert_ne!(copy.id, original.id);
+            assert_eq!(copy.launch.recipe.arguments, ["--remote", "unix://"]);
+            assert!(copy.is_unstarted());
+            assert!(copy.has_valid_native_continuity());
+            assert_eq!(
+                app.card_state(source_id).unwrap().kind,
+                CardKind::Chat(original)
+            );
+        }
     }
 
     fn diagnostic(message: &str) -> crate::lsp::LspDiagnostic {
