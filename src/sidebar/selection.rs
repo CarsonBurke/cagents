@@ -8,22 +8,33 @@
 
 use std::collections::BTreeSet;
 
-use crate::model::{ChannelId, ProjectId, WorktreeId};
+use crate::model::{CardId, ChannelId, ProjectId, WorktreeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Row {
     Project(ProjectId),
     Worktree(ProjectId, WorktreeId),
     Channel(ChannelId),
+    /// One conversation or terminal the Attention list names on its own,
+    /// because the worktree holding it has no row there. It is a way to
+    /// reach the pane, not a navigation entity: nothing deletes, reorders or
+    /// groups it, so it never joins an explicit selection.
+    Card(CardId),
 }
 
 impl Row {
+    /// Whether the row can join an explicit multi-selection.
+    pub fn selectable(self) -> bool {
+        !matches!(self, Row::Card(_))
+    }
+
     /// Projects leave cagents and stay on disk, so they are removed; the other
     /// kinds are deleted.
     pub fn deletion_verb(self) -> &'static str {
         match self {
             Row::Project(_) => "Remove",
             Row::Worktree(..) | Row::Channel(_) => "Delete",
+            Row::Card(_) => "Close",
         }
     }
 
@@ -35,6 +46,8 @@ impl Row {
             (Row::Worktree(..), false) => "worktrees",
             (Row::Channel(_), true) => "channel",
             (Row::Channel(_), false) => "channels",
+            (Row::Card(_), true) => "pane",
+            (Row::Card(_), false) => "panes",
         }
     }
 
@@ -114,6 +127,9 @@ impl Selection {
             Intent::Toggle => None,
             Intent::Range { extend } => Some(extend),
         };
+        if !row.selectable() {
+            return;
+        }
         self.retain_visible(visible);
         let Some(end) = visible.iter().position(|candidate| *candidate == row) else {
             return;
@@ -133,8 +149,12 @@ impl Selection {
                 if !extend {
                     self.rows.clear();
                 }
-                self.rows
-                    .extend(visible[start.min(end)..=start.max(end)].iter().copied());
+                self.rows.extend(
+                    visible[start.min(end)..=start.max(end)]
+                        .iter()
+                        .copied()
+                        .filter(|row| row.selectable()),
+                );
                 self.anchor.get_or_insert(row);
             }
         }
@@ -174,6 +194,24 @@ mod tests {
             vec![rows[0]],
             "Ctrl-click adds only the clicked row, never the active one"
         );
+    }
+
+    /// A conversation row is a way to a pane, not something a group action
+    /// can delete, so neither a Ctrl-click nor a range spanning it selects it.
+    #[test]
+    fn card_rows_never_join_an_explicit_selection() {
+        let first = Row::Channel(ChannelId::new());
+        let card = Row::Card(CardId::new());
+        let last = Row::Channel(ChannelId::new());
+        let rows = [first, card, last];
+        let mut selection = Selection::default();
+        selection.select(card, Intent::Toggle, &rows);
+        assert!(selection.is_empty());
+        selection.select(card, Intent::Range { extend: false }, &rows);
+        assert!(selection.is_empty());
+        selection.select(first, Intent::Navigate, &[]);
+        selection.select(last, Intent::Range { extend: false }, &rows);
+        assert_eq!(selection.ordered(&rows), vec![first, last]);
     }
 
     #[test]
