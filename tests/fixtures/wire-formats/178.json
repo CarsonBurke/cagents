@@ -4621,36 +4621,6 @@
         ]
       ]
     },
-    "cagents::chat::ActiveModel": {
-      "Struct": [
-        [
-          "id",
-          "Str"
-        ],
-        [
-          "label",
-          "Str"
-        ],
-        [
-          "reasoning",
-          {
-            "Option": "Str"
-          }
-        ],
-        [
-          "default_reasoning",
-          {
-            "Option": "Str"
-          }
-        ],
-        [
-          "aliases",
-          {
-            "Seq": "Str"
-          }
-        ]
-      ]
-    },
     "cagents::chat::AgentAddress": {
       "Struct": [
         [
@@ -9980,24 +9950,12 @@
           }
         ],
         [
-          "chat_active_model",
+          "automation_proposals_changed",
           {
             "Struct": [
               [
-                "chat_id",
-                "Bytes"
-              ],
-              [
-                "revision",
-                "U64"
-              ],
-              [
-                "model",
-                {
-                  "Option": {
-                    "Container": "cagents::chat::ActiveModel"
-                  }
-                }
+                "repository",
+                "Str"
               ]
             ]
           }

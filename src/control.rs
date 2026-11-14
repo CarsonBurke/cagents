@@ -1164,6 +1164,11 @@ impl ControlClient {
                 ServerMessage::NotificationActivated { target } => {
                     return Ok(crate::notifications::Update::Activated(target));
                 }
+                ServerMessage::AutomationProposalsChanged { repository } => {
+                    return Ok(crate::notifications::Update::AutomationProposalsChanged(
+                        repository,
+                    ));
+                }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
                 ServerMessage::Error(error) => {
                     return Err(ControlError::Remote {
@@ -2295,6 +2300,12 @@ impl ControlClient {
                         .push_back(crate::notifications::Update::Activated(target));
                 }
             }
+            ServerMessage::AutomationProposalsChanged { repository } => {
+                let update = crate::notifications::Update::AutomationProposalsChanged(repository);
+                if !self.observed_notifications.contains(&update) {
+                    self.observed_notifications.push_back(update);
+                }
+            }
             ServerMessage::WorkBoard { revision, board } => {
                 if self
                     .observed_work
@@ -2549,6 +2560,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::ChatLimit { .. }
         | ServerMessage::ChatAgentAddresses { .. }
+        | ServerMessage::AutomationProposalsChanged { .. }
         | ServerMessage::ChatActiveModel { .. }
         | ServerMessage::Error(_) => false,
     }
@@ -2577,6 +2589,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
+        ServerMessage::AutomationProposalsChanged { .. } => "automation_proposals_changed",
     }
 }
 

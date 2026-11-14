@@ -239,9 +239,12 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-/// Version 178 appends provider-confirmed active model status independently of
+/// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
+/// a window watching notifications that a project's pending automation
+/// requests changed, so it reads them then rather than polling.
+/// Version 179 appends provider-confirmed active model status independently of
 /// chat snapshots, whose inspector encoding stays frozen for update sources.
-pub const PROTOCOL_VERSION: u16 = 178;
+pub const PROTOCOL_VERSION: u16 = 179;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -928,6 +931,13 @@ pub enum ServerMessage {
     ChatAgentAddresses {
         chat_id: TerminalId,
         addresses: Vec<crate::chat::AgentAddress>,
+    },
+    /// The project at `repository` gained a pending automation request, or one
+    /// was approved or declined. Delivered to every connection watching
+    /// notifications, which reads the project's pending requests again if it
+    /// offers them.
+    AutomationProposalsChanged {
+        repository: std::path::PathBuf,
     },
     /// Provider-confirmed model and effort, independently of a staged model
     /// selection. Each subscriber receives the current revision on attachment.

@@ -1,7 +1,9 @@
 #!/bin/bash
 # A populated sidebar for native evidence of the navigation rail and the
 # expanded sidebar: ten projects of mixed name lengths, channels and worktrees
-# in each, and live agents in every attention state the rail draws.
+# in each, and live agents in every attention state the rail draws, both in
+# channels and as panes of a checkout with no channel, which the Attention
+# list draws as rows of their own.
 #
 # Run from a checkout on the build host, with CAGENTS_EVIDENCE_TASK naming a
 # scripts/native-evidence task (see "Native evidence" in docs/development.md):
@@ -21,9 +23,15 @@
 # first turn to read it:
 #
 #   working   no frames: the fixture holds its first turn busy
-#   unread    a successful result ends the turn while its channel is not open
+#   unread    a successful result ends the turn while its place is not open
 #   failed    an error result ends the turn
 #   waiting   a tool permission request, held open
+#
+# Agents with no channel are spawned with `agent spawn --worktree`, among the
+# panes of one checkout: one waiting in cagents' rail-badges worktree, one
+# unread in atlas's own folder and one working in design-system's
+# dark-palette worktree. The daemon runs at most eight unsettled runs for one
+# caller, which the scene's working and waiting agents fill exactly.
 #
 # `unreachable` moves one project's folder away in the seed, so every later
 # session finds that project missing as it loads the sidebar.
@@ -187,10 +195,23 @@ spawn() {
     local channel
     channel=$(channel_id "$project" "$title")
     [ -n "$channel" ] || { printf 'no channel %s in %s\n' "$title" "$2" >&2; return 1; }
+    start "$state" --repository "$project" ${directory:+--directory "$directory"} --channel "$channel"
+}
+
+# pane STATE PROJECT [WORKTREE]: an agent in no channel, among the panes of
+# the project's own folder or of its linked worktree WORKTREE.
+pane() {
+    local state=$1 project=$projects/$2 worktree=${3:-}
+    start "$state" --repository "$project" --worktree "$project${worktree:+-$worktree}"
+}
+
+# start STATE PLACEMENT-ARGUMENTS...
+start() {
+    local state=$1
+    shift
     frames_for "$state"
     if ! evidence cli agent spawn --provider claude --model haiku --surface chat \
-        --repository "$project" ${directory:+--directory "$directory"} --channel "$channel" \
-        --prompt "Fixture: $state" >/dev/null; then
+        "$@" --prompt "Fixture: $state" >/dev/null; then
         # The daemon caps one caller's unsettled runs; say which are open.
         cli_json agent list | jq -r '.data.agents[] | "open: \(.state) \(.agent.spec.target.directory | split("/") | last)"' >&2
         return 1
@@ -215,10 +236,15 @@ cmd_live() {
     spawn working cagents "Transcript pipeline"
     spawn working cagents "Channel speed"
     spawn working atlas "Flaky login test"
-    spawn working design-system "Tokens" "$projects/design-system-dark-palette"
     # Working with unread news beside it: both corners at once.
     spawn unread edge-proxy "TLS renewals"
     spawn working edge-proxy "TLS renewals"
+    # Panes with no channel. The working one is the one that until now
+    # worked in that worktree for the Tokens channel, which would otherwise
+    # take a ninth unsettled run.
+    pane waiting cagents rail-badges
+    pane unread atlas
+    pane working design-system dark-palette
     rm -f -- "$frames"
     refuse_removal
 }
@@ -270,5 +296,5 @@ case ${1:-} in
     live) cmd_live ;;
     unreachable) cmd_unreachable ;;
     theme) cmd_theme "${2:?dark or light}" ;;
-    *) sed -n '2,37p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,45p' "$0" >&2; exit 2 ;;
 esac

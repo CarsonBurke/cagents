@@ -816,3 +816,61 @@ fn agent_addresses_are_beyond_every_older_recording() {
         );
     }
 }
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed, and no update source watches them, so no recorded older
+/// protocol has a message at its position.
+#[test]
+fn automation_request_changes_are_beyond_every_older_recording() {
+    let changed = ServerMessage::AutomationProposalsChanged {
+        repository: "/fixture".into(),
+    };
+    let index = super::variant_index(&changed).unwrap();
+    const AUTOMATION_REQUEST_CHANGES_SINCE: u16 = 178;
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AUTOMATION_REQUEST_CHANGES_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < AUTOMATION_REQUEST_CHANGES_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+#[test]
+fn active_models_are_beyond_every_older_recording() {
+    let model = ServerMessage::ChatActiveModel {
+        chat_id: crate::model::TerminalId::new(),
+        revision: 1,
+        model: None,
+    };
+    const ACTIVE_MODELS_SINCE: u16 = 179;
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "chat_active_model",
+        ACTIVE_MODELS_SINCE
+    )));
+    let index = super::variant_index(&model).unwrap();
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(ACTIVE_MODELS_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < ACTIVE_MODELS_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
