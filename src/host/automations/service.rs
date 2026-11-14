@@ -94,12 +94,12 @@ pub(in crate::host) fn process_under_control(
             } else {
                 None
             };
-            Response::Proposal(Box::new(
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .resolve_automation_proposal(&proposal, next, now()?)?,
-            ))
+            let resolved = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .resolve_automation_proposal(&proposal, next, now()?)?;
+            proposals_changed(host, &resolved.definition.agent.target.repository);
+            Response::Proposal(Box::new(resolved))
         }
         Request::List { after, limit } => {
             return registry
@@ -264,6 +264,7 @@ fn process_hosted(
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
                 .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+            proposals_changed(host, &proposal.definition.agent.target.repository);
             Ok(Response::Proposal(Box::new(proposal)))
         }
         Request::List { after, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
@@ -295,6 +296,14 @@ fn process_hosted(
         Request::History { id: None, .. } => Err("Choose an automation ID for scoped run history".into()),
         _ => Err("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into()),
     }
+}
+
+/// Windows offer a project's pending automation requests, and read them
+/// again when told they changed rather than polling the registry.
+fn proposals_changed(host: &SharedHost, repository: &std::path::Path) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .automation_proposals_changed(repository);
 }
 
 pub(in crate::host) fn create(
@@ -665,5 +674,96 @@ mod tests {
             .is_err(),
             "closed session cannot retain project read authority"
         );
+    }
+
+    /// A live hosted conversation's request for approval is told to every
+    /// window watching notifications, which offer it without polling.
+    #[test]
+    fn a_hosted_proposal_is_told_to_windows_watching_notifications() {
+        use crate::automations::{Response, Schedule, SchedulePattern, SessionMode};
+        use std::time::{Duration, Instant};
+        let name = "host::automations::service::tests::a_hosted_proposal_is_told_to_windows_watching_notifications";
+        if crate::host::agent_execution::tests::isolated(name).is_some() {
+            return;
+        }
+        let (host, request, _) = crate::host::agent_execution::tests::fixture();
+        let accepted = agent_execution::submit(&host, &Authority::default(), request).unwrap();
+        let registry = agent_execution::registry(&host).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
+            if run.state.is_terminal() {
+                assert_eq!(run.state, crate::agent_execution::State::Succeeded);
+                break;
+            }
+            assert!(Instant::now() < deadline, "fake provider did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let authority = {
+            let registry = registry.lock().unwrap();
+            let session = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            registry.retained_agent_authority(session.id()).unwrap()
+        };
+        let (watching, unwatched) = {
+            let mut host = host.lock().unwrap();
+            let watching = host.register_client(1);
+            let unwatched = host.register_client(2);
+            host.watch_notifications(
+                1,
+                crate::notifications::Presence {
+                    window: "primary".into(),
+                    application: Default::default(),
+                    focused_target: None,
+                    sessions: Vec::new(),
+                    focused: None,
+                },
+            );
+            (watching, unwatched)
+        };
+        let told = |delivery: &crate::host::delivery::DeliveryQueue| {
+            std::iter::from_fn(|| delivery.pop())
+                .filter_map(|outbound| match outbound.message {
+                    crate::terminal_ipc::ServerMessage::AutomationProposalsChanged {
+                        repository,
+                    } => Some(repository),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let Response::Proposal(proposal) = process_under_control(
+            &host,
+            authority,
+            Request::Propose {
+                request: Uuid::new_v4(),
+                definition: Definition {
+                    name: "Nightly recap".into(),
+                    prompt: "Summarize the day".into(),
+                    agent: accepted.agent.spec.clone(),
+                    schedule: Schedule {
+                        pattern: SchedulePattern::Daily { hour: 0, minute: 0 },
+                        timezone: "UTC".into(),
+                    },
+                    session_mode: SessionMode::Fresh,
+                    precheck: None,
+                },
+            },
+        )
+        .unwrap() else {
+            panic!("expected a proposal");
+        };
+        assert_eq!(
+            told(&watching),
+            [proposal.definition.agent.target.repository.clone()]
+        );
+        assert!(told(&unwatched).is_empty());
+        assert!(matches!(
+            agent_execution::process(
+                &host,
+                Authority::default(),
+                crate::agent_execution::Operation::Close(accepted.agent.id)
+            )
+            .unwrap(),
+            crate::agent_execution::Reply::Closed(_)
+        ));
     }
 }
