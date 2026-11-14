@@ -787,9 +787,13 @@ impl Cagents {
                     .get(key)
                     .is_some_and(|held| *held > sequence)
             };
+            // A newer child proves its ancestors exist, not that their cached
+            // metadata is newer. Only each row's own clock can replace a row
+            // present in the reconnect baseline.
             for project in &self.workspace_model.projects {
                 if newer(&MetadataKey::Project(project.repository.clone()))
-                    || protected_projects.contains(&project.repository)
+                    || (protected_projects.contains(&project.repository)
+                        && model.project(&project.repository).is_none())
                 {
                     model
                         .projects
@@ -815,7 +819,8 @@ impl Cagents {
             });
             for channel in &self.workspace_model.channels {
                 if newer(&MetadataKey::Channel(channel.id))
-                    || protected_channels.contains(&channel.id)
+                    || (protected_channels.contains(&channel.id)
+                        && model.channel(channel.id).is_none())
                 {
                     model.channels.retain(|held| held.id != channel.id);
                     model.channels.push(channel.clone());
@@ -5103,6 +5108,170 @@ mod tests {
             app.workspace_model.views.is_empty(),
             "a newer absence alone never protects old parent metadata"
         );
+    }
+
+    #[test]
+    fn review2789_ahead_scope_must_not_discard_reconnect_metadata() {
+        use crate::model::{BrowserId, BrowserRestoreFidelity, BrowserSession};
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let mut baseline = registry(vec![shared(channel, &repository, "Old channel", 0)]);
+        baseline.sequence = 4;
+        baseline.projects = vec![ModelProject {
+            repository: repository.clone(),
+            name: "Old project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 0,
+        }];
+        baseline.views = vec![View {
+            revision: 4,
+            panes: vec![pane.clone()],
+            ..View::empty(scope.clone())
+        }];
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+
+        // A publisher's older receipt resolves its scope at sequence 10.
+        // The observer's reconnect baseline was captured at 8, but arrives later.
+        let mut mirror = Mirror::for_model(&baseline);
+        let mut resized = pane;
+        resized.width_fraction = 0.7;
+        let ahead = mirror.install_at(
+            scope.clone(),
+            Some(View {
+                revision: 9,
+                panes: vec![resized],
+                ..View::empty(scope.clone())
+            }),
+            10,
+        );
+        drop(app.install_changed_edge(
+            5,
+            &ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![],
+                closed: vec![],
+            },
+            EdgeChanges {
+                views: ahead,
+                ..Default::default()
+            },
+        ));
+        // Peer metadata edits at 6 and 7 are recovered by this baseline.
+        baseline.sequence = 8;
+        baseline.projects[0].name = "New project".into();
+        baseline.projects[0].ordinal = 2;
+        baseline.channels[0].title = "New channel".into();
+        baseline.channels[0].ordinal = 3;
+        baseline.views[0].revision = 8;
+        baseline.views[0].panes[0].width_fraction = 0.6;
+        assert!(app.install_workspace_model_snapshot(baseline));
+        assert_eq!(app.workspace_model.views[0].revision, 9);
+        assert_eq!(app.workspace_model.views[0].panes[0].width_fraction, 0.7);
+        assert_eq!(app.shared_views.snapshot_sequence, 8);
+        assert_eq!(
+            (
+                app.workspace_model.channels[0].title.as_str(),
+                app.workspace_model.projects[0].name.as_str(),
+            ),
+            ("New channel", "New project"),
+            "a newer view proves ancestor presence, not the freshness of cached ancestor fields"
+        );
+        assert_eq!(app.workspace_model.projects[0].ordinal, 2);
+        assert_eq!(app.workspace_model.channels[0].ordinal, 3);
+    }
+
+    #[test]
+    fn reconnect_project_metadata_uses_its_own_clock_despite_a_newer_child() {
+        for project_sequence in [None, Some(7), Some(8), Some(9)] {
+            for baseline_has_project in [false, true] {
+                let (mut app, _, repository) = app_with_project();
+                let channel = ChannelId::new();
+                let mut baseline = registry(vec![shared(channel, &repository, "Old channel", 0)]);
+                baseline.sequence = 4;
+                baseline.projects.push(ModelProject {
+                    repository: repository.clone(),
+                    name: "Old project".into(),
+                    kind: ProjectKind::Git,
+                    ordinal: 0,
+                });
+                assert!(app.install_workspace_model_snapshot(baseline.clone()));
+                if let Some(sequence) = project_sequence {
+                    let mut project = baseline.projects[0].clone();
+                    project.name = "Observed project".into();
+                    project.ordinal = 2;
+                    drop(app.install_changed_edge(
+                        sequence,
+                        &ModelEdit::OpenProject {
+                            repository: repository.clone(),
+                            name: project.name.clone(),
+                            kind: project.kind,
+                        },
+                        EdgeChanges {
+                            effects: EditEffects {
+                                projects: vec![project],
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    ));
+                }
+                let child = shared(channel, &repository, "New child title", 3);
+                drop(app.install_changed_edge(
+                    10,
+                    &ModelEdit::RetitleChannel {
+                        id: channel,
+                        title: child.title.clone(),
+                    },
+                    EdgeChanges {
+                        effects: EditEffects {
+                            channels: vec![child.clone()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ));
+                let cached = app.workspace_model.projects[0].clone();
+                baseline.sequence = 8;
+                baseline.projects[0].name = "Recovered project".into();
+                baseline.projects[0].ordinal = 1;
+                let recovered = baseline.projects[0].clone();
+                if !baseline_has_project {
+                    baseline.projects.clear();
+                    baseline.closed_projects.push(repository.clone());
+                }
+                assert!(app.install_workspace_model_snapshot(baseline));
+                let expected = if !baseline_has_project
+                    || project_sequence.is_some_and(|sequence| sequence > 8)
+                {
+                    cached
+                } else {
+                    recovered
+                };
+                assert_eq!(app.workspace_model.projects, vec![expected]);
+                assert_eq!(app.workspace_model.channels, vec![child]);
+                assert!(app.workspace_model.closed_projects.is_empty());
+                assert_eq!(app.shared_views.snapshot_sequence, 8);
+            }
+        }
     }
 
     #[test]
