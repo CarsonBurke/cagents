@@ -1,5 +1,9 @@
 //! Authenticate exclusive flock owners using their exact locked descriptors.
-use std::{fs, io, os::unix::fs::MetadataExt, path::Path};
+use std::{collections::BTreeSet, fs, io, os::unix::fs::MetadataExt, path::Path};
+
+/// How many times the kernel index is read before a held lock's absence from
+/// it is believed.
+const INDEX_READS: usize = 3;
 
 pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();
@@ -18,6 +22,35 @@ pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
         return None;
     }
     fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
+}
+
+/// The pids `/proc/locks` names as holding `expected`, which fdinfo must still
+/// prove. The kernel serves that file a page per read(2) and resumes each
+/// page by position, so when other locks come and go between pages, a lock
+/// held throughout can be skipped. On a host with hundreds of locks that
+/// happens to a few percent of reads; an empty answer is read again.
+pub(crate) fn indexed_owners(
+    proc_root: &Path,
+    expected: &fs::Metadata,
+) -> io::Result<BTreeSet<u32>> {
+    indexed_owners_from(|| fs::read_to_string(proc_root.join("locks")), expected)
+}
+
+fn indexed_owners_from(
+    mut read: impl FnMut() -> io::Result<String>,
+    expected: &fs::Metadata,
+) -> io::Result<BTreeSet<u32>> {
+    let mut owners = BTreeSet::new();
+    for _ in 0..INDEX_READS {
+        owners = read()?
+            .lines()
+            .filter_map(|line| flock_owner(line, expected))
+            .collect();
+        if !owners.is_empty() {
+            break;
+        }
+    }
+    Ok(owners)
 }
 
 pub(crate) fn fdinfo_owns_lock(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
@@ -52,11 +85,11 @@ pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Resul
     // This index is advisory contender discovery. Losing procfs visibility is
     // not proof of an owner and must not abort a requested shutdown; flock on
     // the caller's own validated file remains the authoritative reservation.
-    let locks = match fs::read_to_string(proc_root.join("locks")) {
-        Ok(locks) => locks,
+    let owners = match indexed_owners(proc_root, expected) {
+        Ok(owners) => owners,
         Err(_) => return Ok(None),
     };
-    for pid in locks.lines().filter_map(|line| flock_owner(line, expected)) {
+    for pid in owners {
         let process = proc_root.join(pid.to_string());
         // Inode collisions can belong to another user's filesystem. Exclude
         // those owners before their private fdinfo can refuse inspection.
@@ -130,6 +163,27 @@ mod tests {
         symlink(lock.path(), process.join("fd/7")).unwrap();
         fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
         assert_eq!(holder_pid(root.path(), &expected).unwrap(), Some(PID));
+    }
+
+    #[test]
+    fn a_held_lock_skipped_by_one_index_read_is_found_by_the_next() {
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let expected = lock.as_file().metadata().unwrap();
+        let mut tables = vec![String::new(), lock_record(&expected)].into_iter();
+        let owners = indexed_owners_from(|| Ok(tables.next().unwrap()), &expected).unwrap();
+        assert_eq!(owners.into_iter().collect::<Vec<_>>(), [PID]);
+        // An unheld lock is believed absent after a bounded number of reads.
+        let mut reads = 0;
+        let owners = indexed_owners_from(
+            || {
+                reads += 1;
+                Ok(String::new())
+            },
+            &expected,
+        )
+        .unwrap();
+        assert!(owners.is_empty());
+        assert_eq!(reads, INDEX_READS);
     }
 
     #[test]
