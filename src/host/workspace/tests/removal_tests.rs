@@ -141,7 +141,9 @@ fn shared_close_fences_pending_terminal_and_native_starts() {
                 },
             );
         } else {
-            host.lock().unwrap().spawning.insert(source.id);
+            let mut state = host.lock().unwrap();
+            state.terminals.remove(&source.id);
+            state.reserve_spawn(source.id).unwrap();
         }
         assert_refused(&host, &removal);
     }

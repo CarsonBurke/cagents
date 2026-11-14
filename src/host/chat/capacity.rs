@@ -61,14 +61,26 @@ impl Reservation {
             return Err(error("Chat is already starting or closing"));
         }
         state.chat_spawning.insert(source.id, source.clone());
-        state
-            .chat_close_reservations
-            .insert(source.id, source.clone());
         state.inventory_generation += 1;
         Ok(Self {
             host: host.clone(),
             source: source.clone(),
         })
+    }
+
+    /// Explicit pane Close may publish its removal while teardown runs.
+    /// Other users of the teardown fence, such as recovery and conversion,
+    /// retain their ordinary transition fence against pane removal.
+    pub(super) fn removing(
+        host: &SharedHost,
+        state: &mut HostState,
+        source: &Session,
+    ) -> Result<Self, ProtocolError> {
+        let reservation = Self::closing(host, state, source)?;
+        state
+            .chat_close_reservations
+            .insert(source.id, source.clone());
+        Ok(reservation)
     }
 
     pub(super) fn holds(&self, state: &HostState, id: TerminalId) -> bool {
@@ -266,7 +278,8 @@ mod tests {
                 views::{Change, Pane, Scope},
             },
         };
-        for cleanup in [false, true] {
+        for purpose in ["startup", "transition", "close"] {
+            let cleanup = purpose == "close";
             let directory = tempfile::tempdir().unwrap();
             let host = host();
             host.lock()
@@ -321,6 +334,8 @@ mod tests {
                 },
             };
             let reservation = if cleanup {
+                Reservation::removing(&host, &mut host.lock().unwrap(), &source).unwrap()
+            } else if purpose == "transition" {
                 Reservation::closing(&host, &mut host.lock().unwrap(), &source).unwrap()
             } else {
                 Reservation::new(&host, &source).unwrap().unwrap()

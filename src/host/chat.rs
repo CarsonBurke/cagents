@@ -1886,7 +1886,10 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state.native_closing.contains_key(&terminal)
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()))
         || state.chat_handoffs.contains_key(&terminal)
 }
 
@@ -1913,8 +1916,7 @@ pub(super) fn shared_removal_in_transition(
             },
         )
     };
-    state.spawning.contains(&source.id)
-        || state.chat_bindings.contains_key(&source.id)
+    state.chat_bindings.contains_key(&source.id)
         || state.chat_handoffs.contains_key(&source.id)
         || state
             .chat_spawning
@@ -1929,8 +1931,8 @@ pub(super) fn shared_removal_in_transition(
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
         || state
             .native_closing
-            .get(&source.id)
-            .is_some_and(|closing| !same(closing.source()))
+            .values()
+            .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
 fn start_with_execution(
@@ -4539,7 +4541,7 @@ pub(super) fn close_captured(
                 "The exact native attachment changed before close",
             ));
         }
-        capacity::Reservation::closing(host, &mut state, &source)?
+        capacity::Reservation::removing(host, &mut state, &source)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
