@@ -707,8 +707,12 @@ impl Cagents {
         match update {
             ModelUpdate::AgentLabels(labels) => {
                 self.chrome_ui.agent_labels.extend(labels);
+                // An activation that waited on this metadata has a new basis
+                // even when the model sequence and local panes did not change.
+                self.notification_ui.scope_changed();
                 let reconcile = self.reconcile_workspace_model();
-                Task::batch([reconcile, self.sync_chrome()])
+                let activation = self.retry_notification_activation();
+                Task::batch([reconcile, activation, self.sync_chrome()])
             }
             ModelUpdate::RetirementFailed { channel, error } => {
                 self.channel_ui.retiring.remove(&channel);

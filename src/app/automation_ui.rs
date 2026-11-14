@@ -142,6 +142,17 @@ impl Cagents {
                 let Some(agent) = detail.agent else {
                     return Task::none();
                 };
+                // History already carries this task, including before the
+                // workspace watcher has delivered its label metadata.
+                self.chrome_ui
+                    .agent_labels
+                    .entry(agent.id)
+                    .or_insert_with(|| {
+                        crate::agent_execution::agent_label(
+                            agent.name.as_deref().unwrap_or("an agent"),
+                            Some(&detail.definition.prompt),
+                        )
+                    });
                 if agent.closed
                     || !matches!(agent.origin, crate::agent_execution::Origin::Automation { id } if id == detail.firing.automation)
                 {
