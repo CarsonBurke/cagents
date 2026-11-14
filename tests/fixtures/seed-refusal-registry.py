@@ -2,8 +2,10 @@
 """Refuse a saved channel's seed in a native-evidence fixture's real registry.
 
 Run `arm CHANNEL` after closing only the native UI, leaving its daemon alive;
-run `allow` before pressing Retry. The SQLite trigger creates a real definitive
-registry refusal, without replacing transport or simulating a UI update.
+run `allow` before pressing Retry. Adding a trigger makes the published schema
+unrecognized, so the real registry refuses admission. This is a global schema
+fault, not a channel-specific daemon write fault; its conditional SQLite body
+is only a fallback. No transport or UI update is replaced.
 """
 
 import argparse
@@ -15,7 +17,7 @@ import stat
 import uuid
 
 TRIGGER = "fixture_seed_refusal"
-REASON = "The workspace could not store these panes"
+SQLITE_TRIGGER_REASON = "The workspace could not store these panes"
 
 
 def registry_path():
@@ -60,10 +62,19 @@ def main():
             if not panes or not any(kind == "chat" for _, kind in panes):
                 raise ValueError("the fixture channel must already contain a saved chat pane")
             db.execute(f"DROP TRIGGER IF EXISTS {TRIGGER}")
+            # The canonical view transaction normally owns these non-FK active
+            # mappings. Reset them with the selected view, preserving both
+            # monotonic clocks and all actor/history/window-retention records.
+            db.execute(
+                "DELETE FROM channel_work_placement_epochs WHERE pane IN ("
+                "SELECT p.id FROM panes p JOIN view_scopes s ON p.scope=s.id "
+                "WHERE s.channel=?)",
+                (channel,),
+            )
             db.execute("DELETE FROM view_scopes WHERE channel=?", (channel,))
             # The UUID is parsed above; the reason is a fixed fixture sentence.
-            db.execute(f"CREATE TRIGGER {TRIGGER} BEFORE INSERT ON view_scopes WHEN NEW.channel='{channel}' BEGIN SELECT RAISE(ABORT, '{REASON}'); END")
-            print(json.dumps({"armed": True, "channel": channel, "panes": len(panes), "reason": REASON}))
+            db.execute(f"CREATE TRIGGER {TRIGGER} BEFORE INSERT ON view_scopes WHEN NEW.channel='{channel}' BEGIN SELECT RAISE(ABORT, '{SQLITE_TRIGGER_REASON}'); END")
+            print(json.dumps({"armed": True, "channel": channel, "panes": len(panes), "fault": "unrecognized registry schema trigger"}))
         elif args.action == "allow":
             db.execute(f"DROP TRIGGER IF EXISTS {TRIGGER}")
             print(json.dumps({"armed": False}))

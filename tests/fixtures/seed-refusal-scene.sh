@@ -89,9 +89,9 @@ notice)
     # The application's existing persistent-notice popup holds the recovery.
     # Set the point after observing the native header at this viewport size.
     evidence drive move "${NOTICE_CONTROL_POINT:?name the native notices icon point}" >/dev/null
-    evidence drive wait 'Application notices' --timeout 10 >/dev/null
+    evidence drive wait 'notices' --timeout 10 >/dev/null
     evidence drive click "$NOTICE_CONTROL_POINT" >/dev/null
-    evidence drive wait "aren.t shared" --timeout 15 >/dev/null
+    evidence drive wait 'Retry' --timeout 15 >/dev/null
     shot "seed-refused-notice-$layout"
     ;;
 retry)

@@ -516,9 +516,15 @@ the fixture's paused terminal does not appear in that dialog.
 offline Claude conversation with an unsent launch-note draft. Its `refuse`
 step closes only the UI, keeps the daemon and provider alive, then uses
 [`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
-remove that channel's shared view and reject its next storage write. Relaunching
-the UI sends a real `SeedView` and receives a definitive registry refusal.
-The fixture does not inject UI state or replace the model transport.
+remove that channel's shared view and its active placement mappings. It keeps
+both monotonic clocks, actor/history records, window retention pins and other
+scopes. The helper then adds a trigger that published-schema admission does
+not recognize. While armed, the real registry can refuse all writes, before
+the trigger's channel-conditional body runs. The native notice reports the
+registry's schema-mismatch reason, not the trigger body's SQLite sentence.
+The fixture does not inject UI state, replace transport or weaken schema checks.
+Dropping the trigger restores admission; the selected panes can register again
+with fresh placement generations.
 
 Run the scene on the native-evidence host, with both fixture scripts in the
 same directory. When comparing a revision that predates the scripts, copy them
@@ -550,13 +556,22 @@ bash "$scene" retry wide
 existing warning control's tooltip and captures the refusal and Retry action.
 `retry` removes the fixture refusal, presses Retry and waits for the saved pane
 to reopen. Repeat with `narrow` in a new session at the narrower viewport;
-both widths restore the same seed. The notices icon's position depends on that
+both widths restore the same seed. To avoid taking another native slot, a
+1500×900 session can instead use `native-evidence nested niri msg action
+set-column-width 900` and return to `1500`; first confirm the actual app-window
+size with `drive observe`. Capture the full native window. The manifest retains
+the requested headless viewport and separately records the actual image size;
+report the latter for a resized capture. Apply identical geometry on both sides.
+The notices icon's position depends on that
 viewport and the inspector state, so observe it instead of reusing a guessed
 point. Stop immediately after capturing the states.
 
 The helper refuses a HOME or data directory outside the private evidence
-fixture. Its offline contracts cover the channel-scoped failure, recovery and
-refusal to modify an unrelated home or missing channel:
+fixture. Its offline contracts cover selected-view/placement cleanup, foreign-key
+cascades, unchanged unrelated rows and monotonic clocks, and refusal to modify
+an unrelated home or missing channel. A separate direct-SQL check exercises the
+conditional trigger body only; it does not test daemon schema admission. Real
+registry refusal and successful recovery must be checked in the native app:
 
 ```sh
 python3 -I -B tests/fixtures/test_seed_refusal_registry.py -v
