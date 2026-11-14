@@ -695,6 +695,16 @@ impl Handle {
             Owner::Remote(remote) => remote.state().interrupt_subagents.clone(),
         }
     }
+    /// Provider-confirmed model status from the local or retained owner.
+    pub(crate) fn active_model(&self) -> (u64, Option<chat::ActiveModel>) {
+        match &self.0 {
+            Owner::Local(local) => local.active_model(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                (state.active_model_revision, state.active_model.clone())
+            }
+        }
+    }
     /// How the provider addresses the conversation's subagents, where that
     /// is not by the IDs its snapshot lists them under.
     pub(crate) fn agent_addresses(&self) -> Vec<chat::AgentAddress> {

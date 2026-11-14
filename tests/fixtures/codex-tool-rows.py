@@ -111,6 +111,8 @@ class Scenario:
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self.model = "fixture-mini"
+        self.reasoning = None
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
         # Replayed once, by the thread's first turn.
@@ -132,6 +134,7 @@ class Scenario:
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
                                   "latest": self.latest, "child_latest": self.child_latest,
+                                  "model": self.model, "reasoning": self.reasoning,
                                   "interrupting": sorted(self.interrupting)})
 
     def restore(self, state):
@@ -143,6 +146,8 @@ class Scenario:
         self.thread, self.child = state["thread"], state["child"]
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
+        self.model = state.get("model", "fixture-mini")
+        self.reasoning = state.get("reasoning")
         self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
         for thread in (self.thread, self.child):
@@ -324,14 +329,19 @@ class Scenario:
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self.latest if thread == self.thread else self.child_latest
-            result = {"thread": self.metadata(thread), "model": "fixture-mini",
+            if method == "thread/start":
+                catalog = self.models(codex_home)["data"]
+                default = next((model for model in catalog if model.get("isDefault")), catalog[0])
+                self.model = params.get("model") or default["model"]
+                self.reasoning = params.get("config", {}).get("model_reasoning_effort")
+            result = {"thread": self.metadata(thread), "model": self.model,
+                      "reasoningEffort": self.reasoning,
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
         elif method == "thread/read":
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
-            result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
-                       "displayName": "Offline fixture"}], "nextCursor": None}
+            result = self.models(codex_home)
         elif method == "thread/list":
             result = {"data": [self.metadata(self.child)], "nextCursor": None}
         elif method == "thread/turns/list":
@@ -362,6 +372,10 @@ class Scenario:
                     or self.child_latest and self.child_latest["status"] == "inProgress"
                     and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
+            if params.get("model"):
+                self.model = params["model"]
+            if "effort" in params:
+                self.reasoning = params["effort"]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
@@ -395,6 +409,20 @@ class Scenario:
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
         return [{"id": identifier, "result": result}, *after]
+
+    def models(self, codex_home):
+        """Optional recorded model/list result, private to this fixture's home."""
+        models = Path(codex_home) / "fixture-models.json"
+        if models.is_file():
+            catalog = json.loads(models.read_text())
+            if not isinstance(catalog.get("data"), list) or not catalog["data"]:
+                raise ValueError("fixture-models.json must hold a nonempty model/list result")
+            if any(not isinstance(model.get("model"), str) or not model["model"]
+                   for model in catalog["data"]):
+                raise ValueError("every fixture-models.json model must have a nonempty model ID")
+            return catalog
+        return {"data": [{"id": "fixture-mini", "model": "fixture-mini",
+                          "displayName": "Offline fixture"}], "nextCursor": None}
 
 
 def serve(connection, codex_home, scenario, request_lock):

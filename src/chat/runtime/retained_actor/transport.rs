@@ -186,6 +186,10 @@ pub(crate) struct Resident {
     /// that predates them reports none.
     #[serde(default)]
     pub agent_addresses: Vec<chat::AgentAddress>,
+    #[serde(default)]
+    pub active_model: Option<chat::ActiveModel>,
+    #[serde(default)]
+    pub active_model_revision: u64,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -486,6 +490,8 @@ impl RemoteActor {
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
+            active_model: None,
+            active_model_revision: 0,
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -1425,6 +1431,12 @@ impl RemoteActor {
             );
             if resident.agent_addresses != state.agent_addresses {
                 updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
+            if resident.active_model_revision != state.active_model_revision {
+                updates.push(Update::ActiveModel {
+                    revision: resident.active_model_revision,
+                    model: resident.active_model.clone(),
+                });
             }
             *state = Arc::new(resident);
             updates
@@ -2717,6 +2729,8 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
+        let active_model = state.active_model.clone();
+        let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
         let prompt_eligible =
@@ -2811,6 +2825,8 @@ impl Server {
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),
+            active_model,
+            active_model_revision,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,

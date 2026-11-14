@@ -726,12 +726,14 @@ struct Claude {
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
     resolved: HashMap<String, String>,
+    resolved_labels: HashMap<String, String>,
     /// The listed model the conversation is on: the one launched with,
     /// chosen since, or the listed model the latest turn's full ID stands for.
     selected: Option<String>,
     /// The full model ID the latest turn reported running on, which keys the
     /// result's per-model usage.
     running: Option<String>,
+    running_reasoning: Option<String>,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning: Option<String>,
@@ -1429,6 +1431,14 @@ impl Claude {
         }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
+            Model::resolve_claude_labels(&mut self.models, models);
+            self.resolved_labels = models
+                .iter()
+                .filter_map(|model| {
+                    let id = model["resolvedModel"].as_str()?;
+                    Some((id.to_owned(), Model::claude_model_label(models, id)))
+                })
+                .collect();
             self.resolved = models
                 .iter()
                 .filter_map(|model| {
@@ -1504,8 +1514,43 @@ impl Claude {
         });
         if let Some(model) = data["model"].as_str() {
             self.selected = Some(self.listed(model).to_owned());
-            self.running = Some(model.to_owned());
+            self.running = Some(
+                self.resolved
+                    .get(model)
+                    .map_or(model, String::as_str)
+                    .to_owned(),
+            );
+            self.running_reasoning = self.reasoning.clone();
         }
+        let active = self
+            .running
+            .as_ref()
+            .filter(|id| {
+                !matches!(
+                    id.as_str(),
+                    "default" | "opus" | "sonnet" | "haiku" | "opusplan"
+                )
+            })
+            .map(|id| {
+                let label = self
+                    .resolved_labels
+                    .get(id)
+                    .cloned()
+                    .or_else(|| {
+                        self.models
+                            .iter()
+                            .find(|model| model.id == *id)
+                            .map(|model| model.label.clone())
+                    })
+                    .unwrap_or_else(|| id.clone());
+                chat::ActiveModel {
+                    id: id.clone(),
+                    label,
+                    reasoning: self.running_reasoning.clone(),
+                    default_reasoning: None,
+                }
+            });
+        step.events.push(Event::ActiveModel(active));
         step.events.extend([
             Event::Models {
                 models: self.models.clone(),
@@ -3660,6 +3705,12 @@ impl Claude {
                         }
                         "set_model" => {
                             self.selected = request["model"].as_str().map(str::to_owned);
+                            if !self.busy {
+                                self.running = self
+                                    .selected
+                                    .as_ref()
+                                    .map(|id| self.resolved.get(id).unwrap_or(id).clone());
+                            }
                             self.metadata(&Value::Null, &mut step);
                             let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
@@ -3712,6 +3763,9 @@ impl Claude {
                             self.reasoning = request["settings"]["effortLevel"]
                                 .as_str()
                                 .map(str::to_owned);
+                            if !self.busy {
+                                self.running_reasoning = self.reasoning.clone();
+                            }
                             self.metadata(&Value::Null, &mut step);
                         }
                         "set_permission_mode" => {
@@ -18309,6 +18363,60 @@ mod tests {
         assert_eq!(turn(&mut adapter, "claude-fable-5-1"), "fable");
         // A model the list does not name is shown as it is.
         assert_eq!(turn(&mut adapter, "claude-mythos-5-2"), "claude-mythos-5-2");
+    }
+
+    #[test]
+    fn default_alias_reports_the_resolved_model_label_without_changing_its_command_id() {
+        let mut adapter = Claude::default();
+        let mut catalog = Step::default();
+        adapter.metadata(&json!({"models":[
+            {"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},
+            {"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5"}
+        ]}), &mut catalog);
+        assert!(
+            adapter.selected.is_none(),
+            "a catalog alone does not start a model"
+        );
+        assert!(
+            catalog
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ActiveModel(None)))
+        );
+        let mut turn = Step::default();
+        adapter.metadata(&json!({"model":"claude-opus-5-5"}), &mut turn);
+        assert!(turn.events.iter().any(|event| matches!(event,
+            Event::Models { models, selected: Some(selected), .. }
+                if selected == "default" && models.iter().any(|model|
+                    model.id == *selected && model.label == "Default (Opus 5.5)"))));
+        assert!(turn.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-opus-5-5" && model.label == "Opus 5.5")));
+        assert_eq!(adapter.running.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(adapter.selected.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn special_alias_keeps_its_menu_choice_while_active_status_names_the_concrete_model() {
+        let mut adapter = Claude {
+            selected: Some("opusplan".into()),
+            ..Claude::default()
+        };
+        let mut step = Step::default();
+        adapter.metadata(
+            &json!({"models":[
+            {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+            {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"}
+        ], "model":"claude-sonnet-5-5"}),
+            &mut step,
+        );
+        assert_eq!(adapter.selected.as_deref(), Some("opusplan"));
+        assert_eq!(adapter.models[0].label, "Opus Plan");
+        assert!(step.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-sonnet-5-5" && model.label == "Sonnet 5.5")));
+        let mut unknown = Step::default();
+        adapter.metadata(&json!({"model":"claude-new-family-7"}), &mut unknown);
+        assert!(unknown.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-new-family-7" && model.label == model.id)));
     }
 
     #[test]

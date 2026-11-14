@@ -107,6 +107,45 @@ class CodexToolRowsFixture(unittest.TestCase):
             Path(home, "fixture-rate-limits.json").write_text(json.dumps(limits))
             self.assertEqual(scenario.request(request, home), [{"id": 3, "result": limits}])
 
+    def test_model_catalog_and_resolved_selection_come_from_the_fixture_home(self):
+        import json
+        import tempfile
+        scenario = PEER["Scenario"]()
+        catalog = {"data": [{"id": "offline-mini", "model": "offline-mini",
+                             "displayName": "Offline Mini", "isDefault": True,
+                             "defaultReasoningEffort": "medium",
+                             "supportedReasoningEfforts": [{"reasoningEffort": effort}
+                                                           for effort in ("low", "medium", "high")]}],
+                   "nextCursor": None}
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-models.json").write_text(json.dumps(catalog))
+            self.assertEqual(scenario.request({"id": 1, "method": "model/list"}, home),
+                             [{"id": 1, "result": catalog}])
+            [started] = scenario.request({"id": 2, "method": "thread/start", "params": {}}, home)
+            self.assertEqual(started["result"]["model"], "offline-mini")
+            self.assertIsNone(started["result"]["reasoningEffort"])
+            [explicit] = scenario.request({"id": 3, "method": "thread/start", "params": {
+                "model": "offline-mini", "config": {"model_reasoning_effort": "high"}}}, home)
+            self.assertEqual(explicit["result"]["reasoningEffort"], "high")
+            restored = PEER["Scenario"]()
+            restored.restore(scenario.state())
+            [resumed] = restored.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual(resumed["result"]["model"], "offline-mini")
+            self.assertEqual(resumed["result"]["reasoningEffort"], "high")
+            restored.request({"id": 5, "method": "turn/start", "params": {
+                "threadId": restored.thread, "model": "offline-mini", "effort": "low"}}, home)
+            [resumed] = restored.request({"id": 6, "method": "thread/resume", "params": {
+                "threadId": restored.thread}}, home)
+            self.assertEqual(resumed["result"]["reasoningEffort"], "low")
+
+    def test_an_empty_fixture_model_catalog_reports_its_cause(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-models.json").write_text('{"data": []}')
+            with self.assertRaisesRegex(ValueError, "nonempty model/list result"):
+                PEER["Scenario"]().request({"id": 1, "method": "model/list"}, home)
+
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {

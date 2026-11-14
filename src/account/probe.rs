@@ -1089,10 +1089,10 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
 
 fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
     initialized.value.as_ref().ok().and_then(|value| {
-        observed_catalog(
-            models(value["models"].as_array(), Model::from_claude),
-            initialized.observed_at,
-        )
+        let entries = value["models"].as_array();
+        let mut listed = models(entries, Model::from_claude);
+        Model::resolve_claude_labels(&mut listed, entries.map(Vec::as_slice).unwrap_or_default());
+        observed_catalog(listed, initialized.observed_at)
     })
 }
 

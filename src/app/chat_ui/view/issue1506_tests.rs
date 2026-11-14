@@ -913,11 +913,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 true,
                 &app.settings.keyboard_shortcuts,
                 360.0,
-                Place {
-                    name: "chooser-fixture".into(),
-                    branch: None,
-                    channel: None,
-                },
+                Place { branch: None },
                 true,
                 None,
                 Vec::new(),
