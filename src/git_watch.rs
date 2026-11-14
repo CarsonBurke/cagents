@@ -651,17 +651,18 @@ impl Monitor {
                 let create_watcher = || {
                     let events = state.clone();
                     let signal = wake.clone();
-                    notify::recommended_watcher(move |event: notify::Result<Event>| {
-                        // Git status itself produces Access traffic. A requested
-                        // rescan still reaches the normal recovery path.
-                        if event.as_ref().is_ok_and(access_only) {
-                            return;
-                        }
-                        let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
-                        if pending.event(event) {
-                            signal();
-                        }
-                    })
+                    // Every open of a watched file or directory, by Git status
+                    // or a build, would otherwise wake this watcher only to be
+                    // discarded: ask the kernel for changes alone.
+                    RecommendedWatcher::new(
+                        move |event: notify::Result<Event>| {
+                            let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
+                            if pending.event(event) {
+                                signal();
+                            }
+                        },
+                        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+                    )
                 };
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
@@ -1495,5 +1496,73 @@ mod tests {
             change.worktrees.contains(&worktree.id)
         });
         drop(original_directory);
+    }
+
+    /// Context switches of this process's native watcher threads, by thread.
+    fn watcher_thread_switches() -> BTreeMap<String, u64> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| {
+                let task = task.ok()?.path();
+                let name = std::fs::read_to_string(task.join("comm")).ok()?;
+                if !name.starts_with("notify-rs inoti") {
+                    return None;
+                }
+                let switches = std::fs::read_to_string(task.join("status"))
+                    .ok()?
+                    .lines()
+                    .filter(|line| line.contains("ctxt_switches"))
+                    .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .sum();
+                Some((task.file_name()?.to_string_lossy().into_owned(), switches))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reading_watched_files_does_not_wake_the_watcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        let worktree = &project.worktrees[0];
+        let source = worktree.root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree.git_dir).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "first").unwrap();
+        std::fs::write(worktree.git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, "initial configuration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
+        // What Git status and a compiler do to a checkout: open its files and
+        // list its directories, many times over, without changing anything.
+        let before = watcher_thread_switches();
+        for _ in 0..200 {
+            std::fs::read(&file).unwrap();
+            std::fs::read(worktree.git_dir.join("HEAD")).unwrap();
+            std::fs::read_dir(&source).unwrap().for_each(drop);
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        // Other tests' watchers may wake meanwhile, but not hundreds of times.
+        let woke: u64 = watcher_thread_switches()
+            .into_iter()
+            .map(|(thread, switches)| switches - before.get(&thread).copied().unwrap_or(0))
+            .sum();
+        assert!(woke < 40, "the watcher woke {woke} times for reads alone");
+        // A change still arrives.
+        std::fs::write(&file, "second").unwrap();
+        wait_for(&monitor, project.id, "edit after reads", |change| {
+            change.worktrees.contains(&worktree.id)
+        });
     }
 }
