@@ -458,14 +458,32 @@ fn confirm_daemon_ready_at(
             "Could not confirm restored panes: {error}. {guidance}"
         ))
     };
+    // Every request shares the one deadline, so it can expire inside any of
+    // them. That is still a timeout, not a communication failure.
+    let timed_out = |restoring: bool| {
+        invalid(if restoring {
+            format!(
+                "Timed out confirming restored panes: the terminal service is still restoring saved panes. {guidance}"
+            )
+        } else {
+            format!("Timed out confirming restored panes. {guidance}")
+        })
+    };
+    let failed = |error: &dyn std::fmt::Display, restoring: bool| {
+        if Instant::now() < deadline {
+            communication(error)
+        } else {
+            timed_out(restoring)
+        }
+    };
     let stream = crate::control::connect_control_socket(
         socket,
         deadline.saturating_duration_since(Instant::now()),
     )
-    .map_err(|error| communication(&error))?;
+    .map_err(|error| failed(&error, false))?;
     let peer = source::Peer::observe(&stream, socket).map_err(|error| communication(&error))?;
     let mut client = ControlClient::from_stream_with_deadline(stream, deadline)
-        .map_err(|error| communication(&error))?;
+        .map_err(|error| failed(&error, false))?;
     let ownership = |proof: &crate::model::HostSessionProof| {
         let unavailable = || invalid("the confirmed terminal service changed or is unavailable");
         peer.verify(proof).map_err(|_| unavailable())?;
@@ -474,16 +492,15 @@ fn confirm_daemon_ready_at(
         }
         Ok(())
     };
+    let mut restoring = false;
     loop {
         if Instant::now() >= deadline {
-            return Err(invalid(format!(
-                "Timed out confirming restored panes. {guidance}"
-            )));
+            return Err(timed_out(restoring));
         }
         ownership(client.proof()).map_err(|error: UpdateError| communication(&error))?;
         let state = client
             .startup_state_with_deadline(deadline)
-            .map_err(|error| communication(&error))?;
+            .map_err(|error| failed(&error, restoring))?;
         ownership(client.proof()).map_err(|error: UpdateError| communication(&error))?;
         match state {
             StartupState::Ready => return Ok(()),
@@ -493,12 +510,8 @@ fn confirm_daemon_ready_at(
                 )));
             }
             StartupState::Restoring { .. } => {
+                restoring = true;
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(invalid(format!(
-                        "The terminal service is still restoring saved panes. {guidance}"
-                    )));
-                }
                 thread::sleep(remaining.min(Duration::from_millis(100)));
             }
         }
@@ -893,6 +906,8 @@ else: raise AssertionError(sys.argv)
         OtherExecutable,
         OtherProof,
         ChangedLease,
+        /// Reads each startup request and never answers it.
+        Unanswered,
     }
 
     fn startup_fixture(
@@ -961,7 +976,10 @@ else: raise AssertionError(sys.argv)
                 }
                 Err(error) => panic!("writing startup fixture reply: {error}"),
             };
-            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            // A client whose deadline passed before it connected sends nothing.
+            let Ok(Some(connect)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                return 0;
+            };
             assert!(matches!(connect.request, ClientRequest::Connect { .. }));
             if !reply(
                 &mut stream,
@@ -990,6 +1008,10 @@ else: raise AssertionError(sys.argv)
                     Err(error) => panic!("reading startup fixture request: {error}"),
                 };
                 assert_eq!(request.request, ClientRequest::StartupState);
+                if matches!(peer, StartupPeer::Unanswered) {
+                    requests += 1;
+                    continue;
+                }
                 let state = states
                     .pop_front()
                     .unwrap_or(StartupState::Restoring { awaiting: 1 });
@@ -1086,14 +1108,30 @@ else: raise AssertionError(sys.argv)
 
     #[test]
     fn a_service_that_remains_restoring_has_a_bounded_failure() {
+        // Long enough that a loaded host still answers a request before it;
+        // the failure is the same wherever the deadline lands.
         let (result, requests) =
-            startup_fixture(vec![], StartupPeer::Matched, Duration::from_millis(500));
+            startup_fixture(vec![], StartupPeer::Matched, Duration::from_secs(2));
         let error = result.unwrap_err().to_string();
         assert!(
-            error.contains("Timed out confirming restored panes"),
+            error.contains(
+                "Timed out confirming restored panes: the terminal service is still restoring saved panes"
+            ),
             "{error}"
         );
         assert!(requests > 0);
+    }
+
+    #[test]
+    fn a_deadline_that_expires_during_a_request_is_a_timeout() {
+        let (result, requests) =
+            startup_fixture(vec![], StartupPeer::Unanswered, Duration::from_millis(200));
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.starts_with("Timed out confirming restored panes. "),
+            "{error}"
+        );
+        assert!(requests <= 1);
     }
 
     fn run_captured(
