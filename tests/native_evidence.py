@@ -1340,6 +1340,61 @@ class Evidence(unittest.TestCase):
         self.run_tool("save-seed")
         self.assertNotIn("will not reopen", self.run_tool("start", "after").stderr)
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses read-only file permissions")
+    def test_seed_restores_read_only_files_in_place_without_following_symlinks(self) -> None:
+        self.built("after")
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        provider_home = fixture / "home" / ".claude"
+        transcript = provider_home / "session.jsonl"
+        git_object = fixture / "project" / ".git" / "objects" / "aa" / ("0" * 38)
+        git_object.parent.mkdir(parents=True, exist_ok=True)
+        unchanged = fixture / "home" / "unchanged-read-only"
+        files = {transcript: 0o400, git_object: 0o444, unchanged: 0o444}
+        for path, mode in files.items():
+            path.write_text("seeded\n")
+            path.chmod(mode)
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_file = outside / "read-only"
+        outside_file.write_text("outside the fixture\n")
+        outside_file.chmod(0o444)
+        (fixture / "home" / "file-link").symlink_to(outside_file)
+        (fixture / "home" / "directory-link").symlink_to(outside, target_is_directory=True)
+        recorded = {path: path.stat().st_ino for path in [provider_home, *files]}
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+
+        transcript.chmod(0o600)
+        transcript.write_text("changed transcript\n")
+        transcript.chmod(0o400)
+        for path in (transcript, git_object):
+            # A Git scene can recreate the same object with a different mtime.
+            os.utime(path, (1_700_000_120, 1_700_000_120))
+        self.run_tool("start", "after")
+        self.assertEqual(recorded, {path: path.stat().st_ino for path in recorded})
+        for path, mode in files.items():
+            self.assertEqual(path.read_text(), "seeded\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            self.assertEqual(path.stat().st_mtime_ns, 1_700_000_000_000_000_000)
+        self.assertTrue((fixture / "home" / "file-link").is_symlink())
+        self.assertTrue((fixture / "home" / "directory-link").is_symlink())
+        self.assertEqual(outside_file.read_text(), "outside the fixture\n")
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
+        self.run_tool("stop")
+
+        # If the transfer fails, permissions return to their pre-restore mode.
+        git_object.chmod(0o400)
+        os.utime(git_object, (1_700_000_240, 1_700_000_240))
+        write_executable(self.bin / "rsync", "#!/bin/sh\nexit 23\n", self.logs)
+        failed = self.run_tool("start", "after", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("could not restore the seed", failed.stderr)
+        self.assertEqual(git_object.stat().st_ino, recorded[git_object])
+        self.assertEqual(stat.S_IMODE(git_object.stat().st_mode), 0o400)
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
+
     def test_a_seed_saved_before_its_home_was_recorded_is_said_not_to_reopen(self) -> None:
         self.built("after")
         self.run_tool("start", "after")

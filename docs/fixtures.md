@@ -45,6 +45,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
+   Restoring a seed keeps existing provider homes and transcript files in place,
+   including read-only files. Updated files regain the seed's saved permissions;
+   fixture symlinks are not followed when preparing files for restoration.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
    `shot`).

@@ -395,6 +395,57 @@ seeded_home_identity() {
     stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
 }
 
+restore_seed_in_place() {
+    # Older rsync receivers cannot open an owned read-only file for an
+    # in-place update. Lend write permission only to regular files the seed
+    # needs to update; archive mode restores their exact saved permissions.
+    # Neither the walk nor chmod follows fixture symlinks.
+    python3 - "$seed" "$fixture" <<'PY'
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+seed, fixture = map(Path, sys.argv[1:])
+lent = []
+restored = False
+try:
+    for directory, _, names in os.walk(fixture, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            current = path.lstat()
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                    or current.st_mode & stat.S_IWUSR):
+                continue
+            try:
+                saved = (seed / path.relative_to(fixture)).lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISREG(saved.st_mode)
+                    and (current.st_size, current.st_mtime_ns) != (saved.st_size, saved.st_mtime_ns)):
+                path.chmod(stat.S_IMODE(current.st_mode) | stat.S_IWUSR, follow_symlinks=False)
+                lent.append((path, current))
+    result = subprocess.run([
+        "rsync", "-aH", "--inplace", "--delete", "--force", "--", f"{seed}/", f"{fixture}/",
+    ])
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    restored = True
+finally:
+    if not restored:
+        # A failed restore must not leave its existing files writable. Avoid
+        # changing a file that rsync removed or replaced before it failed.
+        for path, original in lent:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                path.chmod(stat.S_IMODE(original.st_mode), follow_symlinks=False)
+PY
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
@@ -405,7 +456,7 @@ prepare_fixture() {
             # and a transcript's location records its file's. Syncing in
             # place keeps every directory and file both share, so a
             # conversation saved in the seed reopens on either side.
-            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+            if ! restore_seed_in_place 2>"$logs/seed.log"; then
                 printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
                 return 1
             fi
