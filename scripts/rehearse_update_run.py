@@ -25,66 +25,42 @@ import tomllib
 import uuid
 
 
-def wait_native_lock(root, descriptor, parent_pid):
-    """Keep one blocking waiter; cancellation terminates and joins only it."""
+def wait_native_lock(root, descriptors, parent_pid, queue=None):
+    """Take one native slot on the caller's descriptors; see native_slots.py.
+
+    Prints the slot taken when there is a queue. Stopping or losing the
+    caller cancels it, and its waiters are joined before it returns.
+    """
     root=Path(root).resolve()
     if os.getppid()!=parent_pid:
         return 75
     marker=root/'.rehearse-update'
-    if marker.is_symlink() or marker.read_text().strip()!=str(root) or descriptor<3:
+    if marker.is_symlink() or marker.read_text().strip()!=str(root) or min(descriptors)<3 or (queue is not None and queue<3):
         raise RuntimeError('native lock waiting requires an owned private root and inherited descriptor')
     stop=root/'desktop/stop'
-    if stop.exists():
-        return 75
-    waiter=None
-    pidfd=None
     previous={}
     def interrupted(signum, frame):
         raise SystemExit(128+signum)
+    def cancelled():
+        if stop.exists() or os.getppid()!=parent_pid:
+            raise native_slots.Cancelled
     try:
         for signum in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):
             previous[signum]=signal.signal(signum,interrupted)
-        # Do not let the child queue for the lock until its pidfd is secured.
-        # If pidfd setup fails, closing stdin makes the child exit without
-        # ever running flock; parent death also terminates it in the kernel.
-        gate=('import os,sys\nif os.getppid()!=int(sys.argv[2]): sys.exit(75)\n'
-              'if os.read(0,1)!=b"1": sys.exit(0)\nos.execlp("flock","flock",sys.argv[1])\n')
-        waiter=subprocess.Popen(['setpriv','--pdeathsig','TERM',sys.executable,'-c',gate,str(descriptor),str(os.getpid())],
-                                pass_fds=(descriptor,),stdin=subprocess.PIPE,stdout=subprocess.DEVNULL)
         try:
-            pidfd=os.pidfd_open(waiter.pid)
-        except ProcessLookupError:
-            return 75 if stop.exists() else waiter.wait()
-        waiter.stdin.write(b'1')
-        waiter.stdin.close()
-        while waiter.poll() is None:
-            if stop.exists():
-                return 75
-            select.select([pidfd],[],[],.1)
-        return 75 if stop.exists() else waiter.wait()
+            index=native_slots.acquire(queue,descriptors,None,cancelled)
+        except native_slots.Cancelled:
+            return 75
+        if stop.exists():
+            return 75
+        if queue is not None:
+            print(index)
+        return 0
     finally:
-        # A second cancellation must not interrupt the child's join.
-        blocked=signal.pthread_sigmask(signal.SIG_BLOCK,previous)
-        try:
-            if waiter is not None:
-                if waiter.stdin is not None and not waiter.stdin.closed:
-                    try:
-                        waiter.stdin.close()
-                    except BrokenPipeError:
-                        pass
-                if waiter.poll() is None and pidfd is not None:
-                    try:
-                        signal.pidfd_send_signal(pidfd,signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                waiter.wait()
-            if pidfd is not None:
-                os.close(pidfd)
-        finally:
-            for signum,handler in previous.items():
-                signal.signal(signum,handler)
-            signal.pthread_sigmask(signal.SIG_SETMASK,blocked)
+        for signum,handler in previous.items():
+            signal.signal(signum,handler)
 
+import native_slots
 import rehearse_update_records as records
 
 
@@ -1991,7 +1967,8 @@ def main():
     observe=commands.add_parser('observe')
     observe.add_argument('output')
     lock=commands.add_parser('wait-native-lock')
-    lock.add_argument('--fd',type=int,required=True)
+    lock.add_argument('--fd',type=int,action='append',required=True,help='one per native slot, slot 0 first')
+    lock.add_argument('--queue-fd',type=int)
     lock.add_argument('--parent-pid',type=int,required=True)
     staged=commands.add_parser('staged-candidate')
     staged.add_argument('archive_dir')
@@ -2035,7 +2012,7 @@ def main():
                                    record=args.record is not None,transcript=args.record))
             return 0
         if args.command=='wait-native-lock':
-            return wait_native_lock(args.root,args.fd,args.parent_pid)
+            return wait_native_lock(args.root,args.fd,args.parent_pid,args.queue_fd)
         if args.command=='wait':
             rehearsal.wait_windows(args.names)
             return 0

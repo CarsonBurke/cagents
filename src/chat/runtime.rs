@@ -430,7 +430,7 @@ impl LocalHandle {
         resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -1810,7 +1810,13 @@ fn spawn_provider(
         .args(&spec.arguments)
         .current_dir(&spec.working_directory)
         .env_clear()
-        .envs(&spec.environment)
+        // Callers withhold these already; no path may hand a provider the
+        // session its daemon or a saved recipe came from.
+        .envs(
+            spec.environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
@@ -3706,6 +3712,20 @@ fn recover_history_error(
         }
         Event::Error { .. } | Event::Reset { .. } | Event::Exited { .. } => *history_error = None,
         _ => {}
+    }
+}
+
+/// Protocol regressions project through the same reducer as a resident actor.
+#[cfg(test)]
+pub(crate) fn project_events_for_test(state: &mut Snapshot, events: Vec<Event>) {
+    let mut indices = state
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id.clone(), index))
+        .collect();
+    for event in events {
+        apply_event(state, &mut indices, event);
     }
 }
 
@@ -9376,6 +9396,50 @@ for line in sys.stdin:
                 provider.child.try_wait().unwrap().unwrap(),
                 observed,
                 "non-reaping observation must match the real Child exit status for {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_is_never_handed_a_parent_session() {
+        use std::io::Read;
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/env".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
+            environment: [
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+            ]
+            .into(),
+            unset_environment: Default::default(),
+        };
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+            .unwrap()
+            .unwrap();
+        let mut output = String::new();
+        provider
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        provider.terminate().unwrap();
+        let received = output.lines().collect::<Vec<_>>();
+        assert!(received.contains(&"CLAUDE_CONFIG_DIR=/home/a/.claude"));
+        for name in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_SOCKET="] {
+            assert!(
+                !received.iter().any(|line| line.starts_with(name)),
+                "{name} reached the provider"
             );
         }
     }

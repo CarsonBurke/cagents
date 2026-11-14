@@ -1553,7 +1553,30 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
         .collect()
 }
 
+/// What this conversation currently waits for in its direct delegated work.
+#[derive(Debug, Default)]
+pub struct SubagentActivity<'a> {
+    pub working: usize,
+    pub waiting: usize,
+    pub on_background_work: usize,
+    pub failed: Vec<&'a Subagent>,
+}
+
 impl Snapshot {
+    pub fn subagent_activity(&self) -> SubagentActivity<'_> {
+        let mut activity = SubagentActivity::default();
+        for agent in &self.subagents {
+            match agent.status {
+                ToolStatus::Running if agent.waiting => activity.waiting += 1,
+                ToolStatus::Running => activity.working += 1,
+                ToolStatus::Waiting => activity.on_background_work += 1,
+                ToolStatus::Failed => activity.failed.push(agent),
+                _ => {}
+            }
+        }
+        activity
+    }
+
     /// Drop renderable history while retaining provider continuity, controls,
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
@@ -1941,6 +1964,10 @@ pub enum ToolStatus {
     /// of life returns it to `Running`, and a Stop or the provider exiting
     /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
     Waiting,
+    /// An earlier or superseded run that has no current work to wait for.
+    /// Its transcript retains the outcome, when one was recorded. Unlike
+    /// `Stopped`, this does not claim someone cancelled the run.
+    Ended,
 }
 
 /// As derived, except that a client from before `Waiting` was added is sent
@@ -1955,6 +1982,11 @@ impl Serialize for ToolStatus {
             {
                 Self::Running
             }
+            Self::Ended
+                if crate::terminal_ipc::encoding_before(crate::terminal_ipc::ENDED_TOOL_STATUS) =>
+            {
+                Self::Stopped
+            }
             status => *status,
         };
         let name = match status {
@@ -1964,6 +1996,7 @@ impl Serialize for ToolStatus {
             Self::Denied => "Denied",
             Self::Stopped => "Stopped",
             Self::Waiting => "Waiting",
+            Self::Ended => "Ended",
         };
         serializer.serialize_unit_variant("ToolStatus", status as u32, name)
     }

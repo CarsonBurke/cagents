@@ -45,6 +45,36 @@ class Provider(unittest.TestCase):
         return [block.get("text") for frame in output if frame.get("type") == "assistant"
                 for block in frame["message"]["content"] if block.get("type") == "text"]
 
+    def test_auth_status_uses_each_accounts_config_with_the_existing_default(self):
+        def status(config=None):
+            environment = {"HOME": str(self.root / "home"),
+                           "PATH": "/usr/local/bin:/usr/bin:/bin"}
+            if config is not None:
+                environment["CLAUDE_CONFIG_DIR"] = str(config)
+            result = subprocess.run(
+                [str(SCRIPT), "auth", "status", "--json"], cwd=self.project,
+                capture_output=True, text=True, timeout=5, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        default = {"loggedIn": True, "email": "fixture@example.test",
+                   "subscriptionType": "pro"}
+        self.assertEqual(status(), default)
+        system = {**default, "email": "system@example.test"}
+        (self.config / "fixture-auth-status.json").write_text(json.dumps(system))
+        self.assertEqual(status(), system)
+        for name in ("account-one", "account-two"):
+            with self.subTest(account=name):
+                config = self.root / name
+                config.mkdir()
+                identity = {**default, "email": f"{name}@example.test"}
+                (config / "fixture-auth-status.json").write_text(json.dumps(identity))
+                self.assertEqual(status(config), identity)
+        # A selected home with no override uses the fixture default, never
+        # another account's identity from HOME/.claude.
+        self.assertEqual(status(self.root / "unconfigured-account"), default)
+        self.assertEqual(status(), system)
+
     def test_resume_can_branch_from_an_earlier_record_without_removing_turns(self):
         session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         interrupt = {"type": "control_request", "request_id": "stop",
