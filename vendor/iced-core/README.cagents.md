@@ -53,6 +53,11 @@ frames. Its default, 500 ms with a ten-second timeout, matches GTK's
 app's code editor and terminal use it, so a focused field stops repainting its
 window twice a second while nobody types.
 
+`Blink::current()` is the schedule those cursors draw with: the desktop's, once
+the app has read it and recorded it with `Blink::set_preferred`, otherwise the
+default. A desktop that turns blinking off records `Blink::STEADY`, whose zero
+timeout keeps the cursor visible and asks for no frames at all.
+
 ```sh
 cargo test --manifest-path vendor/iced-core/Cargo.toml text::blink
 ```

@@ -70,7 +70,9 @@ both use the same fixture data and selected providers.
                   where Cargo and rustup live. Between sessions it runs under
                   the side the last session ran, with no daemon running.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
-  nested CMD...   Run a command in the nested compositor's environment.
+  nested CMD...   Run a command in the nested compositor's environment, on the
+                  app's bus, so with --portal, gsettings set changes what the
+                  session's portal reports to the app.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
   relaunch [--chat-stages]
                   After closing the app window, run the same built UI again in
@@ -925,6 +927,7 @@ run_app() {
         exit 1
     fi
     cd -- "$checkout"
+    record_app_env
     session_variables='WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS NIRI_SOCKET XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XCURSOR_THEME XCURSOR_SIZE'
     write_session_cargo "$side" "$checkout"
     session_path=$state/session-bin:
@@ -991,6 +994,7 @@ cmd_relaunch() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
+    join_app_env
     app_window_is_open && observed=0 || observed=$?
     case $observed in
         0) die 'close the app window before relaunching it' ;;
@@ -1077,7 +1081,7 @@ cmd_start() {
         rm -f -- "$state/codex-executable" "$state/codex-executable.json"
     fi
     rm -f -- "$state/codex-executable-installed.json"
-    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/app-env" "$state/over-limit" "$state/notice"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
@@ -1126,6 +1130,26 @@ nested_session_env() {
     export XDG_RUNTIME_DIR=$runtime
 }
 
+# The bus and configuration directory the app started with. With --portal the
+# harness gives the app a private bus, where its portal and dconf run, which the
+# compositor's environment does not name. A command run in the session joins
+# them, so gsettings changes what the portal reports and a relaunched app reads
+# the same portal.
+record_app_env() {
+    local name
+    for name in DBUS_SESSION_BUS_ADDRESS XDG_CONFIG_HOME; do
+        [ -z "${!name:-}" ] || printf '%s=%s\n' "$name" "${!name}"
+    done >"$state/app-env"
+}
+
+join_app_env() {
+    local name value
+    [ -f "$state/app-env" ] || return 0
+    while IFS='=' read -r name value; do
+        export "$name=$value"
+    done <"$state/app-env"
+}
+
 cmd_drive() {
     current_side >/dev/null
     nested_session_env
@@ -1139,6 +1163,7 @@ cmd_nested() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
+    join_app_env
     exec "$@"
 }
 
