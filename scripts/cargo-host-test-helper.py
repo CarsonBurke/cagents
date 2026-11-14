@@ -134,18 +134,11 @@ def prepare(cargo, arguments):
 
 def main():
     arguments = sys.argv[1:]
-    run = bool(arguments and arguments[0] == "--run")
-    if run:
-        arguments.pop(0)
     if not arguments:
-        raise SystemExit("usage: cargo-host-test-helper.py [--run] CARGO COMMAND...")
+        raise SystemExit("usage: cargo-host-test-helper.py CARGO COMMAND...")
     cargo, arguments = arguments[0], arguments[1:]
     helper = prepare(cargo, arguments)
-    if run:
-        if helper:
-            os.environ[HELPER] = helper
-        os.execvp(cargo, [cargo, *arguments])
-    elif helper:
+    if helper:
         print(helper)
 
 

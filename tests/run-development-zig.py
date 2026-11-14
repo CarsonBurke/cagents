@@ -26,7 +26,8 @@ class ZigDiscovery(unittest.TestCase):
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
         shutil.copy2(GATE, checkout / "scripts/cargo-gate")
-        shutil.copy2(GATE.with_name("cargo-gate-command.py"), checkout / "scripts/cargo-gate-command.py")
+        for helper in ("cargo-gate-command.py", "build-host"):
+            shutil.copy2(GATE.with_name(helper), checkout / "scripts" / helper)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
 
         self.data = self.root / "data with spaces/mise"
@@ -73,6 +74,8 @@ exit 83
             # The runner builds through the gate; keep it off the host's locks.
             CAGENTS_BUILD_LOCK=str(self.root / "cargo.lock"),
             CAGENTS_BUILD_INSTALLED_GATE="", CAGENTS_BUILD_REMOTE="local",
+            # Build in place: no systemd scope or shared jobserver.
+            CAGENTS_BUILD_SCOPE="0",
         )
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.env.pop("MISE_DATA_DIR", None)

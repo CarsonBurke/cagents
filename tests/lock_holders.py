@@ -333,6 +333,22 @@ class LockHolders(unittest.TestCase):
                 self.pids.clear()
                 self.processes.clear()
 
+    def test_build_host_holding_a_share_is_recognized(self):
+        # As the gate runs it: `python3 -I PATH/build-host`, by its shebang,
+        # holding a share while waiting for, or running, its build.
+        program = self.root / "build-host"
+        program.write_text(textwrap.dedent(f"""\
+            #!{sys.executable} -I
+            import fcntl, subprocess
+            share = open({str(self.lock)!r}, "a")
+            fcntl.flock(share, fcntl.LOCK_EX)
+            subprocess.run(["sleep", "60"])
+            """))
+        program.chmod(0o755)
+        self.start(str(program))
+        self.wait_for(self.holds, "holder")
+        self.assertNotIn("no holder is a recognized", self.report())
+
     def test_a_lock_named_through_a_symlink_is_found(self):
         link = self.root / "link.lock"
         link.symlink_to(self.lock)
