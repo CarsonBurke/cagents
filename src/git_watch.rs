@@ -1498,6 +1498,63 @@ mod tests {
         drop(original_directory);
     }
 
+    #[test]
+    fn staging_committing_and_switching_branches_arrive_without_open_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("repository");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "first").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let project = Project::read_changed(
+            ProjectId::new(),
+            service.common_dir(&root, &cancellation).unwrap(),
+            &service.list_worktrees(&root, &cancellation).unwrap(),
+            &cancellation,
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let worktree = project.worktrees[0].id;
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, "initial configuration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
+        // Each Git operation replaces its files by renaming a lock into place.
+        let settle = || {
+            thread::sleep(Duration::from_millis(100));
+            while monitor.1.try_recv().is_ok() {}
+            monitor.0.drain();
+        };
+        std::fs::write(root.join("src/main.rs"), "second").unwrap();
+        settle();
+        git(&root, &["add", "src/main.rs"]);
+        wait_for(&monitor, project.id, "staging", |change| {
+            change.worktrees.contains(&worktree) && change.membership
+        });
+        settle();
+        git(&root, &["commit", "-qm", "second"]);
+        wait_for(&monitor, project.id, "committing", |change| {
+            change.references
+        });
+        settle();
+        git(&root, &["switch", "-qc", "topic"]);
+        wait_for(&monitor, project.id, "switching branches", |change| {
+            change.worktrees.contains(&worktree)
+        });
+    }
+
     /// Voluntary context switches, the times a thread slept and was woken,
     /// of this process's native watcher threads, by thread ID.
     fn watcher_thread_switches() -> BTreeMap<String, u64> {
