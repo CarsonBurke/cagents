@@ -1176,7 +1176,7 @@ async fn probe_codex_with_path(
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
-fn codex_catalog(answer: &Observed<Result<Value, String>>) -> Option<Catalog> {
+fn codex_catalog(answer: &Observed<RpcResult>) -> Option<Catalog> {
     let result = answer.value.as_ref().ok()?;
     let entries = result["data"].as_array();
     let mut catalog =
