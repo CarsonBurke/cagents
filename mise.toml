@@ -19,6 +19,10 @@ editor = "--locked --package ceditor"
 # selection, so `-- --lib terminal::` narrows a lane instead of adding to it.
 # mise passes the arguments shell-quoted in $usage_cargo_args; each lane task
 # restores them with `eval "set -- $usage_cargo_args"`.
+# An aggregate refuses arguments rather than silently running every lane whole:
+# narrow one lane instead, such as `mise run test:host -- --lib terminal::`.
+# Each aggregate's first step checks; mise would expand its $ here in [vars].
+no_arguments = 'arg "[unexpected]..." var=#true hide=#true'
 all_targets = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 
 # Setup ----------------------------------------------------------------------
@@ -27,9 +31,11 @@ all_targets = 'arg "[cargo_args]..." var=#true double_dash="required" default="-
 description = "Install the pinned Zig and Rust toolchains, then run the doctor"
 run = [
   "mise install",
-  # Reads rust-toolchain.toml: the channel, profile and components. Updating
-  # rustup itself stays the user's decision.
-  "rustup toolchain install --no-self-update",
+  'command -v rustup >/dev/null || { echo "rustup is required to install Rust: https://rustup.rs/" >&2; exit 1; }',
+  # The channel, profile and components rust-toolchain.toml names, spelled out
+  # for rustup releases that cannot read the file. Updating rustup itself stays
+  # the user's decision.
+  '''eval "set -- $(/usr/bin/python3 -I -c 'import shlex, tomllib; t = tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]; print(shlex.join([t["channel"], "--profile", t.get("profile", "minimal"), *(f"--component={c}" for c in t.get("components", ()))]))')" && rustup toolchain install --no-self-update "$@"''',
 ]
 depends_post = ["doctor"]
 
@@ -84,13 +90,19 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.edi
 
 [tasks.check]
 description = "Type-check every target of the CLI, host and UI lanes, each admitted on its own"
-depends = ["check:cli", "check:host", "check:ui"]
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
 
 [tasks."check:protocol"]
 description = "Check the IPC source contract, older-client proofs and live-update sources against a base"
 usage = 'flag "--base <ref>" help="Comparison base (default: the merge base with origin/main)"'
 run = [
-  'scripts/check-protocol-contract --base-ref "${usage_base:-$(git merge-base HEAD origin/main)}"',
+  # An empty base would check only the current snapshot, so a missing one fails.
+  '''base=${usage_base-}
+  if [ -z "$base" ]; then
+      base=$(git merge-base HEAD origin/main) || { echo "no merge base with origin/main; fetch it or pass --base REF" >&2; exit 2; }
+  fi
+  exec scripts/check-protocol-contract --base-ref "$base"''',
   "scripts/check-older-clients",
   "scripts/check-update-sources",
 ]
@@ -118,16 +130,17 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test {{vars.ui}}
 description = "Test every target of the CLI, host and UI lanes, one lane after another"
 # In sequence: each lane's tests run outside the build slot, and three suites
 # at once would compete for memory and interleave thousands of result lines.
-run = [{ task = "test:cli" }, { task = "test:host" }, { task = "test:ui" }]
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { task = "test:cli" }, { task = "test:host" }, { task = "test:ui" }]
 
 [tasks."test:lib"]
-description = "Run named root library tests in one lane without Cargo (see scripts/test-lib --help)"
+description = "Build one lane's library tests once and run the named ones (see scripts/test-lib --help)"
 run = "scripts/test-lib"
 
 [tasks."test:scripts"]
 description = "Verify and run the script contract suites CI runs (optionally one JOB [SHARD])"
 usage = '''
-arg "[job]" help="One job, such as tooling; default: every job, unsharded"
+arg "[job]" help="One job, such as tooling; default: every job unsharded, then the source job's suites"
 arg "[shard]" help="I/N shard of a sharded job"
 '''
 run = [
@@ -148,7 +161,8 @@ run = "scripts/check-format"
 # What GitHub CI runs; none of it compiles Rust.
 [tasks.ci]
 description = "Run the checks GitHub CI runs: formatting, protocol contracts and script suites"
-depends = ["fmt:check", "check:protocol", "test:scripts"]
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
 
 # Packaging and release ------------------------------------------------------
 

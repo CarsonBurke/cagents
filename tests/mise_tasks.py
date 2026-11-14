@@ -85,8 +85,10 @@ class Structure(unittest.TestCase):
                     self.assertIsNone(re.search(r"(^|[;&|]\s*|\bexec\s+)cargo\s+(build|check|test|run)\b", command))
 
     def test_aggregates_cover_exactly_the_three_isolated_lanes(self):
-        self.assertEqual(self.tasks["check"]["depends"], ["check:cli", "check:host", "check:ui"])
-        self.assertEqual([entry["task"] for entry in self.tasks["test"]["run"]], ["test:cli", "test:host", "test:ui"])
+        groups = [entry["tasks"] for entry in self.tasks["check"]["run"] if isinstance(entry, dict)]
+        self.assertEqual(groups, [["check:cli", "check:host", "check:ui"]])
+        self.assertEqual([entry["task"] for entry in self.tasks["test"]["run"] if isinstance(entry, dict)],
+                         ["test:cli", "test:host", "test:ui"])
 
     def test_nothing_is_task_cached(self):
         # Cargo decides what is stale; native runs and mutable state are never artifacts.
@@ -120,12 +122,19 @@ class Behavior(unittest.TestCase):
         checkout = self.root / "checkout"
         (checkout / "scripts").mkdir(parents=True)
         shutil.copy(CONFIG, checkout / "mise.toml")
+        shutil.copy(ROOT / "rust-toolchain.toml", checkout / "rust-toolchain.toml")
         scripts = {script for task in load()["tasks"].values() for command in commands(task)
                    for script in SCRIPT.findall(command)}
         for script in scripts:
             path = checkout / script
             path.write_text(RECORDER)
             path.chmod(0o755)
+        # Tools a task runs by name record their calls too.
+        tools = self.root / "bin"
+        tools.mkdir()
+        for name in ("rustup",):
+            (tools / name).write_text(RECORDER)
+            (tools / name).chmod(0o755)
         global_config = self.root / "global.toml"
         global_config.write_text("")
         self.checkout = checkout
@@ -136,6 +145,7 @@ class Behavior(unittest.TestCase):
         self.environment = {
             key: value for key, value in os.environ.items() if not key.startswith("MISE_")
         } | {
+            "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
             "MISE_TASKS_LOG": str(self.log),
             "MISE_GLOBAL_CONFIG_FILE": str(global_config),
             "MISE_TRUSTED_CONFIG_PATHS": str(checkout),
@@ -147,7 +157,12 @@ class Behavior(unittest.TestCase):
             "MISE_AUTO_INSTALL": "0",
             "MISE_YES": "1",
         }
-        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        self.git("init", "-q")
+
+    def git(self, *arguments):
+        subprocess.run(["git", "-C", str(self.checkout), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", *arguments],
+                       check=True, capture_output=True)
 
     def mise_run(self, *arguments, status=0):
         environment = self.environment | {"MISE_TASKS_STATUS": str(status)}
@@ -226,6 +241,48 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("test:scripts", "native evidence", "2/3").returncode, 0)
         recorded = [call[1:] for call in self.calls()]
         self.assertEqual(recorded, [["verify"], ["run"], ["verify"], ["run", "native evidence", "2/3"]])
+
+    def test_aggregates_refuse_arguments_instead_of_running_every_lane_whole(self):
+        for task in ("check", "test", "ci"):
+            with self.subTest(task=task):
+                result = self.mise_run(task, "--", "--lib", "x")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("takes no arguments", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_ci_aggregate_runs_formatting_protocol_and_every_suite(self):
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.mise_run("ci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(call[0] for call in self.calls()), sorted([
+            "check-format", "check-protocol-contract", "check-older-clients", "check-update-sources",
+            "script-contracts", "script-contracts",
+        ]))
+
+    def test_setup_installs_the_toolchain_rust_toolchain_toml_names_then_runs_the_doctor(self):
+        toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
+        result = self.mise_run("setup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [
+            ["rustup", "toolchain", "install", "--no-self-update", toolchain["channel"],
+             "--profile", toolchain["profile"], *(f"--component={c}" for c in toolchain["components"])],
+            ["doctor"],
+        ])
+
+    def test_the_protocol_check_defaults_to_the_merge_base_and_refuses_without_one(self):
+        result = self.mise_run("check:protocol")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pass --base REF", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        base = subprocess.run(["git", "-C", str(self.checkout), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("commit", "-q", "--allow-empty", "-m", "change")
+        result = self.mise_run("check:protocol")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[0], ["check-protocol-contract", "--base-ref", base])
 
     def test_the_protocol_check_compares_with_the_chosen_base(self):
         result = self.mise_run("check:protocol", "--base", "abc123")
