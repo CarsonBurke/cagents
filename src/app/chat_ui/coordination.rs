@@ -649,6 +649,29 @@ fn muted_glyph(icon: Icon) -> Element<'static, Message> {
         .into()
 }
 
+/// A card caption stays one line; the fade handles the space the pane offers.
+/// Keep shaping bounded while the tooltip retains the complete source text.
+fn faded_caption(text: String, title: bool, tooltip: String) -> Element<'static, Message> {
+    let preview = turn::headline(text);
+    let text = if title {
+        chat_title(preview)
+    } else {
+        design::caption(preview)
+    };
+    crate::interaction::tooltip(
+        crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
+            widget::scrollable(text.wrapping(iced::widget::text::Wrapping::None))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill)
+                .height(design::LINE_BODY),
+            design::raised,
+        )),
+        tooltip,
+    )
+}
+
 /// How a card's status line reads.
 #[derive(Clone, Copy)]
 enum Tone {
@@ -724,10 +747,11 @@ impl Runtime {
             .find(|agent| agent.id == listed)
     }
 
-    /// The name an agent's tab shows, where this conversation lists it.
+    /// A listed agent's full name and distinguishing ordinal. Transcript rows
+    /// bound their own visible previews while retaining this accessible name.
     pub(super) fn listed_agent_name(&self, address: &str) -> Option<String> {
         self.subagent(address)
-            .map(|agent| self.child_label(agent, 80).into_owned())
+            .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
     /// The agents a step names that this conversation lists, each once.
@@ -983,7 +1007,11 @@ impl Runtime {
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
         let mut parts: Vec<Element<'static, Message>> = Vec::new();
         if !recipient.name.is_empty() {
-            parts.push(chat_title(recipient.name.clone()).into());
+            parts.push(faded_caption(
+                recipient.name.clone(),
+                true,
+                recipient.name.clone(),
+            ));
         }
         let Some(session) = &recipient.session else {
             return parts;
@@ -997,12 +1025,14 @@ impl Runtime {
                 .into()
         };
         parts.push(if recipient.live {
-            widget::button::custom(label)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([0, step::GAP_XS as u16])
-                .name(format!("Go to session {shown}"))
-                .on_press(action(Action::OpenSession(session.clone())))
-                .into()
+            crate::interaction::tooltip(
+                widget::button::custom(label)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([0, step::GAP_XS as u16])
+                    .name(format!("Go to session {shown}"))
+                    .on_press(action(Action::OpenSession(session.clone()))),
+                format!("Go to session {session}"),
+            )
         } else {
             label
         });
@@ -1025,14 +1055,16 @@ impl Runtime {
         let recipient = recipient(message, reading, &|id| self.listed_agent_name(id));
         let mut heading = vec![
             self.card_indicator(status, Icon::Send),
-            design::caption(message_verb(message.kind)).into(),
+            design::caption(message_verb(message.kind))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
         ];
         heading.extend(self.session_link(&recipient));
         rows.push(
             widget::row::with_children(heading)
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
-                .wrap()
+                .width(Length::Fill)
                 .into(),
         );
         // An agent's tab names it by its type, which several agents share;
@@ -1049,12 +1081,9 @@ impl Runtime {
                 .filter(|task| !task.is_empty() && *task != recipient.name),
             _ => None,
         };
-        let caption = match task {
-            Some(task) => Self::short_description(task, 80),
-            None => message.summary.trim().to_owned(),
-        };
+        let caption = task.unwrap_or(message.summary.trim()).to_owned();
         if !caption.is_empty() {
-            rows.push(design::caption(caption).into());
+            rows.push(faded_caption(caption.clone(), false, caption));
         }
         rows.extend(self.text_block(
             item,
@@ -1143,8 +1172,8 @@ impl Runtime {
             _ => None,
         }
         .unwrap_or_else(|| started(spawn));
-        // CLI details sit beneath their existing compact heading. Native
-        // subagents retain their original heading and transcript controls.
+        // CLI details sit beneath their compact heading; native subagents
+        // keep the shared disclosure presentation.
         if !reading.cli {
             let indicator = match background
                 .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
@@ -1161,22 +1190,19 @@ impl Runtime {
             rows.push(
                 widget::row::with_children(vec![
                     indicator,
-                    crate::interaction::tooltip(
-                        chat_title(Self::short_description(
-                            primary
-                                .lines()
-                                .map(str::trim)
-                                .find(|line| !line.is_empty())
-                                .unwrap_or(&primary),
-                            80,
-                        ))
-                        .width(Length::Fill),
-                        task,
-                    )
-                    .into(),
+                    faded_caption(
+                        primary.clone(),
+                        true,
+                        if primary == task {
+                            task
+                        } else {
+                            format!("{primary}\n{task}")
+                        },
+                    ),
                 ])
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
+                .width(Length::Fill)
                 .into(),
             );
         }
@@ -1211,7 +1237,15 @@ impl Runtime {
             );
         }
         if let Some(brief) = &coordinated.brief {
-            rows.push(self.folded_markdown(item, cached, "brief", brief, "Shared brief", settings));
+            rows.push(self.folded_markdown(
+                item,
+                cached,
+                "brief",
+                brief,
+                "Shared brief",
+                settings,
+                design::raised,
+            ));
         }
         let several = spawn.agents.len() > 1;
         for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
@@ -1339,9 +1373,15 @@ impl Runtime {
     ) -> Option<Element<'static, Message>> {
         Some(match (text, content) {
             (Text::Inline(text), _) if text.trim().is_empty() => return None,
-            (Text::Inline(_), Some(content)) => {
-                self.folded_markdown(item, cached, part, content, unfold, settings)
-            }
+            (Text::Inline(_), Some(content)) => self.folded_markdown(
+                item,
+                cached,
+                part,
+                content,
+                unfold,
+                settings,
+                design::raised,
+            ),
             (Text::File(path), _) => design::caption(format!("The contents of {path}")).into(),
             _ => design::caption("Read from standard input, which the transcript does not show")
                 .into(),
@@ -1358,20 +1398,28 @@ impl Runtime {
         content: &markdown::Content,
         unfold: &'static str,
         settings: markdown::Settings,
+        surface: fn(&cosmic::Theme) -> iced::Color,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
         let open = self.part_unfolded(&key);
-        let toggle =
-            widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Unfold(self.target, key)));
+        let label = if open { "Show less" } else { unfold }.to_owned();
+        let toggle = disclosure::row_on(
+            label.clone(),
+            label,
+            Icon::Chat,
+            None,
+            None,
+            Some(open),
+            Some(Action::Unfold(self.target, key)),
+            surface,
+        );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
             toggle,
             !open,
             view::DELIVERY_FOLDED_HEIGHT,
             step::GAP_S,
-            design::raised,
+            surface,
         )
     }
 
@@ -1425,7 +1473,15 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-                self.folded_markdown(item, cached, part, content, "Show more", settings),
+                self.folded_markdown(
+                    item,
+                    cached,
+                    part,
+                    content,
+                    "Show more",
+                    settings,
+                    design::sunken,
+                ),
             ])
             .spacing(step::GAP_XS),
         )
@@ -1459,12 +1515,13 @@ impl Runtime {
             controls.push(
                 widget::button::custom(
                     widget::row::with_children(vec![
-                        design::caption(label).into(),
+                        design::caption(label.clone()).into(),
                         muted_glyph(Icon::Jump),
                     ])
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
                 )
+                .name(label)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(Action::SelectSubagent(
@@ -1475,20 +1532,28 @@ impl Runtime {
             );
         }
         let open = self.item_expanded(&item.id);
-        let source = match &item.content {
-            ItemContent::Command { .. } => "command",
-            _ => "tool call",
+        let (source, icon) = match &item.content {
+            ItemContent::Command { .. } => ("command", Icon::Terminal),
+            _ => ("tool call", Icon::Utilities),
         };
-        controls.push(
-            widget::button::custom(design::caption(if open {
-                format!("Hide {source}")
+        let label = if open {
+            format!("Hide {source}")
+        } else {
+            format!("Show {source}")
+        };
+        let disclosure = disclosure::row_on(
+            label.clone(),
+            label,
+            icon,
+            Some(if overruled {
+                ToolStatus::Failed
             } else {
-                format!("Show {source}")
-            }))
-            .class(crate::ui_controls::control_style(open, None))
-            .padding([step::GAP_XS as u16, step::GAP_S as u16])
-            .on_press(action(Action::Toggle(self.target, item.id.clone())))
-            .into(),
+                item.content.status().unwrap_or(ToolStatus::Succeeded)
+            }),
+            disclosure::item_duration(item, self.source_now_ms()),
+            Some(open),
+            Some(Action::Toggle(self.target, item.id.clone())),
+            design::raised,
         );
         // A step the CLI said failed is not "Completed" for its exit status,
         // and an agent left running in the background is not done because
@@ -1528,9 +1593,19 @@ impl Runtime {
                     .into(),
             );
         }
-        widget::row::with_children(controls)
+        let mut rows = Vec::new();
+        if !controls.is_empty() {
+            rows.push(
+                widget::row::with_children(controls)
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        rows.push(disclosure);
+        widget::column::with_children(rows)
             .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
             .width(Length::Fill)
             .into()
     }
@@ -1554,6 +1629,278 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    #[test]
+    fn agent_card_captions_fade_without_injecting_ellipsis_or_mutating_source() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Captions(Vec<String>);
+        impl Operation for Captions {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let name = format!("Reviewer {}", "界".repeat(300));
+        let task = format!("Verify {}\nRetain the full task", "permissions ".repeat(80));
+        let items = [
+            (
+                "spawn",
+                "Agent",
+                serde_json::json!({
+                    "subagent_type": name,
+                    "description": task,
+                    "prompt": "Review the fixture"
+                }),
+            ),
+            (
+                "message",
+                "SendMessage",
+                serde_json::json!({
+                    "to": "spawn",
+                    "message": "Review the fixture",
+                    "summary": "Review request"
+                }),
+            ),
+        ]
+        .map(|(id, tool, input)| chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: tool.into(),
+                input: input.to_string(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        });
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&items);
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "spawn".into(),
+                kind: name.clone(),
+                description: task.clone(),
+                status: ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: Vec::new(),
+            });
+        let renderer = crate::app::tests::headless_renderer();
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        for (index, item) in items.iter().enumerate() {
+            let cached = &runtime.cache[&item.id];
+            let coordinated = cached.coordination.as_deref().unwrap();
+            let mut rows = Vec::new();
+            match &coordinated.reading.kind {
+                Kind::Spawn(spawn) => runtime.spawn_rows(
+                    &mut rows,
+                    item,
+                    cached,
+                    coordinated,
+                    spawn,
+                    ToolStatus::Succeeded,
+                    "",
+                    settings,
+                ),
+                Kind::Message(message) => runtime.message_rows(
+                    &mut rows,
+                    item,
+                    cached,
+                    coordinated,
+                    message,
+                    ToolStatus::Succeeded,
+                    "",
+                    settings,
+                ),
+                _ => panic!("fixture is an agent card"),
+            }
+            for (row, mut element) in rows.into_iter().take(index + 1).enumerate() {
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+                );
+                let mut captions = Captions(Vec::new());
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut captions,
+                );
+                let expected = if index == 1 && row == 0 {
+                    vec!["Message to".to_owned(), turn::headline(name.clone())]
+                } else {
+                    vec![turn::headline(if index == 0 {
+                        name.clone()
+                    } else {
+                        task.clone()
+                    })]
+                };
+                assert_eq!(captions.0, expected);
+                assert!(captions.0.iter().all(|text| !text.contains(['…', '\n'])));
+                assert_eq!(node.size().width, 200.0);
+                assert!(
+                    node.size().height <= design::LINE_BODY,
+                    "the whole heading must stay one line"
+                );
+            }
+            assert_eq!(runtime.snapshot.items[index].as_ref(), item);
+        }
+        // A separate session retains its navigation button alongside the faded
+        // recipient, including when the full recipient name exceeds the pane.
+        let session_message = chat::Item {
+            id: "session-message".into(),
+            content: ItemContent::Command {
+                label: "Send the review request".into(),
+                command: "cagents send 95fcd1b9e0aa 'Review the fixture'".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                output: format!(
+                    "Sent 45d4828a to session 95fcd1b9e0aa \"{name}\"; it arrives as soon as that conversation is idle"
+                ),
+                exit_code: Some(0),
+                duration_ms: None,
+            },
+            ..items[1].clone()
+        };
+        let (session_runtime, _session_handle) =
+            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&session_message));
+        let cached = &session_runtime.cache["session-message"];
+        let coordinated = cached.coordination.as_deref().unwrap();
+        let Kind::Message(message) = &coordinated.reading.kind else {
+            unreachable!()
+        };
+        let mut rows = Vec::new();
+        session_runtime.message_rows(
+            &mut rows,
+            &session_message,
+            cached,
+            coordinated,
+            message,
+            ToolStatus::Succeeded,
+            "",
+            settings,
+        );
+        let mut element = rows.remove(0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+        );
+        assert_eq!(node.size().width, 200.0);
+        assert!(node.size().height <= design::LINE_BODY);
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let link = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().label() == Some("Go to session 95fcd1b9"))
+            .expect("live session navigation survives the bounded heading");
+        let bounds = link.node().bounds().unwrap();
+        assert!(bounds.x0 >= 0.0 && bounds.x1 <= 200.0);
+        assert_eq!(runtime.snapshot.subagents[0].kind, name);
+        assert_eq!(runtime.snapshot.subagents[0].description, task);
+        assert_eq!(
+            runtime.listed_agent_name("spawn").as_deref(),
+            Some(name.as_str())
+        );
+    }
+
+    #[test]
+    fn raw_tool_disclosure_preserves_transcript_link_and_elapsed_in_a_narrow_card() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let item = chat::Item {
+            id: "toolu_send".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "SendMessage".into(),
+                input: serde_json::json!({
+                    "to": "a1892b93e88999a7d",
+                    "message": "Review the change",
+                    "summary": "Review request"
+                })
+                .to_string(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: Some(1_000),
+            at: Some(13_000),
+        };
+        let (mut runtime, _handle) =
+            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "toolu_reviewer".into(),
+                kind: "reviewer".into(),
+                description: "Review the change".into(),
+                status: ToolStatus::Running,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            });
+        runtime.agent_addresses =
+            Arc::new([("a1892b93e88999a7d".into(), "toolu_reviewer".into())].into());
+        let renderer = crate::app::tests::headless_renderer();
+        for open in [false, true] {
+            if open {
+                runtime.expanded.insert(item.id.clone());
+            } else {
+                runtime.expanded.remove(&item.id);
+            }
+            let cached = &runtime.cache[&item.id];
+            let coordinated = cached.coordination.as_deref().unwrap();
+            let mut element = runtime.card_footer(&item, cached, coordinated, false);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 800.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let buttons = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| node.node().role() == Role::Button)
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 2);
+            assert_eq!(buttons[0].node().label(), Some("Transcript"));
+            assert_eq!(
+                buttons[1].node().label(),
+                Some(if open {
+                    "Hide tool call · 12s"
+                } else {
+                    "Show tool call · 12s"
+                })
+            );
+            let bounds = buttons[1].node().bounds().unwrap();
+            assert_eq!(bounds.width(), 240.0);
+        }
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the
