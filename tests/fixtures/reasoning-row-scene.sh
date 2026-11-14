@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics}
-case "$scene" in wide|narrow|web|coordination|diagnostics) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -234,6 +234,63 @@ if sys.argv[1] not in value: raise SystemExit("private clipboard did not retain 
 print("Verified private clipboard contains "+sys.argv[1])
 ' "$1"
 }
+
+# A bounded refresh against main after background-notice normalization changed.
+# Keep the original reasoning frames, but omit redundant old disclosure shots.
+if [ "$scene" = refresh-core ]; then
+    cp "$here/reasoning-row-scene/frames.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: retry the permission probe and verify cleanup.' \
+        "$initial_spawn" 'Reasoning refresh'
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if rg -q '"uuid":"rows-running-1-ack"' "$config/projects"; then ready=true; break; fi
+        sleep 2
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: command stream did not finish' >&2; exit 1; }
+    # Both revisions reach the second live-text delta before the first shot.
+    sleep 46
+    scroll_top
+    shot refresh-working
+    outcome_details refresh-
+    narrow_layout
+    transcript_right=535
+    scroll_top
+    shot refresh-narrow-working
+    printf '%s\n' 'Captured working reasoning, failed/running commands and narrow working reasoning.'
+    exit 0
+fi
+
+if [ "$scene" = refresh-notices ]; then
+    cp "$here/reasoning-row-scene/notices.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: inspect the recorded background notices.' \
+        "$fixture/state/reasoning-refresh-notices-spawn.json" 'Notice refresh'
+    evidence drive wait prepared --timeout 10 >/dev/null
+    scroll_top
+    align_row '^Background command'
+    shot refresh-notices-collapsed
+    click_row '^Background command' 0
+    click_row '^Background command' 1
+    find_row 'summary.txt' >/dev/null
+    shot refresh-command-notices-expanded
+    click_row '^Background command' 1
+    click_row '^Background command' 0
+    align_row 'casmi GPU jobs finishing'
+    click_row 'casmi GPU jobs finishing'
+    find_row 'MONITOR[ _]?END' >/dev/null
+    shot refresh-monitor-expanded
+    click_row 'casmi GPU jobs finishing'
+    align_row 'Agent.*Review GPU'
+    click_row 'Agent.*Review GPU'
+    click_row 'Agent.*Review failed'
+    find_row 'FAILED[ _]?REPORT[ _]?END' >/dev/null
+    shot refresh-reports-expanded
+    printf '%s\n' 'Captured notice folds, background outcomes, full monitor and finished/failed reports.'
+    exit 0
+fi
 
 if [ "$scene" = coordination ]; then
     evidence cli project open "$fixture/project" >/dev/null

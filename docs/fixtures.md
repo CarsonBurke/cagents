@@ -304,6 +304,38 @@ It includes finished empty reasoning, active empty reasoning and a live thought
 that gains a new last line. The Edit input maps to the app's Changes item;
 its patch is synthetic. None of the described commands or tools executes.
 
+For a short comparison against main after the background-notice changes, run
+`refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
+each revision. Build both revisions before starting either session, use
+`--ui-trace`, and keep the same scale and theme. These modes capture seven
+states: working reasoning with finished durations, expanded failed/running
+commands, narrow working reasoning, collapsed notices, expanded background
+command outcomes, a full monitor event, and expanded finished/failed reports.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" refresh-core
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" refresh-notices
+```
+
+`refresh-core` uses the original reasoning frames and waits for the latest live
+line before capturing. Its narrow state adds an unsent blank thread, as below.
+`refresh-notices` opens a separate named workspace and loads
+[`notices.jsonl`](../tests/fixtures/reasoning-row-scene/notices.jsonl), derived
+from the delivery-notices fixture. It preserves successful and failed
+background command notifications, extends the monitor log beyond its preview,
+and adds a failed Agent report beside the finished report. A peer message
+mentions a failure without being a failed report. Its explicit synthetic
+sender ID also exercises sender captions. Every call, acknowledgement and
+notification is recorded input: no command, child agent or monitor executes,
+and no live provider is contacted.
+All provider files stay under the evidence task's private home.
+
+Allow about three minutes for the seven captures, then reserve three minutes
+for live review. Check whole-row targets, keyboard disclosure retention,
+hover/fade continuity and wheel scrolling before stopping. Keep bounded
+CPU/RSS samples and the task's UI trace; this fixture has one working actor,
+one finished actor and an unsent draft, not a large concurrent workload.
+
 Run `wide`, `narrow`, then `web` in the same 1200x900 session on each side:
 
 ```sh
