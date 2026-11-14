@@ -224,8 +224,16 @@ spawn_scene() {
     channel=$(printf '%s' "$channel_json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["channel"]["id"])')
     evidence cli --json agent spawn --provider "$provider" --model "$model" --surface chat \
         --repository "$fixture/project" --channel "$channel" --prompt "$prompt" >"$receipt"
-    evidence drive key ctrl+shift+p >/dev/null
-    evidence drive wait 'Search commands' --timeout 5 >/dev/null
+    # A session that has only just started can miss the first shortcut.
+    local opened=false
+    for _ in 1 2 3; do
+        evidence drive key ctrl+shift+p >/dev/null
+        if evidence drive wait 'Search commands' --timeout 5 >/dev/null 2>&1; then opened=true; break; fi
+        # Close a palette that opened too late to be seen before trying again.
+        evidence drive key Escape >/dev/null
+        sleep 1
+    done
+    [ "$opened" = true ] || { printf '%s\n' 'reasoning-row-scene: command palette did not open' >&2; exit 1; }
     evidence drive type "# $title" >/dev/null
     evidence drive key Return >/dev/null
 }
