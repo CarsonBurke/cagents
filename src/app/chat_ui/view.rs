@@ -11892,6 +11892,16 @@ mod tests {
                                 &format!("chat-reasoning-choice-{index}"),
                             )
                         })
+                        .chain([
+                            card_control_id(runtime.target.card, "chat-reasoning-choice-default"),
+                            card_control_id(
+                                runtime.target.card,
+                                &format!(
+                                    "chat-model-choice-Claude-named-{}",
+                                    runtime.snapshot.selected_model.as_deref().unwrap()
+                                ),
+                            ),
+                        ])
                         .collect(),
                     bounds: Vec::new(),
                 };
@@ -11903,10 +11913,15 @@ mod tests {
                 );
                 assert_eq!(
                     efforts.bounds.len(),
-                    3,
-                    "all advertised effort choices remain mounted"
+                    5,
+                    "Default, all advertised efforts, and the selected model remain mounted"
                 );
                 for bounds in efforts.bounds {
+                    assert_eq!(
+                        bounds.height,
+                        design::list::TWO_LINE_HEIGHT,
+                        "model and effort rows use the same height"
+                    );
                     assert!(
                         bounds.x >= 0.0 && bounds.x + bounds.width <= design::MODEL_POPUP_WIDTH,
                         "effort stays inside the model menu at width {width}, fast {fast}: {bounds:?}"
