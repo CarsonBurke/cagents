@@ -494,6 +494,8 @@ impl Cagents {
             SelectionRow::Channel(id) => {
                 self.handle_channel_ui(channel_ui::Action::RequestDelete(id))
             }
+            // A pane row only points at a pane; the sidebar never closes it.
+            SelectionRow::Card(_) => Task::none(),
         }
     }
 
@@ -556,6 +558,7 @@ impl Cagents {
                     blocker,
                 })
             }
+            SelectionRow::Card(_) => Err("Panes cannot be closed from the sidebar.".into()),
         }
     }
 
@@ -642,6 +645,7 @@ impl Cagents {
             tasks.push(match target.row {
                 SelectionRow::Channel(id) => self.delete_channel(id),
                 SelectionRow::Worktree(project, id) => self.delete_selected_worktree(project, id),
+                SelectionRow::Card(_) => Task::none(),
                 SelectionRow::Project(project_id) => {
                     // Prepare the same project removal used by its row, then
                     // consume the already-confirmed intent without displaying
@@ -728,6 +732,8 @@ impl Cagents {
                      workspace. Nothing outside them is touched.",
                 )
             }
+            // Never selected, so never the kind of a group.
+            SelectionRow::Card(_) => (None, ""),
         }
     }
 
