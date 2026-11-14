@@ -199,6 +199,7 @@ fn patch_label(patch: &chat::FileChangePatch, index: usize) -> String {
         chat::ToolStatus::Succeeded => "",
         chat::ToolStatus::Denied => " · Denied",
         chat::ToolStatus::Stopped => " · Stopped",
+        chat::ToolStatus::Ended => " · Ended",
         chat::ToolStatus::Waiting => " · Waiting on background work",
     };
     let history = if patch.imported {

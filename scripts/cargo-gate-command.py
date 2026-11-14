@@ -155,6 +155,20 @@ def main():
         # the primary and allow its PID to be reused before cleanup ends.
         return os.waitid(os.P_PID, primary.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
 
+    def adopted_children():
+        return [pid for pid in map(int, children_path.read_text().split()) if pid != primary.pid]
+
+    def reap_exited_adoptees():
+        # Descendants whose parents exit are adopted by this subreaper, such
+        # as the intermediate process and then the master of an offload's
+        # ssh ControlPersist connection. Left unreaped, each that finishes
+        # stays a zombie for the rest of the build.
+        # Reap only listed PIDs that have already exited, never waitpid(-1):
+        # the primary stays unreaped to reserve its PID, and live adoptees
+        # keep theirs for drain().
+        for pid in adopted_children():
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG)
+
     def send(pid, number):
         try:
             os.kill(pid, number)
@@ -174,9 +188,7 @@ def main():
             force = time.monotonic() >= deadline
             if force:
                 send(primary.pid, signal.SIGKILL)
-            children = [int(value) for value in children_path.read_text().split()]
-            others = [pid for pid in children if pid != primary.pid]
-            for pid in others:
+            for pid in adopted_children():
                 # These are this supervisor's actual unreaped children. With
                 # SIGCHLD at default and one waiter, their IDs cannot be reused
                 # before this loop reaps them. Adoption includes setsid children.
@@ -213,6 +225,7 @@ def main():
                 # may outlive successful commands; only cancellation drains.
                 status = primary.wait()
                 return status if status >= 0 else 128 - status
+            reap_exited_adoptees()
             time.sleep(0.02)
     except BaseException:
         # A supervisor failure after launch must not release a live build.

@@ -1,0 +1,398 @@
+#!/usr/bin/python3
+"""Plan, verify and run the repository's script contract suites.
+
+CI checks out a single revision, a pull request's merge result or a main
+commit, and every job runs this script from that revision. The suite list and
+the files it tests therefore always come from the same commit; there is no
+older-head applicability case to tolerate.
+
+  verify            refuse missing, symlinked or unlisted suites and bad shell
+                    syntax; every problem is reported at once
+  plan              print the CI matrix, one entry per job shard
+  protocol-base     print the commit the protocol contract compares with
+  run JOB [SHARD]   run one job's suites; SHARD (I/N) runs every Nth test of a
+                    sharded job's single suite, so the shards cover it exactly
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class Suite:
+    name: str
+    fixture: str
+    sources: tuple[str, ...] = ()
+    # (shell, path) pairs whose syntax is checked before anything executes.
+    syntax: tuple[tuple[str, str], ...] = ()
+    isolated: bool = True
+    env: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Job:
+    name: str
+    suites: tuple[Suite, ...]
+    shards: int = 1
+
+
+# Jobs run in parallel; keep each at a few minutes on a hosted runner. A
+# sharded job holds a single suite.
+JOBS = (
+    Job("native evidence", shards=3, suites=(
+        Suite("native evidence", "tests/native_evidence.py",
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py"),
+              syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
+    )),
+    Job("build offload", shards=2, suites=(
+        Suite("build offload", "tests/cargo_offload.py", sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py")),
+    )),
+    Job("cargo gate", suites=(
+        Suite("held-command cancellation", "tests/cargo_gate.py",
+              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py"),
+              syntax=(("sh", "scripts/cargo-gate"),)),
+    )),
+    Job("build directories", suites=(
+        Suite("build directory pruning", "tests/prune_build_dirs.py", sources=("scripts/prune-build-dirs",)),
+        Suite("build directory seeding", "tests/seed_build_dir.py", sources=("scripts/seed-build-dir",),
+              syntax=(("sh", "scripts/seed-build-dir"),)),
+        Suite("build disk guard and gate install", "tests/build_disk_guard.py",
+              sources=("scripts/build-disk-guard", "scripts/install-cargo-gate", "scripts/cargo_artifacts.py"),
+              syntax=(("sh", "scripts/build-disk-guard"), ("sh", "scripts/install-cargo-gate"))),
+        Suite("lock holders", "tests/lock_holders.py", sources=("scripts/lock-holders",)),
+        Suite("native slots", "tests/native_slots.py", sources=("scripts/native_slots.py",)),
+        Suite("memory limit", "tests/memory_capped.py", sources=("scripts/memory-capped",)),
+        Suite("workload time limit", "tests/bounded.py", sources=("scripts/bounded",)),
+        Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib",)),
+        Suite("HOST test helper", "tests/cargo_host_test_helper.py",
+              sources=("scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py")),
+        Suite("main build sentinel", "tests/main_build_sentinel.py", sources=("scripts/main-build-sentinel",)),
+    )),
+    Job("tooling", suites=(
+        Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
+        Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
+        Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
+        Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
+        Suite("formatter", "tests/check_format.py",
+              sources=("scripts/check-format", "scripts/check-format-cache.py"),
+              isolated=False, env=(("CHECK_FORMAT_CARGO_FIXTURE", "1"),)),
+        Suite("validation checkout", "tests/prepare_validation_checkout.py",
+              sources=("scripts/prepare-validation-checkout",)),
+        Suite("process custody", "tests/qualification/test_process_custody.py",
+              sources=("scripts/qualification/process_custody.py",)),
+        Suite("synthetic Claude provider", "tests/chat_composer_provider.py",
+              sources=("tests/fixtures/chat-composer-claude.sh",)),
+        Suite("synthetic Claude streaming", "tests/chat_composer_streaming.py",
+              sources=("tests/fixtures/chat-composer-claude.sh",)),
+        Suite("Codex resume history", "tests/codex_resume_history.py",
+              sources=("tests/fixtures/codex-resume-history.py",)),
+        Suite("Codex busy buttons", "tests/codex_busy_buttons_fixture.py",
+              sources=("tests/fixtures/codex-child-errors.py", "tests/fixtures/fixture-codex.sh"),
+              syntax=(("sh", "tests/fixtures/fixture-codex.sh"),)),
+        Suite("local install head check", "tests/install_local.py", sources=("scripts/install-local",),
+              syntax=(("bash", "scripts/install-local"),)),
+        Suite("GitHub status bootstrap", "tests/gh-pr-status.py",
+              sources=("scripts/gh-pr-status", "scripts/cargo_artifacts.py")),
+        Suite("GitHub request telemetry", "tests/gh-observe.py", sources=("scripts/gh-observe",)),
+        Suite("GitHub request coordination", "tests/gh-coordinate.py", sources=("scripts/gh-coordinate.py",)),
+    )),
+)
+
+# Suites CI runs in its source job, which needs the comparison base and rustfmt.
+SOURCE_JOB_FIXTURES = (
+    "tests/protocol_contract.py",
+    "tests/check_older_clients.py",
+    "tests/check_update_sources.py",
+)
+
+# Python suites deliberately outside the script contracts, so that a new suite
+# is scheduled or excluded on purpose rather than silently never running.
+UNSCHEDULED = (
+    "tests/ceditor_artifacts.py",
+    "tests/ceditor_package_artifacts.py",
+    "tests/chat_composer_task_receipts.py",
+    "tests/checkout_cache_artifacts.py",
+    "tests/checkout_cache_git_environment.py",
+    "tests/codex_tool_rows_fixture.py",
+    "tests/hot-development.py",
+    "tests/installer_desktop_entries.py",
+    "tests/installer_platform.py",
+    "tests/linux_ui_font_exports.py",
+    "tests/package_linux_artifacts.py",
+    "tests/publish_release_git_environment.py",
+    "tests/redraw_latency.py",
+    "tests/rehearse_codex.py",
+    "tests/rehearse_update.py",
+    "tests/rehearse_update_retry.py",
+    "tests/rehearse_update_retry_bind.py",
+    "tests/rehearse_update_staging.py",
+    "tests/release_artifact_smoke.py",
+    "tests/release_editor_archive.py",
+    "tests/release_host_helper.py",
+    "tests/release_package_dependencies.py",
+    "tests/terminal_escape_fixture.py",
+)
+
+# Shell entry points that have no suite of their own.
+SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"))
+
+# Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT`: execute the fixture as
+# __main__, but let its unittest.main() run only every COUNT-th test, in id
+# order, starting at INDEX. unittest's own loader enumerates the tests, so
+# inherited and generated tests are included and the shards partition the suite.
+SHARD = r"""
+import runpy
+import sys
+import unittest
+from pathlib import Path
+
+fixture, index, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+called = False
+
+
+def flatten(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from flatten(test)
+        else:
+            yield test
+
+
+def main(*_arguments, **_options):
+    global called
+    called = True
+    tests = sorted(flatten(unittest.TestLoader().loadTestsFromModule(sys.modules["__main__"])), key=lambda test: test.id())
+    selected = tests[index::count]
+    print(f"Shard {index + 1}/{count}: {len(selected)} of {len(tests)} tests", flush=True)
+    if not selected:
+        print("Empty shard: lower the job's shard count", file=sys.stderr)
+        raise SystemExit(2)
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(selected))
+    raise SystemExit(0 if result.wasSuccessful() else 1)
+
+
+unittest.main = main
+# Match `python3 [-I] -B FIXTURE`: an absolute __file__, and the fixture's
+# directory first on sys.path only when not isolated.
+script = str(Path(fixture).resolve())
+sys.argv = [fixture]
+if not sys.flags.isolated:
+    sys.path[0] = str(Path(script).parent)
+try:
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as exit:
+    # A failure before unittest.main() stays a failure; only success is suspect.
+    if called or exit.code not in (None, 0):
+        raise
+if not called:
+    print(f"{fixture} never called unittest.main(), so it cannot be sharded", file=sys.stderr)
+    raise SystemExit(2)
+"""
+
+
+UNITTEST_IMPORT = re.compile(r"^\s*(?:import\s+unittest\b|from\s+unittest\b)", re.MULTILINE)
+
+
+class ContractError(Exception):
+    pass
+
+
+def regular_file(root, relative):
+    """Return a problem if RELATIVE is not a regular file reached through real directories."""
+    parts = Path(relative).parts
+    current = root
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return f"{relative}: missing"
+        expected = stat.S_ISREG if index == len(parts) - 1 else stat.S_ISDIR
+        if not expected(mode):
+            return f"{relative}: must be a regular file reached through real directories, never a symlink"
+    return None
+
+
+def manifest_problems(jobs):
+    problems = []
+    job_names = [job.name for job in jobs]
+    suite_names = [suite.name for job in jobs for suite in job.suites]
+    for kind, names in (("job", job_names), ("suite", suite_names)):
+        problems += [f"Duplicate {kind} name: {name}" for name in sorted({n for n in names if names.count(n) > 1})]
+    for job in jobs:
+        if not job.suites:
+            problems.append(f"Job {job.name} has no suites")
+        if job.shards < 1:
+            problems.append(f"Job {job.name} needs at least one shard")
+        if job.shards > 1 and len(job.suites) != 1:
+            problems.append(f"Sharded job {job.name} must hold exactly one suite")
+    return problems
+
+
+def listed_fixtures(jobs):
+    return [suite.fixture for job in jobs for suite in job.suites]
+
+
+def unittest_files(root):
+    found = []
+    for path in sorted((root / "tests").rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        if "/fixtures/" in f"/{relative}" or path.is_symlink() or not path.is_file():
+            continue
+        if UNITTEST_IMPORT.search(path.read_text(errors="replace")):
+            found.append(relative)
+    return found
+
+
+def files_and_syntax(root, suites, extra_paths=(), extra_syntax=()):
+    """Problems with the suites' files and shell syntax; nothing is executed."""
+    paths = sorted({path for suite in suites
+                    for path in (suite.fixture, *suite.sources, *(p for _, p in suite.syntax))}
+                   | set(extra_paths) | {p for _, p in extra_syntax})
+    problems = [problem for problem in (regular_file(root, path) for path in paths) if problem]
+    syntax = sorted({pair for suite in suites for pair in suite.syntax} | set(extra_syntax))
+    for shell, path in syntax:
+        if regular_file(root, path):
+            continue
+        result = subprocess.run([shell, "-n", path], cwd=root, capture_output=True, text=True)
+        if result.returncode:
+            problems.append(f"{path}: {shell} syntax error\n{result.stderr.rstrip()}")
+    return problems
+
+
+def verify(root, jobs=JOBS, unscheduled=UNSCHEDULED, source_fixtures=SOURCE_JOB_FIXTURES, shell_syntax=SHELL_SYNTAX):
+    problems = manifest_problems(jobs)
+    fixtures = listed_fixtures(jobs)
+    problems += [f"Fixture listed more than once: {f}" for f in sorted({f for f in fixtures if fixtures.count(f) > 1})]
+    for path in sorted(set(unscheduled) & set(fixtures)):
+        problems.append(f"{path}: both scheduled and listed as unscheduled")
+    known = set(fixtures) | set(source_fixtures) | set(unscheduled)
+    for path in unittest_files(root):
+        if path not in known:
+            problems.append(f"{path}: unlisted unittest suite; add it to a job in scripts/script-contracts, or to UNSCHEDULED")
+    suites = [suite for job in jobs for suite in job.suites]
+    return problems + files_and_syntax(root, suites, source_fixtures, shell_syntax)
+
+
+def plan(jobs=JOBS):
+    return [
+        {"job": job.name, "shard": f"{index}/{job.shards}",
+         "label": job.name if job.shards == 1 else f"{job.name} {index}/{job.shards}"}
+        for job in jobs for index in range(1, job.shards + 1)
+    ]
+
+
+def parse_shard(text, shards):
+    try:
+        index, count = (int(part) for part in text.split("/"))
+    except ValueError:
+        raise ContractError(f"Shard must be I/N, not {text!r}") from None
+    if count != shards or not 1 <= index <= count:
+        raise ContractError(f"Shard {text} does not match this job's {shards} shard(s)")
+    return index - 1, count
+
+
+def command(suite, shard=None):
+    flags = ["-I", "-B"] if suite.isolated else ["-B"]
+    if shard is None:
+        return [sys.executable, *flags, suite.fixture, "-v"]
+    index, count = shard
+    return [sys.executable, *flags, "-c", SHARD, suite.fixture, str(index), str(count)]
+
+
+def run(root, job_name, shard_text=None, jobs=JOBS):
+    job = next((job for job in jobs if job.name == job_name), None)
+    if job is None:
+        raise ContractError(f"Unknown job {job_name!r}; choose one of: {', '.join(j.name for j in jobs)}")
+    shard = parse_shard(shard_text or "1/1", job.shards)
+    if job.shards == 1:
+        shard = None
+    problems = files_and_syntax(root, job.suites)
+    if problems:
+        raise ContractError("; ".join(problems))
+    failures = []
+    for suite in job.suites:
+        print(f"::group::{suite.name}" if os.environ.get("GITHUB_ACTIONS") == "true" else f"== {suite.name}", flush=True)
+        for path in (*suite.sources, suite.fixture):
+            print(f"{hashlib.sha256((root / path).read_bytes()).hexdigest()}  {path}", flush=True)
+        environment = {**os.environ, **dict(suite.env)}
+        returncode = subprocess.run(command(suite, shard), cwd=root, env=environment).returncode
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::endgroup::", flush=True)
+        if returncode:
+            failures.append((suite.name, returncode))
+    for name, returncode in failures:
+        print(f"Failed: {name} (exit {returncode})", file=sys.stderr)
+    return failures[0][1] if failures else 0
+
+
+def protocol_base(root, event, before=None, fetch=True):
+    """The commit the protocol contract compares this revision with.
+
+    A pull request's merge result is compared with the base side of its merge;
+    a main push with the commit it replaced, fetched if the checkout is shallow.
+    """
+    def git(*arguments, **options):
+        return subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True, **options)
+
+    if event == "pull_request":
+        parents = git("rev-list", "--parents", "-n", "1", "HEAD").stdout.split()[1:]
+        if len(parents) != 2:
+            raise ContractError("A pull request is tested as its two-parent merge result; HEAD is not one")
+        return parents[0]
+    if event != "push":
+        raise ContractError(f"No protocol comparison base for a {event!r} event")
+    if not re.fullmatch(r"[0-9a-f]{40}", before or "") or before == "0" * 40:
+        raise ContractError("A trusted comparison base is required for the protocol contract")
+    if git("cat-file", "-e", f"{before}^{{commit}}").returncode:
+        if not fetch or git("fetch", "--no-tags", "--depth=1", "origin", before).returncode:
+            raise ContractError(f"Cannot fetch the comparison base {before}")
+    return before
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("verify")
+    commands.add_parser("plan")
+    base_parser = commands.add_parser("protocol-base")
+    base_parser.add_argument("--event", required=True)
+    base_parser.add_argument("--before")
+    run_parser = commands.add_parser("run")
+    run_parser.add_argument("job")
+    run_parser.add_argument("shard", nargs="?")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    try:
+        if args.command == "verify":
+            problems = verify(root)
+            for problem in problems:
+                print(f"Script contracts refused: {problem}", file=sys.stderr)
+            if not problems:
+                print(f"Verified {sum(len(job.suites) for job in JOBS)} suites in {len(JOBS)} jobs", flush=True)
+            return 2 if problems else 0
+        if args.command == "protocol-base":
+            print(protocol_base(root, args.event, args.before))
+            return 0
+        if args.command == "plan":
+            print(json.dumps(plan(), separators=(",", ":")))
+            return 0
+        return run(root, args.job, args.shard)
+    except ContractError as error:
+        print(f"Script contracts refused: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

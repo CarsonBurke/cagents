@@ -6,8 +6,9 @@ host in CAGENTS_BUILD_REMOTE, unless that is `local` or names this host. A
 command that compiles leases a build slot there, copies the
 checkout's sources into it, and runs Cargo there with its output streamed
 back and its exit status kept. What a caller here expects from it comes back:
-executables, documentation, timing reports, artifact directories, fixes to
-the sources, and Cargo's messages with their paths turned into this host's.
+executables, documentation, timing reports, artifact directories, what the
+command wrote in the sources (Cargo's fixes, a test's recording), and Cargo's
+messages with their paths turned into this host's.
 `run` builds there and runs the program here.
 
 Each slot's checkout path never changes, so every worktree built in a slot
@@ -31,6 +32,7 @@ faithfully is refused with the reason.
 import base64
 import contextlib
 import fcntl
+import filecmp
 import hashlib
 import ipaddress
 import json
@@ -594,7 +596,7 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import collections, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
+import base64, collections, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -1893,6 +1895,52 @@ def registered(base):
     return found
 
 
+CHECKOUT_BEFORE = "checkout-before.json"
+
+def checkout_state(source, skip):
+    """Each file and link of the slot's checkout outside the directories in
+    `skip`, by its path in bytes, with what writing it changes: its size,
+    times and inode. A write that keeps the old modification time, as a
+    copy that preserves it does, still changes the status-change time."""
+    root = os.fsencode(source)
+    skip = {os.fsencode(os.path.realpath(path)) for path in skip}
+    state = {}
+    for directory, names, files in os.walk(root):
+        links = [name for name in names if os.path.islink(os.path.join(directory, name))]
+        names[:] = [name for name in names if name not in links
+                    and os.path.realpath(os.path.join(directory, name)) not in skip]
+        for name in files + links:
+            path = os.path.join(directory, name)
+            try:
+                status = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            state[os.path.relpath(path, root)] = [
+                status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+    return state
+
+def record_checkout(slot, skip):
+    """What the slot's checkout holds as a command starts, for `written`."""
+    record = {"skip": list(skip), "files": {
+        base64.b64encode(name).decode(): state
+        for name, state in checkout_state(os.path.join(slot, "src"), skip).items()}}
+    with open(os.path.join(slot, CHECKOUT_BEFORE + ".new"), "w") as file:
+        json.dump(record, file)
+    os.replace(os.path.join(slot, CHECKOUT_BEFORE + ".new"), os.path.join(slot, CHECKOUT_BEFORE))
+
+def written_since(slot):
+    """The files the last command added to the slot's checkout or wrote in
+    it, by base64 path, each with whether it is new."""
+    try:
+        with open(os.path.join(slot, CHECKOUT_BEFORE)) as file:
+            record = json.load(file)
+    except (OSError, ValueError):
+        return []
+    before = {base64.b64decode(name): state for name, state in record["files"].items()}
+    return [[base64.b64encode(name).decode(), name not in before]
+            for name, state in sorted(checkout_state(os.path.join(slot, "src"), record["skip"]).items())
+            if before.get(name) != state]
+
 def enclosing_checkout(path):
     """A Git marker above `path`, under which tests that check Git ancestry
     fail, or None."""
@@ -2199,6 +2247,13 @@ elif command == "prune":
         if relative not in keep_dirs and not os.listdir(directory):
             os.rmdir(directory)
 
+elif command == "written":
+    # What the last command wrote in the slot's checkout, once it and
+    # whatever it left running have ended: see record_checkout.
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
+    print(json.dumps(written_since(base)))
+
 elif command == "busiest":
     # For scripts/cargo-gate's own wait on this host; `base` is unused. After
     # an optional `--bounded PATH`, each argument is a running build's holder
@@ -2326,6 +2381,11 @@ elif command == "run":
             directories = {}
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
+    # Outside its build output, as the command starts: what it writes comes back.
+    outputs = [os.path.join(base, "src", "target"), *request.get("outputs", [])]
+    if request.get("directories") is not None:
+        outputs += directories.values()
+    record_checkout(base, outputs)
     if request.get("host_test_helper") is not None:
         # The helper build and test run share this lease, source copy and Cargo
         # environment. Keep it beneath the supervised child, so cancellation
@@ -2333,7 +2393,11 @@ elif command == "run":
         helper = os.path.join(base, "cargo-host-test-helper.py")
         with open(helper, "w") as file:
             file.write(request["host_test_helper"])
-        arguments = [sys.executable, "-I", helper, "--run", *arguments]
+        with open(os.path.join(base, "cargo_artifacts.py"), "w") as file:
+            file.write(request["cargo_artifacts"])
+        # Each invocation supplies its own source. Do not leave bytecode that
+        # could alias a later same-size source update within one timestamp tick.
+        arguments = [sys.executable, "-I", "-B", helper, "--run", *arguments]
     if request.get("memory_cap") is not None:
         # The gate's helper travels with this invocation, including installed
         # gates and arbitrary Cargo workspaces that have no repository scripts.
@@ -2452,6 +2516,60 @@ def sweep_connections(directory, age=120):
         finally:
             probe.close()
         shutil.rmtree(path, ignore_errors=True)
+
+
+def file_state(path):
+    """What writing a file here changes, as the build host's checkout_state
+    records it there, or None when there is nothing at `path`."""
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return [status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+
+
+def same_content(first, second):
+    if os.path.islink(first) or os.path.islink(second):
+        return (os.path.islink(first) and os.path.islink(second)
+                and os.readlink(first) == os.readlink(second))
+    return filecmp.cmp(first, second, shallow=False)
+
+
+def install(staged, path, expected):
+    """Puts the staged copy of a file at `path`: a new one only while nothing
+    is there, an existing one only while it is still as it was sent,
+    `expected`. Returns "taken", "same", "changed" or "appeared"."""
+    if expected is not None:
+        if file_state(path) != expected:
+            return "changed"
+        if same_content(staged, path):
+            return "same"
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return "appeared"  # Something other than a directory is in the way.
+    temporary = os.path.join(directory, b".cagents-offload-" + os.urandom(8).hex().encode())
+    if os.path.islink(staged):
+        os.symlink(os.readlink(staged), temporary)
+    else:
+        shutil.copy2(staged, temporary)
+    try:
+        if expected is None:
+            # Linking, unlike renaming, never replaces what is there.
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                return "appeared"
+            return "taken"
+        if file_state(path) != expected:
+            return "changed"
+        os.replace(temporary, path)
+        temporary = None
+        return "taken"
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
 
 
 class Offload:
@@ -2910,11 +3028,9 @@ class Offload:
         environment.update(self.inputs(slot, top, local_target, remote_target,
                                        {os.fsdecode(name) for name in files}))
         shell = " ".join(shlex.quote(word) for word in self.ssh)
-        sent = {}
-        if plan.fixes:
-            for name in files:
-                status = os.lstat(os.path.join(os.fsencode(top), name))
-                sent[os.fsdecode(name)] = (status.st_size, status.st_mtime_ns)
+        # What each file was as sent, so that one edited here meanwhile keeps
+        # that edit over what the command writes there.
+        sent = {name: file_state(os.path.join(os.fsencode(top), name)) for name in files}
         # Files are compared by content and a changed one is written with
         # the time it arrives, not the time it has here. Cargo judges path
         # crates, such as the vendored patches, by modification time: a
@@ -2965,13 +3081,16 @@ class Offload:
         )
         try:
             request = {"environment": environment,
-                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
+                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
+                       # Build output in the checkout, which does not come back as written.
+                       "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())})}
             if plan.runs_tests:
                 request["memory_cap"] = self.memory_cap
             if plan.subcommand == "test":
                 helper = Path(__file__).resolve().with_name("cargo-host-test-helper.py")
                 if helper.is_file():
                     request["host_test_helper"] = helper.read_text()
+                    request["cargo_artifacts"] = helper.with_name("cargo_artifacts.py").read_text()
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())
@@ -3016,10 +3135,9 @@ class Offload:
             return status
 
         # What the command left for this host, whether or not it succeeded:
-        # fixes it applied before failing, and a failed build's timings.
-        back = 0
-        if plan.fixes:
-            back = back or self.take_fixes(source, top, listing, sent, shell)
+        # what it wrote in the checkout, such as fixes it applied before
+        # failing or a test's recording, and a failed build's timings.
+        back = self.take_written(slot, source, top, sent, shell)
         if plan.timings:
             back = back or self.fetch(f"{remote_target}/cargo-timings/",
                                       os.path.join(local_target, "cargo-timings") + "/", shell,
@@ -3111,38 +3229,68 @@ class Offload:
         back = self.spawn(command + [f"{self.host}:{remote}", local],
                           stdin=subprocess.PIPE if files is not None else subprocess.DEVNULL)
         if files is not None:
-            back.communicate(("\0".join(files) + "\0").encode())
+            back.communicate(b"".join(os.fsencode(name) + b"\0" for name in files))
         else:
             back.wait()
         return 0 if self.cancelled else back.returncode
 
-    def take_fixes(self, source, top, listing, sent, shell):
-        """Brings back the sources Cargo fixed on the build host, unless the
-        file here changed after it was sent: that edit is newer, and is kept."""
-        differing = subprocess.run(
-            ["rsync", "-a", "-c", "-n", "--from0", "--files-from=-", "--out-format=%n",
-             "-e", shell, f"{self.host}:{source}/", top + "/"],
-            input=listing, capture_output=True)
-        if differing.returncode:
-            return differing.returncode
-        fixed, kept = [], []
-        for name in os.fsdecode(differing.stdout).splitlines():
-            if not name or name.endswith("/"):
+    def take_written(self, slot, source, top, sent, shell):
+        """Brings back what the command wrote in the slot's checkout, as it
+        would have written it here: Cargo's fixes, a test's recording, an
+        updated lockfile. A file here that changed after it was sent, or a new
+        one that appears here meanwhile, is newer and is kept; a new file this
+        checkout ignores is left there."""
+        found = subprocess.run(self.remote("written", slot), stdin=subprocess.DEVNULL,
+                               capture_output=True)
+        if found.returncode:
+            return found.returncode
+        written = [(base64.b64decode(name), new) for name, new in json.loads(found.stdout)]
+        here = os.fsencode(top)
+        added = [name for name, new in written if new]
+        ignored = set()
+        if added:
+            check = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
+                                   input=b"".join(name + b"\0" for name in added),
+                                   capture_output=True)
+            if check.returncode in (0, 1):
+                ignored = set(check.stdout.split(b"\0"))
+            else:
+                say("cannot tell which files the command added are ignored here; left on "
+                    f"{self.host}: {', '.join(map(os.fsdecode, added))}")
+                ignored = set(added)
+        wanted = []
+        for name, new in written:
+            path = os.path.join(here, name)
+            if new and name in ignored:
                 continue
-            try:
-                status = os.lstat(os.path.join(top, name))
-                now = (status.st_size, status.st_mtime_ns)
-            except OSError:
-                now = None
-            (fixed if now == sent.get(name) else kept).append(name)
-        for name in kept:
-            say(f"not applying the build host's fixes to {name}, which changed here meanwhile")
-        if not fixed:
+            if new and os.path.lexists(path):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it appeared here "
+                    "while the command ran")
+            elif not new and file_state(path) != sent.get(name):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it changed here "
+                    "while the command ran")
+            else:
+                wanted.append((name, new))
+        if not wanted:
             return 0
-        status = self.fetch(f"{source}/", top + "/", shell, files=fixed)
-        if not status:
-            say(f"applied fixes to {len(fixed)} file{'s' if len(fixed) != 1 else ''}")
-        return status
+        # Copied beside the checkout first, so that nothing here is written
+        # until each file is installed with its own check.
+        with tempfile.TemporaryDirectory(prefix="cagents-offload-written-") as staging:
+            status = self.fetch(f"{source}/", staging + "/", shell, files=[name for name, _ in wanted])
+            if status or self.cancelled:
+                return status
+            taken = []
+            for name, new in wanted:
+                outcome = install(os.path.join(os.fsencode(staging), name), os.path.join(here, name),
+                                  None if new else sent[name])
+                if outcome == "taken":
+                    taken.append(os.fsdecode(name))
+                elif outcome != "same":
+                    say(f"not taking {os.fsdecode(name)} from {self.host}: it {outcome} here "
+                        "while the command ran")
+        if taken:
+            say(f"took back what the command wrote here: {', '.join(taken)}")
+        return 0
 
     def triple(self, plan):
         """The target `cargo run` builds for: the one given, or this host's."""

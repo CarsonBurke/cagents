@@ -202,7 +202,7 @@ struct Comparison<'a> {
     restated: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
-    selected: &'static [(&'static str, &'static [&'static str])],
+    selected: Vec<(&'static str, Vec<&'static str>)>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
 }
@@ -255,8 +255,8 @@ impl Comparison<'_> {
                     .selected
                     .iter()
                     .find(|(name, _)| *name == short(current) || *name == current)
-                    .map(|(_, variants)| *variants);
-                if let Some(selected) = selected {
+                    .map(|(_, variants)| variants.clone());
+                if let Some(selected) = &selected {
                     for name in selected {
                         if !old.iter().any(|(variant, _)| variant == name)
                             || !new.iter().any(|(variant, _)| variant == name)
@@ -266,7 +266,10 @@ impl Comparison<'_> {
                     }
                 }
                 for (index, (name, fields)) in old.iter().enumerate() {
-                    if selected.is_some_and(|variants| !variants.contains(&name.as_str())) {
+                    if selected
+                        .as_ref()
+                        .is_some_and(|variants| !variants.contains(&name.as_str()))
+                    {
                         continue;
                     }
                     let path = format!("{path}::{name}");
@@ -382,7 +385,7 @@ fn differences(
         gated,
         refused,
         restated,
-        selected: &[],
+        selected: Vec::new(),
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -421,8 +424,9 @@ fn variant_count(shapes: &Shapes, name: &str) -> u32 {
 fn this_protocols_wire_format_is_recorded() {
     let current = traced();
     if std::env::var_os(RECORD).is_some() {
-        // Written to the checkout the test ran in, and printed for a build
-        // host whose checkout is a copy.
+        // Written to the checkout the test ran in; scripts/cargo-gate brings
+        // it back from a build host's copy. Printed as well, for a runner
+        // that does not.
         let path = fixture(PROTOCOL_VERSION);
         let text = serde_json::to_string_pretty(&current).unwrap() + "\n";
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -492,6 +496,10 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                     .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
                 (client.protocol < MODEL_EDGES_WITH_EFFECTS)
                     .then_some((SERVER_MESSAGE, MODEL_EDGES)),
+                (client.protocol < WORK_CHECK_COUNTS)
+                    .then_some((WORK_RESPONSE, WORK_CHECK_REPLIES)),
+                (client.protocol < WORK_CHECK_COUNTS)
+                    .then_some((SERVER_MESSAGE, WORK_BOARD_MESSAGES)),
             ]
             .into_iter()
             .flatten()
@@ -517,6 +525,25 @@ fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// The lifecycle contract with a source of `protocol`: the frozen variants,
+/// and the unsolicited chat events it already sends.
+fn selected_for(protocol: u16) -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut selected = crate::update::source::LIFECYCLE_VARIANTS
+        .iter()
+        .map(|(container, variants)| (*container, variants.to_vec()))
+        .collect::<Vec<_>>();
+    for &(container, variant, since) in crate::update::source::UNSOLICITED_SINCE {
+        if protocol < since {
+            continue;
+        }
+        match selected.iter_mut().find(|(name, _)| *name == container) {
+            Some((_, variants)) => variants.push(variant),
+            None => selected.push((container, vec![variant])),
+        }
+    }
+    selected
+}
+
 /// Compare lifecycle and inspection in both directions: unlike general older
 /// clients, nested enums may neither add nor remove variants. Both envelope
 /// headers are included, so proof fields and request correlation stay frozen.
@@ -526,6 +553,7 @@ fn lifecycle_differences(
     older: &Shapes,
     current: &Shapes,
     restated: &[(&'static str, &'static str)],
+    selected: &[(&'static str, Vec<&'static str>)],
 ) -> Vec<String> {
     let mut changed = Vec::new();
     for (older, current) in [(older, current), (current, older)] {
@@ -535,7 +563,7 @@ fn lifecycle_differences(
             gated: Vec::new(),
             refused: Vec::new(),
             restated: restated.to_vec(),
-            selected: crate::update::source::LIFECYCLE_VARIANTS,
+            selected: selected.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),
         };
@@ -563,10 +591,13 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     for protocol in crate::update::source::current_client_protocols() {
         let older = recorded(protocol);
         let restated = restated_for(protocol);
-        let mut changed = lifecycle_differences(&older, &current_recording, &restated);
+        let selected = selected_for(protocol);
+        let mut changed = lifecycle_differences(&older, &current_recording, &restated, &selected);
         // Also compare actual Rust types: regenerating the current fixture
         // cannot bless an incompatible change to an admitted source's subset.
-        changed.extend(lifecycle_differences(&older, &current, &restated));
+        changed.extend(lifecycle_differences(
+            &older, &current, &restated, &selected,
+        ));
         assert!(
             changed.is_empty(),
             "update source protocol {protocol} no longer has this build's frozen lifecycle and inspector wire format:\n{}",
@@ -618,7 +649,8 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
                     .unwrap();
                 variants.swap(index, index - 1);
                 assert!(
-                    !lifecycle_differences(&baseline, &changed, &[]).is_empty(),
+                    !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol))
+                        .is_empty(),
                     "protocol {protocol}: inspector variant {name} must be frozen"
                 );
             }
@@ -633,7 +665,9 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
             panic!()
         };
         fields.push(("future_history_field".into(), Shape::Bool));
-        assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+        assert!(
+            !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol)).is_empty()
+        );
     }
 }
 
@@ -677,7 +711,8 @@ fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
                 _ => unreachable!(),
             }
             assert!(
-                !lifecycle_differences(&baseline, &changed, &[]).is_empty(),
+                !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol))
+                    .is_empty(),
                 "protocol {protocol}: readiness mutation {mutation} must be rejected"
             );
         }
@@ -687,6 +722,7 @@ fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
 #[test]
 fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
     let baseline = recorded(128);
+    let selected = selected_for(128);
     let key = |name: &str| {
         baseline
             .containers
@@ -701,7 +737,7 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.swap(0, 1);
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Struct(fields) = changed.containers.get_mut(&key("DaemonImpact")).unwrap()
@@ -709,14 +745,14 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     fields.push(("future_field".into(), Shape::Bool));
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Enum(variants) = changed.containers.get_mut(&key("Disposition")).unwrap() else {
         panic!()
     };
     variants.push(("future_variant".into(), Some(Fields::Unit)));
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
 
     // The newer daemon can evolve unrelated agent operations independently.
     let mut changed = baseline.clone();
@@ -724,25 +760,51 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
-    assert!(lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
+}
+
+#[test]
+fn lifecycle_proof_covers_the_unsolicited_chat_events_a_source_already_sends() {
+    let baseline = recorded(173);
+    let mut changed = baseline.clone();
+    let key = changed
+        .containers
+        .keys()
+        .find(|key| short(key) == "ServerMessage")
+        .unwrap()
+        .clone();
+    let Container::Enum(variants) = changed.containers.get_mut(&key).unwrap() else {
+        panic!()
+    };
+    assert_eq!(variants.pop().unwrap().0, "chat_agent_addresses");
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected_for(173)).is_empty());
+    // A source from before it never sends it.
+    assert!(lifecycle_differences(&baseline, &changed, &[], &selected_for(172)).is_empty());
 }
 
 /// How a provider addresses a chat's subagents travels beside its snapshot,
 /// whose layout every admitted update source shares, so neither an older
-/// listed client nor an older source daemon could be sent or send it.
+/// listed client nor a source daemon from before it could be sent or send it.
+/// Sources since then send it, and the lifecycle proof compares it.
 #[test]
 fn agent_addresses_are_beyond_every_older_recording() {
     let addresses = ServerMessage::ChatAgentAddresses {
         chat_id: crate::model::TerminalId::new(),
         addresses: Vec::new(),
     };
+    const AGENT_ADDRESSES_SINCE: u16 = 173;
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "chat_agent_addresses",
+        AGENT_ADDRESSES_SINCE
+    )));
     let index = super::variant_index(&addresses).unwrap();
     assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
         .chain(crate::update::source::current_client_protocols())
-        .filter(|protocol| *protocol < PROTOCOL_VERSION);
+        .filter(|&protocol| protocol < AGENT_ADDRESSES_SINCE);
     for protocol in older {
         assert!(
             variant_count(&recorded(protocol), "ServerMessage") <= index,

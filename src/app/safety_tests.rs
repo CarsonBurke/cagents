@@ -1475,12 +1475,107 @@ fn an_unanswered_close_can_be_asked_again_once_its_report_is_dismissed() {
 
 #[test]
 fn terminal_confirmation_owns_tab_navigation_and_restores_shell_setting() {
+    use super::dialog_ui::tests::{focus_after_key, key_press, shift_tab};
     let (mut app, card, _, _) = live_app();
     app.core.set_keyboard_nav(true);
     request_active_close(&mut app, card);
     assert!(!app.core.keyboard_nav());
-    let _ = app.cycle_terminal_close_focus(false);
-    assert!(!app.core.keyboard_nav());
+    // Tab and Shift+Tab cycle "Don't ask again", Cancel and Close, wrapping
+    // inside the dialog instead of reaching the window behind it.
+    let dont_ask = super::dialog_ui::dont_ask_again_id(settings::Confirmation::CloseActiveTerminal);
+    let cancel = widget::Id::new("dialog.terminal-close.cancel");
+    let close = widget::Id::new("dialog.terminal-close.confirm");
+    let tab = key_press(keyboard::key::Named::Tab);
+    for (from, event, to) in [
+        (&close, tab.clone(), &dont_ask),
+        (&dont_ask, tab.clone(), &cancel),
+        (&cancel, tab, &close),
+        (&dont_ask, shift_tab(), &close),
+        (&close, key_press(keyboard::key::Named::ArrowLeft), &cancel),
+    ] {
+        let (focused, captured) =
+            focus_after_key(app.terminal_close_dialog().unwrap(), from.clone(), event);
+        assert_eq!(focused.as_ref(), Some(to));
+        assert!(captured, "the dialog keeps its focus keys from the shell");
+    }
+    // Space presses the focused control as Enter does: it ticks the
+    // checkbox and answers with the focused button.
+    let space = super::dialog_ui::tests::space();
+    for (focused, expected) in [
+        (
+            &dont_ask,
+            Message::DontAskAgain(settings::Confirmation::CloseActiveTerminal, true),
+        ),
+        (&cancel, Message::CancelTerminalClose),
+        (&close, Message::ConfirmTerminalClose),
+    ] {
+        let (messages, captured) = super::dialog_ui::tests::key_control(
+            app.terminal_close_dialog().unwrap(),
+            focused.clone(),
+            space.clone(),
+        );
+        assert_eq!(
+            format!("{messages:?}"),
+            format!("{:?}", [expected]),
+            "Space presses {focused:?}"
+        );
+        assert!(captured);
+    }
+    // Someone still typing hasn't read the question: a letter leaves every
+    // choice unfocused, so the Enter ending their line answers nothing.
+    let keyboard::Event::KeyPressed {
+        physical_key,
+        location,
+        modifiers,
+        ..
+    } = key_press(keyboard::key::Named::Enter)
+    else {
+        unreachable!()
+    };
+    let letter = keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character("l".into()),
+        modified_key: keyboard::Key::Character("l".into()),
+        physical_key,
+        location,
+        modifiers,
+        text: Some("l".into()),
+        repeat: false,
+    };
+    let (focused, captured) =
+        focus_after_key(app.terminal_close_dialog().unwrap(), close.clone(), letter);
+    assert_eq!(focused, None);
+    assert!(captured);
+    // A held Enter or Space answers nothing.
+    for held in [key_press(keyboard::key::Named::Enter), space] {
+        let keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+            text,
+            ..
+        } = held
+        else {
+            unreachable!()
+        };
+        let repeated = keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+            text,
+            repeat: true,
+        };
+        let (messages, captured) = super::dialog_ui::tests::key_control(
+            app.terminal_close_dialog().unwrap(),
+            close.clone(),
+            repeated,
+        );
+        assert!(messages.is_empty(), "a held key answers nothing");
+        assert!(captured);
+    }
     let _ = app.update(Message::CancelTerminalClose);
     assert!(app.core.keyboard_nav());
 }
@@ -1520,12 +1615,18 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     app.settings_path = Some(path.clone());
     app.settings_write_blocked = false;
     request_active_close(&mut app, card);
-    let _ = app.update(Message::TerminalCloseDontAskChanged(true));
+    let _ = app.update(Message::DontAskAgain(
+        settings::Confirmation::CloseActiveTerminal,
+        true,
+    ));
     let _ = app.update(Message::CancelTerminalClose);
     assert!(app.settings.confirm_terminal_close);
     assert!(!path.exists());
     request_active_close(&mut app, card);
-    let _ = app.update(Message::TerminalCloseDontAskChanged(true));
+    let _ = app.update(Message::DontAskAgain(
+        settings::Confirmation::CloseActiveTerminal,
+        true,
+    ));
     // The process may finish while its confirmation is open. Keep this
     // preference test independent of any real daemon or process shutdown.
     let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
@@ -1547,7 +1648,7 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     report_close(&mut app, terminal_close::CloseOutcome::Closed);
     assert!(app.terminal_close.is_none());
     let enable = app.update(Message::SettingsChanged {
-        field: SettingsField::ConfirmTerminalClose,
+        field: SettingsField::Confirm(settings::Confirmation::CloseActiveTerminal),
         value: "true".into(),
     });
     tests::settle_settings_task(&mut app, enable);

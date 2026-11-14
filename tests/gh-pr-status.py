@@ -48,6 +48,7 @@ class Fixture(unittest.TestCase):
         self.addCleanup(self.patch.stop)
         self.script = self.repo / "scripts/gh-pr-status"
         self.script.write_bytes((ROOT / "scripts/gh-pr-status").read_bytes())
+        (self.script.parent / "cargo_artifacts.py").write_bytes((ROOT / "scripts/cargo_artifacts.py").read_bytes())
         self.script.chmod(0o755)
         self.install("bin/cagents", "#!/bin/sh\necho 'old installed cagents was invoked' >&2\nexit 77\n")
         self.install("bin/gh", '''#!/usr/bin/python3

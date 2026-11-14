@@ -100,6 +100,28 @@ fn setting_stepper<'a>(
     setting_field(label, detail, control)
 }
 
+/// The switch that turns a routine question on again after "Don't ask
+/// again", or off without waiting for it to be asked.
+fn confirmation_setting<'a>(kind: settings::Confirmation, asks: bool) -> Setting<'a, Message> {
+    let (label, detail, keywords) = match kind {
+        settings::Confirmation::StopWorkingChat => (
+            "Confirm closing a working chat",
+            "Ask before closing a chat that is still working. Closing stops it; the conversation stays in history.",
+            "working_chats stop",
+        ),
+        settings::Confirmation::CloseActiveTerminal => (
+            "Confirm closing active processes",
+            "Ask before closing a terminal with a foreground program or background jobs. Idle shells close immediately.",
+            "active_processes terminal",
+        ),
+    };
+    crate::settings_widgets::toggle(label, detail, asks, move |ask| Message::SettingsChanged {
+        field: SettingsField::Confirm(kind),
+        value: ask.to_string(),
+    })
+    .keywords(keywords)
+}
+
 fn settings_choice<'a>(
     label: &'static str,
     detail: &'static str,
@@ -368,17 +390,36 @@ fn settings_category_controls<'a>(
                 .collect();
             settings.push(setting_field(
                 "Manage accounts",
-                "Add, rename, sign in to or remove accounts, and compare what each has left.",
+                "Add, rename, sign in to or remove accounts, and compare their usage limits.",
                 crate::ui_controls::button::secondary("Open Accounts")
                     .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                     .into(),
             )
             .label_in_control());
-            vec![settings_group(
-                "Default accounts",
-                "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
-                settings,
-            )]
+            vec![
+                settings_group(
+                    "Default accounts",
+                    "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
+                    settings,
+                ),
+                settings_group(
+                    "Usage",
+                    "How account allowances appear throughout the app.",
+                    vec![settings_choice(
+                        "Account usage",
+                        "Left shows remaining allowance in text and gauges. Used shows consumed allowance. Warning colours still indicate when an account is running low.",
+                        SettingsField::AccountUsageDisplay,
+                        settings::AccountUsageDisplay::ALL.map(|display| {
+                            (
+                                display.label(),
+                                display.key(),
+                                draft.account_usage_display == display,
+                            )
+                        }),
+                    )
+                    .keywords("account_usage_display remaining consumed")],
+                ),
+            ]
         }
         SettingsCategory::General => {
             let reset = setting_field(
@@ -494,6 +535,19 @@ fn settings_category_controls<'a>(
                     "Performance",
                     "Balance active panes and background resource use.",
                     vec![hot_panes, hibernation],
+                ),
+                settings_group(
+                    "Confirmations",
+                    "Questions asked before routine closes. Turn one back on here after choosing Don't ask again.",
+                    settings::Confirmation::ALL
+                        .into_iter()
+                        .map(|kind| {
+                            confirmation_setting(
+                                kind,
+                                draft.confirmations.get(&kind).copied().unwrap_or(true),
+                            )
+                        })
+                        .collect(),
                 ),
                 settings_group(
                     "Reset",
@@ -613,7 +667,7 @@ fn settings_category_controls<'a>(
                     ),
                     crate::settings_widgets::toggle(
                         "Show the status bar",
-                        "See each signed-in account's remaining usage at the bottom of the window.",
+                        "See each signed-in account's usage limits at the bottom of the window.",
                         draft.show_status_bar,
                         |enabled| Message::SettingsChanged {
                             field: SettingsField::ShowStatusBar,
@@ -778,20 +832,6 @@ fn settings_category_controls<'a>(
                     SettingsField::TerminalScrollbackMib,
                     invalid,
                 )],
-            ),
-            settings_group(
-                "Closing",
-                "Idle shells close immediately. Terminal identity is always checked.",
-                vec![crate::settings_widgets::toggle(
-                    "Confirm closing active processes",
-                    "Ask before closing a terminal with a foreground program or background jobs.",
-                    draft.confirm_terminal_close,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::ConfirmTerminalClose,
-                        value: enabled.to_string(),
-                    },
-                )
-                .keywords("active_processes")],
             ),
             settings_group(
                 "Upgrades",
@@ -2032,9 +2072,11 @@ mod keyboard_table_tests {
     }
 }
 
-/// Observe shared sidebar preferences off the UI thread. The subscription restarts
-/// after a local save, so a skipped observation during that save is read again.
-pub(super) fn sidebar_preferences_stream(
+/// Observe preferences another window may change while this one is open - the
+/// sidebar's worktree display, the account usage display and which routine
+/// questions are asked - off the UI thread. The subscription restarts after a
+/// local save, so a skipped observation during that save is read again.
+pub(super) fn shared_preferences_stream(
     path: Option<PathBuf>,
 ) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
     use cosmic::iced::futures::SinkExt;
@@ -2069,6 +2111,8 @@ pub(super) fn sidebar_preferences_stream(
                 let current = (
                     settings.sidebar_worktrees,
                     settings.sidebar_worktree_overrides.clone(),
+                    settings.account_usage_display,
+                    settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
                 );
                 if previous.as_ref() != Some(&current) {
                     previous = Some(current);
@@ -2087,13 +2131,47 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn shared_preferences_observes_account_usage_display_changes_without_sidebar_changes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = AppSettings::default();
+        settings::save(&path, &settings).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        let initial = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial.account_usage_display,
+            settings::AccountUsageDisplay::Left
+        );
+        settings.account_usage_display = settings::AccountUsageDisplay::Used;
+        settings::save(&path, &settings).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+        assert_eq!(observed.sidebar_worktrees, initial.sidebar_worktrees);
+        assert_eq!(
+            observed.sidebar_worktree_overrides,
+            initial.sidebar_worktree_overrides
+        );
+    }
+
+    #[tokio::test]
     async fn sidebar_preferences_observes_global_and_project_changes() {
         use cosmic::iced::futures::{StreamExt, pin_mut};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let initial = AppSettings::default();
         settings::save(&path, &initial).unwrap();
-        let stream = sidebar_preferences_stream(Some(path.clone()));
+        let stream = shared_preferences_stream(Some(path.clone()));
         pin_mut!(stream);
         let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await

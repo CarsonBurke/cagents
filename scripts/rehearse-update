@@ -62,7 +62,8 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        the actual published Resumes (1) review before consent.
   desktop start [--limit SECONDS]
                        Start a headless desktop (KWin virtual + nested niri)
-                       under the native lock. Windows open there.
+                       in one of the host's native slots, for at most --limit
+                       seconds (default 900, at most 1800). Windows open there.
   desktop stop         End the desktop; the daemon and sessions keep running.
   env CMD...           Run CMD as the private user, without the desktop.
   app CMD...           Run CMD as the private user inside the desktop.
@@ -339,13 +340,17 @@ cmd_desktop() {
 }
 
 desktop_start() {
-    local limit=3600
+    local limit=900
     while [ "$#" -gt 0 ]; do
         case $1 in
             --limit) limit=${2:?}; shift 2 ;;
             *) die "unknown desktop option: $1" 2 ;;
         esac
     done
+    [[ $limit =~ ^[1-9][0-9]*$ ]] || die 'the desktop limit must be a whole number of seconds' 2
+    # It holds one of the host's few native slots, which evidence sessions share.
+    [ "$limit" -le 1800 ] ||
+        die "a desktop may hold a native slot for at most 1800 seconds, so it cannot keep other sessions waiting; --limit $limit is longer" 2
     desktop_live && die 'the desktop is already running'
     rm -rf -- "$desktop"
     mkdir -p -- "$desktop"/{home,config,data,cache,state}
@@ -388,17 +393,37 @@ desktop_stop() {
 # evidence on this host takes the same lock.
 run_desktop() {
     local limit=$1
-    exec 9>"$native_lock"
+    # One of the host's native slots, which evidence sessions share; see
+    # scripts/native_slots.py. Only the slot taken stays open, on 9.
+    local paths path descriptor queue_descriptor slot_descriptors=() arguments=() lock_status=0 index
+    paths=$(/usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock") ||
+        die 'could not list the native slots'
+    exec {queue_descriptor}>>"$native_lock.queue" || die "could not open $native_lock.queue"
+    while IFS= read -r path; do
+        exec {descriptor}>>"$path" || die "could not open $path"
+        slot_descriptors+=("$descriptor")
+        arguments+=(--fd "$descriptor")
+    done <<<"$paths"
     printf 'waiting for the native lock %s\n' "$native_lock"
-    local lock_status=0
     setpriv --pdeathsig TERM /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" \
-        "$root" "$self" wait-native-lock --fd 9 --parent-pid "$BASHPID" || lock_status=$?
+        "$root" "$self" wait-native-lock --queue-fd "$queue_descriptor" "${arguments[@]}" \
+        --parent-pid "$BASHPID" >"$desktop/slot" || lock_status=$?
+    index=$(cat -- "$desktop/slot")
+    if [ "$lock_status" -eq 0 ]; then
+        [[ $index =~ ^[0-9]+$ ]] && [ "$index" -lt "${#slot_descriptors[@]}" ] || lock_status=2
+    fi
+    [ "$lock_status" -ne 0 ] || exec 9>&"${slot_descriptors[$index]}"
+    for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+        exec {descriptor}>&-
+    done
     if [ "$lock_status" -ne 0 ]; then
         [ "$lock_status" -eq 75 ] && [ -e "$desktop/stop" ] && return 0
         die "native lock waiter exited $lock_status" "$lock_status"
     fi
     [ ! -e "$desktop/stop" ] || return 0
-    printf 'holding the native lock\n'
+    printf 'holding native slot %s\n' "$index"
+    # The limit runs from taking the slot, so preparing the desktop counts.
+    local deadline=$((SECONDS + limit))
     : >"$desktop/locked"
     local runtime_desktop=$desktop/rt
     mkdir -m 700 -p -- "$runtime_desktop"
@@ -417,7 +442,7 @@ run_desktop() {
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
         --width 1596 --height 929 --exit-with-session \
         "$self --root $root __inner" >"$logs/kwin.log" 2>&1 9>&- &
-    local compositor=$! deadline=$((SECONDS + limit))
+    local compositor=$!
     while kill -0 "$compositor" 2>/dev/null; do
         if [ -e "$desktop/stop" ] || [ "$SECONDS" -ge "$deadline" ]; then
             [ -e "$desktop/stop" ] || printf 'desktop reached its %ss limit\n' "$limit"

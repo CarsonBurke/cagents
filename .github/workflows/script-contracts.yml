@@ -11,296 +11,133 @@ permissions:
 
 concurrency:
   group: script-contracts-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push supersedes a pull request's run. A started main run finishes;
+  # GitHub still replaces a main run that is only queued with the newest one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUSTUP_TOOLCHAIN: 1.93.0
   RUSTUP_AUTO_INSTALL: "0"
   PYTHONDONTWRITEBYTECODE: "1"
   CARGO_NET_OFFLINE: "true"
-  EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
+# Every job checks out the event's own commit: for a pull request, its merge
+# result, which is also where GitHub reads this workflow from. Suites and the
+# sources they test therefore never come from different revisions.
 jobs:
-  contracts:
-    name: Script contracts
+  plan:
+    name: Contract structure
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Refuse missing, symlinked or unlisted suites and bad shell syntax
+        run: python3 -I -B scripts/script-contracts verify
+
+      - name: Plan suite jobs
+        id: plan
+        run: |
+          matrix=$(python3 -I -B scripts/script-contracts plan)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
+  source:
+    name: Formatting and protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     defaults:
       run:
         shell: bash
     steps:
-      - name: Check out the exact source
+      - name: Check out the tested revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
           persist-credentials: false
 
-      - name: Install the pinned formatter
-        run: |
-          rustup toolchain install 1.93.0 --profile minimal --component rustfmt
-          format_toolchain_bin=$(dirname "$(rustup which --toolchain 1.93.0 cargo)")
-          printf '%s\n' "$format_toolchain_bin" >> "$GITHUB_PATH"
-
-      - name: Verify source and required tools
-        run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
-          git rev-parse HEAD 'HEAD^{tree}'
-          sha256sum scripts/run-development tests/run-development-zig.py \
-            scripts/check-format scripts/check-format-cache.py tests/check_format.py mise.toml
-          for format_tool in git cargo rustc rustfmt rustup sh python3; do
-            command -v "$format_tool"
-          done
-          python3 - <<'PY'
-          import sys
-          import tomllib
-          assert sys.version_info >= (3, 11), "Python 3.11+ is required for TOML contract coverage"
-          print(sys.version)
-          PY
-          case "$(cargo --version)" in
-            "cargo 1.93.0 "*) ;;
-            *) printf '%s\n' 'Cargo must use the pinned Rust 1.93.0 toolchain' >&2; exit 1 ;;
-          esac
-          case "$(rustc --version)" in
-            "rustc 1.93.0 "*) ;;
-            *) printf '%s\n' 'Rust must use the pinned 1.93.0 toolchain' >&2; exit 1 ;;
-          esac
-          cargo --version
-          rustfmt --version
-
-      - name: Check Cargo gate source and contracts
-        run: |
-          python3 -I -B - <<'PY'
-          from pathlib import Path
-          import stat
-          import subprocess
-          import sys
-
-          def present(path):
-              current = Path()
-              for index, part in enumerate(path.parts):
-                  current /= part
-                  try:
-                      mode = current.lstat().st_mode
-                  except FileNotFoundError:
-                      return False
-                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
-                  if not expected(mode):
-                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
-                      raise SystemExit(2)
-              return True
-
-          gate = Path("scripts/cargo-gate")
-          source = Path("scripts/cargo-gate-command.py")
-          fixture = Path("tests/cargo_gate.py")
-          gate_present = present(gate)
-          source_present = present(source)
-          fixture_present = present(fixture)
-          if source_present != fixture_present:
-              print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
-              raise SystemExit(2)
-          if source_present and not gate_present:
-              print(f"Incomplete Cargo gate: {gate} is required by {source} and {fixture}", file=sys.stderr)
-              raise SystemExit(2)
-          runner = Path("scripts/run-development")
-          if not gate_present and present(runner) and b"scripts/cargo-gate" in runner.read_bytes():
-              print(f"Incomplete Cargo gate: {runner} references missing {gate}", file=sys.stderr)
-              raise SystemExit(2)
-          if gate_present and not source_present and b"cargo-gate-command.py" in gate.read_bytes():
-              print(f"Incomplete Cargo gate: {gate} references missing {source} and {fixture}", file=sys.stderr)
-              raise SystemExit(2)
-          if gate_present:
-              print("Checking: Cargo gate source", flush=True)
-              paths = [str(gate)]
-              if source_present:
-                  paths.extend((str(source), str(fixture)))
-              for command in (["sha256sum", *paths], ["sh", "-n", str(gate)]):
-                  result = subprocess.run(command)
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
-          else:
-              print("Not applicable: Cargo gate (source absent at this head)", flush=True)
-          if not source_present:
-              print("Not applicable: held-command cancellation (source and fixture both absent at this head)", flush=True)
-          else:
-              print("Checking: held-command cancellation", flush=True)
-              result = subprocess.run([sys.executable, "-I", "-B", str(fixture), "-v"])
-              if result.returncode:
-                  raise SystemExit(result.returncode)
-          PY
-
-      - name: Check selected IPC source contract
-        env:
-          PROTOCOL_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          python3 -I -B - <<'PY'
-          from pathlib import Path
-          import os
-          import re
-          import stat
-          import subprocess
-          import sys
-
-          def present(path, directory=False):
-              current = Path()
-              for index, part in enumerate(path.parts):
-                  current /= part
-                  try:
-                      mode = current.lstat().st_mode
-                  except FileNotFoundError:
-                      return False
-                  expected = stat.S_ISDIR if directory or index < len(path.parts) - 1 else stat.S_ISREG
-                  if not expected(mode):
-                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
-                      raise SystemExit(2)
-              return True
-
-          paths = [Path(path) for path in (
-              "scripts/check-protocol-contract",
-              "scripts/protocol_contract_source.py",
-              "tests/protocol_contract.py",
-          )]
-          exists = [present(path) for path in paths]
-          ledger_present = present(Path("tests/fixtures/protocol-contract"), directory=True)
-          if not any(exists) and not ledger_present:
-              print("Not applicable: selected IPC source contract (guard and fixtures absent at this head)", flush=True)
-              raise SystemExit(0)
-          if not all(exists) or not ledger_present:
-              print("Incomplete protocol contract: checker, source lexer, tests and snapshot directory must all exist", file=sys.stderr)
-              raise SystemExit(2)
-          base = os.environ.get("PROTOCOL_CONTRACT_BASE_SHA", "")
-          if not re.fullmatch(r"[0-9a-f]{40}", base) or base == "0" * 40:
-              print("A trusted event comparison base is required for the protocol contract", file=sys.stderr)
-              raise SystemExit(2)
-          if subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], stderr=subprocess.DEVNULL).returncode:
-              result = subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", base])
-              if result.returncode:
-                  raise SystemExit(result.returncode)
-          for command in (
-              ["sha256sum", *(str(path) for path in paths)],
-              [sys.executable, "-I", "-B", str(paths[2]), "-v"],
-              [sys.executable, "-I", "-B", str(paths[0]), "--base-ref", base],
-          ):
-              result = subprocess.run(command)
-              if result.returncode:
-                  raise SystemExit(result.returncode)
-          PY
-
-      - name: Check Zig discovery contracts
-        run: python3 tests/run-development-zig.py -v
-
-      - name: Check installer coordinator extraction contracts
-        run: python3 tests/installer_coordinator.py -v
-
-      - name: Check validation checkout and process custody contracts
-        run: |
-          python3 -I -B - <<'PY'
-          from pathlib import Path
-          import stat
-          import subprocess
-          import sys
-
-          def present(path):
-              current = Path()
-              for index, part in enumerate(path.parts):
-                  current /= part
-                  try:
-                      mode = current.lstat().st_mode
-                  except FileNotFoundError:
-                      return False
-                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
-                  if not expected(mode):
-                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
-                      raise SystemExit(2)
-              return True
-
-          for name, source, fixture in (
-              ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
-              ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
-              ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
-              ("build directory seeding", "scripts/seed-build-dir", "tests/seed_build_dir.py"),
-              ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
-              ("build directory pruning", "scripts/prune-build-dirs", "tests/prune_build_dirs.py"),
-              ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
-              ("HOST test helper", "scripts/cargo-host-test-helper.py", "tests/cargo_host_test_helper.py"),
-              ("main build sentinel", "scripts/main-build-sentinel", "tests/main_build_sentinel.py"),
-              ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
-              ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
-              ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
-              ("workload time limit", "scripts/bounded", "tests/bounded.py"),
-              ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),
-              ("synthetic Claude streaming", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_streaming.py"),
-              ("Codex resume history", "tests/fixtures/codex-resume-history.py", "tests/codex_resume_history.py"),
-              ("local install head check", "scripts/install-local", "tests/install_local.py"),
-              ("GitHub status bootstrap", "scripts/gh-pr-status", "tests/gh-pr-status.py"),
-              ("GitHub request telemetry", "scripts/gh-observe", "tests/gh-observe.py"),
-              ("GitHub request coordination", "scripts/gh-coordinate.py", "tests/gh-coordinate.py"),
-          ):
-              source_present = present(Path(source))
-              fixture_present = present(Path(fixture))
-              if not source_present and not fixture_present:
-                  print(f"Not applicable: {name} (source and fixture both absent at this head)", flush=True)
-                  continue
-              if not source_present or not fixture_present:
-                  print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
-                  raise SystemExit(2)
-              print(f"Checking: {name}", flush=True)
-              if source in ("scripts/seed-build-dir", "scripts/build-disk-guard"):
-                  shell = [source] if source == "scripts/seed-build-dir" else [source, "scripts/install-cargo-gate"]
-                  result = subprocess.run(["sh", "-n", *shell])
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
-              if source in ("scripts/native-evidence", "scripts/install-local"):
-                  shells = [source]
-                  if source == "scripts/native-evidence" and present(Path("scripts/native-evidence-remote")):
-                      shells.append("scripts/native-evidence-remote")
-                  for shell in shells:
-                      result = subprocess.run(["bash", "-n", shell])
-                      if result.returncode:
-                          raise SystemExit(result.returncode)
-              result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
-              if result.returncode:
-                  raise SystemExit(result.returncode)
-          PY
-
-      - name: Check all formatter contracts
-        env:
-          CHECK_FORMAT_CARGO_FIXTURE: "1"
-        run: python3 tests/check_format.py -v
-
-      - name: Check shell syntax
-        run: |
-          sh -n scripts/run-development
-          [ ! -e scripts/refuse-compile ] || sh -n scripts/refuse-compile
-          sh -n scripts/check-format
+      - uses: ./.github/actions/script-contracts-setup
 
       - name: Check repository formatting
         run: scripts/check-format
 
+      - name: Check selected IPC source contract
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base=$(python3 -I -B scripts/script-contracts protocol-base --event "$GITHUB_EVENT_NAME" --before "$PUSH_BEFORE")
+          sha256sum scripts/check-protocol-contract scripts/protocol_contract_source.py tests/protocol_contract.py
+          python3 -I -B tests/protocol_contract.py -v
+          python3 -I -B scripts/check-protocol-contract --base-ref "$base"
+
+      - name: Check older clients are proven at the merged protocol
+        run: |
+          python3 -I -B tests/check_older_clients.py -v
+          python3 -I -B scripts/check-older-clients
+
+      - name: Check every protocol main served is a live-update source or retired
+        run: |
+          python3 -I -B tests/check_update_sources.py -v
+          python3 -I -B scripts/check-update-sources
+
       - name: Verify the source remains unchanged
         run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code
           git diff --cached --exit-code
 
-  older-clients:
-    # The claim that older CLIs are proven must hold for the merge, not only
-    # for this head: a protocol bump merging beside it leaves them unproven.
-    # The default checkout of a pull request is its merge result as of the
-    # latest pull request event.
-    name: Older clients proven at the merged protocol
+  suites:
+    name: Suites (${{ matrix.label }})
+    needs: plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     defaults:
       run:
         shell: bash
     steps:
-      - name: Check out the merge result
+      - name: Check out the tested revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 2
           persist-credentials: false
 
-      - name: Check older client proofs
+      - uses: ./.github/actions/script-contracts-setup
+
+      - name: Run ${{ matrix.label }}
+        env:
+          JOB: ${{ matrix.job }}
+          SHARD: ${{ matrix.shard }}
+        run: python3 -I -B scripts/script-contracts run "$JOB" "$SHARD"
+
+      - name: Verify the source remains unchanged
         run: |
-          git rev-parse HEAD
-          python3 -I -B tests/check_older_clients.py -v
-          python3 -I -B scripts/check-older-clients
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+  result:
+    # One stable check that passes only when every job above passed, so a
+    # skipped or cancelled job cannot read as success.
+    name: Script contracts
+    if: always()
+    needs: [plan, source, suites]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every contract job
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SOURCE: ${{ needs.source.result }}
+          SUITES: ${{ needs.suites.result }}
+        run: |
+          printf 'structure=%s source=%s suites=%s\n' "$PLAN" "$SOURCE" "$SUITES"
+          test "$PLAN" = success && test "$SOURCE" = success && test "$SUITES" = success

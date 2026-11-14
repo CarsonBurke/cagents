@@ -593,7 +593,7 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
             return;
         };
-        crate::diagnostics::record_panic(recovered);
+        crate::diagnostics::record_panic(recovered, panic);
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {

@@ -16,7 +16,7 @@ use crate::{
     chat::{self, Item, Launch},
     model::TerminalId,
 };
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 /// The shortest handle accepted, as for messages.
 const MIN_HANDLE: usize = 4;
@@ -34,8 +34,32 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
         true,
         true,
     )?;
-    let mut session = resolve(&listing, &query.session)?;
-    let source = source(host, session.session.id, true)?;
+    // A conversation is also named by its provider's own ID, as the
+    // provider's files and resume commands show it.
+    let mut conversations: HashMap<TerminalId, String> = listing
+        .saved
+        .iter()
+        .filter_map(|(id, launch)| Some((*id, launch.session_id.clone()?)))
+        .collect();
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        for (id, record) in &state.chats {
+            if let Some(conversation) = record
+                .handle
+                .confirmed_session_id()
+                .or_else(|| record.session.launch.session_id.clone())
+            {
+                conversations.insert(*id, conversation);
+            }
+        }
+    }
+    let mut session = resolve(&listing, &conversations, &query.session)?;
+    let source = source(
+        host,
+        session.session.id,
+        true,
+        listing.saved.get(&session.session.id),
+    )?;
     session.active_at = source.modified();
     let recognizer = host
         .lock()
@@ -87,8 +111,13 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
 }
 
 /// The one session `handle` names, as `cagents send` resolves a recipient:
-/// `parent`, or a prefix of a session ID, lineage or delegated agent ID.
-fn resolve(listing: &directory::Listing, handle: &str) -> Result<Member, String> {
+/// `parent`, or a prefix of a session ID, lineage or delegated agent ID; or
+/// a prefix of the provider's ID for its conversation, from `conversations`.
+fn resolve(
+    listing: &directory::Listing,
+    conversations: &HashMap<TerminalId, String>,
+    handle: &str,
+) -> Result<Member, String> {
     if handle == "parent" {
         // A parent relaunched in its card leaves the exited original listed
         // beside it; the live one is the parent now.
@@ -125,6 +154,9 @@ fn resolve(listing: &directory::Listing, handle: &str) -> Result<Member, String>
         .filter(|Member { session: entry, .. }| {
             matches(&entry.id)
                 || matches(&entry.lineage)
+                || conversations
+                    .get(&entry.id)
+                    .is_some_and(|conversation| matches(conversation))
                 || entry
                     .delegation
                     .as_ref()
@@ -169,8 +201,14 @@ pub(super) struct Source {
 
 /// The history of `id`, located from its launch. A terminal's provider
 /// conversation is observed afresh when `observe` is set, which waits on its
-/// PTY owner; otherwise its last recorded resume hint is used.
-pub(super) fn source(host: &SharedHost, id: TerminalId, observe: bool) -> Result<Source, String> {
+/// PTY owner; otherwise its last recorded resume hint is used. A chat this
+/// daemon is not hosting is located from `saved`, its pane's saved launch.
+pub(super) fn source(
+    host: &SharedHost,
+    id: TerminalId,
+    observe: bool,
+    saved: Option<&Launch>,
+) -> Result<Source, String> {
     enum Found {
         Chat(Launch, Option<String>),
         Terminal(crate::terminal::TerminalHandle, Option<String>),
@@ -178,15 +216,24 @@ pub(super) fn source(host: &SharedHost, id: TerminalId, observe: bool) -> Result
     let found = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(record) = state.chats.get(&id) {
-            Found::Chat(
+            Some(Found::Chat(
                 record.session.launch.clone(),
                 record.handle.confirmed_session_id(),
-            )
-        } else if let Some(record) = state.terminals.get(&id) {
-            Found::Terminal(record.handle.clone(), record.session.resume_hint.clone())
+            ))
         } else {
-            return Err("The session is no longer hosted".into());
+            state.terminals.get(&id).map(|record| {
+                Found::Terminal(record.handle.clone(), record.session.resume_hint.clone())
+            })
         }
+    };
+    let found = match found {
+        Some(found) => found,
+        // A pane saved before a restart keeps the launch that located its
+        // conversation, though no window has reopened it here.
+        None => Found::Chat(
+            saved.cloned().ok_or("The session is no longer hosted")?,
+            None,
+        ),
     };
     let mut launch = match found {
         Found::Chat(mut launch, confirmed) => {
@@ -384,6 +431,7 @@ mod tests {
             caller: None,
             sessions,
             served: directory::Wanted::Scope(Scope::All),
+            saved: Default::default(),
         }
     }
 
@@ -394,7 +442,10 @@ mod tests {
             member(RELAUNCH, ORIGINAL, Relation::Parent, false),
             member(OTHER, OTHER, Relation::Peer, false),
         ]);
-        let id = |handle| resolve(&relaunched, handle).map(|member| member.session.id.to_string());
+        let id = |handle| {
+            resolve(&relaunched, &HashMap::new(), handle)
+                .map(|member| member.session.id.to_string())
+        };
         assert_eq!(id("parent").unwrap(), RELAUNCH);
         assert_eq!(id("2222").unwrap(), RELAUNCH);
         assert_eq!(id("3333").unwrap(), OTHER);
@@ -405,7 +456,7 @@ mod tests {
 
         let exited_only = listing(vec![member(ORIGINAL, ORIGINAL, Relation::Parent, true)]);
         assert_eq!(
-            resolve(&exited_only, "parent")
+            resolve(&exited_only, &HashMap::new(), "parent")
                 .unwrap()
                 .session
                 .id
@@ -418,7 +469,7 @@ mod tests {
             member(RELAUNCH, OTHER, Relation::Peer, false),
         ]);
         assert!(
-            resolve(&twins, "3333")
+            resolve(&twins, &HashMap::new(), "3333")
                 .unwrap_err()
                 .contains("2 sessions match")
         );

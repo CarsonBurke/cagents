@@ -20,6 +20,11 @@ pub(super) struct Entry {
     source: TerminalSession,
     request: uuid::Uuid,
     disposition: Disposition,
+    // Keep the explanation above the controls stable while rechecking.
+    previous_disposition: Option<Disposition>,
+    // Once offered, retain this control's place during later inspections.
+    // Its enablement still requires a current, successful absence check.
+    show_relaunch: bool,
     directory: Directory,
     authority: crate::agent_execution::Authority,
     socket: Result<Option<PathBuf>, String>,
@@ -32,6 +37,7 @@ pub(super) enum Directory {
     Unknown,
 }
 
+#[derive(Clone, Copy)]
 enum Disposition {
     Pending,
     Dormant,
@@ -367,6 +373,8 @@ impl Cagents {
                 source: source.clone(),
                 request: uuid::Uuid::new_v4(),
                 disposition: Disposition::Pending,
+                previous_disposition: None,
+                show_relaunch: false,
                 directory: Directory::Unknown,
                 authority,
                 socket,
@@ -401,6 +409,9 @@ impl Cagents {
         let request = uuid::Uuid::new_v4();
         let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
         entry.request = request;
+        if !matches!(entry.disposition, Disposition::Pending) {
+            entry.previous_disposition = Some(entry.disposition);
+        }
         entry.disposition = Disposition::Pending;
         self.saved_terminals.queue.push_back(Waiting {
             card,
@@ -705,6 +716,7 @@ impl Cagents {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
                 entry.directory = directory;
                 let absent = result.is_ok();
+                entry.show_relaunch |= absent;
                 entry.disposition = if absent {
                     Disposition::Dormant
                 } else {
@@ -790,7 +802,11 @@ impl Cagents {
         let description = if entry.authority.token().is_some() {
             "Use the original workspace window to reconnect or manage this saved terminal. You can copy its details here."
         } else {
-            match entry.disposition {
+            match if pending {
+                entry.previous_disposition.unwrap_or(entry.disposition)
+            } else {
+                entry.disposition
+            } {
                 Disposition::Pending => "Checking for the existing terminal…",
                 Disposition::Dormant => {
                     "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
@@ -802,6 +818,7 @@ impl Cagents {
         };
         let reconnect =
             crate::ui_controls::button::primary(if pending { "Checking…" } else { "Reconnect" })
+                .reserve_labels(["Reconnect", "Checking…"])
                 .id(control_id("reconnect"))
                 .name("Reconnect saved terminal");
         let closing = self.terminal_close_in_progress(card);
@@ -812,7 +829,7 @@ impl Cagents {
                 reconnect.on_press(action(Command::Reconnect))
             };
         let mut controls = vec![reconnect.into()];
-        if dormant {
+        if entry.show_relaunch {
             let label = if entry.source.agent_resume_recipe().is_some() {
                 "Resume session"
             } else {
@@ -846,6 +863,7 @@ impl Cagents {
                 )
                 .into(),
             crate::ui_controls::button::secondary(if closing { "Checking…" } else { "Close" })
+                .reserve_labels(["Close", "Checking…"])
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
                 .on_press_maybe(
