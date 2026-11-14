@@ -411,7 +411,7 @@ impl Cagents {
         self.card_state_mut(card).unwrap().kind = kind;
         self.saved_terminals.entries.remove(&card);
         self.retained_outputs.remove(&terminal);
-        self.shared_views.ended_terminal_workers.remove(&card);
+        self.shared_views.terminal_source_workers.remove(&card);
         self.shared_views.attached.insert(card);
         self.terminal_recovery_attempts.remove(&terminal);
         if matches!(self.card_state(card).map(|s| &s.kind), Some(CardKind::Terminal(s)) if terminal_ended(s))

@@ -158,11 +158,7 @@ fn edit_then<T>(
                 let CardKind::Terminal(source) = &before.kind else {
                     return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 };
-                if state
-                    .terminal_removal_basis(source)
-                    .map_err(|_| Registry::VIEW_REMOVAL_CONFLICT.to_owned())?
-                    != *worker
-                {
+                if !state.current_metadata_worker(source.id, worker) {
                     return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 }
             }

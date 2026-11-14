@@ -154,7 +154,7 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
-    pub(super) ended_terminal_workers: HashMap<
+    pub(super) terminal_source_workers: HashMap<
         CardId,
         (
             TerminalId,
@@ -389,7 +389,7 @@ impl Cagents {
         // Another window can publish the same session update first, as when two
         // windows attached to one conversation both learn its provider session.
         // Only a session update qualifies: a refused name or width edit can be lost.
-        let session_already_applied = matches!(&change, Change::Update { before, pane } if {
+        let session_already_applied = matches!(&change, Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. } if {
             let same_source = |a: &Pane, b: &Pane| {
                 a.kind == b.kind
                     && a.pending_terminal_start == b.pending_terminal_start
@@ -406,7 +406,8 @@ impl Cagents {
                 && owners.next().is_none()
         });
         let mut retry = None;
-        if let Change::Update { before, pane } = &change
+        if let (Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }) =
+            &change
             && before.id == pane.id
             && self
                 .card_state(pane.id)
@@ -434,7 +435,7 @@ impl Cagents {
                 let later = &self.shared_views.pending[index + 1..];
                 let superseded = |field: fn(&Pane, &Pane) -> bool| {
                     later.iter().any(|(_, _, change)| {
-                        matches!(change, Change::Update { before, pane: after }
+                        matches!(change, Change::Update { before, pane: after } | Change::UpdateTerminalSource { before, pane: after, .. }
                         if after.id == pane.id && field(before, after))
                     })
                 };
@@ -469,7 +470,7 @@ impl Cagents {
         // did not change may have moved on since, as a suggested title does.
         let already_applied = session_already_applied
             && (retry.is_some()
-                || matches!(&change, Change::Update { before, pane }
+                || matches!(&change, Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }
                     if self
                         .workspace_model
                         .views
@@ -1877,12 +1878,12 @@ impl Cagents {
                     Change::Update { before, mut pane }
                         if matches!((&before.kind, &pane.kind),
                             (CardKind::Terminal(a), CardKind::Terminal(b)) if a.id == b.id && a.launch == b.launch)
-                            && views::updates_source(&before, &pane) =>
+                            && before.kind != pane.kind =>
                     {
                         let worker = match self.cards.get(&pane.id) {
                             Some(CardRuntime::Terminal(handle)) => handle.execution_instance().zip(handle.host_proof())
                                 .map(|(instance, owner)| views::TerminalRemovalBasis::Worker { owner, instance }),
-                            _ => self.shared_views.ended_terminal_workers.get(&pane.id)
+                            _ => self.shared_views.terminal_source_workers.get(&pane.id)
                                 .filter(|(id, _)| matches!(&pane.kind, CardKind::Terminal(s) if &s.id == id))
                                 .map(|(_, worker)| worker.clone()),
                         };
@@ -1896,8 +1897,6 @@ impl Cagents {
                             // A source without a surface receipt is saved locally,
                             // but cannot overwrite another worker's canonical state.
                             pane.kind = before.kind.clone();
-                            pane.pending_terminal_start = before.pending_terminal_start;
-                            pane.scope = before.scope.clone();
                             Change::Update { before, pane }
                         }
                     }
@@ -2101,6 +2100,14 @@ impl Cagents {
                     .insert(*operation, source_basis);
             }
             *scope = owner.scope.clone();
+            if let Change::UpdateTerminalSource { before, pane, .. } = change
+                && !views::updates_source(before, pane)
+            {
+                *change = Change::Update {
+                    before: before.clone(),
+                    pane: pane.clone(),
+                };
+            }
             edits.push(ModelEdit::ChangeView {
                 scope: scope.clone(),
                 expected_revision: owner.revision,
@@ -3118,7 +3125,7 @@ impl Cagents {
                 if let CardKind::Terminal(s) = &pane.kind {
                     self.retained_outputs.remove(&s.id);
                 }
-                self.shared_views.ended_terminal_workers.remove(&pane.id);
+                self.shared_views.terminal_source_workers.remove(&pane.id);
                 // The canonical live source attaches; saved exit state cannot
                 // turn its replacement back into the old Completed placeholder.
                 observed_exit = None;
@@ -3907,8 +3914,27 @@ mod tests {
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             panic!("terminal");
         };
+        let owner = session
+            .continuity
+            .live_proof()
+            .filter(HostSessionProof::is_complete)
+            .unwrap_or_else(|| HostSessionProof {
+                host_session_id: "observed-move-host".into(),
+                boot_id: "observed-move-boot".into(),
+                host_incarnation: "observed-move-instance".into(),
+            });
+        let observed = (
+            session.id,
+            views::TerminalRemovalBasis::Worker {
+                owner,
+                instance: uuid::Uuid::new_v4(),
+            },
+        );
         // This is the durable descriptor boundary written by ResumeHintChanged.
         session.resume_hint = Some("observed-provider-session-while-moving".into());
+        app.shared_views
+            .terminal_source_workers
+            .insert(card, observed);
         app.persist();
         let pane = app
             .local_view_panes(&Scope::Channel(source))
@@ -3963,22 +3989,12 @@ mod tests {
                 if let ModelEdit::ChangeView {
                     scope,
                     operation,
-                    change:
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
+                    change: change @ (Change::Update { .. } | Change::UpdateTerminalSource { .. }),
                     ..
                 } = edit
                 {
                     assert_eq!(scope, Scope::Channel(source));
-                    old.push((
-                        operation,
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
-                    ));
+                    old.push((operation, change));
                 }
             }
             assert!(
@@ -4028,23 +4044,13 @@ mod tests {
                     scope,
                     expected_revision,
                     operation,
-                    change:
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
+                    change: change @ (Change::Update { .. } | Change::UpdateTerminalSource { .. }),
                 } = edit
                 {
                     assert_eq!(scope, Scope::Channel(destination));
                     assert_eq!(expected_revision, 1);
                     assert!(!old.iter().any(|(previous, _)| *previous == operation));
-                    retried.push((
-                        operation,
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
-                    ));
+                    retried.push((operation, change));
                 }
             }
             assert_eq!(

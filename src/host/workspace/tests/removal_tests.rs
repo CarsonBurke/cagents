@@ -264,3 +264,43 @@ fn completed_pane_without_a_surface_can_read_the_exact_worker_receipt() {
     ended.launch.arguments.push("foreign-source".into());
     assert!(host.lock().unwrap().terminal_removal_basis(&ended).is_err());
 }
+
+#[test]
+fn observed_metadata_uses_the_worker_receipt_after_the_host_descriptor_advances() {
+    let (_directory, host, worker, before, removal) = prepared();
+    let mut pane = before.clone();
+    let CardKind::Terminal(source) = &mut pane.kind else {
+        unreachable!()
+    };
+    source.resume_hint = Some("observed-fixture-session".into());
+    host.lock()
+        .unwrap()
+        .terminals
+        .get_mut(&source.id)
+        .unwrap()
+        .session
+        .resume_hint = source.resume_hint.clone();
+    let ModelEdit::ChangeView {
+        scope,
+        expected_revision,
+        ..
+    } = removal
+    else {
+        unreachable!()
+    };
+    let change = ModelEdit::ChangeView {
+        scope,
+        expected_revision,
+        operation: uuid::Uuid::new_v4(),
+        change: Change::UpdateTerminalSource {
+            before,
+            pane: pane.clone(),
+            worker: TerminalRemovalBasis::Worker {
+                owner: host.lock().unwrap().proof().clone(),
+                instance: worker.handle.execution_instance(),
+            },
+        },
+    };
+    let model = edit(&host, 1, change).unwrap();
+    assert_eq!(model.views[0].panes[0].kind, pane.kind);
+}

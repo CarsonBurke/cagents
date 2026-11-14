@@ -200,23 +200,39 @@ impl HostState {
         })
     }
 
+    pub(in crate::host) fn current_metadata_worker(
+        &self,
+        id: TerminalId,
+        basis: &TerminalRemovalBasis,
+    ) -> bool {
+        matches!(basis, TerminalRemovalBasis::Worker { owner, instance }
+            if owner == self.proof() && owner.is_complete() && !instance.is_nil()
+                && self.terminals.get(&id).is_some_and(|record| record.handle.execution_instance() == *instance))
+    }
+
     pub(in crate::host) fn validate_view_removal(&self, edit: &ModelEdit) -> Result<(), String> {
         if let ModelEdit::ChangeView {
-            change: Change::UpdateTerminalSource { before, worker, .. },
+            change:
+                Change::UpdateTerminalSource {
+                    before,
+                    pane,
+                    worker,
+                },
             ..
         } = edit
         {
-            let crate::model::CardKind::Terminal(source) = &before.kind else {
+            let (
+                crate::model::CardKind::Terminal(source),
+                crate::model::CardKind::Terminal(observed),
+            ) = (&before.kind, &pane.kind)
+            else {
                 return Err(conflict());
             };
-            if self.removal_in_transition(source.id) {
-                return Err(conflict());
-            }
-            if self.terminals.contains_key(&source.id)
-                && self
-                    .terminal_removal_basis(source)
-                    .map_err(|_| conflict())?
-                    != *worker
+            if source.id != observed.id
+                || source.launch != observed.launch
+                || self.removal_in_transition(source.id)
+                || (self.terminals.contains_key(&source.id)
+                    && !self.current_metadata_worker(source.id, worker))
             {
                 return Err(conflict());
             }
