@@ -447,7 +447,7 @@ fn rendered_automation_click_reads_exact_receipt_without_ack_or_actor_even_after
             result: if available {
                 Ok(page(automation(0), 42))
             } else {
-                Err(())
+                Err(LifecycleReadError::Unavailable)
             },
         }));
         assert!(

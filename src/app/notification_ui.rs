@@ -43,7 +43,7 @@ pub enum Action {
 /// Unavailable receipts retain the existing historical fallback. A permission
 /// refusal instead explains why this window cannot read the notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum LifecycleReadError {
+pub enum LifecycleReadError {
     Unavailable,
     Refused(Failure),
 }

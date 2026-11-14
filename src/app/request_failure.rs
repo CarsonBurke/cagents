@@ -70,7 +70,7 @@ impl Activity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Failure {
+pub struct Failure {
     pub(super) message: String,
     pub(super) details: Option<String>,
 }
