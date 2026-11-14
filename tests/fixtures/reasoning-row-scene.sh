@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -270,6 +270,31 @@ if [ "$scene" = refresh-core ]; then
     scroll_top
     shot refresh-narrow-working
     printf '%s\n' 'Captured working reasoning, failed/running commands and narrow working reasoning.'
+    exit 0
+fi
+
+# One turn's activity while it works and after it finishes. An empty thought
+# opens the turn; a background command keeps the command group running while
+# a second empty thought is live, then the receipt arrives and the turn ends.
+if [ "$scene" = activity ]; then
+    cp "$here/reasoning-row-scene/activity.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: wait for the receipt and confirm the worktree.' \
+        "$fixture/state/reasoning-activity-spawn.json" 'Turn activity'
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if rg -q '"uuid":"activity-wait-1-ack"' "$config/projects"; then ready=true; break; fi
+        sleep 2
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: background command did not start' >&2; exit 1; }
+    sleep 4
+    scroll_top
+    shot activity-working
+    evidence drive wait 'receipt has arrived' --timeout 60 >/dev/null
+    scroll_top
+    shot activity-finished
+    printf '%s\n' 'Captured a working turn and the same turn finished.'
     exit 0
 fi
 

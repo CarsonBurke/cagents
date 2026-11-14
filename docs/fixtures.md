@@ -304,6 +304,17 @@ It includes finished empty reasoning, active empty reasoning and a live thought
 that gains a new last line. The Edit input maps to the app's Changes item;
 its patch is synthetic. None of the described commands or tools executes.
 
+`activity` opens its own named workspace and loads
+[`activity.jsonl`](../tests/fixtures/reasoning-row-scene/activity.jsonl): an
+empty thought, a command and a background command, then a second empty thought
+that stays live for 40 seconds while the command group is still running. It
+captures that working turn, waits for the receipt and the answer, and captures
+the finished turn.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
+```
+
 For a short comparison against main after the background-notice changes, run
 `refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
 each revision. Build both revisions before starting either session, use

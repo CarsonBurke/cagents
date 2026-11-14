@@ -1,0 +1,18 @@
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"activity-plan-@TURN@"}}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}
+{"_sleep":2}
+{"type":"assistant","uuid":"activity-plan-@TURN@-carrier","message":{"id":"activity-plan-@TURN@","role":"assistant","content":[{"type":"thinking","thinking":""}]}}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+{"type":"stream_event","event":{"type":"message_stop"}}
+{"type":"assistant","uuid":"activity-status-@TURN@-call","message":{"id":"activity-status-@TURN@-call","role":"assistant","content":[{"type":"tool_use","id":"activity-status-@TURN@","name":"Bash","input":{"command":"printf fixture-clean","description":"Check the fixture worktree"}}]}}
+{"type":"user","uuid":"activity-status-@TURN@-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"activity-status-@TURN@","is_error":false,"content":"The fixture worktree is clean."}]}}
+{"type":"assistant","uuid":"activity-wait-@TURN@-call","message":{"id":"activity-wait-@TURN@-call","role":"assistant","content":[{"type":"tool_use","id":"activity-wait-@TURN@","name":"Bash","input":{"command":"sleep 40 # the fixture receipt arrives while the conversation keeps reasoning","description":"Wait for the fixture receipt","run_in_background":true}}]}}
+{"type":"user","uuid":"activity-wait-@TURN@-ack","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"activity-wait-@TURN@","is_error":false,"content":"Command running in background with ID: activity-receipt-@TURN@."}]},"tool_use_result":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"activity-receipt-@TURN@"}}
+{"type":"system","subtype":"task_started","uuid":"activity-wait-start-@TURN@","task_id":"activity-receipt-@TURN@","tool_use_id":"activity-wait-@TURN@","task_type":"local_bash","description":"Wait for the fixture receipt"}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"activity-review-@TURN@"}}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}
+{"_sleep":40}
+{"type":"assistant","uuid":"activity-review-@TURN@-carrier","message":{"id":"activity-review-@TURN@","role":"assistant","content":[{"type":"thinking","thinking":""}]}}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+{"type":"stream_event","event":{"type":"message_stop"}}
+{"type":"user","uuid":"activity-receipt-notice-@TURN@","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<task-id>activity-receipt-@TURN@</task-id>\n<tool-use-id>activity-wait-@TURN@</tool-use-id>\n<status>completed</status>\n<summary>Background command &quot;Wait for the fixture receipt&quot; completed (exit code 0)</summary>\n</task-notification>"}}
