@@ -1232,7 +1232,11 @@ impl Cagents {
                         })
                         .collect()
                 } else {
-                    Vec::new()
+                    vec![Offer {
+                        provider: current,
+                        models: &runtime.snapshot.models,
+                        catalog: self.account_ui.catalog(current),
+                    }]
                 };
                 let view = runtime.view(
                     self.chat_auth_recovery(runtime),
@@ -4254,7 +4258,7 @@ impl Runtime {
         // model on hover and to assistive technology.
         let named = fit != FooterFit::Tight;
         let limit = fit.label_limit();
-        let (tooltip, name) = if !named || label.chars().count() > limit {
+        let (mut tooltip, name) = if !named || label.chars().count() > limit {
             (
                 format!("Model: {label} · {shortcut}"),
                 Cow::Owned(format!("Choose a model, now {label}")),
@@ -4262,6 +4266,11 @@ impl Runtime {
         } else {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
+        if !self.is_draft()
+            && let Some(choice) = staged_model_choice(&self.snapshot)
+        {
+            tooltip = format!("{choice} applies from the next turn");
+        }
         let label = Self::short_description(&label, limit);
         let anchor = widget::button::custom(
             widget::row::with_children(
@@ -4314,13 +4323,17 @@ impl Runtime {
         let query = self.model_picker.as_deref()?;
         let provider = self.session.launch.provider;
         let draft = self.choosing();
+        let catalog = offers
+            .iter()
+            .find(|offer| offer.provider == provider)
+            .and_then(|offer| offer.catalog);
         let offers = if draft {
             offers
         } else {
             vec![Offer {
                 provider,
                 models: &self.snapshot.models,
-                catalog: None,
+                catalog,
             }]
         };
         let models = model_list(
@@ -4339,30 +4352,46 @@ impl Runtime {
                 .find(|model| Some(&model.id) == self.snapshot.selected_model.as_ref())
             && !model.reasoning.is_empty()
         {
-            let mut choices = vec![
-                design::caption("Reasoning effort")
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
-            ];
-            choices.extend(model.reasoning.iter().enumerate().map(|(index, effort)| {
-                widget::button::custom(design::body(effort_label(effort)))
-                    .name(effort_label(effort))
-                    .id(card_control_id(
-                        self.target.card,
-                        &format!("chat-reasoning-choice-{index}"),
-                    ))
-                    .class(crate::ui_controls::control_style(
-                        Some(effort) == self.snapshot.reasoning.as_ref(),
-                        None,
-                    ))
-                    .width(Length::Fill)
-                    .on_press(action(Action::Reasoning(
-                        self.target,
-                        model.id.clone(),
-                        effort.clone(),
-                    )))
-                    .into()
-            }));
+            let default_effort = reasoning_default(&self.snapshot, model, catalog);
+            let mut choices = vec![picker_section_header(
+                widget::row::with_children(vec![
+                    iced::widget::Space::new()
+                        .width(f32::from(design::COMPACT_ICON_SIZE))
+                        .into(),
+                    design::caption("Reasoning effort")
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+                step::GAP_XS,
+            )];
+            choices.extend(
+                reasoning_rows(model, default_effort)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (effort, title))| {
+                        picker_choice_row(
+                            title.clone(),
+                            None,
+                            title,
+                            card_control_id(
+                                self.target.card,
+                                &match effort {
+                                    None => "chat-reasoning-choice-default".into(),
+                                    Some(_) => format!("chat-reasoning-choice-{}", index - 1),
+                                },
+                            ),
+                            effort == self.snapshot.reasoning.as_deref(),
+                            action(Action::Reasoning(
+                                self.target,
+                                model.id.clone(),
+                                effort.map(str::to_owned),
+                            )),
+                        )
+                    }),
+            );
             sections.push(
                 widget::column::with_children(choices)
                     .spacing(step::GAP_XS)
@@ -6185,12 +6214,81 @@ fn model_choice_label(model: &chat::Model) -> Cow<'_, str> {
     }
 }
 
-fn effort_label(effort: &str) -> String {
-    let mut chars = effort.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
+/// Provider identifiers stay in the protocol; people see these names everywhere.
+fn effort_label(effort: &str) -> Cow<'_, str> {
+    match effort {
+        "low" => "Low".into(),
+        "medium" => "Medium".into(),
+        "high" => "High".into(),
+        "xhigh" => "Extra high".into(),
+        "max" => "Max".into(),
+        _ => effort.into(),
     }
+}
+
+fn reasoning_rows<'a>(
+    model: &'a chat::Model,
+    default: Option<&str>,
+) -> Vec<(Option<&'a str>, Cow<'a, str>)> {
+    let title = default.map_or_else(
+        || Cow::Borrowed("Default"),
+        |effort| Cow::Owned(format!("Default ({})", effort_label(effort))),
+    );
+    std::iter::once((None, title))
+        .chain(
+            model
+                .reasoning
+                .iter()
+                .map(|effort| (Some(effort.as_str()), effort_label(effort))),
+        )
+        .collect()
+}
+
+fn model_matches_active(model: &chat::Model, active: &chat::ActiveModel) -> bool {
+    model.id == active.id
+        || model.label == active.label
+        || (model.id == "default" && model.label == format!("Default ({})", active.label))
+}
+
+fn reasoning_default<'a>(
+    snapshot: &'a chat::Snapshot,
+    model: &chat::Model,
+    catalog: Option<&'a crate::account::cache::Catalog>,
+) -> Option<&'a str> {
+    snapshot
+        .active_model
+        .as_ref()
+        .filter(|active| model_matches_active(model, active))
+        .and_then(|active| active.default_reasoning.as_deref())
+        .or_else(|| catalog.and_then(|catalog| catalog.default_effort(Some(&model.id))))
+}
+
+fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
+    let active = snapshot.active_model.as_ref()?;
+    let selected = snapshot.selected_model.as_deref();
+    let model = snapshot
+        .models
+        .iter()
+        .find(|model| Some(model.id.as_str()) == selected);
+    let model_changed = selected.is_some_and(|id| id != active.id)
+        && !model.is_some_and(|model| model_matches_active(model, active));
+    let default = active.default_reasoning.as_deref();
+    let effort_changed =
+        snapshot.reasoning.as_deref().or(default) != active.reasoning.as_deref().or(default);
+    let mut choices = Vec::new();
+    if model_changed {
+        choices.push(model.map_or_else(
+            || selected.unwrap_or("Default").to_owned(),
+            |model| model_choice_label(model).into_owned(),
+        ));
+    }
+    if effort_changed {
+        choices.push(snapshot.reasoning.as_deref().map_or_else(
+            || "Default".to_owned(),
+            |effort| effort_label(effort).into_owned(),
+        ));
+    }
+    (!choices.is_empty()).then(|| choices.join(" · "))
 }
 
 fn footer_model_label<'a>(
@@ -6202,25 +6300,22 @@ fn footer_model_label<'a>(
 ) -> Cow<'a, str> {
     let selected = snapshot.models.iter().find(|model| {
         Some(&model.id) == snapshot.selected_model.as_ref()
-            || (draft && snapshot.selected_model.is_none() && model.id == "default")
+            || (snapshot.selected_model.is_none() && model.id == "default")
     });
     let active = (!draft).then_some(snapshot.active_model.as_ref()).flatten();
     let label = if let Some(active) = active {
         active.label.as_str().into()
     } else {
         match selected {
-            Some(model) if draft => model_choice_label(model),
-            // Other-model providers use their selected entry as status.
-            Some(model) if provider == Provider::Omp => model.label.as_str().into(),
-            None if draft => match &snapshot.selected_model {
+            Some(model) => model_choice_label(model),
+            None => match &snapshot.selected_model {
                 Some(id) => id.as_str().into(),
                 None if fit != FooterFit::Wide => "Default model".into(),
                 None => format!("{} · Default model", family_label(provider)).into(),
             },
-            _ => "Model".into(),
         }
     };
-    let chosen = (draft || provider == Provider::Omp)
+    let chosen = (active.is_none() || provider == Provider::Omp)
         .then_some(snapshot.reasoning.as_deref())
         .flatten()
         .filter(|effort| Some(*effort) != draft_default_effort);
@@ -6310,6 +6405,62 @@ fn names_provider(provider: Provider, needle: &str) -> bool {
     })
 }
 
+fn picker_section_header<'a>(content: Element<'a, Message>, top: f32) -> Element<'a, Message> {
+    widget::container(content)
+        .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]).top(top))
+        .into()
+}
+
+fn picker_choice_row<'a>(
+    title: Cow<'a, str>,
+    detail: Option<&'a str>,
+    name: Cow<'a, str>,
+    id: widget::Id,
+    selected: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    let mut label = vec![
+        design::body(title)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    ];
+    if let Some(detail) = detail {
+        label.push(
+            design::caption(detail)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        );
+    }
+    widget::button::custom(
+        widget::row::with_children(vec![
+            if selected {
+                widget::icon(Icon::Check.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into()
+            } else {
+                iced::widget::Space::new()
+                    .width(f32::from(design::COMPACT_ICON_SIZE))
+                    .into()
+            },
+            widget::column::with_children(label)
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center),
+    )
+    .name(name)
+    .id(id)
+    .class(crate::ui_controls::control_style(selected, None))
+    .selected(selected)
+    .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
+    .height(Length::Fixed(design::list::TWO_LINE_HEIGHT))
+    .width(Length::Fill)
+    .on_press(message)
+    .into()
+}
+
 /// The search field and the models `query` names among `offers`, under a
 /// heading for each provider where there is more than one to choose from.
 ///
@@ -6342,31 +6493,24 @@ fn model_list<'a>(
     }
     for (index, (provider, models)) in groups.into_iter().enumerate() {
         if headed {
-            rows.push(
-                widget::container(
-                    widget::row::with_children(vec![
-                        widget::icon(crate::ui_controls::provider_icon(provider))
-                            .size(design::COMPACT_ICON_SIZE)
-                            .into(),
-                        design::caption(family_label(provider))
-                            .class(cosmic::theme::Text::Custom(design::muted_text))
-                            .into(),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                // Groups are set apart by the space above their heading
-                // rather than by a rule, which would be one more line in a
-                // list that is all lines.
-                .padding(
-                    iced::Padding::from([step::GAP_XS, step::GAP_S]).top(if index == 0 {
-                        step::GAP_XS
-                    } else {
-                        step::GAP_M
-                    }),
-                )
+            rows.push(picker_section_header(
+                widget::row::with_children(vec![
+                    widget::icon(crate::ui_controls::provider_icon(provider))
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
+                    design::caption(family_label(provider))
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
                 .into(),
-            );
+                if index == 0 {
+                    step::GAP_XS
+                } else {
+                    step::GAP_M
+                },
+            ));
         }
         for row in models {
             let selected =
@@ -6383,11 +6527,6 @@ fn model_list<'a>(
                     Cow::Owned(format!("{} default model", family_label(provider))),
                 ),
             };
-            let mut label: Vec<Element<'a, Message>> = vec![
-                design::body(title.clone())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-            ];
             // The identifier is shown only where it is not already the
             // label, because most providers use one string for both and a
             // row that prints it twice is half a list of duplicates.
@@ -6400,54 +6539,20 @@ fn model_list<'a>(
                 None if listed => Some("Whichever it would choose itself"),
                 None => Some("Its models are listed once it has run"),
             };
-            if let Some(detail) = detail {
-                label.push(
-                    design::caption(detail)
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into(),
-                );
-            }
-            rows.push(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        // The mark keeps its column whether or not this row
-                        // carries it, so the labels stay in one line down
-                        // the list instead of stepping in and out.
-                        if selected {
-                            widget::icon(Icon::Check.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into()
-                        } else {
-                            iced::widget::Space::new()
-                                .width(f32::from(design::COMPACT_ICON_SIZE))
-                                .into()
-                        },
-                        widget::column::with_children(label)
-                            .width(Length::Fill)
-                            .into(),
-                    ])
-                    .spacing(step::GAP_S)
-                    .align_y(Alignment::Center),
-                )
-                .name(name)
-                .id(card_control_id(
+            rows.push(picker_choice_row(
+                title,
+                detail,
+                name,
+                card_control_id(
                     target.card,
                     &match id {
                         Some(id) => format!("chat-model-choice-{provider:?}-named-{id}"),
                         None => format!("chat-model-choice-{provider:?}-default"),
                     },
-                ))
-                .class(crate::ui_controls::control_style(selected, None))
-                .selected(selected)
-                .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
-                // The row spans the list, so the highlight under the model in
-                // use is a band across it rather than a patch the width of its
-                // name.
-                .width(Length::Fill)
-                .on_press(row.choose(target, draft))
-                .into(),
-            );
+                ),
+                selected,
+                row.choose(target, draft),
+            ));
         }
     }
     widget::column::with_children(vec![
@@ -11988,13 +12093,27 @@ mod tests {
                     Message::ChatUi(Action::Model(actual, id)) =>
                         *actual == target && id == "model-b",
                     Message::ChatUi(Action::Reasoning(actual, id, effort)) =>
-                        *actual == target && id == "model-a" && effort == "high",
+                        *actual == target && id == "model-a" && effort.as_deref() == Some("high"),
                     _ => false,
                 }),
                 "picker must publish its selection"
             );
             drop(app.update(action(Action::ModelPicker(target, false))));
         }
+        let (next, messages) = click(&app, target, cache, &mut renderer, "chat-model-picker");
+        cache = next;
+        apply(&mut app, messages);
+        let (next, messages) = click(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            "chat-reasoning-choice-default",
+        );
+        cache = next;
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Reasoning(actual, id, None)) if *actual == target && id == "model-a")));
+        drop(app.update(action(Action::ModelPicker(target, false))));
         // The keyboard command opens the model popup over its visible anchor.
         drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
         let (_, messages) = click(
@@ -15484,6 +15603,100 @@ mod tests {
     }
 
     #[test]
+    fn footer_effort_labels_and_default_row_use_person_facing_names() {
+        let model = chat::Model {
+            id: "model".into(),
+            label: "Model".into(),
+            reasoning: ["low", "medium", "high", "xhigh", "max"]
+                .map(str::to_owned)
+                .into(),
+        };
+        assert_eq!(
+            reasoning_rows(&model, None),
+            vec![
+                (None, "Default".into()),
+                (Some("low"), "Low".into()),
+                (Some("medium"), "Medium".into()),
+                (Some("high"), "High".into()),
+                (Some("xhigh"), "Extra high".into()),
+                (Some("max"), "Max".into()),
+            ]
+        );
+        assert_eq!(
+            reasoning_rows(&model, Some("medium"))[0],
+            (None, "Default (Medium)".into())
+        );
+        assert_eq!(effort_label("future-effort"), "future-effort");
+    }
+
+    #[test]
+    fn footer_staged_choice_tooltip_keeps_running_values_separate() {
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.models = vec![
+            model("default", "Default (Opus 5.5)"),
+            model("next", "Next model"),
+        ];
+        snapshot.selected_model = Some("default".into());
+        snapshot.reasoning = None;
+        snapshot.active_model = Some(chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: None,
+            default_reasoning: Some("medium".into()),
+        });
+        assert_eq!(staged_model_choice(snapshot), None);
+        snapshot.models.push(model("opus", "Opus 5.5"));
+        snapshot.selected_model = Some("opus".into());
+        assert_eq!(
+            staged_model_choice(snapshot),
+            None,
+            "ordinary aliases also resolve to the running model"
+        );
+        snapshot.selected_model = Some("default".into());
+        snapshot.reasoning = Some("high".into());
+        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("High"));
+        assert_eq!(
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+            "Opus 5.5"
+        );
+        snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
+        assert_eq!(staged_model_choice(snapshot), None);
+        snapshot.reasoning = None;
+        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("Default"));
+        snapshot.selected_model = Some("next".into());
+        assert_eq!(
+            staged_model_choice(snapshot).as_deref(),
+            Some("Next model · Default")
+        );
+        let catalog = crate::account::cache::Catalog {
+            models: snapshot.models.clone(),
+            observed_at: 1,
+            default_model: None,
+            reasoning_defaults: [("next".into(), "high".into())].into(),
+        };
+        assert_eq!(
+            reasoning_default(snapshot, &snapshot.models[1], Some(&catalog)),
+            Some("high")
+        );
+        assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
+        snapshot.active_model = None;
+        assert_eq!(staged_model_choice(snapshot), None);
+        snapshot.selected_model = Some("default".into());
+        assert_eq!(
+            footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+            "Default (Opus 5.5)"
+        );
+        snapshot.reasoning = Some("high".into());
+        for provider in [Provider::Claude, Provider::Codex] {
+            assert_eq!(
+                footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+                "Default (Opus 5.5) · High"
+            );
+        }
+    }
+
+    #[test]
     fn footer_model_label_names_active_model_and_keeps_draft_alias() {
         let (mut runtime, _handle) = furnished_runtime();
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
@@ -15519,7 +15732,7 @@ mod tests {
         snapshot.active_model = None;
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
-            "Model"
+            "next-turn-model"
         );
         assert_eq!(
             footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
