@@ -6618,6 +6618,7 @@ mod tests {
                     "Claude",
                     NOW,
                     Some(&vec![preview_window_key(
+                        Provider::Claude,
                         &state.snapshot.as_ref().unwrap().windows[0],
                     )]),
                     mode,
