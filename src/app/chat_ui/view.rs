@@ -116,6 +116,8 @@ pub(super) const NOTICE_CHARS: usize = 480;
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
 const FOOTER_LABEL: usize = 32;
+/// The most of a channel's name the footer shows after its `# `.
+const CHANNEL_LABEL: usize = 26;
 /// The same, in a pane too narrow for the conversation's place.
 const NARROW_FOOTER_LABEL: usize = 20;
 /// The same where the model is named only on hover, for the text drawn in
@@ -889,13 +891,8 @@ fn menu_row<'a>(
             .into(),
     );
     cells.push(
-        design::caption(description)
-            .class(cosmic::theme::Text::Custom(design::muted_text))
+        crate::ui_controls::FadeText::caption(description)
             .width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
             .into(),
     );
     cells.extend(kind.map(|kind| {
@@ -2663,14 +2660,24 @@ impl Runtime {
         // shares. The symmetric inset already exceeds the scrollbar rail.
         // Reserving the rail a second time would make transcript rows
         // narrower than the composer in a pane no wider than the column.
+        // The viewport runs right up to whatever is pinned above and below
+        // it, the composer included, so a line scrolling past either edge
+        // meets that surface rather than a strip of pane laid over it. The
+        // gap the pane keeps between its blocks moves inside the viewport
+        // instead: it is the room the first and last rows rest at, and
+        // scrolled content passes through it.
+        let transcript_index = content.len();
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
+                .padding(
+                    iced::Padding::new(step::GAP_M)
+                        .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
+                        .bottom(step::GAP_M + step::GAP_S),
+                )
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
         )
         .center_x(Length::Fill);
-        let transcript_index = content.len();
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
             crate::ui_memory::gate(selection::transcript_virtualized(
@@ -2861,7 +2868,7 @@ impl Runtime {
         // typing would cost more than the question being missable.
         if !snapshot.requests.is_empty() {
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(
                         widget::column::with_children(
                             snapshot
@@ -2893,7 +2900,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Shrink),
-                )
+                    design::base,
+                ))
                 .max_height(REQUEST_CEILING)
                 .into(),
             );
@@ -2947,7 +2955,7 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>();
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(widget::column::with_children(rows).padding(
                         design::with_vertical_rail(iced::Padding::new(COMPLETION_INSET)),
                     ))
@@ -2962,7 +2970,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Fixed(viewport)),
-                )
+                    design::raised,
+                ))
                 .class(design::surface(
                     Some(design::raised),
                     [design::RADIUS_M; 4],
@@ -3042,6 +3051,7 @@ impl Runtime {
         // finds named siblings but does not move their trees to new indices.
         // Only the transcript layer spans the pane; everything around it
         // keeps the reading column.
+        let transcript_last = content.len() == transcript_index + 1;
         let mut content = vec![
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == transcript_index {
@@ -3050,15 +3060,18 @@ impl Runtime {
                     widget::container(child)
                         .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
                             step::GAP_M
-                        } else {
+                        } else if index == transcript_index + 1 {
+                            // Against the transcript's edge: its own
+                            // padding keeps the rows clear of this.
                             0.0
+                        } else {
+                            space::S
                         }))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(space::S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .into(),
@@ -3360,9 +3373,8 @@ impl Runtime {
                 status.push(bounded(
                     widget::row::with_children(vec![
                         crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                        design::caption(Self::short_description(branch, FOOTER_LABEL))
-                            .class(cosmic::theme::Text::Custom(design::muted_text))
-                            .wrapping(iced::widget::text::Wrapping::None)
+                        crate::ui_controls::FadeText::caption(branch.clone())
+                            .limit(FOOTER_LABEL)
                             .into(),
                     ])
                     .spacing(step::GAP_XS)
@@ -3545,18 +3557,25 @@ impl Runtime {
             action(Action::PermissionPicker(target, false)),
         );
         let pane = widget::container(super::layout::pane(
+            // The first block holds the transcript, which runs on down to
+            // the next block when it ends that one: see `transcript` above.
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == 0 {
                     child
                 } else {
                     widget::container(child)
-                        .padding([0.0, step::GAP_M])
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(
+                            if index == 1 && transcript_last {
+                                0.0
+                            } else {
+                                step::GAP_S
+                            },
+                        ))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(step::GAP_S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill)
@@ -3910,11 +3929,15 @@ impl Runtime {
             })
             .collect();
         let empty = rows.is_empty();
-        let list = widget::scrollable(
-            widget::column::with_children(rows)
-                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-        )
-        .height(Length::Shrink);
+        // The rows scroll beneath the search field inside the popover.
+        let list = crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+            )
+            .height(Length::Shrink),
+            design::component_base,
+        );
         let mut content: Vec<Element<'_, Message>> = Vec::new();
         if self.composer_menu_searchable() {
             content.push(
@@ -3993,7 +4016,9 @@ impl Runtime {
             );
             if transitioning {
                 controls.push(bounded(
-                    design::caption(Self::short_description(&label, fit.label_limit())).into(),
+                    crate::ui_controls::FadeText::caption(label.clone())
+                        .limit(fit.label_limit())
+                        .into(),
                     &label,
                     "Model",
                     fit.label_limit(),
@@ -4017,31 +4042,25 @@ impl Runtime {
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor =
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            // Keep the permission label on the same line as
-                            // the model when the footer narrows.
-                            design::caption(selected.map_or("Permissions", |index| {
+                let anchor = widget::button::custom(
+                    // Faded rather than wrapped where a narrow footer leaves
+                    // the leading group little room; the chevron that says
+                    // this is a picker keeps its place either way.
+                    crate::ui_controls::trailing(
+                        crate::ui_controls::FadeText::caption(
+                            selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
-                            }))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .into(),
-                            widget::icon(Icon::PanDown.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .name("Choose permission mode")
-                    .id(card_control_id(target.card, "chat-permission-picker"))
-                    .class(crate::ui_controls::control_style(open, None))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                            }),
+                        ),
+                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        step::GAP_XS,
+                    ),
+                )
+                .name("Choose permission mode")
+                .id(card_control_id(target.card, "chat-permission-picker"))
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -4069,12 +4088,7 @@ impl Runtime {
         // and to assistive technology, so the controls beside it keep room.
         let named = fit == FooterFit::Wide;
         let label = || -> Element<'a, Message> {
-            design::caption(accounts.current.clone())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into()
+            crate::ui_controls::FadeText::caption(accounts.current.clone()).into()
         };
         let icon = Icon::Avatar.handle();
         if transitioning || !self.choosing() {
@@ -4163,14 +4177,8 @@ impl Runtime {
                                     .into(),
                             ),
                         }
-                        let mut text: Vec<Element<'a, Message>> = vec![
-                            design::body(choice.label.clone())
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .ellipsize(iced::widget::text::Ellipsize::End(
-                                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                ))
-                                .into(),
-                        ];
+                        let mut text: Vec<Element<'a, Message>> =
+                            vec![crate::ui_controls::fade_text(choice.label.clone()).into()];
                         if !choice.detail.is_empty() {
                             text.push(
                                 design::caption(choice.detail)
@@ -4281,7 +4289,6 @@ impl Runtime {
         {
             tooltip = format!("{choice} applies from the next turn");
         }
-        let label = Self::short_description(&label, limit);
         let anchor = widget::button::custom(
             widget::row::with_children(
                 std::iter::once(
@@ -4292,8 +4299,8 @@ impl Runtime {
                     .into(),
                 )
                 .chain(named.then(|| {
-                    design::caption(label)
-                        .wrapping(iced::widget::text::Wrapping::None)
+                    crate::ui_controls::FadeText::caption(label)
+                        .limit(limit)
                         .into()
                 }))
                 .chain(std::iter::once(
@@ -5126,25 +5133,31 @@ impl Runtime {
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
-                    widget::container(
+                    // The list runs to the panel's foot, its inset scrolling
+                    // with it, so a row passing the foot fades into the
+                    // panel rather than stopping short of it.
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::column::with_children(rows)
                                 .spacing(step::GAP_XS)
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                                .padding(design::with_vertical_rail(
+                                    iced::Padding::ZERO.bottom(step::GAP_S),
+                                )),
                         )
                         .id(card_control_id(self.target.card, "chat-queue"))
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
-                    .max_height(QUEUE_CEILING)
+                        design::sunken,
+                    ))
+                    .max_height(QUEUE_CEILING + step::GAP_S)
                     .into(),
                 ])
                 .spacing(step::GAP_XS),
             )
             .width(Length::Fill)
-            .padding(step::GAP_S)
+            .padding(iced::Padding::new(step::GAP_S).bottom(0.0))
             .class(design::surface(
                 Some(design::sunken),
                 [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
@@ -5433,7 +5446,7 @@ impl Runtime {
             if long {
                 widget::column::with_children(vec![
                     text,
-                    disclosure::row_on(
+                    disclosure::row(
                         if expanded { "Show less" } else { "Show more" }.into(),
                         if expanded { "Show less" } else { "Show more" }.into(),
                         Icon::Chat,
@@ -5441,7 +5454,6 @@ impl Runtime {
                         None,
                         Some(expanded),
                         Some(Action::Toggle(self.target, item.id.clone())),
-                        design::accent_wash,
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -5734,7 +5746,7 @@ impl Runtime {
                 "Thinking".to_owned()
             };
             let name = format!("Reasoning: {label}");
-            let header = disclosure::row_on(
+            let header = disclosure::row(
                 label,
                 name,
                 Icon::Agent,
@@ -5742,13 +5754,6 @@ impl Runtime {
                 elapsed,
                 has_text.then_some(expanded),
                 has_text.then(|| Action::Toggle(target, item.id.clone())),
-                move |theme| {
-                    if expanded {
-                        design::sunken(theme)
-                    } else {
-                        theme.current_container().base.into()
-                    }
-                },
             );
             let mut rows = vec![header];
             if expanded {
@@ -6590,7 +6595,9 @@ fn model_list<'a>(
         // The popover owns dismissal. Unfocusing on mouse-down inside a
         // model row must not remove that row before its mouse-up selects it.
         .into(),
-        widget::container(
+        // The popover's own frame inset stays; a model passing it fades into
+        // the popover rather than being cut at the inset.
+        widget::container(crate::interaction::overflow_fade_y(
             widget::scrollable(
                 widget::column::with_children(rows)
                     .padding(design::with_vertical_rail(iced::Padding::ZERO)),
@@ -6599,7 +6606,8 @@ fn model_list<'a>(
                 design::scrollbar(),
             ))
             .height(Length::Shrink),
-        )
+            design::component_base,
+        ))
         .max_height(design::MODEL_POPUP_CEILING)
         .into(),
     ])
@@ -12673,6 +12681,16 @@ mod tests {
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
+                // Nothing of the pane lies between the transcript and the
+                // composer: a row scrolling down meets the composer's own
+                // edge, never a strip of pane drawn over it.
+                if state != 2 && state != 4 {
+                    assert_eq!(
+                        viewport.y + viewport.height,
+                        editor.y,
+                        "the transcript runs on to the composer in state {state} at {width}"
+                    );
+                }
             }
         }
     }

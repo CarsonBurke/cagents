@@ -69,6 +69,7 @@ pub struct State {
     remove_dialog: Option<ProjectRemoval>,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
+    remove_requests: HashMap<PathBuf, uuid::Uuid>,
     /// Projects closed by the shared model but still settling their channels.
     pub(super) closing: HashMap<ProjectId, PathBuf>,
     close_started: HashMap<ProjectId, Instant>,
@@ -231,7 +232,8 @@ pub enum Action {
     ConfirmRemove,
     RemovedProject {
         repository: PathBuf,
-        result: Result<crate::workspace_model::WorkspaceModel, String>,
+        request: uuid::Uuid,
+        result: Result<crate::workspace_model::delta::EditReceipt, String>,
     },
     AwaitClosedProject(ProjectId, u64),
     ProjectSessionsClosed(ProjectId, u64, Result<ProjectSessionClosure, String>),
@@ -553,6 +555,7 @@ impl Cagents {
             return Task::none();
         }
         self.project_ui.removing.remove(repository);
+        self.project_ui.remove_requests.remove(repository);
         if !self.project_ui.closed.insert(repository.to_path_buf()) {
             return self.complete_closed_projects();
         }
@@ -1391,35 +1394,80 @@ impl Cagents {
                 self.project_ui
                     .removing
                     .insert(repository.clone(), removal.worktrees.clone());
+                let request = uuid::Uuid::new_v4();
+                self.project_ui
+                    .remove_requests
+                    .insert(repository.clone(), request);
                 let close = cosmic::task::future(async move {
                     let result =
                         tokio::task::spawn_blocking(move || remove_project_from_cagents(&removal))
                             .await
                             .map_err(|error| error.to_string())
                             .and_then(|result| result);
-                    Message::ProjectUi(Action::RemovedProject { repository, result })
+                    Message::ProjectUi(Action::RemovedProject {
+                        repository,
+                        request,
+                        result,
+                    })
                 });
                 return Task::batch([close, self.project_dialog_closed()]);
             }
-            Action::RemovedProject { repository, result } => match result {
-                Ok(model) => {
-                    if model.sequence <= self.workspace_model.sequence {
-                        return if self.workspace_model.project(&repository).is_none() {
-                            self.close_shared_project(&repository)
-                        } else {
-                            Task::none()
-                        };
+            Action::RemovedProject {
+                repository,
+                request,
+                result,
+            } => match result {
+                Ok(receipt) => {
+                    let current =
+                        self.project_ui.remove_requests.get(&repository) == Some(&request);
+                    if current {
+                        self.project_ui.remove_requests.remove(&repository);
+                        self.project_ui.removing.remove(&repository);
                     }
-                    // The observer is a different client and may deliver this
-                    // edit before or after the command's own answer.
-                    return self.apply_workspace_model_update(
-                        super::workspace_model_sync::ModelUpdate::Edited {
-                            sequence: model.sequence,
-                            edit: crate::workspace_model::ModelEdit::CloseProject { repository },
+                    // A later read could include a peer's reopen. Only this
+                    // transaction's canonical effects and sequence authorize
+                    // its close; the callback never invents a new close edge.
+                    let views = crate::workspace_model::delta::ViewChanges {
+                        sequence: receipt.sequence,
+                        removed: receipt
+                            .effects
+                            .views
+                            .iter()
+                            .filter_map(|revision| {
+                                revision.after.is_none().then_some(())?;
+                                Some((revision.scope.clone(), revision.before?))
+                            })
+                            .collect(),
+                        ..Default::default()
+                    };
+                    let applied = self.apply_workspace_model_update(
+                        super::workspace_model_sync::ModelUpdate::Committed {
+                            receipt,
+                            edit: crate::workspace_model::ModelEdit::CloseProject {
+                                repository: repository.clone(),
+                            },
+                            views,
                         },
                     );
+                    if current
+                        && self.workspace_model.project(&repository).is_some()
+                        && let Some(project) = self
+                            .sidebar_model
+                            .projects
+                            .iter()
+                            .find(|project| project.repository == repository)
+                            .map(|project| project.id)
+                        && !self.project_ui.closing.contains_key(&project)
+                    {
+                        self.project_ui.close_started.remove(&project);
+                    }
+                    return applied;
                 }
                 Err(error) => {
+                    if self.project_ui.remove_requests.get(&repository) != Some(&request) {
+                        return Task::none();
+                    }
+                    self.project_ui.remove_requests.remove(&repository);
                     self.project_ui.removing.remove(&repository);
                     if let Some(project) = self
                         .sidebar_model
@@ -2228,10 +2276,10 @@ fn close_sessions_in_scope(
     // sessions, including those opened in another window.
     let mut project_sessions = project_sessions.clone();
     let scope = if let Some(project) = project {
-        let model = client.read_workspace_model().map_err(|error| {
+        let (_, projects) = client.read_workspace_projects().map_err(|error| {
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
-        let scope = shared_project_session_scope(worktrees, project, &model)?;
+        let scope = shared_project_session_scope(worktrees, project, &projects)?;
         let paths = crate::instance::window_database_paths().map_err(|error| {
             format!("Could not locate other windows before closing sessions: {error}")
         })?;
@@ -2448,11 +2496,11 @@ impl ProjectSessionScope {
 fn shared_project_session_scope(
     roots: &[PathBuf],
     repository: &Path,
-    model: &crate::workspace_model::WorkspaceModel,
+    projects: &[crate::workspace_model::ModelProject],
 ) -> Result<ProjectSessionScope, String> {
     let mut protected = Vec::new();
     let service = RepositoryService::system("git");
-    for project in &model.projects {
+    for project in projects {
         if project.repository == repository {
             continue;
         }
@@ -2493,7 +2541,7 @@ fn project_session_roots(
 /// leaves all Git files and worktree directories untouched.
 fn remove_project_from_cagents(
     removal: &ProjectRemoval,
-) -> Result<crate::workspace_model::WorkspaceModel, String> {
+) -> Result<crate::workspace_model::delta::EditReceipt, String> {
     let roots = project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone());
     close_sessions_in_scope(
         &roots,
@@ -2505,7 +2553,7 @@ fn remove_project_from_cagents(
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     client
-        .edit_workspace_model(crate::workspace_model::ModelEdit::CloseProject {
+        .apply_workspace_edit(crate::workspace_model::ModelEdit::CloseProject {
             repository: removal.repository.clone(),
         })
         .map_err(|error| error.to_string())
@@ -2606,6 +2654,234 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    fn removal_receipt_app() -> (
+        Cagents,
+        PathBuf,
+        uuid::Uuid,
+        crate::workspace_model::views::Scope,
+    ) {
+        use crate::workspace_model::{
+            ModelProject, WorkspaceModel,
+            views::{Scope, View},
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/repo/.git");
+        let project = ProjectId::new();
+        let identity = uuid::Uuid::new_v4();
+        let scope = Scope::Worktree {
+            repository: repository.clone(),
+            path: "/repo".into(),
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+        let model = WorkspaceModel {
+            identity,
+            sequence: 10,
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+                ordinal: 0,
+            }],
+            views: vec![View {
+                revision: 10,
+                ..View::empty(scope.clone())
+            }],
+            ..Default::default()
+        };
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::ConnectedClosed {
+                model,
+                closed: vec![],
+            },
+        ));
+        (app, repository, identity, scope)
+    }
+
+    #[test]
+    fn project_removal_receipt_preserves_a_peer_reopen_that_overtook_the_reply() {
+        removal_callback_test(|| {
+            use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+            use crate::workspace_model::{
+                ModelEdit,
+                delta::{EditEffects, EditReceipt, ViewChanges, ViewRevision},
+                views::View,
+            };
+            let (mut app, repository, identity, scope) = removal_receipt_app();
+            let request = uuid::Uuid::new_v4();
+            app.project_ui
+                .remove_requests
+                .insert(repository.clone(), request);
+            app.project_ui
+                .removing
+                .insert(repository.clone(), vec!["/repo".into()]);
+            let reopened = app.workspace_model.project(&repository).unwrap().clone();
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 13,
+                edit: ModelEdit::ReopenProject {
+                    repository: repository.clone(),
+                    name: reopened.name.clone(),
+                    kind: reopened.kind,
+                },
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views: ViewChanges {
+                        sequence: 13,
+                        views: vec![View {
+                            revision: 13,
+                            ..View::empty(scope.clone())
+                        }],
+                        ..Default::default()
+                    },
+                    effects: EditEffects {
+                        projects: vec![reopened.clone()],
+                        ..Default::default()
+                    },
+                },
+            }));
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 14,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges::default(),
+            }));
+            drop(app.handle_project_action(Action::RemovedProject {
+                repository: repository.clone(),
+                request,
+                result: Ok(EditReceipt {
+                    identity,
+                    sequence: 12,
+                    effects: EditEffects {
+                        removed_projects: vec![repository.clone()],
+                        views: vec![ViewRevision {
+                            scope: scope.clone(),
+                            before: Some(10),
+                            after: None,
+                        }],
+                        ..Default::default()
+                    },
+                }),
+            }));
+            assert!(app.workspace_model.project(&repository).is_some());
+            assert!(!app.workspace_model.closed_projects.contains(&repository));
+            assert!(!app.project_ui.closed.contains(&repository));
+            assert!(!app.project_ui.removing.contains_key(&repository));
+            assert_eq!(
+                app.workspace_model
+                    .views
+                    .iter()
+                    .find(|view| view.scope == scope)
+                    .unwrap()
+                    .revision,
+                13
+            );
+            let mut renamed = reopened;
+            renamed.name = "Name after reopen".into();
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 13,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    effects: EditEffects {
+                        projects: vec![renamed.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }));
+            assert_eq!(
+                app.workspace_model.project(&repository),
+                Some(&renamed),
+                "the close receipt must not be relabeled with an unrelated later snapshot sequence"
+            );
+        });
+    }
+
+    #[test]
+    fn project_removal_receipt_is_bound_to_its_registry() {
+        removal_callback_test(|| {
+            use crate::workspace_model::delta::{EditEffects, EditReceipt, ViewRevision};
+            let (mut app, repository, _, scope) = removal_receipt_app();
+            let before = app.workspace_model.clone();
+            drop(app.handle_project_action(Action::RemovedProject {
+                repository: repository.clone(),
+                request: uuid::Uuid::new_v4(),
+                result: Ok(EditReceipt {
+                    identity: uuid::Uuid::new_v4(),
+                    sequence: 900,
+                    effects: EditEffects {
+                        removed_projects: vec![repository.clone()],
+                        closed: vec![CardId::new()],
+                        views: vec![ViewRevision {
+                            scope,
+                            before: Some(10),
+                            after: None,
+                        }],
+                        ..Default::default()
+                    },
+                }),
+            }));
+            assert_eq!(app.workspace_model, before);
+            assert!(!app.project_ui.closed.contains(&repository));
+            assert!(app.shared_views.closed.is_empty());
+        });
+    }
+
+    #[test]
+    fn old_project_removal_callbacks_cannot_clear_a_newer_request() {
+        removal_callback_test(|| {
+            use crate::workspace_model::delta::{EditEffects, EditReceipt};
+            let (mut app, repository, identity, _) = removal_receipt_app();
+            let current = uuid::Uuid::new_v4();
+            let old = uuid::Uuid::new_v4();
+            app.project_ui
+                .remove_requests
+                .insert(repository.clone(), current);
+            app.project_ui
+                .removing
+                .insert(repository.clone(), vec!["/repo".into()]);
+            drop(app.handle_project_action(Action::RemovedProject {
+                repository: repository.clone(),
+                request: old,
+                result: Ok(EditReceipt {
+                    identity,
+                    sequence: 8,
+                    effects: EditEffects {
+                        removed_projects: vec![repository.clone()],
+                        ..Default::default()
+                    },
+                }),
+            }));
+            drop(app.handle_project_action(Action::RemovedProject {
+                repository: repository.clone(),
+                request: old,
+                result: Err("old refusal".into()),
+            }));
+            assert_eq!(
+                app.project_ui.remove_requests.get(&repository),
+                Some(&current)
+            );
+            assert!(app.project_ui.removing.contains_key(&repository));
+            assert!(app.workspace_model.project(&repository).is_some());
+            drop(app.handle_project_action(Action::RemovedProject {
+                repository: repository.clone(),
+                request: current,
+                result: Err("current refusal".into()),
+            }));
+            assert!(!app.project_ui.remove_requests.contains_key(&repository));
+            assert!(!app.project_ui.removing.contains_key(&repository));
+            assert!(
+                app.status.is_some(),
+                "the current request still reports its failure and releases its controls"
+            );
+        });
     }
 
     fn removal_lsp_app() -> (Cagents, tempfile::TempDir, Target) {
@@ -4200,7 +4476,8 @@ mod tests {
             ..WorkspaceModel::default()
         };
         let scope =
-            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &model).unwrap();
+            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &model.projects)
+                .unwrap();
         assert!(scope.contains(&folder.join("owned")));
         assert!(!scope.contains(&child.join("work")));
         assert!(!scope.contains(&linked));
@@ -4211,7 +4488,9 @@ mod tests {
         );
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
-        assert!(shared_project_session_scope(&[folder.clone()], &folder, &missing).is_err());
+        assert!(
+            shared_project_session_scope(&[folder.clone()], &folder, &missing.projects).is_err()
+        );
     }
 
     #[test]
