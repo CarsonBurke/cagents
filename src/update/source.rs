@@ -624,6 +624,11 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         release: "0.1.3+local.43678f2fb",
         family: ClientFamily::Current,
     },
+    ReleasedSource {
+        protocol: 175,
+        release: "0.1.3+local.c73002744",
+        family: ClientFamily::Current,
+    },
 ];
 
 /// Protocols main served since the oldest pinned source that live updates
@@ -635,6 +640,7 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (166, "superseded before update sources were pinned"),
     (172, "superseded before update sources were pinned"),
     (174, "main served it under a day; never installed"),
+    (176, "main served it under a day; never installed"),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
@@ -884,7 +890,7 @@ mod admission_message_tests {
     fn live_sources_are_the_pinned_releases_and_the_current_release() {
         assert_eq!(
             protocols().collect::<Vec<_>>(),
-            [156, 173, crate::terminal_ipc::PROTOCOL_VERSION]
+            [156, 173, 175, crate::terminal_ipc::PROTOCOL_VERSION]
         );
         for source in RELEASED_SOURCES {
             assert!(source.protocol < crate::terminal_ipc::PROTOCOL_VERSION);
@@ -893,13 +899,14 @@ mod admission_message_tests {
         for &(protocol, _) in RETIRED_SOURCES {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
         }
-        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174] {
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176] {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
             let message = unsupported_source(protocol).to_string();
             assert!(message.contains(&format!("uses protocol {protocol}")));
             assert!(message.contains(&format!(
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
-                 protocol 173 (0.1.3+local.43678f2fb) and protocol {}.",
+                 protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744) \
+                 and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
             assert!(message.contains("did not request preparation or shutdown"));
