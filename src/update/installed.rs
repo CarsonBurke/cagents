@@ -469,18 +469,24 @@ fn confirm_daemon_ready_at(
             format!("Timed out confirming restored panes. {guidance}")
         })
     };
-    let failed = |error: &dyn std::fmt::Display, restoring: bool| {
-        if Instant::now() < deadline {
-            communication(error)
-        } else {
+    let failed = |error: &crate::control::ControlError, restoring: bool| {
+        if crate::control::is_timeout_error(error) {
             timed_out(restoring)
+        } else {
+            communication(error)
         }
     };
     let stream = crate::control::connect_control_socket(
         socket,
         deadline.saturating_duration_since(Instant::now()),
     )
-    .map_err(|error| failed(&error, false))?;
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            timed_out(false)
+        } else {
+            communication(&error)
+        }
+    })?;
     let peer = source::Peer::observe(&stream, socket).map_err(|error| communication(&error))?;
     let mut client = ControlClient::from_stream_with_deadline(stream, deadline)
         .map_err(|error| failed(&error, false))?;
@@ -1046,6 +1052,9 @@ else: raise AssertionError(sys.argv)
             std::env::current_exe().unwrap()
         };
         let result = confirm_daemon_ready_at(&socket, &executable, Instant::now() + timeout);
+        // A client whose deadline passed before it connected left the
+        // fixture waiting to accept; this connection ends that wait.
+        drop(UnixStream::connect(&socket));
         (result, server.join().unwrap())
     }
 

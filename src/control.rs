@@ -2503,7 +2503,7 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-fn is_timeout_error(error: &ControlError) -> bool {
+pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,
