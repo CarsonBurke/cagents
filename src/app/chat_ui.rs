@@ -8300,7 +8300,14 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).chat_waiting_messages = chat_waiting_messages;
         }
         if repository_navigation != self.durable.repository_navigation {
-            Arc::make_mut(&mut self.durable).repository_navigation = repository_navigation;
+            let durable = Arc::make_mut(&mut self.durable);
+            let previous =
+                std::mem::replace(&mut durable.repository_navigation, repository_navigation);
+            for (card, navigation) in previous {
+                if !durable.repository_navigation.contains_key(&card) {
+                    self.released_repository_navigation.insert(card, navigation);
+                }
+            }
         }
         if defaults.is_empty() && draft_starts.is_empty() && admission_sources.is_empty() {
             return Arc::clone(&self.durable);
