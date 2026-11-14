@@ -156,11 +156,6 @@ for provider in claude codex; do
         "$ne" drive key Escape
         reasoning
         "$ne" drive click 'high'
-    elif [ "$provider" = codex ]; then
-        # Search → the sole model → Low → Medium → High. The model popup's
-        # search still owns focus after its screenshot and the provider pause.
-        for _ in 1 2 3 4; do "$ne" drive key Tab; done
-        "$ne" drive key Return
     else
         "$ne" drive click 'High'
     fi
