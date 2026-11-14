@@ -163,13 +163,13 @@ tools_details() {
     local prefix=$1
     scroll_top
     if ! text_visible '\bRead\b'; then click_row '\bEdited\b'; fi
-    align_row 'Fixture.*inspect'
-    if ! text_visible '\bInspection\b'; then click_row 'Fixture.*inspect'; fi
+    align_row '^Used\b'
+    if ! text_visible '\bInspection\b'; then click_row '^Used\b'; fi
     find_row '\bInspection\b' >/dev/null
     shot "${prefix}rows-tools-expanded"
     # Restore both disclosure levels; opening the next scene must not depend
     # on whether a long output happened to remain outside the viewport.
-    click_row 'Fixture.*inspect'
+    click_row '^Used\b'
     scroll_top
     click_row '\bEdited\b'
     scroll_top
