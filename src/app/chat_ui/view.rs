@@ -4571,7 +4571,7 @@ impl Runtime {
             );
         }
         if let Some((glyph, label)) = self.timeline_activity(false, None) {
-            transcript.push(activity_row(glyph, label));
+            transcript.push(activity_row(glyph, label, None));
         }
         Some(virtualized::column(transcript.children, Default::default()))
     }
