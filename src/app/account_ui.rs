@@ -5766,7 +5766,10 @@ fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), Str
     match outcome {
         CloseOutcome::Closed | CloseOutcome::ClosedWithBasis(_) => Ok(()),
         CloseOutcome::NotHosted | CloseOutcome::NotHostedWithBasis(_) => Ok(()),
-        CloseOutcome::Active | CloseOutcome::Stale | CloseOutcome::Kept(_) => {
+        CloseOutcome::Active
+        | CloseOutcome::Stale
+        | CloseOutcome::SourceChanged
+        | CloseOutcome::Kept(_) => {
             Err("its terminal is still running and could not be closed".to_owned())
         }
         CloseOutcome::Unreachable(error) => Err(error),

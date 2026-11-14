@@ -242,6 +242,9 @@ use crate::{
 /// Version 178 fences shared Close on its original pane and terminal worker,
 /// and appends attachment metadata and completed/absent removal-basis reads.
 pub const PROTOCOL_VERSION: u16 = 179;
+/// A correlated refusal issued before source-checked cleanup has any effect.
+pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
+    "The terminal changed or still owns work; nothing was closed";
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

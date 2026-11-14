@@ -1206,7 +1206,7 @@ fn validate_cleanup_source(
         if !valid {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
-                "The terminal changed or still owns work; nothing was closed",
+                crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
                 false,
             ));
         }

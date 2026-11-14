@@ -50,6 +50,8 @@ pub enum CloseOutcome {
     ClosedWithBasis(crate::workspace_model::views::TerminalRemovalBasis),
     Active,
     Stale,
+    /// The owner correlated a refusal before any cleanup could take effect.
+    SourceChanged,
     /// The owning daemon answered and the terminal is proven gone. Nothing was
     /// stopped: there is nothing left to stop.
     NotHosted,
@@ -468,7 +470,9 @@ impl Cagents {
                         client.close_terminal_source(source, basis.clone(), true, allow_active)
                     } else {
                         client.release_completed_terminal(source, allow_active)
-                    }.map_err(|error| error.to_string())?;
+                    }.map_err(|error| if is_source_close_refusal(&error) {
+                        "This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into()
+                    } else { error.to_string() })?;
                     match outcome {
                         TerminalCloseResult::Closed => {
                             Ok(CompletedCloseOutcome::ClosedWithBasis(basis))
@@ -818,10 +822,8 @@ impl Cagents {
         // exists so one intent cannot submit two concurrent requests and so
         // no automatic path retries a request whose fate is unknown; it is
         // not a permanent refusal to ever close this terminal again. A
-        // terminal id is a fresh UUID and the request carries the owner's
-        // session proof, so a later explicit close cannot reach a different
-        // terminal, and an owner that no longer knows this one answers
-        // `Stale` rather than killing something else.
+        // later explicit close captures its source again. Shared closes carry
+        // that source's worker receipt when a terminal ID is reused.
         if intent.detail.is_some() {
             self.terminal_close_attempts.remove(&intent.terminal);
         }
@@ -1036,6 +1038,7 @@ impl Cagents {
                     | CloseOutcome::NotHostedWithBasis(_)
                     | CloseOutcome::Active
                     | CloseOutcome::Stale
+                    | CloseOutcome::SourceChanged
                     | CloseOutcome::NotHosted => {
                         "This terminal changed before it could close, so the pane was kept. Try closing it again.".into()
                     }
@@ -1411,6 +1414,69 @@ mod tests {
             host_incarnation: HostIncarnation::new("incarnation"),
         };
         (app, card)
+    }
+
+    #[test]
+    fn source_refusal_is_definitive_but_unknown_cleanup_remains_uncertain() {
+        use crate::control::ControlError;
+        let refusal = |retryable| ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT.into(),
+            retryable,
+        };
+        assert!(matches!(
+            source_close_outcome(Err(refusal(false))),
+            CloseOutcome::SourceChanged
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(refusal(true))),
+            CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(ControlError::ConnectionClosed)),
+            CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            source_close_outcome(Ok(TerminalCloseResult::Unknown("retained".into()))),
+            CloseOutcome::Unreachable(_)
+        ));
+    }
+
+    #[test]
+    fn dismissing_a_source_refusal_allows_fresh_close_of_the_replacement() {
+        for definitive in [false, true] {
+            let (mut app, card) = retry_close_fixture();
+            drop(app.begin_card_close(card));
+            let intent = app.terminal_close.as_ref().unwrap().clone();
+            assert!(app.terminal_close_attempts.contains(&intent.terminal));
+            let outcome = if definitive {
+                CloseOutcome::SourceChanged
+            } else {
+                CloseOutcome::Unreachable("reply lost".into())
+            };
+            drop(app.terminal_close_finished(
+                card,
+                intent.terminal,
+                intent.proof,
+                intent.generation,
+                outcome,
+            ));
+            assert_eq!(
+                app.terminal_close_attempts.contains(&intent.terminal),
+                !definitive
+            );
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            drop(app.cancel_terminal_close());
+            let CardKind::Terminal(source) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            source.launch.arguments.push("replacement".into());
+            let replacement = source.clone();
+            drop(app.begin_card_close(card));
+            let fresh = app.terminal_close.as_ref().unwrap();
+            assert!(fresh.pending);
+            assert_eq!(fresh.saved_source.as_ref(), Some(&replacement));
+        }
     }
 
     fn terminal_source(app: &Cagents, card: CardId) -> TerminalSession {
@@ -2480,6 +2546,23 @@ mod tests {
     }
 }
 
+fn is_source_close_refusal(error: &crate::control::ControlError) -> bool {
+    matches!(error, crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+        message, retryable: false } if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT)
+}
+
+fn source_close_outcome(
+    result: Result<TerminalCloseResult, crate::control::ControlError>,
+) -> CloseOutcome {
+    match result {
+        Ok(TerminalCloseResult::Closed) => CloseOutcome::Closed,
+        Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
+        Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
+        Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
+        Err(error) => CloseOutcome::Unreachable(error.to_string()),
+    }
+}
+
 fn revalidate_and_close(
     intent: &CloseIntent,
     allow_active: bool,
@@ -2517,16 +2600,14 @@ fn revalidate_and_close(
             if !authority.permits(&basis) {
                 return Ok(CloseOutcome::Stale);
             }
-            (if let Some(basis) = authority.worker() {
+            let result = if let Some(basis) = authority.worker() {
                 client.close_terminal_source(source.clone(), basis.clone(), true, allow_active)
             } else {
                 client.release_completed_terminal(source.clone(), allow_active)
-            })
-            .map_err(|error| error.to_string())
-            .map(|outcome| match outcome {
-                TerminalCloseResult::Closed => CloseOutcome::ClosedWithBasis(basis),
-                TerminalCloseResult::Active => CloseOutcome::Active,
-                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+            };
+            Ok(match source_close_outcome(result) {
+                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(basis),
+                outcome => outcome,
             })
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
@@ -2592,14 +2673,12 @@ fn close_hosted_terminal_source(
         if client.proof() != owner || !owner.is_complete() {
             return Ok(CloseOutcome::Stale);
         }
-        client
-            .close_terminal_source(source.clone(), basis.clone(), false, allow_active)
-            .map_err(|error| error.to_string())
-            .map(|outcome| match outcome {
-                TerminalCloseResult::Closed => CloseOutcome::Closed,
-                TerminalCloseResult::Active => CloseOutcome::Active,
-                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
-            })
+        Ok(source_close_outcome(client.close_terminal_source(
+            source.clone(),
+            basis.clone(),
+            false,
+            allow_active,
+        )))
     };
     run().unwrap_or_else(CloseOutcome::Unreachable)
 }
