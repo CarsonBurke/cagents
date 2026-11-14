@@ -6276,11 +6276,10 @@ fn reasoning_default<'a>(
 
 fn staged_model_choice(snapshot: &chat::Snapshot, provider: Provider) -> Option<String> {
     let active = snapshot.active_model.as_ref()?;
-    let selected = snapshot.selected_model.as_deref();
-    let model = snapshot
-        .models
-        .iter()
-        .find(|model| Some(model.id.as_str()) == selected);
+    let model = selected_chat_model(snapshot);
+    let selected = model
+        .map(|model| model.id.as_str())
+        .or(snapshot.selected_model.as_deref());
     let model_changed = selected.is_some_and(|id| id != active.id)
         && !model.is_some_and(|model| model_matches_active(provider, model, active));
     let default = active.default_reasoning.as_deref();
@@ -6315,6 +6314,7 @@ fn footer_model_label<'a>(
         active.label.as_str().into()
     } else {
         match selected {
+            Some(model) if provider == Provider::Omp && !draft => model.label.as_str().into(),
             Some(model) => model_choice_label(model),
             None => match &snapshot.selected_model {
                 Some(id) => id.as_str().into(),
@@ -15729,6 +15729,14 @@ mod tests {
             None,
             "ordinary aliases also resolve to the running model"
         );
+        snapshot.selected_model = None;
+        assert_eq!(staged_model_choice(snapshot, Provider::Claude), None);
+        snapshot.models[0].label = "Default (Another model)".into();
+        assert_eq!(
+            staged_model_choice(snapshot, Provider::Claude).as_deref(),
+            Some("Default (Another model)")
+        );
+        snapshot.models[0].label = "Default (Opus 5.5)".into();
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = Some("high".into());
         assert_eq!(
