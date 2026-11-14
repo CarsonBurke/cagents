@@ -57,6 +57,9 @@ pub(super) struct Panes {
     destination: Option<WorkspaceDestination>,
     cards: Vec<CardId>,
     focused: Option<CardId>,
+    /// Panes of the workspace's channels that run in it: what its status
+    /// counts when it has no panes of its own.
+    channeled: Vec<CardId>,
 }
 
 /// The switcher's size, from the window it is drawn in.
@@ -659,12 +662,14 @@ impl Cagents {
                 destination: Some(destination),
                 cards: self.workspace.order().collect(),
                 focused: self.workspace.focused(),
+                channeled: Vec::new(),
             };
         }
         let open = |id: &CardId| {
             self.card_state(*id)
                 .is_some_and(|card| card.existence.is_open())
         };
+        let mut channeled = Vec::new();
         let (cards, preferred): (Vec<CardId>, Option<CardId>) = match destination {
             WorkspaceDestination::Channel(id) => {
                 let Some(channel) = self
@@ -690,7 +695,7 @@ impl Cagents {
                 else {
                     return Panes::default();
                 };
-                let channeled: HashSet<_> = self
+                let in_channels: HashSet<_> = self
                     .durable
                     .channels
                     .iter()
@@ -701,12 +706,12 @@ impl Cagents {
                     .iter()
                     .map(PathBuf::as_path)
                     .collect::<Vec<_>>();
-                let cards = self
+                let (own, elsewhere): (Vec<CardId>, Vec<CardId>) = self
                     .durable
                     .cards
                     .iter()
                     .filter(|card| {
-                        !channeled.contains(&card.id)
+                        card.existence.is_open()
                             && worktree_ui::belongs_to_scope(
                                 card,
                                 &scope,
@@ -715,8 +720,9 @@ impl Cagents {
                             )
                     })
                     .map(|card| card.id)
-                    .collect();
-                (cards, self.worktree_focus.get(&scope).copied())
+                    .partition(|card| !in_channels.contains(card));
+                channeled = elsewhere;
+                (own, self.worktree_focus.get(&scope).copied())
             }
         };
         let focused = worktree_ui::scope_focus(
@@ -727,6 +733,7 @@ impl Cagents {
             destination: Some(destination),
             cards,
             focused,
+            channeled,
         }
     }
 
@@ -1079,9 +1086,30 @@ impl Cagents {
             children.push(design::caption(format!("{} more", others.len() - shown)).into());
         }
         if panes_known && panes.cards.is_empty() {
-            children.push(
-                design::caption("Nothing is open here yet. Opening it starts a new pane.").into(),
-            );
+            if panes.channeled.is_empty() {
+                children.push(
+                    design::caption("Nothing is open here yet. Opening it starts a new pane.")
+                        .into(),
+                );
+            } else {
+                // Its status counts agents whose panes live in channels, so
+                // say where they are rather than that nothing is here.
+                children.push(
+                    design::caption(
+                        "No panes of its own yet. These work here from their channels:",
+                    )
+                    .into(),
+                );
+                for &card in panes.channeled.iter().take(OTHER_PANES) {
+                    children.push(self.workspace_switcher_pane_row(card, false));
+                }
+                if panes.channeled.len() > OTHER_PANES {
+                    children.push(
+                        design::caption(format!("{} more", panes.channeled.len() - OTHER_PANES))
+                            .into(),
+                    );
+                }
+            }
         }
         let footnote = if open {
             Some("Open now".to_owned())
