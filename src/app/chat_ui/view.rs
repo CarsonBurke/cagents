@@ -68,6 +68,10 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
     .width(Length::Fill)
     .into()
 }
+
+/// The exchanges [`Runtime::transcript_preview`] draws, from the end.
+const PREVIEW_TURNS: usize = 8;
+
 /// The composer's own line height and inner padding.
 ///
 /// Named because the composer's height is computed from the draft rather than
@@ -4402,7 +4406,10 @@ impl Runtime {
         let markdown_settings =
             design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
         let mut transcript = VirtualRows::new(step::GAP_L);
-        for turn in &self.turns {
+        // The preview shows the end of the conversation, which the last few
+        // exchanges fill however long it has run.
+        let tail = self.turns.len().saturating_sub(PREVIEW_TURNS);
+        for turn in &self.turns[tail..] {
             self.push_turn_row(
                 &mut transcript,
                 turn,

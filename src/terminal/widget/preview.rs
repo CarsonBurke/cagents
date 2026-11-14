@@ -168,7 +168,7 @@ impl<Message> Widget<Message, Theme, Renderer> for SnapshotPreview {
                 let mut shaped = state.shaped.borrow_mut();
                 // The cache follows absolute rows, so a screen that scrolled by
                 // a line reshapes only the line that appeared.
-                shaped.scroll_to(shown.start as u64);
+                shaped.scroll_to(self.snapshot.scroll.offset + shown.start as u64);
                 shaped.refresh(&geometry, self.font_size, rows, column_limit);
                 let foreground = color(self.snapshot.foreground);
                 for (index, cached) in shaped.rows.iter().enumerate() {

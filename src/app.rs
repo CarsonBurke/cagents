@@ -16870,13 +16870,10 @@ impl Application for Cagents {
                 }
             }
             Message::WorkspaceSwitcherActivate { since, index } => {
-                if self.chrome_ui.workspace_preview_since != Some(since)
-                    || index >= self.chrome_ui.workspace_switcher_rows.len()
-                {
+                if self.chrome_ui.workspace_preview_since != Some(since) {
                     return Task::none();
                 }
-                drop(self.select_workspace_preview(index));
-                self.commit_workspace_preview()
+                self.open_workspace_row(index)
             }
             Message::WorkspaceSwitcherReleased(since) => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {

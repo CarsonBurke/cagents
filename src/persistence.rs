@@ -5918,12 +5918,17 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace history", &value))
         .transpose()?
         .unwrap_or_default(),
+        // Only dates rows in the workspace switcher, so an unreadable value
+        // costs those dates rather than the workspace.
         workspace_visits: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_visits"),
         )?
-        .map(|value| from_json("workspace visits", &value))
-        .transpose()?
+        .and_then(|value| {
+            from_json("workspace visits", &value)
+                .inspect_err(|error| tracing::warn!(%error, "Skipping unreadable workspace visits"))
+                .ok()
+        })
         .unwrap_or_default(),
         repository_navigation: metadata(
             connection,

@@ -274,11 +274,7 @@ impl Cagents {
         };
         if let Some(index) = digit(key, physical_key) {
             // A number opens the row it labels, as a click would.
-            if index >= self.chrome_ui.workspace_switcher_rows.len() {
-                return Task::none();
-            }
-            drop(self.select_workspace_preview(index));
-            return self.commit_workspace_preview();
+            return self.open_workspace_row(index);
         }
         match key {
             keyboard::Key::Named(Named::Escape) => {
@@ -322,17 +318,11 @@ impl Cagents {
         }
     }
 
-    /// The switcher's rows: recently used workspaces first, then the rest in
-    /// the sidebar's order.
-    fn build_workspace_switcher_rows(
-        &self,
-        order: &[WorkspaceDestination],
-        actions: Vec<SidebarAction>,
-    ) -> Vec<Row> {
-        let mut destinations: HashMap<_, _> = actions
-            .into_iter()
-            .filter_map(|action| Some((WorkspaceDestination::from_action(&action)?, action)))
-            .collect();
+    /// A row for each workspace the switcher can name, in the sidebar's
+    /// order. Only these take part in the hold, so the rows and the frozen
+    /// order index the same destinations.
+    fn build_workspace_switcher_rows(&self, actions: Vec<SidebarAction>) -> Vec<Row> {
+        let mut seen = HashSet::new();
         let worktrees: HashMap<_, _> = self
             .sidebar_model
             .projects
@@ -355,10 +345,13 @@ impl Cagents {
                     .map(move |channel| (channel.id, (project, channel)))
             })
             .collect();
-        order
-            .iter()
-            .filter_map(|destination| {
-                let action = destinations.remove(destination)?;
+        actions
+            .into_iter()
+            .filter_map(|action| {
+                let destination = WorkspaceDestination::from_action(&action)?;
+                if !seen.insert(destination) {
+                    return None;
+                }
                 let (project, name, place) = match &action {
                     SidebarAction::OpenRepository {
                         project_id,
@@ -400,7 +393,7 @@ impl Cagents {
                     _ => return None,
                 };
                 Some(Row {
-                    destination: *destination,
+                    destination,
                     action,
                     project,
                     name,
@@ -527,20 +520,35 @@ impl Cagents {
     }
 
     pub(super) fn select_workspace_preview(&mut self, index: usize) -> Task<Message> {
-        let Some(destination) = self.workspace_history.select_index(index) else {
-            return Task::none();
-        };
-        let Some(row) = self.chrome_ui.workspace_switcher_rows.get(index) else {
-            return Task::none();
-        };
-        if row.destination != destination {
+        if !self.select_workspace_row(index) {
             return Task::none();
         }
-        self.chrome_ui.workspace_preview = Some(row.action.clone());
         Task::batch([
             self.workspace_selection_moved(),
             self.reveal_workspace_selection(),
         ])
+    }
+
+    /// Opens row `index` of the hold, as a click or its number does. Nothing
+    /// is opened if the row cannot be selected.
+    pub(super) fn open_workspace_row(&mut self, index: usize) -> Task<Message> {
+        if !self.select_workspace_row(index) {
+            return Task::none();
+        }
+        self.commit_workspace_preview()
+    }
+
+    fn select_workspace_row(&mut self, index: usize) -> bool {
+        let Some(row) = self.chrome_ui.workspace_switcher_rows.get(index) else {
+            return false;
+        };
+        let action = row.action.clone();
+        let destination = row.destination;
+        if self.workspace_history.select_index(index) != Some(destination) {
+            return false;
+        }
+        self.chrome_ui.workspace_preview = Some(action);
+        true
     }
 
     pub(super) fn next_workspace(
@@ -551,11 +559,11 @@ impl Cagents {
         if self.workspace_history.cycle_order().is_some() {
             self.workspace_history.advance(backwards)?;
         } else {
-            let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
-            let available: Vec<_> = destinations
-                .iter()
-                .filter_map(WorkspaceDestination::from_action)
-                .collect();
+            let rows = self.build_workspace_switcher_rows(sidebar::workspace_cycle(
+                &self.sidebar_model,
+                &self.sidebar_state,
+            ));
+            let available: Vec<_> = rows.iter().map(|row| row.destination).collect();
             let live: HashSet<_> = available.iter().copied().collect();
             self.workspace_history.retain(|id| live.contains(&id));
             self.workspace_history.step(
@@ -563,8 +571,16 @@ impl Cagents {
                 self.active_workspace_destination(),
                 backwards,
             )?;
+            // The order holds each available destination once: recently
+            // used first, then the rest in the sidebar's order.
+            let mut rows: HashMap<_, _> =
+                rows.into_iter().map(|row| (row.destination, row)).collect();
             self.chrome_ui.workspace_switcher_rows = self
-                .build_workspace_switcher_rows(self.workspace_history.cycle_order()?, destinations);
+                .workspace_history
+                .cycle_order()?
+                .iter()
+                .filter_map(|destination| rows.remove(destination))
+                .collect();
         }
         self.chrome_ui
             .workspace_switcher_rows
@@ -729,9 +745,11 @@ impl Cagents {
             return None;
         }
         let panes = &self.chrome_ui.workspace_switcher_panes;
+        // A pane the open workspace also shows is drawn there already.
         let card = panes
             .focused
-            .filter(|_| panes.destination == Some(selected))?;
+            .filter(|_| panes.destination == Some(selected))
+            .filter(|&card| self.workspace.visibility(card).is_none())?;
         matches!(
             self.cards.get(&card),
             Some(CardRuntime::Chat(_) | CardRuntime::Terminal(_))
@@ -934,7 +952,7 @@ impl Cagents {
         ])
         .spacing(space::XXS)
         .width(Length::Fill);
-        let attention = self.destination_attention(row.destination);
+        let attention = self.destination_attention(row);
         let trailing: Element<'a, Message> = match sidebar::attention_indicator(attention) {
             Some(indicator) => indicator,
             None if current => design::caption("current").into(),
@@ -972,25 +990,29 @@ impl Cagents {
             .into()
     }
 
-    /// What needs attention in a workspace, as its sidebar row shows it.
-    fn destination_attention(&self, destination: WorkspaceDestination) -> AttentionSummary {
-        match destination {
-            WorkspaceDestination::Worktree(worktree) => self
+    /// What needs attention in a row's workspace, as its sidebar row shows
+    /// it. Looked up through the row's project, for a view that asks once
+    /// per row.
+    fn destination_attention(&self, row: &Row) -> AttentionSummary {
+        match (row.destination, row.project) {
+            (WorkspaceDestination::Worktree(worktree), Some(project)) => {
+                self.sidebar_state.worktree_attention(project, worktree)
+            }
+            (WorkspaceDestination::Folder(project), _) => {
+                self.sidebar_state.project_attention(project)
+            }
+            (WorkspaceDestination::Channel(channel), Some(project)) => self
                 .sidebar_model
-                .projects
-                .iter()
-                .find(|project| project.worktrees.iter().any(|w| w.id == worktree))
-                .map(|project| self.sidebar_state.worktree_attention(project.id, worktree))
-                .unwrap_or_default(),
-            WorkspaceDestination::Folder(project) => self.sidebar_state.project_attention(project),
-            WorkspaceDestination::Channel(channel) => self
-                .sidebar_model
-                .projects
-                .iter()
-                .flat_map(|project| &project.channels)
-                .find(|candidate| candidate.id == channel)
+                .project(project)
+                .and_then(|project| {
+                    project
+                        .channels
+                        .iter()
+                        .find(|candidate| candidate.id == channel)
+                })
                 .map(|channel| channel.attention)
                 .unwrap_or_default(),
+            _ => AttentionSummary::default(),
         }
     }
 
@@ -1011,7 +1033,7 @@ impl Cagents {
         let project = row
             .project
             .and_then(|project| self.sidebar_model.project(project));
-        let attention = self.destination_attention(selected).description();
+        let attention = self.destination_attention(row).description();
         let header = widget::row::with_children(vec![
             project.map_or_else(|| iced::widget::Space::new().into(), sidebar::project_chip),
             widget::column::with_children(vec![
@@ -1257,7 +1279,13 @@ fn digit(key: &keyboard::Key, physical: &keyboard::key::Physical) -> Option<usiz
         },
         _ => None,
     };
-    let digit = from_key.or_else(from_code)?;
+    // The physical key stands in only for a character, so a digit typed
+    // with Shift or on another layout still counts, while the numpad's
+    // Home, End and arrows with Num Lock off keep steering.
+    let digit = match key {
+        keyboard::Key::Character(_) => from_key.or_else(from_code)?,
+        _ => from_key?,
+    };
     (1..=DIGITS as u32)
         .contains(&digit)
         .then(|| digit as usize - 1)
@@ -1309,5 +1337,13 @@ mod tests {
         // the row by the key's position.
         assert_eq!(digit(&key("&"), &Physical::Code(Code::Digit1)), Some(0));
         assert_eq!(digit(&key("a"), &Physical::Code(Code::KeyA)), None);
+        // The numpad's End with Num Lock off steers rather than opening row 1.
+        assert_eq!(
+            digit(
+                &keyboard::Key::Named(keyboard::key::Named::End),
+                &Physical::Code(Code::Numpad1)
+            ),
+            None
+        );
     }
 }
