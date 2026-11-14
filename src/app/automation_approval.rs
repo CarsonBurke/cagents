@@ -13,11 +13,33 @@ pub(super) struct State {
     /// window reads every two seconds, and a connection apiece had the daemon
     /// accept, authenticate and serve a new one each time.
     reader: Arc<std::sync::Mutex<Option<ControlClient>>>,
+    /// Reads in a row that found nothing to review for `read_repository`,
+    /// which space the next read out; see [`State::read_interval`].
+    idle_reads: u32,
+    read_repository: Option<PathBuf>,
     deciding: bool,
     generation: u64,
     focus: usize,
     error: Option<String>,
     restore_keyboard_nav: Option<bool>,
+}
+
+/// How often a focused window reads pending requests while one is offered,
+/// or just after something that could have made one.
+const READ_INTERVAL: Duration = Duration::from_secs(2);
+/// The longest a focused window waits between reads while nothing is
+/// pending. Agents make requests, and an agent's turn ending, the window
+/// regaining focus or another project being opened reads again sooner.
+const IDLE_READ_INTERVAL: Duration = Duration::from_secs(16);
+
+impl State {
+    /// [`READ_INTERVAL`], doubling with each read that found nothing up to
+    /// [`IDLE_READ_INTERVAL`].
+    fn read_interval(&self) -> Duration {
+        READ_INTERVAL
+            .saturating_mul(1 << self.idle_reads.min(8))
+            .min(IDLE_READ_INTERVAL)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -186,11 +208,18 @@ impl Cagents {
 
     pub(super) fn automation_approval_subscription(&self) -> Subscription<Message> {
         if self.refresh_ui.focused && !self.sidebar_model.projects.is_empty() {
-            cosmic::iced::time::every(Duration::from_secs(2))
+            cosmic::iced::time::every(self.automation_approval.read_interval())
                 .map(|_| Message::AutomationApproval(Action::Tick))
         } else {
             Subscription::none()
         }
+    }
+
+    /// Something that could have made a request happened: an agent's turn
+    /// ended, or the window was focused again. Reads go back to their quick
+    /// pace until they find nothing again.
+    pub(super) fn automation_approval_activity(&mut self) {
+        self.automation_approval.idle_reads = 0;
     }
 
     pub(super) fn adopt_automation_approval_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -260,6 +289,10 @@ impl Cagents {
                 let Some(repository) = self.approval_repository().map(Path::to_path_buf) else {
                     return Task::none();
                 };
+                if self.automation_approval.read_repository.as_ref() != Some(&repository) {
+                    self.automation_approval.idle_reads = 0;
+                    self.automation_approval.read_repository = Some(repository.clone());
+                }
                 self.automation_approval.reading = true;
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
@@ -291,6 +324,19 @@ impl Cagents {
                     return Task::none();
                 }
                 self.automation_approval.reading = false;
+                // Nothing to review, or no daemon to ask: read less often.
+                // An offered request keeps the quick pace so its review
+                // follows another window resolving it.
+                let offered = result.as_ref().as_ref().is_ok_and(|proposals| {
+                    proposals
+                        .iter()
+                        .any(|proposal| proposal.state == ProposalState::Pending)
+                });
+                self.automation_approval.idle_reads = if offered {
+                    0
+                } else {
+                    self.automation_approval.idle_reads.saturating_add(1)
+                };
                 if self.modal_is_open()
                     || !self.refresh_ui.focused
                     || self.chrome_ui.workspace_preview_since.is_some()
@@ -735,6 +781,63 @@ mod tests {
         );
         assert!(slot.is_none());
         assert_eq!(connects, 3);
+    }
+
+    /// A focused window with nothing to review reads less and less often,
+    /// and quickly again once a request is offered or anything could have
+    /// made one.
+    #[test]
+    fn idle_approval_reads_back_off_until_something_could_have_changed() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for repository in ["/fixture", "/second"] {
+            app.sidebar_model.projects.push(
+                SidebarProject::new(
+                    ProjectId::new(),
+                    RepositoryId::new(),
+                    repository.into(),
+                    repository.into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_kind(ProjectKind::Folder),
+            );
+        }
+        app.active_workspace = Some("/fixture".into());
+        app.refresh_ui.focused = true;
+        let read = |app: &mut Cagents, result: Result<Vec<Proposal>, String>| {
+            drop(app.update_automation_approval(Action::Tick));
+            let generation = app.automation_approval.generation;
+            drop(app.update_automation_approval(Action::Read {
+                generation,
+                result: Arc::new(result),
+            }));
+            app.automation_approval.read_interval().as_secs()
+        };
+        assert_eq!(app.automation_approval.read_interval().as_secs(), 2);
+        let idle = (0..5)
+            .map(|_| read(&mut app, Ok(Vec::new())))
+            .collect::<Vec<_>>();
+        assert_eq!(idle, [4, 8, 16, 16, 16]);
+        assert_eq!(read(&mut app, Err("no daemon".into())), 16);
+
+        // An offered request keeps reads quick until it is gone.
+        assert_eq!(read(&mut app, Ok(vec![proposal()])), 2);
+        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
+        assert_eq!(read(&mut app, Ok(Vec::new())), 8);
+
+        // An agent's turn ended: the window's notifications changed.
+        drop(
+            app.update_notifications(super::super::notification_ui::Action::Snapshot(
+                crate::notifications::Snapshot::default(),
+            )),
+        );
+        assert_eq!(app.automation_approval.read_interval().as_secs(), 2);
+        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
+        assert_eq!(read(&mut app, Ok(Vec::new())), 8);
+
+        // Another project's requests are read from the quick pace.
+        app.active_workspace = Some("/second".into());
+        assert_eq!(read(&mut app, Ok(Vec::new())), 4);
     }
 
     #[test]
