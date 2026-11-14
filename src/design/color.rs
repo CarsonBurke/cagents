@@ -120,8 +120,18 @@ pub fn modal_scrim(theme: &Theme) -> Color {
 
 /// `rule` for an edge drawn on a component surface such as a popover.
 pub fn component_rule(theme: &Theme) -> Color {
-    let component = &theme.current_container().component;
-    soften(theme, component.base.into(), component.divider.into())
+    component_rule_on(theme, theme.current_container().component.base.into())
+}
+
+/// [`component_rule`] for an edge drawn over `surface` on a component, such
+/// as a selected row's tint, so it stands off that surface as far as it would
+/// off the component's own.
+pub fn component_rule_on(theme: &Theme, surface: Color) -> Color {
+    soften(
+        theme,
+        surface,
+        theme.current_container().component.divider.into(),
+    )
 }
 
 /// How strongly `theme` paints its rules. A high-contrast theme asked for its
