@@ -101,18 +101,13 @@ const COMPOSER_CONTROL_INSET: f32 =
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
-/// How much of a long report or message shows until the reader opens it:
-/// its opening paragraph or so, enough to recognize it without reading it. A
-/// short one is read in full where it lands.
+/// The preview height of messages inside coordinating tool cards.
 pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 pub(super) const NOTICE_LINES: usize = 3;
 /// The characters of a notice's event shown before it is opened, so a single
 /// line too long to read at a glance cannot wrap down the transcript either.
 pub(super) const NOTICE_CHARS: usize = 480;
-/// The characters of a notice's heading. A heading is one line: what the
-/// notice is about, not the event itself.
-pub(super) const NOTICE_HEADING_CHARS: usize = 160;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
@@ -1365,6 +1360,24 @@ struct Place {
     branch: Option<String>,
 }
 
+fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
+    let (title, outcome) = heading
+        .strip_prefix("Background command ")
+        .map(|outcome| ("Background command", outcome))
+        .or_else(|| heading.rsplit_once(" · "))?;
+    let known = matches!(outcome, "finished" | "stopped" | "failed")
+        || outcome
+            .strip_prefix("failed (exit ")
+            .and_then(|code| code.strip_suffix(')'))
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some();
+    known.then_some((title, outcome))
+}
+
+fn delivery_command_failed(heading: &str) -> bool {
+    delivery_command_outcome(heading).is_some_and(|(_, outcome)| outcome.starts_with("failed"))
+}
+
 impl Runtime {
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
@@ -2032,21 +2045,19 @@ impl Runtime {
             return;
         }
         if let Some(literal) = self.prepared_literal(item) {
-            // System notices use a fully closed step disclosure. User-slot
-            // notices retain their existing visible body preview.
-            if item.role == chat::Role::System
-                && matches!(
-                    item.content,
-                    ItemContent::Delivery {
-                        kind: chat::DeliveryKind::Notice,
-                        ..
-                    }
-                )
-                && !(detail && self.item_expanded(&item.id))
+            // Monitor previews are visible; other notices disclose their body.
+            if matches!(
+                item.content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    ..
+                }
+            ) && !self.item_expanded(&item.id)
+                && !matches!(&item.content, ItemContent::Delivery { summary, .. } if summary.starts_with("Monitor event: "))
             {
                 return;
             }
-            literal.catalog(builder, item, detail && self.item_expanded(&item.id));
+            literal.catalog(builder, item, self.item_expanded(&item.id));
             return;
         }
         if literal_content::Prepared::required(&item.content) {
@@ -2069,6 +2080,9 @@ impl Runtime {
             if reasoning_finished(items, busy, &item.id) {
                 return;
             }
+        }
+        if matches!(item.content, ItemContent::Delivery { .. }) && !self.item_expanded(&item.id) {
+            return;
         }
         if matches!(
             item.content,
@@ -5348,18 +5362,9 @@ impl Runtime {
         .into()
     }
 
-    /// Something another agent, or the harness for it, delivered.
-    ///
-    /// It opens the work it prompts, as the reader's own message does, but it
-    /// is not theirs: drawn as their bubble, a subagent's report read as
-    /// though the reader had pasted it. So it sits on the agent's side of the
-    /// column, on the surface used for quoted content, under a heading that
-    /// names who sent it. A long report is folded to its opening, because the
-    /// agent receiving it usually answers with the part that matters and a
-    /// report several screens long would bury that answer.
-    ///
-    /// A notice is the harness saying background work changed state, so it
-    /// takes one quiet line instead of a card.
+    /// A delivery stays at the point where it prompted the next reply. The
+    /// one-line disclosure names its source or outcome; literal notice output
+    /// and full reports are available on demand.
     fn delivery_view(
         &self,
         item: &chat::Item,
@@ -5377,191 +5382,205 @@ impl Runtime {
             return self.prompt_view(item);
         };
         let expanded = self.item_expanded(&item.id);
-        let toggle = |label: &'static str| -> Element<'static, Message> {
-            widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Toggle(self.target, item.id.clone())))
-                .into()
-        };
-        let glyph = |name: Icon| -> Element<'static, Message> {
-            widget::icon(name.handle())
-                .size(14)
-                .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-                    cosmic::iced::widget::svg::Style {
-                        color: Some(design::muted_icon_color(theme)),
-                    }
-                })))
-                .into()
-        };
-        if *kind == chat::DeliveryKind::Report {
-            let heading = chat::delivery_heading(*kind, from, sender, summary);
-            // Preserve an explicit task outcome even when its name needs to
-            // shorten. This is report presentation, not failure inference:
-            // arbitrary report prose never becomes a parent account error.
-            let short = [" was stopped", " finished", " failed"]
-                .into_iter()
-                .find_map(|ending| {
-                    heading
-                        .strip_suffix(ending)
-                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
-                })
-                .unwrap_or_else(|| Self::short_description(&heading, 96));
-            let disclosure = widget::button::custom(design::caption(if expanded {
-                "Hide details"
-            } else {
-                "Details"
-            }))
-            .name(format!(
-                "{} report details: {heading}",
-                if expanded { "Hide" } else { "Show" }
-            ))
-            .class(crate::ui_controls::control_style(false, None))
-            .on_press(action(Action::Toggle(self.target, item.id.clone())));
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Copy(
-                    self.target,
-                    item.id.clone(),
-                    CopyPart::Text,
-                )));
-            let mut rows = vec![
-                widget::row::with_children(vec![
-                    glyph(Icon::Chat),
-                    crate::interaction::tooltip(
-                        design::caption(short).width(Length::Fill),
-                        heading.clone(),
-                    )
-                    .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-                widget::row::with_children(vec![disclosure.into(), copy.into()])
-                    .spacing(step::GAP_S)
-                    .into(),
-            ];
-            if expanded {
-                if !sender.is_empty() && !heading.contains(sender) {
-                    rows.push(selectable_prose::plain(
-                        format!("Sender: {sender}"),
-                        design::TEXT_CAPTION,
-                        iced::Font::MONOSPACE,
-                        self.target,
-                    ));
-                }
-                rows.push(selectable_prose::plain(
-                    heading,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ));
-                if !body.is_empty() {
-                    rows.push(prose::view(
-                        cached,
-                        settings,
-                        self.target,
-                        self.find.as_deref(),
-                    ));
-                }
-            }
-            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
-                .max_width(design::READABLE_MEASURE)
-                .width(Length::Fill)
-                .into();
-        }
-        if *kind == chat::DeliveryKind::Notice {
+        let notice = if *kind == chat::DeliveryKind::Notice {
             let Some(notice) = self
                 .prepared_literal(item)
                 .and_then(literal_content::Content::notice)
             else {
                 return design::caption("Loading notice…").into();
             };
-            let mut rows = vec![
-                widget::row::with_children(vec![
-                    glyph(Icon::Attention),
-                    literal_content::notice_summary(self, item, cached, settings),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-            ];
-            if notice.body.full.len() != 0 {
-                rows.push(literal_content::notice_body(
-                    self, item, cached, settings, None,
-                ));
-                if notice.body.long {
-                    rows.push(toggle("Show more"));
-                }
-            }
-            return widget::container(message_actions(
-                widget::column::with_children(rows)
-                    .spacing(step::GAP_XS)
-                    .into(),
-                self.message_copy(item),
-                Alignment::Start,
-            ))
-            .max_width(design::READABLE_MEASURE)
-            .width(Length::Fill)
-            .into();
-        }
-        // A named sender leads and its own summary follows; an unnamed one is
-        // described by the harness's summary, as `chat::delivery_heading`.
-        let mut heading = vec![glyph(Icon::Chat)];
-        let mut subtitle = None;
-        if from.is_empty() && !summary.is_empty() {
-            heading.push(chat_title(summary.clone()).into());
+            Some(notice)
         } else {
-            heading.push(design::caption(kind.verb()).into());
-            heading.push(chat_title(chat::delivery_sender(from, sender)).into());
-            // A named sender's ID only tells two of the same name apart.
-            if !from.is_empty() && !sender.is_empty() {
-                heading.push(
-                    design::caption(sender.chars().take(8).collect::<String>())
-                        .font(iced::Font::MONOSPACE)
-                        .into(),
+            None
+        };
+        let heading = notice.map_or_else(
+            || {
+                chat::delivery_heading(
+                    *kind,
+                    from,
+                    sender,
+                    if !body.is_empty() && body.trim() == summary.trim() {
+                        ""
+                    } else {
+                        summary
+                    },
+                )
+            },
+            |notice| notice.summary.plain().to_string(),
+        );
+        let (first, remainder) = heading
+            .split_once(['\r', '\n'])
+            .map_or((heading.as_str(), ""), |(first, rest)| {
+                (first, rest.trim_start_matches(['\r', '\n']))
+            });
+        let monitor = *kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ");
+        let has_body = notice.map_or_else(
+            || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
+            |notice| notice.body.full.len() != 0,
+        );
+        // Only the adapter's explicit background-command outcome is an error.
+        // A peer's prose mentioning a failure is ordinary delivered content.
+        let failed =
+            *kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading);
+        let glyph = if failed {
+            Icon::Error
+        } else if *kind == chat::DeliveryKind::Notice
+            && !monitor
+            && delivery_command_outcome(&heading).is_some()
+        {
+            Icon::Terminal
+        } else if *kind == chat::DeliveryKind::Notice {
+            Icon::Attention
+        } else {
+            Icon::Chat
+        };
+        let icon = widget::icon(glyph.handle())
+            .size(14)
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
+                cosmic::iced::widget::svg::Style {
+                    color: Some(if failed {
+                        design::destructive_color(theme)
+                    } else {
+                        design::muted_icon_color(theme)
+                    }),
+                }
+            })));
+        let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
+            delivery_command_outcome(first)
+                .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
+        } else if *kind == chat::DeliveryKind::Report
+            && from.is_empty()
+            && ["Agent ", "Workflow "]
+                .iter()
+                .any(|prefix| first.starts_with(prefix))
+        {
+            [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|outcome| {
+                    first
+                        .strip_suffix(outcome)
+                        .map(|title| (title, Some(outcome.trim())))
+                })
+                .unwrap_or((first, None))
+        } else {
+            (first, None)
+        };
+        // Bound synchronous text shaping. The original remains in the tooltip,
+        // copy action and expanded detail; fades never introduce an ellipsis.
+        let short: String = title.chars().take(1024).collect();
+        let title = crate::interaction::overflow_fade_x(
+            widget::scrollable(design::caption(short).wrapping(iced::widget::text::Wrapping::None))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill),
+        );
+        let mut cells = vec![icon.into(), title];
+        if let Some(outcome) = outcome {
+            cells.push(
+                design::caption(outcome.to_owned())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            );
+        }
+        let disclosure = has_body && (!monitor || notice.is_some_and(|notice| notice.body.long));
+        if disclosure {
+            cells.push(
+                widget::icon(
+                    if expanded {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    }
+                    .handle(),
+                )
+                .size(design::COMPACT_ICON_SIZE)
+                .into(),
+            );
+        }
+        let row = widget::row::with_children(cells)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+        let heading_row: Element<'static, Message> = if disclosure {
+            widget::button::custom(row)
+                .name(format!(
+                    "{} delivery details: {heading}",
+                    if expanded { "Hide" } else { "Show" }
+                ))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .width(Length::Fill)
+                .on_press(action(Action::Toggle(self.target, item.id.clone())))
+                .into()
+        } else {
+            widget::container(row)
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .into()
+        };
+        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone()).into()];
+        if (expanded || monitor) && has_body {
+            if expanded
+                && *kind != chat::DeliveryKind::Notice
+                && !sender.is_empty()
+                && !heading.contains(sender)
+            {
+                rows.push(selectable_prose::plain(
+                    format!("Sender: {sender}"),
+                    design::TEXT_CAPTION,
+                    iced::Font::MONOSPACE,
+                    self.target,
+                ));
+            }
+            if expanded && !remainder.is_empty() {
+                rows.push(selectable_prose::plain(
+                    remainder.to_owned(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+            }
+            if expanded && first.chars().nth(1024).is_some() {
+                rows.push(selectable_prose::plain(
+                    first.to_owned(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+            }
+            let detail = if notice.is_some() {
+                literal_content::notice_body(self, item, cached, settings, None)
+            } else {
+                prose::view(cached, settings, self.target, self.find.as_deref())
+            };
+            rows.push(
+                widget::container(detail)
+                    .padding([0, step::GAP_M as u16])
+                    .into(),
+            );
+            if expanded {
+                rows.push(
+                    widget::button::custom(design::caption(
+                        if *kind == chat::DeliveryKind::Report {
+                            "Copy report"
+                        } else {
+                            "Copy message"
+                        },
+                    ))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .on_press(action(Action::Copy(
+                        self.target,
+                        item.id.clone(),
+                        CopyPart::Text,
+                    )))
+                    .into(),
                 );
             }
-            if !summary.is_empty() {
-                subtitle = Some(design::caption(summary.clone()));
-            }
         }
-        let mut rows = vec![
-            widget::row::with_children(heading)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
-        ];
-        rows.extend(subtitle.map(Element::from));
-        if !body.is_empty() {
-            rows.push(fold::fold(
-                prose::view(cached, settings, self.target, self.find.as_deref()),
-                toggle(if *kind == chat::DeliveryKind::Report {
-                    "Show full report"
-                } else {
-                    "Show full message"
-                }),
-                !expanded,
-                DELIVERY_FOLDED_HEIGHT,
-                step::GAP_S,
-                design::sunken,
-            ));
-        }
-        let card = widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_S)
-                .width(Length::Fill),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_M; 4],
-            true,
-        ))
-        .padding([step::GAP_S as u16, step::GAP_M as u16])
-        .width(Length::Fill)
-        .into();
         widget::container(message_actions(
-            card,
+            widget::column::with_children(rows)
+                .spacing(step::GAP_XS)
+                .into(),
             self.message_copy(item),
             Alignment::Start,
         ))
@@ -12840,6 +12859,109 @@ mod tests {
     }
 
     #[test]
+    fn delivery_failure_icon_requires_an_explicit_command_outcome() {
+        for heading in [
+            "Background command failed",
+            "Background command failed (exit 1)",
+            "Wait for logs · failed (exit 101)",
+            "Wait for logs · failed (exit 0)",
+        ] {
+            assert!(delivery_command_failed(heading), "{heading}");
+        }
+        for heading in [
+            "Background command finished",
+            "Wait for logs · finished",
+            "Build failed while testing",
+            "Message from tester: failed",
+            "casmi GPU jobs finishing",
+        ] {
+            assert!(!delivery_command_failed(heading), "{heading}");
+        }
+    }
+
+    #[test]
+    fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
+        use iced::advanced::{layout, widget::Tree};
+        let mut item = frame_cost::transcript(1).remove(0);
+        item.id = "background-delivery".into();
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: "command-task".into(),
+            summary: format!("{} · finished", "Wait for k-gather logs ".repeat(20)),
+            body: "cd /fixture/logs && cat < input.log > output.log".into(),
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let item = runtime.snapshot.items[0].clone();
+        let renderer = crate::app::tests::headless_renderer();
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 1000.0));
+        let mut closed = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&closed);
+        let node = closed.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(node.size().width <= 280.0);
+        assert!(
+            node.size().height < 60.0,
+            "long heading remains one row: {:?}",
+            node.size()
+        );
+        let closed_height = node.size().height;
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Prose, false);
+        assert_eq!(
+            catalog.finish().retained_plain_bytes(),
+            0,
+            "closed details cannot be selected"
+        );
+        runtime.expanded.insert(item.id.clone());
+        let mut open = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&open);
+        let node = open.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(
+            node.size().height > closed_height,
+            "disclosure reveals command"
+        );
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Prose, true);
+        assert!(
+            catalog.finish().retained_plain_bytes() > 0,
+            "open literal output is selectable"
+        );
+    }
+
+    #[test]
+    fn monitor_event_output_remains_visible_and_selectable_without_expanding() {
+        use iced::advanced::{layout, widget::Tree};
+        let mut item = frame_cost::transcript(1).remove(0);
+        item.id = "monitor-delivery".into();
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: "monitor-task".into(),
+            summary: "Monitor event: \"casmi GPU jobs finishing\"".into(),
+            body: "k-gather-1 done: 1 failed, 3 passed in 28.96s\nx < y && y > z".into(),
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let item = &runtime.snapshot.items[0];
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let mut view = runtime.delivery_view(item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&view);
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0));
+        let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(
+            node.size().height > 40.0,
+            "monitor event output stays visible"
+        );
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, item, turn::Slot::Prose, false);
+        assert!(
+            catalog.finish().retained_plain_bytes() > 0,
+            "visible event has selection geometry"
+        );
+    }
+
+    #[test]
     fn queued_and_notice_widgets_copy_through_logical_catalog() {
         use iced::advanced::{
             layout,
@@ -12851,7 +12973,7 @@ mod tests {
         delivery.content = ItemContent::Delivery {
             kind: chat::DeliveryKind::Notice,
             from: String::new(),
-            sender: String::new(),
+            sender: "notice-task".into(),
             summary: "Provider report".into(),
             body: "Delivered warning".into(),
         };
@@ -12859,6 +12981,7 @@ mod tests {
         sources.push(delivery);
         let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
         let delivery = runtime.snapshot.items.last().unwrap().clone();
+        runtime.expanded.insert(delivery.id.clone());
         let queued = Queued {
             source: prompt::LocalSource::new("Queued message".into()),
             presentation: prompt::LocalPresentation::default(),
