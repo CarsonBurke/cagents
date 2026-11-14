@@ -5278,6 +5278,10 @@ pub struct Cagents {
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
+    /// Where editors were when a save last dropped them from durable: a
+    /// closed editor, or one still loading. A shared view reopening the same
+    /// pane, or a retried attach, puts the editor back there.
+    released_repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     /// A focused chat pane whose message input was not drawn when the pane
     /// was focused, which takes the keyboard once it is; see
     /// [`Cagents::focus_pane_keyboard`].
@@ -7503,7 +7507,13 @@ impl Cagents {
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-        if let Some(navigation) = self.durable.repository_navigation.get(&card) {
+        let released = self.released_repository_navigation.remove(&card);
+        if let Some(navigation) = self
+            .durable
+            .repository_navigation
+            .get(&card)
+            .or(released.as_ref())
+        {
             runtime.restore_navigation(navigation);
         }
         let load = repository_task(runtime.initial_load(card));
@@ -14895,6 +14905,7 @@ impl Application for Cagents {
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
             navigation_save_generation: 0,
+            released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -23554,7 +23565,7 @@ mod tests {
         };
         let expected = runtime.navigation().unwrap();
         let descriptor = runtime.descriptor.clone();
-        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor.clone());
         let saved = app.persistent_workspace();
         assert_eq!(saved.repository_navigation.get(&card), Some(&expected));
         let CardKind::Repository(view) = &saved
@@ -23599,6 +23610,22 @@ mod tests {
                 .repository_navigation
                 .contains_key(&card)
         );
+        assert!(!app.durable.repository_navigation.contains_key(&card));
+        assert_eq!(
+            app.released_repository_navigation.get(&card),
+            Some(&expected),
+            "the window keeps where the closed editor was"
+        );
+        // A shared view reopening the same pane attaches it there again.
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap()
+            .existence = crate::model::Existence::Open;
+        app.cards.remove(&card);
+        drop(app.attach_repository_pane(card, descriptor));
+        assert!(!app.released_repository_navigation.contains_key(&card));
     }
 
     #[test]
@@ -30894,6 +30921,7 @@ mod tests {
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
             navigation_save_generation: 0,
+            released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
