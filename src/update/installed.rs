@@ -941,31 +941,54 @@ else: raise AssertionError(sys.argv)
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let reply = |stream: &mut UnixStream, id, response| {
-                write_frame(
-                    stream,
-                    &ServerEnvelope {
-                        version: crate::terminal_ipc::PROTOCOL_VERSION,
-                        request_id: Some(id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response { response },
-                    },
-                )
-                .unwrap();
+            let reply = |stream: &mut UnixStream, id, response| match write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: crate::terminal_ipc::PROTOCOL_VERSION,
+                    request_id: Some(id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response { response },
+                },
+            ) {
+                Ok(()) => true,
+                Err(crate::terminal_ipc::FrameError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("writing startup fixture reply: {error}"),
             };
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(connect.request, ClientRequest::Connect { .. }));
-            reply(
+            if !reply(
                 &mut stream,
                 connect.request_id,
                 ServerResponse::Connected {
                     proof: proof.clone(),
                     resumed: Vec::new(),
                 },
-            );
+            ) {
+                return 0;
+            }
             let mut states = VecDeque::from(states);
             let mut requests = 0;
-            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+            loop {
+                let request = match read_frame::<ClientEnvelope>(&mut stream) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => break,
+                    // The timeout intentionally closes the client, possibly
+                    // with an unread status reply. Unix sockets may report a
+                    // reset instead of EOF in that case.
+                    Err(crate::terminal_ipc::FrameError::Io(error))
+                        if error.kind() == std::io::ErrorKind::ConnectionReset =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("reading startup fixture request: {error}"),
+                };
                 assert_eq!(request.request, ClientRequest::StartupState);
                 let state = states
                     .pop_front()
@@ -983,13 +1006,13 @@ else: raise AssertionError(sys.argv)
                     )
                     .unwrap();
                 }
-                reply(
+                requests += 1;
+                if !reply(
                     &mut stream,
                     request.request_id,
                     ServerResponse::StartupState(state),
-                );
-                requests += 1;
-                if finished {
+                ) || finished
+                {
                     break;
                 }
             }

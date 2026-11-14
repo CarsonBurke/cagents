@@ -18,6 +18,12 @@ Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
 runner as the isolated Codex executable. It models the app-server protocol
 only: no provider, credentials, network service or tool is contacted.
+
+With CODEX_HOME/fixture-web-rows present, each prompt instead plays one
+webSearch item with synthetic results. This isolates the native web-search
+row without collaboration activity or unrelated tool/event rows.
+CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
+short, synthetic original diagnostic for the native Details/Copy controls.
 """
 import copy
 import importlib.util
@@ -104,6 +110,20 @@ def items(child):
         ({"id": "compact", "type": "contextCompaction"},
          {"id": "compact", "type": "contextCompaction"}),
     ]
+
+
+def web_items():
+    """The dedicated app-server web-search item, with opaque result records."""
+    query = "temporary probe permission precedence and cleanup receipts with a deliberately long search query"
+    item = {"id": "fixture-web-search", "type": "webSearch", "query": query}
+    return [({**item, "results": []}, {**item, "results": [
+        {"title": "Fixture permission reference with a long descriptive title",
+         "url": "https://example.test/fixture/permissions/temporary-probe-cleanup-policy",
+         "snippet": "Recorded evidence: remove each temporary probe before final verification."},
+        {"title": "Fixture cleanup receipt schema",
+         "url": "https://example.test/fixture/receipts/schema",
+         "snippet": "Synthetic schema: the receipt records probe creation, removal and the final permission."},
+    ]})]
 
 
 class Scenario:
@@ -276,11 +296,23 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True):
+    def notifications(self, turn, starts_child=True, *, web_rows=False, diagnostics=False):
+        starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
+        if diagnostics:
+            raw = ("Fixture diagnostic: the local synthetic receipt was rejected.\n"
+                   "request-id: fixture-original-diagnostic\n"
+                   "Original diagnostic detail: no provider or network was contacted.\n"
+                   "Recover by reviewing the recorded receipt; no files changed.")
+            return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                    {"_sleep": PAUSE},
+                    notify("error", turnId=turn, error={"message": raw}, willRetry=False),
+                    notify("turn/completed", turn={"id": turn, "status": "failed", "items": [],
+                                                   "error": {"message": raw}})]
         started, completed = [], []
-        for begin, end in items(self.child):
+        pairs = web_items() if web_rows else items(self.child)
+        for begin, end in pairs:
             if begin is not None:
                 started.append(notify("item/started", turnId=turn, item=begin))
             completed.append(notify("item/completed", turnId=turn, item=end))
@@ -288,9 +320,10 @@ class Scenario:
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
         history, self.history = self.history, []
         replayed = [notify("item/completed", turnId=turn, item=item) for item in history]
-        settled = [*history, *(end for _, end in items(self.child))]
+        settled = [*history, *(end for _, end in pairs)]
         finished = {"id": turn, "status": "completed", "items": settled}
-        answer = {"id": "answer", "type": "agentMessage", "text": "Done.", "phase": None}
+        answer = {"id": "answer", "type": "agentMessage",
+                  "text": "Web references ready." if web_rows else "Done.", "phase": None}
         child_started = [notify("turn/started", threadId=self.child,
                                turn={"id": f"{turn}-child", "status": "inProgress", "items": []})] if starts_child else []
         child_completed = [notify("turn/completed", threadId=self.child,
@@ -299,7 +332,7 @@ class Scenario:
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
                 *replayed,
                 *child_started,
-                *started, diff, {"_sleep": PAUSE}, *completed,
+                *started, *([] if web_rows else [diff]), {"_sleep": PAUSE}, *completed,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
@@ -333,7 +366,9 @@ class Scenario:
             result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
                        "displayName": "Offline fixture"}], "nextCursor": None}
         elif method == "thread/list":
-            result = {"data": [self.metadata(self.child)], "nextCursor": None}
+            result = {"data": [] if any((Path(codex_home) / marker).is_file()
+                                       for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
+                      else [self.metadata(self.child)], "nextCursor": None}
         elif method == "thread/turns/list":
             latest = self.latest if params.get("threadId") == self.thread else self.child_latest
             result = {"data": [latest] if latest else [], "nextCursor": None}
@@ -366,11 +401,13 @@ class Scenario:
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
             self._advance(self.thread)
-            starts_child = not self.child_latest or self.child_latest["status"] != "inProgress"
+            web_rows = (Path(codex_home) / "fixture-web-rows").is_file()
+            diagnostics = (Path(codex_home) / "fixture-row-diagnostics").is_file()
+            starts_child = not (web_rows or diagnostics) and (not self.child_latest or self.child_latest["status"] != "inProgress")
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child)
+            after = self.notifications(turn, starts_child, web_rows=web_rows, diagnostics=diagnostics)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
