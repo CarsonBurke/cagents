@@ -245,7 +245,7 @@ print("Verified private clipboard contains "+sys.argv[1])
 }
 
 if [ "$scene" = coordination ]; then
-    [ -f "$web_done" ] || { printf '%s\n' 'run web before coordination' >&2; exit 2; }
+    evidence cli project open "$fixture/project" >/dev/null
     cp "$here/reasoning-row-scene/coordination.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
     spawn_scene claude haiku 'Coordination fixture: review the recorded transcript controls.' \
@@ -289,7 +289,7 @@ if [ "$scene" = coordination ]; then
 fi
 
 if [ "$scene" = diagnostics ]; then
-    [ -f "$coordination_done" ] || { printf '%s\n' 'run coordination before diagnostics' >&2; exit 2; }
+    evidence cli project open "$fixture/project" >/dev/null
     touch "$fixture/home/.codex/fixture-row-diagnostics"
     spawn_scene codex fixture-mini 'Diagnostic fixture: inspect the original synthetic failure.' \
         "$fixture/state/reasoning-row-scene-diagnostics-spawn.json" 'Diagnostic fixture rows'
