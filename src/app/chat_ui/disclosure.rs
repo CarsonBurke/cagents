@@ -38,7 +38,7 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     match status {
         Some(chat::ToolStatus::Failed) => Icon::Error,
         Some(chat::ToolStatus::Denied) => Icon::Unavailable,
-        Some(chat::ToolStatus::Stopped) => Icon::Cancel,
+        Some(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Cancel,
         Some(chat::ToolStatus::Waiting) => Icon::AgentBackground,
         _ => kind,
     }
@@ -49,7 +49,7 @@ pub(super) fn row(
     name: String,
     icon: Icon,
     status: Option<chat::ToolStatus>,
-    elapsed: Option<String>,
+    trailing: Option<String>,
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
@@ -58,7 +58,7 @@ pub(super) fn row(
         name,
         icon,
         status,
-        elapsed,
+        trailing,
         expanded,
         toggle,
         |theme| theme.current_container().base.into(),
@@ -70,7 +70,48 @@ pub(super) fn row_on(
     name: String,
     icon: Icon,
     status: Option<chat::ToolStatus>,
-    elapsed: Option<String>,
+    trailing: Option<String>,
+    expanded: Option<bool>,
+    toggle: Option<Action>,
+    base: impl Fn(&cosmic::Theme) -> iced::Color + 'static,
+) -> Element<'static, Message> {
+    let name = match &trailing {
+        Some(trailing) => format!("{name} · {trailing}"),
+        None => name,
+    };
+    row_painted(label, name, icon, status, trailing, expanded, toggle, base)
+}
+
+/// A row whose accessible name already includes its trailing metadata.
+/// Delivered reports retain their canonical full heading even when the title
+/// and outcome are drawn in separate cells.
+pub(super) fn row_named(
+    label: String,
+    name: String,
+    icon: Icon,
+    status: Option<chat::ToolStatus>,
+    trailing: Option<String>,
+    expanded: Option<bool>,
+    toggle: Option<Action>,
+) -> Element<'static, Message> {
+    row_painted(
+        label,
+        name,
+        icon,
+        status,
+        trailing,
+        expanded,
+        toggle,
+        |theme| theme.current_container().base.into(),
+    )
+}
+
+fn row_painted(
+    label: String,
+    name: String,
+    icon: Icon,
+    status: Option<chat::ToolStatus>,
+    trailing: Option<String>,
     expanded: Option<bool>,
     toggle: Option<Action>,
     base: impl Fn(&cosmic::Theme) -> iced::Color + 'static,
@@ -113,17 +154,14 @@ pub(super) fn row_on(
         }
     };
     let mut cells = vec![indicator, text];
-    let name = if let Some(elapsed) = elapsed {
+    if let Some(trailing) = trailing {
         cells.push(
-            design::caption(elapsed.clone())
+            design::caption(trailing)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         );
-        format!("{name} · {elapsed}")
-    } else {
-        name
-    };
+    }
     if let Some(expanded) = expanded {
         cells.push(crate::ui_controls::passive_icon(
             if expanded {
@@ -239,6 +277,10 @@ mod tests {
         );
         assert_eq!(
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Stopped)),
+            Icon::Cancel
+        );
+        assert_eq!(
+            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Ended)),
             Icon::Cancel
         );
         assert_eq!(

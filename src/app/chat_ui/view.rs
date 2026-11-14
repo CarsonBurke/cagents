@@ -101,18 +101,13 @@ const COMPOSER_CONTROL_INSET: f32 =
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
-/// How much of a long report or message shows until the reader opens it:
-/// its opening paragraph or so, enough to recognize it without reading it. A
-/// short one is read in full where it lands.
+/// The preview height of messages inside coordinating tool cards.
 pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 pub(super) const NOTICE_LINES: usize = 3;
 /// The characters of a notice's event shown before it is opened, so a single
 /// line too long to read at a glance cannot wrap down the transcript either.
 pub(super) const NOTICE_CHARS: usize = 480;
-/// The characters of a notice's heading. A heading is one line: what the
-/// notice is about, not the event itself.
-pub(super) const NOTICE_HEADING_CHARS: usize = 160;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
@@ -828,7 +823,11 @@ pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
 
 /// The row that closes a working transcript: a small muted spinner, or the
 /// waiting glyph, beside what the agent is doing.
-fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
+fn activity_row<'a>(
+    glyph: Icon,
+    label: String,
+    failure: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
     let glyph = if glyph == Icon::AgentWorking {
         crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -837,15 +836,32 @@ fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
     } else {
         crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
     };
-    widget::row::with_children(vec![
-        glyph,
-        design::caption(label)
+    let caption = |label: String| -> Element<'a, Message> {
+        design::caption(label.replace(['\n', '\r'], " "))
             .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into(),
-    ])
-    .spacing(step::GAP_XS)
-    .align_y(Alignment::Center)
-    .into()
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    };
+    let mut parts = Vec::new();
+    if !label.is_empty() {
+        parts.push(caption(label));
+    }
+    if let Some(failure) = failure {
+        if !parts.is_empty() {
+            parts.push(caption(" · ".into()));
+        }
+        parts.push(failure);
+    }
+    let status = widget::scrollable(widget::row::with_children(parts).align_y(Alignment::Center))
+        .width(Length::Fill)
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::hidden(),
+        ));
+    widget::row::with_children(vec![glyph, crate::interaction::overflow_fade_x(status)])
+        .spacing(step::GAP_XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A one-line row of a composer list: an optional icon, a name, what it
@@ -1363,6 +1379,24 @@ struct Place {
     branch: Option<String>,
 }
 
+fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
+    let (title, outcome) = heading
+        .strip_prefix("Background command ")
+        .map(|outcome| ("Background command", outcome))
+        .or_else(|| heading.rsplit_once(" · "))?;
+    let known = matches!(outcome, "finished" | "stopped" | "failed")
+        || outcome
+            .strip_prefix("failed (exit ")
+            .and_then(|code| code.strip_suffix(')'))
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some();
+    known.then_some((title, outcome))
+}
+
+fn delivery_command_failed(heading: &str) -> bool {
+    delivery_command_outcome(heading).is_some_and(|(_, outcome)| outcome.starts_with("failed"))
+}
+
 impl Runtime {
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
@@ -1400,6 +1434,7 @@ impl Runtime {
             chat::ToolStatus::Failed => "Failed",
             chat::ToolStatus::Denied => "Denied",
             chat::ToolStatus::Stopped => "Stopped",
+            chat::ToolStatus::Ended => "Ended",
         }
     }
 
@@ -1461,6 +1496,14 @@ impl Runtime {
     /// Completion requires provider evidence. An unstarted conversation is a
     /// draft; an idle attached one is ready, while an attachment is connecting.
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
+        self.conversation_status_with_failures(transitioning, true)
+    }
+
+    fn conversation_status_with_failures(
+        &self,
+        transitioning: bool,
+        include_failures: bool,
+    ) -> (Option<Icon>, String) {
         let (glyph, label) = self.conversation_status_base(transitioning);
         let snapshot = &self.snapshot;
         if self.closed_elsewhere
@@ -1473,31 +1516,11 @@ impl Runtime {
         {
             return (glyph, label.to_owned());
         }
-        let working = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
-            .count();
-        let waiting = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
-            .count();
-        let on_background_work = snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Waiting)
-            .count();
-        let failed = snapshot
-            .subagents
-            .iter()
-            .filter(|child| {
-                matches!(
-                    child.status,
-                    chat::ToolStatus::Failed | chat::ToolStatus::Denied
-                )
-            })
-            .count();
+        let activity = snapshot.subagent_activity();
+        let working = activity.working;
+        let waiting = activity.waiting;
+        let on_background_work = activity.on_background_work;
+        let failed = activity.failed.len();
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
@@ -1526,59 +1549,122 @@ impl Runtime {
         });
         let mut parts = Vec::new();
         if let Some(label) = limit_reset.as_deref().or(failure_label) {
-            parts.push(Self::short_description(label, 72));
+            parts.push(label.to_owned());
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0 && on_background_work == 0)
+            || (working == 0 && waiting == 0 && on_background_work == 0 && failed == 0)
         {
-            parts.push(Self::short_description(label, 72));
+            parts.push(label.to_owned());
         }
-        if failure_label.is_some()
-            || snapshot.subagents.len() > 1
-            || on_background_work > 0
-            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
-        {
-            let subagents = |count: usize| {
-                if count == 1 {
-                    "1 subagent".to_owned()
-                } else {
-                    format!("{count} subagents")
-                }
-            };
-            if working > 0 {
-                parts.push(format!("{} working", subagents(working)));
-            }
-            if waiting > 0 {
-                parts.push(format!("{} waiting", subagents(waiting)));
-            }
-            if on_background_work > 0 {
-                parts.push(format!(
-                    "{} waiting on background work",
-                    subagents(on_background_work)
-                ));
-            }
-            if failed > 0 {
-                parts.push(format!("{} failed", subagents(failed)));
-            }
-            if !parts.is_empty() {
-                return (
-                    if working > 0 || snapshot.busy {
-                        Some(Icon::AgentWorking)
-                    } else if failure_label.is_some() || failed > 0 {
-                        Some(Icon::Warning)
-                    } else if on_background_work > 0 {
-                        // Not a finished check: a subagent's background work
-                        // goes on, though nothing is asked of the reader.
-                        None
+        let mut agent_parts = Vec::new();
+        if working > 0 {
+            agent_parts.push(format!(
+                "{working} {} working",
+                if working == 1 { "agent" } else { "agents" }
+            ));
+        }
+        if waiting > 0 {
+            agent_parts.push(if agent_parts.is_empty() {
+                format!(
+                    "{waiting} {} waiting",
+                    if waiting == 1 { "agent" } else { "agents" }
+                )
+            } else {
+                format!("{waiting} waiting")
+            });
+        }
+        if on_background_work > 0 {
+            agent_parts.push(if agent_parts.is_empty() {
+                format!(
+                    "{on_background_work} {} waiting on background work",
+                    if on_background_work == 1 {
+                        "agent"
                     } else {
-                        glyph
-                    },
-                    parts.join(" · "),
-                );
-            }
+                        "agents"
+                    }
+                )
+            } else {
+                format!("{on_background_work} waiting on background work")
+            });
         }
-        (glyph, Self::short_description(label, 100))
+        parts.extend(agent_parts);
+        if include_failures && failed > 0 {
+            parts.push(Self::agent_failure_label(&activity.failed));
+        }
+        if working + waiting + on_background_work + failed > 0 || failure_label.is_some() {
+            return (
+                if working > 0 || snapshot.busy {
+                    Some(Icon::AgentWorking)
+                } else if failure_label.is_some() || failed > 0 {
+                    Some(Icon::Warning)
+                } else if waiting > 0 {
+                    Some(Icon::AgentWaiting)
+                } else {
+                    None
+                },
+                parts.join(" · "),
+            );
+        }
+        (glyph, parts.join(" · "))
+    }
+
+    pub(super) fn agent_failure_task(agent: &chat::Subagent) -> &str {
+        Self::native_child_task(agent).unwrap_or_else(|| Self::native_child_name(agent))
+    }
+
+    fn agent_failure_label(failed: &[&chat::Subagent]) -> String {
+        match failed {
+            [agent] => format!("1 failed: {}", Self::agent_failure_task(agent)),
+            _ => format!("{} failed", failed.len()),
+        }
+    }
+
+    fn agent_failure_control(&self) -> Option<Element<'_, Message>> {
+        let failed = self.snapshot.subagent_activity().failed;
+        if failed.is_empty() {
+            return None;
+        }
+        let (name, on_press) = match failed.as_slice() {
+            [agent] => (
+                format!("Open failed agent: {}", Self::agent_failure_task(agent)),
+                Action::SelectSubagent(self.target, Some(agent.id.clone())),
+            ),
+            _ => (
+                format!("Choose from {} failed agents", failed.len()),
+                Action::SubagentFailures(self.target),
+            ),
+        };
+        let tooltip = failed
+            .iter()
+            .map(|agent| {
+                let task = Self::agent_failure_task(agent);
+                if agent.detail.trim().is_empty() {
+                    task.to_owned()
+                } else {
+                    format!("{task}: {}", agent.detail.trim())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::hash::DefaultHasher::new();
+        for agent in &failed {
+            agent.id.hash(&mut identity);
+        }
+        let button = widget::button::custom(
+            design::caption(Self::agent_failure_label(&failed))
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .name(name)
+        .id(card_control_id(
+            self.target.card,
+            &format!("chat-agent-failures-{:x}", identity.finish()),
+        ))
+        .padding(0)
+        .class(crate::ui_controls::control_style(false, None))
+        .on_press(action(on_press));
+        Some(crate::interaction::tooltip_above(button, tooltip))
     }
 
     /// What the agent is doing now, for the row that closes the transcript:
@@ -1611,11 +1697,11 @@ impl Runtime {
             }
             return (agent.status == chat::ToolStatus::Running).then(|| {
                 if agent.waiting {
-                    (Icon::AgentWaiting, "Waiting for you".to_owned())
+                    (Icon::AgentWaiting, "Waiting".to_owned())
                 } else {
                     let activity = items_activity(&agent.items);
                     let label = if activity == "Working" && !agent.detail.trim().is_empty() {
-                        Self::short_description(agent.detail.trim(), 100)
+                        agent.detail.trim().to_owned()
                     } else {
                         activity.to_owned()
                     };
@@ -1630,15 +1716,9 @@ impl Runtime {
         let (glyph, label) = self.conversation_status(transitioning);
         match glyph {
             Some(glyph @ (Icon::AgentWorking | Icon::AgentWaiting)) => Some((glyph, label)),
-            // A failure stands in the transcript on its own; a subagent still
-            // waiting on the reader is not settled by it.
-            Some(Icon::Warning)
-                if snapshot
-                    .subagents
-                    .iter()
-                    .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
-            {
-                Some((Icon::AgentWaiting, label))
+            // A recent failed task stays actionable even after the lead finishes.
+            Some(Icon::Warning) if !snapshot.subagent_activity().failed.is_empty() => {
+                Some((Icon::Warning, label))
             }
             // Nothing is asked of the reader, but the finished stamp alone
             // would read as everything being done.
@@ -1984,27 +2064,28 @@ impl Runtime {
             return;
         }
         if let Some(literal) = self.prepared_literal(item) {
-            // System notices use a fully closed step disclosure. User-slot
-            // notices retain their existing visible body preview.
-            if item.role == chat::Role::System
-                && matches!(
-                    item.content,
-                    ItemContent::Delivery {
-                        kind: chat::DeliveryKind::Notice,
-                        ..
-                    }
-                )
-                && !(detail && self.item_expanded(&item.id))
+            // Monitor previews are visible; other notices disclose their body.
+            if matches!(
+                item.content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    ..
+                }
+            ) && !self.item_expanded(&item.id)
+                && !matches!(&item.content, ItemContent::Delivery { summary, .. } if summary.starts_with("Monitor event: "))
             {
                 return;
             }
-            literal.catalog(builder, item, detail && self.item_expanded(&item.id));
+            literal.catalog(builder, item, self.item_expanded(&item.id));
             return;
         }
         if literal_content::Prepared::required(&item.content) {
             return;
         }
         if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
+            return;
+        }
+        if matches!(item.content, ItemContent::Delivery { .. }) && !self.item_expanded(&item.id) {
             return;
         }
         if matches!(
@@ -2218,7 +2299,9 @@ impl Runtime {
                     heading.into()
                 },
             );
-            if agent.items.is_empty() {
+            if agent.items.is_empty()
+                && !(agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty())
+            {
                 transcript.push(transcript_body(
                     if agent.status == chat::ToolStatus::Running {
                         "Waiting for subagent activity…"
@@ -2467,7 +2550,17 @@ impl Runtime {
         // composer, and each change redraws this one row rather than adding
         // another.
         if let Some((glyph, label)) = self.timeline_activity(transitioning, selected) {
-            transcript.push(activity_row(glyph, label));
+            let failure = selected
+                .is_none()
+                .then(|| self.agent_failure_control())
+                .flatten();
+            let label = if failure.is_some() {
+                self.conversation_status_with_failures(transitioning, false)
+                    .1
+            } else {
+                label
+            };
+            transcript.push(activity_row(glyph, label, failure));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -4188,7 +4281,10 @@ impl Runtime {
                     .map(|(index, choice)| {
                         let mut row: Vec<Element<'a, Message>> = Vec::new();
                         match choice.usage_fraction {
-                            Some(fraction) => row.push(crate::ui_controls::budget_radial(fraction)),
+                            Some(fraction) => row.push(crate::ui_controls::budget_radial_toned(
+                                fraction,
+                                choice.tone.color().map(design::Tone::Themed),
+                            )),
                             None => row.push(
                                 iced::widget::Space::new()
                                     .width(design::RADIAL_GAUGE_SIZE)
@@ -4204,7 +4300,11 @@ impl Runtime {
                                 .into(),
                         ];
                         if !choice.detail.is_empty() {
-                            text.push(design::caption(choice.detail).into());
+                            text.push(
+                                design::caption(choice.detail)
+                                    .class(choice.tone.text_class())
+                                    .into(),
+                            );
                         }
                         row.push(
                             widget::column::with_children(text)
@@ -5328,18 +5428,9 @@ impl Runtime {
         .into()
     }
 
-    /// Something another agent, or the harness for it, delivered.
-    ///
-    /// It opens the work it prompts, as the reader's own message does, but it
-    /// is not theirs: drawn as their bubble, a subagent's report read as
-    /// though the reader had pasted it. So it sits on the agent's side of the
-    /// column, on the surface used for quoted content, under a heading that
-    /// names who sent it. A long report is folded to its opening, because the
-    /// agent receiving it usually answers with the part that matters and a
-    /// report several screens long would bury that answer.
-    ///
-    /// A notice is the harness saying background work changed state, so it
-    /// takes one quiet line instead of a card.
+    /// A delivery stays at the point where it prompted the next reply. The
+    /// one-line disclosure names its source or outcome; literal notice output
+    /// and full reports are available on demand.
     fn delivery_view(
         &self,
         item: &chat::Item,
@@ -5357,185 +5448,161 @@ impl Runtime {
             return self.prompt_view(item);
         };
         let expanded = self.item_expanded(&item.id);
-        let toggle = |label: &'static str, surface: fn(&cosmic::Theme) -> iced::Color| {
-            let label = if expanded { "Show less" } else { label };
-            disclosure::row_on(
-                label.into(),
-                label.into(),
-                Icon::Chat,
-                None,
-                None,
-                Some(expanded),
-                Some(Action::Toggle(self.target, item.id.clone())),
-                surface,
-            )
-        };
-        let glyph = |name: Icon| -> Element<'static, Message> {
-            widget::icon(name.handle())
-                .size(14)
-                .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-                    cosmic::iced::widget::svg::Style {
-                        color: Some(design::muted_icon_color(theme)),
-                    }
-                })))
-                .into()
-        };
-        if *kind == chat::DeliveryKind::Report {
-            let heading = chat::delivery_heading(*kind, from, sender, summary);
-            // The outcome must survive a long task name fading out. This is
-            // report presentation, not inference of a parent account failure.
-            let preview = [
-                (" was stopped", "Stopped"),
-                (" finished", "Finished"),
-                (" failed", "Failed"),
-            ]
-            .into_iter()
-            .find_map(|(suffix, outcome)| {
-                heading
-                    .strip_suffix(suffix)
-                    .map(|subject| format!("{outcome}: {subject}"))
-            })
-            .unwrap_or_else(|| heading.clone());
-            let disclosure = disclosure::row(
-                turn::headline(preview),
-                format!(
-                    "{} report details: {heading}",
-                    if expanded { "Hide" } else { "Show" }
-                ),
-                Icon::Chat,
-                None,
-                None,
-                Some(expanded),
-                Some(Action::Toggle(self.target, item.id.clone())),
-            );
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Copy(
-                    self.target,
-                    item.id.clone(),
-                    CopyPart::Text,
-                )));
-            let mut rows = vec![disclosure, copy.into()];
-            if expanded {
-                if !sender.is_empty() && !heading.contains(sender) {
-                    rows.push(selectable_prose::plain(
-                        format!("Sender: {sender}"),
-                        design::TEXT_CAPTION,
-                        iced::Font::MONOSPACE,
-                        self.target,
-                    ));
-                }
-                rows.push(selectable_prose::plain(
-                    heading,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ));
-                if !body.is_empty() {
-                    rows.push(prose::view(
-                        cached,
-                        settings,
-                        self.target,
-                        self.find.as_deref(),
-                    ));
-                }
-            }
-            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
-                .max_width(design::READABLE_MEASURE)
-                .width(Length::Fill)
-                .into();
-        }
-        if *kind == chat::DeliveryKind::Notice {
+        let notice = if *kind == chat::DeliveryKind::Notice {
             let Some(notice) = self
                 .prepared_literal(item)
                 .and_then(literal_content::Content::notice)
             else {
                 return design::caption("Loading notice…").into();
             };
-            let mut rows = vec![
-                widget::row::with_children(vec![
-                    glyph(Icon::Attention),
-                    literal_content::notice_summary(self, item, cached, settings),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-            ];
-            if notice.body.full.len() != 0 {
-                rows.push(literal_content::notice_body(
-                    self, item, cached, settings, None,
-                ));
-                if notice.body.long {
-                    rows.push(toggle("Show more", |theme| {
-                        theme.current_container().base.into()
-                    }));
-                }
-            }
-            return widget::container(message_actions(
-                widget::column::with_children(rows)
-                    .spacing(step::GAP_XS)
-                    .into(),
-                self.message_copy(item),
-                Alignment::Start,
-            ))
-            .max_width(design::READABLE_MEASURE)
-            .width(Length::Fill)
-            .into();
-        }
-        // A named sender leads and its own summary follows; an unnamed one is
-        // described by the harness's summary, as `chat::delivery_heading`.
-        let mut heading = vec![glyph(Icon::Chat)];
-        let mut subtitle = None;
-        if from.is_empty() && !summary.is_empty() {
-            heading.push(chat_title(summary.clone()).into());
+            Some(notice)
         } else {
-            heading.push(design::caption(kind.verb()).into());
-            heading.push(chat_title(chat::delivery_sender(from, sender)).into());
-            // A named sender's ID only tells two of the same name apart.
-            if !from.is_empty() && !sender.is_empty() {
-                heading.push(
-                    design::caption(sender.chars().take(8).collect::<String>())
-                        .font(iced::Font::MONOSPACE)
+            None
+        };
+        let heading = notice.map_or_else(
+            || {
+                chat::delivery_heading(
+                    *kind,
+                    from,
+                    sender,
+                    if !body.is_empty() && body.trim() == summary.trim() {
+                        ""
+                    } else {
+                        summary
+                    },
+                )
+            },
+            |notice| notice.summary.plain().to_string(),
+        );
+        let (first, remainder) = heading
+            .split_once(['\r', '\n'])
+            .map_or((heading.as_str(), ""), |(first, rest)| {
+                (first, rest.trim_start_matches(['\r', '\n']))
+            });
+        let monitor = *kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ");
+        let has_body = notice.map_or_else(
+            || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
+            |notice| notice.body.full.len() != 0,
+        );
+        // Only the adapter's explicit background-command outcome is an error.
+        // A peer's prose mentioning a failure is ordinary delivered content.
+        let failed =
+            *kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading);
+        let glyph = if failed {
+            Icon::Error
+        } else if *kind == chat::DeliveryKind::Notice
+            && !monitor
+            && delivery_command_outcome(&heading).is_some()
+        {
+            Icon::Terminal
+        } else if *kind == chat::DeliveryKind::Notice {
+            Icon::Attention
+        } else {
+            Icon::Chat
+        };
+        let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
+            delivery_command_outcome(first)
+                .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
+        } else if *kind == chat::DeliveryKind::Report
+            && from.is_empty()
+            && ["Agent ", "Workflow "]
+                .iter()
+                .any(|prefix| first.starts_with(prefix))
+        {
+            [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|outcome| {
+                    first
+                        .strip_suffix(outcome)
+                        .map(|title| (title, Some(outcome.trim())))
+                })
+                .unwrap_or((first, None))
+        } else {
+            (first, None)
+        };
+        // Bound synchronous text shaping. The original remains in the tooltip,
+        // copy action and expanded detail; fades never introduce an ellipsis.
+        let short: String = title.chars().take(1024).collect();
+        let disclosure = has_body && (!monitor || notice.is_some_and(|notice| notice.body.long));
+        let heading_row = disclosure::row_named(
+            short,
+            if disclosure {
+                format!(
+                    "{} delivery details: {heading}",
+                    if expanded { "Hide" } else { "Show" }
+                )
+            } else {
+                heading.clone()
+            },
+            glyph,
+            failed.then_some(chat::ToolStatus::Failed),
+            outcome.map(str::to_owned),
+            disclosure.then_some(expanded),
+            disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
+        );
+        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone()).into()];
+        if (expanded || monitor) && has_body {
+            if expanded
+                && *kind != chat::DeliveryKind::Notice
+                && !sender.is_empty()
+                && !heading.contains(sender)
+            {
+                rows.push(selectable_prose::plain(
+                    format!("Sender: {sender}"),
+                    design::TEXT_CAPTION,
+                    iced::Font::MONOSPACE,
+                    self.target,
+                ));
+            }
+            if expanded && !remainder.is_empty() {
+                rows.push(selectable_prose::plain(
+                    remainder.to_owned(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+            }
+            if expanded && first.chars().nth(1024).is_some() {
+                rows.push(selectable_prose::plain(
+                    first.to_owned(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+            }
+            let detail = if notice.is_some() {
+                literal_content::notice_body(self, item, cached, settings, None)
+            } else {
+                prose::view(cached, settings, self.target, self.find.as_deref())
+            };
+            rows.push(
+                widget::container(detail)
+                    .padding([0, step::GAP_M as u16])
+                    .into(),
+            );
+            if expanded {
+                let label = if *kind == chat::DeliveryKind::Report {
+                    "Copy report"
+                } else {
+                    "Copy message"
+                };
+                rows.push(
+                    widget::button::custom(design::caption(label))
+                        .name(label)
+                        .class(crate::ui_controls::control_style(false, None))
+                        .on_press(action(Action::Copy(
+                            self.target,
+                            item.id.clone(),
+                            CopyPart::Text,
+                        )))
                         .into(),
                 );
             }
-            if !summary.is_empty() {
-                subtitle = Some(design::caption(summary.clone()));
-            }
         }
-        let mut rows = vec![
-            widget::row::with_children(heading)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
-        ];
-        rows.extend(subtitle.map(Element::from));
-        if !body.is_empty() {
-            rows.push(fold::fold(
-                prose::view(cached, settings, self.target, self.find.as_deref()),
-                toggle("Show full message", design::sunken),
-                !expanded,
-                DELIVERY_FOLDED_HEIGHT,
-                step::GAP_S,
-                design::sunken,
-            ));
-        }
-        let card = widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_S)
-                .width(Length::Fill),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_M; 4],
-            true,
-        ))
-        .padding([step::GAP_S as u16, step::GAP_M as u16])
-        .width(Length::Fill)
-        .into();
         widget::container(message_actions(
-            card,
+            widget::column::with_children(rows)
+                .spacing(step::GAP_XS)
+                .into(),
             self.message_copy(item),
             Alignment::Start,
         ))
@@ -7540,9 +7607,9 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).error = None;
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.subagents.push(native_child_fixture());
-        assert_eq!(runtime.conversation_status(false).1, "Subagents working");
+        assert_eq!(runtime.conversation_status(false).1, "1 agent working");
         Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-        assert_eq!(runtime.conversation_status(false).1, "Subagents waiting");
+        assert_eq!(runtime.conversation_status(false).1, "1 agent waiting");
         Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Succeeded;
         assert_eq!(
             runtime.conversation_status(false).1,
@@ -7589,6 +7656,149 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_counts_only_active_states_and_identifies_the_current_failure() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        for (index, status) in [
+            chat::ToolStatus::Running,
+            chat::ToolStatus::Running,
+            chat::ToolStatus::Waiting,
+            chat::ToolStatus::Failed,
+            chat::ToolStatus::Stopped,
+            chat::ToolStatus::Ended,
+            chat::ToolStatus::Succeeded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut child = native_child_fixture();
+            child.id = format!("child-{index}");
+            child.status = status;
+            child.waiting = index == 1;
+            child.description = "Check restart safety".into();
+            snapshot.subagents.push(child);
+        }
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "1 agent working · 1 waiting · 1 waiting on background work · 1 failed: Check restart safety"
+        );
+        assert_eq!(
+            runtime.conversation_status_with_failures(false, false).1,
+            "1 agent working · 1 waiting · 1 waiting on background work"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot
+            .subagents
+            .retain(|agent| agent.status == chat::ToolStatus::Failed);
+        assert_eq!(
+            runtime.timeline_activity(false, None),
+            Some((Icon::Warning, "1 failed: Check restart safety".into()))
+        );
+    }
+
+    #[test]
+    fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a_filtered_chooser()
+     {
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        runtime.target.card = app.workspace.focused().unwrap();
+        let target = runtime.target;
+        let mut failed = native_child_fixture();
+        failed.status = chat::ToolStatus::Failed;
+        failed.description = "Check restart safety".into();
+        failed.detail = "The soak test crashed".into();
+        Arc::make_mut(&mut runtime.snapshot).subagents.push(failed);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            activity_row(
+                Icon::Warning,
+                String::new(),
+                runtime.agent_failure_control(),
+            ),
+            iced::Size::new(800.0, 36.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Open failed agent: Check restart safety"))
+            .and_then(|node| node.node().bounds())
+            .expect("an actionable named failure");
+        let pointer = iced::Point::new(
+            (bounds.x0 + bounds.x1) as f32 / 2.0,
+            (bounds.y0 + bounds.y1) as f32 / 2.0,
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ],
+            iced::mouse::Cursor::Available(pointer),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        drop(ui);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let select = messages
+            .into_iter()
+            .find_map(|message| match message {
+                Message::ChatUi(action @ Action::SelectSubagent(..)) => Some(action),
+                _ => None,
+            })
+            .expect("failure click selects a transcript");
+        drop(app.handle_chat_ui(select));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("native-child"));
+        let mut second = runtime.snapshot.subagents[0].clone();
+        second.id = "second-failure".into();
+        Arc::make_mut(&mut runtime.snapshot).subagents.push(second);
+        drop(app.handle_chat_ui(Action::SubagentFailures(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let picker = runtime.child_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, child_navigation::Filter::Failed);
+        assert_eq!(
+            picker
+                .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn long_activity_remains_one_line_in_a_narrow_pane() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut row = activity_row(
+            Icon::AgentWorking,
+            "7 agents working\n1 waiting on background work · ".repeat(20),
+            None,
+        );
+        let mut tree = Tree::new(row.as_widget());
+        let node = row.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 200.0)),
+        );
+        assert_eq!(node.size().width, 240.0);
+        assert!(
+            node.size().height < 30.0,
+            "status wrapped: {:?}",
+            node.size()
+        );
+    }
+
+    #[test]
     fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         let activity = |runtime: &Runtime| runtime.timeline_activity(false, None);
@@ -7612,21 +7822,21 @@ mod tests {
             activity(&runtime),
             Some((
                 Icon::AgentWorking,
-                "Reviewing changes · 2 subagents working".into()
+                "Reviewing changes · 2 agents working".into()
             ))
         );
         assert_eq!(runtime.snapshot.items.len(), items);
         Arc::make_mut(&mut runtime.snapshot).busy = false;
         assert_eq!(
             activity(&runtime),
-            Some((Icon::AgentWorking, "2 subagents working".into()))
+            Some((Icon::AgentWorking, "2 agents working".into()))
         );
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.subagents[0].waiting = true;
         snapshot.subagents[1].status = chat::ToolStatus::Succeeded;
         assert_eq!(
             activity(&runtime),
-            Some((Icon::AgentWaiting, "1 subagent waiting".into()))
+            Some((Icon::AgentWaiting, "1 agent waiting".into()))
         );
         Arc::make_mut(&mut runtime.snapshot).waiting = true;
         assert_eq!(
@@ -7751,7 +7961,7 @@ mod tests {
         snapshot.finished_at = Some(42);
         let (glyph, label) = runtime.conversation_status(false);
         assert!(
-            label.contains("1 subagent waiting on background work"),
+            label.contains("1 agent waiting on background work"),
             "{label}"
         );
         assert!(!label.contains("Waiting for you"), "{label}");
@@ -7764,7 +7974,7 @@ mod tests {
             runtime.timeline_activity(false, None),
             Some((
                 Icon::AgentBackground,
-                "1 subagent waiting on background work".into()
+                "1 agent waiting on background work".into()
             ))
         );
         let child = runtime.snapshot.subagents[0].clone();
@@ -12711,6 +12921,109 @@ mod tests {
     }
 
     #[test]
+    fn delivery_failure_icon_requires_an_explicit_command_outcome() {
+        for heading in [
+            "Background command failed",
+            "Background command failed (exit 1)",
+            "Wait for logs · failed (exit 101)",
+            "Wait for logs · failed (exit 0)",
+        ] {
+            assert!(delivery_command_failed(heading), "{heading}");
+        }
+        for heading in [
+            "Background command finished",
+            "Wait for logs · finished",
+            "Build failed while testing",
+            "Message from tester: failed",
+            "casmi GPU jobs finishing",
+        ] {
+            assert!(!delivery_command_failed(heading), "{heading}");
+        }
+    }
+
+    #[test]
+    fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
+        use iced::advanced::{layout, widget::Tree};
+        let mut item = frame_cost::transcript(1).remove(0);
+        item.id = "background-delivery".into();
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: "command-task".into(),
+            summary: format!("{} · finished", "Wait for k-gather logs ".repeat(20)),
+            body: "cd /fixture/logs && cat < input.log > output.log".into(),
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let item = runtime.snapshot.items[0].clone();
+        let renderer = crate::app::tests::headless_renderer();
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 1000.0));
+        let mut closed = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&closed);
+        let node = closed.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(node.size().width <= 280.0);
+        assert!(
+            node.size().height < 60.0,
+            "long heading remains one row: {:?}",
+            node.size()
+        );
+        let closed_height = node.size().height;
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Prose, false);
+        assert_eq!(
+            catalog.finish().retained_plain_bytes(),
+            0,
+            "closed details cannot be selected"
+        );
+        runtime.expanded.insert(item.id.clone());
+        let mut open = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&open);
+        let node = open.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(
+            node.size().height > closed_height,
+            "disclosure reveals command"
+        );
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Prose, true);
+        assert!(
+            catalog.finish().retained_plain_bytes() > 0,
+            "open literal output is selectable"
+        );
+    }
+
+    #[test]
+    fn monitor_event_output_remains_visible_and_selectable_without_expanding() {
+        use iced::advanced::{layout, widget::Tree};
+        let mut item = frame_cost::transcript(1).remove(0);
+        item.id = "monitor-delivery".into();
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: "monitor-task".into(),
+            summary: "Monitor event: \"casmi GPU jobs finishing\"".into(),
+            body: "k-gather-1 done: 1 failed, 3 passed in 28.96s\nx < y && y > z".into(),
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let item = &runtime.snapshot.items[0];
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let mut view = runtime.delivery_view(item, &runtime.cache[&item.id], settings);
+        let mut tree = Tree::new(&view);
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0));
+        let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(
+            node.size().height > 40.0,
+            "monitor event output stays visible"
+        );
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, item, turn::Slot::Prose, false);
+        assert!(
+            catalog.finish().retained_plain_bytes() > 0,
+            "visible event has selection geometry"
+        );
+    }
+
+    #[test]
     fn queued_and_notice_widgets_copy_through_logical_catalog() {
         use iced::advanced::{
             layout,
@@ -12722,7 +13035,7 @@ mod tests {
         delivery.content = ItemContent::Delivery {
             kind: chat::DeliveryKind::Notice,
             from: String::new(),
-            sender: String::new(),
+            sender: "notice-task".into(),
             summary: "Provider report".into(),
             body: "Delivered warning".into(),
         };
@@ -12730,6 +13043,7 @@ mod tests {
         sources.push(delivery);
         let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
         let delivery = runtime.snapshot.items.last().unwrap().clone();
+        runtime.expanded.insert(delivery.id.clone());
         let queued = Queued {
             source: prompt::LocalSource::new("Queued message".into()),
             presentation: prompt::LocalPresentation::default(),

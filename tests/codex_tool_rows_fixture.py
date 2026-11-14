@@ -169,6 +169,17 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(self.publish(scenario, replies[pause + 1:], generations), [])
             self.assertIsNone(scenario.child_latest)
             self.assertNotIn("answer", [item["id"] for item in scenario.latest["items"]])
+    def test_rate_limits_come_from_the_fixture_home_when_it_has_them(self):
+        import json
+        import tempfile
+        scenario = PEER["Scenario"]()
+        request = {"id": 3, "method": "account/rateLimits/read"}
+        with tempfile.TemporaryDirectory() as home:
+            [missing] = scenario.request(request, home)
+            self.assertEqual(missing["error"]["code"], -32601)
+            limits = {"rateLimits": {"credits": {"hasCredits": True, "balance": "12.5"}}}
+            Path(home, "fixture-rate-limits.json").write_text(json.dumps(limits))
+            self.assertEqual(scenario.request(request, home), [{"id": 3, "result": limits}])
 
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()

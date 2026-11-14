@@ -202,6 +202,7 @@ impl Turn {
             Some(ToolStatus::Failed) => " · failed",
             Some(ToolStatus::Denied) => " · denied",
             Some(ToolStatus::Stopped) => " · stopped",
+            Some(ToolStatus::Ended) => " · ended",
             Some(ToolStatus::Waiting) => " · waiting on background work",
             Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => "",
         }
