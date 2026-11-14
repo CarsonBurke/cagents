@@ -78,14 +78,6 @@ pub fn component_base(theme: &Theme) -> Color {
     theme.current_container().component.base.into()
 }
 
-/// The fill of a pane on COSMIC's Primary layer, such as the docked
-/// navigation pane: [`docked_primary`] and `Container::Primary`.
-///
-/// [`docked_primary`]: crate::design::docked_primary
-pub fn primary_base(theme: &Theme) -> Color {
-    theme.cosmic().primary(theme.transparent).base.into()
-}
-
 /// The fill of a `Dialog` container.
 pub fn dialog_base(theme: &Theme) -> Color {
     theme.cosmic().primary(theme.transparent).base.into()
@@ -375,6 +367,19 @@ mod tests {
             assert!(link >= 3.0, "{link}");
             let text = contrast(theme.cosmic().on_bg_color().into(), wash);
             assert!(text >= 4.5, "{text}");
+        }
+    }
+
+    /// The context panel holding the source-control and file lists is a
+    /// `Container::Background`, so lists that fade at its edges fade into
+    /// [`base`]. COSMIC's Primary layer is a different fill wherever a theme
+    /// sets its containers apart, as dark palettes such as Catppuccin do.
+    #[test]
+    fn base_is_the_fill_of_a_background_container() {
+        use cosmic::iced::widget::container::Catalog;
+        for theme in [Theme::dark(), Theme::light()] {
+            let style = theme.style(&cosmic::theme::Container::Background);
+            assert_eq!(style.background, Some(base(&theme).into()));
         }
     }
 

@@ -9078,7 +9078,7 @@ fn source_control_panel<'a>(
                 .class(cosmic::style::iced::Scrollable::Minimal)
                 .width(Length::Fill)
                 .height(Length::Fill),
-                design::primary_base,
+                design::base,
             ),
             !modal_open,
         )),
@@ -9542,7 +9542,7 @@ fn files_section<'a>(
             .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
             .height(Length::Fill),
-            design::primary_base,
+            design::base,
         ),
         if flat {
             cosmic::iced::widget::Space::new().height(0).into()
