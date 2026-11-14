@@ -119,6 +119,7 @@ fn attached_with_connection(
         handle: TerminalSurface::from(handle),
         session: hosted,
         spawned: false,
+        save_failure: None,
     };
     (started, connection.recv().unwrap())
 }

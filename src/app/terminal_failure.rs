@@ -1431,6 +1431,7 @@ mod completion_tests {
                 handle,
                 session,
                 spawned: false,
+                save_failure: None,
             }),
         }));
         assert!(!app.terminal_start_in_flight(card));
@@ -1594,6 +1595,7 @@ mod ownership_tests {
                 handle,
                 session,
                 spawned: true,
+                save_failure: None,
             }),
         }));
         assert!(app.terminal_runtime_claims(terminal));

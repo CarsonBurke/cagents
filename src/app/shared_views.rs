@@ -1021,9 +1021,18 @@ impl Cagents {
                 if let Scope::Worktree { path, .. } = scope {
                     pane.scope = Some(path.clone());
                 }
+                self.hold_unsaved_terminal_pane(scope, &mut pane);
                 Some(pane)
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn local_views_for_terminal_save_test(&self, scope: &Scope) -> Pane {
+        let direct = self.local_view_panes(scope);
+        let batched = self.local_views_in(Some(&HashSet::from([scope.clone()])));
+        assert_eq!(direct, batched.panes[scope]);
+        direct[0].clone()
     }
 
     fn local_views(&self) -> LocalViews {
@@ -1095,6 +1104,7 @@ impl Cagents {
                     if let Scope::Worktree { path, .. } = scope {
                         pane.scope = Some(path.clone());
                     }
+                    self.hold_unsaved_terminal_pane(scope, &mut pane);
                     Some(pane)
                 })
                 .collect();
@@ -3026,15 +3036,18 @@ impl Cagents {
                 tasks.push(task);
                 current.extend(saved_copy);
             }
-            match &pane.user_title {
-                Some(title) => {
-                    // A user's name takes precedence over a reported title,
-                    // which must not be published back with it.
-                    self.reported_title_save.cards.remove(&pane.id);
-                    self.chrome_ui.user_titles.insert(pane.id, title.clone());
-                }
-                None => {
-                    self.chrome_ui.user_titles.remove(&pane.id);
+            let keep_live = self.observe_terminal_save(pane);
+            if !keep_live {
+                match &pane.user_title {
+                    Some(title) => {
+                        // A user's name takes precedence over a reported title,
+                        // which must not be published back with it.
+                        self.reported_title_save.cards.remove(&pane.id);
+                        self.chrome_ui.user_titles.insert(pane.id, title.clone());
+                    }
+                    None => {
+                        self.chrome_ui.user_titles.remove(&pane.id);
+                    }
                 }
             }
             let existing = self.card_state(pane.id).cloned();
@@ -3122,7 +3135,11 @@ impl Cagents {
                             self.sidebar_state.forget_card_attention(pane.id);
                         }
                     }
-                    let mut kind = pane.kind.clone();
+                    let mut kind = if keep_live {
+                        card.kind.clone()
+                    } else {
+                        pane.kind.clone()
+                    };
                     preserve_observed_terminal_exit(observed_exit.as_ref(), &mut kind);
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
@@ -3130,15 +3147,17 @@ impl Cagents {
                     // Writing a card copies it while a save still holds it,
                     // so only a card the view changes is written.
                     let changed = self.card_state(pane.id).is_some_and(|current| {
-                        (!reported && current.title != pane.title)
-                            || current.width_fraction != pane.width_fraction
+                        (!reported && !keep_live && current.title != pane.title)
+                            || !keep_live && current.width_fraction != pane.width_fraction
                             || (!resuming && current.kind != kind)
                     });
                     if changed && let Some(current) = self.card_state_mut(pane.id) {
-                        if !reported {
+                        if !reported && !keep_live {
                             current.title = pane.title.clone();
                         }
-                        current.width_fraction = pane.width_fraction;
+                        if !keep_live {
+                            current.width_fraction = pane.width_fraction;
+                        }
                         if !resuming {
                             current.kind = kind;
                         }

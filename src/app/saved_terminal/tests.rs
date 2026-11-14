@@ -115,6 +115,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
                 handle: surface.clone(),
                 session: exact_live(&source),
                 spawned: false,
+                save_failure: None,
             })),
         );
         assert_eq!(app.terminal_starts_in_flight(), 0);

@@ -522,3 +522,10 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+`tests/fixtures/pending-terminal-save-scene.sh` exercises this refusal in a
+native before/after pair: it types into the shell while saving fails, retries
+once while the fault remains, then removes the fault and retries saving. It
+records the pending flag and the holder-owned shell's PID/start time to
+separate worker launches from the UI's interactive PATH probes. The recovered
+shot also checks keyboard focus by typing immediately after Retry save.

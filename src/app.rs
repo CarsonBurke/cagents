@@ -52,6 +52,7 @@ mod terminal_end_ui;
 mod terminal_failure;
 #[cfg(test)]
 mod terminal_output_tests;
+mod terminal_save;
 mod terminal_ui;
 mod update_ui;
 mod work_ui;
@@ -225,6 +226,7 @@ pub struct StartedTerminal {
     handle: TerminalSurface,
     session: TerminalSession,
     spawned: bool,
+    save_failure: Option<terminal_save::Failure>,
 }
 
 const TOOLBAR_FOCUS_ID: &str = "cagents-workspace-toolbar";
@@ -302,6 +304,8 @@ enum NoticeKey {
     ChatReturn(CardId),
     /// Closing this chat, which the daemon refused.
     ChatClose(CardId),
+    /// Saving the reservation for this already running terminal.
+    TerminalSave(CardId, TerminalId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4442,6 +4446,7 @@ pub enum Message {
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
+    TerminalSave(terminal_save::Action),
     SavedTerminal(saved_terminal::Action),
     TerminalStarted {
         card: CardId,
@@ -5407,6 +5412,7 @@ pub struct Cagents {
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     terminal_failure: terminal_failure::State,
+    terminal_save: terminal_save::State,
     saved_terminals: saved_terminal::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
@@ -6087,10 +6093,10 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.attaches_as_shared(card);
-        let reservation = self.pending_terminal_reservation(card);
+        let reservation = self.terminal_save_reservation(card);
         let reserved = reservation.is_some();
-        if reservation.is_some_and(
-            |pane| !matches!(&pane.kind, CardKind::Terminal(current) if current.id == session.id),
+        if reservation.as_ref().is_some_and(
+            |reservation| !matches!(&reservation.pane.kind, CardKind::Terminal(current) if current.id == session.id),
         ) {
             return cosmic::task::message(Message::TerminalStarted {
                 card,
@@ -6104,34 +6110,39 @@ impl Cagents {
                     return attach_initial_terminal(card, session, sender);
                 }
                 let mut created = false;
+                let mut save_failure = None;
                 let (recovered, mode) = if shared && (!explicit_retry || reserved) {
-                    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                    // A reserved start has nothing to find yet, and completing
-                    // it attaches to the terminal another client got to first.
-                    let mut hosted = if reserved { None } else {
-                        client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id)
+                    let socket = crate::terminal::ensure_daemon_ready()
+                        .map_err(|error| error.to_string())?;
+                    let mut client = crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())?;
+                    let hosted = if let Some(reservation) = reservation {
+                        let (hosted, failure) = terminal_save::complete(
+                            &mut client,
+                            reservation,
+                            &session,
+                            config.clone().into(),
+                        )?;
+                        save_failure = failure;
+                        created = save_failure.is_none();
+                        Some(hosted)
+                    } else {
+                        client
+                            .list()
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .find(|hosted| hosted.session.id == session.id)
                     };
-                    if reserved {
-                        for _ in 0..100 {
-                            match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
-                                Ok(terminal) => { hosted=Some(terminal);created=true;break; }
-                                Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
-                                    hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
-                                    if hosted.is_some() {break;}
-                                    std::thread::sleep(Duration::from_millis(20));
-                                }
-                                Err(error) => return Err(error.to_string()),
-                            }
-                        }
-                    }
-                    let hosted=hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
+                    let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
                     shared_terminal_attachment(hosted.session, client.proof().clone())
-                } else { recover_terminal(session, explicit_retry)? };
+                } else {
+                    recover_terminal(session, explicit_retry)?
+                };
                 tracing::debug!(target: "cagents::pane_open", stage = "recovered", ?card, shared);
-                let started = open_terminal(card, recovered, mode, config, sender, created);
+                let mut started = open_terminal(card, recovered, mode, config, sender, created)?;
+                started.save_failure = save_failure;
                 tracing::debug!(target: "cagents::pane_open", stage = "attached", ?card);
-                started
+                Ok(started)
             })
             .await
             .map_err(|error| format!("terminal worker join failed: {error}"))
@@ -6331,8 +6342,12 @@ impl Cagents {
         let mut tasks = Vec::new();
         match result {
             Ok(started) => {
+                let unsaved = started.save_failure.is_some();
+                if let Some(failure) = started.save_failure {
+                    self.record_terminal_save_failure(card, failure);
+                }
                 self.startup_terminal_attached(card);
-                if let Some(proof) = started.session.continuity.live_proof() {
+                if let Some(proof) = started.session.continuity.live_proof().filter(|_| !unsaved) {
                     // A replacement daemon cannot own the previous
                     // daemon's in-memory receipts.
                     self.pending_terminal_handoffs.retain(|_, pending| {
@@ -11067,13 +11082,15 @@ impl Cagents {
                     ),
                     Message::TerminalFind(terminal_ui::Action::DismissContext(id)),
                 );
-                if let Some(strip) = self.terminal_find_view(id) {
-                    widget::column::with_children(vec![strip, terminal])
-                        .height(Length::Fill)
-                        .into()
-                } else {
-                    terminal
+                let mut content = Vec::new();
+                if let Some(notice) = self.terminal_save_notice(id, false) {
+                    content.push(notice);
                 }
+                if let Some(strip) = self.terminal_find_view(id) {
+                    content.push(strip);
+                }
+                content.push(terminal);
+                widget::column::with_children(content).height(Length::Fill).into()
             }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
@@ -12813,6 +12830,7 @@ impl Cagents {
     /// retiring, another client removing a shared pane - so this holds for
     /// all of them in one place, after every update, rather than in each.
     fn resolve_notices_for_closed_cards(&mut self) {
+        self.prune_terminal_save_notices();
         let closed = self
             .notices
             .entries
@@ -12821,7 +12839,8 @@ impl Cagents {
                 Some(
                     key @ (NoticeKey::ChatAttach(card)
                     | NoticeKey::ChatReturn(card)
-                    | NoticeKey::ChatClose(card)),
+                    | NoticeKey::ChatClose(card)
+                    | NoticeKey::TerminalSave(card, _)),
                 ) if self
                     .card_state(*card)
                     .is_none_or(|state| !state.existence.is_open()) =>
@@ -14711,6 +14730,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            terminal_save: terminal_save::State::default(),
             saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
@@ -15188,6 +15208,7 @@ impl Application for Cagents {
         };
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
@@ -20238,6 +20259,7 @@ fn open_terminal(
         handle: surface,
         session,
         spawned,
+        save_failure: None,
     })
 }
 
@@ -26138,6 +26160,7 @@ mod tests {
                 handle: TerminalSurface::from(handle),
                 session: original.clone(),
                 spawned: false,
+                save_failure: None,
             }),
         });
         assert_eq!(
@@ -26202,6 +26225,7 @@ mod tests {
                 handle: unconnected_surface(directory.path(), recovered.id),
                 session: recovered.clone(),
                 spawned: false,
+                save_failure: None,
             }),
         ));
         let writer = app.session.as_ref().unwrap();
@@ -26539,6 +26563,7 @@ mod tests {
                 handle: unconnected_surface(directory.path(), session.id),
                 session: session.clone(),
                 spawned: false,
+                save_failure: None,
             })),
         });
         assert_eq!(app.terminal_starts_in_flight(), 0);
@@ -26580,6 +26605,7 @@ mod tests {
             handle: unconnected_surface(directory.path(), session.id),
             session: session.clone(),
             spawned: false,
+            save_failure: None,
         };
         let _ = app.update(Message::RestoredAgentAttached {
             card,
@@ -31090,6 +31116,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            terminal_save: terminal_save::State::default(),
             saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
