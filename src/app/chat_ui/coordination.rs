@@ -1374,11 +1374,12 @@ impl Runtime {
             .align_y(Alignment::Center)
             .width(Length::Fill);
         let open_tool = self.item_expanded(&item.id);
-        let source = match &item.content {
-            ItemContent::Command { .. } if open_tool => "Hide command",
-            ItemContent::Command { .. } => "Show command",
-            _ if open_tool => "Hide tool call",
-            _ => "Show tool call",
+        // The detail holds what was said and reported in full, then the
+        // command or tool call that carried it.
+        let source = if open_tool {
+            "Hide details"
+        } else {
+            "Show details"
         };
         let (target, id, copy) = (self.target, item.id.clone(), row.copy);
         let menu = move || {
