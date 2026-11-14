@@ -87,13 +87,15 @@ fn integer(value: &Value<'_>) -> Option<i64> {
 }
 
 /// The desktop's blink once at start, when it states one, then again each
-/// time it changes. Ends quietly where there is no settings portal.
+/// time it changes. Without a session bus it ends at once; with a bus but no
+/// settings portal, the read fails and no change ever arrives, so cursors keep
+/// the default.
 pub(crate) fn stream() -> impl Stream<Item = Option<Blink>> {
     cosmic::iced::stream::channel(1, async |mut output| {
         let settings = match Settings::new().await {
             Ok(settings) => settings,
             Err(error) => {
-                tracing::debug!(%error, "no settings portal; text cursors keep the default blink");
+                tracing::debug!(%error, "no session bus; text cursors keep the default blink");
                 return;
             }
         };
@@ -106,7 +108,9 @@ pub(crate) fn stream() -> impl Stream<Item = Option<Blink>> {
                     keys.apply(key, value);
                 }
             }
-            Err(error) => tracing::debug!(%error, "the settings portal did not report the blink"),
+            Err(error) => {
+                tracing::debug!(%error, "no settings portal answered; text cursors keep the default blink");
+            }
         }
         let mut sent = keys.blink();
         if sent.is_some() && output.send(sent).await.is_err() {

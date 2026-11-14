@@ -58,7 +58,9 @@ impl Blink {
     /// Records the desktop's blink for every cursor in the process, or
     /// forgets it with `None`. Cursors pick it up on their next frame; the
     /// caller is expected to redraw, so that a cursor turned steady while in
-    /// its hidden phase is drawn again.
+    /// its hidden phase is drawn again. Call it from the thread that draws:
+    /// the interval and timeout are stored separately, so a reader on another
+    /// thread could see half of a change.
     pub fn set_preferred(blink: Option<Self>) {
         let nanos = |duration: Duration| {
             u64::try_from(duration.as_nanos()).map_or(UNSET - 1, |nanos| nanos.min(UNSET - 1))
@@ -151,6 +153,8 @@ mod tests {
         }
     }
 
+    // The only test that touches the process-wide preference, so tests that
+    // run alongside it never see it set.
     #[test]
     fn the_desktop_preference_replaces_the_default_until_forgotten() {
         assert_eq!(Blink::current(), Blink::DEFAULT);
