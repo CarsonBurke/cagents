@@ -281,48 +281,63 @@ mid-turn, and `{"_end": true}` to end the turn on the frames' own result. A
 `fixture-slow-start` file holds a conversation's provider at start-up. See
 [the synthetic provider](chat-composer-fixture.md) for each.
 
-## Reasoning rows
+## Reasoning and step rows
 
 [`tests/fixtures/reasoning-row-scene.sh`](../tests/fixtures/reasoning-row-scene.sh)
-replays an offline Claude turn with reasoning interleaved with command groups,
-a finished empty block, an active empty block, and reasoning that gains a new
-last line. It captures the empty active state, opens the first thought to
-verify its full text, then collapses it and captures the updated live preview.
-The tool results are synthetic; their shell commands are not executed. The
-scene uses the offline provider fixture and contacts no live model.
+loads an offline Claude conversation into the actual native app. Its reasoning
+is interleaved with three successful commands, a mixed Read/Search/Edit/MCP
+group, a failed command and a group with an acknowledged background command.
+It includes finished empty reasoning, active empty reasoning and a live thought
+that gains a new last line. The Edit input maps to the app's Changes item;
+its patch is synthetic. None of the described commands or tools executes.
 
-Run `wide` then `narrow` in the same 1200x900 native-evidence session on
-each side:
+Run `wide`, `narrow`, then `web` in the same 1200x900 session on each side:
 
 ```sh
-export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-reasoning
-scripts/native-evidence start before --width 1200 --height 900 --limit 600
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-step-rows
+scripts/native-evidence start before --width 1200 --height 900 --limit 900 \
+    --ui-trace --codex tool-rows
 tests/fixtures/reasoning-row-scene.sh wide
 tests/fixtures/reasoning-row-scene.sh narrow
+tests/fixtures/reasoning-row-scene.sh web
 scripts/native-evidence stop
 ```
 
-`wide` prepares the conversation and captures its active empty, expanded, and
-updated live reasoning. `narrow` reuses that conversation, opens an unsent
-blank thread with Ctrl+T, focuses each pane through its native tab, and uses
-Alt+R to select one-third width preferences (three cycles on the existing chat,
-one on the new draft). They share the workspace into roughly 270px
-panes, with the inspector still docked. It captures the first conversation
-collapsed and expanded; the blank thread sends no prompt and starts no
-provider. Run `narrow` only once after `wide` in that session.
+`wide` captures empty active, expanded and updated live reasoning, followed by
+expanded mixed tools and failed/running commands. `narrow` reuses that
+conversation, adds an unsent blank thread with Ctrl+T, focuses its native tabs,
+and uses Alt+R to select one-third width preferences (three cycles on the
+hosted chat, one on the draft). The panes share the docked workspace at roughly
+270px each. It captures reasoning and the same tools/outcomes at that width.
+The blank draft sends no prompt and starts no provider.
 
-Keep the native window at 1200x900: resizing below the docked inspector's
-minimum workspace width makes the inspector an overlay that hides the
-transcript. For a remote `pair`, use these two lines in its steps file:
+`web` closes those two cards, retaining their conversations in the sidebar,
+and starts the offline Codex peer's opt-in `fixture-web-rows` mode. This sends
+a dedicated app-server `webSearch` item with two synthetic results; Claude's
+WebSearch tool uses the generic Tool representation and cannot cover this row.
+It captures the group collapsed and its nested result detail expanded at the
+same narrow width. The peer does not launch a child or publish unrelated tool
+or diff rows in this mode. Result links use `example.test`; no search is sent.
+
+Keep the native window at 1200x900: below the docked inspector's minimum
+workspace width it becomes an overlay that hides the transcript. Run each
+mode once, in order. For a remote `pair`, its steps file contains:
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" narrow
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" web
 ```
 
-The scene keeps provider settings and transcripts inside the task's private
-fixture. Stop the session afterward: its final thinking block deliberately
-stays active for 300 seconds.
+All provider settings and transcripts stay inside the task's private fixture;
+no live model, provider account or real provider home is used. Stop afterward:
+the final thought deliberately stays active for 600 seconds. The background
+command is a recorded protocol acknowledgement, not a sleeping process.
+`--ui-trace` retains UI-thread summaries and calls over 50ms. Compare these and
+bounded CPU/RSS samples during the same captures, and exercise hover/scroll
+while the latest-line delta arrives. This short fixture has one working
+conversation, a blank draft and later a second synthetic conversation; it does
+not establish performance for long histories or many concurrent agents.
 
 ## Adding a scene to evidence
 
