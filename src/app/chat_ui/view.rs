@@ -4354,6 +4354,7 @@ impl Runtime {
         let Some(mode) = &self.snapshot.fast_mode else {
             return Some(
                 widget::column::with_children(sections)
+                    .width(design::MODEL_POPUP_WIDTH)
                     .spacing(step::GAP_S)
                     .into(),
             );
@@ -4385,6 +4386,7 @@ impl Runtime {
         sections.push(control);
         Some(
             widget::column::with_children(sections)
+                .width(design::MODEL_POPUP_WIDTH)
                 .spacing(step::GAP_XS)
                 .into(),
         )
