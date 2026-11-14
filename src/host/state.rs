@@ -4128,6 +4128,38 @@ fn read_pending_terminal(
     })
 }
 
+/// Persistence-only recovery never enters spawn admission. Retirement between
+/// observation and this request cannot reinterpret a saved recipe as a launch.
+pub(super) fn retry_pending_terminal_save(
+    shared: &SharedHost,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+) -> Result<(), ProtocolError> {
+    let writer = super::workspace::writer(shared)?;
+    let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    let reservation = read_pending_terminal(shared, &registry, pane, terminal_id)?;
+    let handle = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        state.ensure_retention_available(&[terminal_id])?;
+        let record = state.terminals.get(&terminal_id).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::TerminalNotFound,
+                "This terminal is no longer hosted. Its pending save was kept.",
+                false,
+            )
+        })?;
+        if reservation.pane_is_pending() && record.pending_terminal_completion.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ViewConflict,
+                super::model::Registry::VIEW_SOURCE_CONFLICT,
+                false,
+            ));
+        }
+        record.handle.clone()
+    };
+    finish_pending_terminal(shared, &mut registry, terminal_id, &handle)
+}
+
 pub(super) fn spawn_pending_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -4943,8 +4975,8 @@ fn start_terminal_view_owned_reserved(
         }
     });
     // A save failure leaves a fully observed resident worker and its exact
-    // completion intent available to the next request. Return the refusal to
-    // the existing terminal error UI instead of acknowledging a lost save.
+    // completion intent available to the next request. Return the refusal so
+    // the UI can attach the worker and report its unresolved save separately.
     if let Some(registry) = pending_registry.as_deref_mut() {
         finish_pending_terminal(shared, registry, terminal_id, &redraw_handle)?;
     }

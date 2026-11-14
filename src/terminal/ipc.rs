@@ -242,7 +242,7 @@ use crate::{
 /// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
 /// a window watching notifications that a project's pending automation
 /// requests changed, so it reads them then rather than polling.
-pub const PROTOCOL_VERSION: u16 = 178;
+pub const PROTOCOL_VERSION: u16 = 179;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -645,6 +645,12 @@ pub enum ClientRequest {
     /// Read only the metadata needed for an ownership or identity check.
     ReadWorkspaceMetadata {
         query: crate::workspace_model::metadata::Query,
+    },
+    /// Save only a resident worker's retained automatic-start intent. This
+    /// request never allocates or replays a worker after retirement.
+    RetryPendingTerminalSave {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
     },
 }
 

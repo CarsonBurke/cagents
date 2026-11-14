@@ -429,3 +429,46 @@ fn retry_reports_pane_withdrawal_between_reservation_reads() {
             .same_worker(&original)
     );
 }
+
+#[test]
+fn retry_save_after_inventory_and_worker_retirement_cannot_launch_again() {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(&fixture.path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+    assert_eq!(
+        fixture.complete().unwrap_err().code,
+        ProtocolErrorCode::Internal
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let launches = fixture.directory.path().join("launches");
+    while fs::read_to_string(&launches).unwrap_or_default() != "started\n" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fixture.host.lock().unwrap().list(1).len(), 1);
+    db.execute_batch("DROP TRIGGER reject_pending").unwrap();
+    // Another client closes the exact worker after the UI's inventory read,
+    // while the pending pane still records its original automatic-start intent.
+    crate::host::client::process_request(
+        &fixture.host,
+        1,
+        ClientRequest::ShutdownTerminal {
+            terminal_id: fixture.session.id,
+        },
+    )
+    .unwrap();
+    assert!(fixture.host.lock().unwrap().terminals.is_empty());
+    assert!(fixture.view().panes[0].pending_terminal_start);
+    let error = crate::host::client::process_request(
+        &fixture.host,
+        1,
+        ClientRequest::RetryPendingTerminalSave {
+            pane: fixture.pane.id,
+            terminal_id: fixture.session.id,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::TerminalNotFound);
+    assert!(fixture.host.lock().unwrap().terminals.is_empty());
+    assert_eq!(fs::read_to_string(launches).unwrap(), "started\n");
+}

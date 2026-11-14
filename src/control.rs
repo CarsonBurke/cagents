@@ -1587,6 +1587,20 @@ impl ControlClient {
         Ok(terminal)
     }
 
+    pub fn retry_pending_terminal_save(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::RetryPendingTerminalSave { pane, terminal_id })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "a terminal save acknowledgement",
+                &response,
+            )),
+        }
+    }
+
     pub fn complete_pending_terminal(
         &mut self,
         pane: crate::model::CardId,

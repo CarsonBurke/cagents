@@ -52,6 +52,7 @@ struct Entry {
 #[derive(Debug, Default)]
 pub(super) struct State {
     entries: HashMap<CardId, Entry>,
+    focus_after_save: Option<(CardId, TerminalId)>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +147,6 @@ fn retry_save(
     card: CardId,
     terminal: TerminalId,
     expected: HostSessionProof,
-    options: TerminalSpawnOptions,
 ) -> Result<crate::workspace_model::WorkspaceModel, SaveError> {
     let socket = crate::terminal::ensure_daemon_ready().map_err(|e| SaveError {
         reason: "The terminal service is unavailable. Keep this terminal open and retry saving."
@@ -160,20 +160,8 @@ fn retry_save(
             diagnostics: "daemon proof changed before retry save".into(),
         });
     }
-    if !client
-        .list()
-        .map_err(SaveError::control)?
-        .iter()
-        .any(|hosted| hosted.session.id == terminal)
-    {
-        return Err(SaveError {
-            reason: "This terminal is no longer hosted. Its pending save was kept.".into(),
-            diagnostics:
-                "reserved worker absent from daemon inventory; completion was not replayed".into(),
-        });
-    }
     client
-        .complete_pending_terminal(card, terminal, options)
+        .retry_pending_terminal_save(card, terminal)
         .map_err(SaveError::control)?;
     client.read_workspace_model().map_err(SaveError::control)
 }
@@ -281,6 +269,9 @@ impl Cagents {
             && same_worker
             && matches!(&pane.kind, CardKind::Terminal(session) if session.continuity.live_proof().as_ref() == Some(&entry.failure.proof))
         {
+            if entry.retry.is_some() {
+                self.terminal_save.focus_after_save = Some((pane.id, accepted.id));
+            }
             self.resolve_terminal_save(pane.id);
             return true;
         }
@@ -288,6 +279,20 @@ impl Cagents {
         // the canonical pending source remains the publication authority.
         pane.pending_terminal_start && same_worker
             && self.card_state(pane.id).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if session.id == accepted.id))
+    }
+
+    pub(super) fn refocus_saved_terminal(&mut self) -> Task<Message> {
+        let Some((card, terminal)) = self.terminal_save.focus_after_save.take() else {
+            return Task::none();
+        };
+        if self.card_state(card).is_some_and(|state| {
+            state.existence.is_open()
+                && matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)
+        }) {
+            self.refocus_after_terminal_save(card)
+        } else {
+            Task::none()
+        }
     }
 
     pub(super) fn has_terminal_save_notices(&self) -> bool {
@@ -390,22 +395,18 @@ impl Cagents {
                     return Task::none();
                 }
                 let proof = entry.failure.proof.clone();
-                let options = self
-                    .terminal_config(self.exposure(card) == Exposure::Visible)
-                    .into();
                 let operation = uuid::Uuid::new_v4();
                 self.terminal_save.entries.get_mut(&card).unwrap().retry = Some(operation);
                 cosmic::task::future(async move {
                     let expected = proof.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        retry_save(card, terminal, expected, options)
-                    })
-                    .await
-                    .map_err(|e| SaveError {
-                        reason: "The save task could not finish. Retry saving.".into(),
-                        diagnostics: e.to_string(),
-                    })
-                    .and_then(|r| r);
+                    let result =
+                        tokio::task::spawn_blocking(move || retry_save(card, terminal, expected))
+                            .await
+                            .map_err(|e| SaveError {
+                                reason: "The save task could not finish. Retry saving.".into(),
+                                diagnostics: e.to_string(),
+                            })
+                            .and_then(|r| r);
                     Message::TerminalSave(Action::Finished {
                         card,
                         terminal,
@@ -437,8 +438,7 @@ impl Cagents {
                         let applied = self.apply_workspace_model_update(
                             workspace_model_sync::ModelUpdate::Read(model),
                         );
-                        let focus = self.refocus_after_terminal_save(card);
-                        Task::batch([applied, focus])
+                        applied
                     }
                     Err(error) => {
                         // The shell stays mounted even if the retry fails.
@@ -457,7 +457,7 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::{
-        model::{BootId, HostIncarnation, HostSessionId, ProjectChannel},
+        model::{BootId, ChannelId, HostIncarnation, HostSessionId, ProjectChannel},
         workspace_model::{ModelChannel, views::View},
     };
 
@@ -522,7 +522,7 @@ mod tests {
             retired: vec![],
         });
         app.shared_views.attached.insert(card);
-        app.shared_views.initialized.insert(scope);
+        app.initialize_terminal_save_test_scope(scope);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()
         };

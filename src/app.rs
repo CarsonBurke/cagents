@@ -18772,6 +18772,9 @@ impl Application for Cagents {
             self.report_notice(notice);
         }
         self.resolve_notices_for_closed_cards();
+        // A canonical save can arrive before the retry reply. Restore input
+        // after either path retires the focused Retry save control.
+        let task = Task::batch([task, self.refocus_saved_terminal()]);
         self.sync_notice_countdown();
         // Before `reconcile_notice_popup`, which owns the case of the notices
         // being open when their last entry goes.

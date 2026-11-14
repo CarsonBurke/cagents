@@ -1028,6 +1028,11 @@ impl Cagents {
     }
 
     #[cfg(test)]
+    pub(super) fn initialize_terminal_save_test_scope(&mut self, scope: Scope) {
+        self.shared_views.initialized.insert(scope);
+    }
+
+    #[cfg(test)]
     pub(super) fn local_views_for_terminal_save_test(&self, scope: &Scope) -> Pane {
         let direct = self.local_view_panes(scope);
         let batched = self.local_views_in(Some(&HashSet::from([scope.clone()])));
