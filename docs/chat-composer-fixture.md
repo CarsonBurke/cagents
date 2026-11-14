@@ -8,6 +8,10 @@ synthetic account. It advertises asynchronous message support, holds its first
 turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
+The permission picker can read `get_settings` both idle and during a turn:
+the fixture returns an empty effective settings object and no rule sources,
+matching its default permission setup. Reading settings keeps the turn active;
+this does not simulate editing permission rules or inherited configuration.
 
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;

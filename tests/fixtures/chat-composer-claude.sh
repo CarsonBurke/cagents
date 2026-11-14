@@ -538,6 +538,10 @@ handle_control() {
         if [ -f "$config/fixture-commands.json" ]; then
             metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
         fi
+    elif [ "$subtype" = get_settings ]; then
+        # No permission rule sources or flag overlays are configured in the
+        # default fixture. An empty success object is not a settings snapshot.
+        metadata='{"effective":{},"sources":[]}'
     elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
         metadata=$(jq -c . "$usage_file")
     elif [ "$subtype" = set_model ]; then
