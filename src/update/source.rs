@@ -637,7 +637,7 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     },
     ReleasedSource {
         protocol: 178,
-        release: "PR #2797 at e7c22de60 (protocol 178)",
+        release: "0.1.3+local.e7c22de60",
         family: ClientFamily::Current,
     },
 ];
@@ -901,7 +901,14 @@ mod admission_message_tests {
     fn live_sources_are_the_pinned_releases_and_the_current_release() {
         assert_eq!(
             protocols().collect::<Vec<_>>(),
-            [156, 173, 175, 177, crate::terminal_ipc::PROTOCOL_VERSION]
+            [
+                156,
+                173,
+                175,
+                177,
+                178,
+                crate::terminal_ipc::PROTOCOL_VERSION
+            ]
         );
         for source in RELEASED_SOURCES {
             assert!(source.protocol < crate::terminal_ipc::PROTOCOL_VERSION);
@@ -917,7 +924,7 @@ mod admission_message_tests {
             assert!(message.contains(&format!(
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
-                 protocol 177 (0.1.3+local.346722314) \
+                 protocol 177 (0.1.3+local.346722314), protocol 178 (0.1.3+local.e7c22de60) \
                  and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
