@@ -4165,21 +4165,18 @@ impl Runtime {
             } else {
                 let open = self.permission_picker;
                 let anchor = widget::button::custom(
-                    widget::row::with_children(vec![
-                        // Cut rather than wrapped where a narrow footer
-                        // leaves the leading group little room.
+                    // Faded rather than wrapped where a narrow footer leaves
+                    // the leading group little room; the chevron that says
+                    // this is a picker keeps its place either way.
+                    crate::ui_controls::trailing(
                         crate::ui_controls::FadeText::caption(
                             selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
                             }),
-                        )
-                        .into(),
-                        widget::icon(Icon::PanDown.handle())
-                            .size(design::COMPACT_ICON_SIZE)
-                            .into(),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
+                        ),
+                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        step::GAP_XS,
+                    ),
                 )
                 .name("Choose permission mode")
                 .id(card_control_id(target.card, "chat-permission-picker"))
