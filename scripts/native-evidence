@@ -400,7 +400,7 @@ restore_seed_in_place() {
     # in-place update. Lend write permission only to regular files the seed
     # needs to update; archive mode restores their exact saved permissions.
     # Neither the walk nor chmod follows fixture symlinks.
-    python3 - "$seed" "$fixture" <<'PY'
+    /usr/bin/python3 - "$seed" "$fixture" <<'PY'
 import os
 import stat
 import subprocess
