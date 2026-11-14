@@ -1786,6 +1786,9 @@ struct CachedItem {
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
+    /// The decoded preview's pixel size, kept after its pixels are released
+    /// so the preview's room is held while they are read again.
+    image_size: Option<(u32, u32)>,
     /// What the step did to work with other agents, where it did.
     coordination: Option<Box<coordination::Coordinated>>,
     /// What a plain tool call's row says it did, read from its input once
@@ -1933,6 +1936,7 @@ impl CachedItem {
             cached.image_attempt = previous.image_attempt;
             cached.image_wait = previous.image_wait.clone();
             cached.image_evicted = previous.image_evicted;
+            cached.image_size = previous.image_size;
         }
         cached
     }
@@ -2080,6 +2084,7 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_size,
         ) = previous
             .as_ref()
             .filter(|cached| cached.token == ChangeToken::of(content))
@@ -2093,6 +2098,7 @@ impl CachedItem {
                     cached.image_attempt,
                     cached.image_wait.clone(),
                     cached.image_evicted,
+                    cached.image_size,
                 )
             })
             .unwrap_or_default();
@@ -2239,6 +2245,7 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_size,
             coordination: coordination
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
                 .or(retained_coordination),

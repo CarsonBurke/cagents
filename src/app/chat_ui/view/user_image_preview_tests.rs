@@ -407,3 +407,49 @@ fn a_tall_attachment_keeps_to_the_height_cap_at_its_own_ratio() {
         "{preview:?}"
     );
 }
+
+#[test]
+fn an_attachment_read_again_keeps_its_room_until_its_pixels_return() {
+    let item = image("returning-user-image", 7);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    runtime.visible.store(true, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    let source = runtime.cache[&item.id]
+        .image_source
+        .clone()
+        .expect("a visible recent attachment is read");
+    let attempt = runtime.cache[&item.id].image_attempt;
+    images::complete(
+        &mut runtime,
+        &source,
+        attempt,
+        images::Loaded::Ready(iced::widget::image::Handle::from_rgba(
+            1200,
+            300,
+            [12, 34, 56, 255].repeat(1200 * 300),
+        )),
+    );
+    let renderer = crate::app::tests::headless_renderer();
+    let caption = |runtime: &Runtime, text: &str| {
+        click_prompt(&renderer, runtime, &item)
+            .labels
+            .into_iter()
+            .find(|(label, _)| label == text)
+            .map(|(_, bounds)| bounds)
+            .unwrap_or_else(|| panic!("{text:?} is shown"))
+    };
+    let shown = caption(&runtime, "Image 7 · Click to enlarge");
+
+    // Leaving the conversation releases the pixels; returning reads them again.
+    runtime.visible.store(false, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    runtime.visible.store(true, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    let cached = &runtime.cache[&item.id];
+    assert!(cached.image.is_none() && cached.image_source.is_some());
+    let loading = caption(&runtime, "Image 7 · Loading preview…");
+    assert_eq!(
+        loading.y, shown.y,
+        "the caption stays where the returning picture puts it"
+    );
+}

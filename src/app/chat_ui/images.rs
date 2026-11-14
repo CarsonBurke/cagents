@@ -806,7 +806,14 @@ pub(super) fn complete(
         Loaded::Ready(handle) => Some(handle),
         _ => None,
     };
+    cached.image_size = cached.image.as_ref().and_then(pixel_size);
     None
+}
+fn pixel_size(handle: &iced::widget::image::Handle) -> Option<(u32, u32)> {
+    match handle {
+        iced::widget::image::Handle::Rgba { width, height, .. } => Some((*width, *height)),
+        _ => None,
+    }
 }
 pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
     interest(runtime)
@@ -1069,6 +1076,19 @@ impl Runtime {
             _ => "Image".into(),
         };
         let Some(handle) = &cached.image else {
+            // A preview whose pixels are being read again keeps its room, so
+            // returning to the conversation doesn't shift it as they arrive.
+            let room = |note: &str| -> Element<'static, Message> {
+                let caption = design::caption(format!("{label} · {note}")).into();
+                match cached.image_size {
+                    Some((width, height)) => {
+                        widget::column::with_children(vec![preview::room(width, height), caption])
+                            .spacing(step::GAP_XS)
+                            .into()
+                    }
+                    None => caption,
+                }
+            };
             return if cached.image_unavailable {
                 design::caption(
                     cached
@@ -1078,13 +1098,13 @@ impl Runtime {
                 )
                 .into()
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                room("Waiting for preview memory…")
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                room("Loading preview…")
             } else {
                 widget::column::with_children(vec![
                     design::caption(label).into(),
