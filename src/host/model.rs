@@ -240,6 +240,10 @@ impl Registry {
                 identity,
                 agents: self.agents(None)?,
             },
+            Query::AgentLabels => Reply::AgentLabels {
+                identity,
+                labels: self.agent_labels()?,
+            },
         };
         snapshot.commit().map_err(|error| error.to_string())?;
         Ok(reply)

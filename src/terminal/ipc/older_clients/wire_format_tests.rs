@@ -59,6 +59,9 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         ClientRequest::ReadWorkspaceMetadata {
             query: crate::workspace_model::metadata::Query::Agents,
         },
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        },
         ClientRequest::ReadWorkspaceSnapshot,
         ClientRequest::ReadWorkspaceView {
             scope: scope.clone(),
@@ -94,6 +97,13 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         Reply::Agents {
             identity,
             agents: vec![],
+        },
+        Reply::AgentLabels {
+            identity,
+            labels: vec![(
+                crate::model::AgentId::new(),
+                "reviewer · Review the one-row cards".into(),
+            )],
         },
     ] {
         let mut frame = Vec::new();

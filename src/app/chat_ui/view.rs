@@ -12999,10 +12999,28 @@ mod tests {
             let mut closed = runtime.coordination_card(&item, cached, coordinated, settings, None);
             let mut tree = Tree::new(&closed);
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2000.0));
-            let size = closed
-                .as_widget_mut()
-                .layout(&mut tree, &renderer, &limits)
-                .size();
+            let node = closed.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let size = node.size();
+            let accessible = closed.as_widget().a11y_nodes(
+                iced::advanced::Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let buttons: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Open reviewer")
+                })
+                .collect();
+            assert_eq!(buttons.len(), 1, "one named icon opens this reviewer");
+            let bounds = buttons[0].node().bounds().unwrap();
+            assert!(
+                bounds.x1 - bounds.x0 < 40.0,
+                "row action keeps compact icon width"
+            );
             assert!(
                 size.width <= width && size.height < 60.0,
                 "compact spawn: {size:?}"

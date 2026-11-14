@@ -638,15 +638,9 @@ fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<
     parts.join(" · ")
 }
 
+/// A glyph at the size and tone of the step rows beside it.
 fn muted_glyph(icon: Icon) -> Element<'static, Message> {
-    widget::icon(icon.handle())
-        .size(14)
-        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-            cosmic::iced::widget::svg::Style {
-                color: Some(design::muted_icon_color(theme)),
-            }
-        })))
-        .into()
+    crate::ui_controls::passive_icon(icon.handle(), design::COMPACT_ICON_SIZE)
 }
 
 /// A card caption stays one line; the fade handles the space the pane offers.
@@ -871,12 +865,7 @@ impl Runtime {
                 .filter(|text| !text.trim().is_empty())
                 .or_else(|| (!agent.description.is_empty()).then_some(agent.description.as_str()))
         });
-        let mut title = Self::short_description(&name, 60);
-        if let Some(task) = task {
-            title.push_str(" · ");
-            let task = Self::short_description(task, 160);
-            title.push_str(task.lines().next().unwrap_or(&task));
-        }
+        let title = crate::agent_execution::agent_label(&name, task);
         let summary = widget::container(
             design::caption(Self::short_description(&title, 200))
                 .width(Length::Fill)
@@ -935,23 +924,24 @@ impl Runtime {
                 .into(),
             );
         }
-        if let Some(run) = &coordinated.reading.outcome.run
+        // Keep the same trailing room on running, successful and failed rows.
+        let open: Element<'static, Message> = if let Some(run) = &coordinated.reading.outcome.run
             && !run.agent.is_empty()
         {
-            heading.push(
-                widget::button::custom(design::caption("Open").class(cosmic::theme::Text::Custom(
-                    |theme| cosmic::iced::widget::text::Style {
-                        color: Some(design::accent_color(theme)),
-                        ..Default::default()
-                    },
-                )))
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                .name(format!("Open agent {}", run.agent))
-                .on_press(action(Action::OpenAgent(run.agent.clone())))
-                .into(),
-            );
-        }
+            let label = format!("Open {name}");
+            crate::interaction::tooltip(
+                widget::button::custom(muted_glyph(Icon::Open))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .name(label.clone())
+                    .on_press(action(Action::OpenAgent(run.agent.clone()))),
+                label,
+            )
+            .into()
+        } else {
+            widget::Space::with_width(design::COMPACT_ICON_SIZE as f32 + 2.0 * step::GAP_S).into()
+        };
+        heading.push(open);
         let mut rows = vec![
             widget::row::with_children(heading)
                 .align_y(Alignment::Center)

@@ -44,6 +44,8 @@ fn may_resend(edit: &ModelEdit, first: std::time::SystemTime, now: std::time::Sy
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
+    /// Spawn metadata arrives before the model that first exposes its agent.
+    AgentLabels(Vec<(crate::model::AgentId, String)>),
     /// The registry as it stood when the watcher connected.
     ///
     /// This is the only update that means "a connection just began", which is
@@ -167,6 +169,8 @@ fn observe_with_client(
         }
         Err(error) => return Err(error.to_string()),
     };
+    let mut labelled = HashSet::new();
+    read_new_agent_labels(client, sender, &model, &mut labelled)?;
     sender
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
@@ -193,6 +197,7 @@ fn observe_with_client(
             let model = client
                 .read_workspace_model()
                 .map_err(|error| error.to_string())?;
+            read_new_agent_labels(client, sender, &model, &mut labelled)?;
             sender
                 .send_blocking(ModelUpdate::Read(model))
                 .map_err(|error| error.to_string())?;
@@ -206,11 +211,39 @@ fn observe_with_client(
             let model = client
                 .read_workspace_model()
                 .map_err(|error| error.to_string())?;
+            read_new_agent_labels(client, sender, &model, &mut labelled)?;
             sender
                 .send_blocking(ModelUpdate::Read(model))
                 .map_err(|error| error.to_string())?;
         }
     }
+}
+
+/// Labels are immutable acceptance metadata. Read them once per new inventory,
+/// off the UI thread, rather than loading a hidden transcript or polling it.
+fn read_new_agent_labels(
+    client: &mut ControlClient,
+    sender: &async_channel::Sender<ModelUpdate>,
+    model: &WorkspaceModel,
+    labelled: &mut HashSet<crate::model::AgentId>,
+) -> Result<(), String> {
+    if model
+        .agents
+        .iter()
+        .all(|agent| labelled.contains(&agent.id))
+    {
+        return Ok(());
+    }
+    let (identity, labels) = client
+        .read_agent_labels()
+        .map_err(|error| error.to_string())?;
+    if identity != model.identity {
+        return Err("The workspace registry changed while reading agent labels".into());
+    }
+    labelled.extend(labels.iter().map(|(id, _)| *id));
+    sender
+        .send_blocking(ModelUpdate::AgentLabels(labels))
+        .map_err(|error| error.to_string())
 }
 
 /// Publishes this window's shared-model mutations.
@@ -672,6 +705,11 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::AgentLabels(labels) => {
+                self.chrome_ui.agent_labels.extend(labels);
+                let reconcile = self.reconcile_workspace_model();
+                Task::batch([reconcile, self.sync_chrome()])
+            }
             ModelUpdate::RetirementFailed { channel, error } => {
                 self.channel_ui.retiring.remove(&channel);
                 self.fail_channel_reopen(
@@ -1298,6 +1336,11 @@ impl Cagents {
             if !session.same_process(&current) {
                 return None;
             }
+            if self.chrome_ui.agent_labels.contains_key(&agent.id) {
+                self.chrome_ui
+                    .agent_title_sources
+                    .insert(card_id, session.clone());
+            }
             let saved = display.pane.as_ref()?;
             let in_place = match placement {
                 crate::agent_execution::Placement::Channel(channel) => self
@@ -1355,14 +1398,17 @@ impl Cagents {
                 CardKind::Terminal(session.clone())
             }
         };
+        let label = self.chrome_ui.agent_labels.get(&agent.id)?;
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
+            // Wait for accepted metadata rather than exposing a generic label
+            // that changes as soon as the conversation is first opened.
             title: display
                 .pane
                 .as_ref()
                 .map(|pane| pane.title.clone())
-                .unwrap_or_else(|| format!("{} agent", agent.spec.provider.label())),
+                .unwrap_or_else(|| label.clone()),
             width_fraction: if let Some(pane) = &display.pane {
                 pane.width_fraction
             } else if matches!(kind, CardKind::Chat(_)) {
@@ -1405,6 +1451,9 @@ impl Cagents {
                 }
             }
         }
+        self.chrome_ui
+            .agent_title_sources
+            .insert(card_id, session.clone());
         self.cards.insert(card_id, CardRuntime::Loading);
         self.register_presence(card_id, Exposure::Offscreen, Residency::Cold);
         // Native chats keep a lightweight attachment even offscreen, just as
@@ -2356,6 +2405,36 @@ mod tests {
                     },
                 )
                 .unwrap();
+                let labels = |peer: &mut std::os::unix::net::UnixStream, model: &WorkspaceModel| {
+                    let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::ReadWorkspaceMetadata {
+                            query: crate::workspace_model::metadata::Query::AgentLabels,
+                        }
+                    );
+                    write_frame(
+                        peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::WorkspaceMetadata(
+                                    crate::workspace_model::metadata::Reply::AgentLabels {
+                                        identity: model.identity,
+                                        labels: model
+                                            .agents
+                                            .iter()
+                                            .map(|agent| (agent.id, "reviewer · Review".into()))
+                                            .collect(),
+                                    },
+                                ),
+                            },
+                        },
+                    )
+                    .unwrap();
+                };
                 let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
                 assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
                 let mut model = WorkspaceModel {
@@ -2378,6 +2457,9 @@ mod tests {
                     },
                 )
                 .unwrap();
+                if !model.agents.is_empty() {
+                    labels(&mut peer, &model);
+                }
                 for (sequence, edit) in [(1, title), (2, ModelEdit::AgentsChanged), (3, create)] {
                     write_frame(
                         &mut peer,
@@ -2415,7 +2497,11 @@ mod tests {
                         )
                         .unwrap();
                     }
+                    if sequence == 2 && !removed {
+                        labels(&mut peer, &model);
+                    }
                 }
+                drop(labels);
                 write_frame(
                     &mut peer,
                     &ServerEnvelope {
@@ -2432,6 +2518,18 @@ mod tests {
             assert!(observe_with_client(&tx, &mut client).is_err());
             server.join().unwrap();
             let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|update| matches!(update, ModelUpdate::AgentLabels(_)))
+                    .count(),
+                1,
+                "a label read occurs once, before the new inventory is exposed"
+            );
+            let updates: Vec<_> = updates
+                .into_iter()
+                .filter(|update| !matches!(update, ModelUpdate::AgentLabels(_)))
+                .collect();
             assert_eq!(
                 updates.len(),
                 5,
@@ -2970,6 +3068,9 @@ mod tests {
         let card = CardId::from_uuid(agent.id.as_uuid());
         let channels = app.durable.channels.clone();
         let deletion = app.project_ui.begin_deleting(path.clone());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         drop(app.update(Message::ProjectUi(
             crate::app::project_ui::Action::Deleted {
@@ -2978,6 +3079,9 @@ mod tests {
                 result: Err("fixture deletion refused".into()),
             },
         )));
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_some());
         assert_eq!(app.durable.channels, channels);
         assert_eq!(app.workspace.focused(), focus);
@@ -3104,6 +3208,9 @@ mod tests {
             retired: vec![card],
         });
         assert!(app.workspace_model.views.is_empty());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Mailbox lead".into());
         app.workspace_model = model;
         drop(app.reconcile_workspace_model());
         assert!(
@@ -3291,6 +3398,9 @@ mod tests {
                 created_ms: 0,
                 closed: false,
             };
+            app.chrome_ui
+                .agent_labels
+                .insert(agent.id, "Agent task".into());
             let card = CardId::from_uuid(agent.id.as_uuid());
             let scope = Scope::Channel(target);
             let mut channels = vec![shared(active, &agent.spec.target.repository, "Active", 0)];
@@ -3339,6 +3449,9 @@ mod tests {
                         kind: CardKind::Chat(primary_session),
                         scope: Some(primary.spec.target.directory.clone()),
                     });
+                app.chrome_ui
+                    .agent_labels
+                    .insert(primary.id, "Existing primary".into());
                 model.agents.push(primary);
                 id
             });
@@ -3725,6 +3838,9 @@ mod tests {
                 .any(|candidate| candidate.id == card),
             "model refresh must not mount scheduled history or its live actor"
         );
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_some());
         assert!(
             app.chat_start_pending(card),
@@ -3749,6 +3865,9 @@ mod tests {
         assert!(
             matches!(&app.durable.cards.iter().find(|entry| entry.id == card).unwrap().kind, CardKind::Chat(actual) if actual == &session)
         );
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         Arc::make_mut(&mut app.durable)
             .cards
@@ -3762,6 +3881,9 @@ mod tests {
                 reason: Some("user closed".into()),
             },
         };
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         assert_eq!(
             app.durable
@@ -3857,7 +3979,104 @@ mod tests {
             },
         ];
         app.workspace_model.agents.push(agent.clone());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, pane.title.clone());
         (app, agent, pane, destination)
+    }
+
+    #[test]
+    fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
+        use crate::agent_execution::{HostedSession, Surface, agent_label};
+        let (mut app, mut agent, pane, destination) = managed_display_fixture();
+        let CardKind::Terminal(console) = pane.kind else {
+            unreachable!()
+        };
+        let session = crate::chat::Session {
+            id: console.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: console.launch,
+                session_id: None,
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "labels-host".into(),
+                boot_id: "labels-boot".into(),
+                host_incarnation: "labels-owner".into(),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        agent.name = Some("reviewer".into());
+        agent.spec.surface = Surface::Chat;
+        agent.session = Some(HostedSession::Chat(session.clone()));
+        agent.console = None;
+        agent.placement = crate::agent_execution::Placement::Channel(destination);
+        for channel in &mut Arc::make_mut(&mut app.durable).channels {
+            if channel.id == destination {
+                channel.title_source = crate::model::ChannelTitleSource::Prompt;
+            }
+        }
+        app.workspace_model.agents = vec![agent.clone()];
+        app.workspace_model.views.clear();
+        app.chrome_ui.agent_labels.clear();
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "unloaded agent waits for its accepted label"
+        );
+        assert!(app.card_state(pane.id).is_none());
+        let label = agent_label(
+            "reviewer",
+            Some("Review the one-row cards\nKeep details available"),
+        );
+        app.chrome_ui.agent_labels.insert(agent.id, label.clone());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert!(
+            app.chat_start_pending(pane.id),
+            "the conversation is still unloaded"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().title, label);
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.card_chrome[&pane.id].title, label,
+            "tabs, sidebar and overflow use shared chrome"
+        );
+        drop(app.focus_workspace_card(pane.id));
+        drop(app.sync_window_title());
+        assert!(
+            app.core.window.header_title.contains(&label),
+            "window title follows the same label"
+        );
+        assert!(
+            !app.apply_reported_title(pane.id, "Review the one-row cards".into()),
+            "opening may not replace spawn identity"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        app.chrome_ui
+            .user_titles
+            .insert(pane.id, "My reviewer".into());
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            "My reviewer"
+        );
+        app.chrome_ui.user_titles.remove(&pane.id);
+        let CardKind::Chat(current) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            unreachable!()
+        };
+        current.id = TerminalId::new();
+        assert!(app.apply_reported_title(pane.id, "Replacement conversation".into()));
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            "Replacement conversation"
+        );
     }
 
     #[test]
@@ -3878,6 +4097,9 @@ mod tests {
         app.workspace_model.agents = vec![agent.clone()];
         let original = app.durable.clone();
         let count = app.cards.len();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         assert!(Arc::ptr_eq(&original, &app.durable));
         assert_eq!(app.cards.len(), count);
@@ -3950,6 +4172,9 @@ mod tests {
         original_only.views.clear();
         let display =
             crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         let runtime = app.cards.remove(&pane.id).unwrap();
         app.cards.insert(pane.id, runtime);
@@ -3987,6 +4212,9 @@ mod tests {
         original_only.views.clear();
         let display =
             crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         app.shared_views.initialize(
             crate::workspace_model::views::Scope::Channel(destination),

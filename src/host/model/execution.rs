@@ -1523,6 +1523,34 @@ impl Registry {
         records.iter().map(|record| decode(record)).collect()
     }
 
+    /// Presentation identities come from each agent's first accepted task,
+    /// even when its provider has never been attached by a window. Later runs
+    /// and provider titles do not rename the original delegated task.
+    pub(crate) fn agent_labels(&self) -> Result<Vec<(AgentId, String)>, String> {
+        let mut query = self.db.prepare(
+            "SELECT a.record, (SELECT r.request FROM agent_runs r WHERE r.agent=a.id ORDER BY r.rowid LIMIT 1)
+             FROM agents a WHERE a.closed=0 ORDER BY a.rowid DESC LIMIT 1024",
+        ).map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (agent, request) = row.map_err(|error| error.to_string())?;
+            let agent: Agent = decode(&agent)?;
+            let request: Option<Submit> = request.as_deref().map(decode).transpose()?;
+            Ok((
+                agent.id,
+                crate::agent_execution::agent_label(
+                    agent.name.as_deref().unwrap_or("an agent"),
+                    request.as_ref().map(|request| request.prompt.as_str()),
+                ),
+            ))
+        })
+        .collect()
+    }
+
     /// Bind the daemon-issued descriptor once. Adoption may later replace it
     /// only after independently validating the exact prior descriptor lineage.
     pub(crate) fn bind_agent(
@@ -5829,6 +5857,46 @@ mod tests {
         assert!(registry.agents(None).unwrap().is_empty());
         request.name = Some("reviewer-2_api".into());
         assert!(registry.submit_agent(&Origin::User, &request, 2).is_ok());
+    }
+
+    #[test]
+    fn unloaded_agent_labels_use_the_first_accepted_task_and_survive_reconnect() {
+        use crate::workspace_model::metadata::{Query, Reply};
+
+        let (mut registry, directory, mut request) = fixture();
+        request.name = Some("reviewer".into());
+        request.prompt = "Review the one-row cards\nCheck the narrow layout too".into();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert!(accepted.agent.session.is_none());
+        assert!(registry.model().unwrap().views.is_empty());
+        let expected = vec![(
+            accepted.agent.id,
+            "reviewer · Review the one-row cards".into(),
+        )];
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+
+        request.name = None;
+        request.destination = Destination::Existing(accepted.agent.id);
+        request.idempotency_key = "follow-up".into();
+        request.prompt = "A later task does not rename the agent".into();
+        registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        drop(registry);
+
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+        let identity = registry.model().unwrap().identity;
+        assert_eq!(
+            registry.metadata(Query::AgentLabels).unwrap(),
+            Reply::AgentLabels {
+                identity,
+                labels: expected,
+            }
+        );
+        registry.interrupt_unproven_agent_runs(3).unwrap();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(registry.agent_labels().unwrap().is_empty());
     }
 
     #[test]

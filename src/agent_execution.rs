@@ -29,6 +29,30 @@ pub const MAX_CHILDREN: usize = 64;
 pub const MAX_PARENT_RUNNING: usize = 8;
 pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
+
+/// The identity shown for a delegated agent, before or after its conversation
+/// loads. The accepted task supplies a stable preview, independent of provider
+/// titles; individual surfaces truncate this shared label to their own width.
+pub fn agent_label(name: &str, task: Option<&str>) -> String {
+    fn preview(text: &str, limit: usize) -> Option<String> {
+        let text = crate::names::normalize_card_name(text)?;
+        let mut chars = text.chars();
+        let mut preview: String = chars.by_ref().take(limit).collect();
+        if chars.next().is_some() {
+            preview.push('…');
+        }
+        Some(preview)
+    }
+
+    let name = preview(name, 60).unwrap_or_else(|| "an agent".into());
+    let task = task
+        .and_then(|task| task.trim().lines().next())
+        .and_then(|task| preview(task, 160));
+    match task {
+        Some(task) => format!("{name} · {task}"),
+        None => name,
+    }
+}
 /// How the daemon begins refusing a follow-up run for an agent that a usage
 /// limit stops until a known reset; the CLI reports it as `agent_limited`.
 pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
@@ -740,6 +764,29 @@ pub enum ProviderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_labels_share_a_bounded_first_line_without_formatting_controls() {
+        assert_eq!(
+            agent_label(
+                "reviewer",
+                Some("Review the one-row cards\nDetailed instructions")
+            ),
+            "reviewer · Review the one-row cards"
+        );
+        assert_eq!(
+            agent_label(
+                "\u{202e}reviewer",
+                Some(" \n Review\t the\u{7} cards \nMore")
+            ),
+            "reviewer · Review the cards"
+        );
+        assert_eq!(agent_label("reviewer", None), "reviewer");
+        assert_eq!(agent_label("", Some("\u{202e}")), "an agent");
+        let label = agent_label(&"界".repeat(100), Some(&"界".repeat(300)));
+        assert_eq!(label.chars().count(), 60 + 1 + 3 + 160 + 1);
+        assert!(!label.chars().any(char::is_control));
+    }
 
     #[test]
     fn waiting_is_observable_without_settling_the_run() {

@@ -1057,6 +1057,20 @@ impl ControlClient {
         }
     }
 
+    /// Stable names for managed agents, without loading their conversations.
+    pub fn read_agent_labels(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<(crate::model::AgentId, String)>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::AgentLabels { identity, labels },
+            ) => Ok((identity, labels)),
+            response => Err(unexpected_response("agent labels", &response)),
+        }
+    }
+
     /// Commit an edit without reading or transporting unrelated model state.
     pub fn apply_workspace_edit(
         &mut self,
