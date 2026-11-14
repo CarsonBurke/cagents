@@ -1386,32 +1386,28 @@ impl Runtime {
         let (tip, name) = row.described();
         let label = row.shown.clone();
         // The preview fades out where the pane runs short, as a step row's
-        // summary does, into whatever the row is painted with; the agent
-        // keeps its tab's words, cut as the tab cuts them.
-        let painted = disclosure::Painted::on(transcript_surface);
+        // summary does, on whatever the row is painted with; the agent keeps
+        // its tab's words, cut as the tab cuts them.
         let mut line: Vec<Element<'static, Message>> = if let Some(destination) = &row.destination {
             // A destination keeps the room approved for narrow spawn rows.
-            // The identity/task preview fades and the status cuts to fit;
+            // The identity/task preview and status fade where they run short;
             // both remain whole in the row's tooltip and accessible name.
             vec![
                 lead,
-                painted.fade(
-                    chat_title(crate::agent_execution::agent_label(
-                        &row.label,
-                        Some(&row.preview),
-                    ))
-                    .size(design::TEXT_BODY),
-                ),
-                widget::container(
-                    design::caption(destination.clone())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::advanced::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        )),
-                )
-                .width(Length::Fixed(180.0))
-                .clip(true)
+                crate::ui_controls::fade_text(crate::agent_execution::agent_label(
+                    &row.label,
+                    Some(&row.preview),
+                ))
+                .size(design::TEXT_BODY)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Semibold,
+                    ..cosmic::font::default()
+                })
+                .width(Length::Fill)
                 .into(),
+                crate::ui_controls::FadeText::caption(destination.clone())
+                    .width(Length::Fixed(180.0))
+                    .into(),
             ]
         } else {
             vec![
@@ -1424,17 +1420,16 @@ impl Runtime {
                     .size(design::TEXT_BODY)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
-                painted.fade(
-                    design::body(row.preview.clone())
-                        .class(cosmic::theme::Text::Custom(design::muted_text)),
-                ),
+                crate::ui_controls::fade_text(row.preview.clone())
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .width(Length::Fill)
+                    .into(),
             ]
         };
-        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
-        let status = match row.state.tone {
-            Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
-            Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
-            Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
+        let status_class = match row.state.tone {
+            Tone::Plain => cosmic::theme::Text::Custom(design::muted_text),
+            Tone::Warning => cosmic::theme::Text::Custom(design::warning_text),
+            Tone::Error => cosmic::theme::Text::Custom(design::destructive_text),
         };
         if row.destination.is_some() {
             let mut trailing: Vec<Element<'static, Message>> = Vec::new();
@@ -1445,10 +1440,8 @@ impl Runtime {
                 ));
             }
             trailing.push(
-                status
-                    .ellipsize(iced::advanced::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
+                crate::ui_controls::fade_text(row.state.text)
+                    .class(status_class)
                     .into(),
             );
             line.push(
@@ -1468,7 +1461,12 @@ impl Runtime {
                     design::muted_color,
                 ));
             }
-            line.push(status.into());
+            line.push(
+                design::body(row.state.text)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .class(status_class)
+                    .into(),
+            );
         }
         let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
@@ -1520,7 +1518,7 @@ impl Runtime {
             .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
         let mut button = widget::button::custom(content)
             .name(name)
-            .class(painted.button_class())
+            .class(crate::ui_controls::control_style(false, None))
             .padding(padding)
             .width(Length::Fill)
             .on_press(action(pressed));
@@ -1710,7 +1708,7 @@ impl Runtime {
         let key = format!("{}#{part}", item.id);
         let open = self.part_unfolded(&key);
         let label = if open { "Show less" } else { unfold }.to_owned();
-        let toggle = disclosure::row_on(
+        let toggle = disclosure::row(
             label.clone(),
             label,
             Icon::Chat,
@@ -1718,7 +1716,6 @@ impl Runtime {
             None,
             Some(open),
             Some(Action::Unfold(self.target, key)),
-            surface,
         );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),

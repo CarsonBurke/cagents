@@ -11,6 +11,36 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// An identity-only projection issued by an authenticated retained Claude
+/// helper. This shape grants no authority: callers must authenticate its exact
+/// source lineage before updating a saved agent or pane.
+pub(super) fn retained_identity_update(
+    source: &crate::chat::Session,
+    replacement: &crate::chat::Session,
+) -> bool {
+    if source.launch.provider != crate::agent::Provider::Claude
+        || !matches!(
+            source.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        )
+        || !source.has_valid_native_continuity()
+        || !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete())
+        || !replacement
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    {
+        return false;
+    }
+    let mut projected = source.clone();
+    projected.launch.session_id = replacement.launch.session_id.clone();
+    projected == *replacement
+}
+
 /// The host proves this actor state before inspecting or retiring authority.
 #[derive(Clone, Copy)]
 pub(in crate::host) enum ResidentRelease {
@@ -1557,7 +1587,7 @@ impl Registry {
         &mut self,
         id: AgentId,
         expected: Option<&HostedSession>,
-        session: HostedSession,
+        mut session: HostedSession,
     ) -> Result<Agent, String> {
         let tx = self
             .db
@@ -1575,10 +1605,21 @@ impl Registry {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(pending) = pending
-            && !decode::<HostedSession>(&pending)?.same_process(&session)
-        {
-            return Err("The provider does not match the committed launch intent".into());
+        if let Some(pending) = pending {
+            let pending = decode::<HostedSession>(&pending)?;
+            if !pending.same_process(&session) {
+                return Err("The provider does not match the committed launch intent".into());
+            }
+            // Confirmation can commit after startup captured its reply but
+            // before this binding. Keep the authenticated pending identity;
+            // an older reply must not erase it from the agent and its pane.
+            if let (HostedSession::Chat(current), HostedSession::Chat(learned)) =
+                (&mut session, &pending)
+                && current.launch.session_id.is_none()
+                && retained_identity_update(current, learned)
+            {
+                current.launch.session_id = learned.launch.session_id.clone();
+            }
         }
         require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         agent.session = Some(session);
@@ -5547,6 +5588,35 @@ mod tests {
             accepted.run,
             "adoption never resends or settles the accepted prompt"
         );
+    }
+
+    #[test]
+    fn binding_preserves_identity_confirmed_during_pending_launch() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut initial) = source() else {
+            unreachable!()
+        };
+        initial.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let confirmed = initial.launch.session_id.take().unwrap();
+        let initial = HostedSession::Chat(initial);
+        registry
+            .reserve_agent_launch(accepted.agent.id, &initial)
+            .unwrap();
+        let mut learned = initial.clone();
+        let HostedSession::Chat(chat) = &mut learned else {
+            unreachable!()
+        };
+        chat.launch.session_id = Some(confirmed);
+        registry
+            .adopt_authenticated_agent_session(std::slice::from_ref(&initial), &learned)
+            .unwrap();
+        // The startup reply was captured before the daemon persisted confirmation.
+        let bound = registry
+            .bind_agent(accepted.agent.id, None, initial)
+            .unwrap();
+        assert_eq!(bound.session, Some(learned));
     }
 
     #[test]

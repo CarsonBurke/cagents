@@ -1,5 +1,6 @@
 # Development
 
+- [Tasks](#tasks)
 - [Prerequisites](#prerequisites)
 - [Feature boundaries](#feature-boundaries)
 - [Development runner](#development-runner)
@@ -27,9 +28,62 @@ check Cargo's exit status before selecting an executable. The module is shipped
 beside the HOST test helper in gate installations and remote slots; isolated
 Python entry points explicitly import their own companion directory.
 
-[Issue #2780](https://github.com/CarsonBurke/cagents/issues/2780) tracks adopting
-mise tasks as the supported command interface while preserving the build and
-development contracts below.
+## Tasks
+
+[mise](https://mise.jdx.dev/) tasks are the supported way to set up, run, check,
+test and package cagents. `mise tasks` lists them, and `mise run TASK --help`
+shows a task's arguments. Tasks compose the scripts in `scripts/`, which keep the
+build admission, process and verification logic; Cargo still resolves
+dependencies and compiles. Run tasks from anywhere in the checkout.
+
+| Task | What it does |
+| --- | --- |
+| `setup` | Install the pinned Zig (`mise install`) and Rust (`rust-toolchain.toml`), then run `doctor` |
+| `doctor` | Report each missing prerequisite with its fix, and whether the build host answers |
+| `dev` | Run the browserless [development UI](#development-runner) |
+| `dev:browser` | Run the development UI with the embedded browser |
+| `check:cli`, `check:host`, `check:ui` | Type-check one [lane](#feature-boundaries), all targets by default |
+| `check:browser`, `check:editor` | Type-check the integrated-browser UI client or ceditor |
+| `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
+| `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
+| `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
+| `test` | The three lane test suites, one after another |
+| `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
+| `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
+| `fmt`, `fmt:check` | Format, or check the formatting of, Cargo roots and the Rust sources behind `include!` |
+| `ci` | What GitHub CI runs: `fmt:check`, `check:protocol` and `test:scripts`; none of it compiles Rust |
+| `install` | [Install your checkout](#installing-your-checkout) |
+| `package`, `package:smoke` | Build Linux packages; exercise package upgrades in a networkless root |
+| `release:build`, `release:verify` | [Build a release](releasing.md#building-a-release) from a tag; verify a bundle without publishing |
+
+Arguments for a task go after `--`. A lane task's arguments replace its default
+target selection, so naming a target narrows the lane rather than adding to it,
+and a later `--` reaches the test harness:
+
+```sh
+mise run check:host                                  # --all-targets
+mise run check:host -- --bin cagentsd                # just the daemon
+mise run test:host -- --lib terminal::
+mise run test:ui -- --test session_restore_contract -- --exact restores_tabs
+mise run dev -- --debug --log-file /tmp/cagents-ui.log
+mise run test:lib -- ui --profile dev-runtime --prefix app::chat_ui::
+mise run test:scripts tooling
+```
+
+Always write `mise run TASK`: `mise doctor` and `mise install` are mise's own
+commands. A task exits with its command's status. `check` runs its three lanes
+at once and `test` runs them in order, stopping at the first failure; the
+aggregates `check`, `test` and `ci` take no arguments, so narrow one lane
+instead. Every compiling task
+goes through `scripts/cargo-gate`, so the [build host](#building-on-another-host)
+and its admission apply exactly as they do to the commands below. No task
+combines the `host` and `ui` features, and none is cached by mise: Cargo decides
+what is stale, and a native run is never a build artifact.
+
+The scripts remain the lower-level entry points, documented in the sections
+below, for options a task does not forward, other build profiles, and callers
+that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
+build host's slots.
 
 ## Prerequisites
 
@@ -43,13 +97,32 @@ sudo apt-get install --yes --no-install-recommends \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
   libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
   libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
-rustup toolchain install 1.93.0 --profile minimal
-rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) (or with
-`mise install`, which reads `mise.toml`) and make sure `zig` is on `PATH`. The
-terminal host uses Ghostty's native library, so daemon builds require Zig.
+Install [rustup](https://rustup.rs/); `mise run setup` below installs the Rust
+toolchain `rust-toolchain.toml` pins, which rustup then selects in the checkout.
+
+The terminal host uses Ghostty's native library, so daemon builds require Zig.
+Install [mise](https://mise.jdx.dev/getting-started.html), trust the checkout's
+`mise.toml`, and let `setup` install the pinned Zig and Rust toolchains:
+
+```sh
+mise trust
+mise run setup
+```
+
+mise reads only configuration you have trusted, and every worktree has its own
+`mise.toml`. To trust the checkout and every worktree beneath it at once, run
+`mise settings add trusted_config_paths "$PWD"` from its root instead of
+`mise trust`. Without mise, install Zig 0.15.2 from
+[ziglang.org](https://ziglang.org/download/) and put it on `PATH`.
+
+`mise run doctor` checks the toolchains, Git and Python, and where Rust
+compiles. With a remote build host, the default, it checks that the host
+answers over SSH, and this computer needs no native build libraries. With
+`CAGENTS_BUILD_REMOTE=local` it checks the build tools and the libraries above.
+It also notes optional tools: a Wayland session for `dev`, `niri-harness` for
+[parallel instances](#parallel-instances) and Bubblewrap for release builds.
 
 Ordinary debug builds automatically use the isolated development instance;
 optimized builds are production unless the Cargo `development` feature is
@@ -62,20 +135,26 @@ Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --bin cagents
+mise run check:cli -- --bin cagents
 
 # Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd
+mise run check:host -- --bin cagentsd
 
 # Browserless UI client: libcosmic, no Ghostty or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+mise run check:ui -- --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
-scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
+mise run check:browser
 
 # Standalone editor: separate package using the browserless UI graph.
-scripts/cargo-gate check --locked --package ceditor --bin ceditor
+mise run check:editor
 ```
+
+Without arguments, `check:cli`, `check:host` and `check:ui` check all targets,
+tests included, and `check` runs all three: what a change needs before review.
+Each task runs one `scripts/cargo-gate check --locked` command with its lane's
+features, `--no-default-features --features host` for the daemon for example;
+`mise.toml` defines the lanes once.
 
 Each of these commands waits in the build host's queue on its own, and on a
 busy host the wait is most of its time: on fw16 under a full queue, the CLI
@@ -136,13 +215,17 @@ process ownership, IPC and integrated browser portability remain separate work.
 
 ## Development runner
 
-Launch the native UI through `scripts/run-development`, not a direct
-`cargo run`:
+Launch the native UI with `mise run dev`, which runs `scripts/run-development`,
+not a direct `cargo run`:
 
 ```sh
-scripts/run-development --browserless   # no Servo; saved browser URLs open externally
-scripts/run-development                 # with the embedded browser
+mise run dev                            # no Servo; saved browser URLs open externally
+mise run dev:browser                    # with the embedded browser
+mise run dev -- --debug --fresh-daemon  # runner options after --
 ```
+
+The options below are the runner's; pass them after `--`, or run the script
+directly.
 
 | Option | Effect |
 | --- | --- |
@@ -163,9 +246,9 @@ scripts/run-development                 # with the embedded browser
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
-scripts/run-development --browserless --debug
-scripts/run-development --debug --fresh-daemon
-scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
+mise run dev -- --debug
+mise run dev:browser -- --debug --fresh-daemon
+mise run dev -- --debug --log-file /tmp/cagents-ui.log
 ```
 
 Use `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or
@@ -475,191 +558,99 @@ implementation alone does not establish native hotpatch acceptance.
 ### Sharing a host between several checkouts
 
 Rust compiles on the [build host](#building-on-another-host); this section
-describes how the gate admits builds on the host that compiles, whether that is
+describes how builds share the host that compiles, whether that is
 the build host itself or this one with `CAGENTS_BUILD_REMOTE=local`. When
 several agents build on one host, run Cargo through the build gate rather than
 a single global lock:
 
 ```sh
-scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
-scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+mise run check:ui -- --bin cagents-ui  # scripts/cargo-gate check --locked ... --features ui
+mise run test:host                     # scripts/cargo-gate test --locked ... --features host
 ```
 
-The gate admits several builds at once, up to one per 4 GiB of RAM after an 8
-GiB reserve, at most one per 4 CPUs and at most 4 (`CAGENTS_BUILD_SLOTS`
-overrides the count). Builds spend most of their time in a few crates that
-compile or link on one CPU, so each busies about 1.4 CPUs on average, and
-memory and CPU pressure decide how many run. On a host whose CPUs are already
-saturated, by other builds or other work, a further build slows every running
-one rather than finishing sooner, so a build starts beside others only while
-the kernel's CPU pressure (`some avg10` in `/proc/pressure/cpu`, the share of
-the last 10 seconds in which some task waited for a CPU) is below 60%
-(`CAGENTS_BUILD_CPU_PRESSURE`; `0` disables this check and the next), and not
-within 10 seconds of the newest build starting
-(`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
-host that does not report pressure is treated as having room.
+On the host that compiles, `scripts/build-host` runs each build. Memory, not
+CPU, is what several builds run out of: a compile of the `cagents` crate peaks
+at 6 to 9 GiB. So the only wait is for memory. Three quarters of the host's
+memory is set aside for builds, in shares of 4 GiB (at least two;
+`CAGENTS_BUILD_SLOTS` overrides the count). A check, or anything in the CLI
+lane, takes one share. A host or UI build takes two, as does an `exec` script
+(`CAGENTS_BUILD_SHARES` overrides either). The lane comes from the selected
+features, packages (`-p`, `--package`) and executables. A build that finds its
+shares free starts at once. Waiting builds line up behind a queue lock, and
+the one at its head takes shares as they free, so a build that needs two is
+not passed over by builds that need one. The shares are the lock files
+`/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
+the first), and builds offloaded to the host take them too.
 
-When a build starts waiting for CPU, the gate says what holds the CPUs. Once
-it has released its admission decision, it samples the host's processes for
-about a second. It reports how many CPUs the running builds use and how many
-everything else uses. It then names up to three process sessions outside the
-builds that use at least half a CPU each, and the kernel's own threads when
-they do. For each session it gives the command that started it and how long
-ago, the CPUs it uses, how many processes it has and its busiest process. If
-the session's leader has exited, it says so. Other sessions are summed. The
-message ends with how to look at the first session, `ps -s SESSION`, and to
-end it, `pkill -s SESSION`. It never offers `pkill` for a session holding
-cagents itself, such as the installed daemon that hosts every terminal and
-agent; for the session of the wait or of anything that started it, such as
-the waiting agent; or for the system's session, one started from the desktop
-or a terminal's. It says which it is instead. The process count is
-everything in the session, as `pkill -s` would end it. The message points at
-`scripts/bounded --list` when the checkout has that script. Sampling gives up
-after 10 seconds, as reading a process stuck on a hung mount can block:
+Once admitted, a build runs in its own systemd scope in
+`background-cagents.slice`, inside the user manager's `background.slice`.
+systemd gives that a `CPUWeight` of 30, below the 100 of `app.slice`, where
+agent sessions, the desktop's applications and tests run, so builds yield the
+CPU to them. The build slice's `MemoryHigh` is the three quarters of memory
+set aside for builds, so the kernel throttles builds as a whole before they
+push everything else into swap.
 
-```
-cargo-gate: builds use 6.2 CPUs and everything else 9.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 8.9 CPUs in 11 processes, most in pid 2272069 (python3 -I stress.py --workers 8); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
-```
+Every build draws from one pool of GNU make jobserver tokens, one for each
+CPU, kept in a named pipe under `/run/user/UID/cagents-jobserver`. Cargo,
+rustc's parallel code generation and C builds take a token for each job
+beyond their first. A lone build uses every CPU, and several share them
+without waiting for each other to start, so the gate sets `CARGO_BUILD_JOBS`
+to the CPU count unless the caller set it. A build's Cargo and compilers do
+not use the pool directly: `scripts/build-host` gives the build a pipe to
+take tokens from, which it keeps stocked from the pool, and another to give
+them back into, which it empties into the pool. While several builds want
+more tokens than they have, each gets an equal share; a build alone in
+wanting more gets everything the others leave. When a build ends, cancelled
+or killed included, every token taken for it returns to the pool. If
+`build-host` itself is killed outright, another build gives back what it had
+taken, from the record each keeps under `builds/`. No service runs the pool:
+the first build to find nobody using it fills it. A build that another
+`build-host` started, such as Cargo under `cargo-gate exec`, runs in that
+build's scope with its tokens.
 
-When no other session uses half a CPU, and everything else together uses
-less than one CPU, or less than a quarter of what the builds use when that is
-more, the message begins `nothing else uses much; the running builds hold
-them` instead. It begins `nothing uses much at the moment` when the builds
-use less than half a CPU, less than everything else, or, with everything
-else, less than half the host's CPUs: pressure is a ten-second average, so a
-wait can follow a burst that has already ended. When everything else uses more than that, but no
-session half a CPU, it ends `though no session outside them uses half a
-CPU`.
+Without a systemd user manager, or with `CAGENTS_BUILD_SCOPE=0`, builds wait
+for their shares the same way but run in place, each with its own Cargo jobs.
 
-A session is what one login, ssh command or terminal started. A loop that
-keeps starting short-lived commands is one session, and the time of the
-commands it has reaped counts as its own. The builds are:
-
-- the processes below a running build's holder, or below a process holding
-  a slot lock, which includes one taken by a plain `flock`. The slot locks
-  are the waiting family's, those the build registry names, and on the host
-  each `/var/tmp/cagents-*.lock` slot family with a `.queue` beside it; other
-  locks there, such as a native-evidence session's, are not builds;
-- processes whose environment marks them as a running build's:
-  `CAGENTS_BUILD_SLOT_HELD` for a gated command, `CAGENTS_OFFLOAD_SLOT` for an
-  offloaded one;
-- processes working in a leased offload slot, as its file copies do.
-
-A process in an offload slot, or with its mark, that started before the
-process holding the slot's lock is left from an earlier build, and it is
-named.
-Whatever a gated command detaches stays below the gate's command supervisor,
-which is a subreaper. A plain `flock` holder's command carries no mark, so
-whatever it detaches without the lock's descriptor is named as something else.
-An offloaded build's wait says the same about the build host, whose commands
-it says to run `there`.
-
-Each build has an expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
-script and 9 GiB for an `exec --hold` one such as the development runner's; a
-slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
-overrides it. A build starts beside others only
-when the memory available, less what the running builds are expected to take
-beyond what they already hold, covers its own, and while the kernel's memory
-pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
-stalled on reclaim) is below 10% (`CAGENTS_BUILD_MEMORY_PRESSURE`; `0` disables
-it). A lone build always starts, whatever the memory or pressure. Each build gets a
-share of the CPUs among the builds running once it starts, between 4 and 8 (the
-jobs the costs were measured with) and at most half the CPUs, as
-`CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
-`test`, `bench` and `run` only the build holds a slot, and the tests or program
-run after it is released, so do not wrap the gate in another lock. Tests and
-benchmarks run under a memory limit; see [Memory limits](#memory-limits). Rustdoc
-compiles doctests while they run, so `cargo test --doc` keeps its slot
-throughout; a plain `cargo test` compiles its doctests after the slot is
+For `test`, `bench` and `run`, only the build (`--no-run`, or `build`) holds
+the shares, so do not wrap the gate in another lock. Give `run` its `--bin`:
+its build is `cargo build` with the same options, which builds every binary
+the package has when none is named. The tests or program run after the
+shares are given back, tests and benchmarks in their own scope in
+`app-cagents-test.slice`, under a memory limit; see [Memory limits](#memory-limits).
+Rustdoc compiles doctests while they run, so `cargo test --doc` keeps its
+shares throughout, under the same memory limit; a plain `cargo test` compiles its doctests after they are
 released. The development runner builds its matched set through the gate
 itself, and skips the gate when the set is [already
 current](#up-to-date-launches).
 
-The running builds are those of the whole host, not only of one family of
-slots. Builds in the shared families, whose first lock is named
-`/var/tmp/cagents-*.lock` (such as `/var/tmp/cagents-cargo.lock` and
-`/var/tmp/cagents-fw16-cargo.lock`), and builds in the slots offloaded to the
-build host each record themselves in `/var/tmp/cagents-builds-UID`
-(`CAGENTS_BUILD_REGISTRY`; empty disables it), naming the lock they hold. Every
-family prices the others' running builds beside its own, and a build is lone
-only when nothing on the host builds. Without this each family filled the same
-memory: on fw16, three families admitted builds independently and the host
-swapped about 20 GiB each way every six minutes. A private family, such as a
-test's or a native session's own lock elsewhere (including one in a directory
-under `/var/tmp` named like a shared lock), stays out of the registry unless
-the variable names one. A record whose lock is free is stale and ignored, and
-one whose holder has exited is priced at the largest cost. Families decide one
-at a time, under the registry's `.decision` lock. A slot held by a plain
-`flock`, by a gate from before the registry or by an offload agent sent from
-such a checkout writes no record, so only its own family prices it.
-
-When room refuses a build whose own slot is free, the gate names the build
-host and reports the available memory, the memory still reserved for running
-builds, and this build's expected cost. A slot/queue message still describes a
-slot/queue wait. Memory diagnostics use the same snapshot as the admission
-decision and print after releasing its registry lock, once per memory-wait
-episode.
-
-So that no build waits forever behind smaller ones from other families that
-keep fitting, a build refused room while it holds a free slot records itself
-as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
-read on the host that admits the build; `0` disables it), the build refused
-longest on the host starts beside the running builds whatever the memory or
-pressure. Only one such build ramps up at a time: while one admitted that way
-started less than 10 minutes ago and its holder lives, the next waits. Time
-spent queued behind its own family, or waiting for one of its slots, does not
-count, and a build no longer refused for 10 seconds loses its place.
-
-Set `CAGENTS_BUILD_PRIORITY=urgent` for urgent work (`normal` is the default).
-It changes only the order among room waiters that have already passed their
-overdue age: urgent first, then refusal age and PID. It does not skip a family's
-FIFO queue, grant ordinary resource admission, reduce the overdue age or bypass
-the current overdue build's 600-second ramp. An urgent waiter that is still too
-young cannot block an eligible normal one. Offload carries the priority to the
-build host; legacy one-line waiter records count as normal. The gate does not
-infer urgency from a lock file's name.
-
-UI builds retain their 9 GiB expected cost. A warm incremental result alone
-cannot price a future command whose dependencies may have changed.
-
-The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
-command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
-one slot. Without `--close`, every process the command starts inherits the lock,
-so a test's daemon that outlives it blocks everyone until that daemon exits. Killing
-a `flock --close` frees the slot even if its command keeps running. A gated command
-started under a running `flock` on a slot runs at once in that slot; a slot that any
-other process holds is waited for. Set `CAGENTS_BUILD_SLOTS` to override the count.
+The first share is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
+command still run under `flock --close /var/tmp/cagents-cargo.lock` holds
+exactly one share. Without `--close`, every process the command starts
+inherits the lock, so a test's daemon that outlives it holds the share until
+that daemon exits. Killing a `flock --close` frees the share even if its
+command keeps running. A gated command started under a running `flock` on a
+share, or inside a gated `exec`, runs without waiting again.
 
 Admission waits are unbounded by default. To give one invocation a budget,
 set `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS` to a positive integer, for example
-`CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS=120 scripts/cargo-gate check --locked --no-default-features --bin cagents`.
-The single budget includes metadata, disk reclamation/seeding, queue, slot,
-memory and CPU waits. Expiry exits 124 after withdrawing owned waiters and cleaning
-up preflight descendants; polling and the existing cleanup grace can delay
-exit. Once a slot is admitted, the build and subsequent tests/program have no
-admission timeout. Commands already inside a held slot still run directly.
+`CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS=120 mise run check:cli -- --bin cagents`.
+The single budget includes metadata, disk reclamation and seeding, the wait for
+the build host and the wait for shares. Expiry exits 124. Once admitted, the
+build and its tests or program have no admission timeout.
 
 To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
 own, unless `exec --hold` holds one slot there for all of them. Building here,
-it holds one slot until the command exits, with or without `--hold`, and gated
-commands inside it run in that slot; gating each Cargo command instead keeps
-test runs out of the slot.
+it holds two shares until the command exits, with or without `--hold`, and
+gated commands inside it run within them; gating each Cargo command instead
+keeps test runs out of the shares.
 
-Queue and slot lock requests die with their gate, including when it is killed
-without a chance to handle a signal. Waiters retain only their lock descriptor
-and standard streams; inherited pipes and locks remain with the gate for the
-admitted command.
-
-Cancelling a held command keeps its slot until the command and its descendants
-have exited. The Linux Python 3 supervisor sends TERM, allows the command one
-shared two-second grace period, then kills and reaps remaining descendants,
-including children that created a separate session. Successful commands may leave background cache
-services running without holding a slot. The regression contract uses private
-locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
+A build's shares are held only by `scripts/build-host`, not by what it runs,
+so a daemon a build leaves behind holds none. Killing `build-host` ends its
+command too. The regression contract uses private locks and owned fixture
+processes only: `python3 tests/cargo_gate.py -v`.
 
 `scripts/lock-holders [LOCK...]` shows who holds each lock under
 `/var/tmp/cagents-*.lock*`, whether they or their descendants are using CPU, and who
@@ -688,8 +679,7 @@ at most once every two minutes and checks every new first-parent commit in
 order. Its first run checks the current tip. Each commit gets three separate
 `scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, and `--features ui`. These use the ordinary shared queue
-and the persistent sentinel worktree cache, without an urgent admission or a
-held slot between lanes.
+and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 
 After this change merges, install **one** user timer on fw16, from an updated
@@ -764,15 +754,14 @@ slot here. Commands that compile nothing, such as `metadata`, `tree` or
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as `scripts/build-ceditor-product`, builds there too,
 each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
-leases one slot there first, at the cost of a UI build, and holds it until
-COMMAND exits: each gated Cargo command in it builds in that slot, one at a
-time, with no admission of its own. It is for a script that only builds, such
-as the development runner's three: a launch waits in the host's queue once
-rather than three times. Tests run in that slot too, priced by what they hold
-while they run and as a UI build again once they end. A Cargo command run from
-another checkout, or after the hold's lease has ended, leases a slot of its
-own. Anything slow between its builds would keep the slot leased and its memory
-reserved while it ran, so leave `--hold` off for such a script. A Cargo
+leases one slot there first and holds it until COMMAND exits: each gated Cargo
+command in it builds in that slot, one at a time, taking its memory shares
+there as it builds. It is for a script that only builds, such as the
+development runner's three: a launch waits for a slot once rather than three
+times. Tests run in that slot too. A Cargo command run from another checkout,
+or after the hold's lease has ended, leases a slot of its own. Anything slow
+between its builds would keep the slot leased while it ran, so leave `--hold`
+off for such a script. A Cargo
 reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
 or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
 `scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
@@ -797,10 +786,9 @@ target directory. A further slot is made when every slot is leased, up to
 `CAGENTS_BUILD_REMOTE_SLOTS` (default 8), and only while the host's free space
 holds another 50 GiB of build output above its floor, beyond the 50 GiB each
 slot made in the last 12 hours is taken to be filling to; how many build at
-once is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS`
-is set, each build gets the host's CPUs divided among the builds leased when
-it starts, as `CARGO_BUILD_JOBS`: at least 4, and at most 8 or half the CPUs
-where that is more than 4, as builds here get. A request from the same worktree
+once is then down to the host's memory shares, as for builds started there,
+and they share its CPUs through its jobserver. `CAGENTS_BUILD_REMOTE_JOBS` sets
+a build's `CARGO_BUILD_JOBS` there. A request from the same worktree
 and directory for the same build as one building now, a command that runs
 nothing there, waits for that slot rather than build it again in another,
 outside the queue meanwhile, and then gets back in line: once it ends, little
@@ -815,27 +803,13 @@ gets the time it arrives: Cargo judges the checkout's crates, including the
 `[patch]` crates under `vendor/`, by modification time, so keeping this
 checkout's older time would leave another worktree's build of that file in
 place. A slot last leased by a gate from before this rule rebuilds its sources
-once. A slot is admitted as the gate admits builds here: beside other
-running builds, only when the host's available memory, less what those builds
-are expected to take beyond what they already hold, covers this build's
-expected peak (at least 2 GiB), while the host's memory pressure (`some
-avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
-(`/proc/pressure/cpu`) is below 40%; a lone build always starts. The running
-builds counted include those the host's own gate admits in its shared
-families, through the registry described [above](#sharing-a-host-between-several-checkouts),
-where these slots record their builds in turn. A plain
-`cargo test` runs its tests there, in the slot, which stays leased until they
-end. Cargo builds everything a test run needs before it runs any test, so the
-compile's expected peak stops applying once it only runs executables it built
-into a `deps` directory: from then on the slot is priced at the most its
-processes have held since its tests began, sampled every 2 s, and never below
-2 GiB. Builds the host admits meanwhile may take the memory the compile no
-longer reserves, while whatever the tests hold stays counted. Growth beyond
-that peak is not reserved, as the memory of tests the gate runs on this host
-is not; memory pressure then holds further builds back. Running a compiler or build
-script again, as doctests do, prices it as a build again. Without this, slots
-running only tests on fw16 reserved about 18 of its 26 GiB available, and
-queued builds waited beside idle slots. One build's
+once. The command runs there through `scripts/build-host`, which the gate
+sends with it, exactly as the gate builds [on the host that
+compiles](#sharing-a-host-between-several-checkouts): it takes its memory shares from the
+same lock files as builds started there, runs in `background-cagents.slice` with
+the shared jobserver, and runs a plain `cargo test`'s tests in the slot
+after giving its shares back, in `app-cagents-test.slice` under the memory
+limit. The slot stays leased until the tests end. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
@@ -975,8 +949,9 @@ concurrent compilation jobs**, including `cargo test` and every build in the
 runner. Cargo otherwise uses the logical CPU count, which can create
 substantial RAM pressure on high-core-count or shared machines. Override it
 with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner,
-and `-j` takes precedence for a single invocation; with several build slots,
-`scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
+and `-j` takes precedence for a single invocation. Through the gate, builds
+share the host's jobserver instead, and the gate sets `CARGO_BUILD_JOBS` to
+the CPU count unless the caller set it.
 Run the isolated feature lanes one after another, each through the gate.
 
 Give each worktree its own build directory, which the user-wide
@@ -1125,11 +1100,12 @@ infer a historical producer from timestamps. Other cached packages remain
 available, though Cargo may rebuild dependents of the selected package.
 
 ```sh
-# Reduce compilation concurrency further on a memory-constrained host.
-CARGO_BUILD_JOBS=1 scripts/run-development --browserless
-
-# Opt into more compilation jobs when system RAM is available.
-scripts/cargo-gate check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+# Cap one build's compilation jobs, as on a memory-constrained host; through
+# the gate, a build otherwise takes as many as the shared jobserver gives it.
+mise run check:ui -- -j 4 --bin cagents-ui
+# Cap every build a command runs: CAGENTS_BUILD_REMOTE_JOBS on the build host,
+# CARGO_BUILD_JOBS where Rust compiles on this host.
+CAGENTS_BUILD_REMOTE_JOBS=2 mise run dev
 ```
 
 Compilation jobs and test threads are separate controls: `-j` does not
@@ -1306,9 +1282,10 @@ empty harnesses. The host-only terminal workload example is also skipped outside
 its lane. Cover the boundaries a change touches:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --all-targets
-scripts/cargo-gate test --locked --no-default-features --features host --all-targets
-scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
+mise run test:cli     # scripts/cargo-gate test --locked --no-default-features --all-targets
+mise run test:host    # ... --features host --all-targets
+mise run test:ui      # ... --features ui --all-targets
+mise run test         # all three, in order
 ```
 
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
@@ -1388,9 +1365,9 @@ left processes behind. Same-test reexecs that call `env_clear()` must pass
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --features host --lib terminal::
-scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
-scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
+mise run test:host -- --lib terminal::
+mise run test:host -- --test terminal_load_contract
+mise run test:ui -- --test session_restore_contract
 ```
 
 For focused root library tests, compile one isolated test harness and run the
@@ -1457,10 +1434,11 @@ into shards that partition its tests. The `Script contracts` check passes only
 when every job passed. Run the same steps locally:
 
 ```sh
-python3 -I -B scripts/script-contracts verify
-python3 -I -B scripts/script-contracts plan
-python3 -I -B scripts/script-contracts run tooling
-python3 -I -B scripts/script-contracts run "native evidence" 2/3
+mise run test:scripts                       # verify, then every job unsharded
+mise run test:scripts tooling
+mise run test:scripts "native evidence" 2/3
+mise run ci                                 # with formatting and the protocol checks
+python3 -I -B scripts/script-contracts plan # the CI matrix
 ```
 
 A new `tests/` file that imports `unittest` must be added to a job, or to
@@ -1471,10 +1449,14 @@ job's shard count rather than its timeout.
 The selected IPC source contract can be checked without compiling Rust:
 
 ```sh
-scripts/check-protocol-contract
+mise run check:protocol                 # against the merge base with origin/main
+mise run check:protocol --base REF
+scripts/check-protocol-contract         # the current snapshot only
 python3 -I -B tests/protocol_contract.py -v
-scripts/check-protocol-contract --base-ref origin/main
 ```
+
+`check:protocol` also runs `scripts/check-older-clients` and
+`scripts/check-update-sources`, as CI does.
 
 It covers `ClientRequest`, `ServerMessage` and `ServerResponse` in
 `src/terminal/ipc.rs`, `Provider` in `src/agent.rs`, and `Run`, `Summary` and
@@ -1547,7 +1529,8 @@ scripts/cargo-gate test --locked --no-default-features --features host --test re
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Run `mise run fmt:check` (`scripts/check-format`) after Rust edits, or
+`mise run fmt` to rewrite the same files. The check runs `cargo fmt --check` for
 Cargo roots and directly checks `src/modules.rs` and nested Rust-source
 `include!` fragments, which rustfmt does not discover through macro expansion.
 Both stages report their diagnostics and any failure makes the command fail;
@@ -1987,7 +1970,7 @@ data. It does not signal the host daemon or install anything on the host.
 `HEAD`:
 
 ```sh
-scripts/install-local --build-host fw16
+mise run install -- --build-host fw16
 ```
 
 It builds the three matched executables with the `local` Cargo profile,
@@ -2228,7 +2211,9 @@ elsewhere before cleanup. Run the pure checks with
 
 | Symptom | What to do |
 | --- | --- |
-| `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
+| `required command not found: zig` | Run `mise run setup`, or install Zig 0.15.2 and put it on `PATH`. |
+| `Config files in .../mise.toml are not trusted` | Run `mise trust` in that worktree, or trust the whole checkout with `mise settings add trusted_config_paths PATH`. |
+| Something else is missing | `mise run doctor` names each missing prerequisite and its fix. |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
 | `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
@@ -2249,7 +2234,8 @@ mise's trust prompt and waits for an answer whenever its stderr is a terminal, e
 stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
 `scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
 for you, because trusting a checkout's configuration is your decision. Run `mise trust`
-in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+in a new worktree, and in the checkout above it if that isn't trusted either, or
+trust them all once with `trusted_config_paths` (see [Prerequisites](#prerequisites)). Taking
 the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
 such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
 only that file pins can fail at once with `No version is set for shim`.
