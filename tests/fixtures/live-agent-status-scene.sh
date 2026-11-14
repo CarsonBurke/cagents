@@ -29,6 +29,8 @@ point() {
 }
 
 # The centre of the last visible OCR text run matching an extended regex.
+# OCR can drop leading letters and split captions; use stable interior words.
+# The last match also distinguishes the Conversation tab from diagnostic prose.
 locate() {
     "$ne" drive observe 2>/dev/null | sed -nE "/$1/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p" |
         tail -1 | awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
@@ -83,7 +85,9 @@ sleep 2
 "$ne" drive wait 'Fixture: current agent status' --timeout 30
 # The selected list title is colored and can evade OCR while its preview
 # title is recognized. Focus the search field before submitting its selection.
-"$ne" drive click 'Search titles'
+search=$(locate 'titles')
+[ -n "$search" ] || { printf '%s\n' 'Could not find the native resume search field' >&2; exit 1; }
+"$ne" drive click "$search"
 "$ne" drive key Return
 "$ne" drive wait 'archived' --timeout 30
 # Keep the task focused on the transcript at both viewport widths.
@@ -120,7 +124,7 @@ else
     sleep 2
     "$ne" shot "${prefix}agent-failure-tooltip"
     "$ne" drive click "$at"
-    "$ne" drive wait 'Message main agent' --timeout 15
+    "$ne" drive wait 'main agent' --timeout 15
     shot agent-failure-selected
     "$ne" drive click 'Details'
     "$ne" drive wait 'Restore' --timeout 15
@@ -131,7 +135,9 @@ fi
 # then add two tasks sharing a generic agent name. Their descriptions must
 # distinguish the choices. The long task also exercises the narrow fade.
 if [ "${SIDE:-}" != before ]; then
-    "$ne" drive click 'Conversation'
+    conversation=$(locate 'Conversation')
+    [ -n "$conversation" ] || { printf '%s\n' 'Could not find the native Conversation tab' >&2; exit 1; }
+    "$ne" drive click "$conversation"
 fi
 "$ne" env /bin/cp "$here/live-agent-status-multiple.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
 composer=$(composer_point)
@@ -161,10 +167,10 @@ else
     "$ne" drive click "$at"
     "$ne" drive wait 'Search subagents' --timeout 15
     shot agent-multiple-chooser
-    at=$(locate 'Audit recovery after')
+    at=$(locate 'recovery after')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the recovery task in the Failed chooser' >&2; exit 1; }
     "$ne" drive click "$at"
-    "$ne" drive wait 'Message main agent' --timeout 15
+    "$ne" drive wait 'main agent' --timeout 15
     shot agent-multiple-selected
     "$ne" drive click 'Details'
     "$ne" drive wait 'Regenerate' --timeout 15
@@ -175,7 +181,9 @@ fi
 # in this turn. Its full single-failure label must fade within one line at
 # the narrow viewport instead of using an ellipsis.
 if [ "${SIDE:-}" != before ]; then
-    "$ne" drive click 'Conversation'
+    conversation=$(locate 'Conversation')
+    [ -n "$conversation" ] || { printf '%s\n' 'Could not find the native Conversation tab' >&2; exit 1; }
+    "$ne" drive click "$conversation"
 fi
 "$ne" env /bin/cp "$here/live-agent-status-long.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
 composer=$(composer_point)
