@@ -90,7 +90,7 @@ exit 83
         return result, calls
 
     def test_in_session_rejects_lifecycle_options_and_the_login_desktop(self):
-        for flags in ([], ["--keep"], ["--fresh-daemon"], ["--ttl", "60"],
+        for flags in ([], ["--keep"], ["--ttl", "60"],
                       ["--stop-instance", "review2571"]):
             with self.subTest(flags=flags):
                 result = subprocess.run(
@@ -344,6 +344,20 @@ exit 83
         self.assertIn("CAGENTS_DEVELOPMENT_INSTANCE=review2571", app_environment.read_text())
         self.assertFalse(harness_calls.exists(), "the runner started another compositor")
         self.assertTrue(log.exists())
+
+    def test_fresh_daemon_in_the_current_private_session_keeps_its_compositor(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        harness_calls = self.root / "harness-calls"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{harness_calls}"\nexit 1\n')
+        harness.chmod(0o755)
+        result, _ = self.launch("--browserless", "--instance", "review2571", "--in-session", "--fresh-daemon",
+                    XDG_RUNTIME_DIR=str(self.root / "nh-evidence"),
+                    DISPLAY="", NIRI_SOCKET="private-niri.sock", APP_ENV=str(app_environment))
+        self.assertIn("CAGENTS_DEVELOPMENT_INSTANCE=review2571", app_environment.read_text())
+        self.assertIn("Restarting the development daemon", result.stderr)
+        self.assertFalse(harness_calls.exists(), "a daemon-only restart cannot stop or replace the compositor")
 
     def test_a_launch_below_the_lock_holder_cannot_compile(self):
         guard_calls = self.fake_cargo_reports_its_guard()

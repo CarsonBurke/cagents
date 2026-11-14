@@ -1792,6 +1792,11 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **Matched daemon.** The first window uses the development runner's
+  `--fresh-daemon` so daemon and protocol changes cannot reuse an older actor.
+  Additional windows and UI-only relaunches retain that session's daemon.
+  A named private session permits this daemon-only restart with `--in-session`;
+  the runner retains its compositor and rejects session lifetime controls.
 - **A second window.** Run `open-window window-2` in the background to open
   that saved slot through the matched development runner in the same private
   session. It replays only the builds already recorded, refuses a live slot,

@@ -161,7 +161,7 @@ done
 
 if [ "$in_session" = true ]; then
     if [ -z "$instance" ] || [ "$stop_instance" = true ] || [ "$keep_instance" = true ] ||
-        [ -n "$instance_ttl" ] || [ "$fresh_daemon" = true ] || [ "$hot" = true ] ||
+        [ -n "$instance_ttl" ] || [ "$hot" = true ] ||
         [ "$list_instances" = true ] || [ "$collect_garbage" = true ]; then
         printf '%s\n' "--in-session requires --instance and cannot manage a session's lifetime" >&2
         exit 2
@@ -1203,12 +1203,18 @@ instance_cli_path() {
 # the CLI's own check does not cover, so first refuse a session whose daemon
 # hosts this process or a session it descends from.
 refuse_hosting_session() {
-    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
-    runtime=$(
-        unset XDG_RUNTIME_DIR
-        eval "$harness_env"
-        printf '%s' "${XDG_RUNTIME_DIR-}"
-    )
+    if [ "$in_session" = true ]; then
+        # This private runtime was validated above. A daemon-only restart must
+        # not discover or stop an outer compositor with a matching name.
+        runtime=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}
+    else
+        harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+        runtime=$(
+            unset XDG_RUNTIME_DIR
+            eval "$harness_env"
+            printf '%s' "${XDG_RUNTIME_DIR-}"
+        )
+    fi
     [ -n "$runtime" ] || return 0
     hosts=$(caller_host_runtimes)
     if hosts_unknown "$hosts"; then
@@ -1358,7 +1364,7 @@ fi
 if [ "$fresh_daemon" = true ]; then
     printf '%s\n' "Restarting the development daemon stops its terminal/chat jobs and all their background subagents." >&2
     run_cli daemon stop-for-rebuild --including-subagents >/dev/null
-    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
+    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development${instance:+-$instance}/cagentsd.sock
     remaining=100
     while [ -e "$socket" ]; do
         if [ "$remaining" -eq 0 ]; then
