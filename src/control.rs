@@ -8482,6 +8482,14 @@ mod tests {
         checked: bool,
         case: &str,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        public_terminal_close_exchange_source(checked, case, false)
+    }
+
+    fn public_terminal_close_exchange_source(
+        checked: bool,
+        case: &str,
+        source_checked: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
         fn reply(
             stream: &mut UnixStream,
@@ -8531,6 +8539,13 @@ mod tests {
             None,
         );
         let id = terminal.session.id;
+        let source = terminal.session.clone();
+        let basis = crate::workspace_model::views::TerminalRemovalBasis::Worker {
+            owner: pinned.clone(),
+            instance: uuid::Uuid::new_v4(),
+        };
+        let peer_source = source.clone();
+        let peer_basis = basis.clone();
         let case = case.to_owned();
         let peer_case = case.clone();
         let server = thread::spawn(move || {
@@ -8572,7 +8587,14 @@ mod tests {
             let close = request(&mut server_stream, &pinned, 3);
             assert_eq!(
                 close,
-                if checked {
+                if source_checked {
+                    ClientRequest::CloseTerminalSource {
+                        session: peer_source,
+                        basis: peer_basis,
+                        completed_only: false,
+                        allow_active: false,
+                    }
+                } else if checked {
                     ClientRequest::CloseTerminalChecked {
                         terminal_id: id,
                         allow_active: false,
@@ -8623,6 +8645,17 @@ mod tests {
                 "wrong-request" => envelope.request_id = Some(999),
                 _ => {}
             }
+            if source_checked {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    None,
+                    ServerMessage::Redraw {
+                        terminal_id: id,
+                        generation: 1,
+                    },
+                );
+            }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
             if !matches!(peer_case.as_str(), "closed" | "late-closed") {
@@ -8667,7 +8700,9 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let result = if checked {
+        let result = if source_checked {
+            client.close_terminal_source(source, basis, false, false)
+        } else if checked {
             client.close_terminal_checked(id, false)
         } else {
             client
@@ -8679,6 +8714,14 @@ mod tests {
         }
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn source_checked_terminal_close_accepts_streaming_before_its_reply() {
+        for case in ["closed", "active", "unknown", "remote-error"] {
+            let result = public_terminal_close_exchange_source(true, case, true);
+            assert_eq!(result.is_ok(), case != "remote-error", "{case}: {result:?}");
+        }
     }
 
     #[test]
