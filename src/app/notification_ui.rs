@@ -817,6 +817,9 @@ impl Cagents {
                 Task::batch([open, self.activate_main_window(None)])
             }
             Action::Snapshot(snapshot) => {
+                // Agents make automation requests, and a snapshot follows
+                // their turns ending.
+                self.automation_approval_activity();
                 self.notification_ui.snapshot_host = self.notification_ui.host.clone();
                 self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
