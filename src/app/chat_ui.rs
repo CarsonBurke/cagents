@@ -27481,17 +27481,20 @@ mod tests {
                     ],
                     selected_model: Some("staged".into()),
                     reasoning: Some("high".into()),
-                    active_model: Some(chat::ActiveModel {
-                        id: "running".into(),
-                        label: "Running".into(),
-                        reasoning: Some("low".into()),
-                        default_reasoning: Some("low".into()),
-                    }),
                     ..Snapshot::default()
                 },
             );
-            app.remember_chat_model(provider, Some("staged".into()), Some("high".into()));
             let target = chat_runtime(&app, card).target;
+            // Full snapshots preserve the separately published running model.
+            // Seed that status independently of the staged model fixture.
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).active_model =
+                Some(chat::ActiveModel {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    reasoning: Some("low".into()),
+                    default_reasoning: Some("low".into()),
+                });
+            app.remember_chat_model(provider, Some("staged".into()), Some("high".into()));
             drop(app.update(Message::ChatUi(Action::Reasoning(
                 target,
                 "staged".into(),

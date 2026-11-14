@@ -9995,6 +9995,56 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
     }
 
     #[test]
+    fn active_model_turn_default_reset_sends_null_for_the_next_accepted_turn() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"high-turn"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("high-turn"))
+            .unwrap();
+        let cleared = adapter
+            .command(Command::SetModel {
+                model: "override-model".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        assert!(cleared.events.iter().any(|event| matches!(event,
+            Event::Models { selected, reasoning: None, .. }
+                if selected.as_deref() == Some("override-model"))));
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_completed("high-turn"))
+            .unwrap();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "Use the default effort".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = sent
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(request["params"]["model"], "override-model");
+        assert_eq!(request["params"].get("effort"), Some(&Value::Null));
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        let accepted = adapter
+            .receive(json!({"id":request["id"],"result":{"turn":{"id":"default-turn"}}}))
+            .unwrap();
+        assert!(accepted.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model))
+                if model.id == "override-model" && model.reasoning.is_none())));
+        adapter
+            .receive(active_model_turn_started("default-turn"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), None);
+        assert!(adapter.reasoning.is_none());
+    }
+
+    #[test]
     fn active_model_turn_started_then_ack_does_not_guess_the_pending_selection() {
         let (mut adapter, request) = active_model_turn_fixture();
         adapter
