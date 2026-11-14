@@ -117,7 +117,6 @@ mod text_copy;
 mod thumbnails;
 mod tool_text;
 mod tool_title;
-mod trailing;
 mod turn;
 mod view;
 mod virtualized;

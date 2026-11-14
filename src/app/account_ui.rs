@@ -5555,14 +5555,7 @@ impl Cagents {
             || account.email(&state.registry).is_some()
             || state.registry.label(&account.account).is_some()
         {
-            title.push(
-                design::caption(state.display_name(account))
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .into(),
-            );
+            title.push(crate::ui_controls::FadeText::caption(state.display_name(account)).into());
         }
         let mut identity: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::provider_icon(account.account.provider))

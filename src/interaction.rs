@@ -397,17 +397,6 @@ pub fn horizontal_wheel_around_vertical<'a, Message: 'a>(
     })
 }
 
-/// Lets the enclosing native scrollable own wheel gestures over a read-only
-/// editor while preserving the editor's selection and keyboard handling.
-pub fn parent_wheel<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    Element::new(WheelInput {
-        content: content.into(),
-        route: WheelRoute::Parent,
-    })
-}
-
 /// Fade the leading/trailing edges of a horizontal strip when it can scroll.
 ///
 /// Tab rows hide their scrollbar; the fade is the usual hint that more tabs
@@ -445,22 +434,6 @@ pub fn overflow_fade_y<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-    })
-}
-
-/// Fade into the actual surface behind a strip, including an enclosing
-/// control's hover/focus paint. The surface is resolved at draw time.
-pub fn overflow_fade_x_on<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-    surface: impl Fn(&Theme) -> Color + 'a,
-) -> Element<'a, Message> {
-    Element::new(OverflowFade {
-        content: content.into(),
-        axis: Axis::Horizontal,
-        fill: Box::new(move |theme| Color {
-            a: 1.0,
-            ..surface(theme)
-        }),
     })
 }
 
@@ -1128,8 +1101,6 @@ enum WheelRoute {
     /// that moves vertically, even one already at its end; any other wheel
     /// moves the content sideways.
     AroundVertical,
-    /// The wheel skips the content for the enclosing scrollable.
-    Parent,
 }
 
 /// The wheel gesture in progress, and whether it keeps its vertical motion.
@@ -1319,11 +1290,6 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if self.route == WheelRoute::Parent
-            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
-        {
-            return;
-        }
         let gesture = tree.state.downcast_mut::<WheelGesture>();
         gesture.observe(event);
         let remapped;
