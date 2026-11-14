@@ -11679,6 +11679,84 @@ mod tests {
     }
 
     #[test]
+    fn footer_model_picker_bounds_reasoning_with_and_without_fast_mode() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Efforts {
+            ids: Vec<widget::Id>,
+            bounds: Vec<iced::Rectangle>,
+        }
+        impl Operation for Efforts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id.is_some_and(|id| self.ids.contains(id)) {
+                    self.bounds.push(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        for fast in [false, true] {
+            for width in [900.0, 1500.0] {
+                let (mut runtime, _handle) = furnished_runtime();
+                runtime.model_picker = Some(String::new());
+                Arc::make_mut(&mut runtime.snapshot).fast_mode = fast.then_some(chat::FastMode {
+                    state: chat::FastModeState::Off,
+                    disabled_reason: Some("preference".into()),
+                });
+                let mut menu = runtime.model_search(Vec::new()).expect("open model picker");
+                let mut tree = Tree::new(menu.as_widget());
+                let node = menu.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 900.0)),
+                );
+                assert_eq!(
+                    node.size().width,
+                    design::MODEL_POPUP_WIDTH,
+                    "combined model and reasoning menu at window width {width}, fast {fast}"
+                );
+                let mut efforts = Efforts {
+                    ids: (0..3)
+                        .map(|index| {
+                            card_control_id(
+                                runtime.target.card,
+                                &format!("chat-reasoning-choice-{index}"),
+                            )
+                        })
+                        .collect(),
+                    bounds: Vec::new(),
+                };
+                menu.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut efforts,
+                );
+                assert_eq!(
+                    efforts.bounds.len(),
+                    3,
+                    "all advertised effort choices remain mounted"
+                );
+                for bounds in efforts.bounds {
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= design::MODEL_POPUP_WIDTH,
+                        "effort stays inside the model menu at width {width}, fast {fast}: {bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn narrow_footer_model_picker_contains_model_and_reasoning_choices() {
         use iced::advanced::{
             clipboard,
