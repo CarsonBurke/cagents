@@ -759,7 +759,9 @@ mod tests {
         );
         let flags = socket_flags(&sender);
         let directory = File::open(".").unwrap();
-        let value = "x".repeat(1 << 20);
+        // Far more than the socket buffers, but quick to encode: the deadline
+        // must expire after the first send, not while the frame is encoded.
+        let value = "x".repeat(256 << 10);
         // Nobody reads, so a send that waited for the reader never returns.
         let (sender, directory, value, error) =
             crate::test_timing::returns("a stalled send", move || {
@@ -767,7 +769,7 @@ mod tests {
                     &sender,
                     &value,
                     &[directory.as_fd()],
-                    Instant::now() + Duration::from_millis(200),
+                    Instant::now() + Duration::from_secs(2),
                     2 << 20,
                     1,
                     FrameByteOrder::BigEndian,
