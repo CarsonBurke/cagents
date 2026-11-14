@@ -291,7 +291,8 @@ long_history_turn() {
 # with "_history": true is only recorded, as Claude records a queued
 # notification. A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
-# {"_sleep": SECONDS} pauses, so a running state can be observed. A line
+# {"_sleep": SECONDS} pauses while still servicing controls; interruption or
+# input EOF discards the remaining replay. A line
 # {"_end": true} ends the turn there: the frames supply its closing result,
 # such as a failed one, and the fixture adds no answer of its own. A line
 # {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
@@ -303,16 +304,28 @@ frames_ended=0
 frames_turn() {
     frames_ended=0
     frame_line=0
+    busy=true
     while IFS= read -r spec; do
         frame_line=$((frame_line + 1))
         [ -n "$spec" ] || continue
         delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
         if [ -n "$delay" ]; then
-            sleep "$delay"
+            if ! [[ $delay =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+                printf '%s\n' "fixture: line $frame_line of $frames_file: _sleep must hold nonnegative seconds, not $delay" >&2
+                exit 2
+            fi
+            delay_us=$(seconds_microseconds "$delay")
+            # Keep the input owner alive during a replay pause, just as while
+            # streaming answer deltas. EOF cancels this optional replay.
+            if ! wait_stream_input "$delay_us" cancel; then
+                frames_ended=1
+                return
+            fi
             continue
         fi
         if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
             frames_ended=1
+            busy=false
             return
         fi
         status=$(printf '%s' "$spec" | jq -r '._exit // empty')
@@ -409,12 +422,14 @@ if ! [[ $stream_chunk =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 # Bash's read timeout and clock share microsecond precision.
-stream_seconds=${stream_delay%%.*}
-stream_fraction=${stream_delay#*.}
-if [[ $stream_delay != *.* ]]; then stream_fraction=; fi
-stream_fraction=${stream_fraction}000000
-stream_fraction=${stream_fraction:0:6}
-stream_delay_us=$((10#${stream_seconds:-0} * 1000000 + 10#$stream_fraction))
+seconds_microseconds() {
+    local seconds=${1%%.*} fraction=${1#*.}
+    if [[ $1 != *.* ]]; then fraction=; fi
+    fraction=${fraction}000000
+    fraction=${fraction:0:6}
+    printf '%s\n' "$((10#${seconds:-0} * 1000000 + 10#$fraction))"
+}
+stream_delay_us=$(seconds_microseconds "$stream_delay")
 
 # Optional slow start: while fixture-slow-start exists, a conversation's
 # provider waits before it reads anything, as a cold start does: the file's
@@ -569,11 +584,12 @@ queue_user() {
         '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
 }
 
-# Incoming controls do not restart the inter-delta delay. stdout and transcript
+# Incoming controls do not restart the emission deadline. stdout and transcript
 # writes stay in this shell, so interruption cannot race a background writer.
 wait_stream_input() {
     local now=${EPOCHREALTIME/./} deadline remaining timeout kind
-    deadline=$((now + stream_delay_us))
+    local delay_us=${1:-$stream_delay_us} eof_mode=${2:-finish}
+    deadline=$((now + delay_us))
     while :; do
         now=${EPOCHREALTIME/./}
         remaining=$((deadline - now))
@@ -586,6 +602,7 @@ wait_stream_input() {
             printf -v timeout '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
         fi
         if [ "$input_eof" = true ]; then
+            if [ "$eof_mode" = cancel ]; then busy=false; return 1; fi
             sleep "$timeout"
             break
         fi
@@ -596,6 +613,10 @@ wait_stream_input() {
                 user) queue_user "$frame" ;;
             esac
             if [ "$busy" = false ]; then return 1; fi
+        fi
+        if [ "$input_eof" = true ] && [ "$eof_mode" = cancel ]; then
+            busy=false
+            return 1
         fi
         # A steady flow of controls must not starve the next delta.
         if [ "$remaining" -le 0 ]; then break; fi
