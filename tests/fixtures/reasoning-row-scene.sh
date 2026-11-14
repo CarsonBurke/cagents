@@ -299,7 +299,13 @@ if [ "$scene" = activity ]; then
     sleep 4
     scroll_top
     shot activity-working
-    evidence drive wait 'receipt arrived' --timeout 60 >/dev/null
+    finished=false
+    for _ in $(seq 60); do
+        if rg -q '"uuid":"activity-answer-1"' "$config/projects"; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || { printf '%s\n' 'reasoning-row-scene: the turn did not finish' >&2; exit 1; }
+    sleep 3
     scroll_top
     shot activity-finished
     printf '%s\n' 'Captured a working turn and the same turn finished.'
