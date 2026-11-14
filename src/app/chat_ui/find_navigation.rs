@@ -1280,10 +1280,15 @@ fn raw_scan_inner(
                 _ => false,
             };
             if matched || !parts.is_empty() {
+                let spawn_detail = coordinated.as_ref().is_some_and(|reading| {
+                    reading.cli
+                        && matches!(reading.kind, chat::coordination::Kind::Spawn(_))
+                        && !parts.is_empty()
+                });
                 plans.push(ItemPlan {
                     id: item.id.clone(),
                     source: Arc::downgrade(item),
-                    expand: (raw_disclosure && matched) || delivery,
+                    expand: (raw_disclosure && matched) || delivery || spawn_detail,
                     parts,
                 });
             }
@@ -2555,6 +2560,43 @@ mod tests {
         assert_eq!(observed.recv().unwrap(), (worker, 0));
         assert_eq!(semaphore.available_permits(), 1);
     }
+    #[test]
+    fn find_opens_the_compact_cli_spawn_before_revealing_its_prompt() {
+        let item = Arc::new(chat::Item {
+            id: "spawn".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "cagents agent spawn --name reviewer 'Review NEEDLE carefully'".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: "Accepted agent 1a2b3c4d run 5e6f7a8b".into(),
+            },
+            at: None,
+            started_at: None,
+        });
+        let input = RawInput {
+            query: "NEEDLE".into(),
+            provider: Provider::Claude,
+            labels: Arc::default(),
+            metadata: metadata_capacity(),
+            groups: vec![(
+                "group".into(),
+                vec![RawItem {
+                    item,
+                    raw_disclosure: true,
+                    tools: Vec::new(),
+                }],
+            )],
+        };
+        let (groups, _, _, _) = raw_scan(&input, "NEEDLE", &|| true).unwrap();
+        assert!(groups[0].1[0].expand);
+        assert_eq!(groups[0].1[0].parts, vec!["spawn#prompt-0"]);
+    }
+
     #[test]
     fn raw_plan_discovers_unquoted_parts_and_exact_prepared_readers_in_order() {
         let query = "say \"NEEDLE λ\"";

@@ -2099,7 +2099,9 @@ impl Runtime {
                 builder.markdown(&item.id, &[0], cached.markdown.items());
             }
         }
-        if let Some(coordinated) = &cached.coordination {
+        if let Some(coordinated) = &cached.coordination
+            && (!coordinated.is_spawn_step() || self.item_expanded(&item.id))
+        {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
@@ -12877,6 +12879,83 @@ mod tests {
         ] {
             assert!(!delivery_command_failed(heading), "{heading}");
         }
+    }
+
+    #[test]
+    fn cli_spawn_step_stays_one_row_and_discloses_its_launch_at_narrow_width() {
+        use iced::advanced::{layout, widget::Tree};
+        let item = chat::Item {
+            id: "spawn-reviewer".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: format!(
+                    "cagents agent spawn --name reviewer '{}'",
+                    "Review the build carefully. ".repeat(30)
+                ),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(20),
+                output: format!(
+                    "Accepted agent 1a2b3c4d run 5e6f7a8b\nIn channel \"casmi review\" ({})",
+                    crate::model::ChannelId::new()
+                ),
+            },
+            started_at: None,
+            at: None,
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let renderer = crate::app::tests::headless_renderer();
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Card, false);
+        assert_eq!(catalog.finish().retained_plain_bytes(), 0);
+        for width in [280.0, 900.0] {
+            let cached = &runtime.cache[&item.id];
+            let coordinated = cached
+                .coordination
+                .as_deref()
+                .expect("recognized CLI spawn");
+            let mut closed = runtime.coordination_card(&item, cached, coordinated, settings, None);
+            let mut tree = Tree::new(&closed);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2000.0));
+            let size = closed
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits)
+                .size();
+            assert!(
+                size.width <= width && size.height < 60.0,
+                "compact spawn: {size:?}"
+            );
+        }
+        runtime.expanded.insert(item.id.clone());
+        let mut catalog = selection::Catalog::builder();
+        runtime.selection_item(&mut catalog, &item, turn::Slot::Card, true);
+        assert!(catalog.finish().retained_plain_bytes() > 0);
+        let cached = &runtime.cache[&item.id];
+        let mut open = runtime.coordination_card(
+            &item,
+            cached,
+            cached.coordination.as_deref().unwrap(),
+            settings,
+            Some(runtime.step_detail(&item, cached, settings)),
+        );
+        let mut tree = Tree::new(&open);
+        let size = open
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 4000.0)),
+            )
+            .size();
+        assert!(size.height > 60.0, "expanded launch details: {size:?}");
+        assert!(
+            size.width <= 280.0,
+            "expanded launch fits the pane: {size:?}"
+        );
     }
 
     #[test]
