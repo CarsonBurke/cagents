@@ -26900,9 +26900,22 @@ mod tests {
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
             let terminal = app.workspace.focused().unwrap();
-            // A shell that already ended: its close needs no daemon.
+            // A shell that already ended. The reducer receives the daemon's
+            // positive absence receipt below, without starting a real worker.
             app.cards
                 .insert(terminal, CardRuntime::Failed("fixture".into()));
+            let CardKind::Terminal(session) = &mut app.card_state_mut(terminal).unwrap().kind
+            else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+            let terminal_source = session.clone();
             let channel = crate::model::ChannelId::new();
             let project = ProjectId::new();
             let repository = PathBuf::from(FIXTURE_DIRECTORY);
@@ -26990,6 +27003,23 @@ mod tests {
                     close_chat(&mut app, card);
                 } else {
                     let _ = app.update(Message::CloseCard(card));
+                    let _ = app.update(Message::CompletedTerminalClosed {
+                        card,
+                        session: terminal_source.clone(),
+                        result: Ok(
+                            super::super::terminal_close::CompletedCloseOutcome::ClosedWithBasis(
+                                crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                                    owner: HostSessionProof {
+                                        host_session_id: "fixture-host".into(),
+                                        boot_id: "fixture-boot".into(),
+                                        host_incarnation: "fixture-incarnation".into(),
+                                    },
+                                    latest_worker: None,
+                                    history_epoch: 0,
+                                },
+                            ),
+                        ),
+                    });
                     let _ = app.update(Message::CommitClose(card));
                     assert!(!app.workspace.order().any(|id| id == card));
                 }
