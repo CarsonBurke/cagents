@@ -25,7 +25,7 @@ open_point() {
 width=int(sys.argv[1]); right=260+(width-270)//2; found=[]
 for line in sys.stdin:
  m=re.search(r"\[t\d+\]\s+(\d+),\s+(\d+)\s+(\d+)x(\d+)",line)
- if m and 296<=int(m[1])<=325 and 120<int(m[2])<700 and any(name in line.lower() for name in ("reviewer", "casm")) and "cagents" not in line.lower():
+ if m and 270<=int(m[1])<right-35 and 120<int(m[2])<700 and any(name in line.lower() for name in ("reviewer", "casm")) and "cagents" not in line.lower():
   found.append(tuple(map(int,m.groups())))
 assert found, "missing reviewer spawn row"
 x,y,w,h=max(found,key=lambda row:row[1]); print(f"{right-26},{y+h//2}")' "${SCENE_WIDTH:-1500}"

@@ -1135,13 +1135,14 @@ impl Cagents {
             widget::container(
                 widget::column::with_children(vec![
                     input.into(),
-                    widget::container(
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]),
                         )
                         .id(widget::Id::new("palette.commands"))
                         .height(Length::Shrink),
-                    )
+                        design::component_base,
+                    ))
                     .max_height(360)
                     .into(),
                     design::caption("↑ ↓ choose · Enter run · Escape close").into(),
