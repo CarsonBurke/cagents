@@ -558,6 +558,7 @@ impl Cagents {
                 _ => Task::none(),
             };
         }
+        self.materialize_replica_snapshot();
         self.snapshot_workspace_scope();
         let left = self
             .durable
@@ -739,8 +740,7 @@ impl Cagents {
         for (id, owner) in attention {
             self.sidebar_state.reattribute_card_attention(id, owner);
         }
-        self.sidebar_state
-            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        self.refresh_attention_projection();
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
@@ -958,6 +958,7 @@ impl Cagents {
             }
         }
         drop(roots);
+        self.materialize_replica_snapshot();
         if was_channel {
             self.snapshot_workspace_scope();
         }

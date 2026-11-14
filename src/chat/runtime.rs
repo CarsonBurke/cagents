@@ -5846,7 +5846,7 @@ mod tests {
         let mut state = Snapshot::default();
         let subagent = |id: &str, description: &str, status| super::super::Subagent {
             id: id.into(),
-            kind: "general-purpose".into(),
+            kind: description.into(),
             description: description.into(),
             status,
             model: None,
@@ -5935,7 +5935,7 @@ mod tests {
                                     waiting: None,
                                     detail: None,
                                     id: format!("late-background-{index}"),
-                                    kind: "Explore".into(),
+                                    kind: "Started after the caller observed idle".into(),
                                     description: "Started after the caller observed idle".into(),
                                     status: Some(ToolStatus::Running),
                                     background: Some(true),
@@ -8416,8 +8416,11 @@ mod tests {
         (directory, handle)
     }
 
-    fn finish_initialization_pipe(handle: &LocalHandle, timeout: Duration) -> Snapshot {
-        let deadline = Instant::now() + timeout;
+    /// Wait for the fixture's initialization to end, however it ends. The
+    /// error says which deadline or failure ended it, so how long it took is
+    /// not part of any assertion.
+    fn finish_initialization_pipe(handle: &LocalHandle) -> Snapshot {
+        let deadline = Instant::now() + IO_TIMEOUT + crate::test_timing::EVENTUALLY;
         while !handle.is_completed() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -8436,7 +8439,7 @@ mod tests {
              print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
              sys.stdin.read()\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         assert!(!snapshot.ready);
         assert!(
             snapshot.error.as_deref().is_some_and(|error| error
@@ -8456,7 +8459,7 @@ mod tests {
                     advisory = if advisory { "True" } else { "False" },
                 );
                 let (_directory, handle) = claude_initialization_pipe(&body);
-                let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+                let snapshot = finish_initialization_pipe(&handle);
                 assert!(!snapshot.ready);
                 assert!(
                     snapshot.error.as_deref().is_some_and(
@@ -8472,7 +8475,7 @@ mod tests {
              for _ in range(7):\n    print('wrapper diagnostic', flush=True)\n\
              print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         assert!(snapshot.error.is_none(), "{snapshot:?}");
         assert!(handle.failure().is_none());
 
@@ -8742,7 +8745,9 @@ for line in sys.stdin:
              print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
              sys.stdin.read()\n",
         );
-        let deadline = Instant::now() + Duration::from_secs(50);
+        // The fixture alone takes 40 seconds; a deadline it failed to renew
+        // ends the loop early with an error.
+        let deadline = Instant::now() + Duration::from_secs(40) + crate::test_timing::EVENTUALLY;
         let snapshot = loop {
             let snapshot = handle.snapshot(None).unwrap();
             if snapshot.ready || snapshot.error.is_some() || Instant::now() > deadline {
@@ -8756,14 +8761,13 @@ for line in sys.stdin:
 
     #[test]
     fn claude_garbage_only_startup_still_fails_at_the_first_deadline_with_its_preview() {
-        let started = Instant::now();
+        // Wrapper output never stops, so a deadline that it renewed would
+        // never expire.
         let (_directory, handle) = claude_initialization_pipe(
             "import time\n\
-             for _ in range(5):\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n\
-             print('wrapper diagnostic', flush=True)\n\
-             sys.stdin.read()\n",
+             while True:\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         let error = snapshot.error.as_deref().unwrap();
         assert!(
             error.contains("timed out without a JSON protocol frame"),
@@ -8773,7 +8777,6 @@ for line in sys.stdin:
             error.contains("Last ignored output: wrapper diagnostic"),
             "{error}"
         );
-        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(5));
     }
 
     #[test]
@@ -8793,7 +8796,7 @@ for line in sys.stdin:
             ),
         ] {
             let (_directory, handle) = claude_initialization_pipe(body);
-            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let snapshot = finish_initialization_pipe(&handle);
             let error = snapshot.error.as_deref().unwrap();
             assert!(error.contains(expected), "{error}");
             assert!(
@@ -8809,18 +8812,17 @@ for line in sys.stdin:
             "'wrapper diag' + json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False})",
             "json.dumps({'type': 'control_request', 'request_id': 'r', 'request': {}}) + ' wrapper tail'",
         ] {
-            let started = Instant::now();
             let (_directory, handle) = claude_initialization_pipe(&format!(
                 "print({line}, flush=True)\nsys.stdin.read()\n"
             ));
-            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let snapshot = finish_initialization_pipe(&handle);
             let error = snapshot.error.as_deref().unwrap();
             assert!(
                 error.contains("inside one of its conversation messages"),
                 "{error}"
             );
+            // Waiting out the deadline instead would report a timeout.
             assert!(error.contains("type"), "{error}");
-            assert!(started.elapsed() < Duration::from_secs(5));
         }
     }
 
@@ -9575,28 +9577,22 @@ for line in sys.stdin:
             stdout.read_line(&mut line).unwrap();
             pids.push(line.trim().parse::<u32>().unwrap());
         }
-        let is_shell =
-            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
-        let find = |wanted: &dyn Fn(u32) -> bool| {
-            *pids
+        // A shell prints a command's PID when it forks it, and a fork runs as
+        // `sh` until it execs, so wait for both sleeps to have started.
+        let command = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        let (alone, shell, inner) = crate::test_timing::wait_for("the command tree", || {
+            let find = |wanted: &dyn Fn(u32) -> bool| pids.iter().copied().find(|pid| wanted(*pid));
+            let alone = find(&|pid| parent(pid) == root && command(pid) == "sleep\n")?;
+            let shell = find(&|pid| pid != alone && parent(pid) == root)?;
+            let inner = find(&|pid| parent(pid) == shell && command(pid) == "sleep\n")?;
+            Some((alone, shell, inner))
+        });
+        assert_eq!(command(shell), "sh\n");
+        crate::test_timing::eventually("commands leaving the provider's cgroup", || {
+            [alone, shell, inner]
                 .iter()
-                .find(|pid| wanted(**pid))
-                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
-        };
-        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
-        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
-        let inner = find(&|pid| parent(pid) == shell);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while [alone, shell, inner]
-            .iter()
-            .any(|pid| cgroup(*pid) == provider_leaf)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "commands stayed in the provider's cgroup"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .all(|pid| cgroup(*pid) != provider_leaf)
+        });
         let alone_leaf = cgroup(alone);
         let shell_leaf = cgroup(shell);
         for leaf in [&alone_leaf, &shell_leaf] {
@@ -9612,18 +9608,9 @@ for line in sys.stdin:
         assert_eq!(cgroup(root), provider_leaf, "the provider stays alone");
 
         mark_and_kill(&alone_leaf);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stops = loop {
-            let stops = scope.take_command_stops();
-            if !stops.is_empty() {
-                break stops;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the stopped command was never reported"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let stops = crate::test_timing::wait_for("the stopped command's report", || {
+            Some(scope.take_command_stops()).filter(|stops| !stops.is_empty())
+        });
         assert_eq!(
             stops,
             vec![crate::daemon::process_scope::CommandStop {
@@ -9633,7 +9620,7 @@ for line in sys.stdin:
         );
         let mut byte = [0];
         woken
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::test_timing::EVENTUALLY))
             .unwrap();
         woken.read_exact(&mut byte).unwrap();
         let report = command_stop_report(&stops, 0);
@@ -9666,18 +9653,9 @@ for line in sys.stdin:
         std::fs::write(leaf_path.join("cgroup.procs"), hog.id().to_string()).unwrap();
         hog.stdin.take().unwrap().write_all(b"x").unwrap();
         assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stops = loop {
-            let stops = scope.take_command_stops();
-            if !stops.is_empty() {
-                break stops;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the kernel's kill was never reported"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let stops = crate::test_timing::wait_for("the kernel's kill being reported", || {
+            Some(scope.take_command_stops()).filter(|stops| !stops.is_empty())
+        });
         assert_eq!(
             stops,
             vec![crate::daemon::process_scope::CommandStop {
@@ -9690,14 +9668,9 @@ for line in sys.stdin:
 
         // The provider's own leaf, and with it the provider.
         mark_and_kill(&provider_leaf);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = provider.observed_exit_status().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "the provider outlived its kill");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let status = crate::test_timing::wait_for("the provider exiting from its kill", || {
+            provider.observed_exit_status().unwrap()
+        });
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let report = exit_report(&provider, status);
         assert!(

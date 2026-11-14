@@ -155,12 +155,11 @@ fn read_open_agents<'a>(
     client: &mut crate::control::ControlClient,
 ) -> Result<&'a [crate::agent_execution::Agent], String> {
     if agents.is_none() {
-        let model = client
-            .read_workspace_model()
+        let (_, open_agents) = client
+            .read_workspace_agents()
             .map_err(|error| error.to_string())?;
         *agents = Some(
-            model
-                .agents
+            open_agents
                 .into_iter()
                 .filter(|agent| !agent.closed)
                 .collect(),
@@ -1105,6 +1104,11 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn remember_channel_name_for_test(&mut self, id: ChannelId, title: String) {
+        self.remember_channel_name(id, title, crate::model::ChannelTitleSource::Provider);
+    }
+
     /// Gives a channel back the automatic name it had once the registry holds
     /// the pane that returned to it, which is when it forgets the name. Any
     /// name it holds by then, the conversation's own or one typed, wins.
@@ -1991,8 +1995,7 @@ impl Cagents {
     pub(super) fn refresh_sidebar_channels(&mut self) {
         self.sidebar_state
             .set_channel_selected(self.durable.active_channel.is_some());
-        self.sidebar_state
-            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        self.refresh_attention_projection();
         let durable = &self.durable;
         let mut cards = HashMap::new();
         for card in durable
@@ -2135,6 +2138,43 @@ impl Cagents {
     }
 }
 
+impl Cagents {
+    /// Folds attention into the rows the Attention list draws: counts first,
+    /// then the pane rows they give. Every projection goes through here, so
+    /// no caller can leave the pane rows behind the counts.
+    pub(super) fn refresh_attention_projection(&mut self) {
+        self.sidebar_state
+            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        self.refresh_attention_card_rows();
+    }
+
+    /// The Attention list's pane rows, titled as their panes are. Every title
+    /// report comes through here, and most change no row: those compare the
+    /// rows in place and stop, and the rest rebuild only the projects whose
+    /// rows changed.
+    pub(super) fn refresh_attention_card_rows(&mut self) {
+        let stale = self
+            .sidebar_model
+            .stale_attention_cards(&self.sidebar_state, |id| {
+                self.card_state(id)
+                    .map(|card| self.card_display_title(card))
+            });
+        if stale.is_empty() {
+            return;
+        }
+        let mut titles = self
+            .sidebar_state
+            .attention_pane_cards()
+            .filter_map(|id| {
+                let card = self.card_state(id)?;
+                Some((id, self.card_display_title(card).to_owned()))
+            })
+            .collect::<HashMap<_, _>>();
+        self.sidebar_model
+            .set_attention_cards(&self.sidebar_state, &stale, |id| titles.remove(&id));
+    }
+}
+
 fn channel_title_from_prompt(prompt: &str) -> Option<String> {
     crate::workspace_model::channel_title_from_prompt(prompt)
 }
@@ -2212,17 +2252,29 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = model_with_empty_channel(home);
         app.workspace_model.sequence = 8;
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        let (_, projection) = app.apply_workspace_model_update_projection(ModelUpdate::Changed {
             sequence: 10,
             edit: ModelEdit::ChannelWorkChanged { home },
-        }));
+            changes: Default::default(),
+        });
+        assert!(
+            matches!(projection, super::super::Projection::Unchanged),
+            "channel work is not shown, so its invalidation projects nothing"
+        );
         assert_eq!(
             app.workspace_model.sequence, 8,
             "an invalidation cannot acknowledge an unseen canonical edit"
         );
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
             sequence: 9,
             edit: ModelEdit::DeleteChannel { id: home.channel },
+            changes: super::super::workspace_model_sync::EdgeChanges {
+                effects: crate::workspace_model::delta::EditEffects {
+                    removed_channels: vec![home.channel],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         }));
         assert!(app.workspace_model.channel(home.channel).is_none());
         assert_eq!(app.workspace_model.sequence, 9);
