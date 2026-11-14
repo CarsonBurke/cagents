@@ -12,8 +12,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifacts
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,20 +87,10 @@ def write(path, text):
 def build_workspace(checkout, env, names):
     output, log = run("cargo", "build", "--offline", "--workspace", "--verbose",
                       "--message-format=json-render-diagnostics", cwd=checkout, env=env)
-    messages = [json.loads(line) for line in output.splitlines()]
-    products = {}
-    for name in names:
-        matches = [Path(message["executable"]) for message in messages
-                   if message.get("reason") == "compiler-artifact"
-                   and message.get("target", {}).get("name") == name
-                   and "bin" in message.get("target", {}).get("kind", [])
-                   and message.get("executable")]
-        if len(matches) != 1:
-            raise RuntimeError(f"expected exactly one Cargo executable for {name}; got {matches}")
-        product = matches[0]
-        if not product.is_absolute() or not product.is_file() or not os.access(product, os.X_OK):
-            raise RuntimeError(f"Cargo executable is missing or not runnable: {product}")
-        products[name] = product
+    artifacts = CargoArtifacts()
+    messages = [message for line in output.splitlines()
+                if (message := artifacts.read(line)) is not None]
+    products = {name: artifacts.executable(name) for name in names}
     return products, messages, log
 
 
