@@ -31340,10 +31340,13 @@ mod tests {
             .contains(&row)
     }
 
-    /// Gives the project holding `channel` a worktree and shows its row so
-    /// attention retention is exercised independently of group disclosure.
+    /// Moves `card` out of `channel` onto a new worktree of the channel's
+    /// project, as an unchanneled pane scoped to it, and shows worktree rows
+    /// so attention retention is exercised independently of group
+    /// disclosure. A channel's own panes never count on a worktree row.
     fn add_attention_worktree(
         app: &mut Cagents,
+        card: CardId,
         channel: crate::model::ChannelId,
     ) -> sidebar::SelectionRow {
         let project = app
@@ -31354,6 +31357,7 @@ mod tests {
             .unwrap()
             .project_id;
         let worktree = crate::model::WorktreeId::new();
+        let path = PathBuf::from("/repo/feature");
         app.sidebar_model
             .projects
             .iter_mut()
@@ -31362,9 +31366,17 @@ mod tests {
             .worktrees
             .push(sidebar::SidebarWorktree::from_durable(
                 worktree,
-                "/repo/feature".into(),
+                path.clone(),
                 Some("feature".into()),
             ));
+        let durable = Arc::make_mut(&mut app.durable);
+        for entry in &mut durable.channels {
+            entry.cards.retain(|known| *known != card);
+            if entry.focused == Some(card) {
+                entry.focused = None;
+            }
+        }
+        durable.card_scopes.insert(card, path);
         app.sidebar_state
             .set_sidebar_worktrees(settings::SidebarWorktrees::Expanded);
         sidebar::SelectionRow::Worktree(project, worktree)
@@ -31375,22 +31387,16 @@ mod tests {
     #[test]
     fn attention_forgets_kept_rows_once_their_surface_is_gone() {
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
-        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
-            unreachable!()
-        };
         let channel_row = sidebar::SelectionRow::Channel(channel);
-        app.sidebar_state
-            .observe_agent_update(card, project, worktree);
+        app.sidebar_state.observe_card_update(card);
         app.refresh_sidebar_channels();
-        assert!(attention_lists(&app, channel_row) && attention_lists(&app, worktree_row));
+        assert!(attention_lists(&app, channel_row));
         drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(
-            attention_lists(&app, channel_row) && attention_lists(&app, worktree_row),
-            "both rows are kept"
+            attention_lists(&app, channel_row),
+            "the channel row is kept"
         );
-
         let saved_channel = app
             .durable
             .channels
@@ -31398,6 +31404,35 @@ mod tests {
             .find(|entry| entry.id == channel)
             .unwrap()
             .clone();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|entry| entry.id != channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        assert!(
+            !attention_lists(&app, channel_row),
+            "a channel created again is not drawn as read"
+        );
+
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, worktree_row));
+        app.read_card_update(card);
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists(&app, worktree_row),
+            "the worktree row is kept"
+        );
         let saved_worktree = {
             let entry = app
                 .sidebar_model
@@ -31412,14 +31447,9 @@ mod tests {
                 .unwrap();
             entry.worktrees.remove(index)
         };
-        Arc::make_mut(&mut app.durable)
-            .channels
-            .retain(|entry| entry.id != channel);
         drop(app.update(Message::Sidebar(
             SidebarAction::SearchChanged(String::new()),
         )));
-
-        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
         app.sidebar_model
             .projects
             .iter_mut()
@@ -31431,10 +31461,6 @@ mod tests {
             SidebarAction::SearchChanged(String::new()),
         )));
         assert!(
-            !attention_lists(&app, channel_row),
-            "a channel created again is not drawn as read"
-        );
-        assert!(
             !attention_lists(&app, worktree_row),
             "a worktree created again is not drawn as read"
         );
@@ -31445,7 +31471,7 @@ mod tests {
     #[test]
     fn attention_does_not_keep_the_row_of_a_closed_unread_pane() {
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
         let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
             unreachable!()
         };
@@ -31468,7 +31494,7 @@ mod tests {
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
 
         let (mut app, card, channel) = attention_channel_test_app();
-        let worktree_row = add_attention_worktree(&mut app, channel);
+        let worktree_row = add_attention_worktree(&mut app, card, channel);
         let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
             unreachable!()
         };
@@ -31512,11 +31538,12 @@ mod tests {
             Some("Expand Worktrees (1), 1 unread conversation")
         );
 
-        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        app.read_card_update(card);
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(attention_lists_channel(&app, channel));
         assert!(!attention_lists(&app, worktree_row));
-        assert_eq!(group_name(&app).as_deref(), Some("Expand Worktrees (1)"));
+        // Nothing in the project needs the user any more, and no row of it
+        // was listed to be kept, so the group leaves the list with its news.
+        assert_eq!(group_name(&app).as_deref(), None);
     }
 
     fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {
