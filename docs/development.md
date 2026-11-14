@@ -48,8 +48,8 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
 | `test` | The three lane test suites, one after another |
-| `test:lib` | Run named root library tests without Cargo ([`scripts/test-lib`](#testing)) |
-| `test:scripts` | Verify and run the script contract suites, or one `JOB [SHARD]` |
+| `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
+| `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
 | `fmt`, `fmt:check` | Format, or check the formatting of, Cargo roots and the Rust sources behind `include!` |
 | `ci` | What GitHub CI runs: `fmt:check`, `check:protocol` and `test:scripts`; none of it compiles Rust |
 | `install` | [Install your checkout](#installing-your-checkout) |
@@ -70,8 +70,11 @@ mise run test:lib -- ui --profile dev-runtime --prefix app::chat_ui::
 mise run test:scripts tooling
 ```
 
-A task exits with its command's status. `check` runs its three lanes at once and
-`test` runs them in order, stopping at the first failure. Every compiling task
+Always write `mise run TASK`: `mise doctor` and `mise install` are mise's own
+commands. A task exits with its command's status. `check` runs its three lanes
+at once and `test` runs them in order, stopping at the first failure; the
+aggregates `check`, `test` and `ci` take no arguments, so narrow one lane
+instead. Every compiling task
 goes through `scripts/cargo-gate`, so the [build host](#building-on-another-host)
 and its admission apply exactly as they do to the commands below. No task
 combines the `host` and `ui` features, and none is cached by mise: Cargo decides
@@ -94,9 +97,10 @@ sudo apt-get install --yes --no-install-recommends \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
   libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
   libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
-rustup toolchain install 1.93.0 --profile minimal
-rustup default 1.93.0
 ```
+
+Install [rustup](https://rustup.rs/); `mise run setup` below installs the Rust
+toolchain `rust-toolchain.toml` pins, which rustup then selects in the checkout.
 
 The terminal host uses Ghostty's native library, so daemon builds require Zig.
 Install [mise](https://mise.jdx.dev/getting-started.html), trust the checkout's

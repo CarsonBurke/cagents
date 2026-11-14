@@ -80,8 +80,8 @@ cagents --help
 
 You need [mise](https://mise.jdx.dev/getting-started.html),
 [rustup](https://rustup.rs/), and the
-[native build dependencies](docs/development.md#prerequisites). mise installs
-the pinned Zig 0.15.2 and Rust 1.93 toolchains.
+[native build dependencies](docs/development.md#prerequisites). `mise run setup`
+installs the pinned Zig 0.15.2 with mise and Rust 1.93 with rustup.
 
 ```sh
 git clone https://github.com/CarsonBurke/cagents.git
