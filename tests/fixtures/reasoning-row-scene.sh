@@ -153,7 +153,7 @@ tools_details() {
     scroll_top
     if ! text_visible 'inspect'; then click_row '^edited'; fi
     if ! text_visible '\bInspection\b'; then click_row 'inspect'; fi
-    evidence drive wait Inspection --timeout 15 >/dev/null
+    find_row '\bInspection\b' >/dev/null
     shot "${prefix}rows-tools-expanded"
     click_row '^edited'
     scroll_top
@@ -166,7 +166,7 @@ outcome_details() {
     scroll_top
     click_row 'optional-probe-denied'
     if ! text_visible '\bRefused\b'; then click_row 'optional-probe-denied' 1; fi
-    evidence drive wait Refused --timeout 15 >/dev/null
+    find_row '\bRefused\b' >/dev/null
     if ! text_visible 'fixture-log-ready'; then click_row '(ran|running) 2 commands'; fi
     local point y steps
     point=$(find_row 'optional-probe-denied')
@@ -310,8 +310,10 @@ if [ "$scene" = web ]; then
     scroll_top
     shot rows-web-collapsed
     click_row '^searched the web'
-    click_row temporary
-    evidence drive wait Recorded --timeout 15 >/dev/null
+    # A one-step group repeats the nested row title. Target the second
+    # matching line, even when a narrow fade conceals the query itself.
+    click_row '^searched the web' 1
+    find_row '\bRecorded\b' >/dev/null
     shot rows-web-expanded
     touch "$web_done"
     printf '%s\n' 'Captured dedicated Codex web-search rows; coordination may run next.'
