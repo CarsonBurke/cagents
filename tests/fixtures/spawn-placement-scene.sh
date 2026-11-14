@@ -18,6 +18,21 @@ shot() {
     sleep 1
     evidence shot "$1"
 }
+# OCR can locate a row's text even when its action is an unlabelled glyph.
+# The action stays at the row's trailing edge in both supported viewports.
+open_point() {
+    evidence drive observe | python3 -c 'import re,sys
+width=int(sys.argv[1]); right=260+(width-270)//2; found=[]
+for line in sys.stdin:
+ m=re.search(r"\[t\d+\]\s+(\d+),\s+(\d+)\s+(\d+)x(\d+)",line)
+ if m and 260<int(m[1])<right and 120<int(m[2])<700 and "reviewer" in line.lower():
+  found.append(tuple(map(int,m.groups())))
+assert found, "missing reviewer spawn row"
+x,y,w,h=max(found,key=lambda row:row[1]); print(f"{right-26},{y+h//2}")' "${SCENE_WIDTH:-1500}"
+}
+open_spawn() {
+    evidence drive click "$(open_point)"
+}
 evidence cli project open "$fx/project"
 evidence cli project open "$fx/casmi"
 channel=$(evidence cli --json channel spawn --repository "$fx/project" --title 'Backoff implementation' | jq -er '.data.channel.id')
@@ -39,6 +54,9 @@ parent_tab
 sleep 4
 evidence drive observe
 shot spawn-start
+if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+    printf '120\n' >"$config/fixture-first-turn-seconds"
+fi
 printf '%s\n' "cagents agent spawn --name reviewer --model haiku --surface chat 'Review the one-row cards'" >"$config/fixture-run-once"
 evidence cli agent send "$parent" 'Start a reviewer on the one-row cards.'
 sleep 10
@@ -46,11 +64,30 @@ evidence cli --json channel list
 evidence cli --json agent list
 evidence drive observe
 shot same-project
-if [ "$SIDE" = after ]; then
-    evidence drive click 'Open'
+if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+    evidence drive move 500,22
+    evidence drive scroll horizontal 100
+    sleep 2
+    shot same-project-pager-end
+    parent_tab
+    at=$(open_point)
+    evidence drive move "$at"
+    sleep 2
+    evidence shot same-project-hover
+fi
+if [ "$SIDE" = after ] || [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+    open_spawn
     sleep 3
     evidence drive observe
     shot same-project-opened
+fi
+if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
+    # Open must put the keyboard in the destination's composer.
+    evidence drive type 'Reviewer destination draft'
+    evidence drive observe
+    shot same-project-opened-keyboard
+    evidence drive key ctrl+a
+    evidence drive key BackSpace
 fi
 parent_tab
 sleep 2
