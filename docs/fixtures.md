@@ -321,7 +321,7 @@ expanded mixed tools and failed/running commands. `narrow` reuses that
 conversation, adds an unsent blank thread with Ctrl+T, focuses its native tabs,
 and uses Alt+R to select one-third width preferences (three cycles on the
 hosted chat, one on the draft). The panes share the docked workspace at roughly
-270px each. It captures reasoning and the same tools/outcomes at that width.
+270px each. It captures reasoning and the expanded mixed tools at that width.
 The blank draft sends no prompt and starts no provider.
 
 `web` can also run immediately after a fresh `start --codex tool-rows`,
@@ -333,7 +333,7 @@ contains two invented results. It captures collapsed and expanded rows at the
 
 Keep the native window at 1200x900: below the docked inspector's minimum
 workspace width it becomes an overlay that hides the transcript. Run each core mode once, in order. Ancillary modes use separate named
-workspaces and need no initial600-second reasoning actor or close request. For a remote `pair`, its steps file contains:
+workspaces and need no initial 600-second reasoning actor or close request. For a remote `pair`, its steps file contains:
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide
@@ -357,7 +357,7 @@ nested compositor's private clipboard. Neither mode reaches the host clipboard.
 
 All provider settings and transcripts stay inside the task's private fixture;
 no live model, provider account or real provider home is used. Stop afterward:
-the final thought deliberately stays active for 600 seconds. The background
+the final thought deliberately stays active for 600 seconds. Run the ancillary scenes separately when a longer live review is needed. The background
 command is a recorded protocol acknowledgement, not a sleeping process.
 `--ui-trace` retains UI-thread summaries and calls over 50ms. Compare these and
 bounded CPU/RSS samples during the same captures, and exercise hover/scroll

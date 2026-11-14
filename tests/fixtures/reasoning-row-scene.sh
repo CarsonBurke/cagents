@@ -301,7 +301,6 @@ if [ "$scene" = diagnostics ]; then
     shot rows-diagnostic-expanded
     click_row '\bCopy\b'
     copy_contains fixture-original-diagnostic
-    click_row '^Hide details$'
     printf '%s\n' 'Captured original failure Details and verified private Copy details.'
     exit 0
 fi
