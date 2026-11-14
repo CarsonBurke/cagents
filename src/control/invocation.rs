@@ -238,6 +238,9 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
                 effort: agent.spec.reasoning_effort.unwrap_or_default(),
                 channel,
                 placement,
+                placed_in: data
+                    .get("placed_in")
+                    .and_then(|placed| serde_json::from_value(placed.clone()).ok()),
                 state: Some(run.state),
                 timed_out: data["timed_out"].as_bool().unwrap_or(false),
                 result: run.result.text,

@@ -391,6 +391,7 @@ mod tests {
                 path: "/fixture/linked".into(),
             }),
             channel_repository: None,
+            lineage_channel: None,
             state: ActivityState::Waiting,
             directory: Some("/fixture/linked".into()),
             worktree: Some("/fixture/linked".into()),

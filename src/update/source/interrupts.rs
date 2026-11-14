@@ -634,6 +634,7 @@ mod tests {
             channel: None,
             view_scope: None,
             channel_repository: None,
+            lineage_channel: None,
             state: crate::agent::ActivityState::Working,
             directory: Some("/work".into()),
             worktree: None,

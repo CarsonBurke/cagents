@@ -624,19 +624,12 @@ fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<
     if !spawn.effort.is_empty() {
         parts.push(spawn.effort.clone());
     }
-    if reading.cli {
-        parts.push(match &spawn.placement {
-            Some(crate::agent_execution::Placement::Channel(channel)) => {
-                format!("Channel {channel}")
-            }
-            Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
-                format!("Worktree view {}", path.display())
-            }
-            None => spawn.channel.as_ref().map_or_else(
-                || "View not reported".to_owned(),
-                |channel| format!("Channel {channel}"),
-            ),
-        });
+    // A channel the agent went to other than this conversation's is named
+    // on the card's first line, by its title; an ID would say nothing here.
+    if reading.cli
+        && let Some(crate::agent_execution::Placement::Worktree { path, .. }) = &spawn.placement
+    {
+        parts.push(format!("Worktree view {}", path.display()));
     }
     parts.join(" · ")
 }
@@ -1018,26 +1011,59 @@ impl Runtime {
             [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
             _ => primary.clone(),
         };
-        rows.push(
-            widget::row::with_children(vec![
-                indicator,
-                crate::interaction::tooltip(
-                    chat_title(Self::short_description(
-                        primary
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                            .unwrap_or(&primary),
-                        80,
-                    ))
-                    .width(Length::Fill),
-                    task,
-                )
-                .into(),
-            ])
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
+        let mut heading = vec![
+            indicator,
+            crate::interaction::tooltip(
+                chat_title(Self::short_description(
+                    primary
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .unwrap_or(&primary),
+                    80,
+                )),
+                task,
+            )
             .into(),
+        ];
+        let run = reading.outcome.run.as_ref();
+        if let Some(placed) = run.and_then(|run| run.placed_in.as_ref()) {
+            heading.push(
+                design::caption(match &placed.title {
+                    Some(title) => format!("in channel \u{201c}{title}\u{201d}"),
+                    None => "in another channel".to_owned(),
+                })
+                .into(),
+            );
+        }
+        heading.push(widget::Space::new().width(Length::Fill).into());
+        // A separate session has a tab of its own, which this opens.
+        if reading.cli
+            && let Some(agent) = run.map(|run| run.agent.as_str())
+            && !agent.is_empty()
+            && !matches!(status, ToolStatus::Failed | ToolStatus::Denied)
+        {
+            heading.push(
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        design::caption("Open").into(),
+                        muted_glyph(Icon::Jump),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                )
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .name(format!("Open agent {agent}"))
+                .on_press(action(Action::OpenAgent(agent.to_owned())))
+                .into(),
+            );
+        }
+        rows.push(
+            widget::row::with_children(heading)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
         );
         let observed_model = if !reading.cli {
             match reading.subagents.as_slice() {
@@ -1103,7 +1129,6 @@ impl Runtime {
             ));
         }
         // How the run went, as far as this step saw it.
-        let run = reading.outcome.run.as_ref();
         let line = match status {
             ToolStatus::Running if background.is_some() => None,
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
@@ -1533,16 +1558,18 @@ mod identity_tests {
         reading.cli = true;
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
-            "cagents agent · Model not reported · View not reported"
+            "cagents agent · Model not reported"
         );
         spawn.provider = "codex".into();
         spawn.model = "gpt-reported".into();
         spawn.effort = "low".into();
         let channel = crate::model::ChannelId::new();
         spawn.channel = Some(channel);
+        spawn.placement = Some(crate::agent_execution::Placement::Channel(channel));
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
-            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+            "cagents agent · codex · gpt-reported · low",
+            "a channel is named by title on the first line, never by its ID"
         );
         spawn.placement = Some(crate::agent_execution::Placement::Worktree {
             repository: "/repo".into(),

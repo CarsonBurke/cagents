@@ -93,6 +93,11 @@ pub struct Entry {
     /// The channel's owning repository, independent of this session's cwd.
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
+    /// Reported for the caller only: the channel its lineage last belonged
+    /// to, which an agent it starts joins when its own view is missing or
+    /// ambiguous.
+    #[serde(default)]
+    pub lineage_channel: Option<ChannelHome>,
     pub state: ActivityState,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
@@ -104,6 +109,13 @@ pub struct Entry {
     pub relation: Relation,
     /// Stable across this session's relaunches and recoveries.
     pub lineage: super::Lineage,
+}
+
+/// A channel and the project that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHome {
+    pub id: crate::model::ChannelId,
+    pub repository: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -303,6 +303,31 @@ impl Registry {
     fn lineage_members(&self, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
         lineage_members_in(&self.db, lineage)
     }
+
+    /// The sessions of `lineage`, the latest registered first, ending with
+    /// its root. Rows are written once, before their session starts, so
+    /// their order is the order the sessions succeeded one another.
+    pub(crate) fn lineage_succession(&self, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
+        let mut statement = self
+            .db
+            .prepare_cached(
+                "SELECT session_id FROM session_lineages WHERE lineage = ?1 ORDER BY rowid DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut sessions = statement
+            .query_map([lineage.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                row.map_err(|error| error.to_string())?
+                    .parse()
+                    .map_err(|_| "Stored session lineage is invalid".to_owned())
+            })
+            .collect::<Result<Vec<TerminalId>, String>>()?;
+        if !sessions.contains(&lineage.0) {
+            sessions.push(lineage.0);
+        }
+        Ok(sessions)
+    }
 }
 
 fn lineage_members_in(db: &Connection, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
@@ -561,6 +586,27 @@ mod tests {
                 .succeed(TerminalId::new(), rival, Some(root), |_| false)
                 .unwrap(),
             Lineage(rival)
+        );
+    }
+
+    #[test]
+    fn a_lineage_lists_its_sessions_latest_first_and_its_root_last() {
+        let (mut registry, _directory, _request) = fixture();
+        let root = TerminalId::new();
+        assert_eq!(
+            registry.lineage_succession(Lineage(root)).unwrap(),
+            [root],
+            "a root never registered is still its own lineage"
+        );
+        registry
+            .fresh_agent_authority(&terminal(root, None))
+            .unwrap();
+        let (first, second) = (TerminalId::new(), TerminalId::new());
+        registry.succeed(first, root, None, |_| false).unwrap();
+        registry.succeed(second, first, None, |_| false).unwrap();
+        assert_eq!(
+            registry.lineage_succession(Lineage(root)).unwrap(),
+            [second, first, root]
         );
     }
 

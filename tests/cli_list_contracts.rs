@@ -73,6 +73,7 @@ impl Listing {
                             channel: None,
                             view_scope: None,
                             channel_repository: None,
+                            lineage_channel: None,
                             state: cagents::agent::ActivityState::Working,
                             directory: Some("/fixture".into()),
                             worktree: Some("/fixture".into()),
