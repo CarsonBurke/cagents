@@ -1225,6 +1225,11 @@ impl Cagents {
     }
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
+        let trailing_clearance = if self.pane_inspector_layout(card).is_none() {
+            crate::app::pane_inspector::TOGGLE_CLEARANCE
+        } else {
+            0.0
+        };
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
@@ -1262,11 +1267,7 @@ impl Cagents {
                         .card(card)
                         .map_or(self.workspace.viewport_width(), |card| card.width())
                         .min(super::layout::READING_COLUMN),
-                    if self.pane_inspector_layout(card).is_none() {
-                        crate::app::pane_inspector::TOGGLE_CLEARANCE
-                    } else {
-                        0.0
-                    },
+                    trailing_clearance,
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1289,7 +1290,7 @@ impl Cagents {
             ])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
-            .padding(step::GAP_M)
+            .padding(iced::Padding::new(step::GAP_M).right(step::GAP_M.max(trailing_clearance)))
             .into(),
         }
     }
@@ -2670,10 +2671,9 @@ impl Runtime {
             }
         }
         // The scroll viewport spans the pane, so its scrollbar follows the
-        // pane edge, while the rows keep the reading column the composer
-        // shares. The symmetric inset already exceeds the scrollbar rail.
-        // Reserving the rail a second time would make transcript rows
-        // narrower than the composer in a pane no wider than the column.
+        // pane edge. Rows keep the composer's centered reading column and
+        // leading inset, with extra trailing clearance for the pane toggle.
+        // This also protects a row scrolled beneath that fixed control.
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
                 .padding(
@@ -12528,6 +12528,7 @@ mod tests {
     #[test]
     fn inspector_overlay_fills_its_pane_and_escape_restores_the_retained_toggle_focus() {
         use iced::advanced::widget::{Operation, operation};
+        use iced::futures::StreamExt;
         use iced::runtime::user_interface::{Cache, UserInterface};
         struct Panel {
             id: widget::Id,
