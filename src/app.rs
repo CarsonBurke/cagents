@@ -19817,6 +19817,8 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    mod automation_work_authority;
+
     #[test]
     fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
         let mut app = context_inspector_test_app(false);
