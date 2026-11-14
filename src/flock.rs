@@ -1,9 +1,9 @@
 //! Authenticate exclusive flock owners using their exact locked descriptors.
 use std::{collections::BTreeSet, fs, io, os::unix::fs::MetadataExt, path::Path};
 
-/// How many times the kernel index is read before a held lock's absence from
-/// it is believed.
-const INDEX_READS: usize = 3;
+/// How many times the kernel index is read before believing that no
+/// candidate it names holds the lock.
+pub(crate) const INDEX_READS: usize = 3;
 
 pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();
@@ -24,33 +24,52 @@ pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
 }
 
-/// The pids `/proc/locks` names as holding `expected`, which fdinfo must still
-/// prove. The kernel serves that file a page per read(2) and resumes each
-/// page by position, so when other locks come and go between pages, a lock
-/// held throughout can be skipped. On a host with hundreds of locks that
-/// happens to a few percent of reads; an empty answer is read again.
-pub(crate) fn indexed_owners(
+/// The holders of `expected` that `prove` accepts, from the pids
+/// `/proc/locks` names for its inode and any `extra` candidates.
+///
+/// The kernel serves that file a page per read(2) and resumes each page by
+/// position, so when other locks come and go between pages, a lock held
+/// throughout can be skipped; on a host with hundreds of locks that happens
+/// to a few percent of reads. The index is also keyed by inode alone here, so
+/// another filesystem's row can stand in for the skipped one. Until some
+/// candidate is proven, the index is read again.
+pub(crate) fn proven_owners<T>(
     proc_root: &Path,
     expected: &fs::Metadata,
-) -> io::Result<BTreeSet<u32>> {
-    indexed_owners_from(|| fs::read_to_string(proc_root.join("locks")), expected)
+    extra: &[u32],
+    prove: impl FnMut(u32) -> io::Result<Option<T>>,
+) -> io::Result<Vec<T>> {
+    proven_owners_from(
+        || fs::read_to_string(proc_root.join("locks")),
+        expected,
+        extra,
+        prove,
+    )
 }
 
-fn indexed_owners_from(
+fn proven_owners_from<T>(
     mut read: impl FnMut() -> io::Result<String>,
     expected: &fs::Metadata,
-) -> io::Result<BTreeSet<u32>> {
-    let mut owners = BTreeSet::new();
+    extra: &[u32],
+    mut prove: impl FnMut(u32) -> io::Result<Option<T>>,
+) -> io::Result<Vec<T>> {
     for _ in 0..INDEX_READS {
-        owners = read()?
+        let candidates: BTreeSet<u32> = read()?
             .lines()
             .filter_map(|line| flock_owner(line, expected))
+            .chain(extra.iter().copied().filter(|pid| *pid > 1))
             .collect();
-        if !owners.is_empty() {
-            break;
+        let mut proven = Vec::new();
+        for pid in candidates {
+            if let Some(owner) = prove(pid)? {
+                proven.push(owner);
+            }
+        }
+        if !proven.is_empty() {
+            return Ok(proven);
         }
     }
-    Ok(owners)
+    Ok(Vec::new())
 }
 
 pub(crate) fn fdinfo_owns_lock(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
@@ -85,28 +104,22 @@ pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Resul
     // This index is advisory contender discovery. Losing procfs visibility is
     // not proof of an owner and must not abort a requested shutdown; flock on
     // the caller's own validated file remains the authoritative reservation.
-    let owners = match indexed_owners(proc_root, expected) {
-        Ok(owners) => owners,
-        Err(_) => return Ok(None),
-    };
-    for pid in owners {
+    let owners = proven_owners(proc_root, expected, &[], |pid| {
         let process = proc_root.join(pid.to_string());
         // Inode collisions can belong to another user's filesystem. Exclude
         // those owners before their private fdinfo can refuse inspection.
-        match fs::metadata(&process) {
-            Ok(metadata) if metadata.uid() != expected.uid() => continue,
-            Ok(_) => {}
-            // A process may exit, revoke inspection, or change namespaces
-            // between the index read and this proof. It is not a proven owner.
-            Err(_) => continue,
-        }
-        match process_owns_lock(&process, pid, expected) {
-            Ok(true) => return Ok(Some(pid)),
-            Ok(false) => {}
-            Err(_) => {}
-        }
-    }
-    Ok(None)
+        // A process may exit, revoke inspection, or change namespaces
+        // between the index read and this proof. It is not a proven owner.
+        Ok(match fs::metadata(&process) {
+            Ok(metadata) if metadata.uid() == expected.uid() => {
+                process_owns_lock(&process, pid, expected)
+                    .unwrap_or(false)
+                    .then_some(pid)
+            }
+            _ => None,
+        })
+    });
+    Ok(owners.ok().and_then(|owners| owners.into_iter().next()))
 }
 
 #[cfg(test)]
@@ -169,20 +182,27 @@ mod tests {
     fn a_held_lock_skipped_by_one_index_read_is_found_by_the_next() {
         let lock = tempfile::NamedTempFile::new().unwrap();
         let expected = lock.as_file().metadata().unwrap();
-        let mut tables = vec![String::new(), lock_record(&expected)].into_iter();
-        let owners = indexed_owners_from(|| Ok(tables.next().unwrap()), &expected).unwrap();
-        assert_eq!(owners.into_iter().collect::<Vec<_>>(), [PID]);
+        let prove = |pid: u32| Ok((pid == PID).then_some(pid));
+        // The first read skipped the holder's row; another filesystem's lock
+        // on the same inode number still matched, but proves nothing.
+        let collision = lock_record(&expected).replace(&format!("WRITE {PID} "), "WRITE 41 ");
+        let mut tables = vec![collision.clone(), collision + &lock_record(&expected)].into_iter();
+        let owners = proven_owners_from(|| Ok(tables.next().unwrap()), &expected, &[], prove);
+        assert_eq!(owners.unwrap(), [PID]);
+        // A candidate from elsewhere needs no index row.
+        let owners = proven_owners_from(|| Ok(String::new()), &expected, &[PID], prove);
+        assert_eq!(owners.unwrap(), [PID]);
         // An unheld lock is believed absent after a bounded number of reads.
         let mut reads = 0;
-        let owners = indexed_owners_from(
-            || {
-                reads += 1;
-                Ok(String::new())
-            },
-            &expected,
-        )
-        .unwrap();
-        assert!(owners.is_empty());
+        let read = || {
+            reads += 1;
+            Ok(String::new())
+        };
+        assert!(
+            proven_owners_from(read, &expected, &[], prove)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(reads, INDEX_READS);
     }
 
