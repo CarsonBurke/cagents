@@ -183,14 +183,14 @@ outcome_details() {
     scroll_top
     # The baseline filters the empty thought and merges this failure into
     # the mixed group. Newer UI preserves the thought and its group boundary.
-    if ! text_visible '(Ran printf|Tried to run)'; then
+    if ! text_visible '(an printf|ried to run)'; then
         click_row '\bEdited\b'
         mixed_parent=true
     else
-        click_row '(Ran printf|Tried to run)'
+        click_row '(an printf|ried to run)'
         # New headers keep one full preview; a long command can fade the
         # appended exit status, so use the common outer/nested prefix.
-        failure_pattern='(Ran printf|Tried to run)'
+        failure_pattern='(an printf|ried to run)'
         failure_index=1
     fi
     align_row "$failure_pattern" "$failure_index"
@@ -210,7 +210,7 @@ outcome_details() {
     click_row '2 commands'
     click_row "$failure_pattern" "$failure_index"
     scroll_top
-    if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row '(Ran printf|Tried to run)'; fi
+    if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row '(an printf|ried to run)'; fi
     scroll_top
 }
 
