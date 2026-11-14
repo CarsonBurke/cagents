@@ -232,6 +232,71 @@ fn a_streaming_frame_of_a_full_window() {
     }
 }
 
+/// The reply the native frame pass streams: the repository's own
+/// documentation, with its headings, tables, lists and code fences, 24 bytes
+/// a publication. Preparing a publication lays out the new text once, so it
+/// counts the paragraphs that publication shapes; the frame after it shows
+/// the same text again and should shape none. The counts cover prose shaped
+/// on the interface thread; flow layouts shaped on a worker and monospace
+/// text are not counted. The documentation changes over time, so compare
+/// runs made on the same revision of it.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_streaming_frame_of_documentation() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    let source = ["performance.md", "fixtures.md"]
+        .iter()
+        .map(|name| std::fs::read_to_string(root.join(name)).expect("documentation"))
+        .collect::<String>();
+    let mut items = transcript(1);
+    if let Some(answer) = items.last_mut() {
+        answer.content = prose(String::new(), false, chat::Phase::Final);
+    }
+    let mut pane = Pane::new(items);
+    pane.metadata.busy = true;
+    let shaped = || super::super::selectable_prose::SHAPES.with(std::cell::Cell::get);
+    let mut at = 0;
+    for (label, publications) in [("first 4k", 160), ("to 16k", 500), ("to 30k", 600)] {
+        let mut stages = Stages::default();
+        let mut publication_shapes = Vec::new();
+        let mut frame_shapes = Vec::new();
+        for publication in 0..publications {
+            let mut end = (at + 24).min(source.len());
+            while !source.is_char_boundary(end) {
+                end += 1;
+            }
+            pane.tail().push_str(&source[at..end]);
+            at = end;
+            pane.publish();
+            let published = shaped();
+            let prepared = pane.prepare_publication();
+            let settled = shaped();
+            let frame = pane.frame();
+            if publication >= WARMUP {
+                publication_shapes.push(settled - published);
+                frame_shapes.push(shaped() - settled);
+                stages.preparation.0.push(prepared);
+                stages.record(frame);
+            }
+        }
+        let quantiles = |shapes: &mut Vec<usize>| {
+            shapes.sort_unstable();
+            let at = |quantile: f64| shapes[((shapes.len() - 1) as f64 * quantile) as usize];
+            format!("median {} p95 {} max {}", at(0.5), at(0.95), at(1.0))
+        };
+        println!("{label} ({at} bytes):");
+        println!(
+            "  paragraphs shaped by a publication: {}",
+            quantiles(&mut publication_shapes)
+        );
+        println!(
+            "  paragraphs shaped by the frame after it: {}",
+            quantiles(&mut frame_shapes)
+        );
+        stages.report();
+    }
+}
+
 /// A live runtime showing `items`, and the handle that publishes to it.
 pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
     let (mut runtime, handle) = cold_runtime(items);
@@ -1084,9 +1149,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
     let waiting = labels(&runtime, &mut tree);
     assert!(
-        waiting
-            .iter()
-            .any(|label| label.contains("Waiting for you")),
+        waiting.iter().any(|label| label == "Waiting"),
         "{waiting:?}"
     );
     assert!(
@@ -1103,7 +1166,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     assert!(
         !stopped
             .iter()
-            .any(|label| label == "Starting" || label == "Working" || label == "Waiting for you"),
+            .any(|label| label == "Starting" || label == "Working" || label == "Waiting"),
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);

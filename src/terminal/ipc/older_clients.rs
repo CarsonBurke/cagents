@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 176,
+    proven_at: 177,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -93,12 +93,17 @@ const WORK_BOARD_MESSAGES: &[&str] = &["work_board"];
 /// an agent is running, which is what it was before: it hasn't finished.
 pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 
+/// Earlier runs are shown as stopped to clients that cannot name Ended.
+pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
+
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
 /// added it. The wire format proof accepts exactly these.
 #[cfg(test)]
-const RESTATED_VARIANTS: &[(&str, &str, u16)] =
-    &[("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS)];
+const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
+    ("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS),
+    ("cagents::chat::ToolStatus", "Ended", ENDED_TOOL_STATUS),
+];
 
 thread_local! {
     /// The older protocol this thread is encoding a message for.

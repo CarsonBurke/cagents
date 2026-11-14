@@ -791,7 +791,7 @@ impl State {
     }
     pub fn draft_dialog(&self) -> Option<Element<'_, Action>> {
         let (generation, _) = self.discard_draft.as_ref()?;
-        Some(crate::app::dialog_ui::surface(
+        Some(crate::app::dialog_ui::confirmation_surface(
             widget::column::with_children(vec![
                 crate::design::title("Discard automation changes?").into(),
                 crate::design::body("Your unsaved changes will be lost.").into(),

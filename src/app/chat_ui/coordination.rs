@@ -991,6 +991,7 @@ enum BackgroundState {
     OnBackgroundWork,
     Failed,
     Stopped,
+    Ended,
     Finished,
 }
 
@@ -998,10 +999,11 @@ impl BackgroundState {
     fn caption(self) -> &'static str {
         match self {
             Self::Working => "Working",
-            Self::Waiting => "Waiting for you",
+            Self::Waiting => "Waiting",
             Self::OnBackgroundWork => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
+            Self::Ended => "Ended",
             Self::Finished => "Finished",
         }
     }
@@ -1467,6 +1469,8 @@ impl Runtime {
             Some(BackgroundState::Failed)
         } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
             Some(BackgroundState::Stopped)
+        } else if any(ToolStatus::Ended) {
+            Some(BackgroundState::Ended)
         } else {
             Some(BackgroundState::Finished)
         }

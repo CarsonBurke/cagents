@@ -1271,8 +1271,8 @@ fn raw_scan_inner(
                     kind: chat::DeliveryKind::Report,
                     ..
                 } => matched,
-                // A long notice heading leads the body it folds into, so a
-                // match there must open the body too.
+                // Additional summary lines live in the detail; a first-line
+                // heading fades without manufacturing a duplicate body.
                 ItemContent::Delivery {
                     kind: chat::DeliveryKind::Notice,
                     summary,
@@ -2653,7 +2653,7 @@ mod tests {
         assert_eq!(scan(Arc::default(), "acme/tools#4 today"), 1);
     }
     #[test]
-    fn find_opens_a_notice_whose_match_folded_from_its_heading_into_its_body() {
+    fn find_opens_multiline_notice_detail_without_duplicating_faded_headings() {
         let notice = |summary: String| {
             Arc::new(chat::Item {
                 id: "notice".into(),
@@ -2675,7 +2675,7 @@ mod tests {
         );
         for (summary, expand) in [
             (heredoc, true),
-            (format!("{}NEEDLE", "word ".repeat(40)), true),
+            (format!("{}NEEDLE", "word ".repeat(40)), false),
             ("Background command \"NEEDLE\" completed".into(), false),
         ] {
             let item = notice(summary);

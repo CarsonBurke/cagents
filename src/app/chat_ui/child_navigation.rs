@@ -9,6 +9,7 @@ pub(super) enum Filter {
     All,
     Working,
     Attention,
+    Failed,
 }
 
 #[derive(Default)]
@@ -55,7 +56,7 @@ fn child_icon(child: &chat::Subagent) -> Icon {
         chat::ToolStatus::Running => Icon::AgentWorking,
         chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
         chat::ToolStatus::Succeeded => Icon::Check,
-        chat::ToolStatus::Stopped => Icon::Cancel,
+        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Icon::Cancel,
     }
 }
 
@@ -242,8 +243,9 @@ impl Picker {
             .filter(|child| {
                 let admitted = match self.filter {
                     Filter::All => true,
-                    Filter::Working => rank(child) == 0,
+                    Filter::Working => child.status == chat::ToolStatus::Running && !child.waiting,
                     Filter::Attention => needs_attention(child),
+                    Filter::Failed => child.status == chat::ToolStatus::Failed,
                 };
                 // The reader searches what the chooser shows: the numbered
                 // name, the task's first line, the model and the state.
@@ -374,7 +376,7 @@ impl Runtime {
             selected.map(|id| card_control_id(target.card, &format!("chat-subagent-tab-{id}"))),
         );
 
-        let working = children.iter().filter(|child| rank(child) == 0).count();
+        let working = self.snapshot.subagent_activity().working;
         let attention = children
             .iter()
             .filter(|child| needs_attention(child))
@@ -462,12 +464,20 @@ impl Runtime {
             let status = Self::native_child_status(child);
             let label = self.child_label(child, 80);
             let name = Self::child_choice_name(child, &label);
+            let (heading, detail) = if picker.filter == Filter::Failed {
+                (
+                    Self::agent_failure_task(child).to_owned(),
+                    format!("{label} · {status}"),
+                )
+            } else {
+                (label.into_owned(), status.to_owned())
+            };
             let row = widget::button::custom(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(child_icon(child), design::COMPACT_ICON_SIZE),
                     widget::column::with_children(vec![
-                        design::body(label).width(Length::Fill).into(),
-                        design::caption(status).into(),
+                        design::body(heading).width(Length::Fill).into(),
+                        design::caption(detail).into(),
                     ])
                     .width(Length::Fill)
                     .spacing(space::XS)
@@ -506,6 +516,7 @@ impl Runtime {
             (Filter::All, "All"),
             (Filter::Working, "Working"),
             (Filter::Attention, "Needs attention"),
+            (Filter::Failed, "Failed"),
         ] {
             filters.push(crate::ui_controls::view_tab(
                 crate::ui_controls::ViewTab {
@@ -542,9 +553,13 @@ impl Runtime {
                             }
                         })),
                 ),
-                widget::row::with_children(filters)
-                    .spacing(space::XS)
-                    .into(),
+                crate::interaction::overflow_fade_x(
+                    widget::scrollable(widget::row::with_children(filters).spacing(space::XS))
+                        .direction(iced::widget::scrollable::Direction::Horizontal(
+                            iced::widget::scrollable::Scrollbar::hidden(),
+                        ))
+                        .width(Length::Fill),
+                ),
                 widget::row::with_children(vec![
                     design::caption(format!(
                         "{}–{} of {count}",
@@ -1064,5 +1079,16 @@ mod tests {
         assert_eq!(child_icon(&waiting), Icon::AgentBackground);
         assert!(needs_attention(&child("asking", Running, true)));
         assert!(needs_attention(&child("failed", Failed, false)));
+        let children = vec![
+            waiting,
+            child("working", Running, false),
+            child("asking", Running, true),
+        ];
+        let mut picker = Picker::new(&children);
+        picker.filter = Filter::Working;
+        assert_eq!(
+            ids(picker.rows(&children, &Ordinals::default())),
+            ["working"]
+        );
     }
 }

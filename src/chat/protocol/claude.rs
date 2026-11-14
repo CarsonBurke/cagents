@@ -713,6 +713,16 @@ struct Claude {
     /// delayed launch acknowledgement cannot reopen it and a refused result
     /// cannot turn a stop into a failure.
     ended_agents: VecDeque<(String, ToolStatus)>,
+    /// Earlier tool occurrences of an explicitly resumed provider agent.
+    /// Receipts for them must not revive or fail the current occurrence.
+    superseded_agents: VecDeque<String>,
+    /// Historical runs with no live process evidence yet. A fresh child
+    /// carrier or API stream can prove that this occurrence resumed.
+    unconfirmed_agents: HashSet<String>,
+    /// Current failure notices, retired only by an accepted human prompt.
+    recent_failed_agents: VecDeque<String>,
+    /// Consumed human inputs; replay acknowledgements must not advance scope.
+    accepted_user_prompts: VecDeque<String>,
     models: Vec<Model>,
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
@@ -870,6 +880,25 @@ impl Claude {
             ..Capabilities::default()
         }
     }
+    fn accept_user_prompt(&mut self, id: &str, step: &mut Step) {
+        if self.accepted_user_prompts.iter().any(|known| known == id) {
+            return;
+        }
+        self.accepted_user_prompts.push_back(id.into());
+        if self.accepted_user_prompts.len() > 2048 {
+            self.accepted_user_prompts.pop_front();
+        }
+        for id in self.recent_failed_agents.drain(..) {
+            self.unconfirmed_agents.insert(id.clone());
+            step.events.push(subagent_status(
+                id,
+                ToolStatus::Ended,
+                Some("Failed before the current prompt; see its transcript"),
+                false,
+            ));
+        }
+    }
+
     fn start_turn(&mut self, step: &mut Step) {
         if self.started_generation != Some(self.attention_generation) {
             self.suggestion_turn = None;
@@ -1614,7 +1643,10 @@ impl Claude {
                 id: parent.into(),
                 kind: String::new(),
                 description: String::new(),
-                status: None,
+                status: self
+                    .unconfirmed_agents
+                    .remove(parent)
+                    .then_some(ToolStatus::Running),
                 background: None,
                 model: None,
                 waiting: Some(false),
@@ -1624,7 +1656,7 @@ impl Claude {
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
-            delivery(frame)
+            self.deliveries(frame)
                 .into_iter()
                 .map(|content| self.deduplicate(content))
                 .collect()
@@ -1961,9 +1993,6 @@ impl Claude {
                                 if ended.is_none() {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                                if let Some(agent) = frame["tool_use_result"]["agentId"].as_str() {
-                                    self.agent_call(agent, &tool_id);
-                                }
                             }
                             let background = self.background_agents.contains(&tool_id);
                             let status = if let Some(ended) =
@@ -1980,7 +2009,13 @@ impl Claude {
                             step.events.push(Event::Subagent {
                                 model: None,
                                 waiting: None,
-                                detail: None,
+                                detail: (status == ToolStatus::Failed).then(|| {
+                                    if let ItemContent::Tool { output, .. } = &item.content {
+                                        bounded_failure_detail([output.as_str()])
+                                    } else {
+                                        "The agent failed without reporting a reason".into()
+                                    }
+                                }),
                                 id: tool_id.clone(),
                                 kind: String::new(),
                                 description: String::new(),
@@ -1991,12 +2026,24 @@ impl Claude {
                             });
                             if let ItemContent::Tool { output, .. } = &item.content
                                 && let Some(address) = agent_address(structured, output)
-                                && self.addressed_agents.insert(tool_id.clone())
                             {
-                                step.events.push(Event::AgentAddress(AgentAddress {
-                                    address,
-                                    subagent: tool_id.clone(),
-                                }));
+                                if !history
+                                    && child.is_none()
+                                    && let Some(previous) = self.agent_call(&address, &tool_id)
+                                {
+                                    step.events.push(subagent_status(
+                                        previous,
+                                        ToolStatus::Ended,
+                                        Some("Superseded by a later run of this agent"),
+                                        false,
+                                    ));
+                                }
+                                if self.addressed_agents.insert(tool_id.clone()) {
+                                    step.events.push(Event::AgentAddress(AgentAddress {
+                                        address,
+                                        subagent: tool_id.clone(),
+                                    }));
+                                }
                             }
                         }
                         if let Some(content) = block["content"].as_array() {
@@ -2150,6 +2197,65 @@ impl Claude {
         }
         Ok(())
     }
+    /// Enrich a notification with the original Bash description and command,
+    /// when its unambiguous tool-use identity still names that call.
+    fn command_delivery(
+        &self,
+        delivery: &mut ItemContent,
+        tool: &str,
+        status: &str,
+        summary: &str,
+    ) {
+        let Some(key) = self.task_call(tool) else {
+            return;
+        };
+        let Some(Item {
+            content:
+                ItemContent::Command {
+                    label,
+                    command,
+                    action: CommandAction::Run,
+                    ..
+                },
+            ..
+        }) = self
+            .tools
+            .get(&key)
+            .or_else(|| self.evicted_launches.get(&key))
+        else {
+            return;
+        };
+        let Some((heading, detail)) = command_notification(summary, status, label, command, true)
+        else {
+            return;
+        };
+        if let ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            summary,
+            body,
+            ..
+        } = delivery
+        {
+            *summary = heading;
+            *body = detail;
+        }
+    }
+
+    fn deliveries(&self, frame: &Value) -> Vec<ItemContent> {
+        let mut delivered = delivery(frame);
+        if let Some(content) = recorded_notification(frame) {
+            for (delivery, head) in delivered.iter_mut().zip(notification_heads(&content)) {
+                self.command_delivery(
+                    delivery,
+                    &notification_field(head, "tool-use-id").unwrap_or_default(),
+                    &notification_field(head, "status").unwrap_or_default(),
+                    &notification_field(head, "summary").unwrap_or_default(),
+                );
+            }
+        }
+        delivered
+    }
+
     /// The one call, in any transcript, a task's `tool_use_id` names, unless
     /// that call starts or resumes a subagent. An Agent's task is its
     /// subagent, and a resumed agent's task names the `SendMessage` that
@@ -2248,8 +2354,17 @@ impl Claude {
         }
     }
 
+    fn nested_agent_tool(&self, tool: &str) -> bool {
+        !self.tools.contains_key(&ScopedId::new(None, tool))
+            && self.tools.iter().any(|(key, item)| {
+                key.id == tool
+                    && key.parent.is_some()
+                    && matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
+            })
+    }
+
     fn agent_tool(&self, tool: &str) -> bool {
-        self.unique_tool_named(tool, "Agent")
+        self.tools.contains_key(&ScopedId::new(None, tool)) && self.unique_tool_named(tool, "Agent")
     }
 
     fn unique_tool_named(&self, tool: &str, expected: &str) -> bool {
@@ -2267,6 +2382,14 @@ impl Claude {
         reported: Option<&str>,
         started: bool,
     ) -> Result<Option<String>, ()> {
+        if reported.is_some_and(|tool| {
+            self.nested_agent_tool(tool)
+                && self.tools.keys().filter(|key| key.id == tool).count() == 1
+        }) {
+            // An unscoped lifecycle notice for a helper of a worker cannot
+            // promote that helper into a direct child of the lead.
+            return Err(());
+        }
         let launched = self
             .agent_calls
             .iter()
@@ -2529,13 +2652,23 @@ impl Claude {
             }
             let id = format!("claude-task:{task}");
             let key = ScopedId::new(None, &id);
+            let failure_detail = (status == ToolStatus::Failed).then(|| {
+                let element = notification_elements(&content).into_iter().find(|element| {
+                    notification_tasks(element)
+                        .iter()
+                        .any(|known| known == &task)
+                });
+                element
+                    .map(notification_failure_detail)
+                    .unwrap_or_else(|| "The agent failed without reporting a reason".into())
+            });
             let status = self.update_task_agent(
                 &task,
                 Some(&owner),
                 false,
                 (!running).then_some(status),
                 status,
-                detail,
+                failure_detail.as_deref().or(detail),
                 step,
             );
             if !running {
@@ -2592,12 +2725,50 @@ impl Claude {
         }
     }
 
-    fn agent_call(&mut self, agent: &str, tool: &str) {
+    fn is_superseded(&self, tool: &str) -> bool {
+        self.superseded_agents.iter().any(|known| known == tool)
+    }
+
+    fn agent_call(&mut self, agent: &str, tool: &str) -> Option<String> {
+        if self.is_superseded(tool) {
+            return None;
+        }
+        let previous = self
+            .agent_calls
+            .iter()
+            .rev()
+            .find(|(known, old)| known == agent && old != tool)
+            .map(|(_, old)| old.clone());
+        if let Some(previous) = &previous {
+            self.superseded_agents.push_back(previous.clone());
+            if self.superseded_agents.len() > MAX_TOOLS {
+                self.superseded_agents.pop_front();
+            }
+            self.background_agents.remove(previous);
+            self.waiting_agents.remove(previous);
+            self.restarted_agents.retain(|known| known != previous);
+            self.ended_agents.retain(|(known, _)| known != previous);
+            self.ended_agents
+                .push_back((previous.clone(), ToolStatus::Ended));
+            let prior_tasks = self
+                .agent_task_calls
+                .iter()
+                .filter(|(known, _)| known == previous)
+                .map(|(_, task)| task.clone())
+                .collect::<Vec<_>>();
+            self.agent_task_calls.retain(|(known, _)| known != previous);
+            for task in prior_tasks {
+                if !self.agent_task_calls.iter().any(|(known, _)| known == tool) {
+                    self.agent_task_calls.push_back((tool.into(), task));
+                }
+            }
+        }
         self.agent_calls.retain(|(known, _)| known != agent);
         self.agent_calls.push_back((agent.into(), tool.into()));
         if self.agent_calls.len() > MAX_TOOLS {
             self.agent_calls.pop_front();
         }
+        previous
     }
     fn ended_agent(&self, tool: &str) -> Option<ToolStatus> {
         self.ended_agents
@@ -2828,11 +2999,6 @@ impl Adapter for Claude {
                 });
             }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
-            let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
-            calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
-            for (tool, agent) in calls {
-                self.agent_call(agent, tool);
-            }
             self.background_agents.extend(
                 history
                     .background_agent_tools
@@ -2845,28 +3011,17 @@ impl Adapter for Claude {
             for frame in frames {
                 self.history_message(&frame, &mut history_step)?;
             }
+            let mut calls = history.agent_addresses.iter().collect::<Vec<_>>();
+            calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
+            for (tool, agent) in calls {
+                self.agent_call(agent, tool);
+            }
             // Replayed Agent tool uses can reinsert completed background jobs.
             // The full history index is authoritative even when a sidecar is
             // absent or fell outside the bounded child-history window.
             self.background_agents
                 .retain(|id| history.agent_status.get(id) == Some(&ToolStatus::Running));
-            let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
-            statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
-            for (id, status) in statuses {
-                history_step.events.push(Event::Subagent {
-                    model: None,
-                    waiting: None,
-                    detail: None,
-                    id: id.clone(),
-                    kind: String::new(),
-                    description: String::new(),
-                    status: Some(*status),
-                    // Replayed launches say whether an agent ran in the
-                    // background, but this process never started it, so its
-                    // interrupt cannot stop it either.
-                    background: Some(false),
-                });
-            }
+            self.waiting_agents.clear();
             // Every launch the full history recorded, including those before
             // the page shown, so a later message to one still names it.
             let mut addresses = history.agent_addresses.iter().collect::<Vec<_>>();
@@ -2911,6 +3066,60 @@ impl Adapter for Claude {
                         history_step.events.extend(child_step.events);
                     }
                 }
+            }
+            let failure_details = history_step
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let Event::Subagent {
+                        id,
+                        status: Some(ToolStatus::Failed),
+                        detail: Some(detail),
+                        ..
+                    } = event
+                    {
+                        Some((id.clone(), detail.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashMap<_, _>>();
+            let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
+            statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
+            for (id, status) in statuses {
+                let status = if self.is_superseded(id) {
+                    &ToolStatus::Ended
+                } else {
+                    status
+                };
+                if *status == ToolStatus::Stopped {
+                    self.ended_agents.push_back((id.clone(), *status));
+                } else if *status == ToolStatus::Ended {
+                    self.unconfirmed_agents.insert(id.clone());
+                } else if *status == ToolStatus::Failed {
+                    self.recent_failed_agents.push_back(id.clone());
+                }
+                history_step.events.push(Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: if *status == ToolStatus::Ended {
+                        Some(
+                            "Earlier run ended; see its transcript for the recorded outcome".into(),
+                        )
+                    } else if *status == ToolStatus::Failed {
+                        failure_details.get(id).cloned()
+                    } else {
+                        None
+                    },
+                    id: id.clone(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(*status),
+                    // Replayed launches say whether an agent ran in the
+                    // background, but this process never started it, so its
+                    // interrupt cannot stop it either.
+                    background: Some(false),
+                });
             }
             let mut items = Vec::new();
             let mut children = Vec::new();
@@ -3174,6 +3383,39 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
+        for event in &mut step.events {
+            if let Event::Subagent {
+                id,
+                status,
+                waiting,
+                detail,
+                background,
+                ..
+            } = event
+                && self.is_superseded(id)
+            {
+                *status = Some(ToolStatus::Ended);
+                *waiting = Some(false);
+                *background = Some(false);
+                *detail = Some("Superseded by a later run of this agent".into());
+            }
+        }
+        for event in &step.events {
+            if let Event::Subagent {
+                id,
+                status: Some(status),
+                ..
+            } = event
+            {
+                self.recent_failed_agents.retain(|known| known != id);
+                if *status == ToolStatus::Failed {
+                    self.recent_failed_agents.push_back(id.clone());
+                    if self.recent_failed_agents.len() > MAX_TOOLS {
+                        self.recent_failed_agents.pop_front();
+                    }
+                }
+            }
+        }
         self.reconcile_waiting_agents(&mut step);
         Ok(step)
     }
@@ -3182,6 +3424,16 @@ impl Adapter for Claude {
 impl Claude {
     fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        if frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|parent| self.nested_agent_tool(parent))
+        {
+            // Forwarded grandchildren have no independent transcript in the
+            // lead conversation. Their launch/result tool row is retained in
+            // the direct worker's transcript; their own stream and outcome
+            // must neither create a peer nor settle that direct worker.
+            return Ok(step);
+        }
         // Reject only exact previously accepted receipts, before metadata or
         // lifecycle bookkeeping. An old child failure cannot re-block fresh
         // activity; parent result and unrelated SDK frames are untouched.
@@ -3285,6 +3537,10 @@ impl Claude {
                 self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.ended_agents.clear();
+                self.superseded_agents.clear();
+                self.unconfirmed_agents.clear();
+                self.recent_failed_agents.clear();
+                self.accepted_user_prompts.clear();
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
@@ -3511,6 +3767,15 @@ impl Claude {
                             .is_some_and(|submission| submission.deferred.is_some())
                     });
                 if !awaiting_delivery {
+                    if actual_user_prompt(&frame)
+                        && frame["parent_tool_use_id"]
+                            .as_str()
+                            .is_none_or(str::is_empty)
+                        && let Some(id) = frame["uuid"].as_str()
+                        && !self.submissions.contains_key(id)
+                    {
+                        self.accept_user_prompt(id, &mut step);
+                    }
                     self.message(&frame, &mut step)?;
                 }
             }
@@ -3782,6 +4047,11 @@ impl Claude {
                             self.queued.push(message.preview.clone());
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
+                        if matches!(state, "started" | "completed")
+                            && self.submissions.contains_key(id)
+                        {
+                            self.accept_user_prompt(id, &mut step);
+                        }
                         if state == "started" && self.submissions.contains_key(id) {
                             self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
@@ -4086,10 +4356,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
     let child: Vec<_> = events
         .drain(start..)
         .filter(|event| {
-            !matches!(
-                event,
-                Event::Status { .. } | Event::Usage(_) | Event::TurnStarted | Event::TurnSettled
-            )
+            // Helpers delegated by this worker are its own dependencies. Their
+            // Agent tool rows remain in its transcript, but listing them as
+            // peers double-counts the lead's direct delegated work.
+            match event {
+                Event::Subagent { id, .. } => id == parent,
+                Event::AgentAddress(_) => false,
+                Event::Status { .. }
+                | Event::Usage(_)
+                | Event::TurnStarted
+                | Event::TurnSettled => false,
+                _ => true,
+            }
         })
         .map(|event| match event {
             Event::Item(mut item) => {
@@ -4168,6 +4446,29 @@ fn slash_command_prompt(content: &str) -> Option<String> {
     } else {
         format!("{name} {args}")
     })
+}
+
+/// Only a person's new prompt advances the scope of recent failures.
+fn actual_user_prompt(frame: &Value) -> bool {
+    if string(frame, "type") != "user"
+        || model_only(frame)
+        || frame["origin"]["kind"]
+            .as_str()
+            .is_some_and(|kind| kind != "human")
+    {
+        return false;
+    }
+    let content = &frame["message"]["content"];
+    let prompt = content.is_string()
+        || content.as_array().is_some_and(|blocks| {
+            !blocks
+                .iter()
+                .any(|block| string(block, "type") == "tool_result")
+                && blocks
+                    .iter()
+                    .any(|block| matches!(string(block, "type"), "text" | "image" | "document"))
+        });
+    prompt && delivery(frame).is_empty()
 }
 
 /// What a user frame Claude Code wrote on another agent's behalf delivers,
@@ -4499,14 +4800,7 @@ fn attribute(attributes: &str, name: &str) -> Option<String> {
     let pattern = format!(" {name}=\"");
     let start = attributes.find(&pattern)? + pattern.len();
     let end = attributes[start..].find('"')?;
-    Some(
-        attributes[start..start + end]
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
+    Some(decode_xml_text(&attributes[start..start + end]))
 }
 
 /// Parses an `<agent-message>` or `<cross-session-message>` element, which is
@@ -4693,7 +4987,48 @@ fn notification_field(inner: &str, name: &str) -> Option<String> {
     } else {
         inner[start..].find(&close)?
     };
-    Some(inner[start..start + end].trim().to_owned())
+    Some(decode_xml_text(inner[start..start + end].trim()))
+}
+
+/// Decode one XML text/attribute boundary. Splitting the original input once
+/// prevents a literal `&amp;lt;` from becoming `<`; malformed references survive.
+fn decode_xml_text(text: &str) -> String {
+    let mut parts = text.split('&');
+    let mut decoded = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        let entity = part.split_once(';').and_then(|(name, rest)| {
+            let value = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => name.strip_prefix('#').and_then(|number| {
+                    let (digits, radix) = number
+                        .strip_prefix('x')
+                        .or_else(|| number.strip_prefix('X'))
+                        .map_or((number, 10), |digits| (digits, 16));
+                    (!digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)))
+                        .then(|| u32::from_str_radix(digits, radix).ok())
+                        .flatten()
+                        .and_then(char::from_u32)
+                        .filter(|c| *c != '\0')
+                }),
+            }?;
+            Some((value, rest))
+        });
+        match entity {
+            Some((value, rest)) => {
+                decoded.push(value);
+                decoded.push_str(rest);
+            }
+            None => {
+                decoded.push('&');
+                decoded.push_str(part);
+            }
+        }
+    }
+    decoded
 }
 
 /// The tasks a notification's head names. A resumed session reports all its
@@ -4807,6 +5142,35 @@ fn notification_outcomes(content: &str) -> Vec<(String, String, ToolStatus)> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn bounded_failure_detail<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut detail = String::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() || detail == part {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push_str("\n\n");
+        }
+        let remaining = RECORDED_SUMMARY_BYTES.saturating_sub(detail.len());
+        detail.push_str(&part[..part.floor_char_boundary(remaining.min(part.len()))]);
+        if detail.len() >= RECORDED_SUMMARY_BYTES {
+            break;
+        }
+    }
+    if detail.is_empty() {
+        "The agent failed without reporting a reason".into()
+    } else {
+        detail
+    }
+}
+
+fn notification_failure_detail(element: &str) -> String {
+    let summary = notification_field(element, "summary").unwrap_or_default();
+    let result = notification_field(element, "result").unwrap_or_default();
+    bounded_failure_detail([summary.as_str(), result.as_str()])
 }
 
 /// What the tasks in a live notification are doing, as tool-use ID, task ID and
@@ -4964,7 +5328,7 @@ fn task_status(status: &str, notification: bool) -> Option<ToolStatus> {
     match status {
         "completed" => Some(ToolStatus::Succeeded),
         "failed" => Some(ToolStatus::Failed),
-        "killed" | "stopped" => Some(ToolStatus::Stopped),
+        "killed" | "stopped" | "cancelled" | "canceled" => Some(ToolStatus::Stopped),
         _ if notification => Some(ToolStatus::Succeeded),
         _ => None,
     }
@@ -5050,24 +5414,101 @@ fn recorded_notification(record: &Value) -> Option<String> {
 
 fn task_notification(inner: &str) -> ItemContent {
     let element = |name: &str| notification_field(inner, name);
-    let summary = element("summary")
-        .or_else(|| element("status").map(|status| format!("Background task {status}")))
-        .unwrap_or_else(|| "Background task updated".into());
+    let mut summary = element("summary")
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or_else(|| background_task_heading(&element("status").unwrap_or_default(), ""));
     // A finished agent's result is its report: headless Claude Code hands a
     // background agent's final message back this way rather than as a peer's.
-    let (kind, body) = match element("result") {
+    let (kind, mut body) = match element("result") {
         Some(result) => match pointer(&result) {
             Some(shown) => (DeliveryKind::Notice, shown.to_owned()),
             None => (DeliveryKind::Report, result),
         },
         None => (DeliveryKind::Notice, element("event").unwrap_or_default()),
     };
+    if kind == DeliveryKind::Notice {
+        if let Some((heading, command)) = command_notification(
+            &summary,
+            &element("status").unwrap_or_default(),
+            "",
+            "",
+            false,
+        ) {
+            summary = heading;
+            body = command;
+        }
+    }
     ItemContent::Delivery {
         kind,
         from: String::new(),
         sender: element("task-id").unwrap_or_default(),
         summary,
         body,
+    }
+}
+
+/// A background completion's prose is a status, not a useful title or output.
+/// Keep its command available once as literal detail and use only the original
+/// Bash description as a human title. A lifecycle task's description can be the
+/// raw shell command, so it is not sufficient provenance for a title.
+fn command_notification(
+    summary: &str,
+    status: &str,
+    description: &str,
+    command: &str,
+    known_command: bool,
+) -> Option<(String, String)> {
+    let rest = summary.strip_prefix("Background command ");
+    if rest.is_none() && !known_command {
+        return None;
+    }
+    let exit = summary_exit_code(summary);
+    let outcome_text = background_command_outcome(summary);
+    let failed = exit.is_some_and(|exit| exit != 0)
+        || matches!(status, "failed" | "error")
+        || outcome_text.is_some_and(|outcome| {
+            outcome == "failed" || outcome.starts_with("failed with exit code ")
+        });
+    let outcome = if failed {
+        exit.map_or_else(|| "failed".into(), |exit| format!("failed (exit {exit})"))
+    } else if matches!(status, "stopped" | "killed")
+        || outcome_text.is_some_and(|outcome| outcome.starts_with("was "))
+    {
+        "stopped".into()
+    } else {
+        "finished".into()
+    };
+    let heading = if description.trim().is_empty()
+        || description.trim() == command.trim()
+        || description.contains('\n')
+    {
+        format!("Background command {outcome}")
+    } else {
+        format!("{} · {outcome}", description.trim())
+    };
+    let detail = if command.trim().is_empty() {
+        rest.zip(outcome_text)
+            .and_then(|(text, outcome)| text.strip_suffix(outcome))
+            .and_then(|subject| subject.trim_end().strip_prefix('"')?.strip_suffix('"'))
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        command.to_owned()
+    };
+    Some((heading, detail))
+}
+
+/// Use the same fallback when either transport omits an informative summary.
+fn background_task_heading(status: &str, description: &str) -> String {
+    let status = if status.trim().is_empty() {
+        "updated"
+    } else {
+        status.trim()
+    };
+    if description.is_empty() {
+        format!("Background task {status}")
+    } else {
+        format!("Background task \"{description}\" {status}")
     }
 }
 
@@ -5080,21 +5521,31 @@ fn live_notification(frame: &Value, description: &str, kind: Option<ReportTask>)
     let status = string(frame, "status");
     let task = string(frame, "task_id").to_owned();
     let Some(task_kind) = kind else {
+        // Stream-json fields are JSON strings, not XML text. Their literal
+        // entities must survive; only the recorded wrapper is decoded.
+        let command = command_notification(summary, status, "", "", false);
         return ItemContent::Delivery {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: task,
-            summary: match (summary.is_empty(), description.is_empty()) {
-                (false, _) => summary.into(),
-                (true, false) => format!("Background task \"{description}\" {status}"),
-                (true, true) => format!("Background task {status}"),
-            },
-            body: String::new(),
+            summary: command
+                .as_ref()
+                .map(|(heading, _)| heading.clone())
+                .unwrap_or_else(|| {
+                    if summary.is_empty() {
+                        background_task_heading(status, description)
+                    } else {
+                        summary.into()
+                    }
+                }),
+            body: command
+                .map(|(_, detail)| detail)
+                .unwrap_or_else(|| string(frame, "event").to_owned()),
         };
     };
     let origin = match task_kind {
-        ReportTask::Agent => "Native subagent",
-        ReportTask::Workflow => "Native workflow",
+        ReportTask::Agent => "Agent",
+        ReportTask::Workflow => "Workflow",
     };
     let subject = if description.is_empty() {
         origin.to_owned()
@@ -5376,15 +5827,60 @@ fn refusal(text: &str, structured: &Value) -> Option<ToolStatus> {
     }
 }
 
-/// The exit status a background command's notification gives in its
-/// summary, `Background command "…" completed (exit code 0)`.
+/// The harness's complete terminal outcome, excluding its quoted subject.
+fn background_command_outcome(summary: &str) -> Option<&str> {
+    let rest = summary.strip_prefix("Background command ")?.trim();
+    let terminal = |outcome: &str| {
+        matches!(
+            outcome,
+            "completed"
+                | "failed"
+                | "was stopped"
+                | "was stopped because the system is running low on memory"
+                | "was stopped after reaching its background time limit"
+        ) || background_outcome_exit_code(outcome).is_some()
+    };
+    let Some(quoted) = rest.strip_prefix('"') else {
+        return terminal(rest).then_some(rest);
+    };
+    quoted.rmatch_indices('"').find_map(|(at, _)| {
+        let outcome = quoted[at + 1..].trim();
+        terminal(outcome).then_some(outcome)
+    })
+}
+
+/// Parse the whole exit clause so a quoted phrase in an explanation cannot
+/// become the terminal outcome. Parentheses inside quotes are literal output.
+fn background_outcome_exit_code(outcome: &str) -> Option<i32> {
+    if let Some(code) = outcome.strip_prefix("failed with exit code ") {
+        return code.parse().ok();
+    }
+    let clause = outcome
+        .strip_prefix("completed (exit code ")
+        .or_else(|| outcome.strip_prefix("failed (exit code "))?
+        .strip_suffix(')')?;
+    let (code, explanation) = clause.split_once(": ").unwrap_or((clause, ""));
+    let code = code.parse().ok()?;
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for character in explanation.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    (depth == 0 && !quoted && !escaped).then_some(code)
+}
+
+/// The exit status in the outcome, never a phrase inside the command itself.
 fn summary_exit_code(summary: &str) -> Option<i32> {
-    let (_, rest) = summary.rsplit_once("exit code ")?;
-    let end = rest
-        .char_indices()
-        .find(|&(at, c)| !(c.is_ascii_digit() || (at == 0 && c == '-')))
-        .map_or(rest.len(), |(at, _)| at);
-    rest[..end].parse().ok()
+    background_outcome_exit_code(background_command_outcome(summary)?)
 }
 
 fn image_content(block: &Value) -> ItemContent {
@@ -5594,7 +6090,10 @@ impl Claude {
                         id: parent.clone(),
                         kind: String::new(),
                         description: String::new(),
-                        status: None,
+                        status: self
+                            .unconfirmed_agents
+                            .remove(&parent)
+                            .then_some(ToolStatus::Running),
                         background: None,
                         model: None,
                         waiting: Some(false),
@@ -6197,13 +6696,18 @@ impl Claude {
                 {
                     self.background_agents.insert(tool.clone());
                 }
+                let failure_detail = (ended == Some(ToolStatus::Failed)).then(|| {
+                    bounded_failure_detail([string(patch, "summary"), string(patch, "result")])
+                });
                 let status = self.update_task_agent(
                     task,
                     known_tool.as_deref(),
                     started,
                     ended,
                     item.content.status().unwrap_or(ToolStatus::Running),
-                    (ended == Some(ToolStatus::Waiting)).then_some(WAITING_ON_BACKGROUND),
+                    failure_detail.as_deref().or_else(|| {
+                        (ended == Some(ToolStatus::Waiting)).then_some(WAITING_ON_BACKGROUND)
+                    }),
                     step,
                 );
                 if let ItemContent::Tool {
@@ -6287,8 +6791,14 @@ impl Claude {
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
                     if recorded {
-                        let content =
-                            self.deduplicate(live_notification(frame, &description, kind));
+                        let mut content = live_notification(frame, &description, kind);
+                        self.command_delivery(
+                            &mut content,
+                            string(frame, "tool_use_id"),
+                            string(frame, "status"),
+                            string(frame, "summary"),
+                        );
+                        let content = self.deduplicate(content);
                         step.events.push(Event::Item(Item {
                             id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
                             role: Role::User,
@@ -6376,6 +6886,9 @@ struct History {
     /// only the agent's type, which must not rename it on resume.
     agent_names: HashMap<String, String>,
     agent_status: HashMap<String, ToolStatus>,
+    /// Latest actual user prompt on the displayed chain; provider notices and
+    /// tool-result carriers never advance the current failure scope.
+    latest_prompt: Option<u64>,
     background_agent_tools: HashSet<String>,
     /// How the background work other calls started ended, by call, as the
     /// transcript's notifications recorded it. One entry per notified call,
@@ -6771,6 +7284,7 @@ impl History {
         let mut message_offsets = HashMap::<String, usize>::new();
         let mut retracted = std::collections::HashSet::<String>::new();
         let mut task_notices = Vec::new();
+        let mut user_prompts = HashSet::new();
         let mut main_message: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
@@ -6840,6 +7354,9 @@ impl History {
                         string(&value, "subtype"),
                         "task_started" | "task_progress" | "task_notification" | "task_updated"
                     ));
+            if main && !task_notice && actual_user_prompt(&value) {
+                user_prompts.insert(record_offset);
+            }
             if main && task_notice {
                 if task_notices.len() >= 200_000 {
                     return Err(
@@ -7252,6 +7769,11 @@ impl History {
             .fold((0, 0), |(damaged, oversized), gap| {
                 (damaged + gap.damaged, oversized + gap.oversized)
             });
+        let latest_prompt = chain
+            .iter()
+            .filter_map(Link::offset)
+            .filter(|offset| user_prompts.contains(offset))
+            .max();
         let offset = chain.len();
         let mut history = Self {
             file,
@@ -7265,6 +7787,7 @@ impl History {
             agent_addresses: HashMap::new(),
             agent_names: HashMap::new(),
             agent_status: HashMap::new(),
+            latest_prompt,
             background_agent_tools: HashSet::new(),
             call_outcomes: HashMap::new(),
             result_calls,
@@ -7276,34 +7799,39 @@ impl History {
         history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
         Ok(history)
     }
-    /// Settles each agent the transcript leaves running that the user stopped,
-    /// which Claude Code records only in the agent's sidecar metadata, and each
-    /// it leaves waiting.
+    /// A transcript records what ran, not proof of a process still running.
+    /// Keep confirmed terminal outcomes; unresolved runs have ended for the
+    /// newly attached process until live frames say
+    /// otherwise. Explicit cancellation remains distinct.
     fn settle_stopped(&mut self) {
-        // The process an agent was waiting in is gone by the time history is
-        // read, and nothing is left to report on it.
-        for status in self.agent_status.values_mut() {
-            if *status == ToolStatus::Waiting {
-                *status = ToolStatus::Stopped;
-            }
-        }
-        let Some(dir) = &self.subagent_dir else {
-            return;
-        };
-        for (tool, status) in &mut self.agent_status {
-            if *status != ToolStatus::Running {
+        for tool in self.agent_tools.keys() {
+            let status = self
+                .agent_status
+                .entry(tool.clone())
+                .or_insert(ToolStatus::Ended);
+            if !status.is_live() {
                 continue;
             }
-            let Some(agent) = self.agent_ids.get(tool).filter(|agent| {
-                !agent.is_empty() && agent.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            }) else {
-                continue;
+            let stopped = self
+                .subagent_dir
+                .as_ref()
+                .and_then(|dir| {
+                    self.agent_ids
+                        .get(tool)
+                        .filter(|agent| {
+                            !agent.is_empty()
+                                && agent.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                        })
+                        .and_then(|agent| {
+                            sidecar_meta(&dir.join(format!("agent-{agent}.meta.json")))
+                        })
+                })
+                .is_some_and(|meta| meta["stoppedByUser"].as_bool() == Some(true));
+            *status = if stopped {
+                ToolStatus::Stopped
+            } else {
+                ToolStatus::Ended
             };
-            if sidecar_meta(&dir.join(format!("agent-{agent}.meta.json")))
-                .is_some_and(|meta| meta["stoppedByUser"].as_bool() == Some(true))
-            {
-                *status = ToolStatus::Stopped;
-            }
         }
     }
     /// Load only children linked by a tool-use ID in this exact parent session.
@@ -9261,10 +9789,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.status, ToolStatus::Failed);
         assert!(!child.waiting);
-        assert!(
-            child.detail.is_empty(),
-            "terminal transient-detail cleanup remains unchanged"
-        );
+        assert_eq!(child.detail, "The child task failed");
         assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
         let failures: Vec<_> = child
             .items
@@ -12533,6 +13058,355 @@ mod tests {
     }
 
     #[test]
+    fn xml_notification_fields_decode_once_including_numeric_references() {
+        let source = "&amp; &lt; &gt; &quot; &apos; &#38; &#x3E; &#X3c; &#128276; &amp;lt;";
+        let expected = "& < > \" ' & > < 🔔 &lt;";
+        for field in ["summary", "result", "event", "note", "status"] {
+            assert_eq!(
+                notification_field(&format!("<{field}>{source}</{field}>"), field).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            decode_xml_text("&unknown; &#; &#x; &#xD800; &#1114112; &#0; &#-1; &unfinished"),
+            "&unknown; &#; &#x; &#xD800; &#1114112; &#0; &#-1; &unfinished"
+        );
+        assert_eq!(
+            attribute(" summary=\"A &#38; B &amp;lt; C\"", "summary").as_deref(),
+            Some("A & B &lt; C")
+        );
+        let content = "<task-notification><task-id>a1</task-id><status>complet&#101;d</status><summary>Agent &quot;Inspect&quot; finished</summary><note>Reports may be &#105;nterim</note><result>Use &lt;input&gt; &amp;&amp; echo &quot;ready&quot; &gt; output; literal &amp;lt;</result></task-notification>";
+        let fields = notice_fields(content);
+        assert!(interim_notice(
+            &notification_field(content, "status").unwrap(),
+            &fields
+        ));
+        assert!(
+            matches!(&task_notifications(content)[..], [ItemContent::Delivery { kind: DeliveryKind::Report, body, .. }] if body == "Use <input> && echo \"ready\" > output; literal &lt;")
+        );
+    }
+
+    #[test]
+    fn empty_notification_summaries_share_live_and_history_status_fallback() {
+        for (xml_summary, live_summary) in [
+            ("", ""),
+            ("<summary></summary>", ""),
+            ("<summary> \n </summary>", " \n "),
+            ("<summary>&#32;</summary>", " "),
+        ] {
+            for (xml_status, status, heading) in [
+                (
+                    "<status>completed</status>",
+                    "completed",
+                    "Background task completed",
+                ),
+                (
+                    "<status>failed</status>",
+                    "failed",
+                    "Background task failed",
+                ),
+                ("<status></status>", "", "Background task updated"),
+                ("", "", "Background task updated"),
+            ] {
+                let xml = format!(
+                    "<task-notification><task-id>task</task-id>{xml_status}{xml_summary}</task-notification>"
+                );
+                let recorded = json!({"type":"user","uuid":"empty-notice","message":{"role":"user","content":xml}});
+                let live = json!({"task_id":"task","status":status,"summary":live_summary});
+                let expected = live_notification(&live, "", None);
+                assert!(
+                    matches!(&expected, ItemContent::Delivery { summary, body, .. } if summary == heading && body.is_empty())
+                );
+                let read = Claude::default().receive(recorded.clone()).unwrap();
+                assert_eq!(deliveries(&read), vec![(Role::User, expected.clone())]);
+                let records = correlation_history(vec![recorded]).page().unwrap();
+                let mut restored = Step::default();
+                Claude::default()
+                    .history_message(&records[0], &mut restored)
+                    .unwrap();
+                assert_eq!(deliveries(&restored), vec![(Role::User, expected)]);
+            }
+        }
+    }
+
+    #[test]
+    fn command_deliveries_have_plain_outcomes_and_match_live_and_recorded_text() {
+        let command = "cd /workspace/logs && until grep -q \"^\\[rss\\]\" fast-frag1.log 2>/dev/null; do sleep 20; done; cat < fast-frag1.log > latest.log; printf '&lt;'";
+        let escaped = command
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        for (status, exit, ending) in [
+            ("completed", 0, "finished"),
+            ("completed", 1, "failed (exit 1)"),
+            ("failed", 1, "failed (exit 1)"),
+            ("failed", 0, "failed (exit 0)"),
+        ] {
+            let summary = format!("Background command \"{command}\" completed (exit code {exit})");
+            let xml = format!(
+                "<task-notification><task-id>task</task-id><tool-use-id>bash</tool-use-id><status>{status}</status><summary>Background command &quot;{escaped}&quot; completed (exit code {exit})</summary></task-notification>"
+            );
+            let frame =
+                json!({"type":"user","uuid":"done","message":{"role":"user","content":xml}});
+            let live =
+                json!({"task_id":"task","tool_use_id":"bash","status":status,"summary":summary});
+            assert_eq!(
+                task_notifications(&xml),
+                vec![live_notification(&live, "", None)]
+            );
+            assert!(
+                matches!(&task_notifications(&xml)[..], [ItemContent::Delivery { summary, body, .. }] if summary == &format!("Background command {ending}") && body == command)
+            );
+            let mut adapter = Claude::default();
+            adapter
+                .receive(scoped_call(
+                    None,
+                    "call",
+                    "bash",
+                    "Bash",
+                    json!({"command":command,"description":"Wait for k-gather logs"}),
+                ))
+                .unwrap();
+            let recorded = adapter.deliveries(&frame).remove(0);
+            let mut streamed = live_notification(&live, "", None);
+            adapter.command_delivery(&mut streamed, "bash", status, &summary);
+            assert_eq!(recorded, streamed);
+            assert!(
+                matches!(recorded, ItemContent::Delivery { summary, body, .. } if summary == format!("Wait for k-gather logs · {ending}") && body == command)
+            );
+        }
+        // A task's description alone can be raw shell; it is not a Bash label.
+        let live = json!({"task_id":"task","status":"completed","summary":"Background command \"echo x > y\" completed (exit code 0)"});
+        assert!(
+            matches!(live_notification(&live, "echo x > y", None), ItemContent::Delivery { summary, body, .. } if summary == "Background command finished" && body == "echo x > y")
+        );
+    }
+
+    #[test]
+    fn command_outcomes_ignore_exit_codes_quoted_in_the_command_or_description() {
+        let command = "grep 'exit code 1' logs";
+        for description in ["", "Search for exit code 1"] {
+            let subject = if description.is_empty() {
+                command
+            } else {
+                description
+            };
+            for (status, outcome, ended, code, ending) in [
+                (
+                    "stopped",
+                    "was stopped",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                (
+                    "killed",
+                    "was stopped",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                ("failed", "failed", ToolStatus::Failed, None, "failed"),
+                (
+                    "completed",
+                    "completed",
+                    ToolStatus::Succeeded,
+                    None,
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0)",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "failed",
+                    "failed with exit code 101",
+                    ToolStatus::Failed,
+                    Some(101),
+                    "failed (exit 101)",
+                ),
+                (
+                    "failed",
+                    "failed with exit code -9",
+                    ToolStatus::Failed,
+                    Some(-9),
+                    "failed (exit -9)",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"exit code 1\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"failed with exit code 1\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"was stopped\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"completed (exit code 1)\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \"completed (exit code 1: inner)\")",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "completed",
+                    "completed (exit code 0: grep reports \")\" (matched))",
+                    ToolStatus::Succeeded,
+                    Some(0),
+                    "finished",
+                ),
+                (
+                    "killed",
+                    "was stopped because the system is running low on memory",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+                (
+                    "killed",
+                    "was stopped after reaching its background time limit",
+                    ToolStatus::Stopped,
+                    None,
+                    "stopped",
+                ),
+            ] {
+                let summary = format!("Background command \"{subject}\" {outcome}");
+                assert_eq!(summary_exit_code(&summary), code, "{summary}");
+                let reported = TaskOutcome::new(ended, &summary);
+                assert_eq!(reported.exit_code, code);
+                let escaped = summary
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&apos;");
+                let xml = format!(
+                    "<task-notification><task-id>task</task-id><tool-use-id>bash</tool-use-id><status>{status}</status><summary>{escaped}</summary></task-notification>"
+                );
+                let live = json!({"type":"system","subtype":"task_notification","uuid":"live-outcome","task_id":"task","tool_use_id":"bash","status":status,"summary":summary});
+                let recorded = json!({"type":"user","uuid":"recorded-outcome","message":{"role":"user","content":xml}});
+                assert_eq!(
+                    task_notifications(&xml),
+                    vec![live_notification(&live, "", None)]
+                );
+                assert!(
+                    matches!(&task_notifications(&xml)[..], [ItemContent::Delivery { body, .. }] if body == subject),
+                    "an exit explanation is not part of the quoted command detail"
+                );
+                for frame in [live, recorded] {
+                    let mut adapter = Claude::default();
+                    adapter.receive(scoped_call(None, "call", "bash", "Bash", json!({"command":command,"description":description,"run_in_background":true}))).unwrap();
+                    adapter.receive(json!({"type":"user","uuid":"launch","tool_use_result":{"backgroundTaskId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"bash","content":"Command running in background with ID: task."}]}})).unwrap();
+                    adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"bash","task_type":"local_bash","description":subject})).unwrap();
+                    let finished = adapter.receive(frame).unwrap();
+                    assert!(
+                        matches!(shown_command(&finished, "bash"), Some((None, ItemContent::Command { status, exit_code, .. })) if status == ended && exit_code == code),
+                        "{summary}"
+                    );
+                    let expected = if description.is_empty() {
+                        format!("Background command {ending}")
+                    } else {
+                        format!("{description} · {ending}")
+                    };
+                    assert_eq!(notice_summaries(&finished), [expected], "{summary}");
+                    assert!(finished.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Delivery { kind: DeliveryKind::Notice, body, .. }, .. }) if body == command
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_outcomes_require_a_complete_terminal_clause() {
+        for outcome in [
+            "failed with exit code 1\")",
+            "failed with exit code 1)",
+            "completed (exit code 1)\")",
+            "completed (exit code 1: unmatched))",
+            "completed (exit code 1: \"unclosed)",
+            "was stopped\")",
+        ] {
+            assert!(
+                background_command_outcome(&format!("Background command \"grep logs\" {outcome}"))
+                    .is_none(),
+                "{outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_reports_match_raw_live_json_and_escaped_history() {
+        let xml = "<task-notification><task-id>agent</task-id><status>completed</status><summary>Agent &quot;Inspect &amp; report&quot; finished</summary><result>## Findings\nUse &lt;input&gt; &amp;&amp; echo &gt; file; literal &amp;lt;</result></task-notification>";
+        let live = json!({"task_id":"agent","status":"completed","summary":"## Findings\nUse <input> && echo > file; literal &lt;"});
+        assert_eq!(
+            task_notifications(xml),
+            vec![live_notification(
+                &live,
+                "Inspect & report",
+                Some(ReportTask::Agent)
+            )]
+        );
+    }
+
+    #[test]
+    fn monitor_deliveries_use_description_and_literal_event_output() {
+        let xml = "<task-notification><task-id>monitor</task-id><summary>Monitor event: &quot;casmi GPU jobs finishing&quot;</summary><event>k-gather-1 done: 1 failed, 3 passed in 28.96s; x &lt; y &amp;&amp; y &gt; z; literal &amp;lt;</event></task-notification>";
+        let live = json!({"task_id":"monitor","summary":"Monitor event: \"casmi GPU jobs finishing\"","event":"k-gather-1 done: 1 failed, 3 passed in 28.96s; x < y && y > z; literal &lt;"});
+        assert_eq!(
+            task_notifications(xml),
+            vec![live_notification(&live, "", None)]
+        );
+        assert!(
+            matches!(&task_notifications(xml)[..], [ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. }] if summary == "Monitor event: \"casmi GPU jobs finishing\"" && body.contains("1 failed, 3 passed") && body.ends_with("literal &lt;"))
+        );
+    }
+
+    #[test]
+    fn peer_xml_attributes_decode_but_peer_json_and_message_bodies_stay_literal() {
+        let text = "Literal &lt;input&gt; && echo > file";
+        let xml = format!(
+            "<cross-session-message from=\"session-1\" from-name=\"Build &#38; inspect\">\n{text}\n</cross-session-message>"
+        );
+        assert!(
+            matches!(peer_envelope(&xml).unwrap().finish(false), ItemContent::Delivery { from, body, .. } if from == "Build & inspect" && body == text)
+        );
+        let frame = json!({"origin":{"kind":"peer","name":"A &amp; B","body":text},"message":{"content":"unused"}});
+        assert!(
+            matches!(&delivery(&frame)[..], [ItemContent::Delivery { from, body, .. }] if from == "A &amp; B" && body == text)
+        );
+        let team = format!(
+            "<teammate-message teammate_id=\"tester\" summary=\"x &lt; y &#38; z\">\n{text}\n</teammate-message>"
+        );
+        assert!(
+            matches!(&teammate_messages(&team)[..], [ItemContent::Delivery { summary, body, .. }] if summary == "x < y & z" && body == text)
+        );
+    }
+
+    #[test]
     fn task_notification_reads_as_a_notice() {
         let mut adapter = Claude::default();
         let finished = adapter
@@ -12553,8 +13427,8 @@ mod tests {
                     kind: DeliveryKind::Notice,
                     from: String::new(),
                     sender: "bw86v5sk1".into(),
-                    summary: "Background command \"Rank runs\" completed (exit code 0)".into(),
-                    body: String::new(),
+                    summary: "Background command finished".into(),
+                    body: "Rank runs".into(),
                 }
             )]
         );
@@ -12720,8 +13594,8 @@ mod tests {
         assert_eq!(
             summaries,
             [
-                "Background command \"a\" completed (exit code 0)",
-                "Background command \"b\" failed with exit code 1"
+                "Background command finished",
+                "Background command failed (exit 1)"
             ]
         );
         let plain = adapter
@@ -12821,7 +13695,7 @@ mod tests {
                 content: ItemContent::Delivery { kind: DeliveryKind::Report, summary, body, .. },
                 ..
             }) if id == "claude-notification:agent1:n1"
-                && summary == "Native subagent \"Fruit report\" finished"
+                && summary == "Agent \"Fruit report\" finished"
                 && body == "## Fruit\nApples."
         )));
         let completed = adapter
@@ -12833,7 +13707,7 @@ mod tests {
                 role: Role::User,
                 content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. },
                 ..
-            }) if summary == "Background command \"Sleep then echo\" completed (exit code 0)" && body.is_empty()
+            }) if summary == "Background command finished" && body == "Sleep then echo"
         )));
         for flag in ["skip_transcript", "ambient"] {
             let quiet = adapter
@@ -12855,16 +13729,12 @@ mod tests {
     #[test]
     fn live_native_report_headings_identify_origin_and_terminal_outcome() {
         for (description, status, expected) in [
-            ("Review", "completed", "Native subagent \"Review\" finished"),
-            ("Review", "failed", "Native subagent \"Review\" failed"),
-            (
-                "Review",
-                "stopped",
-                "Native subagent \"Review\" was stopped",
-            ),
-            ("", "completed", "Native subagent finished"),
-            ("", "failed", "Native subagent failed"),
-            ("", "killed", "Native subagent was stopped"),
+            ("Review", "completed", "Agent \"Review\" finished"),
+            ("Review", "failed", "Agent \"Review\" failed"),
+            ("Review", "stopped", "Agent \"Review\" was stopped"),
+            ("", "completed", "Agent finished"),
+            ("", "failed", "Agent failed"),
+            ("", "killed", "Agent was stopped"),
         ] {
             let frame = json!({"task_id":"child", "status":status, "summary":"Findings"});
             assert!(
@@ -12881,12 +13751,8 @@ mod tests {
     #[test]
     fn native_task_reports_keep_their_explicit_origin_through_progress_frames() {
         for (kind, heading, report) in [
-            ("local_agent", "Native subagent \"Review\" finished", true),
-            (
-                "local_workflow",
-                "Native workflow \"Review\" finished",
-                true,
-            ),
+            ("local_agent", "Agent \"Review\" finished", true),
+            ("local_workflow", "Workflow \"Review\" finished", true),
             ("local_bash", "Findings", false),
             ("unknown", "Findings", false),
         ] {
@@ -13273,6 +14139,445 @@ mod tests {
     }
 
     #[test]
+    fn recorded_current_agent_scene_counts_only_direct_current_work() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(include_bytes!(
+            "../../../tests/fixtures/live-agent-status-history.jsonl"
+        ))
+        .unwrap();
+        file.rewind().unwrap();
+        let history = History::index(file, "a2753000-0000-4000-8000-000000000001").unwrap();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Default::default()
+        };
+        let mut snapshot = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(
+            &mut snapshot,
+            adapter.initialize().unwrap().events,
+        );
+        let activity = snapshot.subagent_activity();
+        assert_eq!(
+            (
+                activity.working,
+                activity.waiting,
+                activity.on_background_work,
+                activity.failed.len()
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .filter(|agent| agent.id.starts_with("toolu_archive_"))
+                .all(|agent| agent.status == ToolStatus::Ended)
+        );
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .all(|agent| !agent.status.is_live())
+        );
+        for line in include_str!("../../../tests/fixtures/live-agent-status-live.jsonl").lines() {
+            let mut frame: Value = serde_json::from_str(line).unwrap();
+            if frame["_end"] == true {
+                continue;
+            }
+            frame.as_object_mut().unwrap().remove("_live");
+            crate::chat::runtime::project_events_for_test(
+                &mut snapshot,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        let activity = snapshot.subagent_activity();
+        assert_eq!(
+            (
+                activity.working,
+                activity.waiting,
+                activity.on_background_work,
+                activity.failed.len()
+            ),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(activity.failed[0].id, "toolu_failed");
+        assert!(activity.failed[0].detail.contains("rollback"));
+        assert!(
+            !snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.id == "toolu_nested")
+        );
+        let worker = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "toolu_worker_1")
+            .unwrap();
+        assert!(worker.items.iter().any(|item| item.id == "toolu_nested"));
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.status == ToolStatus::Stopped)
+        );
+        assert_eq!(snapshot.activity(), chat::ActivityState::Waiting);
+        assert!(snapshot.holds_work());
+        let failed_transcript = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "toolu_retry_old")
+            .unwrap();
+        assert_eq!(failed_transcript.status, ToolStatus::Ended);
+        crate::chat::runtime::project_events_for_test(&mut snapshot, vec![Event::TurnStarted]);
+        assert_eq!(snapshot.subagent_activity().failed.len(), 1);
+    }
+
+    #[test]
+    fn explicit_agent_resume_retires_old_failure_and_ignores_late_old_receipts() {
+        let mut adapter = Claude::default();
+        let mut snapshot = chat::Snapshot::default();
+        let frames = [
+            scoped_call(
+                None,
+                "old-call",
+                "old-agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"user","uuid":"old-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"same-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-agent","content":"Launched"}]}}),
+            json!({"type":"result","uuid":"old-failure","parent_tool_use_id":"old-agent","subtype":"error_during_execution","is_error":true,"errors":["Old attempt failed"]}),
+            scoped_call(
+                None,
+                "new-call",
+                "new-agent",
+                "Agent",
+                json!({"run_in_background":true,"resume":"same-agent"}),
+            ),
+            json!({"type":"user","uuid":"new-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"same-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"new-agent","content":"Launched"}]}}),
+            // A distinct late receipt is not an exact-frame replay; explicit
+            // supersession still prevents it becoming a current failure.
+            json!({"type":"result","uuid":"late-old-failure","parent_tool_use_id":"old-agent","subtype":"error_during_execution","is_error":true,"errors":["Old attempt failed again"]}),
+        ];
+        for frame in frames {
+            crate::chat::runtime::project_events_for_test(
+                &mut snapshot,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(snapshot.subagent_activity().working, 1);
+        assert!(snapshot.subagent_activity().failed.is_empty());
+        let old = snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == "old-agent")
+            .unwrap();
+        assert_eq!(old.status, ToolStatus::Ended);
+        assert!(old.items.iter().any(|item| {
+            chat::failure::provider_error_text(Provider::Claude, item)
+                .is_some_and(|body| body.contains("Old attempt failed"))
+        }));
+    }
+
+    #[test]
+    fn historical_same_agent_occurrences_keep_latest_binding_and_fresh_activity() {
+        for streamed in [false, true] {
+            let mut frames = Vec::new();
+            for tool in ["old-worker", "current-worker"] {
+                frames.push(scoped_call(
+                    None,
+                    &format!("{tool}-call"),
+                    tool,
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ));
+                frames.push(json!({"type":"user","uuid":format!("{tool}-launch"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"shared-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":tool,"content":"Launched"}]}}));
+            }
+            let mut adapter = Claude {
+                history: Some(correlation_history(frames)),
+                ..Default::default()
+            };
+            let mut state = chat::Snapshot::default();
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.initialize().unwrap().events,
+            );
+            assert!(adapter.is_superseded("old-worker"));
+            assert!(!adapter.is_superseded("current-worker"));
+            assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
+            // A late old launch acknowledgement must not replace the latest
+            // authoritative binding, including when this is a distinct UUID.
+            adapter.receive(json!({"type":"user","uuid":"late-old-ack","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"shared-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-worker","content":"Launched"}]}})).unwrap();
+            let live = if streamed {
+                json!({"type":"stream_event","parent_tool_use_id":"current-worker","event":{"type":"message_start","message":{"id":"fresh-current-stream"}}})
+            } else {
+                json!({"type":"assistant","uuid":"fresh-current-carrier","parent_tool_use_id":"current-worker","message":{"id":"fresh-current-text","content":[{"type":"text","text":"Still reviewing"}]}})
+            };
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(live).unwrap().events,
+            );
+            assert_eq!(state.subagent_activity().working, 1);
+            assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
+            assert!(!adapter.is_superseded("current-worker"));
+            crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"shared-worker","task_type":"local_agent"})).unwrap().events);
+            crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"shared-worker","status":"completed"})).unwrap().events);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "current-worker")
+                    .unwrap()
+                    .status,
+                ToolStatus::Succeeded
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lifecycle_notices_never_promote_helpers_to_direct_workers() {
+        let mut adapter = Claude::default();
+        let mut state = chat::Snapshot::default();
+        for frame in [
+            scoped_call(
+                None,
+                "parent-call",
+                "parent-worker",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            scoped_call(
+                Some("parent-worker"),
+                "helper-call",
+                "nested-helper",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"system","subtype":"task_started","task_id":"nested-task","tool_use_id":"nested-helper","task_type":"local_agent","owned_by_subagent":true}),
+            json!({"type":"system","subtype":"task_progress","task_id":"nested-task","tool_use_id":"nested-helper","description":"Comparing files"}),
+            json!({"type":"system","subtype":"task_notification","task_id":"nested-task","tool_use_id":"nested-helper","status":"failed"}),
+            json!({"type":"assistant","uuid":"grandchild-answer","parent_tool_use_id":"nested-helper","message":{"id":"grandchild-answer","content":[{"type":"text","text":"Grandchild progress"}]}}),
+            json!({"type":"stream_event","parent_tool_use_id":"nested-helper","event":{"type":"message_start","message":{"id":"grandchild-stream"}}}),
+            json!({"type":"stream_event","parent_tool_use_id":"nested-helper","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"More grandchild progress"}}}),
+            json!({"type":"result","uuid":"grandchild-result","parent_tool_use_id":"nested-helper","subtype":"error_during_execution","is_error":true,"errors":["Grandchild failure"]}),
+        ] {
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].id, "parent-worker");
+        assert_eq!(state.subagent_activity().working, 1);
+        assert!(state.subagent_activity().failed.is_empty());
+        assert!(
+            state.subagents[0]
+                .items
+                .iter()
+                .any(|item| item.id == "nested-helper")
+        );
+    }
+
+    #[test]
+    fn autonomous_parent_response_does_not_retire_a_fresh_background_failure() {
+        let mut adapter = Claude::default();
+        let mut state = chat::Snapshot::default();
+        for frame in [
+            scoped_call(
+                None,
+                "worker-call",
+                "worker",
+                "Agent",
+                json!({"run_in_background":true}),
+            ),
+            json!({"type":"user","uuid":"worker-launch","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"background-worker"},"message":{"content":[{"type":"tool_result","tool_use_id":"worker","content":"Launched"}]}}),
+            json!({"type":"result","uuid":"lead-idle","subtype":"success","is_error":false}),
+            json!({"type":"system","subtype":"task_notification","uuid":"fresh-failure","task_id":"background-worker","tool_use_id":"worker","status":"failed","summary":"Validation failed"}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"autonomous-response"}}}),
+            json!({"type":"assistant","uuid":"lead-response","message":{"id":"autonomous-response","content":[{"type":"text","text":"The validation worker needs attention."}]}}),
+            json!({"type":"result","uuid":"lead-responded","subtype":"success","is_error":false}),
+        ] {
+            crate::chat::runtime::project_events_for_test(
+                &mut state,
+                adapter.receive(frame).unwrap().events,
+            );
+        }
+        assert_eq!(state.subagent_activity().failed.len(), 1);
+        assert_eq!(state.subagent_activity().failed[0].id, "worker");
+    }
+
+    #[test]
+    fn restored_failures_are_scoped_to_the_latest_actual_user_prompt() {
+        let call = |tool: &str| {
+            scoped_call(
+                None,
+                &format!("{tool}-call"),
+                tool,
+                "Agent",
+                json!({"description":tool}),
+            )
+        };
+        let failure = |tool: &str| json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":true,"content":format!("{tool} could not validate the release")}]}});
+        let history = correlation_history(vec![
+            json!({"type":"user","message":{"content":"First actual prompt"}}),
+            call("old-failure"),
+            failure("old-failure"),
+            json!({"type":"user","message":{"content":"New actual prompt"}}),
+            call("recent-failure"),
+            failure("recent-failure"),
+            // Provider-generated user-role messages don't make a recent
+            // failure historical merely because the lead receives a report.
+            json!({"type":"user","origin":{"kind":"peer"},"message":{"content":"<peer-message>Worker report</peer-message>"}}),
+        ]);
+        assert_eq!(history.agent_status["old-failure"], ToolStatus::Ended);
+        assert_eq!(history.agent_status["recent-failure"], ToolStatus::Failed);
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Default::default()
+        };
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(
+            &mut state,
+            adapter.initialize().unwrap().events,
+        );
+        let activity = state.subagent_activity();
+        assert_eq!(activity.failed.len(), 1);
+        assert_eq!(activity.failed[0].id, "recent-failure");
+        assert!(activity.failed[0].detail.contains("could not validate"));
+    }
+
+    #[test]
+    fn recent_failure_retires_only_when_human_input_is_consumed() {
+        for queued in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let mut state = chat::Snapshot::default();
+            for frame in [
+                scoped_call(
+                    None,
+                    "failure-call",
+                    "failed-worker",
+                    "Agent",
+                    json!({"description":"Validate release"}),
+                ),
+                json!({"type":"user","uuid":"failed-result","message":{"content":[{"type":"tool_result","tool_use_id":"failed-worker","is_error":true,"content":"Validation failed"}]}}),
+            ] {
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.receive(frame).unwrap().events,
+                );
+            }
+            assert_eq!(state.subagent_activity().failed.len(), 1);
+            if queued {
+                let submitted = adapter
+                    .send_prompt("Next task".into(), vec![], PromptMode::Queue)
+                    .unwrap();
+                crate::chat::runtime::project_events_for_test(&mut state, submitted.events);
+                let echo = submitted.writes[0].clone();
+                let id = echo["uuid"].clone();
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.receive(echo.clone()).unwrap().events,
+                );
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter
+                        .receive(
+                            json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}),
+                        )
+                        .unwrap()
+                        .events,
+                );
+                assert_eq!(
+                    state.subagent_activity().failed.len(),
+                    1,
+                    "queued input is not yet a new failure scope"
+                );
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter
+                        .receive(
+                            json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}),
+                        )
+                        .unwrap()
+                        .events,
+                );
+            } else {
+                crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"user","uuid":"actual-next-prompt","origin":{"kind":"human"},"message":{"content":"Next task"}})).unwrap().events);
+            }
+            assert!(state.subagent_activity().failed.is_empty());
+            let old = state
+                .subagents
+                .iter()
+                .find(|agent| agent.id == "failed-worker")
+                .unwrap();
+            assert_eq!(old.status, ToolStatus::Ended);
+            assert!(old.detail.contains("before the current prompt"));
+        }
+    }
+
+    #[test]
+    fn foreground_same_address_replacement_retires_failures_live_and_on_restore() {
+        for restored in [false, true] {
+            let mut frames = Vec::new();
+            for (tool, failed) in [("old-foreground", true), ("new-foreground", false)] {
+                frames.push(scoped_call(
+                    None,
+                    &format!("{tool}-call"),
+                    tool,
+                    "Agent",
+                    json!({"description":tool}),
+                ));
+                frames.push(json!({"type":"user","uuid":format!("{tool}-result"),"tool_use_result":{"agentId":"shared-foreground"},"toolUseResult":{"agentId":"shared-foreground"},"message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":failed,"content":format!("agentId: shared-foreground\n{tool} report")}]}}));
+            }
+            let mut state = chat::Snapshot::default();
+            if restored {
+                let mut adapter = Claude {
+                    history: Some(correlation_history(frames)),
+                    ..Default::default()
+                };
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.initialize().unwrap().events,
+                );
+                assert_eq!(adapter.agent_calls.back().unwrap().1, "new-foreground");
+            } else {
+                let mut adapter = Claude::default();
+                for frame in frames {
+                    crate::chat::runtime::project_events_for_test(
+                        &mut state,
+                        adapter.receive(frame).unwrap().events,
+                    );
+                }
+            }
+            assert!(state.subagent_activity().failed.is_empty());
+            assert_eq!(state.subagent_activity().working, 0);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "old-foreground")
+                    .unwrap()
+                    .status,
+                ToolStatus::Ended
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == "new-foreground")
+                    .unwrap()
+                    .status,
+                ToolStatus::Succeeded
+            );
+            assert!(state.items.iter().any(|item| item.id == "old-foreground"
+                && item.content.status() == Some(ToolStatus::Failed)));
+        }
+    }
+
+    #[test]
     fn child_frames_stay_in_their_subagent_transcript() {
         let mut adapter = Claude::default();
         let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"subagent_type":"Explore","description":"Inspect parser"}}]}})).unwrap();
@@ -13651,24 +14956,27 @@ mod tests {
     /// notice of that notification also tells the reader.
     #[test]
     fn a_background_command_runs_until_its_notification_settles_its_call() {
-        for (status, summary, ended, code) in [
+        for (status, summary, ended, code, heading) in [
             (
                 "completed",
                 "Background command \"Run tests\" completed (exit code 0)",
                 ToolStatus::Succeeded,
                 Some(0),
+                "Run tests · finished",
             ),
             (
                 "failed",
                 "Background command \"Run tests\" failed with exit code 101",
                 ToolStatus::Failed,
                 Some(101),
+                "Run tests · failed (exit 101)",
             ),
             (
                 "killed",
                 "Background command \"Run tests\" was stopped",
                 ToolStatus::Stopped,
                 None,
+                "Run tests · stopped",
             ),
         ] {
             let mut adapter = Claude::default();
@@ -13690,7 +14998,11 @@ mod tests {
                 ),
                 "{status}"
             );
-            assert_eq!(notice_summaries(&notified), [summary], "{status}");
+            assert_eq!(notice_summaries(&notified), [heading], "{status}");
+            assert!(notified.events.iter().any(|event| matches!(event,
+                Event::Item(Item { content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. }, .. })
+                    if summary == heading && body == "cargo test"
+            )), "the delivery keeps the original command once behind its outcome heading");
         }
     }
 
@@ -13822,10 +15134,7 @@ mod tests {
         adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"bash","description":"Build","is_backgrounded":false,"task_type":"local_bash"})).unwrap();
         adapter.receive(json!({"type":"user","uuid":"moved","tool_use_result":{"backgroundTaskId":"b2","timedOutAfterMs":120000},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command did not complete within its 120s timeout and was moved to the background (ID: b2)."}]}})).unwrap();
         let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b2","tool_use_id":"bash","status":"completed","output_file":"/var/tmp/b2.output","summary":"Background command \"Build\" completed (exit code 0)"})).unwrap();
-        assert_eq!(
-            notice_summaries(&notified),
-            ["Background command \"Build\" completed (exit code 0)"]
-        );
+        assert_eq!(notice_summaries(&notified), ["Build · finished"]);
         assert!(matches!(
             shown_command(&notified, "bash"),
             Some((
@@ -15252,7 +16561,7 @@ mod tests {
         history.settle_stopped();
         assert_eq!(
             history.agent_status.get("tool-left"),
-            Some(&ToolStatus::Stopped)
+            Some(&ToolStatus::Ended)
         );
         assert_eq!(
             history.agent_status.get("tool-settled"),
@@ -15260,7 +16569,7 @@ mod tests {
         );
         assert_eq!(
             history.agent_status.get("tool-resumed"),
-            Some(&ToolStatus::Stopped)
+            Some(&ToolStatus::Ended)
         );
     }
 
@@ -15334,7 +16643,7 @@ mod tests {
         };
         assert_eq!(read(transcript), Some(ToolStatus::Succeeded));
         // Reopened before the agent's work finished: the process it waited in
-        // is gone, so it ends stopped rather than finished.
+        // is gone, so its earlier run has ended without a confirmed outcome.
         let second = transcript
             .match_indices("\"type\": \"user\"")
             .map(|(at, _)| at)
@@ -15342,7 +16651,7 @@ mod tests {
             .last()
             .unwrap();
         let start = transcript[..second].rfind('\n').map_or(0, |at| at + 1);
-        assert_eq!(read(&transcript[..start]), Some(ToolStatus::Stopped));
+        assert_eq!(read(&transcript[..start]), Some(ToolStatus::Ended));
     }
 
     #[test]
@@ -15851,11 +17160,14 @@ mod tests {
         };
         let (agent, bash, agent_running) = statuses(false);
         assert_eq!(bash, Some(ToolStatus::Stopped));
-        assert!(agent_running, "the background agent may still run");
-        assert_ne!(
+        assert!(
+            !agent_running,
+            "history alone cannot establish current agent activity"
+        );
+        assert_eq!(
             agent,
-            Some(ToolStatus::Stopped),
-            "and is not marked stopped"
+            Some(ToolStatus::Succeeded),
+            "the launch acknowledgement completed, without proving the agent is still live"
         );
         // Only reading the history starts nothing, so it is left as it was.
         assert_eq!(statuses(true).1, Some(ToolStatus::Running));
@@ -15949,7 +17261,7 @@ mod tests {
     /// A resumed process never started the background agents its history
     /// replays, so cancelling its turn cannot be what stops them.
     #[test]
-    fn a_replayed_background_agent_is_not_stopped_by_this_interrupt() {
+    fn a_replayed_background_agent_is_ended_without_current_liveness_evidence() {
         let session = "00000000-0000-4000-8000-000000000001";
         let mut file = tempfile::tempfile().unwrap();
         for value in [
@@ -15973,7 +17285,7 @@ mod tests {
             } if id == "tool-agent" => Some((*status, *background)),
             _ => None,
         });
-        assert_eq!(last, Some((Some(ToolStatus::Running), false)));
+        assert_eq!(last, Some((Some(ToolStatus::Ended), false)));
     }
 
     /// Claude Code may run an agent in the background without being asked,
@@ -16048,7 +17360,14 @@ mod tests {
         ] {
             adapter.receive(json!({"type":"assistant","uuid":format!("{nested}-launch"),"parent_tool_use_id":"tool-agent","message":{"id":format!("{nested}-message"),"content":[{"type":"tool_use","id":nested,"name":"Agent","input":input}]}})).unwrap();
             let launched = adapter.receive(json!({"type":"user","uuid":format!("{nested}-result"),"parent_tool_use_id":"tool-agent","tool_use_result":{"status":"async_launched","agentId":"a2"},"message":{"content":[{"type":"tool_result","tool_use_id":nested,"content":"Launched"}]}})).unwrap();
-            assert!(launched.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == nested)));
+            assert!(
+                !launched
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Subagent { id, .. } if id == nested))
+            );
+            assert!(launched.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item }
+                if id == "tool-agent" && item.id == nested && item.content.status() == Some(ToolStatus::Succeeded))));
         }
         assert!(adapter.background_agents.is_empty());
         assert!(adapter.agent_calls.is_empty());
@@ -16315,17 +17634,14 @@ mod tests {
         assert_eq!(
             settled,
             [
-                ("tool-queued", ToolStatus::Failed),
+                ("tool-queued", ToolStatus::Ended),
                 ("tool-delivered", ToolStatus::Succeeded),
                 ("tool-killed", ToolStatus::Stopped),
-                ("tool-running", ToolStatus::Running),
+                ("tool-running", ToolStatus::Ended),
                 ("tool-stopped", ToolStatus::Stopped),
             ]
         );
-        assert_eq!(
-            adapter.background_agents,
-            HashSet::from(["tool-running".to_owned()])
-        );
+        assert!(adapter.background_agents.is_empty());
     }
 
     #[test]
