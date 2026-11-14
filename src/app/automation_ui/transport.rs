@@ -26,11 +26,9 @@ impl Connection {
         self.client.proof()
     }
 
-    pub(in crate::app) fn read_workspace_model(
-        &mut self,
-    ) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    pub(in crate::app) fn workspace_registry_identity(&mut self) -> Result<uuid::Uuid, String> {
         self.client
-            .read_workspace_model()
+            .workspace_registry_identity()
             .map_err(|error| error.to_string())
     }
 

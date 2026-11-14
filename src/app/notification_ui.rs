@@ -107,9 +107,8 @@ fn read_lifecycle(
         return Err(LifecycleReadError::Unavailable);
     }
     if client
-        .read_workspace_model()
+        .workspace_registry_identity()
         .map_err(|_| LifecycleReadError::Unavailable)?
-        .identity
         != activation.registry
     {
         return Err(LifecycleReadError::Unavailable);
@@ -134,9 +133,8 @@ fn read_lifecycle(
         _ => return Err(LifecycleReadError::Unavailable),
     };
     if client
-        .read_workspace_model()
+        .workspace_registry_identity()
         .map_err(|_| LifecycleReadError::Unavailable)?
-        .identity
         != activation.registry
     {
         return Err(LifecycleReadError::Unavailable);
@@ -1260,6 +1258,10 @@ impl Cagents {
     /// Local inventory-only sessions must be unique. Any raw managed member
     /// fences that fallback, including rejected/ambiguous canonical ownership.
     fn notification_attention_cards(&self) -> HashMap<TerminalId, Option<CardId>> {
+        #[cfg(test)]
+        self.shared_views
+            .notification_attribution_count
+            .set(self.shared_views.notification_attribution_count.get() + 1);
         let mut cards = HashMap::new();
         for card in self
             .durable

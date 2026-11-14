@@ -63,6 +63,7 @@ STUBS = {
             case ${args[i]} in
                 --root) root=${args[i + 1]} ;;
                 --cmd) cmd=${args[i + 1]} ;;
+                --portal) portal=${args[i + 1]} ;;
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
@@ -86,6 +87,8 @@ STUBS = {
         if [ -n "${cmd:-}" ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
+            # Like the real harness, a portal session runs the app on its own bus.
+            [ -z "${portal:-}" ] || export DBUS_SESSION_BUS_ADDRESS=stub-portal-bus XDG_CONFIG_HOME=$root/xdg-config
             NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
@@ -123,7 +126,11 @@ STUBS = {
                 printf '[]'
             fi
         else
-            printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"}]'
+            if [ -f "$STUB_LOG/ui-peer-pid" ] && kill -0 "$(cat "$STUB_LOG/ui-peer-pid")" 2>/dev/null && [ ! -f "$STUB_LOG/hide-peer" ]; then
+                printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"},{"id":2,"app_id":"dev.cagents.Cagents.Development"}]'
+            else
+                printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"}]'
+            fi
         fi
     """,
     "magick": """
@@ -157,12 +164,29 @@ STUBS = {
     "fixture-cli": """
         #!/bin/bash
         if [ "${0##*/}" = cagents-ui ]; then
+            # Match the public UI option shape: primary has no arguments;
+            # a named window uses two separate arguments. Unknown forms fail.
+            arguments=("$@")
+            slot=
+            while [ "$#" -gt 0 ]; do
+                case $1 in
+                    --window)
+                        [ "$#" -ge 2 ] && [ -n "$2" ] || { echo 'missing window name' >&2; exit 2; }
+                        slot=$2; shift 2 ;;
+                    *) echo "unsupported UI argument: $1" >&2; exit 2 ;;
+                esac
+            done
             rm -f "$STUB_LOG/ui-absent"
             # Replace atomically: a polling reader must never see it empty.
-            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid.$$" && mv -f "$STUB_LOG/ui-pid.$$" "$STUB_LOG/ui-pid"
-            printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
+            if [ -n "$slot" ]; then
+                printf '%s\\n' "$$" > "$STUB_LOG/ui-peer-pid.$$" && mv -f "$STUB_LOG/ui-peer-pid.$$" "$STUB_LOG/ui-peer-pid"
+            else
+                printf '%s\\n' "$$" > "$STUB_LOG/ui-pid.$$" && mv -f "$STUB_LOG/ui-pid.$$" "$STUB_LOG/ui-pid"
+            fi
+            printf '%s\\n' "${arguments[*]}" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             env > "$STUB_LOG/ui-env"
+            printf '%s\\n' "${RUST_LOG:-unset}" > "$STUB_LOG/ui-rust-log"
             exec sleep 300
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
@@ -287,7 +311,9 @@ class Evidence(unittest.TestCase):
             GATE_PLACEHOLDER build $common development --bin cagents
             GATE_PLACEHOLDER build $common development,host --bin cagentsd
             GATE_PLACEHOLDER build $common development,ui --bin cagents-ui
-            exec cargo run --quiet $common development,ui --bin cagents-ui -- --app-argument
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+            [ "$#" -eq 0 ] || shift
+            exec cargo run --quiet $common development,ui --bin cagents-ui -- "$@"
             """,
             self.logs,
         )
@@ -787,6 +813,17 @@ class Evidence(unittest.TestCase):
         self.assertFalse((self.logs / "runner").exists())
         self.assertTrue(self.lock_is_free(self.native_lock))
 
+    def test_workspace_trace_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        tracing = "cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn"
+        for options, expected in (([], "unset"), (["--workspace-trace"], tracing), ([], "unset")):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                self.assertEqual((self.logs / "ui-rust-log").read_text(), f"{expected}\n")
+                self.assertNotIn("RUST_LOG=", self.run_tool("cli", "print-env").stdout)
+                self.run_tool("stop")
+
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
         for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
             with self.subTest(value=value):
@@ -985,6 +1022,101 @@ class Evidence(unittest.TestCase):
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
 
+    def test_ui_fixture_rejects_unsupported_window_arguments(self) -> None:
+        self.built()
+        executable = self.task / "target-after/dev-runtime/cagents-ui"
+        for arguments in (("--window=window-2",), ("--window",), ("--unknown",)):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([str(executable), *arguments], env=self.env,
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse((self.logs / "ui-pid").exists())
+                self.assertFalse((self.logs / "ui-peer-pid").exists())
+
+    def test_open_window_uses_built_products_and_a_new_native_identity(self) -> None:
+        self.assert_open_window_uses_built_products()
+
+    def test_scoped_ui_fixture_applies_to_additional_windows(self) -> None:
+        self.assert_open_window_uses_built_products(scoped=True)
+
+    def assert_open_window_uses_built_products(self, scoped=False) -> None:
+        self.built()
+        self.run_tool("start", "after", "--workspace-trace", *(["--ui-scoped-fixture"] if scoped else []))
+        primary = int((self.logs / "ui-pid").read_text())
+        cargo_before = (self.logs / "cargo").read_text()
+        receipt = self.task / "session/window-window-2"
+        output = self.logs / "open-window-output"
+        with output.open("w") as sink:
+            process = subprocess.Popen([str(SCRIPT), "open-window", "window-2"], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
+        try:
+            for _ in range(200):
+                if receipt.exists():
+                    break
+                if process.poll() is not None:
+                    self.fail(output.read_text())
+                time.sleep(0.05)
+            else:
+                self.fail("secondary window did not map: " + output.read_text())
+            self.assertEqual(receipt.read_text().strip(), "2")
+            self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
+            arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
+            self.assertEqual(arguments[-3:], ["--", "--window", "window-2"])
+            self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
+            self.assertIn(str(self.task / "logs/ui-after-window-2.log"), (self.logs / "runner").read_text())
+            os.kill(primary, 0)
+            self.assertFalse((self.task / "session/replaying").exists())
+            self.assertFalse(self.lock_is_free(self.native_lock))
+        finally:
+            self.run_tool("stop", check=False)
+            process.wait(timeout=20)
+            self.assertFalse(receipt.exists())
+
+    def test_start_discards_previous_session_window_readiness(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.run_tool("stop")
+        state = self.task / "session"
+        for name in ("window-window-2", "window-window-2.new-1", "replaying"):
+            (state / name).write_text("23\n")
+        self.run_tool("start", "after")
+        self.assertFalse(list(state.glob("window-*")))
+        self.assertFalse((state / "replaying").exists())
+
+    def test_open_window_cannot_use_the_existing_primary_as_readiness(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        primary = int((self.logs / "ui-pid").read_text())
+        (self.logs / "runner-exits").touch()
+        result = self.run_tool("open-window", "window-2", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("before a new window appeared", result.stderr)
+        self.assertFalse((self.task / "session/window-window-2").exists())
+        self.assertFalse((self.task / "session/replaying").exists())
+        os.kill(primary, 0)
+        self.assertFalse(self.lock_is_free(self.native_lock))
+
+    def test_open_window_rejects_duplicate_and_invalid_slots_before_launch(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        before = (self.logs / "runner").read_text()
+        for slot in ("", "primary", "update", "device-peer", "../other", "a" * 41, "two words"):
+            with self.subTest(slot=slot):
+                self.assertEqual(self.run_tool("open-window", slot, check=False).returncode, 2)
+        lease = self.task / "rt/cagents-development-ui.lock.window-2"
+        with lease.open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_tool("open-window", "window-2", check=False)
+            self.assertIn("window window-2 is already open", result.stderr)
+        self.assertEqual((self.logs / "runner").read_text(), before)
+        self.assertFalse((self.task / "session/replaying").exists())
+
     def test_relaunch_refuses_an_unconfirmed_window_observation(self) -> None:
         self.built()
         self.run_tool("start", "after")
@@ -1013,9 +1145,16 @@ class Evidence(unittest.TestCase):
         (self.logs / "other-window").touch()
         self.assert_relaunch_keeps_built_products()
 
-    def assert_relaunch_keeps_built_products(self) -> None:
+    def test_relaunch_preserves_workspace_trace(self) -> None:
+        self.assert_relaunch_keeps_built_products(workspace_trace=True)
+
+    def test_relaunch_preserves_scoped_ui_fixture(self) -> None:
+        self.assert_relaunch_keeps_built_products(workspace_trace=True, scoped=True)
+
+    def assert_relaunch_keeps_built_products(self, workspace_trace=False, scoped=False) -> None:
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []),
+                      *(["--ui-scoped-fixture"] if scoped else []))
         original_pid = int((self.logs / "ui-pid").read_text())
         # A previous runner receipt cannot establish that the current window closed.
         (self.task / "niri" / "session.rc").write_text("0")
@@ -1046,6 +1185,14 @@ class Evidence(unittest.TestCase):
             self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
             self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
+            if workspace_trace:
+                self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
             self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
             self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
             self.run_tool("stop")
@@ -1137,6 +1284,17 @@ class Evidence(unittest.TestCase):
         self.assertEqual(len(starts), 2, starts)
         self.assertNotIn("--portal", starts[0])
         self.assertIn("--portal gtk", starts[1])
+
+    def test_nested_commands_reach_the_bus_and_settings_the_app_reads(self) -> None:
+        self.built()
+        show = ("sh", "-c", 'printf "%s %s" "$DBUS_SESSION_BUS_ADDRESS" "$XDG_CONFIG_HOME"')
+        self.run_tool("start", "after")
+        self.assertTrue(self.run_tool("nested", *show).stdout.startswith("stub "))
+        self.run_tool("stop")
+        self.run_tool("start", "after", "--portal", "gtk")
+        self.assertEqual(self.run_tool("nested", *show).stdout,
+                         f"stub-portal-bus {self.task}/niri/xdg-config")
+        self.run_tool("stop")
 
     def test_an_unknown_portal_is_refused_before_the_lock(self) -> None:
         self.built()
@@ -2166,14 +2324,20 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--ui-scoped-fixture")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace", "--ui-scoped-fixture")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --ui-scoped-fixture", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace --ui-scoped-fixture", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
+
+    def test_open_window_is_forwarded_to_the_owned_remote_task(self) -> None:
+        checkout = self.repository("after", {"src.rs": "new\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("open-window", "window-2")
+        self.assertIn("open-window window-2", self.tool_calls())
 
     def test_pair_refuses_a_missing_startup_timeout_before_remote_work(self) -> None:
         result = self.run_tool("pair", "--startup-timeout", check=False)

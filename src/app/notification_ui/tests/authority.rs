@@ -8,7 +8,7 @@ use crate::{
         ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
         ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
     },
-    workspace_model::WorkspaceModel,
+    workspace_model::metadata::{Query, Reply},
 };
 use cosmic::iced::futures::StreamExt;
 use std::{
@@ -50,17 +50,20 @@ fn next(peer: &mut UnixStream, proof: &HostSessionProof) -> ClientEnvelope {
     request
 }
 
-fn read_model(peer: &mut UnixStream, proof: &HostSessionProof, model: &WorkspaceModel) {
+fn read_identity(peer: &mut UnixStream, proof: &HostSessionProof, identity: uuid::Uuid) {
     let request = next(peer, proof);
-    assert!(matches!(request.request, ClientRequest::ReadWorkspaceModel));
+    assert!(matches!(
+        request.request,
+        ClientRequest::ReadWorkspaceMetadata {
+            query: Query::Identity
+        }
+    ));
     reply(
         peer,
         &request,
         proof,
         ServerMessage::Response {
-            response: ServerResponse::WorkspaceModel {
-                model: model.clone(),
-            },
+            response: ServerResponse::WorkspaceMetadata(Reply::Identity(identity)),
         },
     );
 }
@@ -111,13 +114,9 @@ impl Peer {
                     },
                 },
             );
-            let model = WorkspaceModel {
-                identity: registry,
-                ..WorkspaceModel::default()
-            };
             // This observer uses an existing endpoint. A separate readiness
             // Connect/EOF probe would fail here instead of starting a daemon.
-            read_model(&mut peer, &host, &model);
+            read_identity(&mut peer, &host, registry);
             let request = next(&mut peer, &host);
             let ClientRequest::Automation {
                 authority: actual,
@@ -161,7 +160,7 @@ impl Peer {
                     },
                 );
                 // Preserve the second registry check on the same connection.
-                read_model(&mut peer, &host, &model);
+                read_identity(&mut peer, &host, registry);
             }
             assert!(
                 read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
