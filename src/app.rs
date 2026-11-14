@@ -15753,9 +15753,10 @@ impl Application for Cagents {
                 }
                 // Folding takes the rows, and any keyboard focus on one, out
                 // of the tree; ask the tree drawn now before it does.
-                if action == SidebarAction::ToggleInProgress
-                    && !self.sidebar_state.in_progress_collapsed()
-                {
+                if action == SidebarAction::ToggleInProgress {
+                    if !self.sidebar_state.toggle_in_progress() {
+                        return Task::none();
+                    }
                     return sidebar::in_progress_holds_focus(
                         &self.sidebar_model,
                         &self.sidebar_state,
@@ -16303,8 +16304,7 @@ impl Application for Cagents {
                 }
             }
             Message::FoldInProgress { refocus } => {
-                self.sidebar_state.fold_in_progress();
-                if refocus {
+                if self.sidebar_state.fold_in_progress() && refocus {
                     sidebar::focus_and_reveal(sidebar::in_progress_focus_id())
                         .map(cosmic::Action::App)
                 } else {
@@ -31394,6 +31394,30 @@ mod tests {
             Some(sidebar::SelectionRow::Worktree(project, worktree))
         );
         assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
+
+        // A working pane's row is under In progress: revealing it unfolds
+        // that section and leaves its folded project alone.
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::Attention,
+        ))));
+        app.observe_agent_activity_for_card(
+            card,
+            agent_activity(crate::agent::ActivityState::Working),
+        );
+        app.refresh_sidebar_channels();
+        if app.sidebar_state.project_expanded(project) {
+            app.sidebar_state
+                .apply(&SidebarAction::ToggleProject(project));
+        }
+        app.sidebar_state.apply(&SidebarAction::ToggleInProgress);
+        assert!(!attention_lists(&app, card_row), "In progress is folded");
+        assert_eq!(app.reveal_card_row(card), Some(card_row));
+        assert!(!app.sidebar_state.in_progress_collapsed());
+        assert!(!app.sidebar_state.project_expanded(project));
+        assert_eq!(
+            app.sidebar_state.filter(),
+            sidebar::SidebarFilter::Attention
+        );
     }
 
     /// Renaming a pane renames its row in the Attention list at once.
@@ -31522,6 +31546,18 @@ mod tests {
             drop(app.update(Message::Sidebar(SidebarAction::ToggleInProgress)));
             assert!(!app.sidebar_state.in_progress_collapsed());
         }
+
+        // Two quick presses leave the section as it was, though the first
+        // press's probe answers after the second press.
+        let first = app.update(Message::Sidebar(SidebarAction::ToggleInProgress));
+        let second = app.update(Message::Sidebar(SidebarAction::ToggleInProgress));
+        let answers = run(&app, vec![first, second]);
+        assert_eq!(answers.len(), 1, "only the fold waits on a probe");
+        for answer in answers {
+            drop(app.update(answer));
+        }
+        assert!(!app.sidebar_state.in_progress_collapsed());
+        assert!(attention_lists(&app, card_row));
     }
 
     fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {

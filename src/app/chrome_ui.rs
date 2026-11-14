@@ -1892,24 +1892,26 @@ impl Cagents {
     /// row of the channel, checkout or folder the pane is in, revealed in
     /// the unfiltered list, which draws no pane rows.
     pub(super) fn reveal_card_row(&mut self, card: CardId) -> Option<sidebar::SelectionRow> {
-        if self.sidebar_state.filter() == sidebar::SidebarFilter::Attention
-            && let Some(shown_on) = self.sidebar_state.attention_card_row(card)
-            && let Some(project) = self
-                .sidebar_model
-                .projects
-                .iter()
-                .find(|project| project.attention_cards.iter().any(|row| row.id == shown_on))
-                .map(|project| project.id)
-        {
+        // Unfold only the section that holds the row: a project or In
+        // progress folded for other reasons stays as the user left it.
+        if let Some(shown_on) = self.sidebar_state.attention_card_row(card) {
             let row = sidebar::SelectionRow::Card(shown_on);
-            let collapsed = !self.sidebar_state.project_expanded(project);
-            self.sidebar_state.expand_project(project);
+            match sidebar::attention_place(
+                &self.sidebar_model,
+                &self.sidebar_state,
+                self.projects_sidebar_mode() == SidebarMode::Compact,
+                row,
+            ) {
+                Some(sidebar::AttentionPlace::Project(project)) => {
+                    self.sidebar_state.expand_project(project);
+                }
+                Some(sidebar::AttentionPlace::InProgress) => {
+                    self.sidebar_state.unfold_in_progress();
+                }
+                None => {}
+            }
             if self.visible_sidebar_rows().contains(&row) {
                 return Some(row);
-            }
-            if collapsed {
-                self.sidebar_state
-                    .apply(&SidebarAction::ToggleProject(project));
             }
         }
         let destination = self.active_workspace_destination()?;

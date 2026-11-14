@@ -3004,6 +3004,9 @@ pub struct SidebarState {
     /// Whether the Attention list's "In progress" section is folded. It
     /// starts open.
     in_progress_collapsed: bool,
+    /// A press asked to fold In progress, and the fold waits on a probe of
+    /// where keyboard focus is; see [`Self::toggle_in_progress`].
+    in_progress_fold_pending: bool,
     /// The pane workspace focus names, as the application last reported it.
     focused_card: Option<CardId>,
     /// The pane row the Attention list draws as current: the row of the
@@ -3237,6 +3240,7 @@ impl SidebarState {
             .map(|(scope, paths)| (scope, paths.into_iter().collect()))
             .collect();
         self.in_progress_collapsed = view.in_progress_collapsed;
+        self.in_progress_fold_pending = false;
     }
 
     /// Folders the user opened, as display paths, for session persistence.
@@ -4115,11 +4119,37 @@ impl SidebarState {
         self.in_progress_collapsed
     }
 
-    /// Folds In progress, unlike [`SidebarAction::ToggleInProgress`] a no-op
-    /// when it already is: the fold lands after a focus probe, by which time
-    /// another toggle may have folded it.
-    pub fn fold_in_progress(&mut self) {
-        self.in_progress_collapsed = true;
+    /// Toggles In progress for a press the application handles, and says
+    /// whether that press asks to fold it.
+    ///
+    /// Folding takes the rows out of the tree, so the fold waits until a
+    /// probe of the tree drawn now says whether one of them has keyboard
+    /// focus; [`Self::fold_in_progress`] then lands it. Unfolding is
+    /// immediate. Each press toggles what the section will be, a fold still
+    /// waiting included, so two quick presses leave it as it was however
+    /// their probes interleave.
+    pub fn toggle_in_progress(&mut self) -> bool {
+        if self.in_progress_collapsed {
+            self.in_progress_collapsed = false;
+        } else {
+            self.in_progress_fold_pending = !self.in_progress_fold_pending;
+        }
+        self.in_progress_fold_pending
+    }
+
+    /// Lands the fold [`Self::toggle_in_progress`] asked for, and says
+    /// whether there was one: a later press may have taken it back.
+    pub fn fold_in_progress(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.in_progress_fold_pending);
+        self.in_progress_collapsed |= pending;
+        pending
+    }
+
+    /// Unfolds In progress, so a row in it can be shown, and drops any fold
+    /// still waiting on its probe.
+    pub fn unfold_in_progress(&mut self) {
+        self.in_progress_collapsed = false;
+        self.in_progress_fold_pending = false;
     }
 
     /// The worktree the source-control panel is bound to.
@@ -4327,6 +4357,7 @@ impl SidebarState {
             SidebarAction::HideReadAttention => self.retained_attention.clear(),
             SidebarAction::ToggleInProgress => {
                 self.in_progress_collapsed = !self.in_progress_collapsed;
+                self.in_progress_fold_pending = false;
             }
             SidebarAction::ToggleControls => {
                 self.controls_expanded = !self.controls_expanded;
@@ -12641,6 +12672,43 @@ impl InProgressRow<'_> {
             InProgressItem::Card(card) => SelectionRow::Card(card.id),
         }
     }
+}
+
+/// Where the Attention list draws a row, folded or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionPlace {
+    /// Under its project, in the main section.
+    Project(ProjectId),
+    /// In the In progress section.
+    InProgress,
+}
+
+/// Which section of the Attention list holds `row`, before any project or the
+/// In progress section is folded; `None` when the list does not hold it,
+/// under the current filter and search.
+pub fn attention_place(
+    model: &SidebarModel,
+    state: &SidebarState,
+    compact: bool,
+    row: SelectionRow,
+) -> Option<AttentionPlace> {
+    if state.filter != SidebarFilter::Attention {
+        return None;
+    }
+    filtered_projects(model, state, compact)
+        .iter()
+        .find(|project| match row {
+            SelectionRow::Card(card) => project.cards.iter().any(|row| row.id == card),
+            SelectionRow::Channel(channel) => project.channels.iter().any(|row| row.id == channel),
+            SelectionRow::Project(_) | SelectionRow::Worktree(..) => false,
+        })
+        .map(|project| AttentionPlace::Project(project.project.id))
+        .or_else(|| {
+            in_progress_rows(model, state, compact)
+                .into_iter()
+                .any(|candidate| candidate.row() == row)
+                .then_some(AttentionPlace::InProgress)
+        })
 }
 
 /// The Attention list's "In progress" rows, in project order and then each
