@@ -220,6 +220,81 @@ class CodexToolRowsFixture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "nonempty model/list result"):
                 PEER["Scenario"]().request({"id": 1, "method": "model/list"}, home)
 
+    def test_opt_in_turn_audit_is_bounded_and_excludes_prompt_input(self):
+        import json
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            audit = Path(home, "fixture-turn-audit.json")
+            scenario = PEER["Scenario"]()
+            request = {"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread, "model": "offline-mini", "effort": "high",
+                "input": [{"type": "text", "text": "private fixture prompt"}]}}
+            scenario.request(request, home)
+            self.assertFalse(audit.exists(), "auditing must be explicitly enabled")
+            audit.write_text(json.dumps([{"turnId": f"old-{index}"} for index in range(20)]))
+            # A fresh scenario accepts this turn immediately, without playing
+            # the earlier turn or its synthetic collaboration notifications.
+            scenario = PEER["Scenario"]()
+            request["params"]["threadId"] = scenario.thread
+            replies = scenario.request(request, home)
+            records = json.loads(audit.read_text())
+            self.assertEqual(len(records), 16)
+            self.assertEqual(records[0], {"turnId": "old-5"})
+            self.assertEqual(records[-1], {
+                "turnId": replies[0]["result"]["turn"]["id"],
+                "model": "offline-mini", "effort": "high"})
+            self.assertNotIn("private fixture prompt", audit.read_text())
+            self.assertEqual(list(Path(home).glob(".fixture-turn-audit-*")), [])
+            scenario = PEER["Scenario"]()
+            scenario.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": scenario.thread, "effort": None}}, home)
+            self.assertEqual(json.loads(audit.read_text())[-1] | {"turnId": None}, {
+                "turnId": None, "effort": None})
+
+    def test_turn_audit_preserves_concurrent_processes_sharing_one_private_home(self):
+        import json
+        import multiprocessing
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            audit = Path(home, "fixture-turn-audit.json")
+            audit.write_text("[]")
+            barrier = context.Barrier(8)
+
+            def record(index):
+                scenario = PEER["Scenario"]()
+                barrier.wait(5)
+                scenario.request({"id": index, "method": "turn/start", "params": {
+                    "threadId": scenario.thread, "model": f"offline-{index}", "effort": "high"}}, home)
+
+            workers = [context.Process(target=record, args=(index,)) for index in range(8)]
+            try:
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(5)
+                    self.assertEqual(worker.exitcode, 0, "audit writer did not finish successfully")
+            finally:
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.terminate()
+                    worker.join(2)
+            records = json.loads(audit.read_text())
+            self.assertEqual(len(records), 8)
+            self.assertEqual({row["model"] for row in records}, {f"offline-{index}" for index in range(8)})
+            self.assertEqual(len({row["turnId"] for row in records}), 8)
+            self.assertTrue(all(row["effort"] == "high" for row in records))
+
+    def test_malformed_turn_audit_does_not_mutate_the_selection_or_turn(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-turn-audit.json").write_text("{}")
+            scenario = PEER["Scenario"]()
+            scenario.model, scenario.reasoning = "offline-original", "low"
+            with self.assertRaisesRegex(ValueError, "must hold an array"):
+                scenario.request({"id": 1, "method": "turn/start", "params": {
+                    "threadId": scenario.thread, "model": "offline-new", "effort": "high"}}, home)
+            self.assertEqual((scenario.model, scenario.reasoning), ("offline-original", "low"))
+            self.assertIsNone(scenario.latest)
+            self.assertIsNone(scenario.child_latest)
+
     def test_native_evidence_can_hold_a_turn_without_environment_forwarding(self):
         import tempfile
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:

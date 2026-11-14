@@ -24,14 +24,18 @@ webSearch item with synthetic results. This isolates the native web-search
 row without collaboration activity or unrelated tool/event rows.
 CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
 short, synthetic original diagnostic for the native Details/Copy controls.
+An existing CODEX_HOME/fixture-turn-audit.json opts into a bounded record of
+accepted turn model/effort fields, without recording the prompt or other input.
 """
 import copy
+import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -416,11 +420,31 @@ class Scenario:
                         raise ValueError()
                 except ValueError:
                     raise ValueError("fixture-turn-pause must hold seconds between 0 and 300") from None
+            turn = str(uuid.uuid4())
+            audit = Path(codex_home) / "fixture-turn-audit.json"
+            if audit.is_file():
+                with audit.with_suffix(".lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    records = json.loads(audit.read_text().strip() or "[]")
+                    if not isinstance(records, list):
+                        raise ValueError("fixture-turn-audit.json must hold an array")
+                    records = records[-15:] + [{"turnId": turn,
+                                               **{field: params[field] for field in ("model", "effort")
+                                                  if field in params}}]
+                    pending = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="w", dir=audit.parent,
+                                                         prefix=".fixture-turn-audit-", delete=False) as output:
+                            pending = Path(output.name)
+                            output.write(json.dumps(records) + "\n")
+                        pending.replace(audit)
+                    finally:
+                        if pending is not None:
+                            pending.unlink(missing_ok=True)
             if params.get("model"):
                 self.model = params["model"]
             if "effort" in params:
                 self.reasoning = params["effort"]
-            turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
             self._advance(self.thread)

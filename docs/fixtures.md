@@ -231,6 +231,12 @@ which models or efforts a live account can use.
 to 300 for the peer's busy turn, instead of its usual six-second pause.
 The footer scene uses 20 seconds so native capture can show confirmed running
 work without depending on how quickly OCR and screenshot conversion finish.
+Create `home/.codex/fixture-turn-audit.json` containing `[]` to record the last
+16 accepted turn IDs and the actual requested model/effort fields, including
+only fields present in the request. This private audit excludes prompt input and
+helps compare a native selection with the request received by the peer. Writers
+share a sibling file lock and replace the JSON atomically, so concurrent fixture
+processes using the same private home retain their records up to that limit.
 
 [`tests/fixtures/chat-footer-scene.sh`](../tests/fixtures/chat-footer-scene.sh)
 captures a draft, a started conversation, the open model picker and a selected
