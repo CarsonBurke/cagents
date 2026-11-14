@@ -41,6 +41,9 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.
+An admitted CLI from before protocol 178 receives store contention as a
+retryable `Internal` error so it can decode the reply. It keeps the response
+timeouts of its original executable.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused, withheld or restated. It checks
