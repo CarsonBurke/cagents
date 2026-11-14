@@ -390,17 +390,36 @@ fn settings_category_controls<'a>(
                 .collect();
             settings.push(setting_field(
                 "Manage accounts",
-                "Add, rename, sign in to or remove accounts, and compare what each has left.",
+                "Add, rename, sign in to or remove accounts, and compare their usage limits.",
                 crate::ui_controls::button::secondary("Open Accounts")
                     .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                     .into(),
             )
             .label_in_control());
-            vec![settings_group(
-                "Default accounts",
-                "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
-                settings,
-            )]
+            vec![
+                settings_group(
+                    "Default accounts",
+                    "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
+                    settings,
+                ),
+                settings_group(
+                    "Usage",
+                    "How account allowances appear throughout the app.",
+                    vec![settings_choice(
+                        "Account usage",
+                        "Left shows remaining allowance in text and gauges. Used shows consumed allowance. Warning colours still indicate when an account is running low.",
+                        SettingsField::AccountUsageDisplay,
+                        settings::AccountUsageDisplay::ALL.map(|display| {
+                            (
+                                display.label(),
+                                display.key(),
+                                draft.account_usage_display == display,
+                            )
+                        }),
+                    )
+                    .keywords("account_usage_display remaining consumed")],
+                ),
+            ]
         }
         SettingsCategory::General => {
             let reset = setting_field(
@@ -648,7 +667,7 @@ fn settings_category_controls<'a>(
                     ),
                     crate::settings_widgets::toggle(
                         "Show the status bar",
-                        "See each signed-in account's remaining usage at the bottom of the window.",
+                        "See each signed-in account's usage limits at the bottom of the window.",
                         draft.show_status_bar,
                         |enabled| Message::SettingsChanged {
                             field: SettingsField::ShowStatusBar,
@@ -2054,9 +2073,9 @@ mod keyboard_table_tests {
 }
 
 /// Observe preferences another window may change while this one is open - the
-/// sidebar's worktree display and which routine questions are asked - off the
-/// UI thread. The subscription restarts after a local save, so a skipped
-/// observation during that save is read again.
+/// sidebar's worktree display, the account usage display and which routine
+/// questions are asked - off the UI thread. The subscription restarts after a
+/// local save, so a skipped observation during that save is read again.
 pub(super) fn shared_preferences_stream(
     path: Option<PathBuf>,
 ) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
@@ -2092,6 +2111,7 @@ pub(super) fn shared_preferences_stream(
                 let current = (
                     settings.sidebar_worktrees,
                     settings.sidebar_worktree_overrides.clone(),
+                    settings.account_usage_display,
                     settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
                 );
                 if previous.as_ref() != Some(&current) {
@@ -2109,6 +2129,40 @@ pub(super) fn shared_preferences_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_preferences_observes_account_usage_display_changes_without_sidebar_changes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = AppSettings::default();
+        settings::save(&path, &settings).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        let initial = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial.account_usage_display,
+            settings::AccountUsageDisplay::Left
+        );
+        settings.account_usage_display = settings::AccountUsageDisplay::Used;
+        settings::save(&path, &settings).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+        assert_eq!(observed.sidebar_worktrees, initial.sidebar_worktrees);
+        assert_eq!(
+            observed.sidebar_worktree_overrides,
+            initial.sidebar_worktree_overrides
+        );
+    }
 
     #[tokio::test]
     async fn sidebar_preferences_observes_global_and_project_changes() {

@@ -1204,10 +1204,7 @@ fn native_environment(session: &Session, standalone: bool) -> ipc::ChatExecution
     } else {
         BTreeMap::new()
     };
-    session
-        .launch
-        .recipe
-        .remove_unset_environment(&mut environment);
+    session.launch.recipe.withhold_environment(&mut environment);
     ipc::ChatExecutionEnvironment(environment)
 }
 

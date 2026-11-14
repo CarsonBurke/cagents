@@ -6,6 +6,8 @@
 //! second application, and every dialog that mixed the two had no single
 //! control height to align to.
 
+mod reserved_label;
+
 use std::borrow::Cow;
 
 use cosmic::{
@@ -31,6 +33,7 @@ enum Weight {
 
 pub struct Button<'a, Message> {
     label: Cow<'a, str>,
+    reserved_labels: Vec<Cow<'a, str>>,
     weight: Weight,
     name: Option<Cow<'a, str>>,
     icon: Option<widget::icon::Handle>,
@@ -63,6 +66,7 @@ impl<'a, Message> Button<'a, Message> {
     fn new(label: impl Into<Cow<'a, str>>, weight: Weight) -> Self {
         Self {
             label: label.into(),
+            reserved_labels: Vec::new(),
             weight,
             name: None,
             icon: None,
@@ -96,6 +100,17 @@ impl<'a, Message> Button<'a, Message> {
         self
     }
 
+    /// Keep the footprint of every possible label, measured with the same font
+    /// as the visible label. Include both the idle and busy labels on every
+    /// render so enabled neighboring controls stay in place during an action.
+    pub fn reserve_labels(
+        mut self,
+        labels: impl IntoIterator<Item = impl Into<Cow<'a, str>>>,
+    ) -> Self {
+        self.reserved_labels = labels.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// A button wider than its label centers the label.
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.width = width.into();
@@ -112,6 +127,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
     fn from(button: Button<'a, Message>) -> Self {
         let Button {
             label,
+            reserved_labels,
             weight,
             name,
             icon,
@@ -125,8 +141,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         if let Some(icon) = icon {
             content = content.push(widget::icon(icon).size(design::ROW_ICON_SIZE));
         }
-        content = content
-            .push(design::heading(label.clone()).wrapping(iced::widget::text::Wrapping::None));
+        content = content.push(reserved_label::view(label.clone(), reserved_labels));
         let mut button = widget::button::custom(
             widget::container(content)
                 // COSMIC's transparent container resets the inherited ink.
@@ -264,6 +279,85 @@ fn style(weight: Weight) -> cosmic::theme::Button {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_labels_keep_button_and_enabled_neighbor_bounds() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use cosmic::iced::{Rectangle, Size};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for labels in [
+            ["Create worktree", "Creating…"],
+            ["Reconnect", "Checking…"],
+            ["Sign in", "Signing in…"],
+            ["Close", "Checking…"],
+            ["End 12 processes and close", "Ending…"],
+            // Width comes from shaping, not character count.
+            ["WWW", "iiii"],
+        ] {
+            let widest = labels
+                .into_iter()
+                .map(|label| {
+                    let mut plain: Element<'_, ()> = primary(label).into();
+                    let mut tree = Tree::new(plain.as_widget());
+                    plain
+                        .as_widget_mut()
+                        .layout(
+                            &mut tree,
+                            &renderer,
+                            &layout::Limits::new(Size::ZERO, Size::new(900.0, 80.0)),
+                        )
+                        .size()
+                        .width
+                })
+                .fold(0.0, f32::max);
+            for width in [320.0, 900.0] {
+                let mut tree = Tree::empty();
+                let mut bounds: Option<Vec<Rectangle>> = None;
+                for current in labels {
+                    let mut row: Element<'_, ()> = widget::row::with_children(vec![
+                        primary(current).reserve_labels(labels).on_press(()).into(),
+                        secondary("Cancel").on_press(()).into(),
+                    ])
+                    .spacing(space::S)
+                    .into();
+                    tree.diff(row.as_widget_mut());
+                    let node = row.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, Size::new(width, 80.0)),
+                    );
+                    let actual: Vec<_> = node.children().iter().map(layout::Node::bounds).collect();
+                    assert_eq!(
+                        actual[0].width, widest,
+                        "{labels:?} must reserve the widest label"
+                    );
+                    if let Some(bounds) = &bounds {
+                        assert_eq!(&actual, bounds, "{labels:?} at {width}px");
+                    } else {
+                        bounds = Some(actual);
+                    }
+                    let accessible = row.as_widget().a11y_nodes(
+                        Layout::new(&node),
+                        &tree,
+                        mouse::Cursor::Unavailable,
+                    );
+                    let names: Vec<_> = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter_map(|node| node.node().label())
+                        .collect();
+                    assert!(names.contains(&current), "{names:?}");
+                    let hidden = labels.into_iter().find(|label| *label != current).unwrap();
+                    assert!(
+                        !names.contains(&hidden),
+                        "alternate label must not be announced: {names:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn buttons_share_the_dense_control_height_and_disable_without_a_message() {

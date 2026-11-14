@@ -757,7 +757,10 @@ mod tests {
                 io::ErrorKind::WouldBlock,
                 "unqualified source must not receive an authenticated control connection"
             );
-            fs::write(root.join("observed"), b"Connect only").unwrap();
+            // The parent polls for this file and then reads it: publish the
+            // contents whole, so it can never observe a created, empty file.
+            fs::write(root.join("observed.partial"), b"Connect only").unwrap();
+            fs::rename(root.join("observed.partial"), root.join("observed")).unwrap();
             // Stay alive with the original lease until the parent finishes its
             // read-only assertions and closes this owned child's input pipe.
             assert_eq!(io::stdin().read(&mut [0]).unwrap(), 0);

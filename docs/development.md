@@ -835,9 +835,14 @@ the build host also keeps one apart from its target directory. Either way
 they arrive at the paths Cargo's messages, and its JSON messages
 (`--message-format=json...`), name here. `run` builds there and runs the program here, with Cargo's `CARGO_*`
 settings. `doc` copies `target/doc` back, per `--target`, and `--open` opens it
-here. `--timings` copies the report back. `fix` and `clippy --fix` apply their
-fixes here, to the files they changed there, after the same uncommitted-change
-checks Cargo makes. Path options inside the checkout, such as
+here. `--timings` copies the report back. Whatever any command writes in the
+checkout there, such as a lockfile Cargo updates, comes back to the same files
+here, whether or not it succeeds:
+`fix` and `clippy --fix` apply their fixes after the same uncommitted-change
+checks Cargo makes, and a test that records a fixture, such as
+`CAGENTS_RECORD_WIRE_FORMAT=1`, leaves it in this checkout. A file edited here
+while the command ran keeps that edit, and a new file this checkout ignores
+stays there. Path options inside the checkout, such as
 `--manifest-path`, `--target-dir` and `--artifact-dir`, are translated, and a
 `CAGENTS_` setting naming a file in the checkout or its target, such as
 `CAGENTS_TEST_RETAINED_ACTOR_HELPER`, names the host's copy of it there; a
@@ -1427,6 +1432,28 @@ held build lease. It refuses inherited admission because a child cannot release
 its parent's lock. The ordinary `cargo-gate test` commands above remain useful
 for integration targets, broader suites and explicit ignored-test workflows.
 
+GitHub's script contracts run the Python suites listed in
+`scripts/script-contracts`. Every job checks out the event's own commit: a pull
+request's merge result, which is also where GitHub reads the workflow from, so
+the suite list and the files it tests always come from the same tree. A
+structure job refuses missing, symlinked or unlisted suites and shell syntax
+errors in seconds, then the suites run as parallel jobs beside formatting and
+the protocol contract; a long suite is split
+into shards that partition its tests. The `Script contracts` check passes only
+when every job passed. Run the same steps locally:
+
+```sh
+python3 -I -B scripts/script-contracts verify
+python3 -I -B scripts/script-contracts plan
+python3 -I -B scripts/script-contracts run tooling
+python3 -I -B scripts/script-contracts run "native evidence" 2/3
+```
+
+A new `tests/` file that imports `unittest` must be added to a job, or to
+`UNSCHEDULED` when CI deliberately does not run it; `verify` refuses it
+otherwise. Keep each job to a few minutes on a hosted runner, and raise a
+job's shard count rather than its timeout.
+
 The selected IPC source contract can be checked without compiling Rust:
 
 ```sh
@@ -1451,8 +1478,9 @@ the same snapshot path: different contracts cause a Git add/add conflict. After
 combining the source changes, choose another unused version and regenerate its
 snapshot rather than keeping one branch's stale snapshot.
 
-Script CI supplies the PR base or previous main revision from the GitHub event,
-fetching that exact object if the checkout is shallow. The guard refuses changed
+Script CI compares a pull request's merge result with the merge's base parent,
+and a main push with the revision it replaced, fetching that exact object if the
+checkout is shallow. The guard refuses changed
 or deleted base snapshots and unbumped selected declarations relative to that
 base, including its first adoption before snapshots existed. A missing base
 fails explicitly. A local check without `--base-ref` confirms the current
@@ -2006,6 +2034,19 @@ The scenario verifies its mapped window too. The default seed includes Claude
 chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
+
+Use `--scale-chats 120` to rehearse a daemon that has run for days: it also
+opens that many chats, every third one Codex, across both projects. Each opens
+with `--scale-entries` earlier messages (default 400) of about `--scale-bytes`
+each (default 1536), then settles idle, so the update records long transcript
+pages without treating the chats as working. The Claude fake reads
+`fixture-long-history` and `fixture-first-turn-seconds` at launch, and the
+Codex peer reads `history` from `codex-fixture.json`; the seed removes those
+settings once every scale chat is idle, so later launches are unaffected.
+Spawns wait for a free slot, as the daemon runs at most eight agents a person
+starts at once, so seeding 120 chats takes several minutes; it therefore cannot
+be combined with the working or natural-idle cases, whose Codex turn would end
+first. `scale-seed.json` records the counts and seeding time.
 
 Use `--codex-pause 90` to keep the offline Codex turn active at the update
 prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a

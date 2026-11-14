@@ -25,8 +25,8 @@ use crate::{
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
     terminal_ipc::ServerMessage,
     work::{
-        Check, CheckState, ConversationPullRequest, ConversationPullRequests, ConversationWorktree,
-        DiffStat, PullRequest, TranscriptCoverage,
+        Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree, DiffStat,
+        PullRequest, TranscriptCoverage,
     },
 };
 use std::{
@@ -988,16 +988,7 @@ impl Detail {
             .check_summaries()
             .into_iter()
             .filter_map(|check| {
-                // The summary's buckets count a skipped check as passing and
-                // a cancelled one as failing; the row says which it was.
-                let state = match (check.state.0.as_str(), check.bucket.0.as_str()) {
-                    ("SKIPPED", _) => CheckState::Skipped,
-                    ("CANCELLED", _) => CheckState::Cancelled,
-                    (_, "pass") => CheckState::Passed,
-                    (_, "fail") => CheckState::Failed,
-                    (_, "pending") => CheckState::Pending,
-                    _ => return None,
-                };
+                let state = check.work_state()?;
                 Some(Check {
                     name: check.name,
                     workflow: check.workflow,

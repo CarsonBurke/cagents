@@ -343,3 +343,94 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
     let live = directory(&host, &Authority::default(), Scope::All).unwrap();
     assert!(live.sessions.iter().all(|entry| entry.id != session));
 }
+
+/// After a restart, a channel's panes are saved but no window has reopened
+/// their chats, so the daemon hosts none of them. They are still the
+/// channel's members, and each conversation reads from the provider's own
+/// history, named by the session or by the provider's conversation ID.
+#[test]
+fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
+    use crate::{
+        model::{CardId, CardKind},
+        workspace_model::views::Pane,
+    };
+    if isolated("host::agent_execution::tests::transcript::a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let project = root.join("project");
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let channel = ChannelId::new();
+    let session = {
+        let owned = registry(&host).unwrap();
+        let mut model = owned.lock().unwrap();
+        let crate::agent_execution::HostedSession::Chat(mut chat) =
+            model.agent(accepted.agent.id).unwrap().session.unwrap()
+        else {
+            panic!("chat agent")
+        };
+        model
+            .apply(&ModelEdit::CreateChannel {
+                id: channel,
+                repository: project.clone(),
+                title: "Login".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        // The pane saved the conversation its provider confirmed.
+        chat.launch.session_id = host.lock().unwrap().chats[&chat.id]
+            .handle
+            .confirmed_session_id();
+        model
+            .apply(&ModelEdit::SeedView {
+                scope: Placement::Channel(channel),
+                closed: vec![],
+                panes: vec![Pane {
+                    id: CardId::new(),
+                    title: "Find the flaky login test".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    kind: CardKind::Chat(chat.clone()),
+                    scope: Some(project.clone()),
+                }],
+            })
+            .unwrap();
+        chat
+    };
+    save_claude_transcript(&host, session.id, root);
+    // The daemon restarted: nothing reopened the saved pane's chat.
+    let hosted = host.lock().unwrap().chats.remove(&session.id).unwrap();
+    let _ = hosted.handle.close();
+
+    let listed = members(&host, &Authority::default(), Some(channel)).unwrap();
+    let member = listed
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session.id)
+        .expect("a saved pane stays its channel's member");
+    assert!(member.exited, "its provider is not running: {member:?}");
+    assert_eq!(
+        member.session.title.as_deref(),
+        Some("Find the flaky login test")
+    );
+    assert_eq!(member.session.channel, Some(channel));
+    assert!(member.active_at.is_some(), "the saved conversation's time");
+
+    let conversation = session.launch.session_id.clone().unwrap();
+    for handle in [session.id.to_string(), conversation[..8].to_owned()] {
+        let page = read(&host, &Authority::default(), query(&handle, None, 10)).unwrap();
+        assert_eq!(page.session.session.id, session.id, "{handle}");
+        assert!(page.session.exited);
+        assert!(
+            matches!(&page.entries.last().unwrap().content, Content::User(text) if text.text == "Now open a PR"),
+            "{handle}: {:#?}",
+            page.entries
+        );
+    }
+    // The ordinary project listing still shows only running sessions.
+    let live = directory(&host, &Authority::default(), Scope::All).unwrap();
+    assert!(live.sessions.iter().all(|entry| entry.id != session.id));
+}

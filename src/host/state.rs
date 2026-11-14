@@ -367,6 +367,8 @@ pub(crate) struct HostState {
     pub(super) native_adoption_failures: super::chat::AdoptionFailures,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
+    /// Provider listings running outside the control gate.
+    pub(super) agent_probes: Arc<super::activity::Probes>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
@@ -500,6 +502,7 @@ impl HostState {
             native_adoption_failures: Default::default(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
+            agent_probes: Arc::default(),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
@@ -2253,7 +2256,7 @@ fn validate_terminal_upgrade_environment(
     })?;
     let mut restored = crate::model::agent_recovery::fresh_native_environment(provider, false);
     restored.extend(recipe.environment.clone());
-    recipe.remove_unset_environment(&mut restored);
+    recipe.withhold_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
             "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
@@ -4331,7 +4334,7 @@ fn start_terminal_view_owned_reserved(
         execution_recipe
             .as_ref()
             .unwrap_or(&session.launch)
-            .remove_unset_environment(&mut environment.0);
+            .withhold_environment(&mut environment.0);
     }
     if adoption.is_some() {
         super::account_lifecycle::ensure_terminal_adoption(
