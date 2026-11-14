@@ -7,6 +7,7 @@
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
+- [Workspace model edits](#workspace-model-edits)
 - [Native chat viewport](#native-chat-viewport)
 - [Idle retained actors](#idle-retained-actors)
 - [Work board polling](#work-board-polling)
@@ -385,6 +386,40 @@ change, so it is unchanged. Its main-thread profile is terminal widget
 resolution, layout, accessibility projection and allocation. After the change,
 the remaining title-churn time is mostly the same view, layout and render work
 that each title causes; `sync_chrome` is about 0.2% of samples.
+
+## Workspace model edits
+
+A pane edit in one window reaches every other window as a model edge. The
+window applies the edge's effects to its copy and, for a settled presentation
+change such as a pane title, projects only that scope. Two trace targets show
+where that work goes; with both disabled these paths read no clock and
+allocate nothing.
+
+- `cagents::workspace_pipeline=debug` records the inclusive wall time of each
+  shared-model update, including its projection tail, and of each replica
+  snapshot timer and capture.
+- `cagents::workspace_projection=trace` records whether each update projected
+  one scope or the whole workspace, with the reason when it fell back. A unit
+  fixture's eligibility does not show that a native workload qualifies, so
+  count selected and full projections in the native run.
+
+Measure edits on the generated large workspace with fixture agents streaming,
+one of them visible, and drive a fixed number of pane title edits at a fixed
+interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
+main-thread CPU and the UI thread trace's update and frame times over the edit
+interval on both sides.
+
+Start the native evidence session with `--ui-trace --workspace-trace` to
+record both inclusive update time and the selected/full projection decisions.
+`scripts/native-evidence open-window window-2` opens the peer through the
+development runner using the same recorded binaries, without compiling under
+the native lock. Its trace is `logs/ui-SIDE-window-2.log`; the primary trace
+is `logs/ui-SIDE.log`.
+
+The current-main comparison for the UI half of this work is tracked in
+[#2789](https://github.com/CarsonBurke/cagents/pull/2789). Its measurement table
+identifies the actual application revisions, workload, raw receipts and
+qualifications; historical #2573 results are not measurements of this branch.
 
 ## Native chat viewport
 

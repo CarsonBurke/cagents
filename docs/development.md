@@ -1792,6 +1792,13 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **A second window.** Run `open-window window-2` in the background to open
+  that saved slot through the matched development runner in the same private
+  session. It replays only the builds already recorded, refuses a live slot,
+  and records readiness only after a new native window maps. Its trace goes
+  to `logs/ui-SIDE-window-2.log`, its native ID to
+  `session/window-window-2`, and the command stays until the window exits.
+  `stop` ends both windows and their fixture processes.
 - **UI-only restart.** To measure restored chats while their providers keep
   running, close the app window normally, then run `relaunch` in the same
   session. It reuses the recorded executables through the development runner
@@ -1802,7 +1809,10 @@ harness, it provides:
   under `logs/` on normal close; these measure synchronous work rather than
   compositor presentation. Add `--ui-trace` to `start` for a live log of
   UI-thread work by phase and message; see "UI thread trace" in
-  `docs/performance.md`. Recreate the same workload on each revision when comparing
+  `docs/performance.md`. Add `--workspace-trace` to record shared-model update
+  timing, scope projection choices and activity redraw intervals. Both trace
+  flags apply to the requested session and its relaunches; ordinary sessions
+  keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested

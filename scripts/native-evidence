@@ -45,7 +45,7 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME] [--ui-trace]
+        [--instance NAME] [--ui-trace] [--workspace-trace]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -62,6 +62,9 @@ both use the same fixture data and selected providers.
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
                   tree's work, and every call over 50 ms.
+                  --workspace-trace logs shared-model update timing, scope
+                  projection choices and activity redraw intervals. Both trace
+                  options persist through relaunch, until the session stops.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -70,6 +73,12 @@ both use the same fixture data and selected providers.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
   nested CMD...   Run a command in the nested compositor's environment.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  open-window SLOT
+                  Open a saved secondary window in this session through the
+                  matched development runner. Waits for a new mapped window,
+                  then stays in the foreground until that window exits. Writes
+                  logs/ui-SIDE-SLOT.log and session/window-SLOT with its native
+                  window ID. Uses the session's trace flags and never compiles.
   relaunch [--chat-stages]
                   After closing the app window, run the same built UI again in
                   this session, keeping its daemon and providers alive. Runs in
@@ -903,7 +912,8 @@ CARGO
 }
 
 run_app() {
-    local side=$1
+    local side=$1 slot=${2:-} ui_log
+    ui_log=$logs/ui-$side${slot:+-$slot}.log
     load_side "$side" "$state/source"
     # A session holds the native lock while others queue, so it must not wait on
     # Cargo, whose shared locks and fingerprints make even a no-op build uncertain.
@@ -922,14 +932,18 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=() runner_instance=()
+    local status=0 stage_environment=() runner_instance=() window_arguments=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
+    [ -z "$slot" ] || window_arguments=(-- --window "$slot")
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
+        RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
+    )
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless "${runner_instance[@]}" \
-            --debug --log-file "$logs/ui-$side.log" || status=$?
+            --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
@@ -940,6 +954,14 @@ run_app() {
 
 # Query the isolated compositor, which represents a closed window as [].
 app_window_is_open() {
+    local ids
+    ids=$(app_window_ids) || return 2
+    [ -n "$ids" ]
+}
+
+# Window IDs belong to this private compositor. A pre-existing primary
+# window must never satisfy an additional window's startup barrier.
+app_window_ids() {
     local observed
     observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
@@ -947,15 +969,77 @@ try:
     windows=json.load(sys.stdin)
     if not isinstance(windows,list):
         sys.exit(2)
+    ids=[]
     for window in windows:
         if not isinstance(window,dict) or "app_id" not in window:
             sys.exit(2)
         if window["app_id"] is not None and not isinstance(window["app_id"],str):
             sys.exit(2)
-    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
+        if window["app_id"] == "dev.cagents.Cagents.Development":
+            identity=window.get("id")
+            if type(identity) is not int or identity < 0 or identity in ids:
+                sys.exit(2)
+            ids.append(identity)
+    print("\n".join(map(str,sorted(ids))))
 except (ValueError,AttributeError):
     sys.exit(2)
 ' <<<"$observed"
+}
+
+cmd_open_window() {
+    local slot=${1:-} side original watcher receipt status=0
+    [ "$#" -eq 1 ] && [[ $slot =~ ^[A-Za-z0-9_-]{1,40}$ ]] && [ "$slot" != primary ] && [ "$slot" != update ] && [[ $slot != device-* ]] ||
+        die 'open-window needs a secondary slot: 1-40 letters, digits, underscores or hyphens; primary, update and device-* are reserved' 2
+    side=$(current_side)
+    exec 7>"$state/relaunch.lock"
+    flock -n 7 || die 'another window launch or relaunch is active'
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    original=$(app_window_ids) || die 'could not observe the current native windows'
+    # Probe the actual window lease before launching: a duplicate slot would
+    # activate its existing window and could never produce a new native ID.
+    if [ -e "$runtime/cagents-development-ui.lock.$slot" ]; then
+        exec 6<"$runtime/cagents-development-ui.lock.$slot"
+        flock -n -x 6 || die "window $slot is already open"
+        exec 6<&-
+    fi
+    rm -f -- "$state/window-$slot"
+    receipt=$state/window-$slot.new-$$
+    # Product-only targets have no dependency lists. Replay only the exact
+    # builds already recorded by build, as for relaunch; never join Cargo here.
+    touch "$state/replaying"
+    (
+        local ids identity
+        for _ in {1..300}; do
+            live_session || exit 1
+            ids=$(app_window_ids) || break
+            for identity in $ids; do
+                if ! grep -qxF -- "$identity" <<<"$original"; then
+                    printf '%s\n' "$identity" >"$receipt"
+                    rm -f -- "$state/replaying"
+                    mv -f -- "$receipt" "$state/window-$slot"
+                    printf 'window %s ready: native ID %s; log %s\n' "$slot" "$identity" "$logs/ui-$side-$slot.log"
+                    exit 0
+                fi
+            done
+            sleep 0.1
+        done
+        printf 'the additional window did not appear; see %s\n' "$logs/ui-$side-$slot.log" >"$state/failed"
+        touch "$state/stop"
+    ) 7>&- &
+    watcher=$!
+    trap 'kill "$watcher" 2>/dev/null || :; rm -f -- "$state/replaying" "$receipt" "$state/window-$slot"' EXIT
+    trap 'exit 143' TERM HUP
+    run_app "$side" "$slot" 7>&- || status=$?
+    kill "$watcher" 2>/dev/null || :
+    wait "$watcher" 2>/dev/null || :
+    if [ ! -s "$state/window-$slot" ]; then
+        printf 'the additional app exited before a new window appeared; see %s\n' "$logs/ui-$side-$slot.log" >&2
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 
 cmd_relaunch() {
@@ -1012,7 +1096,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= workspace_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1030,6 +1114,7 @@ cmd_start() {
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --ui-trace) ui_trace=1; shift ;;
+            --workspace-trace) workspace_trace=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1065,6 +1150,9 @@ cmd_start() {
     fi
     rm -f -- "$state/codex-executable-installed.json"
     rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
+    # Readiness belongs to one live session and one additional-window command.
+    # A previous side must not satisfy a caller waiting for this side to map.
+    rm -f -- "$state"/window-* "$state/replaying"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
@@ -1076,6 +1164,7 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
@@ -1240,6 +1329,7 @@ case $command in
     build) cmd_build "$@" ;;
     start) cmd_start "$@" ;;
     relaunch) cmd_relaunch "$@" ;;
+    open-window) cmd_open_window "$@" ;;
     cli)
         side=$(current_side)
         load_side "$side" "$state/source"

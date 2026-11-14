@@ -208,11 +208,13 @@ impl Cagents {
                 }
                 let snapshot = self.persistent_workspace();
                 self.record_shared_chat_identities();
+                let offer = self.snapshot_offer(snapshot, true);
                 let receipt = self
                     .session
                     .as_ref()
                     .unwrap()
-                    .recover_terminal_ownership(snapshot, review.recovery);
+                    .recover_terminal_ownership(offer, review.recovery);
+                self.snapshot_offer_answered(receipt.is_ok());
                 self.session_recovery.pending = true;
                 self.session_recovery.error = None;
                 cosmic::task::future(async move {

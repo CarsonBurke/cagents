@@ -89,7 +89,7 @@ fn read_lifecycle(
     if client.proof() != &activation.host {
         return Err(());
     }
-    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
         return Err(());
     }
     // At SQLite's maximum sequence there cannot be a later receipt. The
@@ -112,7 +112,7 @@ fn read_lifecycle(
         crate::automations::Response::Audit(page) => page,
         _ => return Err(()),
     };
-    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
         return Err(());
     }
     Ok(page)
@@ -1215,6 +1215,10 @@ impl Cagents {
     /// Local inventory-only sessions must be unique. Any raw managed member
     /// fences that fallback, including rejected/ambiguous canonical ownership.
     fn notification_attention_cards(&self) -> HashMap<TerminalId, Option<CardId>> {
+        #[cfg(test)]
+        self.shared_views
+            .notification_attribution_count
+            .set(self.shared_views.notification_attribution_count.get() + 1);
         let mut cards = HashMap::new();
         for card in self
             .durable
