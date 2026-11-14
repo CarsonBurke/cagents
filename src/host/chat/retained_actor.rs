@@ -50,7 +50,7 @@ pub(in crate::host) fn broker_running(host: &SharedHost) -> bool {
         .is_some_and(|broker| broker.0.worker_lifetime.strong_count() > 0)
 }
 
-pub(super) fn wake(host: &SharedHost, id: TerminalId) {
+pub(in crate::host) fn wake(host: &SharedHost, id: TerminalId) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down {
         return;
