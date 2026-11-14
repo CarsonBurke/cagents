@@ -1,4 +1,5 @@
 //! Capture the original request scope before dispatching background work.
+use super::super::request_failure::{Activity, Failure};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -51,16 +52,27 @@ impl Context {
     }
 
     pub(in crate::app) fn request(self, request: Request) -> Result<Response, String> {
+        let activity = Activity::automation(&request);
+        let scoped = self.is_scoped();
         self.connect()?
             .request(request)
-            .map_err(|error| error.to_string())
+            .map_err(|error| super::super::request_failure::message(error, activity, scoped))
+    }
+
+    pub(in crate::app) fn is_scoped(&self) -> bool {
+        self.authority.token().is_some()
     }
 
     pub(in crate::app) fn connect(self) -> Result<Connection, String> {
+        let scoped = self.is_scoped();
         self.connect_with(
             || crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string()),
             || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
-            |socket| ControlClient::connect(socket).map_err(|error| error.to_string()),
+            |socket| {
+                ControlClient::connect(socket).map_err(|error| {
+                    super::super::request_failure::message(error, Activity::ViewAutomations, scoped)
+                })
+            },
         )
     }
 
@@ -92,10 +104,7 @@ impl Context {
         // Resolving a remote socket can establish an SSH bridge. Refuse before
         // either resolver, not merely before sending the business request.
         if self.remote && self.authority.token().is_some() {
-            return Err(
-                "Automation management on another device is unavailable from an agent session"
-                    .into(),
-            );
+            return Err(Failure::remote(Activity::ViewAutomations));
         }
         let socket = if self.authority.token().is_some() || self.no_start {
             selected()

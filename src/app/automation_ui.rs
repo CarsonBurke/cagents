@@ -126,14 +126,9 @@ impl Cagents {
             Some(Effect::Request { sequence, request }) => {
                 let context = transport::Context::capture();
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        context
-                            .connect()?
-                            .request(request)
-                            .map_err(crate::control::ControlError::reason)
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
+                    let result = tokio::task::spawn_blocking(move || context.request(request))
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
                     Message::AutomationUi(Action::Received {
                         sequence,
                         result: Arc::new(result),

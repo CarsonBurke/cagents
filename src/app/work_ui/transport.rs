@@ -1,6 +1,7 @@
 //! Preserve the original UI request context before any resolver, future or
 //! watcher thread. Work envelopes use connection authentication, unlike the
 //! separate explicit-authority ChannelWork API.
+use super::super::request_failure::{Activity, Failure};
 use crate::{agent_execution::Authority, control::ControlClient};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,10 @@ impl Context {
         }
     }
 
+    pub(super) fn is_scoped(&self) -> bool {
+        self.authority.token().is_some()
+    }
+
     pub(super) fn connect(
         &self,
         may_start: bool,
@@ -35,7 +40,18 @@ impl Context {
             purpose,
             || crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string()),
             || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
-            |socket| ControlClient::connect(socket).map_err(|error| error.to_string()),
+            |socket| {
+                ControlClient::connect(socket).map_err(|error| {
+                    super::super::request_failure::message(
+                        error,
+                        match purpose {
+                            Purpose::Read => Activity::ViewWork,
+                            Purpose::Mutation => Activity::PinWork,
+                        },
+                        self.is_scoped(),
+                    )
+                })
+            },
         )
     }
 
@@ -51,7 +67,10 @@ impl Context {
         // Local-session authority must never enter a selected remote bridge,
         // including its resolver/SSH discovery, merely to obtain a refusal.
         if scoped && self.remote {
-            return Err("An inherited session capability cannot use a remote Work board".into());
+            return Err(Failure::remote(match purpose {
+                Purpose::Read => Activity::ViewWork,
+                Purpose::Mutation => Activity::PinWork,
+            }));
         }
         let socket = if may_start && !scoped && !self.no_start {
             start()?
@@ -65,7 +84,9 @@ impl Context {
             // or empty inherited scope, matching the existing CLI read policy.
             client
                 .authenticate(self.authority.clone())
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    super::super::request_failure::message(error, Activity::PinWork, scoped)
+                })?;
         }
         Ok(client)
     }
@@ -193,7 +214,7 @@ mod tests {
                     || panic!("must not start remote daemon"),
                     |_| panic!("must not connect remote endpoint"),
                 );
-                assert!(result.err().unwrap().contains("remote Work board"));
+                assert!(result.err().unwrap().contains("on another device"));
             }
         }
     }

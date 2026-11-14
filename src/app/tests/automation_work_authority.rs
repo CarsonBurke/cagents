@@ -319,8 +319,8 @@ fn exercise_app(role: &str) {
                 if scoped {
                     assert_eq!(
                         result.as_ref().as_ref().unwrap_err(),
-                        REFUSAL,
-                        "Automation must retain the existing reason-only error formatting"
+                        "This window's agent session isn't allowed to view automations.",
+                        "Automation explains which task this window cannot perform"
                     );
                 } else {
                     assert_eq!(
@@ -335,7 +335,10 @@ fn exercise_app(role: &str) {
         };
         if let Some(result) = result {
             if scoped {
-                assert!(result.as_ref().unwrap_err().contains(REFUSAL));
+                assert_eq!(
+                    result.as_ref().unwrap_err(),
+                    "Couldn't pin this card: this window's agent session isn't allowed to change Work."
+                );
             } else {
                 assert_eq!(result, &Ok(()));
             }

@@ -35,6 +35,7 @@ mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+mod request_failure;
 mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]

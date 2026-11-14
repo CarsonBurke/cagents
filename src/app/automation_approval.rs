@@ -1,6 +1,7 @@
 //! A hosted proposal never authorizes itself. The window presents the saved
 //! configuration and answers with its exact immutable request revision.
 use super::automation_ui::transport;
+use super::request_failure::{self, Activity};
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
 use crate::control::ControlError;
@@ -107,14 +108,15 @@ fn with_connection<C, T>(
     slot: &mut Option<C>,
     connect: impl FnOnce() -> Result<C, String>,
     read: impl Fn(&mut C) -> Result<T, ControlError>,
+    report: impl Fn(ControlError) -> String,
 ) -> Result<T, String> {
     if let Some(client) = slot.as_mut() {
         match read(client) {
             Ok(value) => return Ok(value),
-            Err(error @ ControlError::Remote { .. }) => return Err(error.to_string()),
+            Err(error @ ControlError::Remote { .. }) => return Err(report(error)),
             Err(error) if !closed(&error) => {
                 *slot = None;
-                return Err(error.to_string());
+                return Err(report(error));
             }
             Err(_) => *slot = None,
         }
@@ -124,7 +126,7 @@ fn with_connection<C, T>(
         if !matches!(error, ControlError::Remote { .. }) {
             *slot = None;
         }
-        error.to_string()
+        report(error)
     })
 }
 
@@ -331,6 +333,7 @@ impl Cagents {
                 let generation = self.automation_approval.generation;
                 let reader = Arc::clone(&self.automation_approval.reader);
                 let context = transport::Context::capture();
+                let scoped = context.is_scoped();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         // A read that panicked may have left a reply unread.
@@ -343,6 +346,9 @@ impl Cagents {
                             &mut reader,
                             || context.connect(),
                             |client| pending_proposal(client, &repository),
+                            |error| {
+                                request_failure::message(error, Activity::ViewApprovals, scoped)
+                            },
                         )
                     })
                     .await
@@ -775,14 +781,23 @@ mod tests {
         };
         let read = |connection: &mut Connection| Ok::<_, ControlError>(connection.0);
 
-        assert_eq!(with_connection(&mut slot, || connect(1), read), Ok(1));
+        assert_eq!(
+            with_connection(&mut slot, || connect(1), read, |error| error.to_string()),
+            Ok(1)
+        );
         for _ in 0..3 {
-            assert_eq!(with_connection(&mut slot, never, read), Ok(1));
+            assert_eq!(
+                with_connection(&mut slot, never, read, |error| error.to_string()),
+                Ok(1)
+            );
         }
         // The daemon answered with a refusal, so its connection still serves.
-        let refusal = with_connection(&mut slot, never, |_: &mut Connection| {
-            Err::<u32, _>(refused())
-        });
+        let refusal = with_connection(
+            &mut slot,
+            never,
+            |_: &mut Connection| Err::<u32, _>(refused()),
+            |error| error.to_string(),
+        );
         assert!(refusal.unwrap_err().contains("refused"));
         assert!(matches!(slot, Some(Connection(1))));
 
@@ -793,10 +808,18 @@ mod tests {
             id => Ok(id),
         };
         assert_eq!(
-            with_connection(&mut slot, || connect(2), closed_unless_new),
+            with_connection(
+                &mut slot,
+                || connect(2),
+                closed_unless_new,
+                |error| error.to_string()
+            ),
             Ok(2)
         );
-        assert_eq!(with_connection(&mut slot, never, read), Ok(2));
+        assert_eq!(
+            with_connection(&mut slot, never, read, |error| error.to_string()),
+            Ok(2)
+        );
 
         // A daemon too slow to answer is not asked again on another
         // connection; the next read connects afresh.
@@ -806,16 +829,24 @@ mod tests {
                 error: crate::terminal_ipc::FrameError::Io(std::io::ErrorKind::TimedOut.into()),
             })
         };
-        assert!(with_connection(&mut slot, never, slow).is_err());
+        assert!(with_connection(&mut slot, never, slow, |error| error.to_string()).is_err());
         assert!(slot.is_none());
 
         // A new connection that fails is not tried again until the next read.
         slot = None;
         let closed = |_: &mut Connection| Err::<u32, _>(ControlError::ConnectionClosed);
-        assert!(with_connection(&mut slot, || connect(3), closed).is_err());
+        assert!(
+            with_connection(&mut slot, || connect(3), closed, |error| error.to_string()).is_err()
+        );
         assert!(slot.is_none());
         assert!(
-            with_connection(&mut slot, || Err::<Connection, _>("no daemon".into()), read).is_err()
+            with_connection(
+                &mut slot,
+                || Err::<Connection, _>("no daemon".into()),
+                read,
+                |error| error.to_string()
+            )
+            .is_err()
         );
         assert!(slot.is_none());
         assert_eq!(connects, 3);

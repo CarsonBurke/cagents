@@ -368,7 +368,10 @@ fn exercise_app() {
             Action::Read { result, .. } => {
                 assert_eq!(approved, None);
                 if scoped {
-                    assert!(result.as_ref().as_ref().unwrap_err().contains(REFUSAL));
+                    assert_eq!(
+                        result.as_ref().as_ref().unwrap_err(),
+                        "This window's agent session isn't allowed to view automation requests."
+                    );
                 } else {
                     assert_eq!(result.as_ref().as_ref().unwrap(), &vec![proposal.clone()]);
                 }
@@ -376,7 +379,10 @@ fn exercise_app() {
             Action::Finished { result, .. } => {
                 assert!(approved.is_some());
                 if scoped {
-                    assert!(result.as_ref().as_ref().unwrap_err().contains(REFUSAL));
+                    assert_eq!(
+                        result.as_ref().as_ref().unwrap_err(),
+                        "This window's agent session isn't allowed to approve or decline automation requests."
+                    );
                 } else {
                     assert_ne!(
                         result.as_ref().as_ref().unwrap().state,
@@ -398,12 +404,11 @@ fn exercise_app() {
         } else if scoped {
             assert_eq!(app.automation_approval.proposal, Some(proposal.clone()));
             assert_eq!(app.automation_approval.available, Some(proposal));
-            assert!(
-                app.automation_approval
-                    .error
-                    .as_ref()
-                    .unwrap()
-                    .contains(REFUSAL)
+            assert_eq!(
+                app.automation_approval.error.as_deref(),
+                Some(
+                    "This window's agent session isn't allowed to approve or decline automation requests."
+                )
             );
         } else {
             assert!(!app.automation_approval_open());
@@ -445,7 +450,10 @@ fn exercise_cache(role: &str) {
             panic!("a pending approval read must produce its owning completion");
         };
         if scoped {
-            assert!(result.as_ref().as_ref().unwrap_err().contains(REFUSAL));
+            assert_eq!(
+                result.as_ref().as_ref().unwrap_err(),
+                "This window's agent session isn't allowed to view automation requests."
+            );
         } else {
             assert_eq!(result.as_ref().as_ref().unwrap(), &vec![proposal.clone()]);
         }

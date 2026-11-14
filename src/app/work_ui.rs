@@ -117,10 +117,20 @@ fn control(
     answer: impl FnOnce(Result<(), String>) -> Action + Send + 'static,
 ) -> Task<Message> {
     let context = transport::Context::capture();
+    let scoped = context.is_scoped();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut client = context.connect(true, purpose)?;
-            request(&mut client).map_err(|error| error.to_string())
+            request(&mut client).map_err(|error| {
+                super::request_failure::message(
+                    error,
+                    match purpose {
+                        transport::Purpose::Read => super::request_failure::Activity::ViewWork,
+                        transport::Purpose::Mutation => super::request_failure::Activity::PinWork,
+                    },
+                    scoped,
+                )
+            })
         })
         .await
         .unwrap_or_else(|error| Err(error.to_string()));

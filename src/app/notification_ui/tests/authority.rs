@@ -188,7 +188,7 @@ impl Drop for Peer {
     }
 }
 
-fn complete(task: Task<Message>) -> (u64, Result<LifecyclePage, ()>) {
+fn complete(task: Task<Message>) -> (u64, Result<LifecyclePage, LifecycleReadError>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -220,7 +220,7 @@ fn exercise_app() {
     );
     let authority = Authority::from_environment();
     let scoped = authority.token().is_some();
-    let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+    let (mut app, id, sequence, notice_id) = lifecycle_notice_fixture();
     let peer = Peer::new(
         app.notification_ui.host.clone().unwrap(),
         app.workspace_model.identity,
@@ -240,21 +240,54 @@ fn exercise_app() {
     assert_eq!(app.notification_ui.snapshot, notices);
     let (actual_generation, result) = complete(task);
     assert_eq!(actual_generation, generation);
-    assert_eq!(
-        result,
-        if scoped {
-            Err(())
-        } else {
-            Ok(exact_notice_page(id, sequence))
-        }
-    );
+    if scoped {
+        let Err(LifecycleReadError::Refused(failure)) = &result else {
+            panic!("a scope refusal must remain distinguishable from a missing receipt");
+        };
+        assert_eq!(
+            failure.message,
+            "This window's agent session isn't allowed to view this automation's history."
+        );
+        assert!(
+            failure
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("Synthetic notification scope refused")
+        );
+    } else {
+        assert_eq!(result, Ok(exact_notice_page(id, sequence)));
+    }
     // Reading alone cannot open cards, consume a notice, or retire the pending
     // generation. The App must apply the owning completion separately.
     assert_eq!(app.notification_ui.lifecycle_read, Some(generation));
     assert_eq!(app.durable.cards, cards);
     assert_eq!(app.workspace.focused(), focused);
     assert_eq!(app.notification_ui.snapshot, notices);
-    assert!(!app.notification_ui.acknowledged_for_test(notice));
+    assert!(!app.notification_ui.acknowledged_for_test(notice_id));
+    if scoped {
+        drop(app.update_notifications(Action::LifecycleResolved { generation, result }));
+        let notice = app
+            .status
+            .as_ref()
+            .expect("refusal explains why history did not open");
+        assert_eq!(
+            notice.message,
+            "This window's agent session isn't allowed to view this automation's history."
+        );
+        assert!(
+            notice
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("Synthetic notification scope refused")
+        );
+        assert_eq!(app.notification_ui.lifecycle_read, None);
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.notification_ui.snapshot, notices);
+        assert!(!app.notification_ui.acknowledged_for_test(notice_id));
+    }
     peer.finished();
 }
 
