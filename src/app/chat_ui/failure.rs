@@ -1291,7 +1291,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        rows.push(self.failure_diagnostics(incident));
+        rows.push(self.failure_diagnostics_on(incident, design::sunken));
         widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
@@ -1308,29 +1308,39 @@ impl Runtime {
         .into()
     }
     pub(super) fn failure_diagnostics(&self, incident: &Incident) -> Element<'static, Message> {
+        self.failure_diagnostics_on(incident, |theme| theme.current_container().base.into())
+    }
+
+    fn failure_diagnostics_on(
+        &self,
+        incident: &Incident,
+        surface: fn(&cosmic::Theme) -> iced::Color,
+    ) -> Element<'static, Message> {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut rows = Vec::new();
+        rows.push(disclosure::row_on(
+            if open { "Hide details" } else { "Details" }.to_owned(),
+            format!(
+                "{} technical details for {}",
+                if open { "Hide" } else { "Show" },
+                incident.summary
+            ),
+            Icon::Error,
+            Some(chat::ToolStatus::Failed),
+            None,
+            Some(open),
+            Some(Action::ToggleFailure(target, incident.key.clone())),
+            surface,
+        ));
         rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::quiet(if open { "Hide details" } else { "Details" })
-                    .name(format!(
-                        "{} technical details for {}",
-                        if open { "Hide" } else { "Show" },
-                        incident.summary
-                    ))
-                    .on_press(action(Action::ToggleFailure(target, incident.key.clone())))
-                    .into(),
-                crate::ui_controls::button::quiet("Copy details")
-                    .name(format!(
-                        "Copy original diagnostics for {}",
-                        incident.summary
-                    ))
-                    .on_press(action(Action::CopyFailure(target, incident.key.clone())))
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
+            crate::ui_controls::button::quiet("Copy details")
+                .name(format!(
+                    "Copy original diagnostics for {}",
+                    incident.summary
+                ))
+                .on_press(action(Action::CopyFailure(target, incident.key.clone())))
+                .into(),
         );
         if open {
             // Full bytes are resolved only on expansion/copy. The collapsed
@@ -1516,6 +1526,97 @@ mod tests {
             .0
             .text(diagnostic_preview_identity(key))
             .is_some()
+    }
+
+    #[test]
+    fn diagnostic_disclosure_keeps_copy_action_and_focus_when_expanded() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced_accessibility::accesskit::Role;
+
+        struct Focus {
+            first: bool,
+            controls: Vec<bool>,
+        }
+        impl Operation for Focus {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if self.first && self.controls.is_empty() {
+                    state.focus();
+                }
+                self.controls.push(state.is_focused());
+            }
+        }
+
+        let (mut runtime, _handle) = live_fixture(Provider::Claude, Vec::new());
+        let incident = Incident {
+            key: "fixture-failure".into(),
+            summary: "The command failed".into(),
+            guidance: "Review the details before trying again.",
+            kind: None,
+            sources: Vec::new(),
+            first_item: None,
+            anchor: None,
+            child_scope: None,
+            active_recovery: false,
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(runtime.failure_diagnostics(&incident).as_widget());
+        for (index, open) in [false, true, false].into_iter().enumerate() {
+            if open {
+                runtime.failure_ui.expanded.insert(incident.key.clone());
+            } else {
+                runtime.failure_ui.expanded.remove(&incident.key);
+            }
+            let mut element = runtime.failure_diagnostics(&incident);
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 800.0)),
+            );
+            let layout = Layout::new(&node);
+            let accessible =
+                element
+                    .as_widget()
+                    .a11y_nodes(layout, &tree, iced::mouse::Cursor::Unavailable);
+            let buttons = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| node.node().role() == Role::Button)
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 2);
+            assert_eq!(
+                buttons[0].node().label(),
+                Some(if open {
+                    "Hide technical details for The command failed"
+                } else {
+                    "Show technical details for The command failed"
+                })
+            );
+            assert_eq!(
+                buttons[1].node().label(),
+                Some("Copy original diagnostics for The command failed")
+            );
+            let mut focus = Focus {
+                first: index == 0,
+                controls: Vec::new(),
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut focus);
+            assert_eq!(focus.controls, [true, false]);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
-use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
+use crate::flock::process_owns_lock as process_owns_slot;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -1150,7 +1150,6 @@ fn verified_window_lease_owners_in(
     use std::os::fd::FromRawFd;
     let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
-    let kernel_locks = fs::read_to_string(proc_root.join("locks"))?;
     for slot in slots {
         let lease_path = runtime.join(slot_lock_name(&slot));
         let lock = OpenOptions::new()
@@ -1166,17 +1165,19 @@ fn verified_window_lease_owners_in(
         // Btrfs subvolume st_dev can differ from the superblock device printed
         // in /proc/locks. Index by inode, then disambiguate using the actual
         // locked descriptor's stat device and inode, not a mere open descriptor.
-        let pids: std::collections::BTreeSet<_> = kernel_locks
-            .lines()
-            .filter_map(|line| flock_owner(line, &expected))
+        // The index can miss a held lock under churn, so the owner the window
+        // recorded in its lease is a candidate too.
+        let recorded: Vec<u32> = daemon_admission::recorded_owner(&lock)
+            .into_iter()
             .collect();
-        let mut matches = Vec::new();
-        for pid in pids {
+        let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
             let process = proc_root.join(pid.to_string());
+            // A candidate that exits or hides its descriptors mid-proof, as a
+            // stale recorded pid may, is simply not the owner.
             if !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == current_uid())
-                || !process_owns_slot(&process, pid, &expected)?
+                || !process_owns_slot(&process, pid, &expected).unwrap_or(false)
             {
-                continue;
+                return Ok(None);
             }
             // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -1198,16 +1199,41 @@ fn verified_window_lease_owners_in(
                     "window ownership changed during verification",
                 ));
             }
-            matches.push(verified);
+            Ok(Some(verified))
+        })?;
+        // A window that closed after the slots were listed is not live.
+        if matches.is_empty() && lease_released(&lock, &expected)? {
+            continue;
         }
         if matches.len() != 1 {
             return Err(io::Error::other(format!(
-                "cannot authenticate live window {slot}"
+                "cannot authenticate live window {slot}: {} verified lease owners",
+                matches.len()
             )));
         }
         owners.push(matches.pop().unwrap());
     }
     Ok(owners)
+}
+
+/// Whether nobody holds the lease `lock` opened, probed through a separate
+/// open of that same inode: a duplicate would share the open file description
+/// and could take a lock already held through it, and the path may since
+/// name another file.
+fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
+    let probe = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+    let probed = probe.metadata()?;
+    if probed.dev() != expected.dev() || probed.ino() != expected.ino() {
+        return Err(io::Error::other("window lease changed during verification"));
+    }
+    match owned_file_lock(probe, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn update_in_progress() -> bool {
@@ -3146,6 +3172,51 @@ mod tests {
         );
         drop(replacement);
         drop(held);
+    }
+
+    #[test]
+    fn a_live_window_missing_from_the_kernel_lock_index_is_found_by_its_recorded_owner() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut held = owned_lock(
+            &runtime.path().join(slot_lock_name("second")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        daemon_admission::publish_capability(held.file_mut()).unwrap();
+        // /proc/locks can skip a held lock when other locks change while it is
+        // read; this index never lists it.
+        let proc_root = tempfile::tempdir().unwrap();
+        fs::write(proc_root.path().join("locks"), "").unwrap();
+        let pid = std::process::id();
+        symlink(
+            Path::new("/proc").join(pid.to_string()),
+            proc_root.path().join(pid.to_string()),
+        )
+        .unwrap();
+        let owners = verified_window_lease_owners_in(runtime.path(), proc_root.path()).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].pid(), pid);
+        // A held lease that no candidate proves is still refused, not taken
+        // for a window that closed.
+        let unrecorded = owned_lock(
+            &runtime.path().join(slot_lock_name("third")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let Err(refused) = verified_window_lease_owners_in(runtime.path(), proc_root.path()) else {
+            panic!("a held lease no candidate proves was accepted");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "cannot authenticate live window third: 0 verified lease owners"
+        );
+        drop(unrecorded);
+        drop(held);
+        assert!(
+            verified_window_lease_owners_in(runtime.path(), proc_root.path())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
