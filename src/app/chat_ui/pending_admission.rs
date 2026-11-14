@@ -20,7 +20,9 @@ impl Runtime {
         // A long draft scrolls inside its card, so it fades into the card's
         // own fill at the card's edges. The vertical inset scrolls with the
         // text; the side inset keeps the fade clear of the rounded corners.
-        let draft = widget::container(crate::interaction::overflow_fade_y(
+        // The card hugs a short draft; the space it may grow into is laid out
+        // last, so the attachment caption below it keeps its room.
+        let card = widget::container(crate::interaction::overflow_fade_y(
             widget::scrollable(
                 widget::container(view::body(text))
                     .width(Length::Fill)
@@ -38,6 +40,9 @@ impl Runtime {
             [design::RADIUS_M; 4],
             false,
         ));
+        let draft = widget::container(card)
+            .width(Length::Fill)
+            .height(Length::Fill);
         // Files and images wait with the text; their names say they were kept.
         let attached = self
             .unsent_attachments()

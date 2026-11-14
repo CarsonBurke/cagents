@@ -549,9 +549,7 @@ impl Runtime {
                 .spacing(space::XS)
                 .align_y(Alignment::Center)
                 .into(),
-                widget::container(crate::interaction::keyed_list_rows(rows))
-                    .padding(design::with_vertical_rail(iced::Padding::ZERO))
-                    .into(),
+                crate::interaction::keyed_list_rows(rows),
             ])
             .spacing(space::S)
             .width(Length::Fill),
@@ -561,12 +559,14 @@ impl Runtime {
         // viewport runs to the panel's edges and a row passing one fades
         // into the panel instead of stopping a band short of it.
         let panel = widget::container(crate::interaction::overflow_fade_y(
-            widget::scrollable(widget::container(list).padding([space::M, 0.0]))
-                .id(card_control_id(target.card, "chat-subagent-list"))
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Fill),
+            widget::scrollable(widget::container(list).padding(design::with_vertical_rail(
+                iced::Padding::from([space::M, 0.0]),
+            )))
+            .id(card_control_id(target.card, "chat-subagent-list"))
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .height(Length::Fill),
             design::sunken,
         ))
         .padding([0.0, space::M])
