@@ -350,6 +350,45 @@ fn failed_pending_save_cannot_retarget_the_retained_worker() {
 }
 
 #[test]
+fn pending_start_refuses_source_change_between_reservation_reads() {
+    let fixture = Fixture::new();
+    let host = fixture.host.clone();
+    let scope = fixture.scope.clone();
+    let revision = fixture.view().revision;
+    let mut newer = fixture.pane.clone();
+    let CardKind::Terminal(source) = &mut newer.kind else {
+        unreachable!()
+    };
+    source.resume_hint = Some("newer-pending-intent".into());
+    let expected = newer.clone();
+    let before = fixture.pane.clone();
+    BEFORE_PENDING_START.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            edit_delta(
+                &host,
+                1,
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision: revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Update {
+                        before,
+                        pane: newer,
+                    },
+                },
+            )
+            .unwrap();
+        }))
+    });
+
+    let error = fixture.complete().unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+    assert!(fixture.host.lock().unwrap().terminals.is_empty());
+    assert_eq!(fixture.view().panes, vec![expected]);
+    assert!(!fixture.directory.path().join("launches").exists());
+}
+
+#[test]
 fn retry_reports_pane_withdrawal_between_reservation_reads() {
     let fixture = Fixture::new();
     let db = rusqlite::Connection::open(&fixture.path).unwrap();

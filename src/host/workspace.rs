@@ -264,7 +264,7 @@ impl PendingTerminal {
     }
 
     pub(super) fn accepts(&self, session: &TerminalSession) -> bool {
-        self.pane.pending_terminal_start && self.session.launch == session.launch
+        self.pane.pending_terminal_start && self.session == *session
     }
 
     /// Execution writes use another connection. Read the pane and its revision

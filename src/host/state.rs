@@ -4513,7 +4513,11 @@ fn start_terminal_view_owned_reserved(
                 return Ok((descriptor, handle));
             }
             if !reservation.accepts(&session) {
-                return Err(not_found(terminal_id));
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    super::model::Registry::VIEW_SOURCE_CONFLICT,
+                    true,
+                ));
             }
         }
         // A saved setup recipe is evidence, never automatic replay permission.
