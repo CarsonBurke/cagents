@@ -119,8 +119,130 @@ pub enum ModelUpdate {
     },
 }
 
+/// How long the observer waits for an answer the publisher is reading before
+/// it reads the model itself.
+const ANSWER_PATIENCE: Duration = Duration::from_millis(500);
+
+/// The way from the daemon threads to the window, and the newest complete
+/// snapshot sent along it.
+///
+/// The publisher and the observer hold separate connections, and the registry
+/// echoes an edit to every connection but the one that made it. So the
+/// observer hears of this window's own edits as the publisher receives the
+/// model they produced, and of edges queued behind a read that already
+/// included them. It reads the model again only for an edge newer than the
+/// snapshot the window has been sent, once no answer that could cover it is
+/// still on its way.
+#[derive(Clone)]
+pub(super) struct ModelUpdates {
+    sender: async_channel::Sender<ModelUpdate>,
+    delivery: Arc<(std::sync::Mutex<Delivery>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct Delivery {
+    /// The registry identity and sequence of the newest snapshot sent.
+    sent: Option<(uuid::Uuid, u64)>,
+    /// Edits the publisher has sent and not yet had answered.
+    answering: usize,
+}
+
+/// An edit the publisher awaits the registry's answer to.
+struct Answering<'a>(&'a ModelUpdates);
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        let (delivery, settled) = &*self.0.delivery;
+        delivery.lock().unwrap_or_else(|p| p.into_inner()).answering -= 1;
+        settled.notify_all();
+    }
+}
+
+impl ModelUpdates {
+    pub(super) fn new(sender: async_channel::Sender<ModelUpdate>) -> Self {
+        Self {
+            sender,
+            delivery: Arc::default(),
+        }
+    }
+
+    fn delivery(&self) -> std::sync::MutexGuard<'_, Delivery> {
+        self.delivery.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn send_blocking(
+        &self,
+        update: ModelUpdate,
+    ) -> Result<(), async_channel::SendError<ModelUpdate>> {
+        // The window installs a connection's or a read's model whole unless it
+        // holds a newer one, whatever registry it was on. It takes an edit's
+        // answer only from the registry it has joined, so that answer counts
+        // only once a snapshot from the same registry is ahead of it.
+        let snapshot = match &update {
+            ModelUpdate::Connected(model) | ModelUpdate::Read(model) => {
+                Some((model.identity, model.sequence, true))
+            }
+            ModelUpdate::ViewApplied { model, .. }
+            | ModelUpdate::RetirementAnswered { model, .. }
+            | ModelUpdate::Reopened { model, .. } => Some((model.identity, model.sequence, false)),
+            _ => None,
+        };
+        self.sender.send_blocking(update)?;
+        if let Some((identity, sequence, joins)) = snapshot {
+            let mut delivery = self.delivery();
+            match delivery.sent {
+                Some((sent, through)) if sent == identity => {
+                    if sequence > through {
+                        delivery.sent = Some((identity, sequence));
+                    }
+                }
+                _ if joins => delivery.sent = Some((identity, sequence)),
+                _ => {}
+            }
+            drop(delivery);
+            self.delivery.1.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Marks an edit sent to the registry until its answer has been handed
+    /// on, or it has failed.
+    fn answering(&self) -> Answering<'_> {
+        self.delivery().answering += 1;
+        Answering(self)
+    }
+
+    /// Whether the window has been sent registry `identity`'s model as of
+    /// `sequence` or later.
+    #[cfg(test)]
+    fn sent(&self, identity: uuid::Uuid, sequence: u64) -> bool {
+        covers(&self.delivery(), identity, sequence)
+    }
+
+    /// [`Self::sent`], once the answers the publisher awaits have arrived or
+    /// `patience` has run out.
+    fn sent_once_answered(&self, identity: uuid::Uuid, sequence: u64, patience: Duration) -> bool {
+        let (delivery, settled) = &*self.delivery;
+        let delivery = delivery.lock().unwrap_or_else(|p| p.into_inner());
+        let (delivery, _) = settled
+            .wait_timeout_while(delivery, patience, |delivery| {
+                delivery.answering > 0 && !covers(delivery, identity, sequence)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        covers(&delivery, identity, sequence)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+fn covers(delivery: &Delivery, identity: uuid::Uuid, sequence: u64) -> bool {
+    matches!(delivery.sent, Some((sent, through)) if sent == identity && through >= sequence)
+}
+
 /// Watches the daemon for shared-model edges.
-pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
+pub(super) fn observe_workspace_model(sender: ModelUpdates) {
     let observer = std::thread::Builder::new()
         .name("cagents-workspace-model".into())
         .spawn(move || {
@@ -140,7 +262,7 @@ pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>
     }
 }
 
-fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
+fn observe(sender: &ModelUpdates) -> Result<(), String> {
     // Never start a daemon merely to watch it: with no daemon there is no shared
     // model to mirror, and the window starts one itself as soon as it publishes.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
@@ -148,10 +270,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     observe_with_client(sender, &mut client)
 }
 
-fn observe_with_client(
-    sender: &async_channel::Sender<ModelUpdate>,
-    client: &mut ControlClient,
-) -> Result<(), String> {
+fn observe_with_client(sender: &ModelUpdates, client: &mut ControlClient) -> Result<(), String> {
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
@@ -167,6 +286,7 @@ fn observe_with_client(
         }
         Err(error) => return Err(error.to_string()),
     };
+    let identity = model.identity;
     sender
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
@@ -190,6 +310,14 @@ fn observe_with_client(
                 | ModelEdit::RetireEmptyChannel { .. }
                 | ModelEdit::AgentsChanged
         ) {
+            // An agent edge is stamped with the sequence current when it is
+            // announced, and agent records can change without advancing it,
+            // so only a committed edit's own sequence proves it was sent.
+            if !matches!(edit, ModelEdit::AgentsChanged)
+                && sender.sent_once_answered(identity, sequence, ANSWER_PATIENCE)
+            {
+                continue;
+            }
             let model = client
                 .read_workspace_model()
                 .map_err(|error| error.to_string())?;
@@ -215,7 +343,7 @@ fn observe_with_client(
 
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
-    updates: async_channel::Sender<ModelUpdate>,
+    updates: ModelUpdates,
     requests: async_channel::Receiver<ModelEdit>,
 ) {
     let publisher = std::thread::Builder::new()
@@ -239,7 +367,7 @@ pub(super) fn publish_workspace_model(
 }
 
 fn publish(
-    updates: &async_channel::Sender<ModelUpdate>,
+    updates: &ModelUpdates,
     requests: &async_channel::Receiver<ModelEdit>,
     pending: &mut Option<Unsent>,
 ) -> Result<(), String> {
@@ -252,7 +380,7 @@ fn publish(
 }
 
 fn publish_with_client(
-    updates: &async_channel::Sender<ModelUpdate>,
+    updates: &ModelUpdates,
     requests: &async_channel::Receiver<ModelEdit>,
     pending: &mut Option<Unsent>,
     client: &mut ControlClient,
@@ -289,7 +417,11 @@ fn publish_with_client(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some((request.clone(), first));
-        match send(client, request.clone(), updates) {
+        let sent = {
+            let _answering = updates.answering();
+            send(client, request.clone(), updates)
+        };
+        match sent {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -357,7 +489,7 @@ fn publish_with_client(
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
-    updates: &async_channel::Sender<ModelUpdate>,
+    updates: &ModelUpdates,
 ) -> Result<(), ControlError> {
     let reordered = matches!(
         &edit,
@@ -1956,6 +2088,7 @@ mod tests {
             );
         });
         let (updates, _received) = async_channel::unbounded();
+        let updates = ModelUpdates::new(updates);
         let (queued, requests) = async_channel::unbounded();
         queued.send_blocking(title).unwrap();
         queued.send_blocking(next.clone()).unwrap();
@@ -2010,6 +2143,7 @@ mod tests {
             peer.shutdown(std::net::Shutdown::Both).unwrap();
         });
         let (updates, received) = async_channel::unbounded();
+        let updates = ModelUpdates::new(updates);
         let (queued, requests) = async_channel::unbounded();
         queued
             .send_blocking(ModelEdit::SuggestChannelTitle {
@@ -2165,6 +2299,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (updates, received) = async_channel::unbounded();
+        let updates = ModelUpdates::new(updates);
         let (queued, requests) = async_channel::unbounded();
         for title in titles {
             queued.send_blocking(title).unwrap();
@@ -2429,6 +2564,7 @@ mod tests {
             });
             let mut client = ControlClient::from_stream(stream).unwrap();
             let (tx, rx) = async_channel::unbounded();
+            let tx = ModelUpdates::new(tx);
             assert!(observe_with_client(&tx, &mut client).is_err());
             server.join().unwrap();
             let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -2459,6 +2595,191 @@ mod tests {
                 "later full reads must not restore stale agent inventory"
             );
         }
+    }
+
+    /// The registry echoes this window's own edit to its observer after the
+    /// publisher has sent the window the model it produced; reading that model
+    /// again would only cost the window a second install.
+    #[test]
+    fn the_observer_reads_only_models_the_window_has_not_been_sent() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let identity = uuid::Uuid::new_v4();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let updates = ModelUpdates::new(tx);
+        let publisher = updates.clone();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "observer".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let respond = |peer: &mut std::os::unix::net::UnixStream, request_id, response| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            let edge = |peer: &mut std::os::unix::net::UnixStream, sequence, edit| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message: ServerMessage::WorkspaceModelEdited {
+                            sequence,
+                            edit,
+                            effects: Default::default(),
+                        },
+                    },
+                )
+                .unwrap();
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            respond(
+                &mut peer,
+                hello.request_id,
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
+            let at = |sequence| WorkspaceModel {
+                identity,
+                sequence,
+                ..Default::default()
+            };
+            respond(
+                &mut peer,
+                watch.request_id,
+                ServerResponse::WorkspaceSnapshot {
+                    model: at(0),
+                    closed: Vec::new(),
+                },
+            );
+            while !publisher.sent(identity, 0) {
+                std::thread::yield_now();
+            }
+            let navigation = || ModelEdit::ResetNavigation {
+                repository: PathBuf::from("/repo/.git"),
+            };
+            // This window's own edit, at sequence 2: the registry echoes it,
+            // with the edge queued before it, while the publisher is still
+            // reading the answer that carries its model.
+            let answering = publisher.answering();
+            edge(&mut peer, 1, navigation());
+            edge(&mut peer, 2, navigation());
+            std::thread::sleep(Duration::from_millis(50));
+            publisher
+                .send_blocking(ModelUpdate::ViewApplied {
+                    scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
+                    operation: None,
+                    model: at(2),
+                })
+                .unwrap();
+            drop(answering);
+            peer.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).is_err(),
+                "an edit the window has the model for is not read again"
+            );
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // An agent edge carries the sequence current when it was
+            // announced, so it is read even when that sequence was sent.
+            edge(&mut peer, 2, ModelEdit::AgentsChanged);
+            edge(&mut peer, 3, navigation());
+            for sequence in [2, 3] {
+                let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                respond(
+                    &mut peer,
+                    read.request_id,
+                    ServerResponse::WorkspaceModel {
+                        model: at(sequence),
+                    },
+                );
+            }
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof,
+                    message: ServerMessage::HostShuttingDown,
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        assert!(observe_with_client(&updates, &mut client).is_err());
+        server.join().unwrap();
+        let received = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(received.len(), 4);
+        assert!(matches!(&received[0], ModelUpdate::Connected(model) if model.sequence == 0));
+        assert!(
+            matches!(&received[1], ModelUpdate::ViewApplied { model, .. } if model.sequence == 2)
+        );
+        assert!(matches!(&received[2], ModelUpdate::Read(model) if model.sequence == 2));
+        assert!(matches!(&received[3], ModelUpdate::Read(model) if model.sequence == 3));
+    }
+
+    #[test]
+    fn only_a_joined_registrys_edit_answers_count_as_sent() {
+        let (tx, _rx) = async_channel::unbounded();
+        let updates = ModelUpdates::new(tx);
+        let (joined, next) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let at = |identity, sequence| WorkspaceModel {
+            identity,
+            sequence,
+            ..Default::default()
+        };
+        let applied = |model| ModelUpdate::ViewApplied {
+            scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
+            operation: None,
+            model,
+        };
+        // The window refuses an edit's answer from a registry it has not
+        // joined, so the answer covers nothing.
+        updates.send_blocking(applied(at(joined, 5))).unwrap();
+        assert!(!updates.sent(joined, 5));
+        updates
+            .send_blocking(ModelUpdate::Read(at(joined, 1)))
+            .unwrap();
+        assert!(updates.sent(joined, 1));
+        updates.send_blocking(applied(at(next, 9))).unwrap();
+        assert!(!updates.sent(next, 9));
+        assert!(
+            updates.sent(joined, 1),
+            "another registry's answer keeps the mark"
+        );
+        updates
+            .send_blocking(ModelUpdate::Connected(at(next, 3)))
+            .unwrap();
+        assert!(updates.sent(next, 3));
+        assert!(!updates.sent(next, 4));
+        assert!(!updates.sent(joined, 1));
+        updates.send_blocking(applied(at(next, 9))).unwrap();
+        updates
+            .send_blocking(ModelUpdate::Read(at(next, 4)))
+            .unwrap();
+        assert!(
+            updates.sent(next, 9),
+            "an older read does not lower the mark"
+        );
     }
 
     #[test]
@@ -2541,6 +2862,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (sender, updates) = async_channel::unbounded();
+        let sender = ModelUpdates::new(sender);
         send(&mut client, edit, &sender).unwrap();
         let ModelUpdate::Ranked { channel, model } = updates.try_recv().unwrap() else {
             panic!("a successful create forwards its canonical receipt")
@@ -2663,6 +2985,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client).unwrap();
         let (sender, updates) = async_channel::unbounded();
+        let sender = ModelUpdates::new(sender);
         send(&mut client, title.clone(), &sender).unwrap();
         assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::Read(_)));
         assert!(
@@ -2805,6 +3128,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         let (tx, rx) = async_channel::unbounded();
+        let tx = ModelUpdates::new(tx);
         send(&mut client, first_edit, &tx).unwrap();
         assert!(
             matches!(rx.try_recv().unwrap(), ModelUpdate::ViewConflicted {

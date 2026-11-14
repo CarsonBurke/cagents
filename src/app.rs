@@ -14293,6 +14293,8 @@ impl Application for Cagents {
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
+        let workspace_model_updates =
+            workspace_model_sync::ModelUpdates::new(workspace_model_updates);
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
         workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
         workspace_model_sync::publish_workspace_model(
