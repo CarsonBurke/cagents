@@ -97,7 +97,7 @@ pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
 
 /// Earlier clients receive retryable Internal errors for store contention.
-pub(super) const STORE_BUSY_ERROR: u16 = 178;
+pub(super) const STORE_BUSY_ERROR: u16 = 179;
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that

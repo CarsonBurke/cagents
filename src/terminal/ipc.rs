@@ -239,10 +239,10 @@ use crate::{
 /// Version 176 separates cancelled and skipped Work check counts from failures
 /// and passes. Board reads, pins and subscriptions require a matching client.
 /// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
-/// Version 178 appends retryable `StoreBusy` errors for mailbox contention.
-/// Older clients cannot decode the new error code; replace the matched set.
-/// Version 179 fences shared Close on its original pane and terminal worker,
-/// with attachment metadata, removal-basis reads and source-checked cleanup.
+/// Version 178 appends `AutomationProposalsChanged` for notification watchers.
+/// Version 179 adds retryable `StoreBusy` errors and fences shared Close on its
+/// original pane and terminal worker, with attachment metadata, captured-source
+/// reads and source-checked cleanup. Replace the matched daemon/window set.
 pub const PROTOCOL_VERSION: u16 = 179;
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
