@@ -18,7 +18,11 @@ impl Cagents {
                     .map(|pane| (&view.scope, pane))
             });
             let Some((scope, before)) = owners.next() else {
-                return if self.shared_views.attached.contains(&card)
+                // An unadmitted saved draft is local text, despite cached
+                // shared membership. Closing it grants no shared authority.
+                return if self.chat_awaiting_admission(card) {
+                    Ok(None)
+                } else if self.shared_views.attached.contains(&card)
                     || self
                         .shared_views
                         .baseline
