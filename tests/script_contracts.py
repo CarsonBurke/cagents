@@ -252,6 +252,20 @@ class Running(Tree):
             self.run_job(jobs, "job")
         self.assertEqual(self.calls(), [])
 
+    def test_every_job_runs_whole_past_failures_keeping_the_first_status(self):
+        self.recording("tests/one.py", "one", exit_code=5)
+        self.recording("tests/two.py", "two")
+        self.recording("tests/three.py", "three", exit_code=9)
+        jobs = (Job("first", (Suite("one", "tests/one.py"),)),
+                Job("sharded", (Suite("two", "tests/two.py"),), shards=3),
+                Job("last", (Suite("three", "tests/three.py"),)))
+        with quiet():
+            self.assertEqual(contracts.run_all(self.root, jobs=jobs), 5)
+        calls = self.calls()
+        self.assertEqual([call["fixture"] for call in calls], ["one", "two", "three"])
+        # The sharded job's suite ran whole rather than as one shard.
+        self.assertEqual(calls[1]["arguments"], ["-v"])
+
     def test_unknown_jobs_and_mismatched_shards_are_refused(self):
         self.recording("tests/one.py", "one")
         jobs = (Job("job", (Suite("one", "tests/one.py"),), shards=3),)
