@@ -338,6 +338,14 @@ debug = 0
 opt-level = 2
 debug = 0
 
+# With debug assertions, WGPU captures a backtrace whenever it takes its
+# snatch lock, which every rendered frame does. Under the runner's
+# RUST_BACKTRACE=1 that unwinding was about a sixth of the UI thread's time
+# while agents worked: a cost release builds never pay, which skewed every
+# development measurement of rendering.
+[profile.dev-runtime.package.wgpu-core]
+debug-assertions = false
+
 [profile.test]
 debug = "line-tables-only"
 
