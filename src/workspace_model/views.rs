@@ -468,6 +468,35 @@ pub enum TerminalRemovalBasis {
     },
 }
 
+impl TerminalRemovalBasis {
+    /// Whether an observation continues the authority captured by Close.
+    pub fn follows_captured(&self, captured: Option<&Self>) -> bool {
+        match (captured, self) {
+            (
+                Some(Self::Worker {
+                    owner: a,
+                    instance: x,
+                }),
+                Self::Worker {
+                    owner: b,
+                    instance: y,
+                },
+            ) => a == b && x == y,
+            (
+                Some(Self::Worker { owner: a, instance }),
+                Self::Absent {
+                    owner: b,
+                    latest_worker,
+                    ..
+                },
+            ) => a != b || latest_worker == &Some(*instance),
+            (Some(existing), next) => existing == next,
+            (None, Self::Absent { .. }) => true,
+            (None, Self::Worker { .. }) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Change {
     Insert {
@@ -930,6 +959,23 @@ mod wire_kind {
 mod wire_tests {
     use super::*;
     use crate::model::*;
+    #[test]
+    fn a_missing_capture_cannot_acquire_a_later_absence_stamp() {
+        let later = TerminalRemovalBasis::Absent {
+            owner: crate::model::HostSessionProof {
+                host_session_id: "fixture".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "incarnation".into(),
+            },
+            latest_worker: Some(uuid::Uuid::new_v4()),
+            history_epoch: 0,
+        };
+        assert!(
+            !later.follows_captured(None),
+            "a replacement that finished before the delayed probe is still a replacement"
+        );
+    }
+
     #[test]
     fn delayed_close_does_not_remove_a_replacement_source() {
         let original = Pane {

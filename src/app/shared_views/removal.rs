@@ -170,29 +170,7 @@ impl Cagents {
         let Change::RemoveSource { terminal, .. } = &mut source.change else {
             unreachable!()
         };
-        let valid = match (terminal.as_ref(), &basis) {
-            (
-                Some(TerminalRemovalBasis::Worker {
-                    owner: a,
-                    instance: x,
-                }),
-                TerminalRemovalBasis::Worker {
-                    owner: b,
-                    instance: y,
-                },
-            ) => a == b && x == y,
-            (
-                Some(TerminalRemovalBasis::Worker { owner: a, instance }),
-                TerminalRemovalBasis::Absent {
-                    owner: b,
-                    latest_worker,
-                    ..
-                },
-            ) => a != b || latest_worker == &Some(*instance),
-            (Some(existing), next) => existing == next,
-            (None, TerminalRemovalBasis::Absent { .. }) => true,
-            (None, TerminalRemovalBasis::Worker { .. }) => false,
-        };
+        let valid = basis.follows_captured(terminal.as_ref());
         if valid {
             *terminal = Some(basis);
         } else {
