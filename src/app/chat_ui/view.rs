@@ -868,6 +868,23 @@ fn activity_row<'a>(
         .into()
 }
 
+/// The closing row of a working transcript whose own rows already show the
+/// work under way. It holds the activity row's place, so the transcript does
+/// not shift each time the work moves between a row and this line.
+fn activity_space<'a>() -> Element<'a, Message> {
+    widget::row::with_children(vec![
+        widget::Space::new()
+            .width(design::COMPACT_ICON_SIZE)
+            .height(design::COMPACT_ICON_SIZE)
+            .into(),
+        design::caption(" ").into(),
+    ])
+    .spacing(step::GAP_XS)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
 /// A one-line row of a composer list: an optional icon, a name, what it
 /// does in muted text cut to the room left, and what kind of thing it is.
 fn menu_row<'a>(
@@ -1762,6 +1779,58 @@ impl Runtime {
         }
     }
 
+    /// Whether the end of the shown transcript already says, with a spinner,
+    /// that the agent is working, so the closing activity line need not.
+    ///
+    /// Each turn draws one activity indicator, on its newest live row: a
+    /// thought still streaming, a card or step still running, or else its
+    /// working step strip. Sending, starting or subagents working on their
+    /// own are said only by the closing line.
+    fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
+        match selected {
+            Some(agent) => agent.items.last().is_some_and(|item| {
+                item.content.status() == Some(chat::ToolStatus::Running)
+                    || matches!(item.content, ItemContent::Text { thinking: true, .. })
+                        && agent.status == chat::ToolStatus::Running
+            }),
+            None => {
+                self.snapshot.busy
+                    && !self.snapshot.has_later
+                    && !self.sending()
+                    && self.turns.last().is_some_and(|turn| {
+                        self.turn_prose_live(turn)
+                            || !turn.steps.is_empty()
+                                && self.strip_status(turn) == Some(chat::ToolStatus::Running)
+                    })
+            }
+        }
+    }
+
+    /// Whether a row after a turn's step strip shows newer work under way:
+    /// reasoning still streaming, or a card or step still running.
+    fn turn_prose_live(&self, turn: &turn::Turn) -> bool {
+        let items = &self.snapshot.items;
+        let busy = self.snapshot.busy && !self.snapshot.has_later;
+        turn.prose.iter().any(|placed| {
+            items.get(placed.index).is_some_and(|item| {
+                if placed.slot == turn::Slot::Thinking {
+                    !reasoning_finished(items, busy, &item.id)
+                } else {
+                    item.content.status() == Some(chat::ToolStatus::Running)
+                }
+            })
+        })
+    }
+
+    /// What a turn's step strip draws for its status. A working strip
+    /// carries the turn's activity indicator unless a newer row of the same
+    /// turn already does; it then keeps its kind glyph, and its caption still
+    /// says it is working.
+    pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<chat::ToolStatus> {
+        turn.glyph()
+            .filter(|status| *status != chat::ToolStatus::Running || !self.turn_prose_live(turn))
+    }
+
     /// Whether a message is on its way to the provider. Other commands -
     /// choosing a model or permissions, paging history, answering, stopping -
     /// leave what the conversation is doing as it was until it says otherwise.
@@ -2195,6 +2264,11 @@ impl Runtime {
             disclosure::item_duration_ms(item, now)
                 .map(|millis| millis / 1_000)
                 .hash(&mut revision);
+            agent
+                .items
+                .last()
+                .is_some_and(|last| last.id == item.id)
+                .hash(&mut revision);
         }
         if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
             let finished = reasoning_finished(
@@ -2554,7 +2628,13 @@ impl Runtime {
             } else {
                 label
             };
-            transcript.push(activity_row(glyph, label, failure));
+            transcript.push(
+                if failure.is_none() && glyph == Icon::AgentWorking && self.work_shown(selected) {
+                    activity_space()
+                } else {
+                    activity_row(glyph, label, failure)
+                },
+            );
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -4583,7 +4663,11 @@ impl Runtime {
         // The preview is a picture of the chat, so it carries no failure
         // control to press.
         if let Some((glyph, label)) = self.timeline_activity(false, None) {
-            transcript.push(activity_row(glyph, label, None));
+            transcript.push(if glyph == Icon::AgentWorking && self.work_shown(None) {
+                activity_space()
+            } else {
+                activity_row(glyph, label, None)
+            });
         }
         Some(virtualized::column(transcript.children, Default::default()))
     }
@@ -4654,7 +4738,7 @@ impl Runtime {
         (
             &turn.key,
             &turn.summary,
-            turn.glyph().map(|status| status as u8),
+            self.strip_status(turn).map(|status| status as u8),
         )
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
@@ -5764,7 +5848,7 @@ impl Runtime {
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
             let expanded = has_text && self.item_expanded(&item.id);
-            let elapsed = reasoning_elapsed(item, items, finished, finished_at);
+            let mut elapsed = reasoning_elapsed(item, items, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
                 if finished {
@@ -5774,10 +5858,11 @@ impl Runtime {
                 }
                 .clone()
             } else if finished {
-                if elapsed.is_some() {
-                    "Thought for".to_owned()
-                } else {
-                    "Thought process".to_owned()
+                // With no text to name it, the duration completes the
+                // sentence rather than standing apart from it.
+                match elapsed.take() {
+                    Some(elapsed) => format!("Thought for {elapsed}"),
+                    None => "Thought process".to_owned(),
                 }
             } else {
                 "Thinking".to_owned()
@@ -7884,6 +7969,142 @@ mod tests {
             node.size().height < 30.0,
             "status wrapped: {:?}",
             node.size()
+        );
+    }
+
+    #[test]
+    fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
+        use iced::advanced::{layout, widget::Tree};
+        let item = |id: &str, role, content| chat::Item {
+            id: id.into(),
+            role,
+            content,
+            started_at: Some(1_000),
+            at: Some(2_000),
+        };
+        let command = |id: &str, status| {
+            item(
+                id,
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: "cargo test".into(),
+                    working_directory: "/project".into(),
+                    action: chat::CommandAction::Run,
+                    status,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: String::new(),
+                },
+            )
+        };
+        let thought = item(
+            "thought",
+            chat::Role::Assistant,
+            ItemContent::Text {
+                text: String::new(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        );
+        let prompt = item(
+            "prompt",
+            chat::Role::User,
+            ItemContent::Text {
+                text: "Run the tests".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        );
+        let regroup = |runtime: &mut Runtime| {
+            runtime.turns = turn::group(
+                &runtime.snapshot.items,
+                &runtime.asked_after,
+                crate::app::chat_ui::Presentations(&runtime.cache),
+            );
+        };
+        let running = command("c1", chat::ToolStatus::Running);
+        let (mut runtime, _handle) =
+            frame_cost::live_runtime(&[prompt.clone(), running.clone(), thought.clone()]);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        regroup(&mut runtime);
+        let turn = runtime.turns.last().unwrap();
+        // A command still running while the agent thinks: the thought is the
+        // newest work, so the strip keeps its glyph and the closing line
+        // holds its place without a spinner of its own.
+        assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running));
+        assert!(turn.summary.ends_with(" · working"));
+        assert_eq!(runtime.strip_status(turn), None);
+        assert!(runtime.work_shown(None));
+        assert_eq!(
+            runtime.step_status(&runtime.snapshot.items[1]),
+            None,
+            "a step inside a strip leaves the indicator to the strip"
+        );
+
+        // Only the command is working: the strip carries the indicator.
+        Arc::make_mut(&mut runtime.snapshot).items.pop();
+        regroup(&mut runtime);
+        let turn = runtime.turns.last().unwrap();
+        assert_eq!(runtime.strip_status(turn), Some(chat::ToolStatus::Running));
+        assert!(runtime.work_shown(None));
+
+        // Between steps nothing in the transcript is live, so the closing
+        // line says what the agent is doing.
+        Arc::make_mut(&mut runtime.snapshot).items[1] =
+            Arc::new(command("c1", chat::ToolStatus::Succeeded));
+        regroup(&mut runtime);
+        let turn = runtime.turns.last().unwrap();
+        assert_eq!(
+            runtime.strip_status(turn),
+            Some(chat::ToolStatus::Succeeded)
+        );
+        assert!(!runtime.work_shown(None));
+        assert_eq!(
+            runtime
+                .timeline_activity(false, None)
+                .map(|(glyph, _)| glyph),
+            Some(Icon::AgentWorking)
+        );
+
+        // In a subagent's own transcript steps stand alone, and only the
+        // newest one carries the indicator.
+        let mut agent = chat::Subagent {
+            id: "child".into(),
+            items: vec![Arc::new(running.clone())],
+            ..native_child_fixture()
+        };
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(agent.clone());
+        runtime.selected_subagent = Some("child".into());
+        assert_eq!(
+            runtime.step_status(&running),
+            Some(chat::ToolStatus::Running)
+        );
+        assert!(runtime.work_shown(Some(&agent)));
+        agent.items.push(Arc::new(thought.clone()));
+        Arc::make_mut(&mut runtime.snapshot).subagents[0] = agent.clone();
+        assert_eq!(runtime.step_status(&running), None);
+        assert!(runtime.work_shown(Some(&agent)));
+
+        // The line that holds the activity row's place is the same height.
+        let renderer = crate::app::tests::headless_renderer();
+        let height = |mut element: Element<'_, Message>| {
+            let mut tree = Tree::new(element.as_widget());
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0)),
+                )
+                .size()
+                .height
+        };
+        assert_eq!(
+            height(activity_space()),
+            height(activity_row(Icon::AgentWorking, "Thinking".into(), None))
         );
     }
 
@@ -14132,7 +14353,7 @@ mod tests {
                     .filter_map(|node| node.node().label())
                     .collect::<Vec<_>>();
                 let expected = if body.is_empty() {
-                    "Thought for"
+                    "Thought for 12s"
                 } else {
                     "Reasoning: Earlier thought · 12s"
                 };
@@ -14236,20 +14457,19 @@ mod tests {
                         buttons.is_empty(),
                         "empty/redacted reasoning has nothing to expand"
                     );
+                    let labels = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter_map(|node| node.node().label())
+                        .collect::<Vec<_>>();
                     assert!(
-                        accessible
-                            .root()
-                            .iter()
-                            .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("Thought for"))
+                        labels.contains(&"Thought for 12s"),
+                        "empty/redacted finished reasoning reads as one phrase: {labels:?}"
                     );
                     assert!(
-                        accessible
-                            .root()
-                            .iter()
-                            .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("12s")),
-                        "empty/redacted finished reasoning retains its right-aligned duration"
+                        !labels.contains(&"12s"),
+                        "its duration is not repeated apart from it: {labels:?}"
                     );
                 }
             }
