@@ -292,6 +292,18 @@ struct Entry {
     shared: Arc<Shared>,
     run: u64,
     running: bool,
+    /// What parses this run.
+    claim: std::cell::Cell<Claim>,
+}
+/// What parses an entry's current run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// Nothing yet.
+    Unclaimed,
+    /// Its subscription, which may already hold a parser.
+    Subscribed,
+    /// The update that staged it handed it to a parser (`State::settle_tail`).
+    HandedOver,
 }
 
 /// Only selected transcript sources are queued. Inputs are shared immutable
@@ -561,6 +573,7 @@ impl State {
             Entry {
                 run: next_attempt(),
                 running: true,
+                claim: std::cell::Cell::new(Claim::Unclaimed),
                 shared: Arc::new(Shared::new(SharedData {
                     latest: Mutex::new(Request {
                         input: Input::Local(source.clone()),
@@ -877,6 +890,7 @@ impl State {
                     if !entry.running {
                         entry.run = next_attempt();
                         entry.running = true;
+                        entry.claim.set(Claim::Unclaimed);
                     }
                     return false;
                 }
@@ -902,6 +916,7 @@ impl State {
             Entry {
                 run: next_attempt(),
                 running: true,
+                claim: std::cell::Cell::new(Claim::Unclaimed),
                 shared: Arc::new(Shared::new(SharedData {
                     latest: Mutex::new(Request {
                         input: Input::Transcript(item.clone()),
@@ -968,12 +983,81 @@ impl State {
         }
     }
 
+    /// Parse the growing answer's newest publication now and wait up to
+    /// `budget` for it, so the update that staged it can also install it.
+    ///
+    /// A streamed chunk otherwise costs two updates and two frames: the
+    /// wake that stages the publication draws the old text while its parse
+    /// runs, and the prepared message draws again. The parse usually takes
+    /// well under a millisecond, far less than the frame between them.
+    /// A parse that outlasts the budget keeps going and arrives as an
+    /// ordinary `MarkdownPrepared`.
+    pub(super) fn settle_tail(&mut self, target: Target, budget: Duration) -> Settled {
+        let Some((id, entry)) = self.entries.iter_mut().find(|(_, entry)| {
+            // A run its subscription has seen may already be parsing.
+            entry.running
+                && entry.claim.get() == Claim::Unclaimed
+                && entry.shared.priority.load(Ordering::Relaxed) == TAIL
+        }) else {
+            return Settled::Idle;
+        };
+        if entry.shared.cancelled.load(Ordering::Relaxed) {
+            return Settled::Idle;
+        }
+        // Outside the application's executor (as in most tests) the
+        // subscription parses it.
+        let Ok(executor) = tokio::runtime::Handle::try_current() else {
+            return Settled::Idle;
+        };
+        let Some(permit) = entry.shared.workers.try_acquire_tail() else {
+            return Settled::Idle;
+        };
+        entry.claim.set(Claim::HandedOver);
+        let handoff = Arc::new(Handoff::default());
+        executor.spawn_blocking({
+            let handoff = handoff.clone();
+            let shared = entry.shared.clone();
+            move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(shared, permit)
+                }))
+                .unwrap_or_else(|_| Err("A message could not be loaded. Retry loading it.".into()));
+                handoff.fill(result);
+            }
+        });
+        let (id, run) = (id.clone(), entry.run);
+        match handoff.wait(budget) {
+            Some(result) => Settled::Ready(id, run, Ready::new(result)),
+            None => Settled::Pending(cosmic::task::future(async move {
+                let result = handoff.arrival().await;
+                action(Action::MarkdownPrepared(
+                    target,
+                    id,
+                    run,
+                    Ready::new(result),
+                ))
+            })),
+        }
+    }
+
+    /// The handed-over parse of `run` was not accepted, so the run parses
+    /// again once a subscription or another wake picks it up.
+    pub(super) fn unclaim(&self, id: &str, run: u64) {
+        if let Some(entry) = self.entries.get(id)
+            && entry.run == run
+            && entry.claim.get() == Claim::HandedOver
+        {
+            entry.claim.set(Claim::Unclaimed);
+        }
+    }
+
     pub(super) fn subscriptions(&self, target: Target) -> Vec<Subscription<Message>> {
         let mut subscriptions: Vec<_> = self
             .entries
             .iter()
-            .filter(|(_, entry)| entry.running)
+            .filter(|(_, entry)| entry.running && entry.claim.get() != Claim::HandedOver)
             .map(|(id, entry)| {
+                entry.claim.set(Claim::Subscribed);
                 Subscription::run_with(
                     Job {
                         target,
@@ -1052,6 +1136,7 @@ impl State {
         } else {
             entry.running = false;
         }
+        entry.claim.set(Claim::Unclaimed);
         let finished = !latest.growing && latest.version == prepared.request.version;
         drop(latest);
         if finished {
@@ -1524,6 +1609,62 @@ impl Drop for ReplySlot {
         }
     }
 }
+/// What `State::settle_tail` did with the growing answer.
+pub(super) enum Settled {
+    /// Nothing was handed over; any staged input parses through its
+    /// subscription.
+    Idle,
+    /// Parsed within the budget, to accept now.
+    Ready(String, u64, Ready),
+    /// Still parsing; the task delivers it.
+    Pending(Task<Message>),
+}
+
+/// A parse handed over outside a subscription: the update that started it
+/// waits a little for the result, and otherwise a task does.
+#[derive(Default)]
+struct Handoff {
+    result: Mutex<Option<Result<Prepared, String>>>,
+    filled: std::sync::Condvar,
+    arrived: tokio::sync::Notify,
+}
+impl Handoff {
+    fn fill(&self, result: Result<Prepared, String>) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        self.filled.notify_all();
+        // Stores a permit when nobody waits yet, so a task that starts
+        // waiting after the parse finished still wakes.
+        self.arrived.notify_one();
+    }
+    fn wait(&self, budget: Duration) -> Option<Result<Prepared, String>> {
+        let result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut result, _) = self
+            .filled
+            .wait_timeout_while(result, budget, |result| result.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        result.take()
+    }
+    async fn arrival(&self) -> Result<Prepared, String> {
+        loop {
+            if let Some(result) = self.result.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return result;
+            }
+            self.arrived.notified().await;
+        }
+    }
+}
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if let Some(Ok(prepared)) = self
+            .result
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            prepared.discard();
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) struct Ready(Arc<ReplySlot>);
 impl Ready {
@@ -1837,6 +1978,23 @@ impl Pool {
             #[cfg(test)]
             self.wakes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+impl Pool {
+    /// A parser for the growing tail at once, if one is free and no other
+    /// input waits for it. Nothing is overtaken: with a waiter queued this
+    /// declines, and the tail waits its turn through the queue as usual.
+    fn try_acquire_tail(self: &Arc<Self>) -> Option<Permit> {
+        let mut queue = self.lock();
+        if !queue.waiting.is_empty() {
+            return None;
+        }
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        queue.tail_held += 1;
+        Some(Permit {
+            tail: Some(self.clone()),
+            _permit: permit,
+        })
     }
 }
 #[cfg(test)]
@@ -2498,6 +2656,251 @@ mod tests {
             let _ = second_release.send(());
             let _ = history_release.send(());
         });
+    }
+
+    #[test]
+    fn the_tail_takes_a_free_parser_at_once_only_when_nobody_waits() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(2));
+            let first = pool.try_acquire_tail().expect("a free parser and no queue");
+            assert_eq!(pool.lock().tail_held, 1);
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let (_history, history_release) = waiter(&pool, 9, None, &granted);
+            // History joins the queue, then yields before it contends.
+            tokio::task::yield_now().await;
+            assert_eq!(pool.lock().waiting.len(), 1);
+            assert_eq!(pool.permits.available_permits(), 1);
+            assert!(
+                pool.try_acquire_tail().is_none(),
+                "history queued for the free parser is not overtaken"
+            );
+            assert_eq!(order.recv().await, Some(9));
+            drop(first);
+            assert_eq!(pool.lock().tail_held, 0);
+            let _ = history_release.send(());
+        });
+    }
+
+    #[test]
+    fn the_update_that_stages_a_streamed_publication_can_install_it() {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let target = target();
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let first = item("The answer");
+        let mut state = configured(target, &first);
+        state.set_provider(Provider::Claude);
+        // Without a rank the input is history and parses in its turn.
+        state.stage(&first, true, theme, |_, _| false);
+        assert!(matches!(
+            state.settle_tail(target, Duration::from_secs(10)),
+            Settled::Idle
+        ));
+        state.rank("message", TAIL);
+        let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10))
+        else {
+            panic!("a free parser prepares the tail within the budget");
+        };
+        assert_eq!(id, "message");
+        assert!(
+            state.subscriptions(target).is_empty(),
+            "a handed-over run is not parsed again by a subscription"
+        );
+        let prepared = state.accept(target, &id, run, ready).expect("current run");
+        assert!(Arc::ptr_eq(prepared.item(), &first));
+        prepared.discard();
+
+        // A parse that outlasts the budget arrives through the task.
+        let second = item("The answer grows");
+        state.stage(&second, true, theme, |_, _| true);
+        let held = hold_retirement();
+        let Settled::Pending(task) = state.settle_tail(target, Duration::from_millis(1)) else {
+            panic!("the held reclaimer keeps the parse past the budget");
+        };
+        assert!(state.subscriptions(target).is_empty());
+        assert!(matches!(
+            state.settle_tail(target, Duration::from_millis(1)),
+            Settled::Idle
+        ));
+        drop(held);
+        let message = executor.block_on(async {
+            iced::runtime::task::into_stream(task)
+                .expect("a pending parse")
+                .next()
+                .await
+        });
+        let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+            Action::MarkdownPrepared(delivered, id, delivered_run, ready),
+        )))) = message
+        else {
+            panic!("the task delivers the prepared publication");
+        };
+        assert_eq!((delivered, delivered_run), (target, job(&state).0));
+        let prepared = state
+            .accept(target, &id, delivered_run, ready)
+            .expect("current run");
+        assert!(Arc::ptr_eq(prepared.item(), &second));
+        prepared.discard();
+
+        // A run its subscription has seen may already hold a parser, and
+        // is never handed over a second time.
+        let third = item("The answer grows again");
+        state.stage(&third, true, theme, |_, _| true);
+        assert_eq!(state.subscriptions(target).len(), 1);
+        let fourth = item("The answer grows again, and again");
+        state.stage(&fourth, true, theme, |_, _| true);
+        assert!(matches!(
+            state.settle_tail(target, Duration::from_secs(10)),
+            Settled::Idle
+        ));
+        assert_eq!(state.subscriptions(target).len(), 1);
+        drop(state);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn pending_handoffs_reject_replaced_sources_and_contexts() {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let target = target();
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for change_context in [false, true] {
+            let original = item("The old answer is still being prepared.");
+            let raw = Arc::downgrade(&original);
+            let mut state = configured(target, &original);
+            state.stage(&original, true, theme, |_, _| false);
+            state.rank("message", TAIL);
+            let (old_run, shared) = job(&state);
+            let lease = Arc::downgrade(&shared.lease);
+            let pool = shared.workers.clone();
+            let capacity = pool.permits.available_permits();
+            let held = hold_retirement();
+            let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+                panic!("the held reclaimer keeps the handoff pending");
+            };
+            assert_eq!(pool.permits.available_permits(), capacity - 1);
+
+            let replacement = item("A rewritten answer belongs to the current context.");
+            if change_context {
+                state.context(
+                    target,
+                    Some("other-session"),
+                    Some("child"),
+                    std::slice::from_ref(&replacement),
+                );
+            }
+            state.stage(&replacement, true, theme, |_, _| false);
+            let current_run = job(&state).0;
+            assert_ne!(current_run, old_run);
+            assert!(shared.cancelled.load(Ordering::Relaxed));
+            drop(original);
+            drop(shared);
+            // Release before awaiting: execute must cross this same barrier.
+            drop(held);
+            let message = executor.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    iced::runtime::task::into_stream(task).unwrap().next(),
+                )
+                .await
+                .expect("the cancelled handoff still delivers its outcome")
+            });
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MarkdownPrepared(delivered, id, delivered_run, ready),
+            )))) = message
+            else {
+                panic!("the task delivers the old handoff outcome");
+            };
+            assert_eq!((delivered, delivered_run), (target, old_run));
+            assert!(state.accept(target, &id, delivered_run, ready).is_none());
+            assert_eq!(job(&state).0, current_run);
+            assert!(
+                state.error().is_none(),
+                "old cancellation cannot fail the replacement"
+            );
+            retirement_barrier();
+            assert!(raw.upgrade().is_none());
+            assert!(lease.upgrade().is_none());
+            assert_eq!(pool.permits.available_permits(), capacity);
+
+            state.rank("message", TAIL);
+            let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10))
+            else {
+                panic!("the replacement can use the released parser");
+            };
+            let prepared = state.accept(target, &id, run, ready).unwrap();
+            assert!(Arc::ptr_eq(prepared.item(), &replacement));
+            prepared.discard();
+            drop(state);
+            retirement_barrier();
+            assert_eq!(pool.permits.available_permits(), capacity);
+        }
+    }
+
+    #[test]
+    fn dropping_a_pending_handoff_task_retires_its_output_and_releases_its_parser() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = executor.enter();
+        let target = target();
+        let source = item("The abandoned task still owns an actual parser result.");
+        let raw = Arc::downgrade(&source);
+        let mut state = configured(target, &source);
+        state.stage(
+            &source,
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        state.rank("message", TAIL);
+        let (_, shared) = job(&state);
+        let lease = Arc::downgrade(&shared.lease);
+        let pool = shared.workers.clone();
+        let capacity = pool.permits.available_permits();
+        drop(shared);
+        let held = hold_retirement();
+        let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+            panic!("the held reclaimer keeps the handoff pending");
+        };
+        drop(task);
+        assert_eq!(pool.permits.available_permits(), capacity - 1);
+        // Keep State alive until the worker has finished, so it produces a
+        // successful result rather than merely observing cancellation.
+        drop(held);
+        drop(entered);
+        executor.shutdown_timeout(Duration::from_secs(10));
+        retirement_barrier();
+        assert!(
+            state.growing_canonical_for_test(&source).is_none(),
+            "an abandoned result was never accepted by the UI"
+        );
+        assert!(
+            state.entries["message"]
+                .shared
+                .canonical
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(pool.permits.available_permits(), capacity);
+        drop(state);
+        drop(source);
+        retirement_barrier();
+        assert!(raw.upgrade().is_none());
+        assert!(lease.upgrade().is_none());
     }
 
     #[test]
