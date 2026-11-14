@@ -55,12 +55,22 @@ impl<Message> Operation<Message> for RevealSelection {
     }
 }
 
-fn selection_offset(top: f32, height: f32, viewport: f32, content: f32, current: f32) -> f32 {
+/// The scroll offset that brings the row spanning `top..top + height` into
+/// view, leaving rows already in view where they are.
+///
+/// A row is revealed a fade's depth clear of the edge, not flush against
+/// it: while more rows lie beyond, that edge carries the overflow fade, and
+/// the row the reader just moved to must not be the one dissolving into it.
+/// At either end of the list there is nothing beyond and no fade, so the
+/// clamp lets the row sit flush. A viewport too short for the margin on both
+/// sides shares what room it has, so a reveal never oscillates.
+pub fn selection_offset(top: f32, height: f32, viewport: f32, content: f32, current: f32) -> f32 {
+    let margin = super::OVERFLOW_FADE.min(((viewport - height) / 2.0).max(0.0));
     let bottom = top + height;
-    let target = if top < current {
-        top
-    } else if bottom > current + viewport {
-        bottom - viewport
+    let target = if top - margin < current {
+        top - margin
+    } else if bottom + margin > current + viewport {
+        bottom + margin - viewport
     } else {
         current
     };
@@ -71,11 +81,26 @@ fn selection_offset(top: f32, height: f32, viewport: f32, content: f32, current:
 mod tests {
     use super::*;
     #[test]
+    fn a_short_viewport_shares_the_margin_and_settles() {
+        // 40 px of room around a 30 px row: 5 px a side, and a second reveal
+        // of the same row stays put.
+        let first = selection_offset(200.0, 30.0, 40.0, 1000.0, 0.0);
+        assert_eq!(first, 195.0);
+        assert_eq!(selection_offset(200.0, 30.0, 40.0, 1000.0, first), first);
+    }
+
+    #[test]
     fn reveal_preserves_visible_rows_and_uses_actual_viewport() {
+        // Rows 84..124 and 66..106 are clear of both fades already.
         assert_eq!(selection_offset(84.0, 40.0, 160.0, 1000.0, 0.0), 0.0);
-        assert_eq!(selection_offset(168.0, 40.0, 160.0, 1000.0, 0.0), 48.0);
-        assert_eq!(selection_offset(84.0, 40.0, 160.0, 1000.0, 42.0), 42.0);
+        assert_eq!(selection_offset(66.0, 40.0, 160.0, 1000.0, 42.0), 42.0);
+        // Below the viewport: it ends a fade's depth above the bottom edge.
+        assert_eq!(selection_offset(168.0, 40.0, 160.0, 1000.0, 0.0), 72.0);
+        // Above it: it starts a fade's depth below the top edge.
+        assert_eq!(selection_offset(300.0, 40.0, 160.0, 1000.0, 400.0), 276.0);
+        // The first row and the last sit flush: no fade lies beyond them.
         assert_eq!(selection_offset(0.0, 40.0, 160.0, 1000.0, 200.0), 0.0);
+        assert_eq!(selection_offset(960.0, 40.0, 160.0, 1000.0, 0.0), 840.0);
         assert_eq!(selection_offset(84.0, 40.0, 160.0, 100.0, 200.0), 0.0);
     }
 }

@@ -26980,6 +26980,7 @@ mod tests {
         drop(app.update(key(keyboard::key::Named::End)));
         assert_eq!(app.workspace_history.cycle_index(), Some(19));
         assert!(app.workspace_switcher_shows_row(19));
+        assert!(app.workspace_switcher_row_clear_of_fades(19));
         assert!(!app.workspace_switcher_shows_row(0));
         drop(app.update(key(keyboard::key::Named::Home)));
         assert_eq!(app.workspace_history.cycle_index(), Some(0));
@@ -26990,6 +26991,7 @@ mod tests {
         }));
         assert_eq!(app.workspace_history.cycle_index(), Some(15));
         assert!(app.chrome_ui.workspace_switcher_scroll > 0.0);
+        assert!(app.workspace_switcher_row_clear_of_fades(15));
         let current_scope = app.active_workspace_destination().unwrap();
         let saved_during_preview = app.persistent_workspace();
         assert_eq!(
