@@ -19061,6 +19061,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workspace_switcher_preview_cleanup_preserves_visible_chats_with_pane_inspectors() {
+        for (case, returned, covered) in [
+            ("peer inspector overlay", true, false),
+            ("same-pane inspector overlay", true, true),
+            ("outside the returned workspace", false, false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let left = draft_chat_for_provider(&mut app, Provider::Claude);
+            let right = draft_chat_for_provider(&mut app, Provider::Claude);
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.focused = Some(left);
+            for card in durable.cards.iter_mut() {
+                card.width_fraction = 0.5;
+            }
+            let mut workspace = (*app.durable).clone();
+            if !returned {
+                // A cancelled preview can belong to another workspace while
+                // its runtime remains retained by the window.
+                workspace.cards.retain(|card| card.id != right);
+            }
+            app.workspace = Cagents::rebuild_workspace(&workspace);
+            let resize = app.workspace.resize_viewport(900.0);
+            drop(app.apply_viewport(resize, false, DurableChange::None));
+            let preview = if covered { left } else { right };
+            assert_eq!(
+                app.workspace.visibility(preview),
+                returned.then_some(VisibilityClass::Visible),
+                "{case}"
+            );
+            if returned {
+                app.open_pane_inspector_now(left);
+                assert_eq!(
+                    app.pane_inspector_layout(left),
+                    Some(InspectorLayout::Overlay),
+                    "{case}"
+                );
+                assert_eq!(app.pane_content_inputs_blocked(preview), covered, "{case}");
+            }
+            app.set_exposure(preview, Exposure::Visible);
+            let target = chat_runtime(&app, preview).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            assert!(chat_runtime(&app, preview).visible.load(Ordering::Relaxed));
+            app.chrome_ui.workspace_switcher_preview = Some(preview);
+
+            drop(app.settle_workspace_switcher_preview());
+
+            assert!(app.chrome_ui.workspace_switcher_preview.is_none(), "{case}");
+            assert_eq!(
+                app.exposure(preview),
+                if returned {
+                    Exposure::Visible
+                } else {
+                    Exposure::Offscreen
+                },
+                "{case}"
+            );
+            assert_eq!(
+                chat_runtime(&app, preview).visible.load(Ordering::Relaxed),
+                returned,
+                "{case}"
+            );
+            if returned {
+                assert!(app.pane_inspectors.is_open(left), "{case}");
+                assert!(!app.pane_inspectors.is_open(right), "{case}");
+            }
+        }
+    }
+
     pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
         let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();
