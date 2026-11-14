@@ -3265,7 +3265,7 @@ impl SettingsField {
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
-            Self::SidebarWorktrees => "Worktrees in sidebar",
+            Self::SidebarWorktrees => "Checkouts in sidebar",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
             Self::DefaultColumnFraction => "New pane width",
@@ -3984,7 +3984,7 @@ fn settings_update(
             .map(|enabled| next.check_for_updates = enabled)
             .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
         SettingsField::SidebarWorktrees => settings::SidebarWorktrees::from_key(value)
-            .map(|mode| next.sidebar_worktrees = mode)
+            .map(|mode| next.set_sidebar_worktrees(mode))
             .ok_or_else(|| "Choose Grouped, Expanded, or Hidden.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
@@ -16653,6 +16653,13 @@ impl Application for Cagents {
                     | SidebarAction::ToggleWorktrees(_)
                     | SidebarAction::ToggleInProgress
                     => Task::none(),
+                    // The settings page edits the same default, so this goes
+                    // through its path: the page's draft, the save and the
+                    // sidebar all follow.
+                    SidebarAction::ToggleCheckouts => self.apply_setting_input(
+                        SettingsField::SidebarWorktrees,
+                        self.settings.toggled_sidebar_worktrees().key().to_owned(),
+                    ),
                     SidebarAction::SetWorktreeDisplay { project_id, mode } => {
                         if let Some(mode) = mode {
                             self.settings.sidebar_worktree_overrides.insert(project_id, mode);
@@ -16876,6 +16883,7 @@ impl Application for Cagents {
                         into.account_usage_display = settings.account_usage_display;
                         into.confirm_terminal_close = settings.confirm_terminal_close;
                         into.confirmations = settings.confirmations.clone();
+                        into.sidebar_worktrees_when_shown = settings.sidebar_worktrees_when_shown;
                     };
                     if let Some(saved) = lane.as_mut() {
                         adopt(&mut saved.settings);
@@ -30963,6 +30971,58 @@ mod tests {
     }
 
     #[test]
+    fn the_checkouts_toggle_hides_every_checkout_and_returns_to_the_mode_they_had() {
+        use settings::SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        drop(app.apply_setting_input(SettingsField::SidebarWorktrees, "expanded".into()));
+        let project = ProjectId::new();
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SetWorktreeDisplay {
+                project_id: project,
+                mode: Some(Grouped),
+            })),
+        );
+        for (shown, expected) in [(true, Hidden), (false, Expanded), (true, Hidden)] {
+            assert_eq!(app.settings.sidebar_worktrees.shows_checkouts(), shown);
+            let generation = app.settings_save_generation;
+            drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+            assert_eq!(app.settings.sidebar_worktrees, expected);
+            assert_eq!(
+                app.settings_draft.sidebar_worktrees, expected,
+                "the settings page shows the same default"
+            );
+            assert_eq!(
+                app.sidebar_state.worktree_display(project),
+                if expected == Hidden { Hidden } else { Grouped },
+                "a hidden default wins over the project's own mode, which then applies again"
+            );
+            assert!(
+                app.settings_save_generation > generation,
+                "the toggle saves"
+            );
+        }
+        assert_eq!(app.settings.sidebar_worktrees_when_shown, Expanded);
+        app.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(saved.sidebar_worktrees_when_shown, Expanded);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&project),
+            Some(&Grouped)
+        );
+        // The settings page choosing a visible mode is what the toggle returns
+        // to after hiding them again.
+        drop(app.apply_setting_input(SettingsField::SidebarWorktrees, "grouped".into()));
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+        assert_eq!(app.settings.sidebar_worktrees, Grouped);
+    }
+
+    #[test]
     fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -30981,9 +31041,15 @@ mod tests {
             generation: app.settings_ack_generation,
             settings: external,
         }));
+        // A hidden default hides every project's checkouts; the project's
+        // own mode is kept for when they show again.
         assert_eq!(
             app.sidebar_state.worktree_display(project),
-            settings::SidebarWorktrees::Expanded
+            settings::SidebarWorktrees::Hidden
+        );
+        assert_eq!(
+            app.settings.sidebar_worktree_overrides.get(&project),
+            Some(&settings::SidebarWorktrees::Expanded)
         );
         app.settings.sidebar_worktree_overrides.remove(&project);
         app.save_settings_now().unwrap();
@@ -31841,6 +31907,42 @@ mod tests {
         );
     }
 
+    /// With checkouts hidden, the unfiltered list names every open pane, a
+    /// quiet one included, and Reveal and Open treat its row as the Attention
+    /// list does; a checkout's own row never comes back to stand in for it.
+    #[test]
+    fn hidden_checkouts_reveal_and_open_a_pane_by_its_row() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        app.context_inspector_open = false;
+        let card_row = sidebar::SelectionRow::Card(card);
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::All,
+        ))));
+        app.refresh_sidebar_channels();
+        assert!(
+            attention_lists(&app, card_row),
+            "a pane with no news has a row"
+        );
+        app.sidebar_state
+            .apply(&SidebarAction::ToggleProject(project));
+        drop(app.update_chrome(chrome_ui::Action::Reveal(card)));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(attention_lists(&app, card_row), "its project unfolds");
+        assert_eq!(app.reveal_card_row(card), Some(card_row));
+
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        assert_eq!(app.workspace.focused(), Some(card));
+        let rows = sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(
+            !rows.contains(&sidebar::SelectionRow::Worktree(project, worktree)),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&card_row), "{rows:?}");
+    }
+
     /// Renaming a pane renames its row in the Attention list at once.
     #[test]
     fn renaming_a_pane_retitles_its_attention_row() {
@@ -31856,7 +31958,7 @@ mod tests {
             .sidebar_model
             .projects
             .iter()
-            .flat_map(|project| &project.attention_cards)
+            .flat_map(|project| &project.panes)
             .find(|row| row.id == card)
             .expect("the pane keeps its row");
         assert_eq!(row.title, "Release review");
@@ -33440,7 +33542,9 @@ mod tests {
                 Some(&Expanded)
             );
         }
-        assert_eq!(app.sidebar_state.worktree_display(project), Expanded);
+        // A hidden default hides every project's checkouts, the project
+        // with its own mode included; that mode is kept for when they show.
+        assert_eq!(app.sidebar_state.worktree_display(project), Hidden);
         assert_eq!(app.sidebar_state.worktree_display(ProjectId::new()), Hidden);
 
         // The next click back to Left must persist a change, rather than look
