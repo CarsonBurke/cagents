@@ -107,6 +107,17 @@ click_row() {
     sleep 1
 }
 
+# A coordination row's detail opens and closes from its context menu, since
+# pressing the row opens its agent.
+row_detail() {
+    local point
+    point=$(find_row "$1")
+    evidence drive click --button right "$point" >/dev/null
+    sleep 1
+    evidence drive click "$2" >/dev/null
+    sleep 1
+}
+
 text_visible() {
     locate_row "$1" >/dev/null
 }
@@ -305,21 +316,42 @@ if [ "$scene" = coordination ]; then
     evidence drive wait ready --timeout 10 >/dev/null
     scroll_top
     shot rows-coordination-folded
-    click_row '^Show full prompt\b'
-    find_row 'PROMPT[ _]?END\b|invented' >/dev/null
-    shot rows-coordination-prompt-expanded
-    click_row '^Show less\b'
-    scroll_top
-    click_row '^Show tool call\b'
-    find_row '^Input$' >/dev/null
-    shot rows-coordination-tool-expanded
-    # The raw input retains its own hover Copy action. The reviewer also
-    # exercises it and Transcript in the live native handoff.
-    click_row '^Hide tool call\b'
-    click_row '^Show full message\b'
-    find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
-    shot rows-coordination-message-expanded
-    click_row '^Show less\b'
+    if text_visible '^Show tool call\b'; then
+        # Each step is a card with its prompt or message folded in it.
+        click_row '^Show full prompt\b'
+        find_row 'PROMPT[ _]?END\b|invented' >/dev/null
+        shot rows-coordination-prompt-expanded
+        click_row '^Show less\b'
+        scroll_top
+        click_row '^Show tool call\b'
+        find_row '^Input$' >/dev/null
+        shot rows-coordination-tool-expanded
+        # The raw input retains its own hover Copy action. The reviewer also
+        # exercises it and Transcript in the live native handoff.
+        click_row '^Hide tool call\b'
+        click_row '^Show full message\b'
+        find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
+        shot rows-coordination-message-expanded
+        click_row '^Show less\b'
+    else
+        # Each step is one row, which opens its agent when pressed; its
+        # detail - the prompt or message in full, then the tool call -
+        # opens from the row's menu.
+        row_detail 'Started\b.*Fixture' 'Show details'
+        click_row '^Show full prompt\b'
+        find_row 'PROMPT[ _]?END\b|invented' >/dev/null
+        shot rows-coordination-prompt-expanded
+        click_row '^Show less\b'
+        find_row '^Input$' >/dev/null
+        shot rows-coordination-tool-expanded
+        row_detail 'Started\b.*Fixture' 'Hide details'
+        row_detail 'Message to\b.*Fixture' 'Show details'
+        click_row '^Show full message\b'
+        find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
+        shot rows-coordination-message-expanded
+        click_row '^Show less\b'
+        row_detail 'Message to\b.*Fixture' 'Hide details'
+    fi
     scroll_bottom
     if text_visible '^Details$'; then
         # The baseline keeps a plain heading and separate Details button.

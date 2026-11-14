@@ -732,16 +732,18 @@ fn omp(name: &str, input: &str) -> Option<Coordination> {
         description: field(task, "description").into(),
         prompt: Text::Inline(field(task, "task").into()),
     };
-    let agents: Vec<Delegate> = match input["tasks"].as_array() {
+    let mut agents: Vec<Delegate> = match input["tasks"].as_array() {
         Some(tasks) => tasks.iter().map(delegate).collect(),
         None if input["task"].is_string() => vec![delegate(&input)],
         None => return None,
     };
-    // A job is listed under the name it was given.
+    // A job is listed under the name it was given. That name is its ID,
+    // which its tab does not go by: it goes by its description, else its
+    // type, and so does the step that started it.
     let subagents = agents
-        .iter()
+        .iter_mut()
         .filter(|agent| !agent.name.is_empty())
-        .map(|agent| agent.name.clone())
+        .map(|agent| std::mem::take(&mut agent.name))
         .collect();
     let mut spawn = Spawn {
         agents,
@@ -1085,5 +1087,7 @@ mod tests {
             (spawn.agents.len(), spawn.brief.as_str()),
             (2, "Shared notes")
         );
+        // A job's name is the ID it is listed under, not what it goes by.
+        assert!(spawn.agents.iter().all(|agent| agent.name.is_empty()));
     }
 }

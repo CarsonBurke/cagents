@@ -2113,6 +2113,53 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell.capture_event();
             return;
         }
+        // The Menu key, or Shift+F10, opens the menu of the control that has
+        // keyboard focus, at that control, as a right click there would.
+        if matches!(self.kind, Kind::ContextMenu)
+            && !shell.is_event_captured()
+            && let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(key),
+                modifiers,
+                ..
+            }) = event
+            && match key {
+                cosmic::iced::keyboard::key::Named::ContextMenu => modifiers.is_empty(),
+                cosmic::iced::keyboard::key::Named::F10 => {
+                    *modifiers == cosmic::iced::keyboard::Modifiers::SHIFT
+                }
+                _ => false,
+            }
+        {
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0 {
+                let at = mouse::Cursor::Available(layout.bounds().center());
+                for click in [
+                    mouse::Event::ButtonPressed(mouse::Button::Right),
+                    mouse::Event::ButtonReleased(mouse::Button::Right),
+                ] {
+                    self.content.as_widget_mut().update(
+                        &mut tree.children[0],
+                        &Event::Mouse(click),
+                        layout,
+                        at,
+                        renderer,
+                        clipboard,
+                        shell,
+                        viewport,
+                    );
+                }
+                shell.capture_event();
+                shell.invalidate_layout();
+                shell.request_redraw();
+                return;
+            }
+        }
         if let Kind::RevealWidth { progress, .. } = self.kind {
             let clipped = layout.bounds().intersection(viewport).unwrap_or_default();
             let cursor = if progress < 1.0 || !cursor.is_over(clipped) {

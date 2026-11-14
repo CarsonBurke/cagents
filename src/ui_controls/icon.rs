@@ -102,6 +102,7 @@ icons! {
         Keyboard => "keyboard",
         MergedPullRequest => "merged-pull-request",
         Minus => "minus",
+        Open => "open",
         OpenFile => "open-file",
         OpenFolder => "open-folder",
         Plus => "plus",

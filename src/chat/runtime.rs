@@ -5846,7 +5846,7 @@ mod tests {
         let mut state = Snapshot::default();
         let subagent = |id: &str, description: &str, status| super::super::Subagent {
             id: id.into(),
-            kind: "general-purpose".into(),
+            kind: description.into(),
             description: description.into(),
             status,
             model: None,
@@ -5935,7 +5935,7 @@ mod tests {
                                     waiting: None,
                                     detail: None,
                                     id: format!("late-background-{index}"),
-                                    kind: "Explore".into(),
+                                    kind: "Started after the caller observed idle".into(),
                                     description: "Started after the caller observed idle".into(),
                                     status: Some(ToolStatus::Running),
                                     background: Some(true),
