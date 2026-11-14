@@ -16,7 +16,9 @@ upstream restarts it here: typing, a binding, a click or regaining window focus.
 TextEditor also restarts it on text committed by an input method, which upstream
 left alone because its blink never stopped. Visibility and frame scheduling are
 otherwise unchanged. The local CURSOR_BLINK_INTERVAL_MILLIS constants are
-replaced by the shared schedule.
+replaced by the shared schedule, read through `Blink::current()` so the app can
+apply the desktop's blink interval and timeout, or hold the cursor steady when
+the desktop turns blinking off.
 
 Why: upstream, a focused field asks for a redraw every 500 ms for as long as it
 keeps focus. Each redraw repaints the whole window. A chat composer holds focus

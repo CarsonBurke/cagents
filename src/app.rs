@@ -4751,6 +4751,8 @@ pub enum Message {
     GitUi(git_ui::Action),
     NotificationUi(notification_ui::Action),
     DaemonHealth(crate::daemon_health::State),
+    /// The desktop's text-cursor blink, or `None` once it states none.
+    CursorBlink(Option<cosmic::iced::advanced::text::Blink>),
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
@@ -18114,6 +18116,12 @@ impl Application for Cagents {
             Message::SessionRecovery(action) => self.update_session_recovery(action),
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
+            Message::CursorBlink(blink) => {
+                // Every text cursor reads this on its next frame; the redraw
+                // that follows this message shows one turned steady mid-blink.
+                cosmic::iced::advanced::text::Blink::set_preferred(blink);
+                Task::none()
+            }
             Message::DaemonHealth(health) => {
                 // A daemon that went away or speaks another protocol may have
                 // been replaced by an install, which is when a stale window
@@ -18419,6 +18427,8 @@ impl Application for Cagents {
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
         let terminal_probes = self.terminal_transcript_probes();
+        // Another project shown, or a review or the workspace switcher closed.
+        let approval = self.read_owed_automation_requests();
         Task::batch([
             task,
             binding,
@@ -18426,6 +18436,7 @@ impl Application for Cagents {
             deferred,
             notices,
             terminal_probes,
+            approval,
         ])
             })();
         self.reconcile_chat_failure_presentations();
@@ -18450,6 +18461,7 @@ impl Application for Cagents {
             self.notification_subscription(),
             self.notice_expiry_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
+            Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
             self.refresh_subscription(),
             self.review_request_subscription(),
             self.git_subscription(),

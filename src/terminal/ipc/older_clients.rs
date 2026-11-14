@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 178,
+    proven_at: 179,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -97,7 +97,7 @@ pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
 
 /// Earlier clients receive retryable Internal errors for store contention.
-pub(super) const STORE_BUSY_ERROR: u16 = 178;
+pub(super) const STORE_BUSY_ERROR: u16 = 179;
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
@@ -477,7 +477,8 @@ mod tests {
         };
         for (version, expected) in [
             (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::Internal),
-            (STORE_BUSY_ERROR - 1, ProtocolErrorCode::Internal),
+            (177, ProtocolErrorCode::Internal),
+            (178, ProtocolErrorCode::Internal),
             (STORE_BUSY_ERROR, ProtocolErrorCode::StoreBusy),
         ] {
             let message = ServerMessage::Error(error.clone());
@@ -638,6 +639,26 @@ mod tests {
         }
         // Appended after every message the oldest listed client knows.
         assert!(variant_index(&addresses).unwrap() >= CANDIDATE_LINE.server_messages);
+    }
+
+    /// A change to a project's pending automation requests is told only to a
+    /// window of this protocol. No listed older client could decode it, so it
+    /// is withheld, and such a window keeps finding requests by reading them.
+    #[test]
+    fn automation_request_changes_are_withheld_from_every_older_client() {
+        let changed = ServerMessage::AutomationProposalsChanged {
+            repository: "/fixture".into(),
+        };
+        assert!(!OLDER_CLIENTS.is_empty());
+        for client in OLDER_CLIENTS {
+            assert!(client.protocol < 178);
+            assert!(
+                !client.admits_message(&changed),
+                "protocol {} clients cannot decode it",
+                client.protocol
+            );
+        }
+        assert!(variant_index(&changed).unwrap() >= CANDIDATE_LINE.server_messages);
     }
 
     #[test]
