@@ -13,7 +13,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const LIMIT: u64 = 8 * 1024 * 1024;
+/// The durable limit of one source's stopped-pane record.
+pub(crate) const LIMIT: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -110,40 +111,7 @@ impl Record {
         let root = crate::fs_safety::Root::open(&directory).map_err(|e| e.to_string())?;
         let mut record = self.clone();
         if let Some(previous) = record_for_source(&record.source)? {
-            record.service_stopped |= previous.service_stopped;
-            for alias in previous.aliases {
-                if !record.aliases.contains(&alias) {
-                    record.aliases.push(alias);
-                }
-            }
-            for snapshot in previous.snapshots {
-                if !record
-                    .snapshots
-                    .iter()
-                    .any(|current| current.source.id == snapshot.source.id)
-                {
-                    record.snapshots.push(snapshot);
-                }
-            }
-            for chat in previous.chats {
-                if !record.chats.iter().any(|current| current.id == chat.id) {
-                    record.chats.push(chat);
-                }
-            }
-            for id in previous.terminals {
-                if !record.terminals.contains(&id) {
-                    record.terminals.push(id);
-                }
-            }
-            for pane in previous.presentations {
-                if !record
-                    .presentations
-                    .iter()
-                    .any(|current| current.agent == pane.agent)
-                {
-                    record.presentations.push(pane);
-                }
-            }
+            record.absorb(previous);
         }
         if !record.source.is_complete()
             || record
@@ -155,6 +123,66 @@ impl Record {
         }
         record.write_to(&root)?;
         load().map(|_| ())
+    }
+
+    /// Join evidence retained earlier for the same source, as saving does.
+    /// This record's own entries win over earlier ones for the same owner.
+    fn absorb(&mut self, previous: Record) {
+        self.service_stopped |= previous.service_stopped;
+        for alias in previous.aliases {
+            if !self.aliases.contains(&alias) {
+                self.aliases.push(alias);
+            }
+        }
+        for snapshot in previous.snapshots {
+            if !self
+                .snapshots
+                .iter()
+                .any(|current| current.source.id == snapshot.source.id)
+            {
+                self.snapshots.push(snapshot);
+            }
+        }
+        for chat in previous.chats {
+            if !self.chats.iter().any(|current| current.id == chat.id) {
+                self.chats.push(chat);
+            }
+        }
+        for id in previous.terminals {
+            if !self.terminals.contains(&id) {
+                self.terminals.push(id);
+            }
+        }
+        for pane in previous.presentations {
+            if !self
+                .presentations
+                .iter()
+                .any(|current| current.agent == pane.agent)
+            {
+                self.presentations.push(pane);
+            }
+        }
+    }
+
+    /// The bytes this record needs once saved beside the evidence already
+    /// retained for its source, with every transcript page empty. Saving
+    /// shortens pages to fit around that evidence and never shortens it.
+    pub(crate) fn retained_identity_size(&self) -> Result<usize, String> {
+        let mut record = self.clone();
+        if let Some(previous) = record_for_source(&record.source)? {
+            record.absorb(previous);
+        }
+        record.identity_size()
+    }
+
+    /// The encoded size with every page emptied, plus one byte per page: an
+    /// unshortened page may say `false` where the emptied one says `true`.
+    fn identity_size(&self) -> Result<usize, String> {
+        let mut minimal = self.clone();
+        minimal.snapshots.iter_mut().for_each(empty_page);
+        serde_json::to_vec(&minimal)
+            .map(|bytes| bytes.len() + minimal.snapshots.len())
+            .map_err(|error| error.to_string())
     }
 
     fn file_name(&self) -> Result<String, String> {
@@ -530,14 +558,6 @@ pub(crate) fn record_for_source(source: &HostSessionProof) -> Result<Option<Reco
         return Err("Stopped update record changed its source".into());
     }
     Ok(Some(record))
-}
-
-/// Preparation budgets its captured pages together with already-approved
-/// floor evidence before any source shutdown can become irreversible.
-pub(crate) fn existing_capture_size(source: &HostSessionProof) -> Result<usize, String> {
-    record_for_source(source)?.map_or(Ok(0), |mut record| {
-        record.encode_capture().map(|bytes| bytes.len())
-    })
 }
 
 #[cfg(feature = "host")]
@@ -964,36 +984,169 @@ impl Record {
 
 /// Transcript previews may shrink to fit; the exact source and managed-pane
 /// evidence never does. Provider transcript files are outside this operation.
+/// Every page keeps its newest entries within a fair share of the room the
+/// identity evidence leaves, so many long conversations all stay readable.
 fn encode_record(record: &mut Record, limit: u64) -> Result<Vec<u8>, String> {
-    loop {
-        let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
-        if bytes.len() as u64 <= limit {
-            return Ok(bytes);
-        }
-        let Some(index) = record
-            .snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, saved)| !saved.snapshot.items.is_empty())
-            .max_by_key(|(_, saved)| {
-                serde_json::to_vec(&saved.snapshot.items).map_or(0, |bytes| bytes.len())
-            })
-            .map(|(index, _)| index)
-        else {
-            return Err("Stopped update pane identities exceed their durable limit".into());
-        };
-        let saved = &mut record.snapshots[index];
-        // Keep the newest contiguous tail. Halving bounds reserialization work
-        // for oversized captures; the provider retains the full conversation.
-        let remove = saved.snapshot.items.len().div_ceil(2);
-        saved.snapshot.items.drain(..remove);
-        saved.snapshot.has_earlier = true;
-        saved.limitation = Some(if saved.source.launch.session_id.is_some() {
-            "The saved page was shortened to fit the update record. Resume loads the full recorded conversation; provider transcript files were kept."
-        } else {
-            "The saved page was shortened to fit the update record. No conversation was recorded; only this captured transcript is available. Start a new conversation to continue."
-        }.into());
+    for saved in &mut record.snapshots {
+        retain_reader_fields(&mut saved.snapshot);
     }
+    let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 <= limit {
+        return Ok(bytes);
+    }
+    let mut pages = record
+        .snapshots
+        .iter()
+        .map(|saved| Page::of(&saved.snapshot))
+        .collect::<Result<Vec<_>, _>>()?;
+    let budget = usize::try_from(limit)
+        .unwrap_or(usize::MAX)
+        .checked_sub(record.identity_size()?)
+        .ok_or("Stopped update pane identities exceed their durable limit")?;
+    keep_fair_shares(&mut record.snapshots, &mut pages, budget);
+    let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("Stopped update pane record exceeds its limit after fitting".into());
+    }
+    Ok(bytes)
+}
+
+/// Appended to a saved page whose older entries did not fit the update's
+/// evidence. Only the page is shorter; the provider keeps the conversation.
+pub(crate) const OLDER_HISTORY_OMITTED: &str =
+    " Earlier messages were left out of this saved page to fit the update's size limit.";
+
+/// A paused page is read through `floor_history`, which shows its entries,
+/// title and conversation identity. Interaction state of a provider which no
+/// longer exists (commands, skills, models, open requests, queued messages,
+/// draft and copy alignment) is never shown there and is not retained.
+pub(crate) fn retain_reader_fields(snapshot: &mut crate::chat::Snapshot) {
+    use std::mem::take;
+    snapshot.notification_preview = Default::default();
+    take(&mut snapshot.text_copy_sources);
+    take(&mut snapshot.requests);
+    take(&mut snapshot.models);
+    take(&mut snapshot.permission_denials);
+    take(&mut snapshot.commands);
+    take(&mut snapshot.skills);
+    take(&mut snapshot.composer);
+    take(&mut snapshot.prompt_suggestion);
+    take(&mut snapshot.plan);
+    take(&mut snapshot.subagents);
+    take(&mut snapshot.queued_messages);
+    take(&mut snapshot.queue_removals);
+    take(&mut snapshot.branch_points);
+    take(&mut snapshot.file_changes);
+}
+
+/// The encoded size of each entry of one page, oldest first. A JSON array
+/// costs one separator per entry beyond its own bytes.
+pub(crate) struct Page {
+    entries: Vec<usize>,
+}
+
+impl Page {
+    pub(crate) fn of(snapshot: &crate::chat::Snapshot) -> Result<Self, String> {
+        snapshot
+            .items
+            .iter()
+            .map(|item| serde_json::to_vec(&**item).map(|bytes| bytes.len() + 1))
+            .collect::<Result<_, _>>()
+            .map(|entries| Self { entries })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Bytes of all of its entries.
+    pub(crate) fn bytes(&self) -> usize {
+        self.entries.iter().sum()
+    }
+
+    /// Keep this page's newest `count` entries, marking it if any were lost.
+    fn keep(&mut self, saved: &mut StoppedSnapshot, count: usize) {
+        let omitted = self.entries.len() - count;
+        if omitted == 0 {
+            return;
+        }
+        self.entries.drain(..omitted);
+        saved.snapshot.items.drain(..omitted);
+        saved.snapshot.has_earlier = true;
+        mark_omitted(saved);
+    }
+}
+
+/// Shorten each page to its fair share of `budget`; see [`fair_shares`].
+/// `pages` measures `snapshots`, one to one, and stays in step with them.
+pub(crate) fn keep_fair_shares(
+    snapshots: &mut [StoppedSnapshot],
+    pages: &mut [Page],
+    budget: usize,
+) {
+    debug_assert_eq!(snapshots.len(), pages.len());
+    let shares = fair_shares(pages, budget);
+    for ((saved, page), count) in snapshots.iter_mut().zip(pages).zip(shares) {
+        page.keep(saved, count);
+    }
+}
+
+/// The least a page can keep: no entries, saying older ones were omitted.
+pub(crate) fn empty_page(saved: &mut StoppedSnapshot) {
+    saved.snapshot.items.clear();
+    saved.snapshot.has_earlier = true;
+    mark_omitted(saved);
+}
+
+/// Say that a page lost its older entries, after the reason the reader
+/// would otherwise show for it.
+pub(crate) fn mark_omitted(saved: &mut StoppedSnapshot) {
+    let limitation = saved
+        .limitation
+        .get_or_insert_with(|| default_limitation(&saved.source).into());
+    if !limitation.ends_with(OLDER_HISTORY_OMITTED) {
+        limitation.push_str(OLDER_HISTORY_OMITTED);
+    }
+}
+
+/// Why a stopped page that records no limitation of its own is read-only.
+pub(crate) fn default_limitation(source: &Session) -> &'static str {
+    if source.launch.session_id.is_some() {
+        "Stopped for the update. This saved page is a transcript preview; Resume loads the full conversation. Your draft is kept."
+    } else {
+        "Stopped for the update before a conversation was recorded. The captured transcript stays visible; start a new conversation to continue. Your draft is kept."
+    }
+}
+
+/// How many newest entries each page keeps so that their total stays within
+/// `budget`, shared max-min fairly in bytes: pages grow one entry at a time,
+/// the smallest result first, so short pages keep all of their history and
+/// leave the rest to longer ones. A page stops at an entry larger than what
+/// remains; the others go on.
+fn fair_shares(pages: &[Page], budget: usize) -> Vec<usize> {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+    // The size a page reaches with its next-newest entry, that entry's own
+    // size and the page, smallest result first.
+    let next = |page: usize, count: usize, kept: usize| {
+        let entries = &pages[page].entries;
+        let size = *entries
+            .len()
+            .checked_sub(count + 1)
+            .map(|at| &entries[at])?;
+        Some(Reverse((kept + size, size, page)))
+    };
+    let mut counts = vec![0; pages.len()];
+    let mut queue: BinaryHeap<_> = (0..pages.len())
+        .filter_map(|page| next(page, 0, 0))
+        .collect();
+    let mut remaining = budget;
+    while let Some(Reverse((kept, size, page))) = queue.pop() {
+        // What remains only shrinks, so this entry never fits later either.
+        let Some(left) = remaining.checked_sub(size) else {
+            continue;
+        };
+        remaining = left;
+        counts[page] += 1;
+        queue.extend(next(page, counts[page], kept));
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -1061,5 +1214,26 @@ mod compact_tests {
             encode_record(&mut record, 1).is_err(),
             "source evidence must never be discarded to fit"
         );
+    }
+
+    #[test]
+    fn pages_share_the_budget_max_min_fairly_newest_first() {
+        let page = |entries: &[usize]| Page {
+            entries: entries.to_vec(),
+        };
+        let pages = [
+            // Short: keeps everything and leaves the rest to longer pages.
+            page(&[10; 3]),
+            // Long: shares what remains evenly with the other long page.
+            page(&[10; 100]),
+            page(&[10; 100]),
+            // Its newest entry fits nowhere; it alone keeps nothing.
+            page(&[10, 10, 500]),
+            // A large older entry stops this page, not the others.
+            page(&[10, 300, 10]),
+        ];
+        assert_eq!(fair_shares(&pages, 0), [0; 5]);
+        assert_eq!(fair_shares(&pages, 420), [3, 19, 19, 0, 1]);
+        assert_eq!(fair_shares(&pages, usize::MAX), [3, 100, 100, 3, 3]);
     }
 }

@@ -236,7 +236,9 @@ use crate::{
 /// typed edit receipts and narrow metadata reads have appended requests/replies.
 /// The changed watch snapshot and edge shape require matched windows; older
 /// carried CLIs retain explicit whole-model reads/edits but cannot watch.
-pub const PROTOCOL_VERSION: u16 = 175;
+/// Version 176 separates cancelled and skipped Work check counts from failures
+/// and passes. Board reads, pins and subscriptions require a matching client.
+pub const PROTOCOL_VERSION: u16 = 176;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

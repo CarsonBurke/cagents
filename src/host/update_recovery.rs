@@ -74,17 +74,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: reconcile retained runs", None);
     let retained_runs = chat::retained_actor::retained_runs(host);
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )?;
-    }
+    settle_agents(host, &retained_runs)?;
     let (proof, terminals, chats) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let chats = state
@@ -114,6 +104,43 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     publish_archived_proof(host);
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: complete", None);
+    Ok(())
+}
+
+/// Settle what agents were left doing by an earlier daemon. A committed
+/// acceptance is not proof of provider delivery: until a restored actor
+/// supplies exact run evidence, never authorize a resend. With every earlier
+/// run settled, an agent whose pane records an unadopted in-place reopen from
+/// an earlier boot follows its pane, so that pane's view can open again; that
+/// repair is best effort and never holds back startup.
+fn settle_agents(
+    host: &SharedHost,
+    retained_runs: &[(crate::model::RunId, crate::agent_execution::HostedSession)],
+) -> Result<(), String> {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let Ok(registry) = agent_execution::registry(host) else {
+        return Ok(());
+    };
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    registry
+        .interrupt_unproven_agent_runs_except(crate::chat::now_ms().unwrap_or(0), retained_runs)?;
+    match registry.adopt_reopened_panes(&boot) {
+        Ok(0) => {}
+        Ok(adopted) => {
+            tracing::info!(
+                adopted,
+                "agents followed panes reopened in place before this boot"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "agents left behind by an in-place reopen were not repaired");
+        }
+    }
     Ok(())
 }
 
@@ -195,15 +222,7 @@ fn restore_recovered(
 
     super::model::floor::restore_presentations()?;
     let retained_runs = super::chat::retained_actor::retained_runs(host);
-    if let Ok(registry) = super::agent_execution::registry(host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )?;
-    }
+    settle_agents(host, &retained_runs)?;
     ensure_no_ambiguous_adoption(host)?;
     let (serving, terminals, chats, aliases) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
