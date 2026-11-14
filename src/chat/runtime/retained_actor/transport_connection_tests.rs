@@ -138,11 +138,16 @@ fn a_full_helper_answers_a_waiting_client_once_a_stalled_one_times_out() {
         // until a stalled client's read deadline frees one. The stalled
         // clients stay connected, so a helper that never freed a worker
         // would not answer.
+        let started = Instant::now();
         serving.state_within(TIMEOUT + crate::test_timing::EVENTUALLY);
         assert!(
             stalled.iter().any(Serving::timed_out),
             "answered while every worker was held"
         );
+        // A helper that held a worker past its client's read budget would
+        // answer only after another one.
+        let elapsed = started.elapsed();
+        assert!(elapsed < TIMEOUT * 2, "answered after {elapsed:?}");
         // The freed workers serve again.
         serving.state_within(TIMEOUT);
         serving.stop();

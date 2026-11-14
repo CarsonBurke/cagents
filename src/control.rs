@@ -9205,7 +9205,9 @@ mod tests {
         assert!(
             matches!(error, ControlError::ReplyTimeout { timeout, .. } if timeout <= Duration::from_millis(100))
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
@@ -9364,7 +9366,9 @@ mod tests {
                 3 => assert!(matches!(error, ControlError::ProofMismatch)),
                 _ => assert!(matches!(error, ControlError::ConnectionClosed)),
             }
-            assert!(started.elapsed() < Duration::from_secs(1));
+            // Sooner than the connection's own I/O timeout, which a request that
+            // ignored its deadline would fall back to.
+            assert!(started.elapsed() < IO_TIMEOUT);
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
             drop(client);
@@ -9447,7 +9451,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
     }
 
     #[test]
@@ -9469,7 +9475,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         drop(client_stream);
         server.join().unwrap();
     }

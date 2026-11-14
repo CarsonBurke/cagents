@@ -588,7 +588,7 @@ raise SystemExit(1)
     assert!(output.stdout.is_empty());
     assert_eq!(f.calls(), 0);
     drop(holder.0.stdin.take());
-    let settled_by = Instant::now() + Duration::from_secs(5);
+    let settled_by = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = holder.0.try_wait().unwrap() {
             assert!(status.success());

@@ -6434,11 +6434,14 @@ mod tests {
         let source = shell_session("exit 0");
         let proof = retirement_test_proof();
         // The TLS stays blocked until released below, so a request that
-        // waited for it would not return.
+        // waited for it would not return, and one that waited for a bounded
+        // shutdown would take its whole timeout.
+        let started = Instant::now();
         let handle = crate::test_timing::returns("the retirement request", move || {
             handle.begin_completed_retirement().unwrap();
             handle
         });
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);
         assert!(matches!(
             handle.completed_retirement(&source, &proof),
             TerminalRetirement::Pending
@@ -7179,7 +7182,7 @@ mod tests {
             let _ = delivered.send(());
         });
         later
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .expect("the notifier stopped after one subscriber panicked");
     }
 

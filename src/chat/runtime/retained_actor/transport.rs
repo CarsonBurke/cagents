@@ -5894,6 +5894,7 @@ exec /bin/sleep 60
             // deadline would never return.
             let _ = wait.recv();
         });
+        let started = Instant::now();
         let (actor, error) = crate::test_timing::returns("source resolution", move || {
             let error = actor
                 .resolve_source_until(&source, Instant::now() + Duration::from_millis(40))
@@ -5903,6 +5904,8 @@ exec /bin/sleep 60
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(actor.0.epoch, epoch);
         assert!(actor.pending_inputs().is_empty());
     }
@@ -6023,6 +6026,7 @@ exec /bin/sleep 60
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
         let proof = fixture.server.proof.clone();
+        let started = Instant::now();
         let error = crate::test_timing::returns("the stalled inspection", move || {
             RemoteActor::inspect_at_until(
                 &record,
@@ -6036,6 +6040,7 @@ exec /bin/sleep 60
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());

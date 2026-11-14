@@ -151,7 +151,7 @@ impl InputRootGuard {
         }
     }
     fn settled(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         while !input_root_exited(&self.pidfd).unwrap() {
             assert!(
                 Instant::now() < deadline,
@@ -187,7 +187,7 @@ fn finish_captured_input_worker(
 }
 
 fn observe_worker_marker(worker: &mut Worker, marker: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     let mut observed = Vec::new();
     loop {
         let message = worker
@@ -342,7 +342,7 @@ os.write(1, b'NEXT_INPUT_OBSERVED\n')
     // Drive the actual PTY, including finishing protocol bytes while its
     // reader resumes. A timeout can never stand in for observing a marker.
     let observe = |worker: &mut Worker, marker: &[u8]| {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         let mut output = Vec::new();
         loop {
             assert!(worker.flush_pty_input());
@@ -498,7 +498,7 @@ os.write(1, b'NEXT_INPUT_OBSERVED\n')
             }),
         };
         let observe = |worker: &mut Worker, marker: &[u8]| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
             let mut output = Vec::new();
             loop {
                 assert!(worker.flush_pty_input());
@@ -796,7 +796,7 @@ os.write(1, b'PAIR_DONE')
         expected.extend(ctrl_up);
         fs::write(home.path().join("expected_len"), expected.len().to_string()).unwrap();
         close_processes::signal(&root.pidfd, libc::SIGCONT).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         let actual = loop {
             worker.flush_pty_input();
             if let Ok(bytes) = fs::read(home.path().join("received.bin"))
@@ -1107,7 +1107,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
                     Command::PrepareUpgrade(reply),
                     Box::new(move || {
                         result
-                            .recv_timeout(Duration::from_secs(1))
+                            .recv_timeout(crate::test_timing::EVENTUALLY)
                             .unwrap()
                             .err()
                             .expect("Prepare must refuse pending input")
@@ -1120,7 +1120,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
                     Command::Carry { socket, reply },
                     Box::new(move || {
                         result
-                            .recv_timeout(Duration::from_secs(1))
+                            .recv_timeout(crate::test_timing::EVENTUALLY)
                             .unwrap()
                             .err()
                             .expect("Carry must refuse pending input")
@@ -1133,7 +1133,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
                     Command::PreserveForRestart(reply),
                     Box::new(move || {
                         result
-                            .recv_timeout(Duration::from_secs(1))
+                            .recv_timeout(crate::test_timing::EVENTUALLY)
                             .unwrap()
                             .err()
                             .expect("Preserve must refuse pending input")
@@ -1368,7 +1368,7 @@ while True: time.sleep(1)
         let prepare = scope.spawn(move || handle.prepare_input_handoff(token, resumed));
         let command = worker
             .commands
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .unwrap();
         assert!(!worker.handle_command(command));
         let error = prepare.join().unwrap().unwrap_err();
@@ -1376,7 +1376,9 @@ while True: time.sleep(1)
     });
     assert!(!token.load(Ordering::Acquire));
     assert_eq!(
-        restarted.recv_timeout(Duration::from_secs(1)).unwrap(),
+        restarted
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap(),
         Ok(())
     );
     assert!(worker.reader.is_some());
@@ -1394,7 +1396,7 @@ while True: time.sleep(1)
         worker.flush_pty_input();
         worker.drain_effects();
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     while !std::path::Path::new("actual-replies").exists() {
         assert!(
             Instant::now() < deadline,
@@ -1453,7 +1455,9 @@ while True: time.sleep(1)
     assert_eq!(worker.pending_input.front(), bytes);
     worker.handle_command(worker.commands.try_recv().unwrap());
     assert_eq!(
-        restarted.recv_timeout(Duration::from_secs(1)).unwrap(),
+        restarted
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap(),
         Ok(())
     );
     assert_eq!(worker.reader.as_ref().unwrap().thread().id(), reader);
@@ -1494,7 +1498,7 @@ fn inactive_pty_and_exited_child_still_observe_capture_cancellation() {
         );
         done.send(capture).unwrap();
     });
-    let observed = result.recv_timeout(Duration::from_secs(1));
+    let observed = result.recv_timeout(crate::test_timing::EVENTUALLY);
     if observed.is_err() {
         // Old command-only branch is released and joined before the assertion
         // fails; this regression never leaks its waiter on the negative path.
@@ -1538,7 +1542,7 @@ while True: time.sleep(1)
     worker.test_write_budget = Some(0);
     let old_reader = worker.reader.as_ref().unwrap().thread().id();
     fs::write("precut-query-gate", b"query").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     while worker.pty_rx.is_empty() {
         assert!(
             Instant::now() < deadline,
@@ -1558,7 +1562,7 @@ while True: time.sleep(1)
         let prepare = scope.spawn(move || handle.prepare_input_handoff(token, resumed));
         let command = worker
             .commands
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .unwrap();
         assert!(!worker.handle_command(command));
         let error = prepare.join().unwrap().unwrap_err();
@@ -1566,7 +1570,9 @@ while True: time.sleep(1)
     });
     assert!(!token.load(Ordering::Acquire));
     assert_eq!(
-        restarted.recv_timeout(Duration::from_secs(1)).unwrap(),
+        restarted
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap(),
         Ok(())
     );
     assert_ne!(
@@ -1665,7 +1671,7 @@ while True: time.sleep(1)
     );
     original.carry(socket.clone()).unwrap();
     fs::write(root.join("emit"), b"query").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     while !root.join("emitted").exists() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
@@ -1752,7 +1758,7 @@ while True: time.sleep(1)
     assert!(retained.is_completed());
     assert!(retained.worker_joined_for_test());
     original_root.settled();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     while !input_root_exited(&original_holder).unwrap() {
         assert!(
             Instant::now() < deadline,
