@@ -10,6 +10,7 @@
 - [Native chat viewport](#native-chat-viewport)
 - [Idle retained actors](#idle-retained-actors)
 - [Work board polling](#work-board-polling)
+- [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -659,6 +660,48 @@ Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
 A fixture checkout holds 40 files. A real checkout costs more per read: on a
 347-worktree repository with 8 active worktrees, the scanner's Git processes
 took at least half a core before this change.
+
+## Git watcher during builds
+
+The daemon's Git watcher (`notify-rs inotify loop`, from the `notify` crate)
+covers each project's tracked directories and Git metadata. It asks the kernel
+for changes only: creations, removals, renames, content and metadata writes.
+An inotify watch that includes opens wakes the thread whenever `git status`, a
+compiler or an editor merely reads a watched file or lists a watched directory.
+Ignored output such as `target/` is never watched, because content watches come
+from the tracked-directory census.
+
+`scripts/measure-watch-wakeups BIN_DIR [SECONDS]` opens a shared clone of the
+checkout as the only project of a private daemon fixture. It then checks the
+clone's CLI through the build gate over and over, touching `src/main.rs` before
+each check, while `scripts/measure-idle-wakeups` counts the daemon's threads.
+Run it from a genuine user shell on the build host, with rustup's Cargo first
+on `PATH`:
+
+```sh
+scripts/measure-watch-wakeups ~/.local/state/cev/watch/target-after/dev-runtime 120
+```
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 120 s of
+builds, `7c7430da9` (before, notify 8.2) against `3611b064f` (after, notify 9
+with `EventKindMask::CORE`). Both sides used the same fixture from the after
+checkout; the host was shared with other builds.
+
+| Daemon, per second | Before | After |
+| --- | --- | --- |
+| `notify-rs inoti` wakeups | 937.08 | 0.47 |
+| `work-scan` wakeups | 3.05 | 5.75 |
+| All daemon threads, wakeups | 943.03 | 10.05 |
+| All daemon threads, CPU % of a core | 0.81 | 0.10 |
+| Checks completed | 26 | 49 |
+
+`work-scan` wakes to read a worktree's status after a real change. It followed
+the build rate on both sides, about 14 wakeups per check, so each touched source
+still reaches the Work board. The watcher's remaining 0.47 wakeups/s are about
+one per touch (0.41/s).
+
+A live daemon with 8,715 watches across several large projects showed the same
+pattern. A 60 s replica of its watch set saw 714 events/s, 701 of them opens.
 
 ## Reference results
 
