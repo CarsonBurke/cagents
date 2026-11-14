@@ -61,3 +61,13 @@ timeout keeps the cursor visible and asks for no frames at all.
 ```sh
 cargo test --manifest-path vendor/iced-core/Cargo.toml text::blink
 ```
+
+## Focus stops
+
+`Focusable::is_focus_stop`, true by default, lets a widget that cannot be
+activated now, such as a disabled button, stay out of keyboard traversal while
+still being reported to operations. `count`, `focus_next` and `focus_previous`
+consider only stops, plus the focused widget, so traversal moves on from a
+control disabled while it held focus. `focus` by id is unchanged. libcosmic's
+button uses this (`vendor/libcosmic/PATCH.md`); the app regression is
+`ui_controls::button::tests::disabled_buttons_are_not_focus_stops`.

@@ -400,4 +400,149 @@ mod tests {
             assert_eq!(messages.len(), usize::from(message.is_some()));
         }
     }
+
+    /// Tab moves through the buttons that can act and passes a disabled one
+    /// over. A button disabled while focused, such as Refresh while it runs,
+    /// keeps the focus, and Tab moves on from it. Operations that locate
+    /// buttons still find a disabled one.
+    #[test]
+    fn disabled_buttons_are_not_focus_stops() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::widget::{
+            Operation, Tree,
+            operation::{self, Outcome, focusable},
+        };
+        use cosmic::iced::advanced::{Layout, layout};
+        use std::sync::{Arc, Mutex};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let ids = ["first", "disabled", "last"].map(widget::Id::new);
+        let row = |enabled: [bool; 3]| -> Element<'static, u8> {
+            widget::row::with_children(
+                ids.iter()
+                    .zip(enabled)
+                    .enumerate()
+                    .map(|(index, (id, enabled))| {
+                        widget::button::custom(design::caption("Action"))
+                            .id(id.clone())
+                            .width(Length::Fixed(80.0))
+                            .on_press_maybe(enabled.then_some(index as u8))
+                            .into()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into()
+        };
+        let run = |element: &mut Element<'static, u8>,
+                   tree: &mut Tree,
+                   mut operation: Box<dyn Operation>| {
+            let node = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+            );
+            loop {
+                element.as_widget_mut().operate(
+                    tree,
+                    Layout::new(&node),
+                    &renderer,
+                    operation.as_mut(),
+                );
+                match operation.finish() {
+                    Outcome::Chain(next) => operation = next,
+                    _ => break,
+                }
+            }
+        };
+        let focused = |element: &mut Element<'static, u8>, tree: &mut Tree| {
+            let found: Arc<Mutex<Option<widget::Id>>> = Arc::default();
+            let sink = Arc::clone(&found);
+            run(
+                element,
+                tree,
+                Box::new(operation::map(focusable::find_focused(), move |id| {
+                    *sink.lock().unwrap() = Some(id);
+                })),
+            );
+            found.lock().unwrap().clone()
+        };
+
+        let mut element = row([true, false, true]);
+        let mut tree = Tree::new(&element);
+        run(&mut element, &mut tree, Box::new(focusable::focus_next()));
+        assert_eq!(focused(&mut element, &mut tree), Some(ids[0].clone()));
+        run(&mut element, &mut tree, Box::new(focusable::focus_next()));
+        assert_eq!(
+            focused(&mut element, &mut tree),
+            Some(ids[2].clone()),
+            "Tab passes over the disabled button"
+        );
+        run(
+            &mut element,
+            &mut tree,
+            Box::new(focusable::focus_previous()),
+        );
+        assert_eq!(
+            focused(&mut element, &mut tree),
+            Some(ids[0].clone()),
+            "Shift+Tab passes over it too"
+        );
+
+        struct Locate(Arc<Mutex<Vec<widget::Id>>>);
+        impl Operation for Locate {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: cosmic::iced::Rectangle,
+                _: &mut dyn focusable::Focusable,
+            ) {
+                self.0.lock().unwrap().extend(id.cloned());
+            }
+        }
+        let located: Arc<Mutex<Vec<widget::Id>>> = Arc::default();
+        run(
+            &mut element,
+            &mut tree,
+            Box::new(Locate(Arc::clone(&located))),
+        );
+        assert_eq!(
+            *located.lock().unwrap(),
+            ids.to_vec(),
+            "operations still find the disabled button"
+        );
+
+        let mut element = row([true, true, true]);
+        tree.diff(element.as_widget_mut());
+        run(
+            &mut element,
+            &mut tree,
+            Box::new(focusable::focus(ids[1].clone())),
+        );
+        let mut element = row([true, false, true]);
+        tree.diff(element.as_widget_mut());
+        assert_eq!(
+            focused(&mut element, &mut tree),
+            Some(ids[1].clone()),
+            "a button disabled while focused keeps the focus"
+        );
+        run(&mut element, &mut tree, Box::new(focusable::focus_next()));
+        assert_eq!(
+            focused(&mut element, &mut tree),
+            Some(ids[2].clone()),
+            "Tab moves on from it"
+        );
+        run(
+            &mut element,
+            &mut tree,
+            Box::new(focusable::focus_previous()),
+        );
+        assert_eq!(
+            focused(&mut element, &mut tree),
+            Some(ids[0].clone()),
+            "and does not return to it"
+        );
+    }
 }
