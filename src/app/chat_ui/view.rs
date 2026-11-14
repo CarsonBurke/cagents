@@ -116,8 +116,6 @@ pub(super) const NOTICE_CHARS: usize = 480;
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
 const FOOTER_LABEL: usize = 32;
-/// The most of a channel's name the footer shows after its `# `.
-const CHANNEL_LABEL: usize = 26;
 /// The same, in a pane too narrow for the conversation's place.
 const NARROW_FOOTER_LABEL: usize = 20;
 /// The same where the model is named only on hover, for the text drawn in
