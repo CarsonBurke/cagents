@@ -18887,7 +18887,10 @@ mod tests {
     #[test]
     fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reachable() {
         use iced::advanced::widget::operation::{self, Focusable};
-        use iced::advanced::{Layout, Operation, Shell, clipboard, layout, widget::Tree};
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree},
+        };
 
         #[derive(Default)]
         struct Controls {
