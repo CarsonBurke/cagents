@@ -1152,6 +1152,7 @@ pub(super) struct Prepared {
     /// The pull requests the prepared text links to.
     links: Box<[crate::github_identity::PullRequestKey]>,
     document: prose_document::Data,
+    reasoning: Option<super::reasoning::Preview>,
     prompt: Option<Box<prompt::Prepared>>,
     literal: Option<literal_content::Prepared>,
     coordination: Option<coordination::Prepared>,
@@ -1262,6 +1263,7 @@ impl Prepared {
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         cached.document = Some(prose_document::Document::new(self.document));
+        cached.reasoning = self.reasoning;
         cached.literal = self.literal.map(literal_content::Prepared::install);
         drop(previous_literal);
         cached.coordination = self
@@ -2045,6 +2047,7 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
             request,
             parsed: Parsed::default(),
             document: prose_document::Data::snapshot(&markdown::Content::default()),
+            reasoning: None,
             prompt: Some(prompt),
             literal: None,
             links: Box::default(),
@@ -2194,10 +2197,12 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
         links.extend(coordinated.links());
     }
     pull_request_links::deduplicate(&mut links);
+    let reasoning = super::reasoning::Preview::of(&item.content);
     Ok(Prepared {
         request,
         parsed,
         document,
+        reasoning,
         prompt,
         literal,
         links: links.into_boxed_slice(),

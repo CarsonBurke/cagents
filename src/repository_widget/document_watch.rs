@@ -198,26 +198,34 @@ fn run(commands: mpsc::Receiver<Command>, wake: mpsc::Sender<Command>) {
     let create = || {
         let pending = pending.clone();
         let wake = wake.clone();
-        notify::recommended_watcher(move |event: notify::Result<Event>| {
-            if event.as_ref().is_ok_and(|event| {
-                !event.need_rescan()
-                    && matches!(event.kind,
+        // Reads of a watched directory's other files, by Git status or a
+        // build, would otherwise wake this thread only to be discarded: ask
+        // the kernel for changes and completed writes alone.
+        notify::RecommendedWatcher::new(
+            move |event: notify::Result<Event>| {
+                if event.as_ref().is_ok_and(|event| {
+                    !event.need_rescan()
+                        && matches!(event.kind,
                 EventKind::Access(kind) if !matches!(kind,
                     notify::event::AccessKind::Close(notify::event::AccessMode::Write)))
-            }) {
-                return;
-            }
-            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
-            match event {
-                Ok(event) if pending.events.len() < 256 => pending.events.push(event),
-                Ok(_) => pending.overflow = true,
-                Err(error) => pending.fault = Some(error.to_string()),
-            }
-            if !pending.queued {
-                pending.queued = true;
-                let _ = wake.send(Command::Events);
-            }
-        })
+                }) {
+                    return;
+                }
+                let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+                match event {
+                    Ok(event) if pending.events.len() < 256 => pending.events.push(event),
+                    Ok(_) => pending.overflow = true,
+                    Err(error) => pending.fault = Some(error.to_string()),
+                }
+                if !pending.queued {
+                    pending.queued = true;
+                    let _ = wake.send(Command::Events);
+                }
+            },
+            notify::Config::default().with_event_kinds(
+                notify::EventKindMask::CORE | notify::EventKindMask::ACCESS_CLOSE,
+            ),
+        )
     };
     let mut watcher = create();
     let mut entries: BTreeMap<uuid::Uuid, Entry> = BTreeMap::new();

@@ -651,17 +651,18 @@ impl Monitor {
                 let create_watcher = || {
                     let events = state.clone();
                     let signal = wake.clone();
-                    notify::recommended_watcher(move |event: notify::Result<Event>| {
-                        // Git status itself produces Access traffic. A requested
-                        // rescan still reaches the normal recovery path.
-                        if event.as_ref().is_ok_and(access_only) {
-                            return;
-                        }
-                        let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
-                        if pending.event(event) {
-                            signal();
-                        }
-                    })
+                    // Every open of a watched file or directory, by Git status
+                    // or a build, would otherwise wake this watcher only to be
+                    // discarded: ask the kernel for changes alone.
+                    RecommendedWatcher::new(
+                        move |event: notify::Result<Event>| {
+                            let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
+                            if pending.event(event) {
+                                signal();
+                            }
+                        },
+                        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+                    )
                 };
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
@@ -1495,5 +1496,141 @@ mod tests {
             change.worktrees.contains(&worktree.id)
         });
         drop(original_directory);
+    }
+
+    #[test]
+    fn staging_committing_and_switching_branches_arrive_without_open_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("repository");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "first").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let project = Project::read_changed(
+            ProjectId::new(),
+            service.common_dir(&root, &cancellation).unwrap(),
+            &service.list_worktrees(&root, &cancellation).unwrap(),
+            &cancellation,
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let worktree = project.worktrees[0].id;
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, "initial configuration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
+        // Each Git operation replaces its files by renaming a lock into place.
+        let settle = || {
+            thread::sleep(Duration::from_millis(100));
+            while monitor.1.try_recv().is_ok() {}
+            monitor.0.drain();
+        };
+        std::fs::write(root.join("src/main.rs"), "second").unwrap();
+        settle();
+        git(&root, &["add", "src/main.rs"]);
+        wait_for(&monitor, project.id, "staging", |change| {
+            change.worktrees.contains(&worktree) && change.membership
+        });
+        settle();
+        git(&root, &["commit", "-qm", "second"]);
+        wait_for(&monitor, project.id, "committing", |change| {
+            change.references
+        });
+        settle();
+        git(&root, &["switch", "-qc", "topic"]);
+        wait_for(&monitor, project.id, "switching branches", |change| {
+            change.worktrees.contains(&worktree)
+        });
+    }
+
+    /// Voluntary context switches, the times a thread slept and was woken,
+    /// of this process's native watcher threads, by thread ID.
+    fn watcher_thread_switches() -> BTreeMap<String, u64> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| {
+                let task = task.ok()?.path();
+                let name = std::fs::read_to_string(task.join("comm")).ok()?;
+                if !name.starts_with("notify-rs inoti") {
+                    return None;
+                }
+                let switches = std::fs::read_to_string(task.join("status"))
+                    .ok()?
+                    .lines()
+                    .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                Some((task.file_name()?.to_string_lossy().into_owned(), switches))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reading_watched_files_does_not_wake_the_watcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        let worktree = &project.worktrees[0];
+        let source = worktree.root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree.git_dir).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "first").unwrap();
+        std::fs::write(worktree.git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let others = watcher_thread_switches();
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, "initial configuration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
+        // This monitor's watcher thread, and any that other tests started
+        // meanwhile, but none that were already running.
+        let mut before = watcher_thread_switches();
+        before.retain(|thread, _| !others.contains_key(thread));
+        assert!(!before.is_empty(), "the watcher thread was not found");
+        // What Git status and a compiler do to a checkout: open its files and
+        // list its directories, many times over, without changing anything.
+        for _ in 0..200 {
+            std::fs::read(&file).unwrap();
+            std::fs::read(worktree.git_dir.join("HEAD")).unwrap();
+            std::fs::read_dir(&source).unwrap().for_each(drop);
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let after = watcher_thread_switches();
+        let woke: u64 = before
+            .iter()
+            .map(|(thread, switches)| {
+                after
+                    .get(thread)
+                    .map_or(0, |after| after.saturating_sub(*switches))
+            })
+            .sum();
+        assert!(woke < 40, "the watcher woke {woke} times for reads alone");
+        // A change still arrives.
+        std::fs::write(&file, "second").unwrap();
+        wait_for(&monitor, project.id, "edit after reads", |change| {
+            change.worktrees.contains(&worktree.id)
+        });
     }
 }
