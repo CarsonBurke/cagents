@@ -79,7 +79,7 @@ locate_row() {
 import json,re,sys
 pattern=re.compile(sys.argv[1],re.I);index=int(sys.argv[2])
 runs=sorted((r for r in json.load(sys.stdin)["runs"]
-             if 270 <= r["x"] < 810 and 55 < r["y"] < 780 and pattern.search(r["text"])),
+             if 270 <= r["x"] < 810 and 55 < r["y"] < 780 and (pattern.search(r["text"]) or pattern.search(re.sub(r"^[^A-Za-z0-9]+", "", r["text"])))),
             key=lambda r:(r["y"],r["x"]))
 rows=[]
 for r in runs:
@@ -91,7 +91,7 @@ print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
 }
 
 scroll_top() {
-    evidence drive scroll --at 420,400 v -- -30 >/dev/null
+    evidence drive scroll --at 280,400 v -- -30 >/dev/null
     sleep 1
 }
 
@@ -101,7 +101,7 @@ find_row() {
     scroll_top
     for _ in 1 2 3 4 5 6; do
         if point=$(locate_row "$1" "${2:-0}"); then printf '%s\n' "$point"; return; fi
-        evidence drive scroll --at 420,400 v -- 5 >/dev/null
+        evidence drive scroll --at 280,400 v -- 5 >/dev/null
         sleep 1
     done
     printf 'reasoning-row-scene: row not visible: %s\n' "$1" >&2
@@ -148,36 +148,49 @@ narrow_layout() {
 
 # A single expanded mixed group covers Read/Search, Changes and a generic MCP
 # tool. The latter's literal input/output verifies its own nested disclosure.
+align_row() {
+    local point y steps
+    point=$(find_row "$1" "${2:-0}")
+    y=${point#*,}
+    if [ "$y" -gt 200 ]; then
+        steps=$(( (y - 140) / 50 ))
+        evidence drive scroll --at 280,400 v -- "$steps" >/dev/null
+        sleep 1
+    fi
+}
+
 tools_details() {
     local prefix=$1
     scroll_top
-    if ! text_visible '^Read'; then click_row '^edited'; fi
-    if ! text_visible '\bInspection\b'; then click_row 'inspect'; fi
+    if ! text_visible '\bRead\b'; then click_row '\bEdited\b'; fi
+    align_row 'Fixture.*inspect'
+    if ! text_visible '\bInspection\b'; then click_row 'Fixture.*inspect'; fi
     find_row '\bInspection\b' >/dev/null
     shot "${prefix}rows-tools-expanded"
+    # Restore both disclosure levels; opening the next scene must not depend
+    # on whether a long output happened to remain outside the viewport.
+    click_row 'Fixture.*inspect'
     scroll_top
-    click_row '^edited'
+    click_row '\bEdited\b'
     scroll_top
 }
 
 # Keep the failed command's original diagnostic alongside a running group and
 # its nested success/running commands. No command is executed by this fixture.
 outcome_details() {
-    local prefix=$1 mixed_parent=false
+    local prefix=$1 mixed_parent=false failure_index=1
     scroll_top
     # The baseline filters the empty thought and merges this failure into
     # the mixed group. Newer UI preserves the thought and its group boundary.
     if ! text_visible 'optional.probe'; then
-        click_row '^edited'
+        click_row '\bEdited\b'
         mixed_parent=true
+        failure_index=0
     else
         click_row 'optional.probe'
     fi
-    if [ "$mixed_parent" = true ]; then
-        if ! text_visible '\bRefused\b'; then click_row 'optional.probe'; fi
-    else
-        if ! text_visible '\bRefused\b'; then click_row 'optional.probe' 1; fi
-    fi
+    align_row 'optional.probe' "$failure_index"
+    if ! text_visible '\bRefused\b'; then click_row 'optional.probe' "$failure_index"; fi
     find_row '\bRefused\b' >/dev/null
     # OCR may split the leading verb from the stable count.
     if ! text_visible 'fixture.log.ready'; then click_row '2 commands'; fi
@@ -186,13 +199,14 @@ outcome_details() {
     y=${point#*,}
     if [ "$y" -gt 200 ]; then
         steps=$(( (y - 160) / 60 ))
-        evidence drive scroll --at 420,400 v -- "$steps" >/dev/null
+        evidence drive scroll --at 280,400 v -- "$steps" >/dev/null
         sleep 1
     fi
     shot "${prefix}rows-outcomes-expanded"
     click_row '2 commands'
+    click_row 'optional.probe' "$failure_index"
     scroll_top
-    if [ "$mixed_parent" = true ]; then click_row '^edited'; else click_row 'optional.probe'; fi
+    if [ "$mixed_parent" = true ]; then click_row '\bEdited\b'; else click_row 'optional.probe'; fi
     scroll_top
 }
 
@@ -217,7 +231,7 @@ open_spawned() {
 }
 
 scroll_bottom() {
-    evidence drive scroll --at 420,400 v -- 40 >/dev/null
+    evidence drive scroll --at 280,400 v -- 40 >/dev/null
     sleep 1
 }
 
@@ -323,10 +337,10 @@ if [ "$scene" = web ]; then
     narrow_layout
     scroll_top
     shot rows-web-collapsed
-    click_row '^searched the web'
+    click_row '\bsearched the web'
     # A one-step group repeats the nested row title. Target the second
     # matching line, even when a narrow fade conceals the query itself.
-    click_row '^searched the web' 1
+    click_row '\bsearched the web' 1
     find_row '\bRecorded\b' >/dev/null
     shot rows-web-expanded
     touch "$web_done"
