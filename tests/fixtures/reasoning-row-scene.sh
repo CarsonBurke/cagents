@@ -151,10 +151,11 @@ narrow_layout() {
 tools_details() {
     local prefix=$1
     scroll_top
-    if ! text_visible 'inspect'; then click_row '^edited'; fi
+    if ! text_visible '^Read'; then click_row '^edited'; fi
     if ! text_visible '\bInspection\b'; then click_row 'inspect'; fi
     find_row '\bInspection\b' >/dev/null
     shot "${prefix}rows-tools-expanded"
+    scroll_top
     click_row '^edited'
     scroll_top
 }
@@ -162,14 +163,26 @@ tools_details() {
 # Keep the failed command's original diagnostic alongside a running group and
 # its nested success/running commands. No command is executed by this fixture.
 outcome_details() {
-    local prefix=$1
+    local prefix=$1 mixed_parent=false
     scroll_top
-    click_row 'optional-probe-denied'
-    if ! text_visible '\bRefused\b'; then click_row 'optional-probe-denied' 1; fi
+    # The baseline filters the empty thought and merges this failure into
+    # the mixed group. Newer UI preserves the thought and its group boundary.
+    if ! text_visible 'optional.probe'; then
+        click_row '^edited'
+        mixed_parent=true
+    else
+        click_row 'optional.probe'
+    fi
+    if [ "$mixed_parent" = true ]; then
+        if ! text_visible '\bRefused\b'; then click_row 'optional.probe'; fi
+    else
+        if ! text_visible '\bRefused\b'; then click_row 'optional.probe' 1; fi
+    fi
     find_row '\bRefused\b' >/dev/null
-    if ! text_visible 'fixture-log-ready'; then click_row '(ran|running) 2 commands'; fi
+    # OCR may split the leading verb from the stable count.
+    if ! text_visible 'fixture.log.ready'; then click_row '2 commands'; fi
     local point y steps
-    point=$(find_row 'optional-probe-denied')
+    point=$(find_row 'optional.probe')
     y=${point#*,}
     if [ "$y" -gt 200 ]; then
         steps=$(( (y - 160) / 60 ))
@@ -177,8 +190,9 @@ outcome_details() {
         sleep 1
     fi
     shot "${prefix}rows-outcomes-expanded"
-    click_row '(ran|running) 2 commands'
-    click_row 'optional-probe-denied'
+    click_row '2 commands'
+    scroll_top
+    if [ "$mixed_parent" = true ]; then click_row '^edited'; else click_row 'optional.probe'; fi
     scroll_top
 }
 
