@@ -6209,6 +6209,11 @@ mod tests {
                 channel.title_source = crate::model::ChannelTitleSource::Prompt;
             }
         }
+        for channel in &mut app.workspace_model.channels {
+            if channel.id == destination {
+                channel.title_source = crate::model::ChannelTitleSource::Prompt;
+            }
+        }
         app.workspace_model.agents = vec![agent.clone()];
         app.workspace_model.views.clear();
         app.chrome_ui.agent_labels.clear();
@@ -6267,7 +6272,14 @@ mod tests {
             app.chat_start_pending(pane.id),
             "the conversation is still unloaded"
         );
-        assert_eq!(app.card_state(pane.id).unwrap().title, label);
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        // A restored source descriptor can still carry the old provider
+        // default. Accepted identity wins without loading the conversation.
+        app.card_state_mut(pane.id).unwrap().title =
+            chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
         assert_eq!(
             app.card_display_title(app.card_state(pane.id).unwrap()),
             label
