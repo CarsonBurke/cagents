@@ -7246,6 +7246,25 @@ fn header_selection(
     }
 }
 
+/// A project's news that none of the channel and pane rows drawn under it
+/// shows: news of a pane a search leaves out, or of no pane at all. While
+/// checkouts are hidden its header says this, or nobody would.
+fn undrawn_attention<'a>(
+    state: &SidebarState,
+    project: ProjectId,
+    channels: impl Iterator<Item = &'a SidebarChannel>,
+    cards: impl Iterator<Item = &'a SidebarCard>,
+) -> AttentionSummary {
+    let mut drawn = AttentionSummary::default();
+    for channel in channels {
+        drawn.add(channel.attention);
+    }
+    for card in cards {
+        drawn.add(card.attention);
+    }
+    state.project_attention(project).without(drawn)
+}
+
 fn project_view<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
@@ -7290,14 +7309,12 @@ fn project_view<'a>(
     } else if attention_list {
         AttentionSummary::default()
     } else if project.state.lists_panes(entity) {
-        let mut drawn = AttentionSummary::default();
-        for card in &project.cards {
-            drawn.add(card.attention);
-        }
-        for channel in &project.channels {
-            drawn.add(channel.attention);
-        }
-        project.state.project_attention(project_id).without(drawn)
+        undrawn_attention(
+            project.state,
+            project_id,
+            project.channels.iter().copied(),
+            project.cards.iter().copied(),
+        )
     } else if !project.state.shows_checkouts(project_id) {
         project.state.project_attention(project_id)
     } else {
@@ -7575,7 +7592,7 @@ fn compact_project_identity(
     selected: bool,
     modal_open: bool,
     state: &SidebarState,
-    badged: bool,
+    badge: Option<AttentionSummary>,
 ) -> Element<'static, SidebarAction> {
     let (initials, color) = project_identity(&project.name);
     let chip = rail::project_chip(project.avatar.as_ref(), initials, color, false);
@@ -7635,11 +7652,9 @@ fn compact_project_identity(
         .control(
             grid.rail(
                 chip,
-                if badged {
-                    rail::Badges::attention(state.shown_attention(attention.summary))
-                } else {
-                    rail::Badges::default()
-                },
+                badge.map_or_else(rail::Badges::default, |summary| {
+                    rail::Badges::attention(state.shown_attention(summary))
+                }),
             ),
             selected,
         )
@@ -7677,11 +7692,13 @@ fn compact_project<'a>(
         column = column.push(row);
     }
     let mut members = Vec::new();
-    for channel in project
+    let drawn_channels: Vec<&SidebarChannel> = project
         .channels
         .iter()
+        .copied()
         .filter(|channel| expanded && compact_rail_shows_channel(project.state, channel))
-    {
+        .collect();
+    for channel in &drawn_channels {
         members.push((
             SelectionRow::Channel(channel.id),
             RowInteraction::selectable(
@@ -7746,18 +7763,25 @@ fn compact_project<'a>(
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
     let has_children = !members.is_empty() || !entity.operations.is_empty();
-    let header = context_controls_with_display(
-        compact_project_identity(
-            entity,
-            selected,
-            modal_open,
+    // Every row with news is drawn below the chip with its own badges (see
+    // `compact_rail_shows_channel`), so the chip speaks for the whole
+    // project only while none are: repeating them would count the same news
+    // twice. Hidden checkouts leave news to their panes' rows, and the chip
+    // keeps what no drawn row carries, as the expanded header does.
+    let badge = if members.is_empty() {
+        Some(project.state.project_attention(entity.id))
+    } else if project.state.lists_panes(entity) {
+        Some(undrawn_attention(
             project.state,
-            // Every row with news is drawn below the chip with its own badges
-            // (see `compact_rail_shows_channel`; hidden checkouts leave it to
-            // their panes' rows), so the chip speaks for the project only
-            // while none are: repeating them would count the same news twice.
-            members.is_empty(),
-        ),
+            entity.id,
+            drawn_channels.iter().copied(),
+            project.cards.iter().copied(),
+        ))
+    } else {
+        None
+    };
+    let header = context_controls_with_display(
+        compact_project_identity(entity, selected, modal_open, project.state, badge),
         entity.id,
         None,
         modal_open,
@@ -14845,7 +14869,13 @@ pub(crate) mod tests {
         );
         let names = accessible_names(
             &headless_renderer(),
-            compact_project_identity(&project, false, false, &state, true),
+            compact_project_identity(
+                &project,
+                false,
+                false,
+                &state,
+                Some(state.project_attention(project.id)),
+            ),
         );
         assert!(
             names
@@ -15557,7 +15587,13 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let names = accessible_names(
             &renderer,
-            compact_project_identity(&project, true, false, &state, true),
+            compact_project_identity(
+                &project,
+                true,
+                false,
+                &state,
+                Some(state.project_attention(project.id)),
+            ),
         );
         assert!(
             names
@@ -15591,7 +15627,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     &SidebarState::default(),
-                    true,
+                    Some(AttentionSummary::default()),
                 );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(COMPACT_WIDTH, WORKTREE_ROW_HEIGHT));
@@ -16721,6 +16757,48 @@ pub(crate) mod tests {
                 .any(|card| rows.contains(&SelectionRow::Card(*card))),
             "{rows:?}"
         );
+    }
+
+    /// The rail's project chip leaves news to the pane rows drawn under it,
+    /// and still carries what none of them does, as the expanded header
+    /// does: a search that leaves out the unread pane's row must not take
+    /// its news off the rail while checkouts are hidden.
+    #[test]
+    fn hidden_checkouts_keep_news_no_drawn_row_carries_on_the_rail_chip() {
+        let (model, mut state, _) = hidden_checkouts_scene();
+        let renderer = headless_renderer();
+        // A rail badge draws an unread count, which its row's name carries
+        // instead, so count the drawn text.
+        let unread_badges = |state: &SidebarState| {
+            let badges = drawn_texts(project_list(&model, state, true, false), COMPACT_WIDTH)
+                .into_iter()
+                .filter(|(text, _)| text == "1")
+                .count();
+            let names = accessible_names(&renderer, project_list(&model, state, true, false));
+            (badges, names)
+        };
+        let (badges, names) = unread_badges(&state);
+        assert_eq!(badges, 1, "on the pane's row alone: {names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent"))
+        );
+
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("build".into()));
+        let (badges, names) = unread_badges(&state);
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent")),
+            "the search leaves the unread pane out: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.starts_with("Open pane Build")),
+            "the chip has a drawn row under it: {names:?}"
+        );
+        assert_eq!(badges, 1, "the chip carries the news: {names:?}");
     }
 
     #[test]
