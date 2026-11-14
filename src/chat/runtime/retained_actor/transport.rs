@@ -5920,17 +5920,22 @@ exec /bin/sleep 60
             let request: Invocation = receive(&control, TIMEOUT).unwrap();
             assert_eq!(request.method, "resolve_source");
             assert_eq!(request.epoch, Some(epoch));
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // Stall until the client has returned: a client that ignored its
+            // deadline would never return.
+            let _ = wait.recv();
         });
         let started = Instant::now();
-        let error = actor
-            .resolve_source_until(&source, started + Duration::from_millis(40))
-            .unwrap_err();
-        let elapsed = started.elapsed();
+        let (actor, error) = crate::test_timing::returns("source resolution", move || {
+            let error = actor
+                .resolve_source_until(&source, Instant::now() + Duration::from_millis(40))
+                .unwrap_err();
+            (actor, error)
+        });
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
-        assert!(elapsed < Duration::from_millis(250));
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(actor.0.epoch, epoch);
         assert!(actor.pending_inputs().is_empty());
     }
@@ -6045,25 +6050,27 @@ exec /bin/sleep 60
             assert_eq!(request.method, "inspect");
             assert!(request.epoch.is_none());
             // SO_PEERCRED has identified this exact Record.holder process, but
-            // its inspection response stalls. The client must still return.
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // its inspection response stalls until the client has returned.
+            let _ = wait.recv();
         });
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
+        let proof = fixture.server.proof.clone();
         let started = Instant::now();
-        let error = RemoteActor::inspect_at_until(
-            &record,
-            fixture.server.proof.clone(),
-            &socket,
-            started + Duration::from_millis(40),
-        )
-        .err()
-        .expect("stalled inspection must time out");
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("the stalled inspection", move || {
+            RemoteActor::inspect_at_until(
+                &record,
+                proof,
+                &socket,
+                Instant::now() + Duration::from_millis(40),
+            )
+            .err()
+            .expect("stalled inspection must time out")
+        });
         let _ = release.send(());
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());
@@ -6847,14 +6854,10 @@ exec /bin/sleep 60
             retransmit(&actor).is_none(),
             "an older helper is not asked again"
         );
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused without waiting"
         );
         // A receipt the helper reports on its own still lifts the fence.
         actor.apply_receipts(&[InputReceipt {
@@ -7014,14 +7017,10 @@ exec /bin/sleep 60
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
         assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused at once"
         );
         // A helper that returns still settles it, which lifts the fence.
         settle_now(&actor);

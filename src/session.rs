@@ -3394,6 +3394,7 @@ mod tests {
             chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
+            workspace_visits: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
@@ -4524,24 +4525,18 @@ mod tests {
             );
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while last_error.lock().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "initial write did not fail");
-            thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_timing::eventually("the initial write failing", || {
+            last_error.lock().unwrap().is_some()
+        });
         blocker.execute_batch("ROLLBACK").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let count: i64 = blocker
-                .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
-                .unwrap();
-            if count == 1 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "snapshot was not retried");
-            thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_timing::eventually("the snapshot being retried", || {
+            blocker
+                .query_row("SELECT COUNT(*) FROM workspaces", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 1
+        });
         let (lock, changed) = &*queue;
         lock.lock().unwrap().shutdown = true;
         changed.notify_one();
@@ -7173,24 +7168,22 @@ mod tests {
                 }),
                 Condvar::new(),
             ));
-            let (health_tx, _health_rx) = async_channel::unbounded();
-            let mut health = HealthPublisher::new(health_tx);
-            let started = Instant::now();
-
-            persistence_loop(
-                store,
-                empty_writes(),
-                queue,
-                Arc::new(Mutex::new(None)),
-                &mut health,
-                PersistenceConfig {
-                    // Long enough that spending it would time the test out.
-                    shutdown_flush_budget: Duration::from_secs(60),
-                    ..fast_persistence_config(2)
-                },
-            );
-
-            assert!(started.elapsed() < Duration::from_secs(5));
+            crate::test_timing::returns("a shutdown with refused writes", move || {
+                let (health_tx, _health_rx) = async_channel::unbounded();
+                let mut health = HealthPublisher::new(health_tx);
+                persistence_loop(
+                    store,
+                    empty_writes(),
+                    queue,
+                    Arc::new(Mutex::new(None)),
+                    &mut health,
+                    PersistenceConfig {
+                        // Far longer than the test waits, so spending it fails.
+                        shutdown_flush_budget: Duration::from_secs(3600),
+                        ..fast_persistence_config(2)
+                    },
+                );
+            });
             assert_eq!(
                 attempts.load(Ordering::Relaxed),
                 1,

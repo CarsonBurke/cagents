@@ -2504,7 +2504,7 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-fn is_timeout_error(error: &ControlError) -> bool {
+pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,
@@ -9208,7 +9208,9 @@ mod tests {
         assert!(
             matches!(error, ControlError::ReplyTimeout { timeout, .. } if timeout <= Duration::from_millis(100))
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
@@ -9367,7 +9369,9 @@ mod tests {
                 3 => assert!(matches!(error, ControlError::ProofMismatch)),
                 _ => assert!(matches!(error, ControlError::ConnectionClosed)),
             }
-            assert!(started.elapsed() < Duration::from_secs(1));
+            // Sooner than the connection's own I/O timeout, which a request that
+            // ignored its deadline would fall back to.
+            assert!(started.elapsed() < IO_TIMEOUT);
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
             drop(client);
@@ -9394,11 +9398,18 @@ mod tests {
                     .is_none()
             );
         });
-        let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let started = Instant::now();
-        let error = client
-            .request_with_deadline(ClientRequest::List, started + Duration::from_millis(6100))
-            .unwrap_err();
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        // The reported budget tells the full deadline apart from a single
+        // read's IO_TIMEOUT; a client that enforced neither never returns.
+        let error = crate::test_timing::returns("a request with a long deadline", move || {
+            let mut client = client;
+            client
+                .request_with_deadline(
+                    ClientRequest::List,
+                    Instant::now() + Duration::from_millis(6100),
+                )
+                .unwrap_err()
+        });
         assert!(
             matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
             "{error}"
@@ -9409,8 +9420,6 @@ mod tests {
                 .contains("the daemon did not answer within 6."),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(8));
-        drop(client);
         server.join().unwrap();
     }
 
@@ -9445,7 +9454,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
     }
 
     #[test]
@@ -9467,7 +9478,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         drop(client_stream);
         server.join().unwrap();
     }
