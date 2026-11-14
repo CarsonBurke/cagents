@@ -191,6 +191,8 @@ impl Observer {
                                         .map_err(|error| error.to_string())?,
                                 ),
                                 Update::Activated(target) => Action::Activated(target),
+                                // Automation requests are offered by the windows.
+                                Update::AutomationProposalsChanged(_) => continue,
                             };
                             sender
                                 .send_blocking(action)

@@ -740,8 +740,7 @@ impl Cagents {
         for (id, owner) in attention {
             self.sidebar_state.reattribute_card_attention(id, owner);
         }
-        self.sidebar_state
-            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        self.refresh_attention_projection();
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {

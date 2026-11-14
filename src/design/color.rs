@@ -246,6 +246,13 @@ pub fn faint_text(theme: &Theme) -> text::Style {
     ink(faint_color(theme))
 }
 
+/// A qualifier beside a label, such as where a row's pane runs: inked like a
+/// muted glyph, so it plainly recedes behind the label it qualifies even when
+/// that label is itself muted. Never a whole row's ink; see [`muted_color`].
+pub fn secondary_text(theme: &Theme) -> text::Style {
+    ink(muted_icon_color(theme))
+}
+
 /// Text that reports a failure the reader is expected to act on.
 pub fn warning_text(theme: &Theme) -> text::Style {
     ink(warning_color(theme))

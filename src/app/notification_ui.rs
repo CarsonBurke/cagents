@@ -14,6 +14,9 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    /// The pending automation requests of this project changed, or of any
+    /// project while the window was not watching.
+    AutomationRequestsChanged(Option<std::path::PathBuf>),
     OpenNotice(NoticeActivation),
     HostBound(HostSessionProof),
     LifecycleResolved {
@@ -345,6 +348,10 @@ fn observe(
     sender
         .send_blocking(Action::Snapshot(snapshot))
         .map_err(|error| error.to_string())?;
+    // Changes made before watching were not pushed to this window.
+    sender
+        .send_blocking(Action::AutomationRequestsChanged(None))
+        .map_err(|error| error.to_string())?;
     while !sender.is_closed() {
         let action = match client
             .next_notification()
@@ -356,6 +363,9 @@ fn observe(
                     .map_err(|error| error.to_string())?,
             ),
             Update::Activated(session) => Action::Activated(session),
+            Update::AutomationProposalsChanged(repository) => {
+                Action::AutomationRequestsChanged(Some(repository))
+            }
         };
         sender
             .send_blocking(action)
@@ -377,6 +387,9 @@ impl Cagents {
                 while !observer.is_closed() {
                     if let Err(error) = observe(&observer, &presence) {
                         tracing::debug!(%error, "notification observation disconnected");
+                        // Unwatched, a change goes untold: each attempt to
+                        // watch again stands in for what it would have said.
+                        let _ = observer.try_send(Action::AutomationRequestsChanged(None));
                     }
                     thread::sleep(crate::daemon_health::retry_delay());
                 }
@@ -816,10 +829,10 @@ impl Cagents {
                 let open = self.open_utility_card(CardKind::Automations);
                 Task::batch([open, self.activate_main_window(None)])
             }
+            Action::AutomationRequestsChanged(repository) => {
+                self.automation_requests_changed(repository.as_deref())
+            }
             Action::Snapshot(snapshot) => {
-                // Agents make automation requests, and a snapshot follows
-                // their turns ending.
-                self.automation_approval_activity();
                 self.notification_ui.snapshot_host = self.notification_ui.host.clone();
                 self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
