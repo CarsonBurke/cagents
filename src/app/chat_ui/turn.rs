@@ -72,8 +72,8 @@ pub(super) struct Turn {
     /// Set while any step in this group is still running, which is what marks
     /// the live group without needing a separate global flag.
     pub(super) running: bool,
-    /// How the group's last resolved step went, so a collapsed strip reports
-    /// the state the work reached.
+    /// A failure anywhere in the group, or its last resolved state otherwise.
+    /// Collapsing the group must not hide a failed step behind later success.
     pub(super) outcome: Option<ToolStatus>,
     /// Earliest first observation in the group, when this stretch of work began.
     started_at: Option<u64>,
@@ -143,20 +143,10 @@ impl Turn {
         Some(end.saturating_sub(start))
     }
 
-    /// Running timers advance at a readable, whole-second cadence. Finished
-    /// durations retain their precision; the cache uses the same cadence so
-    /// unrelated redraws cannot invalidate a turn at millisecond frequency.
+    /// Timers use the same compact seconds/minutes notation as reasoning and
+    /// individual steps. The retained cache shares the running timer cadence.
     pub(super) fn duration_label(&self, now: u64) -> Option<String> {
-        self.working_for(now).map(|millis| {
-            if self.running {
-                match millis / 1_000 {
-                    seconds @ 0..60 => format!("{seconds}s"),
-                    seconds => format!("{}m {}s", seconds / 60, seconds % 60),
-                }
-            } else {
-                super::format_duration(millis)
-            }
-        })
+        self.working_for(now).map(super::disclosure::duration)
     }
 
     /// Fills in the summary once the group's membership is final.
@@ -208,6 +198,7 @@ impl Turn {
             return " · working";
         }
         match self.outcome {
+            Some(ToolStatus::Failed) if self.steps.len() > 1 => " · includes a failed step",
             Some(ToolStatus::Failed) => " · failed",
             Some(ToolStatus::Denied) => " · denied",
             Some(ToolStatus::Stopped) => " · stopped",
@@ -245,12 +236,11 @@ impl Turn {
     fn observe(&mut self, status: Option<ToolStatus>) {
         match status {
             Some(ToolStatus::Running) => self.running = true,
-            // The group's outcome is what its last resolved step reported,
-            // not the worst thing that ever happened inside it. A failure a
-            // retry recovered from is not how the stretch of work ended, and
-            // ranking it highest meant one grep with no matches painted an
-            // error icon on the group for the rest of the session.
-            Some(status) => self.outcome = Some(status),
+            Some(ToolStatus::Failed) => self.outcome = Some(ToolStatus::Failed),
+            Some(status) if self.outcome != Some(ToolStatus::Failed) => {
+                self.outcome = Some(status);
+            }
+            Some(_) => {}
             None => {}
         }
     }
@@ -422,12 +412,11 @@ pub(super) fn same_structure(
 /// A provider that announces a session emits a notice with no body, and the
 /// surface used to draw it as an empty rectangle at the top of every
 /// conversation - two of them, in fact, one captioned and one blank. A text
-/// item with nothing in it is also the transient state of a message that is
-/// about to stream, so it reappears as soon as its first bytes arrive rather
-/// than being dropped for good.
+/// answer with nothing in it is also the transient state of a message that is
+/// about to stream. Empty reasoning still conveys active work or elapsed time.
 fn renders(content: &ItemContent) -> bool {
     match content {
-        ItemContent::Text { text, .. } => !text.trim().is_empty(),
+        ItemContent::Text { text, thinking, .. } => *thinking || !text.trim().is_empty(),
         _ => true,
     }
 }
@@ -760,20 +749,14 @@ pub(super) fn first_line(command: &str) -> &str {
 const SUMMARY_LIMIT: usize = 240;
 
 /// A single step's summary, on one line and bounded for the strip.
-/// Text cut from it, a later line or the end of a long one, is marked with an
-/// ellipsis; the full text stays in the open step.
+/// The fade handles visual overflow; no ellipsis is injected into the text.
+/// Full command text remains available in the open step.
 pub(super) fn headline(summary: String) -> String {
     let line = first_line_of(&summary);
-    let more_lines = line.len() < summary.trim().len();
-    if !more_lines && line.len() == summary.len() && line.chars().count() <= SUMMARY_LIMIT {
+    if line.len() == summary.len() && line.chars().count() <= SUMMARY_LIMIT {
         return summary;
     }
-    let mut chars = line.chars();
-    let mut shown: String = chars.by_ref().take(SUMMARY_LIMIT).collect();
-    if more_lines || chars.next().is_some() {
-        shown.push('…');
-    }
-    shown
+    line.chars().take(SUMMARY_LIMIT).collect()
 }
 
 fn first_line_of(command: &str) -> &str {
@@ -1069,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_outcome_is_how_the_group_ended() {
+    fn a_collapsed_group_keeps_earlier_failures_visible_after_later_success() {
         let items = vec![
             text("u1", Role::User, Phase::Final, false),
             command("c1", ToolStatus::Failed),
@@ -1078,10 +1061,10 @@ mod tests {
         let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].outcome,
-            Some(ToolStatus::Succeeded),
-            "a failure a later step recovered from is not how the work ended"
+            Some(ToolStatus::Failed),
+            "later success must not hide a failed command in a collapsed group"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands");
+        assert_eq!(turns[0].summary, "Ran 2 commands · includes a failed step");
         let items = vec![
             text("u1", Role::User, Phase::Final, false),
             command("c1", ToolStatus::Succeeded),
@@ -1093,7 +1076,7 @@ mod tests {
             Some(ToolStatus::Failed),
             "a group that ended on a failure still reports it"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands · failed");
+        assert_eq!(turns[0].summary, "Ran 2 commands · includes a failed step");
     }
 
     #[test]
@@ -1220,7 +1203,7 @@ mod tests {
         }
         let finished = group(&[tool], &unasked(), plain);
         assert_eq!(finished[0].working_for(90_000), Some(5_050));
-        assert_eq!(finished[0].duration_label(90_000).as_deref(), Some("5.0s"));
+        assert_eq!(finished[0].duration_label(90_000).as_deref(), Some("5s"));
     }
 
     #[test]
@@ -1340,6 +1323,29 @@ mod tests {
             [(2, Slot::Prose)],
             "only the item with a body occupies a slot"
         );
+    }
+
+    #[test]
+    fn empty_reasoning_keeps_its_place_between_step_groups() {
+        for body in ["", "  \n", "[Redacted thinking]"] {
+            let mut thought = text("thought", Role::Assistant, Phase::Commentary, true);
+            if let ItemContent::Text { text, .. } = &mut thought.content {
+                *text = body.into();
+            }
+            let items = vec![
+                command("before", ToolStatus::Succeeded),
+                thought.clone(),
+                command("after", ToolStatus::Running),
+            ];
+            let turns = group(&items, &unasked(), plain);
+            assert_eq!(turns.len(), 2);
+            assert_eq!(steps(&turns[0]), [0]);
+            assert_eq!(slots(&turns[0]), [(1, Slot::Thinking)]);
+            assert_eq!(steps(&turns[1]), [2]);
+            assert!(slots(&turns[1]).is_empty());
+            let active = group(&[thought], &unasked(), plain);
+            assert_eq!(slots(&active[0]), [(0, Slot::Thinking)]);
+        }
     }
 
     /// The view renders prompt, tools, prose for each group. Every streaming
@@ -1653,13 +1659,10 @@ mod tests {
         let summary = &group(&items, &unasked(), plain)[0].summary;
         assert!(summary.starts_with("Ran cd /tmp; echo x;"), "{summary}");
         assert!(!summary.contains('\n'), "{summary}");
-        assert_eq!(summary.chars().count(), SUMMARY_LIMIT + 1, "{summary}");
-        assert!(summary.ends_with('…'));
-        // A short first line still says that more follows.
-        assert_eq!(
-            headline("Ran cat <<EOF\nbody\nEOF".into()),
-            "Ran cat <<EOF…"
-        );
+        assert_eq!(summary.chars().count(), SUMMARY_LIMIT, "{summary}");
+        assert!(!summary.ends_with('…'));
+        // Disclosing the row shows later lines without an injected ellipsis.
+        assert_eq!(headline("Ran cat <<EOF\nbody\nEOF".into()), "Ran cat <<EOF");
         assert_eq!(headline("Ran ls".into()), "Ran ls");
     }
 
