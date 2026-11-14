@@ -336,20 +336,21 @@ if [ "$scene" = coordination ]; then
     else
         # Each step is one row, which opens its agent when pressed; its
         # detail - the prompt or message in full, then the tool call -
-        # opens from the row's menu.
+        # opens from the row's menu. OCR may read a fold's toggle as two
+        # overlapping runs ("Show", "w full prompt"), so match its tail.
         row_detail 'Started\b.*Fixture' 'Show details'
-        click_row '^Show full prompt\b'
+        click_row 'full prompt\b'
         find_row 'PROMPT[ _]?END\b|invented' >/dev/null
         shot rows-coordination-prompt-expanded
-        click_row '^Show less\b'
+        click_row 'w less\b'
         find_row '^Input$' >/dev/null
         shot rows-coordination-tool-expanded
         row_detail 'Started\b.*Fixture' 'Hide details'
         row_detail 'Message to\b.*Fixture' 'Show details'
-        click_row '^Show full message\b'
+        click_row 'full message\b'
         find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
         shot rows-coordination-message-expanded
-        click_row '^Show less\b'
+        click_row 'w less\b'
         row_detail 'Message to\b.*Fixture' 'Hide details'
     fi
     scroll_bottom
