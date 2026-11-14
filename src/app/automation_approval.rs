@@ -2,12 +2,17 @@
 //! configuration and answers with its exact immutable request revision.
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
+use crate::control::{ControlClient, ControlError};
 
 #[derive(Default)]
 pub(super) struct State {
     proposal: Option<Proposal>,
     available: Option<Proposal>,
     reading: bool,
+    /// The daemon connection every read of pending requests reuses. A focused
+    /// window reads every two seconds, and a connection apiece had the daemon
+    /// accept, authenticate and serve a new one each time.
+    reader: Arc<std::sync::Mutex<Option<ControlClient>>>,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -41,6 +46,64 @@ pub enum Action {
         generation: u64,
         result: Arc<Result<Proposal, String>>,
     },
+}
+
+/// The pending request for `repository` a window offers for review, if any.
+fn pending_proposal(
+    client: &mut ControlClient,
+    repository: &Path,
+) -> Result<Vec<Proposal>, ControlError> {
+    let unexpected = |actual| ControlError::UnexpectedResponse {
+        expected: "automation approval listing",
+        actual,
+    };
+    let Response::Proposals(proposals) = client.automation(
+        crate::agent_execution::Authority::default(),
+        Request::PendingProposals {
+            repository: repository.to_path_buf(),
+            after: None,
+            limit: 1,
+        },
+    )?
+    else {
+        return Err(unexpected("another automation response"));
+    };
+    let Some(visible) = proposals.first() else {
+        return Ok(Vec::new());
+    };
+    let Response::Proposal(proposal) = client.automation(
+        crate::agent_execution::Authority::default(),
+        Request::Proposal { id: visible.id },
+    )?
+    else {
+        return Err(unexpected("another automation response"));
+    };
+    Ok(vec![*proposal])
+}
+
+/// Runs `read` on the connection `slot` holds, connecting first when it holds
+/// none. A connection the daemon answered on is kept, refusals included; one
+/// that failed is dropped. When a kept connection turns out to have closed,
+/// as when the daemon restarted, one new connection reads at once instead.
+fn with_connection<C, T>(
+    slot: &mut Option<C>,
+    connect: impl FnOnce() -> Result<C, String>,
+    read: impl Fn(&mut C) -> Result<T, ControlError>,
+) -> Result<T, String> {
+    if let Some(client) = slot.as_mut() {
+        match read(client) {
+            Ok(value) => return Ok(value),
+            Err(error @ ControlError::Remote { .. }) => return Err(error.to_string()),
+            Err(_) => *slot = None,
+        }
+    }
+    let client = slot.insert(connect()?);
+    read(client).map_err(|error| {
+        if !matches!(error, ControlError::Remote { .. }) {
+            *slot = None;
+        }
+        error.to_string()
+    })
 }
 
 fn placement_description(proposal: &Proposal) -> String {
@@ -201,38 +264,19 @@ impl Cagents {
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
                 let generation = self.automation_approval.generation;
+                let reader = Arc::clone(&self.automation_approval.reader);
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        let Response::Proposals(proposals) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::PendingProposals {
-                                    repository,
-                                    after: None,
-                                    limit: 1,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?
-                        else {
-                            return Err("Unexpected automation approval listing".into());
-                        };
-                        let Some(visible) = proposals.first() else {
-                            return Ok(Vec::new());
-                        };
-                        let Response::Proposal(proposal) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::Proposal { id: visible.id },
-                            )
-                            .map_err(|error| error.to_string())?
-                        else {
-                            return Err("Unexpected automation proposal".into());
-                        };
-                        Ok(vec![*proposal])
+                        let mut reader = reader.lock().unwrap_or_else(|p| p.into_inner());
+                        with_connection(
+                            &mut reader,
+                            || {
+                                let socket = crate::terminal::ensure_daemon_ready()
+                                    .map_err(|error| error.to_string())?;
+                                ControlClient::connect(&socket).map_err(|error| error.to_string())
+                            },
+                            |client| pending_proposal(client, &repository),
+                        )
                     })
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()));
@@ -636,6 +680,61 @@ mod tests {
             created_ms: 1,
             state: ProposalState::Pending,
         }
+    }
+
+    /// A focused window reads pending requests every two seconds on one
+    /// connection, and reaches a restarted daemon on the read that finds the
+    /// old connection closed.
+    #[test]
+    fn approval_reads_reuse_one_connection_and_replace_one_that_closed() {
+        struct Connection(u32);
+        let refused = || ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+            message: "refused".into(),
+            retryable: false,
+        };
+        let never = || -> Result<Connection, String> { panic!("no new connection") };
+        let mut slot = None;
+        let mut connects = 0;
+        let mut connect = |id| {
+            connects += 1;
+            Ok(Connection(id))
+        };
+        let read = |connection: &mut Connection| Ok::<_, ControlError>(connection.0);
+
+        assert_eq!(with_connection(&mut slot, || connect(1), read), Ok(1));
+        for _ in 0..3 {
+            assert_eq!(with_connection(&mut slot, never, read), Ok(1));
+        }
+        // The daemon answered with a refusal, so its connection still serves.
+        let refusal = with_connection(&mut slot, never, |_: &mut Connection| {
+            Err::<u32, _>(refused())
+        });
+        assert!(refusal.unwrap_err().contains("refused"));
+        assert!(matches!(slot, Some(Connection(1))));
+
+        // The daemon restarted: the kept connection is closed, and a new one
+        // reads in the same turn.
+        let closed_unless_new = |connection: &mut Connection| match connection.0 {
+            1 => Err(ControlError::ConnectionClosed),
+            id => Ok(id),
+        };
+        assert_eq!(
+            with_connection(&mut slot, || connect(2), closed_unless_new),
+            Ok(2)
+        );
+        assert_eq!(with_connection(&mut slot, never, read), Ok(2));
+
+        // A new connection that fails is not tried again until the next read.
+        slot = None;
+        let closed = |_: &mut Connection| Err::<u32, _>(ControlError::ConnectionClosed);
+        assert!(with_connection(&mut slot, || connect(3), closed).is_err());
+        assert!(slot.is_none());
+        assert!(
+            with_connection(&mut slot, || Err::<Connection, _>("no daemon".into()), read).is_err()
+        );
+        assert!(slot.is_none());
+        assert_eq!(connects, 3);
     }
 
     #[test]
