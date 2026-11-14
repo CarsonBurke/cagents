@@ -5878,19 +5878,22 @@ fn header<'a>(
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
         actions.push(crate::interaction::tooltip(
-            centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-                .class(sidebar_button_style(attention))
-                .id(filter_id(SidebarFilter::Attention))
-                .name("Show projects needing attention")
-                .selected(attention)
-                .on_press_maybe(gated(
-                    SidebarAction::SetFilter(if attention {
-                        SidebarFilter::All
-                    } else {
-                        SidebarFilter::Attention
-                    }),
-                    modal_open,
-                )),
+            crate::interaction::pressed(
+                centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                    .class(sidebar_button_style(attention))
+                    .id(filter_id(SidebarFilter::Attention))
+                    .name("Show projects needing attention")
+                    .selected(attention)
+                    .on_press_maybe(gated(
+                        SidebarAction::SetFilter(if attention {
+                            SidebarFilter::All
+                        } else {
+                            SidebarFilter::Attention
+                        }),
+                        modal_open,
+                    )),
+                attention,
+            ),
             if attention {
                 "Show all projects"
             } else {
@@ -5900,12 +5903,15 @@ fn header<'a>(
         actions.push(checkouts_toggle(state, modal_open));
         let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
-            centered_icon_button(Icon::Search, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-                .class(sidebar_button_style(selected))
-                .id(search_toggle_focus_id())
-                .name("Search projects")
-                .selected(selected)
-                .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
+            crate::interaction::pressed(
+                centered_icon_button(Icon::Search, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                    .class(sidebar_button_style(selected))
+                    .id(search_toggle_focus_id())
+                    .name("Search projects")
+                    .selected(selected)
+                    .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
+                selected,
+            ),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.search_filters_active() {
                 "Close and clear search".to_owned()
@@ -5975,26 +5981,44 @@ pub fn checkouts_toggle_focus_id() -> Id {
     stable_id("sidebar.checkouts")
 }
 
+/// The checkouts toggle's accessible name, whatever its state.
+const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
+
 /// Shows or hides every project's checkouts. Like the filters beside it, it
 /// is lit while it narrows the list, so a list without checkouts never
-/// passes for the whole one. Hiding them by default overrides each
-/// project's own mode, which the hidden label says.
+/// passes for the whole one. Its name stays fixed and its pressed state says
+/// whether checkouts are hidden, as the bell's does for its filter; the
+/// tooltip says what a press does. Hiding them by default overrides each
+/// project's own mode, which the hidden tooltip says.
+///
+/// Only the All view lists checkouts: Attention names panes instead and Pull
+/// requests always shows them. The setting persists, so the toggle stays
+/// live elsewhere and its tooltip names the view it changes.
 fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
     let hidden = !state.sidebar_worktrees.shows_checkouts();
-    let label = if hidden {
-        "Show checkouts (hidden in every project)"
-    } else {
-        "Hide checkouts"
-    };
     crate::interaction::tooltip(
-        centered_icon_button(Icon::Branch, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-            .class(sidebar_button_style(hidden))
-            .id(checkouts_toggle_focus_id())
-            .name(label)
-            .selected(hidden)
-            .on_press_maybe(gated(SidebarAction::ToggleCheckouts, modal_open)),
-        label,
+        crate::interaction::pressed(
+            centered_icon_handle_button(worktree_icon(), ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                .class(sidebar_button_style(hidden))
+                .id(checkouts_toggle_focus_id())
+                .name(CHECKOUTS_TOGGLE_NAME)
+                .selected(hidden)
+                .on_press_maybe(gated(SidebarAction::ToggleCheckouts, modal_open)),
+            hidden,
+        ),
+        checkouts_toggle_tooltip(state),
     )
+}
+
+/// What pressing the checkouts toggle does, in the view it changes.
+fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
+    let hidden = !state.sidebar_worktrees.shows_checkouts();
+    match (hidden, state.filter == SidebarFilter::All) {
+        (false, true) => "Hide checkouts",
+        (true, true) => "Show checkouts (hidden in every project)",
+        (false, false) => "Hide checkouts in the All view",
+        (true, false) => "Show checkouts in the All view (hidden in every project)",
+    }
 }
 
 /// The search toggle is lit whenever the controls narrow the list, not only
@@ -9189,13 +9213,13 @@ fn context_controls_with_display<'a>(
                 if !global.shows_checkouts() {
                     entries.push(Item::Button(
                         "Show checkouts in every project".into(),
-                        Some(Icon::Branch.handle()),
+                        Some(worktree_icon()),
                         ContextCommand::ShowCheckouts(project_id, global),
                     ));
                 } else if override_mode.is_some_and(|mode| !mode.shows_checkouts()) {
                     entries.push(Item::Button(
                         "Show checkouts".into(),
-                        Some(Icon::Branch.handle()),
+                        Some(worktree_icon()),
                         ContextCommand::ShowCheckouts(project_id, global),
                     ));
                 }
@@ -12262,8 +12286,16 @@ fn centered_icon_button<'a>(
     width: f32,
     height: f32,
 ) -> button::Button<'a, SidebarAction> {
+    centered_icon_handle_button(icon_name.handle(), width, height)
+}
+
+fn centered_icon_handle_button<'a>(
+    icon: widget::icon::Handle,
+    width: f32,
+    height: f32,
+) -> button::Button<'a, SidebarAction> {
     button::custom(
-        widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+        widget::container(widget::icon(icon).size(ROW_ICON_SIZE))
             .class(design::transparent())
             .center(Length::Fill),
     )
@@ -16712,41 +16744,66 @@ pub(crate) mod tests {
 
     #[test]
     fn the_checkouts_toggle_says_what_it_does_in_every_project() {
+        use iced_accessibility::accesskit::Toggled;
         let renderer = headless_renderer();
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
         let mut state = SidebarState::default();
         for compact in [false, true] {
-            for (mode, label) in [
-                (crate::settings::SidebarWorktrees::Grouped, "Hide checkouts"),
+            for (mode, pressed, tooltip) in [
+                (
+                    crate::settings::SidebarWorktrees::Grouped,
+                    Toggled::False,
+                    "Hide checkouts",
+                ),
                 (
                     crate::settings::SidebarWorktrees::Expanded,
+                    Toggled::False,
                     "Hide checkouts",
                 ),
                 (
                     crate::settings::SidebarWorktrees::Hidden,
+                    Toggled::True,
                     "Show checkouts (hidden in every project)",
                 ),
             ] {
                 state.set_sidebar_worktrees(mode);
-                let names = accessible_names(
+                assert_eq!(checkouts_toggle_tooltip(&state), tooltip);
+                let mut element = header(&model, &state, compact, false, false, &shortcuts);
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
                     &renderer,
-                    header(&model, &state, compact, false, false, &shortcuts),
+                    &layout::Limits::new(Size::ZERO, Size::new(1280.0, 4_000.0)),
                 );
-                let bell = names
+                let nodes = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    cosmic::iced::advanced::mouse::Cursor::Unavailable,
+                );
+                let buttons: Vec<_> = nodes
+                    .root()
                     .iter()
-                    .position(|name| name == "Show projects needing attention")
+                    .chain(nodes.children())
+                    .map(|node| node.node())
+                    .filter(|node| node.label().is_some())
+                    .collect();
+                let bell = buttons
+                    .iter()
+                    .position(|node| node.label() == Some("Show projects needing attention"))
                     .expect("the bell");
+                assert_eq!(buttons[bell].toggled(), Some(Toggled::False));
+                let toggle = buttons.get(bell + 1).expect("beside the bell");
                 assert_eq!(
-                    names.get(bell + 1).map(String::as_str),
-                    Some(label),
-                    "{mode:?}, compact {compact}: beside the bell: {names:?}"
+                    (toggle.label(), toggle.toggled()),
+                    (Some(CHECKOUTS_TOGGLE_NAME), Some(pressed)),
+                    "{mode:?}, compact {compact}: the name stays and the pressed state says it"
                 );
                 assert!(
-                    !names
-                        .iter()
-                        .any(|name| name.to_lowercase().contains("main")),
-                    "{names:?}"
+                    !buttons.iter().any(|node| node
+                        .label()
+                        .is_some_and(|name| name.to_lowercase().contains("main"))),
+                    "{mode:?}, compact {compact}"
                 );
                 let focusable = published(&mut header(
                     &model, &state, compact, false, false, &shortcuts,
@@ -16761,6 +16818,29 @@ pub(crate) mod tests {
                     Some(&filter_id(SidebarFilter::Attention)),
                     "it follows the bell"
                 );
+            }
+        }
+    }
+
+    /// Only the All view lists checkouts. The setting persists, so the
+    /// toggle stays live in the other views and says which view it changes.
+    #[test]
+    fn the_checkouts_toggle_names_the_all_view_from_the_others() {
+        let mut state = SidebarState::default();
+        for filter in [SidebarFilter::Attention, SidebarFilter::PullRequests] {
+            state.filter = filter;
+            for (mode, tooltip) in [
+                (
+                    crate::settings::SidebarWorktrees::Grouped,
+                    "Hide checkouts in the All view",
+                ),
+                (
+                    crate::settings::SidebarWorktrees::Hidden,
+                    "Show checkouts in the All view (hidden in every project)",
+                ),
+            ] {
+                state.set_sidebar_worktrees(mode);
+                assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{filter:?}");
             }
         }
     }

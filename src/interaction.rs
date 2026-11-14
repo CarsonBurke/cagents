@@ -784,6 +784,23 @@ fn space_as_enter(event: &Event) -> Option<Event> {
     }))
 }
 
+/// Tells assistive technology whether a toggle button is pressed. The
+/// pinned COSMIC button draws `selected` but does not announce it, so a
+/// toggle with a fixed name, such as a filter or show/hide control, would
+/// otherwise read the same in both states.
+pub fn pressed<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    pressed: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Pressed(pressed),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
 /// Blocks click-through without hiding the child's accessibility tree.
 pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Effect {
@@ -2014,6 +2031,7 @@ enum Kind {
         leading: bool,
     },
     Opaque,
+    Pressed(bool),
     KeyboardModal,
     UnclaimedKey,
     FocusScope,
@@ -2121,6 +2139,7 @@ struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
+struct PressedTag;
 struct KeyboardModalTag;
 struct FocusScopeTag;
 struct ContextMenuTag;
@@ -2216,6 +2235,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
+            Kind::Pressed(_) => tree::Tag::of::<PressedTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
             Kind::FocusScope => tree::Tag::of::<FocusScopeTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
@@ -2898,11 +2918,29 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content.as_widget().a11y_nodes(
+        let mut accessible = self.content.as_widget().a11y_nodes(
             effect_layout(self.kind, layout),
             &tree.children[0],
             cursor,
-        )
+        );
+        if let Kind::Pressed(pressed) = self.kind {
+            use iced_accessibility::accesskit::{Role, Toggled};
+            let is_button =
+                |node: &iced_accessibility::A11yNode| node.node().role() == Role::Button;
+            let nodes = if accessible.root().iter().any(is_button) {
+                accessible.root_mut()
+            } else {
+                accessible.children_mut()
+            };
+            if let Some(button) = nodes.iter_mut().find(|node| is_button(node)) {
+                button.node_mut().set_toggled(if pressed {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                });
+            }
+        }
+        accessible
     }
     fn drag_destinations(
         &self,
