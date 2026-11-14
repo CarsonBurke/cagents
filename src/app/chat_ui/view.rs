@@ -1431,19 +1431,27 @@ impl Runtime {
         let mut chars = raw.chars();
         let text: String = chars.by_ref().take(limit).collect();
         if chars.next().is_some() {
-            format!("{text}…")
+            format!("{}…", text.trim_end())
         } else {
             text
         }
     }
-    /// The agent's own name: Codex's nickname, the name Claude was asked to
-    /// give an agent, else its type, or OMP's agent name. The description is
-    /// the task it was given, which says what it does rather than who it is,
-    /// so it never stands in for the name.
+
+    /// What the agent goes by: the name its provider reports for it, else
+    /// the first line of the task it was given, which tells apart agents of
+    /// one type better than the type does. Claude and OMP report a name, then
+    /// a short description, then the type; Codex reports only a nickname.
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
         Some(agent.kind.trim())
             .filter(|name| !name.is_empty())
+            .or_else(|| Self::native_child_task(agent))
             .unwrap_or("Subagent")
+    }
+
+    /// Whether `agent` goes by the task it was given, which its tab and
+    /// heading then already say.
+    pub(super) fn named_by_task(agent: &chat::Subagent) -> bool {
+        Self::native_child_task(agent) == Some(Self::native_child_name(agent))
     }
 
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
@@ -1497,7 +1505,7 @@ impl Runtime {
                 None => identity.push_str(&Self::short_description(detail, 120)),
             }
         }
-        if let Some(task) = Self::native_child_task(agent) {
+        if let Some(task) = Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
             identity.push_str(" · Task: ");
             identity.push_str(&Self::short_description(task, 120));
         }
@@ -2124,7 +2132,12 @@ impl Runtime {
                 builder.markdown(&item.id, &[0], cached.markdown.items());
             }
         }
-        if let Some(coordinated) = &cached.coordination {
+        // What a coordinating step said and collected is drawn only in its
+        // open detail.
+        if let Some(coordinated) = &cached.coordination
+            && detail
+            && self.item_expanded(&item.id)
+        {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
@@ -2250,12 +2263,13 @@ impl Runtime {
                 Provider::Claude => "Claude",
                 Provider::Omp => "OMP",
             };
+            // A model the provider never reported is left out rather than
+            // announced; the tooltip says so for whoever asks.
             let model = agent
                 .model
                 .as_deref()
                 .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .unwrap_or("Model not reported");
+                .filter(|model| !model.is_empty());
             let mut heading = vec![
                 widget::row::with_children(vec![
                     chat_title(self.child_label(agent, 80))
@@ -2270,8 +2284,11 @@ impl Runtime {
                 .into(),
             ];
             // The name titles the transcript; the task it was given sits
-            // beneath it, quieter, so the reader knows what it is for.
-            if let Some(task) = Self::native_child_task(agent) {
+            // beneath it, quieter, so the reader knows what it is for, unless
+            // the agent already goes by that task.
+            if let Some(task) =
+                Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent))
+            {
                 heading.push(
                     design::caption(Self::short_description(task, 80))
                         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -2280,10 +2297,13 @@ impl Runtime {
             }
             heading.push(
                 crate::interaction::tooltip(
-                    design::caption(format!(
-                        "Native subagent · {provider} · {}",
-                        Self::short_description(model, 80)
-                    )),
+                    design::caption(match model {
+                        Some(model) => format!(
+                            "{provider} subagent · {}",
+                            Self::short_description(model, 80)
+                        ),
+                        None => format!("{provider} subagent"),
+                    }),
                     self.native_child_identity(agent),
                 )
                 .into(),
@@ -2363,10 +2383,6 @@ impl Runtime {
                 };
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
-                    || cached
-                        .coordination
-                        .as_deref()
-                        .is_some_and(Coordinated::is_card)
                 {
                     MESSAGE_ACTION_FOOTER
                 } else {
@@ -2409,13 +2425,7 @@ impl Runtime {
                                     let raw = self
                                         .item_expanded(&item.id)
                                         .then(|| self.step_detail(item, cached, markdown_settings));
-                                    self.coordination_card(
-                                        item,
-                                        cached,
-                                        coordinated,
-                                        markdown_settings,
-                                        raw,
-                                    )
+                                    self.coordination_card(item, coordinated, raw)
                                 } else {
                                     match &item.content {
                                         ItemContent::Text { .. } => self.prose_view(
@@ -2668,14 +2678,24 @@ impl Runtime {
         // shares. The symmetric inset already exceeds the scrollbar rail.
         // Reserving the rail a second time would make transcript rows
         // narrower than the composer in a pane no wider than the column.
+        // The viewport runs right up to whatever is pinned above and below
+        // it, the composer included, so a line scrolling past either edge
+        // meets that surface rather than a strip of pane laid over it. The
+        // gap the pane keeps between its blocks moves inside the viewport
+        // instead: it is the room the first and last rows rest at, and
+        // scrolled content passes through it.
+        let transcript_index = content.len();
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
+                .padding(
+                    iced::Padding::new(step::GAP_M)
+                        .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
+                        .bottom(step::GAP_M + step::GAP_S),
+                )
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
         )
         .center_x(Length::Fill);
-        let transcript_index = content.len();
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
             crate::ui_memory::gate(selection::transcript_virtualized(
@@ -2866,7 +2886,7 @@ impl Runtime {
         // typing would cost more than the question being missable.
         if !snapshot.requests.is_empty() {
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(
                         widget::column::with_children(
                             snapshot
@@ -2898,7 +2918,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Shrink),
-                )
+                    design::base,
+                ))
                 .max_height(REQUEST_CEILING)
                 .into(),
             );
@@ -2952,7 +2973,7 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>();
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(widget::column::with_children(rows).padding(
                         design::with_vertical_rail(iced::Padding::new(COMPLETION_INSET)),
                     ))
@@ -2967,7 +2988,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Fixed(viewport)),
-                )
+                    design::raised,
+                ))
                 .class(design::surface(
                     Some(design::raised),
                     [design::RADIUS_M; 4],
@@ -3047,6 +3069,7 @@ impl Runtime {
         // finds named siblings but does not move their trees to new indices.
         // Only the transcript layer spans the pane; everything around it
         // keeps the reading column.
+        let transcript_last = content.len() == transcript_index + 1;
         let mut content = vec![
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == transcript_index {
@@ -3055,15 +3078,18 @@ impl Runtime {
                     widget::container(child)
                         .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
                             step::GAP_M
-                        } else {
+                        } else if index == transcript_index + 1 {
+                            // Against the transcript's edge: its own
+                            // padding keeps the rows clear of this.
                             0.0
+                        } else {
+                            space::S
                         }))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(space::S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .into(),
@@ -3581,18 +3607,25 @@ impl Runtime {
             action(Action::PermissionPicker(target, false)),
         );
         let pane = widget::container(super::layout::pane(
+            // The first block holds the transcript, which runs on down to
+            // the next block when it ends that one: see `transcript` above.
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == 0 {
                     child
                 } else {
                     widget::container(child)
-                        .padding([0.0, step::GAP_M])
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(
+                            if index == 1 && transcript_last {
+                                0.0
+                            } else {
+                                step::GAP_S
+                            },
+                        ))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(step::GAP_S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill)
@@ -3946,11 +3979,15 @@ impl Runtime {
             })
             .collect();
         let empty = rows.is_empty();
-        let list = widget::scrollable(
-            widget::column::with_children(rows)
-                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-        )
-        .height(Length::Shrink);
+        // The rows scroll beneath the search field inside the popover.
+        let list = crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+            )
+            .height(Length::Shrink),
+            design::component_base,
+        );
         let mut content: Vec<Element<'_, Message>> = Vec::new();
         if self.composer_menu_searchable() {
             content.push(
@@ -4599,7 +4636,7 @@ impl Runtime {
                     let raw = self
                         .item_expanded(&item.id)
                         .then(|| self.step_detail(item, cached, settings));
-                    self.coordination_card(item, cached, coordinated, settings, raw)
+                    self.coordination_card(item, coordinated, raw)
                 },
                 settings,
             )
@@ -4777,6 +4814,8 @@ impl Runtime {
         hasher.finish()
     }
 
+    /// The room a prose row leaves under it for its hover actions. A
+    /// coordination row carries its actions in its context menu instead.
     fn prose_action_footer(&self, item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
         if slot == turn::Slot::Thinking
             && !(self.item_expanded(&item.id)
@@ -4787,9 +4826,7 @@ impl Runtime {
         {
             return 0.0;
         }
-        if matches!(item.content, ItemContent::Text { .. })
-            || (slot == turn::Slot::Card && cached.coordination.is_some())
-        {
+        if matches!(item.content, ItemContent::Text { .. }) {
             MESSAGE_ACTION_FOOTER
         } else {
             0.0
@@ -4897,6 +4934,9 @@ impl Runtime {
             }
             rows.push(strip);
         }
+        // A run of coordination rows reads as one list, as the step strip's
+        // rows do, rather than as blocks set apart from one another.
+        let mut after_card = false;
         for prose in &turn.prose {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
@@ -4907,12 +4947,16 @@ impl Runtime {
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
-                rows.message(
+                let gap = if after_card { step::GAP_XS } else { rows.gap };
+                rows.push_with_gap(
                     scroll::item(&item.id, card(item, cached, coordinated)),
-                    self.prose_action_footer(item, cached, prose.slot),
+                    gap,
+                    0.0,
                 );
+                after_card = true;
                 continue;
             }
+            after_card = false;
             rows.message(
                 scroll::item(
                     &item.id,
@@ -5158,25 +5202,31 @@ impl Runtime {
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
-                    widget::container(
+                    // The list runs to the panel's foot, its inset scrolling
+                    // with it, so a row passing the foot fades into the
+                    // panel rather than stopping short of it.
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::column::with_children(rows)
                                 .spacing(step::GAP_XS)
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                                .padding(design::with_vertical_rail(
+                                    iced::Padding::ZERO.bottom(step::GAP_S),
+                                )),
                         )
                         .id(card_control_id(self.target.card, "chat-queue"))
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
-                    .max_height(QUEUE_CEILING)
+                        design::sunken,
+                    ))
+                    .max_height(QUEUE_CEILING + step::GAP_S)
                     .into(),
                 ])
                 .spacing(step::GAP_XS),
             )
             .width(Length::Fill)
-            .padding(step::GAP_S)
+            .padding(iced::Padding::new(step::GAP_S).bottom(0.0))
             .class(design::surface(
                 Some(design::sunken),
                 [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
@@ -6486,7 +6536,9 @@ fn model_list<'a>(
         // The popover owns dismissal. Unfocusing on mouse-down inside a
         // model row must not remove that row before its mouse-up selects it.
         .into(),
-        widget::container(
+        // The popover's own frame inset stays; a model passing it fades into
+        // the popover rather than being cut at the inset.
+        widget::container(crate::interaction::overflow_fade_y(
             widget::scrollable(
                 widget::column::with_children(rows)
                     .padding(design::with_vertical_rail(iced::Padding::ZERO)),
@@ -6495,7 +6547,8 @@ fn model_list<'a>(
                 design::scrollbar(),
             ))
             .height(Length::Shrink),
-        )
+            design::component_base,
+        ))
         .max_height(design::MODEL_POPUP_CEILING)
         .into(),
     ])
@@ -12469,6 +12522,16 @@ mod tests {
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
+                // Nothing of the pane lies between the transcript and the
+                // composer: a row scrolling down meets the composer's own
+                // edge, never a strip of pane drawn over it.
+                if state != 2 && state != 4 {
+                    assert_eq!(
+                        viewport.y + viewport.height,
+                        editor.y,
+                        "the transcript runs on to the composer in state {state} at {width}"
+                    );
+                }
             }
         }
     }

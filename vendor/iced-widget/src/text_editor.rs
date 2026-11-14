@@ -568,7 +568,7 @@ impl Focus {
 
     fn is_cursor_visible(&self) -> bool {
         self.is_window_focused
-            && text::Blink::DEFAULT.visible(self.now - self.updated_at)
+            && text::Blink::current().visible(self.now - self.updated_at)
     }
 }
 
@@ -789,7 +789,7 @@ where
                 {
                     focus.now = *now;
 
-                    if let Some(next) = text::Blink::DEFAULT
+                    if let Some(next) = text::Blink::current()
                         .next_frame(focus.now - focus.updated_at)
                     {
                         shell.request_redraw_at(focus.now + next);

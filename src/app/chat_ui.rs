@@ -7774,14 +7774,15 @@ impl Cagents {
                 .into(),
         );
         Some(
-            widget::container(
+            widget::container(crate::interaction::overflow_fade_y(
                 widget::scrollable(
                     widget::column::with_children(content)
                         .spacing(6)
                         .padding(space::S),
                 )
                 .height(Length::Shrink),
-            )
+                design::base,
+            ))
             .max_height(180)
             .into(),
         )
@@ -9012,8 +9013,12 @@ impl Cagents {
         }
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
+        let offer = self.snapshot_offer(snapshot, true);
         if let Some(writer) = self.session.as_ref() {
-            writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
+            let accepted = writer
+                .offer_chat_identity(card, pending.candidate.id, current, offer)
+                .is_ok();
+            self.snapshot_offer_answered(accepted);
         }
     }
     /// Forgets a chat runtime whose card is going away for good.
@@ -10111,12 +10116,20 @@ impl Cagents {
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
-        let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
         // Send never re-arms unrelated quarantined workspace writes.
-        writer.replace_chat_identity(target.card, source.id, candidate, snapshot);
-        let receipt = writer.request_flush();
+        let offer = self.snapshot_offer(snapshot, true);
+        let writer = self.session.as_ref().expect("writer was checked above");
+        let accepted = writer
+            .offer_chat_identity(target.card, source.id, candidate, offer)
+            .is_ok();
+        self.snapshot_offer_answered(accepted);
+        let receipt = self
+            .session
+            .as_ref()
+            .expect("writer was checked above")
+            .request_flush();
         cosmic::task::future(async move {
             let result = match receipt {
                 Ok(receipt) => tokio::task::spawn_blocking(move || {
@@ -11420,6 +11433,14 @@ impl Cagents {
                     // start is still checked against the inventory, because a
                     // lost reply is not proof the daemon started nothing.
                     return self.retire_chat(target.card, result.ok(), Some(session));
+                }
+                // Drain replica-only debt while the current start phase still
+                // supplies the snapshot's admission projection. Recovery below
+                // can commit identity authority without a complete snapshot.
+                if matches!(self.chat_ui.phases.get(&target.card),
+                    Some(Phase::Starting(attempt)) if attempt.target == target)
+                {
+                    self.materialize_replica_snapshot();
                 }
                 let Some(Phase::Starting(mut attempt)) = self
                     .chat_ui
@@ -18784,7 +18805,7 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("Keep this message"));
         Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
             id: "toolu_dev_server".into(),
-            kind: "general-purpose".into(),
+            kind: "Run the dev server".into(),
             description: "Run the dev server".into(),
             status: chat::ToolStatus::Waiting,
             model: None,
@@ -18921,11 +18942,14 @@ mod tests {
             }
             drop(app.handle_chat_ui(Action::FindNext(target, true)));
             last_item = item;
-            last_part = format!("{coordinated}#body");
+            last_part = coordinated;
         }
         let runtime = chat_runtime(&app, card);
-        let choices =
-            runtime.child_expanded["same-child"].len() + runtime.child_unfolded["same-child"].len();
+        let choices = runtime.child_expanded["same-child"].len()
+            + runtime
+                .child_unfolded
+                .get("same-child")
+                .map_or(0, HashSet::len);
         assert!(
             choices <= 4098,
             "the existing choice budget prunes retired windows"
@@ -18935,20 +18959,17 @@ mod tests {
             "Find ownership must follow the pruned child choice budget"
         );
         assert!(runtime.child_expanded["same-child"].contains(&last_item));
-        assert!(runtime.child_unfolded["same-child"].contains(&last_part));
+        // A step drawn as one row opens its tool call for the match.
+        assert!(runtime.child_expanded["same-child"].contains(&last_part));
         drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
         drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
-        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
-        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime.child_expanded["same-child"],
-            HashSet::from([last_item])
-        );
-        assert_eq!(
-            runtime.child_unfolded["same-child"],
-            HashSet::from([last_part])
+            HashSet::from([last_item, last_part])
         );
         assert!(runtime.child_find_disclosure.is_empty());
         assert!(!runtime.expanded.contains("same#opaque-id"));
@@ -19029,7 +19050,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_child_find_restores_coordination_parts_only_in_their_original_scope() {
+    fn selected_child_find_restores_coordination_disclosures_only_in_their_original_scope() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
         let card_item = |scope: &str| {
@@ -19050,7 +19071,7 @@ mod tests {
             presentation_child("two", card_item("two")),
         ];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
-        let part = "same#opaque-id#body";
+        let part = "same#opaque-id";
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(find_navigation::find_for_test(
@@ -19058,20 +19079,20 @@ mod tests {
             target,
             "one-only".into(),
         ));
-        assert!(chat_runtime(&app, card).child_unfolded["one"].contains(part));
-        assert!(!chat_runtime(&app, card).unfolded.contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["one"].contains(part));
+        assert!(!chat_runtime(&app, card).expanded.contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        assert!(!chat_runtime(&app, card).child_unfolded["one"].contains(part));
+        assert!(!chat_runtime(&app, card).child_expanded["one"].contains(part));
         drop(find_navigation::find_for_test(
             &mut app,
             target,
             "two-only".into(),
         ));
-        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
-        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, part.into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, part.into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
-        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["two"].contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(find_navigation::find_for_test(
@@ -19079,10 +19100,10 @@ mod tests {
             target,
             "parent-only".into(),
         ));
-        assert!(chat_runtime(&app, card).unfolded.contains(part));
+        assert!(chat_runtime(&app, card).expanded.contains(part));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
-        assert!(!chat_runtime(&app, card).unfolded.contains(part));
-        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+        assert!(!chat_runtime(&app, card).expanded.contains(part));
+        assert!(chat_runtime(&app, card).child_expanded["two"].contains(part));
     }
 
     #[test]
@@ -19335,16 +19356,6 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        assert!(
-            chat_runtime(&app, card).cache[&item.id]
-                .coordination
-                .as_ref()
-                .unwrap()
-                .parts()
-                .iter()
-                .any(|(part, body)| part == "body" && body.lines().count() > 12),
-            "the real coordination card exposes a foldable body",
-        );
         drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
         drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
         for child in ["long-running-child", "other-child"] {
@@ -22677,6 +22688,141 @@ mod tests {
         );
         assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
         assert!(app.chat_ui.channel_names[&target].pending);
+    }
+
+    #[test]
+    fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::repository::RepositoryId;
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit, ModelProject,
+            delta::{EditEffects, ViewChanges, ViewRevision},
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "repo".into(),
+                repository.clone(),
+                vec![],
+                vec![],
+            ));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: crate::model::ProjectKind::Git,
+            ordinal: 0,
+        }];
+        app.workspace_model.channels = vec![ModelChannel {
+            id: channel,
+            repository,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let scope = Scope::Channel(channel);
+        let before = View {
+            scope: scope.clone(),
+            revision: 17,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        };
+        app.workspace_model.views = vec![before.clone()];
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        app.shared_views
+            .initialize(scope.clone(), vec![pane.clone()]);
+        app.shared_views.attached.insert(card);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Current provider title".into());
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                session: Some(KNOWN_THREAD.into()),
+                title: Some((
+                    "Current provider title".into(),
+                    ChannelTitleSource::Provider,
+                )),
+                last_view: Some((channel, 17)),
+                pending: true,
+                ..Default::default()
+            },
+        );
+        let mut accepted = before.clone();
+        accepted.revision = 21;
+        accepted.panes[0].width_fraction = 0.68;
+        assert_eq!(
+            app.presentation_projection_ready(&before, &accepted, None),
+            Ok(())
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let update = ModelUpdate::Changed {
+            sequence: 18,
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 17,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Update {
+                    before: pane,
+                    pane: accepted.panes[0].clone(),
+                },
+            },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: 21,
+                    views: vec![accepted],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope,
+                        before: Some(17),
+                        after: Some(18),
+                    }],
+                    ..Default::default()
+                },
+            },
+        };
+        let (_, projection) = app.apply_workspace_model_update_projection(update);
+        assert!(matches!(projection, super::super::Projection::Chrome));
+        assert_eq!(app.durable.channels[0].title, "Current provider title");
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::SuggestConversationTitle { id, card: candidate, expected_revision: 21, title, .. }
+                if id == channel && candidate == card && title == "Current provider title")));
+        assert_eq!(
+            app.chat_ui.channel_names[&target].last_view,
+            Some((channel, 21))
+        );
     }
 
     #[test]
@@ -29635,7 +29781,7 @@ mod tests {
     }
 
     #[test]
-    fn retheme_preserves_completed_hidden_and_coordinated_continuation_release() {
+    fn retheme_preserves_completed_and_hidden_continuation_release() {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let next = crate::settings::EditorSyntaxTheme::Ocean;
         let body = "```rust\nlet value = 1;\n```";
