@@ -4153,7 +4153,10 @@ impl Runtime {
                     .map(|(index, choice)| {
                         let mut row: Vec<Element<'a, Message>> = Vec::new();
                         match choice.usage_fraction {
-                            Some(fraction) => row.push(crate::ui_controls::budget_radial(fraction)),
+                            Some(fraction) => row.push(crate::ui_controls::budget_radial_toned(
+                                fraction,
+                                choice.tone.color().map(design::Tone::Themed),
+                            )),
                             None => row.push(
                                 iced::widget::Space::new()
                                     .width(design::RADIAL_GAUGE_SIZE)
@@ -4169,7 +4172,11 @@ impl Runtime {
                                 .into(),
                         ];
                         if !choice.detail.is_empty() {
-                            text.push(design::caption(choice.detail).into());
+                            text.push(
+                                design::caption(choice.detail)
+                                    .class(choice.tone.text_class())
+                                    .into(),
+                            );
                         }
                         row.push(
                             widget::column::with_children(text)
