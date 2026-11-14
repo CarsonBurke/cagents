@@ -106,7 +106,11 @@ JOBS = (
 )
 
 # Suites CI runs in its source job, which needs the comparison base and rustfmt.
-SOURCE_JOB_FIXTURES = ("tests/protocol_contract.py", "tests/check_older_clients.py")
+SOURCE_JOB_FIXTURES = (
+    "tests/protocol_contract.py",
+    "tests/check_older_clients.py",
+    "tests/check_update_sources.py",
+)
 
 # Python suites deliberately outside the script contracts, so that a new suite
 # is scheduled or excluded on purpose rather than silently never running.
