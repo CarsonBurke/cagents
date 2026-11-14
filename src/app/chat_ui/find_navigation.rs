@@ -825,7 +825,14 @@ fn raw_groups(runtime: &Runtime) -> Vec<(String, Vec<(usize, bool)>)> {
                     .chain(
                         turn.prose
                             .iter()
-                            .map(|placed| (placed.index, placed.slot == turn::Slot::Thinking)),
+                            // A coordination step's row opens onto its tool
+                            // call, as a thought opens onto its reasoning.
+                            .map(|placed| {
+                                (
+                                    placed.index,
+                                    matches!(placed.slot, turn::Slot::Thinking | turn::Slot::Card),
+                                )
+                            }),
                     )
                     .collect(),
             )
@@ -1199,6 +1206,9 @@ fn raw_scan_inner(
             }
             charge(item.id.len().checked_add(128)?)?;
             let mut parts = Vec::new();
+            // What a coordinating step said and collected is drawn, folded,
+            // in its open detail; a match there opens the detail and unfolds
+            // the part it is in.
             if let Some(reading) = &coordinated {
                 use chat::coordination::Kind;
                 let mut texts = Vec::new();
@@ -1249,14 +1259,13 @@ fn raw_scan_inner(
                     ));
                 }
             }
-            let raw_disclosure = !matches!(&item.content, ItemContent::Delivery { .. })
-                && coordinated.as_ref().map_or(raw.raw_disclosure, |reading| {
-                    if reading.is_card() {
-                        parts.is_empty()
-                    } else {
-                        raw.raw_disclosure
-                    }
-                });
+            let raw_disclosure =
+                !matches!(&item.content, ItemContent::Delivery { .. }) && raw.raw_disclosure;
+            // A one-row step draws its parts only in its open detail.
+            let row_parts = coordinated
+                .as_ref()
+                .is_some_and(chat::coordination::Coordination::is_card)
+                && !parts.is_empty();
             let delivery = match &item.content {
                 ItemContent::Delivery {
                     kind: chat::DeliveryKind::Report,
@@ -1283,7 +1292,7 @@ fn raw_scan_inner(
                 plans.push(ItemPlan {
                     id: item.id.clone(),
                     source: Arc::downgrade(item),
-                    expand: (raw_disclosure && matched) || delivery,
+                    expand: (raw_disclosure && matched) || delivery || row_parts,
                     parts,
                 });
             }
@@ -2556,53 +2565,54 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
     #[test]
-    fn raw_plan_discovers_unquoted_parts_and_exact_prepared_readers_in_order() {
-        let query = "say \"NEEDLE λ\"";
+    fn a_one_row_step_opens_on_a_match_in_what_it_said_or_its_tool_call() {
+        let prompt = "say \"NEEDLE λ\"";
         let item = Arc::new(chat::Item {
             id: "agent".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Tool {
                 name: "Agent".into(),
-                input: serde_json::json!({"prompt":query,"run_in_background":true}).to_string(),
+                input: serde_json::json!({"prompt":prompt,"run_in_background":true}).to_string(),
                 output: "Background task launched".into(),
                 status: chat::ToolStatus::Succeeded,
             },
             at: None,
             started_at: None,
         });
-        assert!(!find::contains(
-            match &item.content {
-                ItemContent::Tool { input, .. } => input,
-                _ => unreachable!(),
-            },
-            query
-        ));
-        let input = RawInput {
-            query: query.into(),
-            provider: Provider::Claude,
-            labels: Arc::default(),
-            metadata: metadata_capacity(),
-            groups: vec![(
-                "group".into(),
-                vec![RawItem {
-                    item: item.clone(),
-                    raw_disclosure: true,
-                    tools: vec![(1, Arc::from("absent")), (2, Arc::from(query))],
-                }],
-            )],
+        let scan = |query: &str| {
+            let input = RawInput {
+                query: query.into(),
+                provider: Provider::Claude,
+                labels: Arc::default(),
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item: item.clone(),
+                        raw_disclosure: true,
+                        tools: vec![(1, Arc::from("absent")), (2, Arc::from(prompt))],
+                    }],
+                )],
+            };
+            let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
+            let tools = tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>();
+            (groups, tools)
         };
-        let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
+        // The call draws the prompt as JSON, escaped, so a match only in the
+        // prompt as written is in the formatted prompt the open detail
+        // draws: it opens the detail and unfolds that prompt.
+        let (groups, tools) = scan(prompt);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
-        assert!(
-            !groups[0].1[0].expand,
-            "matching card part owns disclosure rather than raw command"
-        );
-        assert_eq!(
-            tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
-            vec![2]
-        );
+        assert!(groups[0].1[0].expand);
+        assert_eq!(tools, vec![2]);
+        // A match in both opens the detail and unfolds the prompt too.
+        let (groups, tools) = scan("NEEDLE λ");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
+        assert!(groups[0].1[0].expand);
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+        assert_eq!(tools, vec![2]);
     }
     #[test]
     fn find_reaches_a_message_through_the_labels_of_its_pull_request_links() {

@@ -158,7 +158,8 @@ STUBS = {
         #!/bin/bash
         if [ "${0##*/}" = cagents-ui ]; then
             rm -f "$STUB_LOG/ui-absent"
-            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
+            # Replace atomically: a polling reader must never see it empty.
+            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid.$$" && mv -f "$STUB_LOG/ui-pid.$$" "$STUB_LOG/ui-pid"
             printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             env > "$STUB_LOG/ui-env"

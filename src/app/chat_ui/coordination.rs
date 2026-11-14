@@ -1,14 +1,14 @@
 //! Drawing what an agent did to work with other agents.
 //!
-//! A message one agent sends another is the mirror of the delivery the other
-//! receives, and is drawn as one: a card that names its recipient and shows
-//! the message as prose, instead of a `Ran` row whose message is a quoted
-//! shell argument. Starting an agent is drawn the same way, its prompt being
-//! the part worth reading. Every other coordinating step stays one line of
-//! the step strip, but says what it did - "Waited for reviewer" - rather than
+//! A message one agent sends another, and an agent one starts, is routine
+//! activity, so each is one row of the step list: "Message to Relocate the
+//! repo", the start of what it said, and how it went. The row opens the
+//! agent; its tooltip gives the start of the whole message, and its context
+//! menu copies it and opens the row's detail: the message in full, what came
+//! back, and the command or tool call behind it. What the agent did is in its
+//! transcript. Every other coordinating step stays one line of the
+//! step strip, but says what it did - "Waited for reviewer" - rather than
 //! reprinting the command that did it.
-//!
-//! The raw command and its output stay one disclosure away on every card.
 
 use super::*;
 use crate::agent_execution::State;
@@ -32,6 +32,9 @@ pub(super) struct Prepared {
     brief: Option<markdown::Content>,
     answers: Vec<markdown::Content>,
     documents: Vec<prose_document::Data>,
+    /// What a step drawn as one row says, read once here rather than on
+    /// every view.
+    pub(super) plain: Plain,
     #[cfg(test)]
     pub(super) created_on: std::thread::ThreadId,
     #[cfg(test)]
@@ -87,6 +90,14 @@ impl Prepared {
             Ok(markdown::Content::parse_labelled(text, labels.clone()))
         };
         let inline = |text: &Text| text.inline().map(parse).transpose();
+        // A step drawn as one row reads its text plain, in the row and its
+        // tooltip, and formatted in its open detail.
+        let plain = if reading.is_card() {
+            check()?;
+            Plain::of(&reading)
+        } else {
+            Plain::default()
+        };
         let prompts = match &reading.kind {
             Kind::Message(message) => vec![inline(&message.body)?],
             Kind::Spawn(spawn) => spawn
@@ -117,6 +128,7 @@ impl Prepared {
             brief,
             answers,
             documents: vec![],
+            plain,
             #[cfg(test)]
             created_on: std::thread::current().id(),
             #[cfg(test)]
@@ -231,44 +243,6 @@ impl Coordinated {
 
     pub(super) fn is_card(&self) -> bool {
         self.reading.is_card()
-    }
-
-    /// The text of each part the card folds, by the part's name.
-    pub(super) fn parts(&self) -> Vec<(String, &str)> {
-        let mut parts = Vec::new();
-        match &self.reading.kind {
-            Kind::Message(message) => {
-                parts.extend(message.body.inline().map(|body| ("body".to_owned(), body)))
-            }
-            Kind::Spawn(spawn) => {
-                parts.push(("brief".to_owned(), spawn.brief.as_str()));
-                parts.extend(
-                    spawn
-                        .agents
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, agent)| {
-                            Some((format!("prompt-{index}"), agent.prompt.inline()?))
-                        }),
-                );
-            }
-            Kind::Act(_) => {}
-        }
-        let outcome = &self.reading.outcome;
-        parts.extend(
-            outcome
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| (format!("answer-{index}"), message.body.as_str())),
-        );
-        parts.extend(
-            outcome
-                .run
-                .as_ref()
-                .map(|run| ("result".to_owned(), run.result.as_str())),
-        );
-        parts
     }
 
     /// What copying the card takes: the message, or the prompt.
@@ -396,13 +370,14 @@ fn short_id(id: &str) -> &str {
     id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
 }
 
-/// Whom started agents are, as one phrase.
+/// Whom started agents are, as one phrase. One agent goes by its name, else
+/// its task's first line, else its type, as its tab will name it.
 fn started(spawn: &Spawn) -> String {
     match spawn.agents.as_slice() {
-        [only] => [&only.name, &only.kind]
+        [only] => [&only.name, &only.description, &only.kind]
             .into_iter()
-            .find(|name| !name.is_empty())
-            .map_or_else(|| "an agent".to_owned(), |name| name.clone()),
+            .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+            .map_or_else(|| "an agent".to_owned(), str::to_owned),
         agents => format!("{} agents", agents.len()),
     }
 }
@@ -451,6 +426,20 @@ impl Recipient {
             (Some(session), true) => format!("session {}", short_id(session)),
             (Some(session), false) => format!("{} ({})", self.name, short_id(session)),
             (None, _) => self.name.clone(),
+        }
+    }
+
+    /// As a row draws it: the name cut to fit beside the session ID that
+    /// tells it apart, which is kept whole.
+    fn shown(&self) -> String {
+        let cut = |name: &str, room: usize| Runtime::short_description(name, room);
+        match (&self.session, self.name.is_empty()) {
+            (Some(session), false) => {
+                let id = short_id(session);
+                let room = LABEL_CHARS.saturating_sub(id.chars().count() + 3).max(8);
+                format!("{} ({id})", cut(&self.name, room))
+            }
+            _ => cut(&self.plain(), LABEL_CHARS),
         }
     }
 }
@@ -531,6 +520,25 @@ fn arrival(arrival: Arrival) -> &'static str {
     }
 }
 
+/// A confirmed message's row status: its word, and the full arrival behind it.
+fn received(arrival_of: Arrival) -> RowStatus {
+    RowStatus {
+        detail: Some(arrival(arrival_of).to_owned()),
+        ..match arrival_of {
+            Arrival::WhenIdle
+            | Arrival::NextSession
+            | Arrival::Queued
+            | Arrival::Behind
+            | Arrival::NoSlot => RowStatus::plain("Queued"),
+            // A run that ended had the message all the same.
+            Arrival::Inbox | Arrival::User | Arrival::Started | Arrival::Ended => {
+                RowStatus::plain("Delivered")
+            }
+            Arrival::Unknown => RowStatus::warning("Not confirmed"),
+        }
+    }
+}
+
 /// What became of a message a provider's own tool sent, in the card's
 /// status line.
 fn delivered(delivery: Delivery) -> &'static str {
@@ -539,29 +547,6 @@ fn delivered(delivery: Delivery) -> &'static str {
         Delivery::Resumed => "Resumed it with this message",
         Delivery::Inbox => "Left in that session's inbox",
         Delivery::Sent => "Sent",
-    }
-}
-
-/// How a run stands, and which agent runs it, as one status line.
-fn run_line(run: &Run) -> Option<(String, Tone)> {
-    let agent = (!run.agent.is_empty()).then(|| format!("agent {}", run.agent));
-    let tone = match run.state {
-        Some(State::Failed | State::Interrupted) => Tone::Error,
-        Some(State::Cancelled) => Tone::Warning,
-        _ => Tone::Plain,
-    };
-    let state = run.state.map(|state| {
-        let mut state = state_phrase(state).to_owned();
-        if run.timed_out {
-            state.push_str(", wait timed out");
-        }
-        state
-    });
-    match (agent, state) {
-        (Some(agent), Some(state)) => Some((format!("{state} as {agent}"), tone)),
-        (Some(agent), None) => Some((format!("Launch accepted as {agent}"), tone)),
-        (None, Some(state)) => Some((state, tone)),
-        (None, None) => None,
     }
 }
 
@@ -597,86 +582,399 @@ fn last_line(output: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// Describe only metadata reported for this launch; native children do not
-/// inherit the parent model merely because they share a provider.
-fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<&str>) -> String {
-    let mut parts = vec![
-        if reading.cli {
-            "cagents agent"
-        } else {
-            "Native subagent"
-        }
-        .to_owned(),
-    ];
+/// What a launch reported about the agent it started, for the row's tooltip:
+/// only what was reported, as native children do not inherit the parent's
+/// model merely because they share a provider.
+fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if reading.cli {
+        parts.push("cagents agent".to_owned());
+    } else if let [agent] = spawn.agents.as_slice()
+        && !agent.kind.trim().is_empty()
+    {
+        parts.push(agent.kind.trim().to_owned());
+    }
     if !spawn.provider.is_empty() {
         parts.push(spawn.provider.clone());
     }
-    parts.push(
-        observed_model
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or(if spawn.model.is_empty() {
-                "Model not reported"
-            } else {
-                &spawn.model
-            })
-            .to_owned(),
-    );
+    if let Some(model) = observed_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or_else(|| Some(spawn.model.trim()).filter(|model| !model.is_empty()))
+    {
+        parts.push(model.to_owned());
+    }
     if !spawn.effort.is_empty() {
         parts.push(spawn.effort.clone());
     }
     if reading.cli {
-        parts.push(match &spawn.placement {
-            Some(crate::agent_execution::Placement::Channel(channel)) => {
-                format!("Channel {channel}")
+        match (&spawn.placement, &spawn.channel) {
+            (Some(crate::agent_execution::Placement::Channel(channel)), _)
+            | (None, Some(channel)) => parts.push(format!("Channel {channel}")),
+            (Some(crate::agent_execution::Placement::Worktree { path, .. }), _) => {
+                parts.push(format!("Worktree view {}", path.display()))
             }
-            Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
-                format!("Worktree view {}", path.display())
-            }
-            None => spawn.channel.as_ref().map_or_else(
-                || "View not reported".to_owned(),
-                |channel| format!("Channel {channel}"),
-            ),
-        });
+            (None, None) => {}
+        }
     }
-    parts.join(" · ")
+    let mut details = parts.join(" · ");
+    if !spawn.directory.is_empty() {
+        if !details.is_empty() {
+            details.push_str(" · ");
+        }
+        details.push_str("in ");
+        details.push_str(&spawn.directory);
+    }
+    details
 }
 
-fn muted_glyph(icon: Icon) -> Element<'static, Message> {
-    widget::icon(icon.handle())
-        .size(14)
-        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-            cosmic::iced::widget::svg::Style {
-                color: Some(design::muted_icon_color(theme)),
-            }
-        })))
-        .into()
+/// How many characters of a name that is not a listed agent's a row shows:
+/// few enough that, in the narrowest chat pane, the status after it keeps
+/// its place, and enough for "the conversation that started it". A listed
+/// agent goes by its tab's shorter words.
+const LABEL_CHARS: usize = 32;
+/// The room a row keeps at its trailing edge for the open arrow: the glyph
+/// and the gap before it, as a step row keeps for its chevron, so statuses
+/// end in line with step durations.
+const ARROW_ROOM: f32 = design::COMPACT_ICON_SIZE as f32 + step::GAP_S;
+/// How much of a message a row's tooltip shows.
+const TIP_CHARS: usize = 600;
+const TIP_LINES: usize = 12;
+
+/// `text` as one line: its lines joined by spaces, bounded well past what
+/// a row can show, which the row then cuts to its width.
+fn one_line_of(text: &str) -> String {
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.len() > 240 {
+            break;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    line
 }
 
-/// A card caption stays one line; the fade handles the space the pane offers.
-/// Keep shaping bounded while the tooltip retains the complete source text.
-fn faded_caption(text: String, title: bool, tooltip: String) -> Element<'static, Message> {
-    let preview = turn::headline(text);
-    let text = if title {
-        chat_title(preview)
-    } else {
-        design::caption(preview)
+/// Markdown as the plain text a reader sees in it: its words, list markers
+/// and line structure, without the syntax that styles them. Only as much of
+/// it is read as a row or its tooltip can show.
+fn plain(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let source = match markdown.char_indices().nth(4 * TIP_CHARS) {
+        Some((end, _)) => &markdown[..end],
+        None => markdown,
     };
-    crate::interaction::tooltip(
-        crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
-            widget::scrollable(text.wrapping(iced::widget::text::Wrapping::None))
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    iced::widget::scrollable::Scrollbar::hidden(),
-                ))
-                .width(Length::Fill)
-                .height(design::LINE_BODY),
-            design::raised,
-        )),
-        tooltip,
-    )
+    let mut text = String::new();
+    // Each open list's next number, or `None` for a bulleted one.
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let break_block = |text: &mut String| {
+        let kept = text.trim_end_matches([' ', '\n']).len();
+        text.truncate(kept);
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+    };
+    for event in Parser::new(source) {
+        match event {
+            Event::Text(part) | Event::Code(part) | Event::InlineMath(part) => text.push_str(&part),
+            Event::DisplayMath(part) | Event::Html(part) | Event::InlineHtml(part) => {
+                text.push_str(&part)
+            }
+            Event::SoftBreak => text.push(' '),
+            Event::HardBreak => text.push('\n'),
+            Event::Rule => {
+                break_block(&mut text);
+                text.push_str("———");
+            }
+            Event::TaskListMarker(done) => text.push_str(if done { "☑ " } else { "☐ " }),
+            Event::Start(Tag::List(first)) => {
+                if lists.is_empty() {
+                    break_block(&mut text);
+                }
+                lists.push(first);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let kept = text.trim_end_matches(' ').len();
+                text.truncate(kept);
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let depth = lists.len().saturating_sub(1);
+                text.push_str(&"  ".repeat(depth));
+                match lists.last_mut() {
+                    Some(Some(number)) => {
+                        text.push_str(&format!("{number}. "));
+                        *number += 1;
+                    }
+                    _ => text.push_str("• "),
+                }
+            }
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::BlockQuote(_))
+            | Event::Start(Tag::CodeBlock(_) | Tag::Table(_))
+                if lists.is_empty() =>
+            {
+                break_block(&mut text)
+            }
+            Event::End(TagEnd::TableRow | TagEnd::TableHead) => text.push('\n'),
+            Event::End(TagEnd::TableCell) => text.push_str("  "),
+            _ => {}
+        }
+    }
+    text.trim().to_owned()
 }
 
-/// How a card's status line reads.
-#[derive(Clone, Copy)]
+/// `text` bounded for a tooltip, which wraps at its own width.
+fn bounded(text: &str) -> String {
+    let mut lines = text.trim().lines();
+    let mut kept: String = lines
+        .by_ref()
+        .take(TIP_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cut = lines.next().is_some();
+    if let Some((end, _)) = kept.char_indices().nth(TIP_CHARS) {
+        kept.truncate(end);
+        cut = true;
+    }
+    if cut {
+        kept = format!("{}…", kept.trim_end());
+    }
+    kept
+}
+
+/// A one-row step's texts as a reader sees them, without their Markdown.
+#[derive(Default)]
+pub(super) struct Plain {
+    /// The message, or each started agent's prompt in order; empty where it
+    /// is not inline.
+    said: Vec<String>,
+    /// Each answer the step collected, in order.
+    answers: Vec<String>,
+    /// What the run it waited on returned.
+    result: String,
+}
+
+impl Plain {
+    fn of(reading: &Coordination) -> Self {
+        let inline = |text: &Text| text.inline().map(plain).unwrap_or_default();
+        Self {
+            said: match &reading.kind {
+                Kind::Message(message) => vec![inline(&message.body)],
+                Kind::Spawn(spawn) => spawn
+                    .agents
+                    .iter()
+                    .map(|agent| inline(&agent.prompt))
+                    .collect(),
+                Kind::Act(_) => Vec::new(),
+            },
+            answers: reading
+                .outcome
+                .messages
+                .iter()
+                .map(|message| plain(&message.body))
+                .collect(),
+            result: reading
+                .outcome
+                .run
+                .as_ref()
+                .map(|run| plain(&run.result))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// What the step collected, headed by whom it came from, for a tooltip
+    /// where the row has no agent to open.
+    fn collected(&self, reading: &Coordination) -> Vec<String> {
+        reading
+            .outcome
+            .messages
+            .iter()
+            .zip(&self.answers)
+            .map(|(answer, body)| (format!("From {}", answer.from), body.as_str()))
+            .chain(
+                reading
+                    .outcome
+                    .run
+                    .as_ref()
+                    .map(|_| ("Result".to_owned(), self.result.as_str())),
+            )
+            .filter(|(_, body)| !body.is_empty())
+            .map(|(heading, body)| format!("{heading}:\n{body}"))
+            .collect()
+    }
+}
+
+/// What one coordination row draws.
+struct Row {
+    glyph: Icon,
+    verb: &'static str,
+    /// Whom the step reached, whole.
+    label: String,
+    /// The same as the row draws it: an agent in its tab's words, any
+    /// other name cut to fit the narrowest pane.
+    shown: String,
+    /// The start of what was said, or the started agent's type.
+    preview: String,
+    /// The whole of it, for the tooltip.
+    full: String,
+    state: RowStatus,
+    /// What opening the row does, where this conversation can open the agent.
+    open: Option<Action>,
+    /// Where it cannot, why: there is none, or there are several.
+    several: bool,
+    /// The menu's name for copying what the step said.
+    copy: &'static str,
+}
+
+/// What a row that opens no agent does when pressed, said where the
+/// tooltip and a screen reader can tell it apart from one that does.
+const OPENS_DETAIL: &str = "No agent to open; pressing shows it in full with its tool call.";
+/// The same, for a step that reached several agents, each with its own tab.
+const OPENS_DETAIL_OF_SEVERAL: &str =
+    "Open each agent from its tab; pressing shows this in full with its tool call.";
+
+impl Row {
+    /// What the tooltip and a screen reader give whole: the agent's whole
+    /// name where the row cut it, the outcome's reason, what pressing does
+    /// where it opens no agent, and then the message or prompt.
+    fn described(&self) -> (String, String) {
+        let reason = self
+            .state
+            .detail
+            .as_deref()
+            .map(|detail| match self.state.tone {
+                Tone::Error => format!("{}: {detail}", self.state.text),
+                _ => detail.to_owned(),
+            });
+        let pressing = match (&self.open, self.several) {
+            (Some(_), _) => "Opens the agent",
+            (None, false) => OPENS_DETAIL,
+            (None, true) => OPENS_DETAIL_OF_SEVERAL,
+        };
+        let mut tip = Vec::new();
+        if self.shown != self.label {
+            tip.push(format!("{} {}", self.verb, self.label));
+        }
+        tip.extend(reason);
+        if self.open.is_none() {
+            tip.push(pressing.to_owned());
+        }
+        if !self.full.is_empty() {
+            tip.push(bounded(&self.full));
+        }
+        let name = [
+            format!("{} {}", self.verb, self.label),
+            self.state.text.to_owned(),
+            self.state.detail.clone().unwrap_or_default(),
+            pressing.to_owned(),
+            self.preview.clone(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        (tip.join("\n\n"), name)
+    }
+}
+
+/// A row's trailing status: a word or two, with the whole account of it in
+/// the tooltip.
+struct RowStatus {
+    text: &'static str,
+    tone: Tone,
+    /// Still under way, which a spinner beside it says.
+    live: bool,
+    detail: Option<String>,
+}
+
+impl RowStatus {
+    fn with(text: &'static str, tone: Tone, live: bool) -> Self {
+        Self {
+            text,
+            tone,
+            live,
+            detail: None,
+        }
+    }
+    fn plain(text: &'static str) -> Self {
+        Self::with(text, Tone::Plain, false)
+    }
+    fn live(text: &'static str) -> Self {
+        Self::with(text, Tone::Plain, true)
+    }
+    fn warning(text: &'static str) -> Self {
+        Self::with(text, Tone::Warning, false)
+    }
+    fn error(text: &'static str) -> Self {
+        Self::with(text, Tone::Error, false)
+    }
+}
+
+/// How a run stands, as a row's status, naming the agent that runs it in
+/// the tooltip.
+fn run_status(run: &Run) -> RowStatus {
+    let Some(state) = run.state else {
+        return RowStatus {
+            detail: (!run.agent.is_empty()).then(|| format!("As agent {}", run.agent)),
+            ..RowStatus::plain("Launch accepted")
+        };
+    };
+    let mut status = match state {
+        State::Failed | State::Interrupted => RowStatus::error(state_phrase(state)),
+        State::Cancelled => RowStatus::warning(state_phrase(state)),
+        State::Accepted | State::Running | State::Waiting => RowStatus::live(state_phrase(state)),
+        State::Succeeded => RowStatus::plain(state_phrase(state)),
+    };
+    let mut detail = Vec::new();
+    if run.timed_out {
+        detail.push("The wait timed out".to_owned());
+    }
+    if !run.agent.is_empty() {
+        detail.push(format!("As agent {}", run.agent));
+    }
+    status.detail = (!detail.is_empty()).then(|| detail.join(". "));
+    status
+}
+
+/// A coordination row's context menu entry, for the item `id`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowCommand<'a> {
+    target: Target,
+    id: &'a str,
+    copy: bool,
+}
+
+impl widget::menu::Action for RowCommand<'_> {
+    type Message = Message;
+
+    fn message(&self) -> Message {
+        let id = self.id.to_owned();
+        action(if self.copy {
+            Action::Copy(self.target, id, CopyPart::Text)
+        } else {
+            Action::Toggle(self.target, id)
+        })
+    }
+}
+
+/// A glyph at the size and tone of the step rows beside it.
+fn muted_glyph(icon: Icon) -> Element<'static, Message> {
+    crate::ui_controls::passive_icon(icon.handle(), design::COMPACT_ICON_SIZE)
+}
+
+/// The transcript's own background, which a row's open detail sits on, so
+/// a fold fades into it rather than into a card that is no longer there.
+fn transcript_surface(theme: &cosmic::Theme) -> iced::Color {
+    theme.current_container().base.into()
+}
+
+/// How a row's status reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
     Plain,
     /// It went, but not all the way.
@@ -711,28 +1009,15 @@ impl BackgroundState {
         }
     }
 
-    fn tool_status(self) -> ToolStatus {
+    /// The row's status for this state: a spinner while the agent works,
+    /// and a warning while it waits on the person.
+    fn status(self) -> RowStatus {
         match self {
-            Self::Working | Self::Waiting => ToolStatus::Running,
-            Self::OnBackgroundWork => ToolStatus::Waiting,
-            Self::Failed => ToolStatus::Failed,
-            Self::Stopped => ToolStatus::Stopped,
-            Self::Ended => ToolStatus::Ended,
-            Self::Finished => ToolStatus::Succeeded,
+            Self::Working => RowStatus::live(self.caption()),
+            Self::Waiting => RowStatus::warning(self.caption()),
+            Self::Failed => RowStatus::error(self.caption()),
+            _ => RowStatus::plain(self.caption()),
         }
-    }
-}
-
-fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
-    let caption = design::caption(text);
-    match tone {
-        Tone::Plain => caption.into(),
-        Tone::Warning => caption
-            .class(cosmic::theme::Text::Custom(design::warning_text))
-            .into(),
-        Tone::Error => caption
-            .class(cosmic::theme::Text::Custom(design::destructive_text))
-            .into(),
     }
 }
 
@@ -757,6 +1042,12 @@ impl Runtime {
             .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
+    /// How a row names a listed agent: in its tab's words, number and all.
+    fn row_agent_name(&self, agent: &chat::Subagent) -> String {
+        self.child_label(agent, super::child_navigation::TAB_CHARS)
+            .into_owned()
+    }
+
     /// The agents a step names that this conversation lists, each once.
     fn listed_subagents<'a>(
         &'a self,
@@ -777,16 +1068,14 @@ impl Runtime {
             })
     }
 
-    /// A message or a started agent, drawn as a card that shows its text.
-    ///
-    /// `raw` is the command and its output, drawn under the card while the
-    /// reader has it open.
+    /// A message or a started agent, drawn as one row of the step list: what
+    /// was done and to whom, the start of what was said, and how it went.
+    /// The row opens the agent; its context menu copies the message and
+    /// opens the detail, which `raw` then draws beneath it.
     pub(super) fn coordination_card<'a>(
         &self,
         item: &chat::Item,
-        cached: &CachedItem,
         coordinated: &Coordinated,
-        settings: markdown::Settings,
         raw: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let reported = item.content.status().unwrap_or(ToolStatus::Succeeded);
@@ -797,372 +1086,377 @@ impl Runtime {
             }
             _ => "",
         };
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
-        match &coordinated.reading.kind {
-            Kind::Message(message) => self.message_rows(
-                &mut rows,
-                item,
-                cached,
-                coordinated,
-                message,
-                status,
-                output,
-                settings,
-            ),
-            Kind::Spawn(spawn) => self.spawn_rows(
-                &mut rows,
-                item,
-                cached,
-                coordinated,
-                spawn,
-                status,
-                output,
-                settings,
-            ),
-            Kind::Act(_) => {}
-        }
-        rows.push(self.card_footer(item, cached, coordinated, status != reported));
-        rows.extend(raw);
-        let card = widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_S)
-                .width(Length::Fill),
-        )
-        // Raised where a delivery is sunken: what this conversation sent
-        // reads as the other side of what it received.
-        .class(design::surface(
-            Some(design::raised),
-            [design::RADIUS_M; 4],
-            true,
-        ))
-        .padding([step::GAP_S as u16, step::GAP_M as u16])
-        .width(Length::Fill);
-        widget::container(view::message_actions(
-            card.into(),
-            self.message_copy(item),
-            Alignment::Start,
-        ))
-        .max_width(design::READABLE_MEASURE)
-        .width(Length::Fill)
-        .into()
+        let row = match &coordinated.reading.kind {
+            Kind::Message(message) => self.message_row(coordinated, message, status, output),
+            Kind::Spawn(spawn) => self.spawn_row(coordinated, spawn, status, output),
+            Kind::Act(_) => return widget::Space::new().into(),
+        };
+        // The row keeps its place in the widget tree whether or not its tool
+        // call is open, so the row pressed to open it keeps keyboard focus.
+        let mut children = vec![self.row_view(item, row)];
+        children.extend(raw.map(|raw| {
+            widget::container(raw)
+                .padding(iced::Padding::from([0.0, step::GAP_S]).bottom(step::GAP_S))
+                .width(Length::Fill)
+                .into()
+        }));
+        widget::column::with_children(children)
+            .spacing(step::GAP_XS)
+            .width(Length::Fill)
+            .into()
     }
 
-    /// The glyph or spinner a card's heading opens with.
-    fn card_indicator(&self, status: ToolStatus, icon: Icon) -> Element<'static, Message> {
-        match status {
-            ToolStatus::Running => crate::ui_controls::activity_spinner(14.0, design::accent_color),
-            ToolStatus::Failed => widget::icon(Icon::Error.handle())
-                .size(14)
+    fn message_row(
+        &self,
+        coordinated: &Coordinated,
+        message: &Outbound,
+        status: ToolStatus,
+        output: &str,
+    ) -> Row {
+        let reading = &coordinated.reading;
+        let whole = |id: &str| {
+            self.subagent(id)
+                .map(|agent| self.child_label(agent, usize::MAX).into_owned())
+        };
+        let recipient_whole = recipient(message, reading, &whole);
+        let shown = recipient(message, reading, &|id| {
+            self.subagent(id).map(|agent| self.row_agent_name(agent))
+        })
+        .shown();
+        let listed: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        let open = match (listed.as_slice(), &recipient_whole.session) {
+            ([agent], _) => Some(Action::SelectSubagent(self.target, Some(agent.id.clone()))),
+            (_, Some(session)) if recipient_whole.live => {
+                Some(Action::OpenSession(session.clone()))
+            }
+            _ => None,
+        };
+        let (preview, full) = match &message.body {
+            Text::Inline(_) => {
+                let body = coordinated.plain.said.first().cloned().unwrap_or_default();
+                (one_line_of(&body), body)
+            }
+            Text::File(path) => {
+                let text = format!("The contents of {path}");
+                (text.clone(), text)
+            }
+            _ => {
+                let text = "Read from standard input".to_owned();
+                (text.clone(), text)
+            }
+        };
+        let receipt = reading.outcome.receipt.as_ref();
+        let answered = !reading.outcome.messages.is_empty();
+        let state = match (status, receipt) {
+            (ToolStatus::Running, _) if message.waits => RowStatus::live("Waiting for an answer"),
+            (ToolStatus::Running, _) => RowStatus::live("Sending"),
+            // An ask that timed out was still sent; only the answer is late.
+            (ToolStatus::Failed, Some(receipt)) if message.waits => RowStatus {
+                detail: Some(format!(
+                    "{}. No answer yet; it will arrive as a message.",
+                    arrival(receipt.arrival)
+                )),
+                ..RowStatus::warning("No answer yet")
+            },
+            // An ask prints its receipt only once its wait ends, so one
+            // stopped while waiting was sent without saying so.
+            (ToolStatus::Stopped, _) if message.waits => RowStatus::warning("Stopped waiting"),
+            (ToolStatus::Stopped, None) => RowStatus {
+                detail: Some("Stopped before it confirmed sending.".to_owned()),
+                ..RowStatus::warning("Not confirmed")
+            },
+            (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => RowStatus {
+                detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
+                ..RowStatus::error("Not sent")
+            },
+            _ if answered => RowStatus::plain("Answered"),
+            (_, Some(receipt)) => received(receipt.arrival),
+            _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
+                (Some(delivery), _) => RowStatus {
+                    detail: Some(delivered(delivery).to_owned()),
+                    ..RowStatus::plain(match delivery {
+                        Delivery::Queued => "Queued",
+                        Delivery::Resumed => "Resumed",
+                        Delivery::Inbox | Delivery::Sent => "Delivered",
+                    })
+                },
+                // A prompt to an agent starts a run of it.
+                (None, Some(run)) => run_status(run),
+                (None, None) => RowStatus::plain("Delivered"),
+            },
+        };
+        // What it answered is in the open detail, and in the agent's
+        // transcript; where the row cannot open one, the tooltip gives it too.
+        let mut full = vec![full];
+        if open.is_none() {
+            full.extend(coordinated.plain.collected(reading));
+        }
+        Row {
+            glyph: Icon::Send,
+            verb: message_verb(message.kind),
+            label: recipient_whole.plain(),
+            shown,
+            preview,
+            full: full.join("\n\n").trim().to_owned(),
+            state,
+            several: open.is_none() && listed.len() > 1,
+            open,
+            // Without the text inline, copying takes the raw call.
+            copy: match message.body.inline() {
+                Some(_) => "Copy message",
+                None => "Copy tool call",
+            },
+        }
+    }
+
+    fn spawn_row(
+        &self,
+        coordinated: &Coordinated,
+        spawn: &Spawn,
+        status: ToolStatus,
+        output: &str,
+    ) -> Row {
+        let reading = &coordinated.reading;
+        let listed = match reading.subagents.as_slice() {
+            [id] => self.subagent(id),
+            _ => None,
+        };
+        // The agent is named as its tab names it: by its name, else its task,
+        // else its type, which then follows it where the task would.
+        let (label, shown) = match listed {
+            Some(agent) => (
+                self.child_label(agent, usize::MAX).into_owned(),
+                self.row_agent_name(agent),
+            ),
+            None => {
+                let label = started(spawn);
+                let shown = Self::short_description(&label, LABEL_CHARS);
+                (label, shown)
+            }
+        };
+        let preview = match spawn.agents.as_slice() {
+            [agent] if agent.kind.trim() != label => agent.kind.trim().to_owned(),
+            [_] => String::new(),
+            agents => agents
+                .iter()
+                .map(|agent| {
+                    started(&Spawn {
+                        agents: vec![agent.clone()],
+                        ..Spawn::default()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        let observed_model = listed
+            .filter(|_| !reading.cli)
+            .and_then(|agent| agent.model.as_deref());
+        let mut full: Vec<String> = coordinated
+            .plain
+            .said
+            .iter()
+            .filter(|prompt| !prompt.is_empty())
+            .cloned()
+            .collect();
+        let details = spawn_details(reading, spawn, observed_model);
+        if !details.is_empty() {
+            full.push(details);
+        }
+        let background = self.background_state(coordinated);
+        let run = reading.outcome.run.as_ref();
+        let mut glyph = Icon::Agent;
+        // Use the observed task state while a native launch tool is still
+        // settling, but keep an explicit launch failure visible.
+        let state = match background
+            .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
+        {
+            Some(state) => {
+                glyph = match state {
+                    BackgroundState::Waiting => Icon::AgentWaiting,
+                    BackgroundState::OnBackgroundWork => Icon::AgentBackground,
+                    _ => Icon::Agent,
+                };
+                state.status()
+            }
+            None => match status {
+                ToolStatus::Running if spawn.waits => RowStatus::live("Working"),
+                ToolStatus::Running => RowStatus::live("Starting"),
+                ToolStatus::Stopped => RowStatus::plain("Stopped"),
+                ToolStatus::Failed | ToolStatus::Denied => RowStatus {
+                    detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
+                    ..RowStatus::error("Failed")
+                },
+                // Completing the launch command does not complete the
+                // separate session: say how it stands, or only that it
+                // was accepted.
+                _ if reading.cli && !spawn.waits => match run {
+                    Some(run) => run_status(run),
+                    None => RowStatus::plain("Launch accepted"),
+                },
+                _ => run.map_or_else(|| RowStatus::plain("Finished"), run_status),
+            },
+        };
+        let open = listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())));
+        // What it reported is in the open detail, and in the agent's
+        // transcript; where the row cannot open one, the tooltip gives it too.
+        if open.is_none() {
+            full.extend(coordinated.plain.collected(reading));
+        }
+        Row {
+            glyph,
+            verb: "Started",
+            label,
+            shown,
+            preview,
+            full: full.join("\n\n"),
+            state,
+            several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
+            open,
+            copy: if spawn
+                .agents
+                .iter()
+                .any(|agent| agent.prompt.inline().is_some())
+            {
+                "Copy prompt"
+            } else {
+                "Copy tool call"
+            },
+        }
+    }
+
+    /// One coordination row, on the step list's grid.
+    fn row_view<'a>(&self, item: &chat::Item, row: Row) -> Element<'a, Message> {
+        let failed = row.state.tone == Tone::Error;
+        let lead: Element<'static, Message> = if failed {
+            widget::icon(Icon::Error.handle())
+                .size(design::COMPACT_ICON_SIZE)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
                     cosmic::iced::widget::svg::Style {
                         color: Some(design::destructive_color(theme)),
                     }
                 })))
-                .into(),
-            _ => muted_glyph(icon),
-        }
-    }
-
-    /// A recipient's name and session, the session a link to its pane
-    /// while it runs.
-    fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
-        let mut parts: Vec<Element<'static, Message>> = Vec::new();
-        if !recipient.name.is_empty() {
-            parts.push(faded_caption(
-                recipient.name.clone(),
-                true,
-                recipient.name.clone(),
-            ));
-        }
-        let Some(session) = &recipient.session else {
-            return parts;
-        };
-        let shown = short_id(session);
-        let label: Element<'static, Message> = if recipient.name.is_empty() {
-            chat_title(format!("session {shown}")).into()
-        } else {
-            design::caption(shown.to_owned())
-                .font(iced::Font::MONOSPACE)
                 .into()
-        };
-        parts.push(if recipient.live {
-            crate::interaction::tooltip(
-                widget::button::custom(label)
-                    .class(crate::ui_controls::control_style(false, None))
-                    .padding([0, step::GAP_XS as u16])
-                    .name(format!("Go to session {shown}"))
-                    .on_press(action(Action::OpenSession(session.clone()))),
-                format!("Go to session {session}"),
-            )
         } else {
-            label
-        });
-        parts
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn message_rows(
-        &self,
-        rows: &mut Vec<Element<'_, Message>>,
-        item: &chat::Item,
-        cached: &CachedItem,
-        coordinated: &Coordinated,
-        message: &Outbound,
-        status: ToolStatus,
-        output: &str,
-        settings: markdown::Settings,
-    ) {
-        let reading = &coordinated.reading;
-        let recipient = recipient(message, reading, &|id| self.listed_agent_name(id));
-        let mut heading = vec![
-            self.card_indicator(status, Icon::Send),
-            design::caption(message_verb(message.kind))
+            muted_glyph(row.glyph)
+        };
+        let (tip, name) = row.described();
+        let label = row.shown.clone();
+        // The preview fades out where the pane runs short, as a step row's
+        // summary does, into whatever the row is painted with; the agent
+        // keeps its tab's words, cut as the tab cuts them.
+        let painted = disclosure::Painted::on(transcript_surface);
+        let mut line: Vec<Element<'static, Message>> = vec![
+            lead,
+            design::body(row.verb)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-        ];
-        heading.extend(self.session_link(&recipient));
-        rows.push(
-            widget::row::with_children(heading)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .width(Length::Fill)
+            chat_title(label)
+                .size(design::TEXT_BODY)
+                .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
+            painted.fade(
+                design::body(row.preview.clone())
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+            ),
+        ];
+        if row.state.live {
+            line.push(crate::ui_controls::activity_spinner(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::muted_color,
+            ));
+        }
+        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        line.push(
+            match row.state.tone {
+                Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
+                Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
+                Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
+            }
+            .into(),
         );
-        // An agent's tab names it by its type, which several agents share;
-        // the task it was given tells this one apart. It sits under the
-        // heading so a long task never crowds the recipient out of it.
-        // Where no task does, the sender's own summary of the body says
-        // what the message is about.
-        let task = match self
-            .listed_subagents(coordinated)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [agent] => Some(agent.description.trim())
-                .filter(|task| !task.is_empty() && *task != recipient.name),
-            _ => None,
-        };
-        let caption = task.unwrap_or(message.summary.trim()).to_owned();
-        if !caption.is_empty() {
-            rows.push(faded_caption(caption.clone(), false, caption));
-        }
-        rows.extend(self.text_block(
-            item,
-            cached,
-            "body",
-            &message.body,
-            coordinated.prompts.first().and_then(Option::as_ref),
-            "Show full message",
-            settings,
-        ));
-        // How it went: where it is headed, or what stopped it.
-        let receipt = reading.outcome.receipt.as_ref();
-        let replies = &reading.outcome.messages;
-        let line = match (status, receipt) {
-            (ToolStatus::Running, _) if message.waits => {
-                Some(("Waiting for an answer…".to_owned(), Tone::Plain))
-            }
-            (ToolStatus::Running, _) => Some(("Sending…".to_owned(), Tone::Plain)),
-            // An ask that timed out was still sent; only the answer is late.
-            (ToolStatus::Failed, Some(receipt)) if message.waits => Some((
-                format!(
-                    "{} · No answer yet; it will arrive as a message",
-                    arrival(receipt.arrival)
-                ),
-                Tone::Warning,
-            )),
-            // An ask prints its receipt only once its wait ends, so one
-            // stopped while waiting was sent without saying so.
-            (ToolStatus::Stopped, _) if message.waits => {
-                Some(("Stopped waiting for an answer".to_owned(), Tone::Warning))
-            }
-            (ToolStatus::Stopped, None) => Some((
-                "Stopped before it confirmed sending".to_owned(),
-                Tone::Warning,
-            )),
-            (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => {
-                let reason = failure(reading, output);
-                Some((
-                    if reason.is_empty() {
-                        "Not sent".to_owned()
-                    } else {
-                        format!("Not sent: {reason}")
-                    },
-                    Tone::Error,
-                ))
-            }
-            (_, Some(receipt)) if replies.is_empty() => {
-                Some((arrival(receipt.arrival).to_owned(), Tone::Plain))
-            }
-            // A prompt to an agent starts a run of it.
-            _ => reading
-                .outcome
-                .delivery
-                .map(|delivery| (delivered(delivery).to_owned(), Tone::Plain))
-                .or_else(|| reading.outcome.run.as_ref().and_then(run_line)),
-        };
-        if let Some((text, tone)) = line {
-            rows.push(status_caption(text, tone));
-        }
-        // What an ask or a waiting reply collected answers it; what a
-        // prompt's wait collected merely arrived while it waited.
-        let heading = match message.kind {
-            OutboundKind::Ask | OutboundKind::Reply => "Answer from",
-            _ => "From",
-        };
-        rows.extend(self.arrived(item, cached, coordinated, heading, settings));
-        rows.extend(self.result(item, cached, coordinated, settings));
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_rows(
-        &self,
-        rows: &mut Vec<Element<'_, Message>>,
-        item: &chat::Item,
-        cached: &CachedItem,
-        coordinated: &Coordinated,
-        spawn: &Spawn,
-        status: ToolStatus,
-        output: &str,
-        settings: markdown::Settings,
-    ) {
-        let reading = &coordinated.reading;
-        let background = self.background_state(coordinated);
-        // Use the observed task state while a native launch tool is still
-        // settling, but keep an explicit launch failure visible.
-        let indicator = match background
-            .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
-        {
-            Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
-            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
-            Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
-            None => self.card_indicator(status, Icon::Agent),
-        };
-        // The agent is named as its tab names it. Its task describes it in
-        // the tooltip but never stands in for an absent name; agent origin
-        // and launch options belong on their own secondary line.
-        let primary = match reading.subagents.as_slice() {
-            [id] => self.listed_agent_name(id),
-            _ => None,
-        }
-        .unwrap_or_else(|| started(spawn));
-        let task = match spawn.agents.as_slice() {
-            [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
-            _ => primary.clone(),
-        };
-        rows.push(
-            widget::row::with_children(vec![
-                indicator,
-                faded_caption(
-                    primary.clone(),
-                    true,
-                    if primary == task {
-                        task
-                    } else {
-                        format!("{primary}\n{task}")
-                    },
-                ),
-            ])
+        let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
-            .width(Length::Fill)
-            .into(),
-        );
-        let observed_model = if !reading.cli {
-            match reading.subagents.as_slice() {
-                [id] => self.subagent(id).and_then(|agent| agent.model.as_deref()),
-                _ => None,
-            }
+            .width(Length::Fill);
+        let open_tool = self.item_expanded(&item.id);
+        // The detail holds what was said and reported in full, then the
+        // command or tool call that carried it.
+        let source = if open_tool {
+            "Hide details"
         } else {
-            None
+            "Show details"
         };
-        let kind = match spawn.agents.as_slice() {
-            [agent] if !agent.kind.is_empty() && agent.kind != primary => {
-                format!(" · {}", agent.kind)
-            }
-            _ => String::new(),
+        let (target, id, copy) = (self.target, item.id.clone(), row.copy);
+        let menu = move || {
+            let command = |copy| RowCommand {
+                target,
+                id: &id,
+                copy,
+            };
+            widget::menu::items(
+                &HashMap::new(),
+                vec![
+                    widget::menu::Item::Button(copy, None, command(true)),
+                    widget::menu::Item::Button(source, None, command(false)),
+                ],
+            )
         };
-        rows.push(
-            design::caption(format!(
-                "{}{}",
-                spawn_identity(reading, spawn, observed_model),
-                kind,
-            ))
-            .into(),
-        );
-        if !spawn.directory.is_empty() {
-            rows.push(
-                design::caption(format!("in {}", spawn.directory))
-                    .font(iced::Font::MONOSPACE)
-                    .into(),
-            );
-        }
-        if let Some(brief) = &coordinated.brief {
-            rows.push(self.folded_markdown(
-                item,
-                cached,
-                "brief",
-                brief,
-                "Shared brief",
-                settings,
-                design::raised,
-            ));
-        }
-        let several = spawn.agents.len() > 1;
-        for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
-            let mut title: Vec<String> = Vec::new();
-            if several {
-                title.extend(
-                    [&agent.name, &agent.kind]
-                        .into_iter()
-                        .filter(|name| !name.is_empty())
-                        .cloned(),
-                );
+        let tipped = |content: Element<'static, Message>| {
+            if tip.is_empty() {
+                content
+            } else {
+                crate::interaction::tooltip(content, tip.clone())
             }
-            if !agent.description.is_empty() && (several || agent.description != primary) {
-                title.push(agent.description.clone());
-            }
-            if !title.is_empty() {
-                rows.push(if several {
-                    chat_title(title.join(" · ")).into()
-                } else {
-                    design::caption(title.join(" · ")).into()
-                });
-            }
-            rows.extend(self.text_block(
-                item,
-                cached,
-                &format!("prompt-{index}"),
-                &agent.prompt,
-                prompt.as_ref(),
-                "Show full prompt",
-                settings,
-            ));
-        }
-        // How the run went, as far as this step saw it.
-        let run = reading.outcome.run.as_ref();
-        let line = match status {
-            ToolStatus::Running if background.is_some() => None,
-            ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
-            ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
-            ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
-                let reason = failure(reading, output);
-                Some((
-                    match status {
-                        ToolStatus::Stopped => "Stopped".to_owned(),
-                        _ if reason.is_empty() || run.is_some() => "Failed".to_owned(),
-                        _ => format!("Failed: {reason}"),
-                    },
-                    Tone::Error,
-                ))
-            }
-            _ => run.and_then(run_line),
         };
-        if let Some((text, tone)) = line {
-            rows.push(status_caption(text, tone));
+        // Every row keeps room for the open arrow at its trailing edge, so
+        // the statuses end in line whether or not a row opens.
+        let padding = iced::Padding {
+            top: step::GAP_XS,
+            bottom: step::GAP_XS,
+            left: step::GAP_S,
+            right: step::GAP_S + ARROW_ROOM,
+        };
+        // A row that cannot open an agent opens its tool call instead, so the
+        // keyboard reaches it, its menu and its outcome all the same.
+        let opens = row.open.is_some();
+        let pressed = row
+            .open
+            .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
+        let mut button = widget::button::custom(content)
+            .name(name)
+            .class(painted.button_class())
+            .padding(padding)
+            .width(Length::Fill)
+            .on_press(action(pressed));
+        if !opens {
+            // As a step row says whether pressing it shows or hides its detail.
+            button = button.description(if open_tool {
+                "Collapse details"
+            } else {
+                "Expand details"
+            });
         }
-        rows.extend(self.arrived(item, cached, coordinated, "From", settings));
-        rows.extend(self.result(item, cached, coordinated, settings));
+        let button = crate::interaction::a11y_target(button);
+        let row: Element<'static, Message> = if opens {
+            // The way in, drawn inside the row's highlight where the
+            // pointer is. It only marks the row as one that opens: the row
+            // is the control, so a click on the arrow is a click on the
+            // row, and keyboard traversal and screen readers meet it once.
+            let arrow = widget::container(muted_glyph(Icon::Open))
+                .padding(iced::Padding {
+                    right: step::GAP_S,
+                    ..iced::Padding::ZERO
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Center);
+            hover::over(tipped(button), arrow)
+        } else {
+            tipped(button)
+        };
+        crate::interaction::context_menu_lazy(row, menu)
     }
 
     /// How the agents a step left running in the background are doing now,
@@ -1198,27 +1492,83 @@ impl Runtime {
         }
     }
 
-    /// What a run the step waited on answered.
-    fn result(
+    /// What a one-row step's open detail draws above its tool call: the
+    /// message or prompts in full, formatted, and what came back. A refused
+    /// message has no transcript to read it in, and an answer to a question
+    /// is its outcome, so neither is left to the tool call's raw text.
+    pub(super) fn row_detail(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
         coordinated: &Coordinated,
         settings: markdown::Settings,
-    ) -> Option<Element<'static, Message>> {
-        let run = coordinated.reading.outcome.run.as_ref()?;
-        let result = coordinated
-            .answers
-            .last()
-            .filter(|_| !run.result.is_empty())?;
-        Some(self.answer_block(
-            item,
-            cached,
-            "result",
-            "Result".to_owned(),
-            result,
-            settings,
-        ))
+    ) -> Vec<Element<'static, Message>> {
+        let mut rows = Vec::new();
+        match &coordinated.reading.kind {
+            Kind::Message(message) => rows.extend(self.text_block(
+                item,
+                cached,
+                "body",
+                &message.body,
+                coordinated.prompts.first().and_then(Option::as_ref),
+                "Show full message",
+                settings,
+            )),
+            Kind::Spawn(spawn) => {
+                if let Some(brief) = &coordinated.brief {
+                    rows.push(self.folded_markdown(
+                        item,
+                        cached,
+                        "brief",
+                        brief,
+                        "Show shared brief",
+                        settings,
+                        transcript_surface,
+                    ));
+                }
+                let several = spawn.agents.len() > 1;
+                for (index, (agent, prompt)) in
+                    spawn.agents.iter().zip(&coordinated.prompts).enumerate()
+                {
+                    if several {
+                        let title = [&agent.name, &agent.description, &agent.kind]
+                            .into_iter()
+                            .map(|part| part.trim())
+                            .filter(|part| !part.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        if !title.is_empty() {
+                            rows.push(design::caption(title).into());
+                        }
+                    }
+                    rows.extend(self.text_block(
+                        item,
+                        cached,
+                        &format!("prompt-{index}"),
+                        &agent.prompt,
+                        prompt.as_ref(),
+                        "Show full prompt",
+                        settings,
+                    ));
+                }
+            }
+            Kind::Act(_) => {}
+        }
+        rows.extend(self.arrived(item, cached, coordinated, "From", settings));
+        if let Some(run) = &coordinated.reading.outcome.run
+            && !run.result.is_empty()
+            && let Some(result) = coordinated.answers.last()
+        {
+            rows.push(self.answer_block(
+                item,
+                cached,
+                "result",
+                "Result".to_owned(),
+                result,
+                settings,
+            ));
+        }
+        rows
     }
 
     /// A message's or a prompt's text, folded to its opening when long.
@@ -1242,7 +1592,7 @@ impl Runtime {
                 content,
                 unfold,
                 settings,
-                design::raised,
+                transcript_surface,
             ),
             (Text::File(path), _) => design::caption(format!("The contents of {path}")).into(),
             _ => design::caption("Read from standard input, which the transcript does not show")
@@ -1356,121 +1706,6 @@ impl Runtime {
         .width(Length::Fill)
         .into()
     }
-
-    /// The card's last line: the subagent's transcript, where this
-    /// conversation has it, and the command behind the card.
-    fn card_footer(
-        &self,
-        item: &chat::Item,
-        cached: &CachedItem,
-        coordinated: &Coordinated,
-        overruled: bool,
-    ) -> Element<'static, Message> {
-        let mut controls: Vec<Element<'static, Message>> = Vec::new();
-        let listed: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
-        for agent in &listed {
-            let label = if listed.len() == 1 {
-                "Transcript".to_owned()
-            } else {
-                format!("Open {}", self.child_label(agent, 80))
-            };
-            controls.push(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        design::caption(label.clone()).into(),
-                        muted_glyph(Icon::Jump),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                .name(label)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                .on_press(action(Action::SelectSubagent(
-                    self.target,
-                    Some(agent.id.clone()),
-                )))
-                .into(),
-            );
-        }
-        let open = self.item_expanded(&item.id);
-        let (source, icon) = match &item.content {
-            ItemContent::Command { .. } => ("command", Icon::Terminal),
-            _ => ("tool call", Icon::Utilities),
-        };
-        let label = if open {
-            format!("Hide {source}")
-        } else {
-            format!("Show {source}")
-        };
-        let disclosure = disclosure::row_on(
-            label.clone(),
-            label,
-            icon,
-            Some(if overruled {
-                ToolStatus::Failed
-            } else {
-                item.content.status().unwrap_or(ToolStatus::Succeeded)
-            }),
-            disclosure::item_duration(item, self.source_now_ms()),
-            Some(open),
-            Some(Action::Toggle(self.target, item.id.clone())),
-            design::raised,
-        );
-        // A step the CLI said failed is not "Completed" for its exit status,
-        // and an agent left running in the background is not done because
-        // its launch is.
-        let detail = if overruled {
-            Some("Failed".to_owned())
-        } else if let Kind::Spawn(spawn) = &coordinated.reading.kind
-            && coordinated.reading.cli
-            && !spawn.waits
-            && item.content.status() == Some(ToolStatus::Succeeded)
-        {
-            // Completing the launch command does not complete the separate
-            // session. Report its observed state, or only the accepted launch.
-            Some(
-                match coordinated.reading.outcome.run.as_ref() {
-                    Some(run) => run.state.map_or("Launch accepted", state_phrase),
-                    None => "Launch command finished",
-                }
-                .to_owned(),
-            )
-        } else {
-            self.background_state(coordinated)
-                .map(|state| state.caption().to_owned())
-                .or_else(|| cached.detail.clone())
-        };
-        if let Some(detail) = detail {
-            controls.push(widget::Space::new().width(Length::Fill).into());
-            let tone = match detail.as_str() {
-                "Failed" => cosmic::theme::Text::Custom(design::destructive_text),
-                "Waiting for you" => cosmic::theme::Text::Custom(design::warning_text),
-                _ => cosmic::theme::Text::default(),
-            };
-            controls.push(
-                design::heading(detail)
-                    .size(design::TEXT_CAPTION)
-                    .class(tone)
-                    .into(),
-            );
-        }
-        let mut rows = Vec::new();
-        if !controls.is_empty() {
-            rows.push(
-                widget::row::with_children(controls)
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center)
-                    .width(Length::Fill)
-                    .into(),
-            );
-        }
-        rows.push(disclosure);
-        widget::column::with_children(rows)
-            .spacing(step::GAP_XS)
-            .width(Length::Fill)
-            .into()
-    }
 }
 
 #[cfg(test)]
@@ -1493,275 +1728,107 @@ mod identity_tests {
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
     }
 
+    /// However long an agent's name or a step's text, its row stays one line
+    /// in a narrow pane, as tall as a row with short ones. The row's
+    /// accessible name keeps the agent whole, and drawing the row leaves the
+    /// transcript item as it was.
     #[test]
-    fn agent_card_captions_fade_without_injecting_ellipsis_or_mutating_source() {
-        use iced::advanced::{
-            Layout, layout,
-            widget::{Operation, Tree},
-        };
-        struct Captions(Vec<String>);
-        impl Operation for Captions {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
-                self.0.push(text.to_owned());
-            }
-        }
-        let name = format!("Reviewer {}", "界".repeat(300));
-        let task = format!("Verify {}\nRetain the full task", "permissions ".repeat(80));
-        let items = [
-            (
-                "spawn",
-                "Agent",
-                serde_json::json!({
-                    "subagent_type": name,
-                    "description": task,
-                    "prompt": "Review the fixture"
-                }),
-            ),
-            (
-                "message",
-                "SendMessage",
-                serde_json::json!({
-                    "to": "spawn",
-                    "message": "Review the fixture",
-                    "summary": "Review request"
-                }),
-            ),
-        ]
-        .map(|(id, tool, input)| chat::Item {
-            id: id.into(),
-            role: chat::Role::Assistant,
-            content: ItemContent::Tool {
-                name: tool.into(),
-                input: input.to_string(),
-                output: String::new(),
-                status: ToolStatus::Succeeded,
-            },
-            started_at: None,
-            at: None,
-        });
-        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&items);
-        Arc::make_mut(&mut runtime.snapshot)
-            .subagents
-            .push(chat::Subagent {
-                id: "spawn".into(),
-                kind: name.clone(),
-                description: task.clone(),
-                status: ToolStatus::Succeeded,
-                model: None,
-                waiting: false,
-                detail: String::new(),
-                background: false,
-                items: Vec::new(),
-            });
-        let renderer = crate::app::tests::headless_renderer();
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-        for (index, item) in items.iter().enumerate() {
-            let cached = &runtime.cache[&item.id];
-            let coordinated = cached.coordination.as_deref().unwrap();
-            let mut rows = Vec::new();
-            match &coordinated.reading.kind {
-                Kind::Spawn(spawn) => runtime.spawn_rows(
-                    &mut rows,
-                    item,
-                    cached,
-                    coordinated,
-                    spawn,
-                    ToolStatus::Succeeded,
-                    "",
-                    settings,
-                ),
-                Kind::Message(message) => runtime.message_rows(
-                    &mut rows,
-                    item,
-                    cached,
-                    coordinated,
-                    message,
-                    ToolStatus::Succeeded,
-                    "",
-                    settings,
-                ),
-                _ => panic!("fixture is an agent card"),
-            }
-            for (row, mut element) in rows.into_iter().take(index + 1).enumerate() {
-                let mut tree = Tree::new(element.as_widget());
-                let node = element.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
-                );
-                let mut captions = Captions(Vec::new());
-                element.as_widget_mut().operate(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &mut captions,
-                );
-                let expected = if index == 1 && row == 0 {
-                    vec!["Message to".to_owned(), turn::headline(name.clone())]
-                } else {
-                    vec![turn::headline(if index == 0 {
-                        name.clone()
-                    } else {
-                        task.clone()
-                    })]
-                };
-                assert_eq!(captions.0, expected);
-                assert!(captions.0.iter().all(|text| !text.contains(['…', '\n'])));
-                assert_eq!(node.size().width, 200.0);
-                assert!(
-                    node.size().height <= design::LINE_BODY,
-                    "the whole heading must stay one line"
-                );
-            }
-            assert_eq!(runtime.snapshot.items[index].as_ref(), item);
-        }
-        // A separate session retains its navigation button alongside the faded
-        // recipient, including when the full recipient name exceeds the pane.
-        let session_message = chat::Item {
-            id: "session-message".into(),
-            content: ItemContent::Command {
-                label: "Send the review request".into(),
-                command: "cagents send 95fcd1b9e0aa 'Review the fixture'".into(),
-                working_directory: "/project".into(),
-                action: chat::CommandAction::Run,
-                status: ToolStatus::Succeeded,
-                output: format!(
-                    "Sent 45d4828a to session 95fcd1b9e0aa \"{name}\"; it arrives as soon as that conversation is idle"
-                ),
-                exit_code: Some(0),
-                duration_ms: None,
-            },
-            ..items[1].clone()
-        };
-        let (session_runtime, _session_handle) =
-            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&session_message));
-        let cached = &session_runtime.cache["session-message"];
-        let coordinated = cached.coordination.as_deref().unwrap();
-        let Kind::Message(message) = &coordinated.reading.kind else {
-            unreachable!()
-        };
-        let mut rows = Vec::new();
-        session_runtime.message_rows(
-            &mut rows,
-            &session_message,
-            cached,
-            coordinated,
-            message,
-            ToolStatus::Succeeded,
-            "",
-            settings,
-        );
-        let mut element = rows.remove(0);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
-        );
-        assert_eq!(node.size().width, 200.0);
-        assert!(node.size().height <= design::LINE_BODY);
-        let accessible = element.as_widget().a11y_nodes(
-            Layout::new(&node),
-            &tree,
-            iced::mouse::Cursor::Unavailable,
-        );
-        let link = accessible
-            .root()
-            .iter()
-            .chain(accessible.children())
-            .find(|node| node.node().label() == Some("Go to session 95fcd1b9"))
-            .expect("live session navigation survives the bounded heading");
-        let bounds = link.node().bounds().unwrap();
-        assert!(bounds.x0 >= 0.0 && bounds.x1 <= 200.0);
-        assert_eq!(runtime.snapshot.subagents[0].kind, name);
-        assert_eq!(runtime.snapshot.subagents[0].description, task);
-        assert_eq!(
-            runtime.listed_agent_name("spawn").as_deref(),
-            Some(name.as_str())
-        );
-    }
-
-    #[test]
-    fn raw_tool_disclosure_preserves_transcript_link_and_elapsed_in_a_narrow_card() {
+    fn a_narrow_row_stays_one_line_and_names_its_agent_whole() {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced_accessibility::accesskit::Role;
 
-        let item = chat::Item {
-            id: "toolu_send".into(),
-            role: chat::Role::Assistant,
-            content: ItemContent::Tool {
-                name: "SendMessage".into(),
-                input: serde_json::json!({
-                    "to": "a1892b93e88999a7d",
-                    "message": "Review the change",
-                    "summary": "Review request"
-                })
-                .to_string(),
-                output: String::new(),
-                status: ToolStatus::Succeeded,
-            },
-            started_at: Some(1_000),
-            at: Some(13_000),
-        };
-        let (mut runtime, _handle) =
-            super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
-        Arc::make_mut(&mut runtime.snapshot)
-            .subagents
-            .push(chat::Subagent {
-                id: "toolu_reviewer".into(),
-                kind: "reviewer".into(),
-                description: "Review the change".into(),
-                status: ToolStatus::Running,
-                model: None,
-                waiting: false,
-                detail: String::new(),
-                background: true,
-                items: Vec::new(),
+        let rows = |name: &str, task: &str, message: &str| {
+            let items = [
+                (
+                    "spawn",
+                    "Agent",
+                    serde_json::json!({
+                        "subagent_type": name,
+                        "description": task,
+                        "prompt": message
+                    }),
+                ),
+                (
+                    "message",
+                    "SendMessage",
+                    serde_json::json!({
+                        "to": "spawn",
+                        "message": message,
+                        "summary": "Review request"
+                    }),
+                ),
+            ]
+            .map(|(id, tool, input)| chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: tool.into(),
+                    input: input.to_string(),
+                    output: String::new(),
+                    status: ToolStatus::Succeeded,
+                },
+                started_at: None,
+                at: None,
             });
-        runtime.agent_addresses =
-            Arc::new([("a1892b93e88999a7d".into(), "toolu_reviewer".into())].into());
-        let renderer = crate::app::tests::headless_renderer();
-        for open in [false, true] {
-            if open {
-                runtime.expanded.insert(item.id.clone());
-            } else {
-                runtime.expanded.remove(&item.id);
-            }
-            let cached = &runtime.cache[&item.id];
-            let coordinated = cached.coordination.as_deref().unwrap();
-            let mut element = runtime.card_footer(&item, cached, coordinated, false);
-            let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(240.0, 800.0)),
-            );
-            let accessible = element.as_widget().a11y_nodes(
-                Layout::new(&node),
-                &tree,
-                iced::mouse::Cursor::Unavailable,
-            );
-            let buttons = accessible
-                .root()
+            let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&items);
+            Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .push(chat::Subagent {
+                    id: "spawn".into(),
+                    kind: name.into(),
+                    description: task.into(),
+                    status: ToolStatus::Succeeded,
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
+                    background: false,
+                    items: Vec::new(),
+                });
+            let renderer = crate::app::tests::headless_renderer();
+            items
                 .iter()
-                .chain(accessible.children())
-                .filter(|node| node.node().role() == Role::Button)
-                .collect::<Vec<_>>();
-            assert_eq!(buttons.len(), 2);
-            assert_eq!(buttons[0].node().label(), Some("Transcript"));
-            assert_eq!(
-                buttons[1].node().label(),
-                Some(if open {
-                    "Hide tool call · 12s"
-                } else {
-                    "Show tool call · 12s"
+                .enumerate()
+                .map(|(index, item)| {
+                    let cached = &runtime.cache[&item.id];
+                    let coordinated = cached.coordination.as_deref().unwrap();
+                    let mut element = runtime.coordination_card(item, coordinated, None);
+                    let mut tree = Tree::new(element.as_widget());
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 800.0)),
+                    );
+                    let accessible = element.as_widget().a11y_nodes(
+                        Layout::new(&node),
+                        &tree,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let named = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter(|node| node.node().role() == Role::Button)
+                        .filter_map(|node| node.node().label().map(str::to_owned))
+                        .collect::<Vec<_>>();
+                    assert_eq!(runtime.snapshot.items[index].as_ref(), item);
+                    (node.size(), named)
                 })
+                .collect::<Vec<_>>()
+        };
+        let name = format!("Reviewer {}", "界".repeat(300));
+        let task = format!("Verify {}\nRetain the full task", "permissions ".repeat(80));
+        let long = rows(&name, &task, &"Review the fixture ".repeat(200));
+        let short = rows("Reviewer", "Verify", "Review the fixture");
+        for ((long_size, named), (short_size, _)) in long.iter().zip(&short) {
+            assert_eq!(long_size.width, 200.0);
+            assert_eq!(
+                long_size.height, short_size.height,
+                "a long name or text must not wrap the row"
             );
-            let bounds = buttons[1].node().bounds().unwrap();
-            assert_eq!(bounds.width(), 240.0);
+            assert!(
+                matches!(named.as_slice(), [label] if label.contains(&name)),
+                "the row is one control named with its agent whole: {named:?}"
+            );
         }
     }
 
@@ -1866,7 +1933,52 @@ mod identity_tests {
     }
 
     #[test]
-    fn launches_distinguish_native_children_and_separate_sessions_without_guessing() {
+    fn a_message_taken_as_a_run_reads_as_queued_or_delivered_and_an_unknown_end_is_unconfirmed() {
+        let word = |arrival| {
+            let status = received(arrival);
+            (status.text, status.tone == Tone::Warning)
+        };
+        for waiting in [Arrival::Queued, Arrival::Behind, Arrival::NoSlot] {
+            assert_eq!(word(waiting), ("Queued", false));
+        }
+        for given in [Arrival::Started, Arrival::Ended] {
+            assert_eq!(word(given), ("Delivered", false));
+        }
+        assert_eq!(word(Arrival::Unknown), ("Not confirmed", true));
+        assert_eq!(
+            received(Arrival::Unknown).detail.as_deref(),
+            Some(arrival(Arrival::Unknown))
+        );
+    }
+
+    #[test]
+    fn a_rows_text_reads_as_the_message_without_its_markdown() {
+        let message = "The checkout moved, so **a few things** need to follow it:\n\n\
+            1. The repository is now at `/srv/repos/t3code`.\n\
+            2. Re-run `pnpm install` [there](https://example.com).\n\n\
+            - keep `.env.local`\n\n\
+            ```sh\ncd /srv/repos/t3code\n```\n\nThen report back.";
+        assert_eq!(
+            plain(message),
+            "The checkout moved, so a few things need to follow it:\n\n\
+             1. The repository is now at /srv/repos/t3code.\n\
+             2. Re-run pnpm install there.\n\n\
+             • keep .env.local\n\n\
+             cd /srv/repos/t3code\n\n\
+             Then report back."
+        );
+        assert_eq!(
+            one_line_of(&plain(message)),
+            "The checkout moved, so a few things need to follow it: 1. The repository is \
+             now at /srv/repos/t3code. 2. Re-run pnpm install there. • keep .env.local cd \
+             /srv/repos/t3code Then report back."
+        );
+        // Only what a tooltip can show is read.
+        assert!(plain(&"word ".repeat(10_000)).len() <= 4 * TIP_CHARS);
+    }
+
+    #[test]
+    fn launches_describe_only_what_was_reported() {
         let mut spawn = Spawn::default();
         let mut reading = Coordination {
             kind: Kind::Spawn(spawn.clone()),
@@ -1874,35 +1986,154 @@ mod identity_tests {
             subagents: Vec::new(),
             cli: false,
         };
+        assert_eq!(spawn_details(&reading, &spawn, None), "");
         assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "Native subagent · Model not reported"
+            spawn_details(&reading, &spawn, Some("gpt-child-reported")),
+            "gpt-child-reported"
         );
-        assert_eq!(
-            spawn_identity(&reading, &spawn, Some("gpt-child-reported")),
-            "Native subagent · gpt-child-reported"
-        );
+        spawn.agents.push(crate::chat::coordination::Delegate {
+            name: String::new(),
+            kind: "general-purpose".into(),
+            description: "Relocate the repo".into(),
+            prompt: Text::Inline("Move it".into()),
+        });
+        assert_eq!(spawn_details(&reading, &spawn, None), "general-purpose");
+        spawn.agents.clear();
         reading.cli = true;
-        assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "cagents agent · Model not reported · View not reported"
-        );
+        assert_eq!(spawn_details(&reading, &spawn, None), "cagents agent");
         spawn.provider = "codex".into();
         spawn.model = "gpt-reported".into();
         spawn.effort = "low".into();
         let channel = crate::model::ChannelId::new();
         spawn.channel = Some(channel);
         assert_eq!(
-            spawn_identity(&reading, &spawn, None),
+            spawn_details(&reading, &spawn, None),
             format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
         );
         spawn.placement = Some(crate::agent_execution::Placement::Worktree {
             repository: "/repo".into(),
             path: "/repo/tree".into(),
         });
+        spawn.directory = "/repo".into();
         assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "cagents agent · codex · gpt-reported · low · Worktree view /repo/tree"
+            spawn_details(&reading, &spawn, None),
+            "cagents agent · codex · gpt-reported · low · Worktree view /repo/tree · in /repo"
         );
+    }
+
+    #[test]
+    fn a_rows_tooltip_names_a_cut_agent_whole_and_says_what_a_row_without_one_does() {
+        let row = |label: &str, shown: &str, open: Option<Action>, state: RowStatus| Row {
+            glyph: Icon::Send,
+            verb: "Message to",
+            label: label.to_owned(),
+            shown: shown.to_owned(),
+            preview: "The repo is now at /srv".to_owned(),
+            full: "The repo is now at /srv/repos/t3code.".to_owned(),
+            state,
+            open,
+            several: false,
+            copy: "Copy message",
+        };
+        let long = "Relocate the t3code checkout and every worktree";
+        let shown = Runtime::short_description(long, super::super::child_navigation::TAB_CHARS);
+        let opens = row(
+            long,
+            &shown,
+            Some(Action::OpenSession("95fcd1b9".into())),
+            RowStatus::plain("Queued"),
+        );
+        let (tip, name) = opens.described();
+        assert_eq!(
+            tip,
+            format!("Message to {long}\n\nThe repo is now at /srv/repos/t3code.")
+        );
+        assert_eq!(
+            name,
+            format!("Message to {long} · Queued · Opens the agent · The repo is now at /srv")
+        );
+        // A name the row draws whole is not repeated.
+        let (tip, _) = row(
+            "reviewer",
+            "reviewer",
+            opens.open.clone(),
+            RowStatus::plain("Queued"),
+        )
+        .described();
+        assert_eq!(tip, "The repo is now at /srv/repos/t3code.");
+
+        // A row with no agent to open says so, after the outcome's reason.
+        let refused = || RowStatus {
+            detail: Some("No agent named 'release-notes' is reachable.".into()),
+            ..RowStatus::error("Not sent")
+        };
+        let (tip, name) = row("release-notes", "release-notes", None, refused()).described();
+        assert_eq!(
+            tip,
+            format!(
+                "Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
+                 The repo is now at /srv/repos/t3code."
+            )
+        );
+        assert_eq!(
+            name,
+            format!(
+                "Message to release-notes · Not sent · No agent named 'release-notes' is \
+                 reachable. · {OPENS_DETAIL} · The repo is now at /srv"
+            )
+        );
+        // One that reached several agents does not claim there is none.
+        let several = Row {
+            several: true,
+            ..row(
+                "Docs, Tests",
+                "Docs, Tests",
+                None,
+                RowStatus::plain("Delivered"),
+            )
+        };
+        assert!(several.described().0.contains(OPENS_DETAIL_OF_SEVERAL));
+    }
+
+    /// A row names an agent in its tab's words, so two whose tasks a tab
+    /// cuts to one text keep the number that tells them apart; a session it
+    /// messaged keeps the ID that tells it apart, however long its title.
+    #[test]
+    fn a_rows_name_keeps_what_tells_its_agent_apart() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let task = "Investigate the flaky test in the parser module";
+        let agent = |id: &str| chat::Subagent {
+            id: id.into(),
+            kind: task.into(),
+            description: task.into(),
+            status: ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        };
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents =
+            vec![agent("toolu_first"), agent("toolu_second")];
+        let second = &runtime.snapshot.subagents[1];
+        let tab = runtime.child_label(second, super::super::child_navigation::TAB_CHARS);
+        assert!(tab.ends_with(" 2"), "{tab}");
+        assert_eq!(runtime.row_agent_name(second), tab);
+
+        let titled = Recipient {
+            name: "A session whose title runs on well past a row".into(),
+            session: Some("95fcd1b9e3a4".into()),
+            live: true,
+        };
+        let shown = titled.shown();
+        assert!(shown.ends_with(" (95fcd1b9)"), "{shown}");
+        assert!(shown.chars().count() <= LABEL_CHARS + 1, "{shown}");
+        // A phrase the row draws whole.
+        let report = Recipient {
+            name: "the conversation that started it".into(),
+            session: None,
+            live: false,
+        };
+        assert_eq!(report.shown(), report.name);
     }
 }
