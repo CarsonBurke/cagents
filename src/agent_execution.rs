@@ -104,6 +104,8 @@ pub(crate) enum AcceptanceError {
     Invalid(String),
     #[error("{0}")]
     MailboxFull(String),
+    #[error("{0}")]
+    StoreBusy(String),
 }
 
 impl From<String> for AcceptanceError {

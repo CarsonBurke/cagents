@@ -63,9 +63,9 @@ mod workspace_snapshot_tests;
 
 const SCHEMA_VERSION: u32 = 24;
 
-/// A writer that loses a race waits rather than failing. Only the daemon writes
-/// this store, so contention is between its own client threads and is measured
-/// in microseconds; the timeout exists for the WAL checkpoint, not for a rival.
+/// Wait for another connection's writer rather than failing at admission.
+/// Read-then-write transactions must start immediate so SQLite can use this
+/// timeout before they take a snapshot that a rival commit could invalidate.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -76,6 +76,7 @@ const FILE_MODE: u32 = 0o600;
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Pause {
     SequenceRead,
+    MailboxRead,
     BeforeCommit,
     AfterCommit,
 }

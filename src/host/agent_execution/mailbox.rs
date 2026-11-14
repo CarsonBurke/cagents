@@ -531,7 +531,7 @@ pub(in crate::host) fn inbox(
     host: &SharedHost,
     authority: &Authority,
     query: Inbox,
-) -> Result<Vec<Message>, String> {
+) -> Result<Vec<Message>, AcceptanceError> {
     let (_, session) = caller(host, authority)?;
     let registry = registry(host)?;
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -554,7 +554,7 @@ pub(in crate::host) fn peek(
     host: &SharedHost,
     authority: &Authority,
     query: Inbox,
-) -> Result<Vec<Message>, String> {
+) -> Result<Vec<Message>, AcceptanceError> {
     let (_, session) = caller(host, authority)?;
     let registry = registry(host)?;
     let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -580,7 +580,7 @@ pub(in crate::host) fn acknowledge(
     host: &SharedHost,
     authority: &Authority,
     receipt: Receipt,
-) -> Result<(), String> {
+) -> Result<(), AcceptanceError> {
     receipt.validate()?;
     let (_, session) = caller(host, authority)?;
     let registry = registry(host)?;
