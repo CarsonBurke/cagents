@@ -133,6 +133,10 @@ pub(super) fn row_on(
             },
             design::COMPACT_ICON_SIZE,
         ));
+    } else {
+        // Non-expandable thoughts keep the duration column aligned without
+        // advertising a disclosure that has no content.
+        cells.push(widget::Space::new().width(design::COMPACT_ICON_SIZE).into());
     }
     let line = widget::row::with_children(cells)
         .width(Length::Fill)
@@ -238,5 +242,33 @@ mod tests {
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting)),
             Icon::AgentBackground
         );
+    }
+
+    #[test]
+    fn empty_reasoning_reserves_the_disclosure_column_for_aligned_time() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut times = Vec::new();
+        for expanded in [None, Some(false), Some(true)] {
+            let mut element = row(
+                "Thought for".into(),
+                "Reasoning".into(),
+                Icon::Agent,
+                None,
+                Some("12s".into()),
+                expanded,
+                None,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 80.0)),
+            );
+            let line = Layout::new(&node).children().next().unwrap();
+            times.push(line.children().nth(2).unwrap().bounds());
+        }
+        assert_eq!(times[0], times[1]);
+        assert_eq!(times[1], times[2]);
     }
 }
