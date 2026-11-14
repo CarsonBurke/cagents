@@ -663,7 +663,15 @@ fn placed_in(
         .client()
         .ok()
         .and_then(|client| client.read_workspace_model().ok())
-        .and_then(|model| model.channel(channel).map(|channel| channel.title.clone()));
+        .and_then(|model| {
+            model.channel(channel).map(|channel| {
+                if channel.title.is_empty() {
+                    "New channel".to_owned()
+                } else {
+                    channel.title.clone()
+                }
+            })
+        });
     Some(PlacedIn { channel, title })
 }
 
