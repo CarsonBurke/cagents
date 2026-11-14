@@ -1225,10 +1225,10 @@ impl Cagents {
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 self.shared_views.closed.extend(closed);
-                Task::batch([
-                    self.apply_closed_project_tombstones(),
-                    self.reconcile_workspace_model(),
-                ])
+                let closed = self.apply_closed_project_tombstones();
+                let reconciled = self.reconcile_workspace_model();
+                self.sweep_empty_channels();
+                Task::batch([closed, reconciled])
             }
             ModelUpdate::PublisherConnected { identity, ready } => {
                 let matches = identity != NO_REGISTRY && identity == self.workspace_model.identity;
@@ -6338,6 +6338,39 @@ mod tests {
             assert_eq!(app.durable.channels[0].title, "Renamed 4");
             assert_eq!(app.navigation_save_generation, generation.wrapping_add(1));
         }
+    }
+
+    #[test]
+    fn a_closed_identity_baseline_runs_the_restore_ready_empty_channel_sweep() {
+        use crate::workspace_model::views::View;
+        let (mut app, project, repository) = app_with_project();
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(local(channel, project, "Empty", 0));
+        app.workspace_model = WorkspaceModel::default();
+        let requests = intercept_publishes(&mut app);
+        app.allow_empty_channel_sweep();
+        assert_eq!(app.channel_ui.sweep, super::super::channel_ui::Sweep::Ready);
+        let mut model = registry(vec![shared(channel, &repository, "Empty", 0)]);
+        model.views.push(View::empty(channel));
+        let home = crate::channel_work::Home {
+            registry: model.identity,
+            channel,
+            creation_ordinal: 0,
+        };
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model,
+                closed: vec![],
+            }),
+        );
+        assert_eq!(app.channel_ui.sweep, super::super::channel_ui::Sweep::Done);
+        assert!(drain(&requests).iter().any(|edit| matches!(
+            edit,
+            ModelEdit::RetireEmptyChannel { home: actual, expected_view_revision: 0 }
+                if *actual == home
+        )));
     }
 
     #[test]
