@@ -2,6 +2,22 @@
 
 pub const MAX_CARD_NAME_CHARS: usize = 256;
 
+/// Between a shell's foreground command and its directory's name in the
+/// title its host gives a shell that sets none worth showing.
+#[cfg(any(feature = "ui", feature = "host"))]
+const PROCESS_TITLE_SEPARATOR: &str = " · ";
+
+/// "command · directory name": the title of a shell with no title of its
+/// own, or one that only says where the shell is.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn process_title(process: &str, directory: &std::path::Path) -> String {
+    let name = directory
+        .file_name()
+        .unwrap_or(directory.as_os_str())
+        .to_string_lossy();
+    format!("{process}{PROCESS_TITLE_SEPARATOR}{name}")
+}
+
 pub fn normalize_card_name(name: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut kept = 0usize;
