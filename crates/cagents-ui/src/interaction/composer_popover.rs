@@ -409,7 +409,7 @@ mod tests {
     fn menu_opens_above_its_anchor_sharing_its_leading_edge() {
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let size = Size::new(500.0, 300.0);
-        let mut closed = UserInterface::build(view(false), size, Cache::new(), &mut renderer);
+        let closed = UserInterface::build(view(false), size, Cache::new(), &mut renderer);
         let anchor = bounds_of(&closed.a11y_nodes(mouse::Cursor::Unavailable), "Actions");
         let mut open = UserInterface::build(view(true), size, closed.into_cache(), &mut renderer);
         // The first semantic query, before the overlay is laid out, already

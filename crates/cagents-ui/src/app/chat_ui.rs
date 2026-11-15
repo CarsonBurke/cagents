@@ -15622,25 +15622,24 @@ mod tests {
                 &Limits::new(iced::Size::ZERO, window),
             );
             let pointer = mouse::Cursor::Available(viewport.center());
-            let mut send =
-                |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
-                    let mut messages = Vec::new();
-                    element.as_widget_mut().update(
-                        tree,
-                        &event,
-                        Layout::new(&node),
-                        pointer,
-                        &renderer,
-                        &mut clipboard::Null,
-                        &mut Shell::new(&mut messages),
-                        &viewport,
-                    );
-                    messages
-                        .iter()
-                        .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
-                        .count()
-                };
-            let mut menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+            let send = |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    tree,
+                    &event,
+                    Layout::new(&node),
+                    pointer,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
+                    .count()
+            };
+            let menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
                 element
                     .as_widget_mut()
                     .overlay(
@@ -17003,7 +17002,7 @@ mod tests {
             chat_runtime(&app, card).conversation_status(false).1,
             "Account limit reached"
         );
-        let mut judge = |app: &mut Cagents, limit: Option<UsageLimit>| {
+        let judge = |app: &mut Cagents, limit: Option<UsageLimit>| {
             handle.judge_limit_for_test(limit);
             // Without a transcript read, as a hidden conversation hears of it.
             drop(app.handle_chat_ui(Action::Wake(target, Wake::Limit)));
@@ -25518,7 +25517,6 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         };
-        let target = runtime.target;
         // An exited provider this card cannot start again says what to do.
         assert!(!runtime.resumes_in_place());
         let offer = runtime.stopped(false, false);
@@ -25575,7 +25573,7 @@ mod tests {
             model::{ChannelId, ProjectChannel, ProjectId},
             workspace_model::{
                 ModelChannel, ModelEdit,
-                views::{Change, Pane, Scope, View},
+                views::{Change, Pane, View},
             },
         };
         for close_first in [true, false] {

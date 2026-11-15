@@ -413,7 +413,7 @@ impl Cagents {
                 && owners.next().is_none()
         });
         let mut retry = None;
-        if let (Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }) =
+        if let Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. } =
             &change
             && before.id == pane.id
             && self
@@ -11341,7 +11341,7 @@ mod tests {
                 })
                 .collect();
             model.views[0].panes.push(pane.clone());
-            let mut apply =
+            let apply =
                 |app: &mut Cagents, model: &mut crate::workspace_model::WorkspaceModel, scope| {
                     model.sequence += 1;
                     for view in &mut model.views {

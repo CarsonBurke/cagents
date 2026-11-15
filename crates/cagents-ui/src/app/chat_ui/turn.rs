@@ -930,7 +930,7 @@ mod tests {
         appended.at = Some(42);
         assert!(!same_structure(&initial, &[Arc::new(appended.clone())]));
         appended.at = initial[0].at;
-        let ItemContent::Text { text, thinking, .. } = &mut appended.content else {
+        let ItemContent::Text { thinking, .. } = &mut appended.content else {
             unreachable!()
         };
         *thinking = true;

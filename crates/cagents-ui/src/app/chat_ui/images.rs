@@ -197,7 +197,7 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     // Renderer clones retain exactly the actual thumbnail allocation, rather
     // than its conservative square admission reservation.
     drop(pixels.split(excess));
-    drop(bytes);
+    let _ = bytes;
     drop(encoded);
     let bytes = iced::advanced::graphics::core::Bytes::from_owner(Pixels {
         bytes: rgba.into_raw().into_boxed_slice(),

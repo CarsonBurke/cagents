@@ -1554,7 +1554,6 @@ impl PartialEq for Job {
 impl Eq for Job {}
 impl std::hash::Hash for Job {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        use std::hash::Hash;
         std::any::TypeId::of::<Self>().hash(state);
         self.target.hash(state);
         self.id.hash(state);

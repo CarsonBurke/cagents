@@ -35,11 +35,11 @@ fn rendered(runtime: &mut Runtime, width: f32, expanded: bool) {
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(element.as_widget());
     let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 10_000.0));
-    let mut node = element
+    let _ = element
         .as_widget_mut()
         .layout(&mut tree, &renderer, &limits);
     cached.flow_cache.complete_fixture();
-    node = element
+    let node = element
         .as_widget_mut()
         .layout(&mut tree, &renderer, &limits);
     let accessible =

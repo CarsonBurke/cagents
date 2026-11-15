@@ -13,7 +13,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use cosmic::{
@@ -23106,7 +23106,7 @@ pub(crate) mod tests {
             assert!(shell.is_layout_invalid(), "the redraw after focus relays");
         }
         let before = bounds(cached_projects::content_layout(&cached_tree));
-        cached_node = cached
+        let _ = cached
             .as_widget_mut()
             .layout(&mut cached_tree, &renderer, &limits);
         fresh_node = fresh
@@ -23613,7 +23613,7 @@ pub(crate) mod tests {
             &layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0)),
         );
         let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
-        let mut redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+        let redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
             let mut messages = Vec::new();
             list.as_widget_mut().update(
                 tree,
@@ -23673,7 +23673,7 @@ pub(crate) mod tests {
             &layout::Limits::new(Size::ZERO, Size::new(280.0, 200.0)),
         );
         let screen = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
-        let mut redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+        let redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
             let mut messages = Vec::new();
             list.as_widget_mut().update(
                 tree,

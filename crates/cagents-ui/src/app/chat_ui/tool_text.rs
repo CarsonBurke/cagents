@@ -1031,7 +1031,7 @@ mod tests {
             observed: None,
         };
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0));
-        let mut element = make();
+        let element = make();
         let mut tree = Tree::new(&element);
         let (mut element, mut node) = laid_out(&block, &make, &mut tree, &renderer, &limits);
         element.as_widget_mut().operate(
@@ -1065,7 +1065,7 @@ mod tests {
         );
         drop(tree);
         drop(element);
-        let mut element = make();
+        let element = make();
         let mut tree = Tree::new(&element);
         let (mut element, mut node) = laid_out(&block, &make, &mut tree, &renderer, &limits);
         let mut read = probe(None, None);

@@ -1,5 +1,9 @@
 use super::*;
 use crate::chat::{Role, ToolStatus};
+use iced::advanced::{
+    Layout, layout,
+    widget::{self, Operation, Tree},
+};
 
 fn item(id: &str, role: Role, text: &str) -> chat::Item {
     chat::Item {
@@ -1251,29 +1255,26 @@ struct ReportSurface {
     accessible: Vec<String>,
 }
 
-fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
-    use iced::advanced::{
-        Layout, layout,
-        widget::{Operation, Tree},
-    };
-    impl Operation for ReportSurface {
-        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-            visit(self);
-        }
-        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
-            self.text.push(text.to_owned());
-        }
-        fn custom(
-            &mut self,
-            _: Option<&widget::Id>,
-            _: iced::Rectangle,
-            state: &mut dyn std::any::Any,
-        ) {
-            if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
-                self.text.push(prose.plain.to_string());
-            }
+impl Operation for ReportSurface {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+        self.text.push(text.to_owned());
+    }
+    fn custom(
+        &mut self,
+        _: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
+        if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+            self.text.push(prose.plain.to_string());
         }
     }
+}
+
+fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
     let renderer = crate::app::tests::headless_renderer();
     let item = runtime.active_item(id).expect("current report source");
     let mut element = runtime.delivery_view(
