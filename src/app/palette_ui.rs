@@ -850,26 +850,32 @@ impl Cagents {
                             && primary == Some(card.id)))
                     .then_some(channel.title.as_str())
                 });
+                let checkout = pane_channels
+                    .get(&card.id)
+                    .is_none()
+                    .then(|| self.unchanneled_card_worktree_indexed(card, &roots))
+                    .flatten();
                 let place = pane_channels
                     .get(&card.id)
                     .map(|(place, _)| Cow::Borrowed(*place))
                     .or_else(|| {
-                        self.unchanneled_card_worktree_indexed(card, &roots)
-                            .map(|path| {
-                                path_labels.get(path).copied().flatten().map_or_else(
-                                    || {
-                                        Cow::Owned(
-                                            path.file_name()
-                                                .unwrap_or(path.as_os_str())
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                        )
-                                    },
-                                    Cow::Borrowed,
-                                )
-                            })
-                    })
-                    .unwrap_or(Cow::Borrowed("Global"));
+                        checkout.map(|path| {
+                            path_labels.get(path).copied().flatten().map_or_else(
+                                || {
+                                    Cow::Owned(
+                                        path.file_name()
+                                            .unwrap_or(path.as_os_str())
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    )
+                                },
+                                Cow::Borrowed,
+                            )
+                        })
+                    });
+                // A checkout names where a shell is, so its title need not.
+                let title = self.titled_beside_place(card, title, checkout);
+                let place = place.unwrap_or(Cow::Borrowed("Global"));
                 (
                     format!("Focus pane: {title} · {place}"),
                     self.palette_pane_status(card.id).into(),

@@ -36,6 +36,7 @@ pub struct SnapshotPreview {
     font_size: f32,
     family: &'static str,
     scale_factor: f32,
+    padding: f32,
 }
 
 impl SnapshotPreview {
@@ -46,6 +47,7 @@ impl SnapshotPreview {
             font_size: 10.0,
             family: super::intern_family(""),
             scale_factor: 1.0,
+            padding: 0.0,
         }
     }
 
@@ -61,6 +63,13 @@ impl SnapshotPreview {
 
     pub fn scale_factor(mut self, scale_factor: f32) -> Self {
         self.scale_factor = scale_factor;
+        self
+    }
+
+    /// Room between the screen's edge and its text, which the screen's
+    /// background fills.
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = padding;
         self
     }
 }
@@ -145,7 +154,7 @@ impl<Message> Widget<Message, Theme, Renderer> for SnapshotPreview {
                 self.scale_factor,
                 self.family,
                 LINE_HEIGHT_RATIO,
-                0.0,
+                self.padding,
             );
             let Some(content_clip) = geometry.content_bounds.intersection(&clip) else {
                 return;

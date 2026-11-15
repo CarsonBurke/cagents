@@ -8416,7 +8416,9 @@ for line in sys.stdin:
                     waiting: None,
                     detail: None,
                     id: id.into(),
-                    kind: "Explore".into(),
+                    // The Claude adapter resolves `kind` to the label a person
+                    // reads: the agent's name, else its task, else its type.
+                    kind: id.into(),
                     description: id.into(),
                     status: Some(status),
                     background: Some(true),

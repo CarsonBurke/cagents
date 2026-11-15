@@ -57,12 +57,16 @@ JOBS = (
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(
-        Suite("build offload", "tests/cargo_offload.py", sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py")),
+        Suite("build offload", "tests/cargo_offload.py",
+              sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host")),
     )),
     Job("cargo gate", suites=(
         Suite("held-command cancellation", "tests/cargo_gate.py",
-              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py"),
+              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py",
+                       "scripts/build-host", "scripts/memory-capped"),
               syntax=(("sh", "scripts/cargo-gate"),)),
+        Suite("build host admission and jobserver", "tests/build_host.py",
+              sources=("scripts/build-host", "scripts/memory-capped")),
     )),
     Job("build directories", suites=(
         Suite("build directory pruning", "tests/prune_build_dirs.py", sources=("scripts/prune-build-dirs",)),
@@ -98,6 +102,9 @@ JOBS = (
               sources=("tests/fixtures/chat-composer-claude.sh",)),
         Suite("synthetic Claude streaming", "tests/chat_composer_streaming.py",
               sources=("tests/fixtures/chat-composer-claude.sh",)),
+        Suite("shared-view seed refusal fixture", "tests/fixtures/test_seed_refusal_registry.py",
+              sources=("tests/fixtures/seed-refusal-registry.py", "tests/fixtures/seed-refusal-scene.sh"),
+              syntax=(("bash", "tests/fixtures/seed-refusal-scene.sh"),)),
         Suite("Codex resume history", "tests/codex_resume_history.py",
               sources=("tests/fixtures/codex-resume-history.py",)),
         Suite("Codex busy buttons", "tests/codex_busy_buttons_fixture.py",

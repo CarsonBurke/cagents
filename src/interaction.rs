@@ -639,9 +639,15 @@ pub fn focus_scope<'a, Message: 'a>(
     .into()
 }
 
-/// Counts the focusable controls in a subtree and finds the focused one.
-/// Selectable text registers as focusable without an id; it is for the
-/// pointer to copy from, not a stop on the way between a dialog's choices.
+/// Whether Tab within a scope stops on a control. Selectable text registers
+/// as focusable without an id; it is for the pointer to copy from, not a stop
+/// on the way between a dialog's choices. A disabled button is no stop either,
+/// unless it holds focus, so Tab moves on from it.
+fn is_scope_stop(id: Option<&Id>, state: &dyn operation::Focusable) -> bool {
+    id.is_some() && (state.is_focus_stop() || state.is_focused())
+}
+
+/// Counts the stops in a subtree and finds the focused one.
 #[derive(Default)]
 struct ScopeFocus {
     count: usize,
@@ -658,7 +664,7 @@ impl Operation for ScopeFocus {
         _bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if id.is_none() {
+        if !is_scope_stop(id, state) {
             return;
         }
         if state.is_focused() {
@@ -668,7 +674,7 @@ impl Operation for ScopeFocus {
     }
 }
 
-/// Focuses the subtree's `target`th focusable control and no other.
+/// Focuses the subtree's `target`th stop and no other control.
 struct FocusNth {
     target: usize,
     index: usize,
@@ -684,12 +690,13 @@ impl Operation for FocusNth {
         _bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if id.is_some() && self.index == self.target {
+        let stop = is_scope_stop(id, state);
+        if stop && self.index == self.target {
             state.focus();
         } else {
             state.unfocus();
         }
-        self.index += usize::from(id.is_some());
+        self.index += usize::from(stop);
     }
 }
 
@@ -775,6 +782,23 @@ fn space_as_enter(event: &Event) -> Option<Event> {
         text: None,
         repeat: *repeat,
     }))
+}
+
+/// Tells assistive technology whether a toggle button is pressed. The
+/// pinned COSMIC button draws `selected` but does not announce it, so a
+/// toggle with a fixed name, such as a filter or show/hide control, would
+/// otherwise read the same in both states.
+pub fn pressed<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    pressed: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Pressed(pressed),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
 }
 
 /// Blocks click-through without hiding the child's accessibility tree.
@@ -2039,6 +2063,7 @@ enum Kind {
         leading: bool,
     },
     Opaque,
+    Pressed(bool),
     KeyboardModal,
     UnclaimedKey,
     FocusScope,
@@ -2146,6 +2171,7 @@ struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
+struct PressedTag;
 struct KeyboardModalTag;
 struct FocusScopeTag;
 struct ContextMenuTag;
@@ -2241,6 +2267,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
+            Kind::Pressed(_) => tree::Tag::of::<PressedTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
             Kind::FocusScope => tree::Tag::of::<FocusScopeTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
@@ -2923,11 +2950,29 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content.as_widget().a11y_nodes(
+        let mut accessible = self.content.as_widget().a11y_nodes(
             effect_layout(self.kind, layout),
             &tree.children[0],
             cursor,
-        )
+        );
+        if let Kind::Pressed(pressed) = self.kind {
+            use iced_accessibility::accesskit::{Role, Toggled};
+            let is_button =
+                |node: &iced_accessibility::A11yNode| node.node().role() == Role::Button;
+            let nodes = if accessible.root().iter().any(is_button) {
+                accessible.root_mut()
+            } else {
+                accessible.children_mut()
+            };
+            if let Some(button) = nodes.iter_mut().find(|node| is_button(node)) {
+                button.node_mut().set_toggled(if pressed {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                });
+            }
+        }
+        accessible
     }
     fn drag_destinations(
         &self,
