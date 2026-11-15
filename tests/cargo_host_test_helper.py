@@ -46,6 +46,16 @@ if arguments and arguments[0].startswith("+"):
 with open(root / "events.jsonl", "a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "helper": os.environ.get(
         "CAGENTS_TEST_RETAINED_ACTOR_HELPER")}) + "\\n")
+auth = os.environ.get("MAKEFLAGS", "").partition("--jobserver-auth=")[2].split(" ")[0]
+if auth:
+    import stat
+    def pipe(end):
+        try:
+            return stat.S_ISFIFO(os.fstat(int(end)).st_mode)
+        except OSError:
+            return False
+    with open(root / "jobserver.jsonl", "a") as output:
+        output.write(json.dumps([arguments[0], all(map(pipe, auth.split(",")))]) + "\\n")
 if arguments[0] == "metadata":
     print(json.dumps({"workspace_root": str(root), "workspace_default_members": ["cagents-id"],
         "packages": [{"name": "cagents", "version": "0.1.3", "id": "cagents-id",
@@ -108,6 +118,19 @@ elif arguments[0] in ("test", "t"):
         self.assertEqual(events[1]["args"], ["test", "--no-run", *arguments[1:-2]])
         self.assertEqual(events[2], {"args": arguments, "helper": str(self.product)})
         self.assertEqual(result.stdout, "")
+
+    def test_cargo_keeps_the_jobserver_descriptors_the_build_named(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        self.addCleanup(os.close, writer)
+        command = [sys.executable, "-I", str(ROOT / "scripts/cargo-host-test-helper.py"), str(self.cargo),
+                   "test", "--no-default-features", "--features", "host"]
+        environment = self.env | {"MAKEFLAGS": f"-j --jobserver-auth={reader},{writer}"}
+        result = subprocess.run(command, cwd=self.root, env=environment, pass_fds=(reader, writer),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = [json.loads(line) for line in (self.root / "jobserver.jsonl").read_text().splitlines()]
+        self.assertEqual(seen, [["metadata", True], ["build", True]])
 
     def test_profile_target_config_and_attached_options_are_preserved(self):
         arguments = ["+stable", "test", "--lib", "--profile=dev-runtime", "--target-dir", "elsewhere",

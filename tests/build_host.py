@@ -721,6 +721,8 @@ class Jobserver(unittest.TestCase):
         self.assertNotIn("MFLAGS", environment)
         reader, writer = map(int, jobserver.auth.split(","))
         self.assertTrue(os.get_inheritable(reader) and os.get_inheritable(writer))
+        # Clear of what a script redirects, as `exec 9>lock` would.
+        self.assertGreaterEqual(min(reader, writer), build_host.HIGH_DESCRIPTOR)
         # Nothing of the build's own is left to clean up.
         self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["builds", "join", "pool", "users"])
 
@@ -828,6 +830,23 @@ class Jobserver(unittest.TestCase):
             build_host.Jobserver(str(self.directory), self.TOKENS)
         self.assertEqual(sorted(path.name for path in self.directory.iterdir()),
                          ["builds", "join", "pool", "users"])
+
+    def test_a_build_rejoins_when_something_between_closed_its_jobservers_descriptors(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, writer)
+        named = {"MAKEFLAGS": f"-j --jobserver-auth={reader},{writer}"}
+        for environment, lost in (({}, False), ({"MAKEFLAGS": "-s"}, False), (named, False)):
+            with unittest.mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(build_host.lost_jobserver(), lost, environment)
+        os.close(reader)
+        with unittest.mock.patch.dict(os.environ, named, clear=True):
+            self.assertTrue(build_host.lost_jobserver())
+        with unittest.mock.patch.dict(os.environ, named | {"CAGENTS_BUILD_SCOPE": "0"}, clear=True):
+            self.assertFalse(build_host.lost_jobserver())
+        # A descriptor reused for something other than a pipe is lost as well.
+        with open(os.devnull) as file, unittest.mock.patch.dict(
+                os.environ, {"MAKEFLAGS": f"-j --jobserver-auth={file.fileno()},{writer}"}, clear=True):
+            self.assertTrue(build_host.lost_jobserver())
 
     def test_cargo_jobs_follow_the_jobserver_unless_the_caller_set_them(self):
         self.assertEqual(build_host.build_environment({}, "3,4")["CARGO_BUILD_JOBS"], str(os.cpu_count()))

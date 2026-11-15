@@ -14,12 +14,14 @@ given its share back, in app-cagents-test.slice under memory-capped.
 Without a systemd user manager, or with CAGENTS_BUILD_SCOPE=0, builds still
 wait for their shares but run in place, each with its own Cargo jobs. A build
 that another build-host started runs in place too, in that build's scope and
-with its jobserver.
+with its jobserver, unless something between closed that jobserver's
+descriptors, when it joins the jobserver for itself.
 """
 import array
 import contextlib
 import fcntl
 import os
+import re
 import select
 import shutil
 import signal
@@ -76,6 +78,8 @@ TEST_SLICE = "app-cagents-test.slice"
 # often it counts the builds sharing it.
 TOKEN_TICK = 0.02
 SWEEP_SECONDS = 0.25
+# Where a build's jobserver descriptors start.
+HIGH_DESCRIPTOR = 200
 # Cargo's short names for what this splits.
 ALIASES = {"t": "test", "r": "run"}
 # Marks a command run by a build that holds shares, for the gates it starts.
@@ -308,6 +312,10 @@ class Jobserver:
                     ends[name] = (os.open(fifo, os.O_RDWR | os.O_NONBLOCK), os.open(fifo, os.O_RDWR))
                     self.own += ends[name]
             (self.give, reader), (self.back, writer) = ends["give"], ends["back"]
+            # Numbered high, clear of the low descriptors that scripts
+            # redirect, as with `exec 9>lock`.
+            reader, writer = (fcntl.fcntl(end, fcntl.F_DUPFD, HIGH_DESCRIPTOR) for end in (reader, writer))
+            self.own += [reader, writer]
             for descriptor in (reader, writer):
                 os.set_inheritable(descriptor, True)
             self.auth = f"{reader},{writer}"
@@ -408,10 +416,13 @@ class Jobserver:
         try:
             self.stopping.set()
             self.stocker.join()
-            if self.taken > 0:
-                os.write(self.pool, b"+" * self.taken)
-            self.taken = 0
-            self.close_descriptors()
+            # A build joining or sweeping meanwhile would find the pool
+            # emptied by its last holder, or repay this build again.
+            with self.serialized():
+                if self.taken > 0:
+                    os.write(self.pool, b"+" * self.taken)
+                self.taken = 0
+                self.close_descriptors()
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, masked)
 
@@ -419,7 +430,7 @@ class Jobserver:
         if self.record is not None:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(self.record_path)
-        for descriptor in (*self.own, self.record, self.pool, self.users):
+        for descriptor in (*self.own, self.record, self.users, self.pool):
             if descriptor is not None:
                 os.close(descriptor)
         self.users = self.pool = self.record = None
@@ -560,6 +571,18 @@ def within_build():
     return any(os.path.basename(argument) == b"build-host" for argument in arguments)
 
 
+def lost_jobserver():
+    """Whether this inherited a jobserver whose descriptors a process
+    between, such as Python's subprocess by default, did not pass on."""
+    found = re.search(r"--jobserver-auth=(\d+),(\d+)", os.environ.get("MAKEFLAGS", ""))
+    if not found or os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
+        return False
+    try:
+        return not all(stat.S_ISFIFO(os.fstat(int(end)).st_mode) for end in found.groups())
+    except OSError:
+        return True
+
+
 class Build:
     """One build's slot in the host: its shares, scope and jobserver."""
 
@@ -581,7 +604,7 @@ class Build:
                 self.nested = within_build()
                 self.scoped = not self.nested and prepare_slice()
                 self.jobserver = None
-                if self.scoped:
+                if self.scoped or self.nested and lost_jobserver():
                     try:
                         self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
                     except OSError as error:
