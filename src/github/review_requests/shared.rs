@@ -558,10 +558,8 @@ pub mod fixture {
 pub(crate) mod tests {
     use super::fixture::{page, published_fixture, publisher_process, repository, unprobed};
     use super::*;
-    use crate::github::review_requests::{Current, Entry, Viewer};
     use std::{
-        fs::{self, OpenOptions},
-        io::Write,
+        fs,
         process::{Command, Stdio},
         sync::atomic::{AtomicUsize, Ordering},
         thread,

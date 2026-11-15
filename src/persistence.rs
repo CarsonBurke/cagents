@@ -1,3 +1,5 @@
+#[cfg(any(not(feature = "ui"), test))]
+use std::time::Instant;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -6,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{

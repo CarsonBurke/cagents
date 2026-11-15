@@ -8549,7 +8549,7 @@ mod streamed_input;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn embedded_frames_are_recognized_without_flagging_ordinary_text() {

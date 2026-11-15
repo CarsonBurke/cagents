@@ -48,18 +48,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(all(test, not(feature = "host")))]
+use crate::process::WaitEvent;
 #[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(test, not(feature = "host")))]
 use std::{
     io::Write,
     process::{Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
 };
 
-#[cfg(test)]
-use crate::process::WaitEvent;
 pub use crate::process::{
     CLEANUP_GRACE, DEFAULT_STDERR_LIMIT, SIGKILL, SIGTERM, TERMINATION_GRACE, process_failure,
     signal_process_group,

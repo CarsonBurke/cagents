@@ -2160,7 +2160,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)

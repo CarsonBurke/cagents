@@ -3445,7 +3445,7 @@ mod tests {
             }
         }
         let _cleanup = OwnedCleanup(child.identity.try_clone().unwrap());
-        let (mut child, error) = crate::test_timing::returns("a refused finish", move || {
+        let (child, error) = crate::test_timing::returns("a refused finish", move || {
             let mut child = child;
             let error = child
                 .finish_with(true, |_| Err(io::Error::from_raw_os_error(libc::EPERM)))

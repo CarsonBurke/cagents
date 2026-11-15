@@ -2464,7 +2464,7 @@ impl TerminalHandle {
         if order.handoff {
             return Err(TerminalSendError::Closed);
         }
-        let input = matches!(
+        let _input = matches!(
             command,
             Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
         );
@@ -2971,7 +2971,7 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (mut held, output) = match &config.adoption {
+        let (held, output) = match &config.adoption {
             Some(socket) => {
                 let adopted = holder::adopt_recoverable(
                     socket,

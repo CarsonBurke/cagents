@@ -837,7 +837,7 @@ mod tests {
             let listing = memory.listing.as_mut().unwrap();
             listing.at = Instant::now().checked_sub(by).unwrap();
         };
-        let mut poll = |memory: &mut Memory, freshness| {
+        let poll = |memory: &mut Memory, freshness| {
             let read = listing(&gh, &repository, memory, freshness, &cancellation);
             (read.is_ok(), forge.take())
         };
