@@ -45,6 +45,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
+   Restoring a seed keeps existing provider homes and transcript files in place,
+   including read-only files. Updated files regain the seed's saved permissions;
+   fixture symlinks are not followed when preparing files for restoration.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
    `shot`).
@@ -55,6 +58,23 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
+
+## A scoped UI caller
+
+Add `start SIDE --ui-scoped-fixture`, or pass `--ui-scoped-fixture` to a remote
+`pair`, to exercise permission refusals in the actual UI. The option starts
+the fixture's daemon as User, then adds the hardcoded invalid synthetic
+`native-evidence-invalid-session` authority only to the UI runner's environment.
+It accepts no credential value and forwards no caller authority. `env` and
+`cli` commands retain User authority so a scene can seed its private data.
+A later `start` without the option removes that selection; `relaunch` keeps
+the current session's selection.
+
+Run it through `--remote fw16` from a hosted session. The ordinary inherited
+authority refusal still applies before fixture setup. This fixture tests a
+rejected synthetic caller, not the permissions of a valid hosted session.
+It uses the same offline providers and isolated provider homes as other
+native-evidence scenes.
 
 ## An offline GitHub
 
@@ -314,6 +334,18 @@ turn.
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
+```
+
+`agents` has the lead start a background command and three background
+subagents, one of which finishes before the lead answers, so two subagents
+and the command are still working after the lead has finished. `plan` needs a session started with
+`--codex tool-rows`: its Codex turn publishes a plan with a step in progress
+beside the running tool, collaboration and event rows, stays working for 40
+seconds through `CODEX_HOME/fixture-plan`, then finishes.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" agents
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" plan
 ```
 
 For a short comparison against main after the background-notice changes, run

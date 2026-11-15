@@ -1577,6 +1577,40 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_pin_preserves_the_confirmed_pin_and_derived_state() {
+        let mut state = State::default();
+        let mut pinned = item("feat/board", "cagents");
+        pinned.column = Column::Stale;
+        pinned.pinned = true;
+        watched(&mut state, 1, board(vec![pinned]));
+        let confirmed = state.confirmed.clone().unwrap();
+        let card = CardRef::of(&confirmed.items[0]);
+
+        state.update(Action::Pin(card.clone(), Some(Column::InReview)));
+        let shown = state.item(&card).unwrap();
+        assert_eq!(
+            (shown.column, shown.pinned, shown.derived),
+            (Column::InReview, true, Column::InProgress)
+        );
+        assert!(Arc::ptr_eq(state.confirmed.as_ref().unwrap(), &confirmed));
+        let original = &confirmed.items[0];
+        assert_eq!(
+            (original.column, original.pinned, original.derived),
+            (Column::Stale, true, Column::InProgress)
+        );
+
+        state.update(Action::Pinned(Err("Permission denied".into())));
+        let shown = state.item(&card).unwrap();
+        assert_eq!(
+            (shown.column, shown.pinned, shown.derived),
+            (Column::Stale, true, Column::InProgress)
+        );
+        assert!(Arc::ptr_eq(state.confirmed.as_ref().unwrap(), &confirmed));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &confirmed));
+        assert!(state.error.is_some());
+    }
+
+    #[test]
     fn a_card_menu_closes_when_its_card_leaves_the_board() {
         let mut state = State::default();
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));

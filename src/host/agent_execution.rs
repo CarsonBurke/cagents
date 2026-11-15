@@ -52,12 +52,19 @@ pub(super) fn caller(
     host: &SharedHost,
     authority: &Authority,
 ) -> Result<(Origin, Option<TerminalId>), String> {
+    checked_caller(host, authority).map_err(|error| error.to_string())
+}
+
+pub(super) fn checked_caller(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<(Origin, Option<TerminalId>), super::model::AuthorityError> {
     let registry = registry(host)?;
     let (origin, source) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         (
             registry.execution_origin(authority)?,
-            registry.agent_authority_source(authority)?,
+            registry.checked_agent_authority_source(authority)?,
         )
     };
     let session = source.as_ref().map(HostedSession::id);
@@ -79,7 +86,9 @@ pub(super) fn caller(
             }
         };
         if !live {
-            return Err("The issuing agent session is no longer live or proved adopted".into());
+            return Err(super::model::AuthorityError::Denied(
+                "The issuing agent session is no longer live or proved adopted".into(),
+            ));
         }
     }
     Ok((origin, session))

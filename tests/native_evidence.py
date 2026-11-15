@@ -185,10 +185,15 @@ STUBS = {
             fi
             printf '%s\\n' "${arguments[*]}" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
+            env > "$STUB_LOG/ui-env"
             printf '%s\\n' "${RUST_LOG:-unset}" > "$STUB_LOG/ui-rust-log"
             exec sleep 300
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
+        if [ "$*" = 'daemon start' ]; then
+            env > "$STUB_LOG/daemon-start-env"
+            [ ! -e "$STUB_LOG/daemon-start-fails" ] || exit 7
+        fi
         if [ "$*" = '--no-start daemon preflight' ]; then printf 'capability'; exit 0; fi
         if [ "${1:-}" = print-env ]; then env; fi
     """,
@@ -486,6 +491,87 @@ class Evidence(unittest.TestCase):
                                           extra={"STUB_CARGO_FAILS": "1"}).returncode, 0)
         self.assertIn("has not been built", self.run_tool("start", "after", check=False).stderr)
 
+    def main_build(self, checkout: Path, arguments: str | None = None) -> Path:
+        """Executables the sentinel kept of CHECKOUT's commit."""
+        builds = self.root / "real-home" / ".local" / "state" / "cagents-main-sentinel" / "builds"
+        head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], check=True,
+                              env=self.env, capture_output=True, text=True).stdout.strip()
+        directory = builds / head
+        self.executables(directory)
+        if arguments is not None:
+            (directory / "arguments").write_text(arguments)
+        (builds / ".lock").touch()
+        return directory
+
+    def executables(self, directory: Path) -> None:
+        """Executables as build would make them, and what it built them with."""
+        directory.mkdir(parents=True)
+        for name in ("cagents", "cagentsd", "cagents-ui"):
+            shutil.copy(self.bin / "fixture-cli", directory / name)
+        (directory / "arguments").write_text(self.run_tool("__build-arguments").stdout)
+
+    def test_a_main_commit_the_sentinel_built_is_taken_without_compiling(self) -> None:
+        checkout = self.checkout()
+        prebuilt = self.main_build(checkout)
+        result = self.run_tool("build", "after", str(checkout))
+        self.assertIn("from main's prebuilt executables", result.stdout)
+        self.assertFalse((self.logs / "cargo").exists())
+        # The sentinel's copy stays for the next task.
+        self.assertTrue((prebuilt / "cagents-ui").exists())
+        self.run_tool("start", "after")
+        self.assertTrue((self.logs / "ui-ran").exists())
+
+    def test_a_prebuilt_copy_that_fails_is_compiled_instead(self) -> None:
+        checkout = self.checkout()
+        (self.main_build(checkout) / "cagentsd").unlink()
+        result = self.run_tool("build", "after", str(checkout))
+        self.assertIn("has no cagentsd", result.stderr)
+        self.assertTrue((self.logs / "cargo").exists())
+        self.run_tool("start", "after")
+
+    def test_a_changed_checkout_or_other_build_of_main_is_compiled(self) -> None:
+        checkout = self.checkout()
+        self.main_build(checkout, arguments="--features something-else\n")
+        self.run_tool("build", "after", str(checkout))
+        self.assertTrue((self.logs / "cargo").exists())
+        (self.logs / "cargo").unlink()
+        other = self.checkout("before")
+        self.main_build(other)
+        (other / "edited").write_text("new")
+        self.run_tool("build", "before", str(other))
+        self.assertTrue((self.logs / "cargo").exists())
+
+    def test_executables_built_elsewhere_are_moved_into_the_target(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent))
+        self.assertIn(f"from {sent}", result.stdout)
+        self.assertFalse((self.logs / "cargo").exists())
+        self.assertFalse(sent.exists())
+        self.run_tool("start", "after")
+        self.assertTrue((self.logs / "ui-ran").exists())
+
+    def test_executables_built_otherwise_are_refused(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        (sent / "arguments").write_text("--profile release\n")
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not built as this native-evidence builds", result.stderr)
+        self.assertFalse((self.logs / "cargo").exists())
+
+    def test_executables_missing_one_are_refused(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        (sent / "cagentsd").unlink()
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no cagentsd", result.stderr)
+        self.assertIn("has not been built", self.run_tool("start", "after", check=False).stderr)
+
     def test_a_running_side_cannot_be_rebuilt_under_its_evidence(self) -> None:
         checkout = self.built()
         self.run_tool("start", "after")
@@ -768,6 +854,50 @@ class Evidence(unittest.TestCase):
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
+    def test_scoped_ui_fixture_leaves_daemon_env_and_cli_as_user_and_resets_on_next_start(self) -> None:
+        self.built()
+        token = "native-evidence-invalid-session"
+        self.run_tool("start", "after", "--ui-scoped-fixture")
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "runner-env").read_text())
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "ui-env").read_text())
+        daemon_environment = (self.logs / "daemon-start-env").read_text()
+        fixture_environment = self.run_tool("env", "env").stdout
+        cli_environment = self.run_tool("cli", "print-env").stdout
+        for name in AUTHORITY_NAMES:
+            for environment in (daemon_environment, fixture_environment, cli_environment):
+                self.assertNotIn(f"{name}=", environment)
+        self.assertNotIn(token, daemon_environment + fixture_environment + cli_environment)
+        self.assertIn("daemon start", (self.logs / "cli").read_text().splitlines())
+        self.run_tool("stop")
+        (self.logs / "ui-ran").unlink()
+        (self.logs / "runner-env").unlink()
+        self.run_tool("start", "after")
+        self.assertEqual((self.task / "session/ui-scoped-fixture").read_text(), "\n")
+        for name in AUTHORITY_NAMES:
+            self.assertNotIn(f"{name}=", (self.logs / "runner-env").read_text())
+            self.assertNotIn(f"{name}=", (self.logs / "ui-env").read_text())
+        self.run_tool("stop")
+
+    def test_scoped_ui_fixture_still_refuses_inherited_authority_before_start(self) -> None:
+        for name in AUTHORITY_NAMES:
+            for value in ("", "inherited-caller-token"):
+                with self.subTest(name=name, value=value):
+                    result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False,
+                                           extra={name: value})
+                    self.assertEqual(result.returncode, 77)
+                    self.assertIn("genuine User shell", result.stderr)
+                    self.assertFalse(self.task.exists())
+        self.assertFalse((self.logs / "runner").exists())
+
+    def test_scoped_ui_fixture_daemon_start_failure_never_launches_the_ui(self) -> None:
+        self.built()
+        (self.logs / "daemon-start-fails").touch()
+        result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not start the User fixture daemon", result.stderr)
+        self.assertFalse((self.logs / "runner").exists())
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_workspace_trace_reaches_only_the_session_that_asked_for_it(self) -> None:
         self.built()
         tracing = "cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn"
@@ -989,8 +1119,14 @@ class Evidence(unittest.TestCase):
                 self.assertFalse((self.logs / "ui-peer-pid").exists())
 
     def test_open_window_uses_built_products_and_a_new_native_identity(self) -> None:
+        self.assert_open_window_uses_built_products()
+
+    def test_scoped_ui_fixture_applies_to_additional_windows(self) -> None:
+        self.assert_open_window_uses_built_products(scoped=True)
+
+    def assert_open_window_uses_built_products(self, scoped=False) -> None:
         self.built()
-        self.run_tool("start", "after", "--workspace-trace")
+        self.run_tool("start", "after", "--workspace-trace", *(["--ui-scoped-fixture"] if scoped else []))
         primary = int((self.logs / "ui-pid").read_text())
         cargo_before = (self.logs / "cargo").read_text()
         receipt = self.task / "session/window-window-2"
@@ -1012,6 +1148,12 @@ class Evidence(unittest.TestCase):
             arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
             self.assertEqual(arguments[-3:], ["--", "--window", "window-2"])
             self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
             self.assertIn(str(self.task / "logs/ui-after-window-2.log"), (self.logs / "runner").read_text())
             os.kill(primary, 0)
             self.assertFalse((self.task / "session/replaying").exists())
@@ -1091,9 +1233,13 @@ class Evidence(unittest.TestCase):
     def test_relaunch_preserves_workspace_trace(self) -> None:
         self.assert_relaunch_keeps_built_products(workspace_trace=True)
 
-    def assert_relaunch_keeps_built_products(self, workspace_trace=False) -> None:
+    def test_relaunch_preserves_scoped_ui_fixture(self) -> None:
+        self.assert_relaunch_keeps_built_products(workspace_trace=True, scoped=True)
+
+    def assert_relaunch_keeps_built_products(self, workspace_trace=False, scoped=False) -> None:
         self.built()
-        self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []))
+        self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []),
+                      *(["--ui-scoped-fixture"] if scoped else []))
         original_pid = int((self.logs / "ui-pid").read_text())
         # A previous runner receipt cannot establish that the current window closed.
         (self.task / "niri" / "session.rc").write_text("0")
@@ -1126,6 +1272,12 @@ class Evidence(unittest.TestCase):
             self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
             if workspace_trace:
                 self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
             self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
             self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
             self.run_tool("stop")
@@ -1431,6 +1583,61 @@ class Evidence(unittest.TestCase):
             self.run_tool("stop")
         self.run_tool("save-seed")
         self.assertNotIn("will not reopen", self.run_tool("start", "after").stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses read-only file permissions")
+    def test_seed_restores_read_only_files_in_place_without_following_symlinks(self) -> None:
+        self.built("after")
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        provider_home = fixture / "home" / ".claude"
+        transcript = provider_home / "session.jsonl"
+        git_object = fixture / "project" / ".git" / "objects" / "aa" / ("0" * 38)
+        git_object.parent.mkdir(parents=True, exist_ok=True)
+        unchanged = fixture / "home" / "unchanged-read-only"
+        files = {transcript: 0o400, git_object: 0o444, unchanged: 0o444}
+        for path, mode in files.items():
+            path.write_text("seeded\n")
+            path.chmod(mode)
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_file = outside / "read-only"
+        outside_file.write_text("outside the fixture\n")
+        outside_file.chmod(0o444)
+        (fixture / "home" / "file-link").symlink_to(outside_file)
+        (fixture / "home" / "directory-link").symlink_to(outside, target_is_directory=True)
+        recorded = {path: path.stat().st_ino for path in [provider_home, *files]}
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+
+        transcript.chmod(0o600)
+        transcript.write_text("changed transcript\n")
+        transcript.chmod(0o400)
+        for path in (transcript, git_object):
+            # A Git scene can recreate the same object with a different mtime.
+            os.utime(path, (1_700_000_120, 1_700_000_120))
+        self.run_tool("start", "after")
+        self.assertEqual(recorded, {path: path.stat().st_ino for path in recorded})
+        for path, mode in files.items():
+            self.assertEqual(path.read_text(), "seeded\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            self.assertEqual(path.stat().st_mtime_ns, 1_700_000_000_000_000_000)
+        self.assertTrue((fixture / "home" / "file-link").is_symlink())
+        self.assertTrue((fixture / "home" / "directory-link").is_symlink())
+        self.assertEqual(outside_file.read_text(), "outside the fixture\n")
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
+        self.run_tool("stop")
+
+        # If the transfer fails, permissions return to their pre-restore mode.
+        git_object.chmod(0o400)
+        os.utime(git_object, (1_700_000_240, 1_700_000_240))
+        write_executable(self.bin / "rsync", "#!/bin/sh\nexit 23\n", self.logs)
+        failed = self.run_tool("start", "after", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("could not restore the seed", failed.stderr)
+        self.assertEqual(git_object.stat().st_ino, recorded[git_object])
+        self.assertEqual(stat.S_IMODE(git_object.stat().st_mode), 0o400)
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
 
     def test_a_seed_saved_before_its_home_was_recorded_is_said_not_to_reopen(self) -> None:
         self.built("after")
@@ -2018,15 +2225,47 @@ REMOTE_STUBS = {
         host=$1
         shift
         [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
+        login=(env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" GIT_CONFIG_GLOBAL=/dev/null)
+        # An rsync server speaks its protocol over this connection until the
+        # client hangs up, which it does only once ssh has exited.
+        case $1 in
+            rsync) exec "${login[@]}" sh -c "$*" ;;
+        esac
         # What travels to the host: its arguments, above, and its input.
-        tee -a "$STUB_LOG/ssh-input" | env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" \\
-            GIT_CONFIG_GLOBAL=/dev/null sh -c "$*"
+        tee -a "$STUB_LOG/ssh-input" | "${login[@]}" sh -c "$*"
+    """,
+    # Only to say where a checkout's builds go, as Cargo would.
+    "cargo": """
+        #!/bin/bash
+        [ "$1" = metadata ] || { echo "cargo: only metadata here" >&2; exit 101; }
+        printf '{"target_directory":"%s"}\\n' "${CARGO_TARGET_DIR:-$PWD/target}"
     """,
 }
+
+# A checkout's own gate: each build writes a stand-in executable naming the
+# checkout's state, and is recorded.
+GATE_STUB = """
+    #!/bin/bash
+    if [ "$1 $2" = "exec --hold" ]; then
+        printf '%s\\t%s\\n' "$PWD" "exec --hold" >> "$STUB_LOG/gate"
+        shift 2
+        exec "$@"
+    fi
+    printf '%s\\t%s\\n' "$PWD" "$*" >> "$STUB_LOG/gate"
+    target=${CARGO_TARGET_DIR:-target}
+    mkdir -p "$target/dev-runtime"
+    executable=$target/dev-runtime/${*: -1}
+    printf '%s %s\\n' "${*: -1}" "$(cat src.rs 2>/dev/null)" > "$executable"
+    chmod +x "$executable"
+"""
 
 # The build host's native-evidence: records each command and what it ran with.
 REMOTE_TOOL = """
     #!/bin/bash
+    if [ "$1" = __build-arguments ]; then
+        printf -- '--profile dev-runtime --bin %s\\n' cagents cagentsd cagents-ui
+        exit 0
+    fi
     [ "$1" = --task ] && task=$2 && shift 2
     printf '%s\\t%s\\n' "$task" "$*" >> "$STUB_LOG/remote-tool"
     env > "$STUB_LOG/remote-env"
@@ -2046,7 +2285,15 @@ REMOTE_TOOL = """
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
         shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
-        build) printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2" ;;
+        build) [ ! -e "$task/build-fails" ] || exit 1
+               printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2"
+               mkdir -p "$task/target-$2"
+               (cd "$3" && pwd -P) > "$task/target-$2/evidence-source"
+               if [ "${4:-}" = --executables ]; then
+                   printf '%s\\n' "$5" > "$task/executables-$2"
+                   cat "$5"/* > "$task/took-$2"
+                   rm -r "$5"
+               fi ;;
         cli) printf '%s\\n' "$*" > "$task/cli" ;;
     esac
 """
@@ -2090,6 +2337,13 @@ class RemoteEvidence(unittest.TestCase):
             check=True, env=self.env, capture_output=True, text=True,
         ).stdout.strip()
 
+    def checkout(self, name: str, files: dict[str, str]) -> Path:
+        """A checkout whose gate builds stand-in executables in its target,
+        as `mise run dev` would build the real ones."""
+        path = self.repository(name, {**files, "scripts/cargo-gate": GATE_STUB}, executable=True)
+        (path / ".git/info/exclude").write_text("target/\n")
+        return path
+
     def repository(self, name: str, files: dict[str, str], executable: bool = False) -> Path:
         path = self.root / name
         for relative, body in files.items():
@@ -2129,7 +2383,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("--remote fw16", result.stderr)
 
     def test_a_hosted_shell_runs_it_on_the_host_without_its_authority(self) -> None:
-        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         self.run_tool("build", "after", str(checkout))
         environment = (self.logs / "remote-env").read_text()
         self.assertNotIn("CAGENTS_AGENT_AUTHORITY", environment)
@@ -2143,13 +2397,98 @@ class RemoteEvidence(unittest.TestCase):
         built = (self.remote_task / "built-after").read_text().strip()
         self.assertEqual(built, str(self.remote_repository / ".worktrees" / "cev-mytask-after"))
         self.assertEqual(self.git(Path(built), "rev-parse", "HEAD"), self.git(checkout, "rev-parse", "HEAD"))
-        # The host's login shell may not be Bash: every script travels on its input.
+        # The host's login shell may not be Bash: every script travels on its
+        # input. Git and rsync start their own servers, which take only words.
         commands = {line.split(" buildhost ", 1)[-1] for line in (self.logs / "ssh").read_text().splitlines()
-                    if "receive-pack" not in line}
+                    if "receive-pack" not in line and " buildhost rsync --server " not in line}
         self.assertEqual(commands, {"bash -s"})
 
+    def test_a_checkout_builds_through_its_own_gate_and_sends_what_it_built(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        (checkout / "src.rs").write_text("fn main() { edited(); }\n")
+        self.run_tool("build", "after", str(checkout))
+        gate = [line.split("\t") for line in (self.logs / "gate").read_text().splitlines()]
+        self.assertEqual({directory for directory, _ in gate}, {str(checkout)})
+        # In one slot, held for the three, as the tool says to build them.
+        self.assertEqual([arguments for _, arguments in gate], [
+            "exec --hold",
+            *(f"build --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
+        ])
+        # The host takes the executables built here, of the edited files, and
+        # what they were built with.
+        self.assertEqual((self.remote_task / "executables-after").read_text().strip(),
+                         str(self.remote_task / "upload-after"))
+        took = (self.remote_task / "took-after").read_text()
+        self.assertEqual(took.count("fn main() { edited(); }"), 3)
+        self.assertIn("--profile dev-runtime --bin cagents-ui", took)
+        # Nor does the checkout keep anything it did not have.
+        self.assertEqual(self.git(checkout, "status", "--porcelain"), "M src.rs")
+
+    def test_builds_are_taken_from_where_cargo_puts_them(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "moved\n"})
+        elsewhere = self.root / "elsewhere"
+        self.run_tool("build", "after", str(checkout), extra={"CARGO_TARGET_DIR": str(elsewhere)})
+        self.assertEqual((self.remote_task / "took-after").read_text().count("moved"), 3)
+        self.assertFalse((checkout / "target").exists())
+
+    def test_what_was_sent_for_a_failed_build_does_not_stay(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        (self.remote_task / "build-fails").touch()
+        result = self.run_tool("build", "after", str(checkout), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"build after {self.remote_repository}/.worktrees/cev-mytask-after --executables "
+                      f"{self.remote_task}/upload-after", self.tool_calls())
+        self.assertFalse((self.remote_task / "upload-after").exists(), result.stderr)
+
+    def test_a_main_commit_the_host_has_built_is_not_built_again(self) -> None:
+        checkout = self.checkout("before", {"src.rs": "fn main() {}\n"})
+        head = self.git(checkout, "rev-parse", "HEAD")
+        prebuilt = self.remote_home / ".local/state/cagents-main-sentinel/builds" / head
+        prebuilt.mkdir(parents=True)
+        (prebuilt / "arguments").write_text("as native-evidence builds\n")
+        self.run_tool("build", "before", str(checkout))
+        self.assertFalse((self.logs / "gate").exists())
+        self.assertFalse((self.remote_task / "executables-before").exists())
+        self.assertEqual((self.remote_task / "built-before").read_text().strip(),
+                         str(self.remote_repository / ".worktrees" / "cev-mytask-before"))
+
+    def test_the_tools_own_checkout_is_built_from_where_the_tool_already_is(self) -> None:
+        write_executable(self.tool / "scripts" / "cargo-gate", GATE_STUB, self.logs)
+        (self.tool / ".git/info/exclude").write_text("target/\n")
+        self.run_tool("build", "after", str(self.tool))
+        tool_checkout = self.remote_repository / ".worktrees" / "cev-mytask-tool"
+        self.assertEqual((self.remote_task / "built-after").read_text().strip(), str(tool_checkout))
+        self.assertFalse((self.remote_repository / ".worktrees" / "cev-mytask-after").exists())
+        self.assertTrue((tool_checkout / "scripts" / "cargo-gate").exists())
+
+    def test_the_same_uncommitted_files_are_the_same_commit(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "\n"})
+        (checkout / "new.rs").write_text("fn new() {}\n")
+        self.run_tool("build", "after", str(checkout))
+        first = (self.task / "sources.tsv").read_text().split()[3]
+        self.run_tool("build", "after", str(checkout))
+        self.assertEqual((self.task / "sources.tsv").read_text().split()[3], first)
+
+    def test_a_session_running_from_the_tool_checkout_is_not_changed_under_it(self) -> None:
+        write_executable(self.tool / "scripts" / "cargo-gate", GATE_STUB, self.logs)
+        (self.tool / ".git/info/exclude").write_text("target/\n")
+        self.run_tool("build", "after", str(self.tool))
+        self.run_tool("start", "after")
+        before = self.checkout("before", {"src.rs": "\n"})
+        # The tool unchanged, the other side builds.
+        self.run_tool("build", "before", str(before))
+        (self.tool / "edited").write_text("new\n")
+        result = self.run_tool("build", "before", str(before), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runs from this tool's checkout", result.stderr)
+        self.assertFalse((self.remote_repository / ".worktrees" / "cev-mytask-tool" / "edited").exists())
+        self.run_tool("stop")
+        self.run_tool("build", "before", str(before))
+        self.assertTrue((self.remote_repository / ".worktrees" / "cev-mytask-tool" / "edited").exists())
+
     def test_uncommitted_and_untracked_files_are_built_without_touching_the_checkout(self) -> None:
-        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         head = self.git(checkout, "rev-parse", "HEAD")
         (checkout / "src.rs").write_text("fn main() { changed(); }\n")
         (checkout / "new.rs").write_text("fn new() {}\n")
@@ -2180,7 +2519,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(self.git(remote, "rev-parse", "HEAD"), self.git(self.tool, "rev-parse", "base"))
 
     def test_shots_come_back_with_their_manifest(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         result = self.run_tool("shot", "home")
@@ -2189,30 +2528,30 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("cli", "project", "open", "{fixture}/project", "it's quoted")
         self.assertEqual((self.remote_task / "cli").read_text().strip(),
                          f"cli project open {self.remote_task}/fixture/project it's quoted")
 
     def test_pair_runs_the_steps_on_both_sides_and_brings_back_every_shot(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
-        after = self.repository("after", {"src.rs": "new\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
+        after = self.checkout("after", {"src.rs": "new\n"})
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace", "--ui-scoped-fixture")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace --ui-scoped-fixture", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 
     def test_open_window_is_forwarded_to_the_owned_remote_task(self) -> None:
-        checkout = self.repository("after", {"src.rs": "new\n"})
+        checkout = self.checkout("after", {"src.rs": "new\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("open-window", "window-2")
         self.assertIn("open-window window-2", self.tool_calls())
@@ -2225,8 +2564,8 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse((self.logs / "remote-tool").exists())
 
     def test_pair_forwards_a_real_codex_host_path_without_shell_evaluation(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
-        after = self.repository("after", {"src.rs": "new\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
+        after = self.checkout("after", {"src.rs": "new\n"})
         steps = self.root / "steps.sh"
         steps.write_text('evidence shot "real-$SIDE"\n')
         marker = self.root / "must-not-be-created"
@@ -2241,14 +2580,14 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_steps_name_the_fixture_on_the_host(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         steps.write_text("evidence cli project open '{fixture}/project'\n")
         self.run_tool("pair", "--before", str(before), "--after", str(before), "--steps", str(steps))
         self.assertIn(f"cli project open {self.remote_task}/fixture/project", self.tool_calls())
 
     def test_a_running_side_is_not_rebuilt_under_its_session(self) -> None:
-        checkout = self.repository("after", {"src.rs": "one\n"})
+        checkout = self.checkout("after", {"src.rs": "one\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         (checkout / "src.rs").write_text("two\n")
@@ -2259,7 +2598,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(built.read_text(), "one\n")
 
     def test_a_task_with_another_owner_on_the_host_is_left_alone(self) -> None:
-        checkout = self.repository("after", {"src.rs": "one\n"})
+        checkout = self.checkout("after", {"src.rs": "one\n"})
         self.run_tool("build", "after", str(checkout))
         owner = self.remote_home / ".local/state/cev-owners/mytask"
         self.assertTrue(owner.read_text().endswith(f":{self.task}\n"))
@@ -2298,7 +2637,7 @@ class RemoteEvidence(unittest.TestCase):
     def test_a_task_an_earlier_route_started_is_claimed_as_the_refusal_says(self) -> None:
         # Before owner records, the route left a task and no record, and a
         # host with only such tasks has no record directory either.
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         (self.remote_task / "shots").mkdir(parents=True)
         (self.remote_task / ".native-evidence").touch()
         refused = self.run_tool("build", "after", str(checkout), check=False)
@@ -2320,7 +2659,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("run scripts/native-evidence here without --remote", result.stderr)
 
     def test_clean_keeps_everything_when_the_session_does_not_stop(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         (self.remote_task / "stop-fails").touch()
@@ -2331,7 +2670,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertTrue(self.remote_task.exists())
 
     def test_clean_removes_the_task_from_the_host_and_keeps_the_shots_here(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         self.run_tool("shot", "home")
@@ -2344,7 +2683,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertTrue((self.task / "shots" / "after-home.webp").exists())
 
     def test_a_failing_step_still_stops_its_session(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         steps.write_text("evidence shot first\nfalse\nevidence shot never\n")
         result = self.run_tool("pair", "--before", str(before), "--after", str(before),
@@ -2356,7 +2695,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(self.tool_calls()[-1], "stop")
 
     def test_a_lost_connection_still_stops_the_session(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         # What the host's watcher sends once the connection has gone: TERM
         # to the work's process group, which the steps run in.
