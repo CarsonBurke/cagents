@@ -1938,7 +1938,7 @@ scripts/native-evidence stop
   `origin/main`, usually compiles nothing: the host copies its executables.
   Any other checkout builds through its own `scripts/cargo-gate`, in its own
   build slot and target as `mise run dev` does, so what you already built for
-  the change is reused; the three executables then go from here to the task,
+  the change is reused while that slot is free; the three executables then go from here to the task,
   sent as differences from the task's previous ones. Any other revision builds
   in a shared slot on the host. Capture the before side at the start of the
   work, while the main commit you started from is among the sentinel's recent
