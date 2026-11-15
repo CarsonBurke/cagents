@@ -2365,6 +2365,7 @@ impl ControlClient {
             | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
+            | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2591,6 +2592,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatLimit { .. }
         | ServerMessage::ChatAgentAddresses { .. }
         | ServerMessage::AutomationProposalsChanged { .. }
+        | ServerMessage::ChatActiveModel { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2613,6 +2615,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
+        ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",

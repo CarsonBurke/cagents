@@ -582,6 +582,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "chat_limit", 160),
     ("ServerMessage", "chat_agent_addresses", 173),
+    ("ServerMessage", "chat_active_model", 182),
 ];
 
 /// One source qualification for lifecycle control and migration inspection.
@@ -660,6 +661,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (
         180,
         "intermediate #2783 protocol; superseded by 181 without a qualified installed update source",
+    ),
+    (
+        181,
+        "intermediate #2815 protocol; superseded by 182 without a qualified installed update source",
     ),
 ];
 
@@ -927,7 +932,7 @@ mod admission_message_tests {
         for &(protocol, _) in RETIRED_SOURCES {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
         }
-        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176, 180] {
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176, 180, 181] {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
             let message = unsupported_source(protocol).to_string();
             assert!(message.contains(&format!("uses protocol {protocol}")));

@@ -809,6 +809,11 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
+    // It was appended when introduced; later protocols may append more.
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AGENT_ADDRESSES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
@@ -831,12 +836,47 @@ fn automation_request_changes_are_beyond_recordings_before_their_introduction() 
         repository: "/fixture".into(),
     };
     let index = super::variant_index(&changed).unwrap();
-    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    const AUTOMATION_REQUEST_CHANGES_SINCE: u16 = 178;
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AUTOMATION_REQUEST_CHANGES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
         .chain(crate::update::source::current_client_protocols())
-        .filter(|&protocol| protocol < 178);
+        .filter(|&protocol| protocol < AUTOMATION_REQUEST_CHANGES_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+#[test]
+fn active_models_are_beyond_every_older_recording() {
+    let model = ServerMessage::ChatActiveModel {
+        chat_id: crate::model::TerminalId::new(),
+        revision: 1,
+        model: None,
+    };
+    const ACTIVE_MODELS_SINCE: u16 = 182;
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "chat_active_model",
+        ACTIVE_MODELS_SINCE
+    )));
+    let index = super::variant_index(&model).unwrap();
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(ACTIVE_MODELS_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < ACTIVE_MODELS_SINCE);
     for protocol in older {
         assert!(
             variant_count(&recorded(protocol), "ServerMessage") <= index,

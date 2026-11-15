@@ -538,6 +538,13 @@ handle_control() {
         if [ -f "$config/fixture-commands.json" ]; then
             metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
         fi
+        if [ -f "$config/fixture-unconfirmed-model" ]; then
+            metadata=$(printf '%s' "$metadata" | jq -c 'del(.model)')
+        fi
+    elif [ "$subtype" = get_settings ]; then
+        # No permission rule sources or flag overlays are configured in the
+        # default fixture. An empty success object is not a settings snapshot.
+        metadata='{"effective":{},"sources":[]}'
     elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
         metadata=$(jq -c . "$usage_file")
     elif [ "$subtype" = set_model ]; then
@@ -687,8 +694,10 @@ while next_frame; do
                 printf '%s\n' "$frame"
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
-                jq -cn --arg session "$session" --arg model "$(resolved_model)" \
-                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                model_report=true
+                if [ -f "$config/fixture-unconfirmed-model" ]; then model_report=false; fi
+                jq -cn --arg session "$session" --arg model "$(resolved_model)" --argjson reported "$model_report" \
+                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286"} + (if $reported then {model:$model} else {} end)'
                 if [ -n "$task_scene" ]; then
                     task_receipt_turn
                     busy=false
