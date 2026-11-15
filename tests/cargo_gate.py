@@ -1479,6 +1479,9 @@ class SharesByKind(unittest.TestCase):
                 (("test", "-pcagents-ui"), "2"),
                 (("test", "--package=cagents-ui"), "2"),
                 (("test", "--package", "cagents"), "1"),
+                (("build", "--package", "cagents", "--features", "cagents/host"), "2"),
+                (("test", "--package", "cagents", "--package", "cagents-ui", "--features", "cagents/ui"), "2"),
+                (("build", "--package", "cagents-ui", "--features", "integrated-browser"), "2"),
                 (("run", "--", "--features", "ui"), "1")):
             with self.subTest(arguments):
                 self.assertEqual(self.ask(*arguments),
