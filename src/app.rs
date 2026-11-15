@@ -35,6 +35,7 @@ mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+mod request_failure;
 mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
@@ -20332,6 +20333,8 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    mod automation_work_authority;
+
     #[test]
     fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
         let mut app = context_inspector_test_app(false);
