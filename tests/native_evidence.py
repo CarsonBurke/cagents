@@ -343,6 +343,40 @@ class Evidence(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
 
+    def test_scoped_ui_waits_for_user_daemon_exit_before_restart(self) -> None:
+        self.built()
+        target = self.task / 'target-after/dev-runtime'
+        original = target / 'cagents-original'
+        original.write_bytes((target / 'cagents').read_bytes())
+        original.chmod(0o755)
+        write_executable(target / 'cagents', '''
+            #!/bin/bash
+            case "$*" in
+                'daemon stop-for-rebuild --including-subagents')
+                    [ -z "${CAGENTS_AGENT_AUTHORITY+x}" ] || exit 91
+                    socket="$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock"
+                    mkdir -p "${socket%/*}"
+                    : > "$socket"
+                    (sleep 0.3; rm -f "$socket") </dev/null >/dev/null 2>&1 &
+                    ;;
+                'daemon start')
+                    [ -z "${CAGENTS_AGENT_AUTHORITY+x}" ] || exit 92
+                    if [ -e "$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock" ]; then
+                        echo 'old daemon still listening' >&2
+                        exit 93
+                    fi
+                    printf 'started\\n' >> "$STUB_LOG/scoped-daemon"
+                    ;;
+                *) exec ORIGINAL "$@" ;;
+            esac
+            '''.replace('ORIGINAL', shlex.quote(str(original))), self.logs)
+        self.run_tool('start', 'after', '--ui-scoped-fixture')
+        self.assertEqual((self.logs / 'scoped-daemon').read_text(), 'started\n')
+        self.assertNotIn('--fresh-daemon', (self.logs / 'runner').read_text())
+        self.assertIn('CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session',
+                      (self.logs / 'ui-env').read_text())
+        self.run_tool('stop')
+
     def test_narrow_viewport_keeps_its_explicit_height(self):
         self.built("after")
         self.run_tool("start", "after", "--width", "900", "--height", "800")

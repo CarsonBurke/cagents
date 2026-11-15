@@ -1062,6 +1062,15 @@ run_app() {
                 printf 'could not reset the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
                 return 1
             fi
+            local scoped_socket="$runtime/cagents-development${instance_name:+-$instance_name}/cagentsd.sock" remaining=100
+            while [ -e "$scoped_socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf 'the scoped fixture daemon did not stop within 5 seconds\n' >"$state/failed"
+                    return 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
         fi
         runner_lifecycle=()
         if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
