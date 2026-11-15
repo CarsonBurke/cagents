@@ -1216,14 +1216,15 @@ impl Drop for WorkspaceUpdateTiming {
     }
 }
 
-/// Opt-in phase timing for a selected projection. Disabled tracing does not
-/// read the clock or allocate, and phase fields do not replace inclusive time.
+/// Opt-in phase timing for a selected projection, or for a save and the
+/// complete projection it publishes. Disabled tracing does not read the clock
+/// or allocate, and phase fields do not replace inclusive time.
 struct WorkspaceProjectionTiming(Option<std::time::Instant>);
 
 impl WorkspaceProjectionTiming {
-    fn new(selected: bool) -> Self {
+    fn new(timed: bool) -> Self {
         Self(
-            (selected
+            (timed
                 && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
             .then(std::time::Instant::now),
         )
@@ -1518,6 +1519,21 @@ impl Default for PanePresence {
 /// nothing outside this window reads it before then. A channel name another
 /// window gave, which the shared registry already holds, waits the same way.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// What a save deferred by [`NAVIGATION_SAVE_DELAY`] has to do when it falls
+/// due. Ordered so that merging two requests keeps the larger one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DeferredSave {
+    /// Hand the writer this window's snapshot. The change is to state no
+    /// shared view reads, such as a channel's name or where an editor is, so
+    /// projecting every view would publish nothing; with a long saved
+    /// history, that projection is nearly all of a save's time on the UI
+    /// thread.
+    Snapshot,
+    /// Save as [`Cagents::persist`] does, publishing every view: a change of
+    /// channel, worktree or focus can move panes between views.
+    Views,
+}
 
 #[derive(Default)]
 struct ReplicaCapture {
@@ -5424,7 +5440,7 @@ pub struct Cagents {
     lifecycle_sweep_deadline: Option<Instant>,
     lifecycle_sweep_generation: u64,
     /// A save of navigation alone is scheduled; see [`NAVIGATION_SAVE_DELAY`].
-    navigation_save_pending: bool,
+    navigation_save: Option<DeferredSave>,
     replica_capture: ReplicaCapture,
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
@@ -7916,6 +7932,21 @@ impl Cagents {
         self.save_workspace();
     }
 
+    /// Hands the writer this window's snapshot without projecting shared
+    /// views, for a save of state that none of them reads.
+    ///
+    /// The snapshot still takes the strip's order into the active channel,
+    /// and a pane moved or closed in the strip since the last save changes
+    /// what that channel's view holds. Such a save publishes as
+    /// [`Self::persist`] does.
+    fn save_snapshot(&mut self) {
+        if self.snapshot_workspace_scope() {
+            self.persist();
+        } else {
+            self.save_workspace_with_view_publication(|_| {});
+        }
+    }
+
     /// [`Self::persist`] that leaves reported titles waiting for their
     /// deferred save held back from shared views.
     fn save_workspace(&mut self) {
@@ -7946,8 +7977,12 @@ impl Cagents {
         }
         #[cfg(test)]
         terminal_output_tests::record_persist();
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        phase.mark("save_prepare");
         self.snapshot_workspace_scope();
+        phase.mark("save_scope_snapshot");
         publish(self);
+        phase.mark("save_publish");
         // Ordered identity work needs its exact complete snapshot now. Scope
         // projection alone is not authority to coalesce these checkpoints.
         tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",
@@ -8013,7 +8048,7 @@ impl Cagents {
             self.replica_capture.generation = self.replica_capture.generation.wrapping_add(1);
             self.replica_capture.timer_armed = false;
             self.replica_capture.rejected = false;
-            self.navigation_save_pending = false;
+            self.navigation_save = None;
         } else if self.replica_capture.pending.is_some() {
             // A poisoned or closed queue cannot recover by spinning timers.
             // Retain the debt for an explicit save/recovery or replacement.
@@ -8056,7 +8091,7 @@ impl Cagents {
         } else if self.replica_capture.pending.is_none() {
             // Memory-only windows retain their existing navigation bookkeeping;
             // this is not an accepted offer and acknowledges no replica debt.
-            self.navigation_save_pending = false;
+            self.navigation_save = None;
         }
         if let Some(started) = started {
             let parent = SNAPSHOT_CAPTURE_PARENT.with(std::cell::Cell::get);
@@ -10041,9 +10076,23 @@ impl Cagents {
     /// or worktree, within [`NAVIGATION_SAVE_DELAY`], together with whatever
     /// else changes by then.
     fn save_navigation_soon(&mut self) -> Task<Message> {
-        if std::mem::replace(&mut self.navigation_save_pending, true) {
+        self.defer_save(DeferredSave::Views)
+    }
+
+    /// Saves a change no shared view reads within [`NAVIGATION_SAVE_DELAY`],
+    /// as [`Self::save_navigation_soon`] does, but without projecting views
+    /// unless navigation joins it before then.
+    fn save_snapshot_soon(&mut self) -> Task<Message> {
+        self.defer_save(DeferredSave::Snapshot)
+    }
+
+    fn defer_save(&mut self, save: DeferredSave) -> Task<Message> {
+        if let Some(pending) = &mut self.navigation_save {
+            // The burst's timer is already armed, and now saves both.
+            *pending = (*pending).max(save);
             return Task::none();
         }
+        self.navigation_save = Some(save);
         self.navigation_save_generation = self.navigation_save_generation.wrapping_add(1);
         let generation = self.navigation_save_generation;
         cosmic::task::future(async move {
@@ -10052,18 +10101,19 @@ impl Cagents {
         })
     }
 
-    /// Whether the navigation save timer armed for `generation` still has a
-    /// burst to save: another save may have carried it already, or a later
-    /// burst armed its own timer.
-    fn navigation_save_due(&self, generation: u64) -> bool {
-        self.navigation_save_pending && generation == self.navigation_save_generation
+    /// What the navigation save timer armed for `generation` still has to
+    /// save, if anything: another save may have carried it already, or a
+    /// later burst armed its own timer.
+    fn navigation_save_due(&self, generation: u64) -> Option<DeferredSave> {
+        self.navigation_save
+            .filter(|_| generation == self.navigation_save_generation)
     }
 
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
         matches!(message, Message::NavigationSaveDue(generation)
-            if !self.navigation_save_due(*generation))
+            if self.navigation_save_due(*generation).is_none())
     }
 
     /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
@@ -14981,7 +15031,7 @@ impl Application for Cagents {
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            navigation_save_pending: false,
+            navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             released_repository_navigation: HashMap::new(),
@@ -16181,7 +16231,8 @@ impl Application for Cagents {
                         } else {
                             saved.remove(&card);
                         }
-                        tasks.push(self.save_navigation_soon());
+                        // No view reads where an editor is.
+                        tasks.push(self.save_snapshot_soon());
                     }
                 }
                 // A queued refresh discards this result and advances the list
@@ -17492,8 +17543,10 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::NavigationSaveDue(generation) => {
-                if self.navigation_save_due(generation) {
-                    self.persist();
+                match self.navigation_save_due(generation) {
+                    Some(DeferredSave::Views) => self.persist(),
+                    Some(DeferredSave::Snapshot) => self.save_snapshot(),
+                    None => {}
                 }
                 Task::none()
             }
@@ -31095,7 +31148,7 @@ mod tests {
             next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            navigation_save_pending: false,
+            navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             released_repository_navigation: HashMap::new(),
@@ -31331,7 +31384,7 @@ mod tests {
         // Every pane fits, so moving focus exposes nothing new.
         let update = app.workspace.resize_viewport(3_000.0);
         let _ = app.apply_viewport(update, false, DurableChange::Content);
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
 
         for card in [second_id, third_id] {
             let _ = app.update(Message::Viewport {
@@ -31339,19 +31392,22 @@ mod tests {
                 event: WorkspaceViewportEvent::PointerRested(card),
             });
             assert_eq!(app.durable.focused, Some(card));
-            assert!(app.navigation_save_pending, "the save waits for the burst");
+            assert!(
+                app.navigation_save.is_some(),
+                "the save waits for the burst"
+            );
         }
         let _ = app.update(Message::NavigationSaveDue(app.navigation_save_generation));
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
 
         // A change that must be saved now takes the pending focus with it.
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::PointerRested(second_id),
         });
-        assert!(app.navigation_save_pending);
+        assert!(app.navigation_save.is_some());
         let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::Content);
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
     }
 
     /// Seen means seen by the user. The focused pane of a window in the

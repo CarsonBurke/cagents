@@ -1088,6 +1088,7 @@ impl Cagents {
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
+        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
         let cards = self
             .durable
             .cards
@@ -1098,6 +1099,7 @@ impl Cagents {
             mut scopes,
             worktree_cards,
         } = self.discover_view_scopes();
+        phase.mark("local_discover");
         if let Some(selected) = selected {
             scopes.retain(|scope| selected.contains(scope));
         }
@@ -1121,6 +1123,7 @@ impl Cagents {
             .filter(|pane| pane.pending_terminal_start)
             .map(|pane| pane.id)
             .collect::<HashSet<_>>();
+        phase.mark("local_members");
         let mut panes = HashMap::new();
         for scope in &scopes {
             if let Scope::Worktree { path, .. } = scope {
@@ -1154,6 +1157,7 @@ impl Cagents {
                 .collect();
             panes.insert(scope.clone(), projected);
         }
+        phase.mark("local_panes");
         LocalViews {
             scopes,
             cards: members,
@@ -1203,7 +1207,7 @@ impl Cagents {
             return Err("scope admission is unsettled");
         }
         let selected: HashSet<_> = before.panes.iter().map(|pane| pane.id).collect();
-        if self.navigation_save_pending
+        if self.navigation_save.is_some()
             || self.shared_views.creating_default
             || self.shared_views.deferred_default.is_some()
             || !self.shared_views.requested_transfers.is_empty()
@@ -1746,6 +1750,7 @@ impl Cagents {
         {
             return;
         }
+        let mut phase = WorkspaceProjectionTiming::new(matches!(projection, ViewProjection::All));
         let LocalViews {
             scopes,
             cards,
@@ -1759,6 +1764,7 @@ impl Cagents {
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        phase.mark("publish_owners");
         let needed = match projection {
             ViewProjection::All => None,
             ViewProjection::Structural(_) | ViewProjection::Selected(_) => {
@@ -1819,6 +1825,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_indices");
         // A quarantined pane keeps its canonical descriptor and placement:
         // this client neither seeds, moves nor rewrites it. Closing it is the
         // one change it publishes, so it leaves the view like any closed pane.
@@ -1871,6 +1878,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_transfers");
         // A fenced pane the reader closed leaves the view that holds it,
         // wherever this window showed it. Its saved source is unconfirmed, so
         // the close names the pane rather than a source the registry would
@@ -2090,6 +2098,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_scopes");
     }
 
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
@@ -5771,7 +5780,7 @@ mod tests {
             );
             // The issue's burst is one rename per 100 ms. A deferred save
             // falls due once a second and costs what an immediate one did.
-            if index % 10 == 9 && app.navigation_save_pending {
+            if index % 10 == 9 && app.navigation_save.is_some() {
                 drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
             }
             cpu.push(thread_cpu() - started_cpu);
@@ -5792,6 +5801,133 @@ mod tests {
         report("wall", &mut wall);
     }
 
+    fn observe_rename(app: &mut Cagents, channel: ChannelId, title: &str) {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence,
+            edit: ModelEdit::RetitleChannel {
+                id: channel,
+                title: title.into(),
+            },
+        }));
+    }
+
+    /// #2869: the save a rename burst defers hands the writer the burst's
+    /// last name, which a reopened store holds, and projects no view for it.
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn a_deferred_rename_save_stores_the_latest_name_without_projecting_views() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, model) = desktop_inventory_fixture();
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        let directory = replica_capture::writer_fixture(&mut app);
+        assert!(app.navigation_save.is_none());
+        let channel = app.durable.channels[3].id;
+        let offers = app.replica_capture.offers;
+        for index in 0..5 {
+            observe_rename(&mut app, channel, &format!("Renamed {index}"));
+        }
+        assert_eq!(app.replica_capture.offers, offers, "nothing is saved yet");
+        drop(std::iter::from_fn(|| rx.try_recv().ok()).count());
+        app.shared_views.local_projection_count.set(0);
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(app.shared_views.local_projection_count.get(), 0);
+        assert_eq!(
+            app.replica_capture.offers,
+            offers + 1,
+            "one offer per burst"
+        );
+        assert!(app.navigation_save.is_none());
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView { .. } | ModelEdit::SeedView { .. }
+            ))
+        );
+        let mut writer = app.session.take().unwrap();
+        writer.flush(Duration::from_secs(5)).unwrap();
+        writer.shutdown();
+        let (mut reopened, restored) = crate::session::SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("replica-capture"),
+        )
+        .unwrap();
+        let restored = restored.unwrap();
+        assert_eq!(
+            restored
+                .channels
+                .iter()
+                .find(|row| row.id == channel)
+                .map(|row| row.title.as_str()),
+            Some("Renamed 4"),
+            "the latest name wins"
+        );
+        reopened.shutdown();
+    }
+
+    /// Navigation that joins a deferred rename save rides its timer, and the
+    /// save then publishes views as a navigation save does. A rename joining
+    /// pending navigation leaves it that way.
+    #[test]
+    fn navigation_joining_a_deferred_snapshot_save_publishes_views() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, model) = desktop_inventory_fixture();
+        let (tx, _rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        app.navigation_save = None;
+        let channel = app.durable.channels[3].id;
+        observe_rename(&mut app, channel, "First");
+        let generation = app.navigation_save_generation;
+        assert_eq!(app.navigation_save, Some(DeferredSave::Snapshot));
+        drop(app.save_navigation_soon());
+        observe_rename(&mut app, channel, "Second");
+        assert_eq!(app.navigation_save, Some(DeferredSave::Views));
+        assert_eq!(app.navigation_save_generation, generation, "one timer");
+        app.shared_views.local_projection_count.set(0);
+        drop(app.update(Message::NavigationSaveDue(generation)));
+        assert!(app.shared_views.local_projection_count.get() > 0);
+        assert!(app.navigation_save.is_none());
+        // A timer from a burst already saved does nothing.
+        observe_rename(&mut app, channel, "Third");
+        app.shared_views.local_projection_count.set(0);
+        let saved = super::super::terminal_output_tests::persists();
+        drop(app.update(Message::NavigationSaveDue(generation)));
+        assert_eq!(super::super::terminal_output_tests::persists(), saved);
+        assert_eq!(app.navigation_save, Some(DeferredSave::Snapshot));
+    }
+
+    /// A deferred snapshot save still takes the strip into the active
+    /// channel, and a channel whose panes that changes publishes its view.
+    #[test]
+    fn a_deferred_snapshot_save_that_moves_a_pane_publishes_views() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, model) = desktop_inventory_fixture();
+        let (tx, _rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        let channel = app.durable.channels[3].id;
+        drop(app.navigate_to_channel(channel));
+        assert!(app.active_workspace.is_some());
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(app.navigation_save.is_none());
+        observe_rename(&mut app, channel, "Renamed");
+        assert_eq!(app.navigation_save, Some(DeferredSave::Snapshot));
+        // A pane removed since the last save is still listed by its channel.
+        let closed = CardId::new();
+        Arc::make_mut(&mut app.durable).channels[3]
+            .cards
+            .push(closed);
+        app.shared_views.local_projection_count.set(0);
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(!app.durable.channels[3].cards.contains(&closed));
+        assert!(app.shared_views.local_projection_count.get() > 0);
+        assert!(app.navigation_save.is_none());
+    }
+
     /// #2641: a burst of renames from another window held the UI thread for
     /// seconds, each one projecting every view the window holds and saving.
     #[test]
@@ -5801,7 +5937,7 @@ mod tests {
         let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
-        app.navigation_save_pending = false;
+        app.navigation_save = None;
         let before = app.durable.clone();
         let channel = before.channels[3].id;
         let generation = app.navigation_save_generation;
@@ -5838,7 +5974,7 @@ mod tests {
                 Some(title.as_str()),
                 "the sidebar shows the name"
             );
-            assert!(app.navigation_save_pending, "the name is saved soon");
+            assert!(app.navigation_save.is_some(), "the name is saved soon");
         }
         assert_eq!(
             app.navigation_save_generation,
@@ -5846,12 +5982,18 @@ mod tests {
             "the burst arms one save"
         );
         assert_eq!(persists(), saved, "no rename saves at once");
+        assert_eq!(app.navigation_save, Some(DeferredSave::Snapshot));
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         assert_eq!(persists(), saved + 1, "the burst is saved once, after it");
-        assert!(!app.navigation_save_pending);
+        assert_eq!(
+            app.shared_views.local_projection_count.get(),
+            0,
+            "#2869: nor does that save project a view"
+        );
+        assert!(app.navigation_save.is_none());
         // A suggestion cannot replace the manual name, so nothing changes and
         // nothing more is saved.
-        app.navigation_save_pending = false;
+        app.navigation_save = None;
         rename(
             &mut app,
             ModelEdit::SuggestChannelTitle {
@@ -5861,7 +6003,7 @@ mod tests {
             },
         );
         assert_eq!(app.durable.channels[3].title, "Renamed 4");
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
         // A conversation naming a channel that has no name yet is absorbed
         // the same way.
         let unnamed = before.channels[4].id;
@@ -5885,7 +6027,7 @@ mod tests {
             app.durable.channels[4].title_source,
             crate::model::ChannelTitleSource::Provider
         );
-        assert!(app.navigation_save_pending);
+        assert!(app.navigation_save.is_some());
         assert_eq!(app.durable.cards, before.cards);
         assert_eq!(app.durable.card_scopes, before.card_scopes);
         for (after, before) in app.durable.channels.iter().zip(&before.channels) {

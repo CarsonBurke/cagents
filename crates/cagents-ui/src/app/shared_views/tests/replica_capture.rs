@@ -628,10 +628,10 @@ fn presentation_replica_capture_memory_only_navigation_does_not_acknowledge_repl
     let (mut app, _, _, _) = presentation_fixture();
     assert!(app.session.is_none());
     drop(app.save_navigation_soon());
-    assert!(app.navigation_save_pending);
+    assert!(app.navigation_save.is_some());
     let offers = app.replica_capture.offers;
     app.save_workspace();
-    assert!(!app.navigation_save_pending);
+    assert!(app.navigation_save.is_none());
     assert_eq!(app.replica_capture.offers, offers);
     let _directory = writer_fixture(&mut app);
     app.mark_replica_snapshot(Instant::now());
@@ -641,7 +641,7 @@ fn presentation_replica_capture_memory_only_navigation_does_not_acknowledge_repl
     drop(app.save_navigation_soon());
     app.save_workspace();
     assert!(
-        app.navigation_save_pending,
+        app.navigation_save.is_some(),
         "debt with a missing writer is still owed"
     );
     assert_eq!(

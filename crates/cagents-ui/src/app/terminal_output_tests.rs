@@ -500,7 +500,7 @@ fn repaint_ticks_skip_the_projection_tail() {
     assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
     assert!(Arc::ptr_eq(&durable, &app.durable));
     // So does a navigation save timer whose burst another save carried.
-    assert!(!app.navigation_save_pending);
+    assert!(app.navigation_save.is_none());
     drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
     assert_eq!(
         (counts(), CHROME_SYNCS.get(), PERSISTS.get()),
