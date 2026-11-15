@@ -50,6 +50,7 @@ if [[ -z ${CARGO_BUILD_JOBS:-} ]]; then
     # Servo, SpiderMonkey and the final links each need gigabytes; leave every
     # job about 2 GiB of what is available now.
     available_gib=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
+    [[ $available_gib =~ ^[0-9]+$ ]] || fail 'cannot read MemAvailable; set CARGO_BUILD_JOBS'
     CARGO_BUILD_JOBS=$(( available_gib / 2 < $(nproc) ? available_gib / 2 : $(nproc) ))
     ((CARGO_BUILD_JOBS > 0)) || CARGO_BUILD_JOBS=1
 fi
@@ -176,7 +177,14 @@ source_git() {
         git -c core.hooksPath=/dev/null -c core.autocrlf=false -c gc.autoDetach=false \
         --git-dir="$CACHE/source.git" --work-tree="$CACHE/source" "$@"
 }
-[[ -f $CACHE/source.git/HEAD ]] || git init -q --bare "$CACHE/source.git"
+# A shallow repository cannot supply the complete history the cache keeps.
+[[ $(git -C "$ROOT_DIR" rev-parse --is-shallow-repository) == false ]] ||
+    fail 'the source repository is shallow; fetch its full history first'
+# Match the source's object format; nothing from the caller's Git
+# configuration may choose another.
+[[ -f $CACHE/source.git/HEAD ]] ||
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q --bare \
+        --object-format="$(git -C "$ROOT_DIR" rev-parse --show-object-format)" "$CACHE/source.git"
 # The cache lock is held, so any Git lock left here is from a killed build.
 find "$CACHE/source.git" -name '*.lock' -type f -delete
 # A full fetch from the local repository is incremental after the first.
