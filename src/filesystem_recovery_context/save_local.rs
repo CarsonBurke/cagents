@@ -58,7 +58,22 @@ impl SaveTargetAuthority {
             open_parent_beneath(&source, relative_path).map_err(io::Error::other)?;
         let parent = Arc::new(parent);
         let parent_stamp = recovery_directory_stamp(&parent)?;
-        let protection = protect(&parent)?;
+        let protection = protect(&parent);
+        #[cfg(test)]
+        if let Err(error) = &protection {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[save-worker-diagnostic] stage=save_target_cleanup_protection operation=protect_callback boundary=Err fd_role=original_edited_parent source={:?} parent={:?} destination={:?} io_kind={:?} raw_errno={:?} error={}",
+                source.path(),
+                parent.path(),
+                relative_path,
+                error.kind(),
+                error.raw_os_error(),
+                error,
+            );
+        }
+        let protection = protection?;
         let retained_descriptors = HashSet::from([source.descriptor(), parent.descriptor()]).len()
             + protection.retained_descriptor_count();
         let target = Arc::new(Self {

@@ -1,13 +1,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
 };
 
 use crate::{
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerEnvelopeRef,
-        ServerMessage, ServerResponse,
+        OlderClient, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+        ServerEnvelopeRef, ServerMessage, ServerResponse,
     },
 };
 
@@ -38,6 +38,7 @@ pub(crate) struct Outbound {
     request_id: Option<u64>,
     proof: Arc<HostSessionProof>,
     pub(crate) message: ServerMessage,
+    encoded_response: Option<Vec<u8>>,
 }
 
 impl Outbound {
@@ -48,9 +49,74 @@ impl Outbound {
             request_id: None,
             proof: Arc::clone(proof),
             message,
+            encoded_response: None,
         }
     }
 
+    /// This message as `client` receives it: in its envelope version, with a
+    /// reply it cannot decode replaced by a refusal. A notification it cannot
+    /// decode is withheld.
+    fn for_older(mut self, client: OlderClient) -> Option<Self> {
+        // Older peers must be checked against the actual response variant.
+        // Only this upgrade compatibility path needs to decode a relay payload.
+        if let Some(bytes) = self.encoded_response.take() {
+            self.message = match postcard::from_bytes(&bytes) {
+                Ok(response) => ServerMessage::Response { response },
+                Err(_) => ServerMessage::Error(client.refusal()),
+            };
+        }
+        if !client.admits_message(&self.message) {
+            self.request_id?;
+            tracing::debug!(
+                protocol = client.protocol,
+                "refusing a reply an older protocol client cannot decode"
+            );
+            self.message = ServerMessage::Error(client.refusal());
+            self.encoded_response = None;
+        }
+        self.version = client.protocol;
+        Some(self)
+    }
+
+    pub(crate) fn response(
+        proof: &HostSessionProof,
+        request_id: u64,
+        response: crate::terminal_ipc::PreparedResponse,
+    ) -> Self {
+        let (response, encoded_response) = match response {
+            crate::terminal_ipc::PreparedResponse::Decoded(response) => (response, None),
+            crate::terminal_ipc::PreparedResponse::EncodedChat { chat_id, bytes } => (
+                ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: None,
+                },
+                Some(bytes),
+            ),
+        };
+        Self {
+            version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            proof: Arc::new(proof.clone()),
+            message: ServerMessage::Response { response },
+            encoded_response,
+        }
+    }
+    pub(crate) fn write(
+        &self,
+        codec: &mut crate::terminal_ipc::FrameCodec,
+        writer: &mut impl std::io::Write,
+    ) -> Result<(), crate::terminal_ipc::FrameError> {
+        match &self.encoded_response {
+            Some(response) => codec.write_encoded_response(
+                writer,
+                self.version,
+                self.request_id,
+                &self.proof,
+                response,
+            ),
+            None => codec.write(writer, &self.wire()),
+        }
+    }
     pub(crate) fn wire(&self) -> ServerEnvelopeRef<'_> {
         ServerEnvelopeRef {
             version: self.version,
@@ -68,6 +134,7 @@ impl From<ServerEnvelope> for Outbound {
             request_id: value.request_id,
             proof: Arc::new(value.proof),
             message: value.message,
+            encoded_response: None,
         }
     }
 }
@@ -191,6 +258,9 @@ pub(crate) struct DeliveryQueue {
     capacity: usize,
     state: Mutex<QueueState>,
     available: Condvar,
+    /// Set when the client opened the connection at an older protocol that
+    /// this daemon serves; every frame it is sent is then adapted to it.
+    older: OnceLock<OlderClient>,
 }
 
 impl DeliveryQueue {
@@ -207,7 +277,16 @@ impl DeliveryQueue {
                 aborted: false,
             }),
             available: Condvar::new(),
+            older: OnceLock::new(),
         }
+    }
+
+    /// Speaks `client`'s protocol for the rest of this connection. The
+    /// connection's first frame decides this. Frames are adapted as they are
+    /// sent, so only one sent before that frame arrives, such as a shutdown
+    /// notice, goes out in this protocol's version.
+    pub(crate) fn speak_older(&self, client: OlderClient) {
+        let _ = self.older.set(client);
     }
 
     /// Enqueues a message without allowing a slow client to apply backpressure
@@ -316,6 +395,7 @@ impl DeliveryQueue {
             );
             state.discard();
             state.enqueue(Outbound {
+                encoded_response: None,
                 version: PROTOCOL_VERSION,
                 request_id: None,
                 proof: Arc::clone(&message.proof),
@@ -347,7 +427,13 @@ impl DeliveryQueue {
                 return None;
             }
             if let Some(message) = state.dequeue() {
-                return Some(message);
+                match self.older.get() {
+                    None => return Some(message),
+                    Some(client) => match message.for_older(*client) {
+                        Some(message) => return Some(message),
+                        None => continue,
+                    },
+                }
             }
             if state.close_after_drain {
                 return None;
@@ -398,6 +484,101 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn encoded_transcripts_keep_wire_bytes_and_bulk_page_credits() {
+        use crate::terminal_ipc::{FrameCodec, PreparedResponse, ServerResponse, read_frame};
+        let id = TerminalId::new();
+        let proof = redraw(id, 0).proof;
+        let snapshot = crate::chat::Snapshot {
+            generation: 2,
+            title: Some("answer λ".into()),
+            ..Default::default()
+        };
+        let responses = [
+            ServerResponse::ChatSnapshot {
+                chat_id: id,
+                snapshot: Some(snapshot.clone()),
+            },
+            ServerResponse::ChatUpdate {
+                chat_id: id,
+                update: crate::chat::presentation::Presentation {
+                    base_generation: 1,
+                    file_changes_unchanged: true,
+                    metadata: snapshot,
+                    order: vec![],
+                    changes: vec![],
+                    children: vec![],
+                },
+            },
+            ServerResponse::ChatSnapshot {
+                chat_id: id,
+                snapshot: None,
+            },
+        ];
+        for response in responses {
+            let encoded = postcard::to_stdvec(&response).unwrap();
+            let outgoing = Outbound::response(
+                &proof,
+                42,
+                PreparedResponse::EncodedChat {
+                    chat_id: id,
+                    bytes: encoded,
+                },
+            );
+            let mut bytes = Vec::new();
+            outgoing
+                .write(
+                    &mut FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES),
+                    &mut bytes,
+                )
+                .unwrap();
+            let expected = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(42),
+                proof: proof.clone(),
+                message: ServerMessage::Response { response },
+            };
+            let mut ordinary = Vec::new();
+            crate::terminal_ipc::write_frame(&mut ordinary, &expected).unwrap();
+            assert_eq!(bytes, ordinary);
+            let mut refused = Vec::new();
+            assert!(
+                outgoing
+                    .write(&mut FrameCodec::new(ordinary.len() - 5), &mut refused)
+                    .is_err()
+            );
+            assert!(refused.is_empty(), "oversized relay wrote a partial frame");
+            assert_eq!(
+                read_frame::<ServerEnvelope>(&mut std::io::Cursor::new(bytes)).unwrap(),
+                Some(expected)
+            );
+        }
+        let queue = DeliveryQueue::new(1, 20);
+        for request in 0..MAX_QUEUED_BULK_PAGES {
+            queue
+                .push(Outbound::response(
+                    &proof,
+                    request as u64,
+                    PreparedResponse::EncodedChat {
+                        chat_id: id,
+                        bytes: vec![1],
+                    },
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            queue.push(Outbound::response(
+                &proof,
+                99,
+                PreparedResponse::EncodedChat {
+                    chat_id: id,
+                    bytes: vec![1]
+                }
+            )),
+            Err(DeliveryError::Full)
+        );
+    }
+
     fn redraw(terminal_id: TerminalId, generation: u64) -> ServerEnvelope {
         ServerEnvelope {
             version: PROTOCOL_VERSION,
@@ -431,6 +612,117 @@ mod tests {
             board: Box::new(board(revision)),
         };
         envelope
+    }
+
+    #[test]
+    fn an_older_client_receives_its_version_and_nothing_it_cannot_decode() {
+        // Knows the first seven messages (through Error) and the first two
+        // replies (Connected, Listed).
+        let older = crate::terminal_ipc::OlderClient::knowing(7, 7, 2);
+        let queue = DeliveryQueue::new(1, 16);
+        queue.speak_older(older);
+        let reply = |request_id, response| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(request_id);
+            envelope.message = ServerMessage::Response { response };
+            envelope
+        };
+        queue
+            .push(reply(
+                1,
+                ServerResponse::Listed {
+                    terminals: Vec::new(),
+                },
+            ))
+            .unwrap();
+        queue.push(reply(2, ServerResponse::Detached)).unwrap();
+        let mut unknown = redraw(TerminalId::new(), 0);
+        unknown.message = ServerMessage::ChatChanged {
+            chat_id: TerminalId::new(),
+        };
+        queue.push(unknown).unwrap();
+        queue.push(redraw(TerminalId::new(), 9)).unwrap();
+        queue.close_after_drain();
+
+        let delivered: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+        assert!(delivered.iter().all(|message| message.version == 7));
+        assert_eq!(
+            delivered.len(),
+            3,
+            "the undecodable notification is withheld"
+        );
+        assert!(matches!(
+            delivered[0].message,
+            ServerMessage::Response {
+                response: ServerResponse::Listed { .. }
+            }
+        ));
+        assert_eq!(delivered[1].request_id, Some(2));
+        assert!(matches!(
+            &delivered[1].message,
+            ServerMessage::Error(error) if error.code == ProtocolErrorCode::UnsupportedVersion
+        ));
+        assert!(matches!(
+            delivered[2].message,
+            ServerMessage::Redraw { generation: 9, .. }
+        ));
+    }
+
+    /// What the daemon writes to a CLI from before `ToolStatus::Waiting` is
+    /// the same as for a running step, through the path that sends it.
+    #[test]
+    fn an_older_client_reads_a_waiting_step_as_running() {
+        use crate::chat::*;
+        let older = crate::terminal_ipc::older_client(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
+            .unwrap();
+        let chat_id = TerminalId::new();
+        let delivered = |status, client: Option<crate::terminal_ipc::OlderClient>| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(3);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::ChatFileChangePatches {
+                    chat_id,
+                    page: FileChangePage {
+                        request_id: 8,
+                        key: FileChangeKey {
+                            source: FileChangeSource::Subagent {
+                                id: "delegate".into(),
+                            },
+                            path: "a.rs".into(),
+                        },
+                        revision: 5,
+                        patches: vec![FileChangePatch {
+                            ownership_unverified: false,
+                            item_id: "edit".into(),
+                            kind: ChangeKind::Updated,
+                            status,
+                            imported: false,
+                            offset: 0,
+                            total_bytes: 3,
+                            diff: "+a\n".into(),
+                        }],
+                        next: None,
+                        error: None,
+                    },
+                },
+            };
+            let mut outbound = Outbound::from(envelope);
+            if let Some(client) = client {
+                outbound = outbound.for_older(client).unwrap();
+            }
+            assert!(matches!(outbound.message, ServerMessage::Response { .. }));
+            let mut bytes = Vec::new();
+            crate::terminal_ipc::write_frame(&mut bytes, &outbound.wire()).unwrap();
+            bytes
+        };
+        assert_eq!(
+            delivered(ToolStatus::Waiting, Some(older)),
+            delivered(ToolStatus::Running, Some(older))
+        );
+        assert_ne!(
+            delivered(ToolStatus::Waiting, None),
+            delivered(ToolStatus::Running, None)
+        );
     }
 
     #[test]

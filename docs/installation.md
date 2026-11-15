@@ -14,6 +14,10 @@ The installer and the commands below use an authenticated GitHub CLI account.
 You can also download release assets directly from the releases page; tagged
 builds stamp the repository into the released copy of `install.sh` automatically.
 
+Run the installation and removal commands below from a system terminal outside
+cagents. Terminals opened in cagents are hosted sessions; these protected commands
+refuse there even when you type them yourself.
+
 ## Requirements
 
 The supported release target is **Linux x86_64 with glibc**, built on Ubuntu
@@ -217,6 +221,13 @@ metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only
 installed binary and icon by absolute path, so launching from the desktop does
 not depend on `PATH`; using `cagents` from a terminal does.
 
+Those links point into `current`, so an update reaches them. If a desktop
+tool has replaced one with a plain copy, and the copy is byte-for-byte the
+installed file, the installer puts the link back and says so. It refuses
+anything else at those paths, such as an edited copy, a directory, or a link
+to somewhere else, and leaves it unchanged. If the installation then fails,
+the copy is restored.
+
 The standard installation starts its per-user `cagentsd` immediately and
 registers it for graphical-login autostart. See [Daemon and
 upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
@@ -239,8 +250,12 @@ for idle, or you can explicitly choose interruption and exact resumption.
 Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
-including local builds, use this same flow. Source trees and OS packages retain
-their own update method; browserless builds do not download full releases.
+including local builds, use this same flow. Whichever window you update
+from, the newer build's own updater performs the update, so its checks decide
+what continues. Supported source protocols are wire-proven for the updater's
+lifecycle operations. If the running daemon is too old, update it to an
+intermediate build first. Source trees and OS packages retain their own update
+method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
 downloaded bytes, and asks every open window to save. Dirty editors, unsent
@@ -260,10 +275,15 @@ Rerun the installer for a compatible update: the existing daemon and its live
 PTYs keep running. By default the installer verifies the staged CLI against the
 running daemon before switching `current`. An incompatible build is installed
 without replacing the running daemon; saved windows reopen with that daemon's
-matching UI. Finish the staged update in the application or run
-`cagents daemon upgrade`. This command displays the same impact, asks for
-approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
-additionally permits active native turns to stop.
+matching UI. Finish the staged update with `cagents daemon upgrade`, or with
+the application's update control (see [In-app updates](#in-app-updates)). The
+command displays the same impact, asks for approval, and waits for completion.
+`--yes` skips the prompt; `--interrupt` additionally permits active native
+turns to stop. The review groups panes by what happens after the update. Panes
+that cannot reconnect reopen stopped; each lists how to reopen its conversation
+or restart its terminal. The update keeps the saved panes and their files.
+If the running service still reports an item that needs attention, resolve it
+before updating. A changed inventory requires another review.
 
 To make a verified build available without saving or closing running windows,
 append `--stage-only` to the installer invocation. It publishes the complete

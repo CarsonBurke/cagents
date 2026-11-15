@@ -28,6 +28,8 @@ class ReleaseHostHelper(unittest.TestCase):
             (fixture / "tools").mkdir()
             shutil.copyfile(ROOT / "scripts/build-ceditor-product",
                             fixture / "scripts/build-ceditor-product")
+            shutil.copyfile(ROOT / "scripts/cargo_artifacts.py",
+                            fixture / "scripts/cargo_artifacts.py")
             helper = fixture / "reported target with spaces" / "cagentsd"
             helper.parent.mkdir()
             helper.write_text("#!/bin/sh\nexit 97\n")
@@ -81,7 +83,7 @@ with open(os.environ["FIXTURE_EVENTS"], "a") as output:
         self.assertEqual(result.returncode, 0, result.stderr)
         cargo = [event for event in events if event["kind"] == "cargo"]
         self.assertEqual([event["args"][0] for event in cargo],
-                         ["test", "build", "test", "test", "test", "test"])
+                         ["test", "build", "test", "test", "test", "test", "test", "test"])
         self.assertEqual(cargo[1]["args"], [
             "build", "--locked", "--release", "--no-default-features",
             "--features", "host", "--bin", "cagentsd",
@@ -102,13 +104,21 @@ with open(os.environ["FIXTURE_EVENTS"], "a") as output:
                 "test", "--locked", "--release", "--no-default-features",
                 "--features", "ui", "--all-targets",
             ]),
-            ("ceditor", 4, [
+            ("browserless application", 4, [
+                "test", "--locked", "--release", "--package", "cagents-ui",
+                "--all-targets",
+            ]),
+            ("ceditor", 5, [
                 "test", "--locked", "--release", "--package", "ceditor",
                 "--all-targets",
             ]),
-            ("integrated browser", 5, [
+            ("integrated browser", 6, [
                 "test", "--locked", "--release", "--features",
                 "integrated-browser", "--all-targets",
+            ]),
+            ("integrated application", 7, [
+                "test", "--locked", "--release", "--package", "cagents-ui",
+                "--features", "integrated-browser", "--all-targets",
             ]),
         ):
             with self.subTest(lane=lane):

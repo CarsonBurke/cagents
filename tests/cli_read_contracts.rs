@@ -103,6 +103,8 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
             vec!["project", "list"],
             vec!["sessions"],
             vec!["whoami"],
+            vec!["sessions", "--channel"],
+            vec!["transcript", "0000"],
             vec!["account", "info"],
             vec!["daemon", "start"],
         ] {
@@ -120,6 +122,93 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
             );
         }
     }
+}
+
+/// The store commands are what an installer asks a replacement it is about
+/// to switch to, so they must reach only the matched daemon's maintenance
+/// options and report its answer and refusals faithfully.
+#[test]
+fn store_commands_run_only_the_matched_daemon_maintenance_options() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let daemon = fixture.root.path().join("bin/cagentsd");
+    fs::write(
+        &daemon,
+        r#"#!/bin/sh
+printf '%s
+' "$*" >> "$HOME/../daemon-calls"
+case $1 in
+--stored-schema) [ -z "${FIXTURE_SCHEMA-}" ] || printf '%s
+' "$FIXTURE_SCHEMA" ;;
+--downgrade-store)
+    if [ -n "${FIXTURE_REFUSES-}" ]; then
+        printf 'cagentsd: a daemon is running; stop it first
+' >&2
+        exit 1
+    fi
+    [ -z "${FIXTURE_SCHEMA-}" ] || printf 'converted the shared-model store from schema %s to %s
+' "$FIXTURE_SCHEMA" "$2" ;;
+*) exit 64 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |args: &[&str], environment: &[(&str, &str)]| {
+        let mut command = fixture.command(args);
+        for (name, value) in environment {
+            command = command.env(name, value);
+        }
+        let output = fixture.run(command);
+        let stream = if output.success {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        let value: Value = serde_json::from_slice(stream)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}: {output:?}"));
+        (output.success, value)
+    };
+
+    let (success, value) = run(&["daemon", "store-schema"], &[("FIXTURE_SCHEMA", "23")]);
+    assert!(success, "{value}");
+    assert_eq!(value["command"], "daemon.store_schema");
+    assert_eq!(value["data"], serde_json::json!({"schema": 23}));
+    let (success, value) = run(&["daemon", "store-schema"], &[]);
+    assert!(success, "{value}");
+    assert_eq!(value["data"], serde_json::json!({"schema": null}));
+    let (success, value) = run(
+        &["daemon", "downgrade-store", "22"],
+        &[("FIXTURE_SCHEMA", "23")],
+    );
+    assert!(success, "{value}");
+    assert_eq!(
+        value["data"],
+        serde_json::json!({"schema": 22, "converted": true})
+    );
+    let (success, value) = run(&["daemon", "downgrade-store", "22"], &[]);
+    assert!(success, "{value}");
+    assert_eq!(
+        value["data"],
+        serde_json::json!({"schema": 22, "converted": false})
+    );
+    let (success, value) = run(
+        &["daemon", "downgrade-store", "22"],
+        &[("FIXTURE_REFUSES", "1")],
+    );
+    assert!(!success);
+    assert_eq!(value["error"]["kind"], "store");
+    assert_eq!(
+        value["error"]["message"],
+        "a daemon is running; stop it first"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("daemon-calls")).unwrap(),
+        "--stored-schema\n--stored-schema\n--downgrade-store 22\n--downgrade-store 22\n--downgrade-store 22\n"
+    );
+    assert!(!fixture.root.path().join("spawned").exists());
 }
 
 #[test]
@@ -151,6 +240,92 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
     let ssh = fixture.root.path().join("bin/ssh");
     fs::write(&ssh,if failing_ssh {"#!/bin/sh\nprintf 'genuine ssh failure\\n' >&2\nexit 255\n"} else {"#!/bin/sh\nset -eu\nlast=''\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> \"$HOME/../ssh-calls\"\nexec /bin/sh -c \"$last\"\n"}).unwrap();
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn protocol_version_is_local_before_device_selection_or_service_preparation() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for device in ["fixture", "unknown-device"] {
+        for policy in ["none", "flag", "environment"] {
+            let mut args = vec!["--device", device, "daemon", "protocol-version"];
+            if policy == "flag" {
+                args.push("--no-start");
+            }
+            let mut command = fixture.command(&args).env("PATH", &path);
+            if policy == "environment" {
+                command = command.env("CAGENTS_NO_START", "1");
+            }
+            let output = fixture.run(command);
+            assert!(output.success, "{device}/{policy}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["command"], "daemon.protocol_version");
+            assert_eq!(
+                value["data"]["protocol_version"],
+                cagents::terminal::ipc::PROTOCOL_VERSION
+            );
+            assert!(output.stderr.is_empty());
+            assert!(!fixture.root.path().join("spawned").exists());
+            assert!(!fixture.root.path().join("ssh-calls").exists());
+        }
+    }
+}
+
+#[test]
+fn local_lifecycle_refuses_remote_selection_before_local_or_remote_effects() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for device in ["fixture", "unknown-device"] {
+        for command in [
+            vec!["daemon", "upgrade", "--yes"],
+            vec!["daemon", "abandon-upgrade", "--yes"],
+            vec!["daemon", "stop-for-rebuild", "--including-subagents"],
+            vec!["daemon", "bridge"],
+            vec!["daemon", "store-schema"],
+            vec!["daemon", "downgrade-store", "22"],
+            vec![
+                "coordinate-install",
+                "--prefix",
+                "/missing-prefix",
+                "--installer",
+                "/missing-installer",
+            ],
+            vec!["restart-windows", "--instance", "missing-instance"],
+        ] {
+            let mut args = vec!["--device", device];
+            args.extend(command);
+            let output = fixture.run(fixture.command(&args).env("PATH", &path));
+            assert_eq!(output.exit_code, Some(1), "{args:?}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(
+                value["error"]["kind"], "daemon_local_only",
+                "{args:?}: {value}"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(!fixture.root.path().join("spawned").exists());
+            assert!(!fixture.root.path().join("ssh-calls").exists());
+        }
+    }
+    assert_eq!(
+        fs::read_dir(fixture.root.path().join("run"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]

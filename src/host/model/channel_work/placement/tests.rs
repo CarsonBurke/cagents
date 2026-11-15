@@ -76,6 +76,33 @@ fn write(db: &Connection, view: &View) {
     )
     .unwrap();
 }
+/// The fixture's views, read back from its schema 17 table.
+fn stored(db: &Connection) -> Result<Vec<View>, String> {
+    let mut statement = db
+        .prepare("SELECT scope, revision, panes, retired FROM shared_views ORDER BY scope")
+        .unwrap();
+    let views = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| {
+            let (scope, revision, panes, retired) = row.unwrap();
+            View {
+                scope: serde_json::from_str(&scope).unwrap(),
+                revision,
+                panes: serde_json::from_str(&panes).unwrap(),
+                retired: serde_json::from_str(&retired).unwrap(),
+            }
+        })
+        .collect();
+    Ok(views)
+}
 fn backfill(db: &mut Connection) {
     let tx = db.transaction().unwrap();
     migrate(&tx).unwrap();
@@ -368,10 +395,7 @@ fn independent_wal_writer_publishes_epochs_and_rollback_preserves_both_tables() 
     }
     assert_eq!(token(&reader, card(1)).unwrap(), captured);
     assert_eq!(read_clock(&reader).unwrap(), initial_clock);
-    assert_eq!(
-        super::super::super::views::all(&reader).unwrap(),
-        vec![presentation.clone()]
-    );
+    assert_eq!(stored(&reader).unwrap(), vec![presentation.clone()]);
     publish(&mut writer, &presentation, &replacement);
     let current = token(&reader, card(1)).unwrap();
     assert!(current > captured);
@@ -437,10 +461,7 @@ fn missing_malformed_and_exhausted_epochs_refuse_without_partial_publication() {
     assert_eq!(token(&db, card(1)).unwrap(), first);
     assert_eq!(token(&db, card(2)).unwrap(), second);
     assert_eq!(read_clock(&db).unwrap(), clock);
-    assert_eq!(
-        super::super::super::views::all(&db).unwrap(),
-        vec![original.clone()]
-    );
+    assert_eq!(stored(&db).unwrap(), vec![original.clone()]);
     db.execute(
         "UPDATE channel_work_placement_clock SET last_epoch=?1",
         [i64::MAX],

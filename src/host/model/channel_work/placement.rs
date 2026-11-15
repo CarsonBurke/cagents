@@ -28,10 +28,30 @@ pub(in crate::host::model) fn migrate(tx: &Transaction<'_>) -> Result<(), String
         .map_err(|error| error.to_string())?;
     let mut seen = HashSet::new();
     let mut last_epoch = 0;
-    for view in super::super::views::all(tx)? {
-        for pane in view.panes {
+    // This step reads the view layout of schema 17, which later schemas
+    // replace, so it never goes through the current view readers.
+    let views: Vec<(Vec<Pane>, Vec<CardId>)> = {
+        let mut statement = tx
+            .prepare("SELECT panes, retired FROM shared_views ORDER BY scope")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (panes, retired) = row.map_err(|error| error.to_string())?;
+            Ok((
+                serde_json::from_str(&panes).map_err(|error| error.to_string())?,
+                serde_json::from_str(&retired).map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect::<Result<_, String>>()?
+    };
+    for (panes, retired) in views {
+        for pane in panes {
             validate_pane(&pane)?;
-            if view.retired.contains(&pane.id) || !seen.insert(pane.id) {
+            if retired.contains(&pane.id) || !seen.insert(pane.id) {
                 return Err(
                     "Cannot assign a placement epoch to an ambiguous canonical pane".into(),
                 );

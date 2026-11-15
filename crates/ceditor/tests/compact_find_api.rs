@@ -1,6 +1,6 @@
-use cagents::editor_search::{FindOptions, MatchIndex, Matches, find_in_lines};
 use cagents::model::CardId;
-use cagents::repository_widget::RepositoryAction;
+use cagents_ui::editor_search::{FindOptions, MatchIndex, Matches, find_in_lines};
+use cagents_ui::repository_widget::RepositoryAction;
 
 #[test]
 fn public_find_results_complete_a_standalone_editor_action() {

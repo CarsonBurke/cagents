@@ -8,6 +8,8 @@ fn main() {
     std::process::exit(2);
 }
 
+cagents::stamp_version!();
+
 #[cfg(feature = "host")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use cagents::{
