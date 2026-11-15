@@ -17348,9 +17348,16 @@ impl Application for Cagents {
                     {
                         return Task::none();
                     }
-                    return self
-                        .commit_card_removal(id, None)
-                        .unwrap_or_else(Task::none);
+                    // Recorded first: committing the close publishes it.
+                    self.shared_views.fenced_closes.insert(id);
+                    let closed = self.commit_card_removal(id, None);
+                    if self
+                        .card_state(id)
+                        .is_none_or(|card| card.existence.is_open())
+                    {
+                        self.shared_views.fenced_closes.remove(&id);
+                    }
+                    return closed.unwrap_or_else(Task::none);
                 }
                 if self
                     .workspace

@@ -9789,6 +9789,14 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        // A fenced pane's saved session is unconfirmed: reconnecting or
+        // resuming it could act for an agent that is no longer this pane's.
+        if self.shared_views.quarantined.contains(&card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane can't reconnect because cagents can't confirm its saved session. Close it instead.",
+            ));
+            return Task::none();
+        }
         let initial_session = upgrade_admission
             .as_ref()
             .map_or(session.id, |canonical| canonical.id);

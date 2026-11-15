@@ -1021,6 +1021,10 @@ impl Cagents {
                 .flat_map(|view| view.retired.iter().copied())
                 .filter(|id| !open.contains(id)),
         );
+        // Fence what this snapshot fences before anything publishes against
+        // it. Only projection lifts a fence, with the aliases it recomputes.
+        let fenced = super::shared_views::quarantined_managed_panes(&model, &model.views);
+        self.shared_views.quarantined.extend(fenced);
         self.workspace_model = model;
         true
     }

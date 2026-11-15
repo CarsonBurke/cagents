@@ -998,6 +998,18 @@ fn fenced_pane_whose_attachment_failed_offers_no_retry() {
         daemon.requests().is_empty(),
         "a fenced pane must not reattach or relaunch its stale session"
     );
+    // Reconnect and Resume reach the chat start directly.
+    let CardKind::Chat(session) = pane.kind.clone() else {
+        unreachable!()
+    };
+    let task = app.start_chat(pane.id, session, crate::chat::Intent::Restore, None, false);
+    settle(&mut app, task);
+    assert!(daemon.requests().is_empty());
+    assert!(
+        format!("{:?}", app.status).contains("can't reconnect"),
+        "{:?}",
+        app.status
+    );
 }
 
 #[test]

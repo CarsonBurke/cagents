@@ -109,12 +109,12 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
+/// What a fenced pane tells its reader, whatever its kind.
+pub(super) const FENCED_PANE_EXPLANATION: &str = "cagents can't confirm that this pane's saved session is the one its agent is running now, so the pane stays as saved and won't reconnect. Other panes here work normally. Closing the pane doesn't stop its agent.";
+
 /// Canonical managed panes whose saved descriptor no longer matches the
 /// registry's actor, or whose card is ambiguous. Each one stays inert alone:
 /// it neither projects nor publishes, while its scope's other panes proceed.
-/// What a fenced pane tells its reader, whatever its kind.
-pub(super) const FENCED_PANE_EXPLANATION: &str = "cagents can't confirm that this pane's saved session is the one its agent is running now, so the pane stays as saved and won't reconnect. Other panes in this view work normally. Closing the pane doesn't stop its agent.";
-
 pub(super) fn quarantined_managed_panes(
     model: &crate::workspace_model::WorkspaceModel,
     views: &[View],
@@ -233,6 +233,9 @@ pub(super) struct State {
     /// local presentation and saved evidence: managed panes that fail their
     /// registry proof, and the local aliases of those panes.
     pub quarantined: HashSet<CardId>,
+    /// Fenced panes the reader closed, until no shared view holds them. Their
+    /// close publishes a removal by identity, never a stale source.
+    pub fenced_closes: HashSet<CardId>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     /// Chat cards whose shared view re-pointed them since this window last
     /// saved, which its own store must be told explicitly.
@@ -1563,7 +1566,7 @@ impl Cagents {
         }
         if self.shared_views.quarantined.contains(&card) {
             self.status = Some(TransientNotice::warning(
-                "This pane can't move to another channel until its saved session is confirmed.",
+                "This pane can't move to another channel because cagents can't confirm its saved session. Close it instead.",
             ));
             return Task::none();
         }
@@ -1873,28 +1876,32 @@ impl Cagents {
         // the close names the pane rather than a source the registry would
         // refuse, as a seed's closed list does. Until a scope has seeded, its
         // seed carries the close instead; a refused removal is derived again.
-        let closed_fenced = self
-            .workspace_model
-            .views
-            .iter()
-            .filter(|view| {
-                !quarantined.is_empty() && self.shared_views.initialized.contains(&view.scope)
-            })
-            .flat_map(|view| {
-                view.panes
-                    .iter()
-                    .filter(|pane| {
-                        quarantined.contains(&pane.id)
-                            && self
-                                .card_state(pane.id)
-                                .is_some_and(|card| !card.existence.is_open())
-                            && !self.shared_views.pending.iter().any(|(_, _, change)| {
-                                matches!(change, Change::Remove { id } if *id == pane.id)
-                            })
-                    })
-                    .map(|pane| (view.scope.clone(), view.revision, pane.id))
-            })
-            .collect::<Vec<_>>();
+        let mut closed_fenced = Vec::new();
+        if !self.shared_views.fenced_closes.is_empty() {
+            let mut held = HashSet::new();
+            for view in &self.workspace_model.views {
+                for pane in &view.panes {
+                    if !self.shared_views.fenced_closes.contains(&pane.id) {
+                        continue;
+                    }
+                    held.insert(pane.id);
+                    if self.shared_views.initialized.contains(&view.scope)
+                        && self
+                            .card_state(pane.id)
+                            .is_some_and(|card| !card.existence.is_open())
+                        && !self.shared_views.pending.iter().any(|(_, _, change)| {
+                            matches!(change, Change::Remove { id } if *id == pane.id)
+                        })
+                    {
+                        closed_fenced.push((view.scope.clone(), view.revision, pane.id));
+                    }
+                }
+            }
+            // Once no view holds it, the removal has landed.
+            self.shared_views
+                .fenced_closes
+                .retain(|id| held.contains(id));
+        }
         for (scope, expected_revision, id) in closed_fenced {
             let operation = uuid::Uuid::new_v4();
             let change = Change::Remove { id };
@@ -2150,14 +2157,11 @@ impl Cagents {
         }
     }
 
-    /// Fenced cards for the model this client holds now. A snapshot installed
-    /// since the last projection may have fenced a pane already, before
-    /// reconciliation recomputes the projected set and its local aliases.
+    /// Fenced cards for the model this client holds now. Installing a
+    /// snapshot adds the panes it fences; projection recomputes the set with
+    /// their local aliases.
     fn fenced_panes(&self) -> HashSet<CardId> {
-        let mut fenced =
-            quarantined_managed_panes(&self.workspace_model, &self.workspace_model.views);
-        fenced.extend(self.shared_views.quarantined.iter().copied());
-        fenced
+        self.shared_views.quarantined.clone()
     }
 
     /// A transfer can commit before a later metadata edit reaches the daemon.

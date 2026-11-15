@@ -471,7 +471,7 @@ impl Cagents {
                 _ => ("they stay", "them"),
             };
             sentences.push(format!(
-                "{} can't reconnect because cagents can't confirm that the saved session is the one the agent is running now, so {they} as saved: {}. Close {them} when you no longer need {them}; other panes in the same views work normally.",
+                "{} can't reconnect because cagents can't confirm that the saved session is the one the agent is running now, so {they} as saved: {}. Close {them} when you no longer need {them}; other panes work normally.",
                 saved_panes(fenced.len()),
                 self.startup_pane_names(fenced),
             ));
