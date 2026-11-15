@@ -618,7 +618,7 @@ mod tests {
 /// worktrees. The timing run is ignored by default; build it optimized:
 ///
 /// ```sh
-/// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+/// scripts/cargo-gate test --locked --profile local -p cagents-ui \
 ///     --lib -- --ignored --nocapture app::pull_request_ui::workload
 /// ```
 #[cfg(test)]

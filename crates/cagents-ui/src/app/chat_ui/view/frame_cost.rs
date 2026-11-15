@@ -4,7 +4,7 @@
 //! unoptimized one measures the compiler rather than the surface.
 //!
 //! ```sh
-//! cargo test --locked --no-default-features --features ui --profile dev-runtime \
+//! cargo test --locked -p cagents-ui --profile dev-runtime \
 //!     --config 'profile.dev-runtime.opt-level=2' \
 //!     --config 'profile.dev-runtime.debug-assertions=false' --lib \
 //!     chat_ui::view::frame_cost -- --ignored --nocapture --test-threads=1

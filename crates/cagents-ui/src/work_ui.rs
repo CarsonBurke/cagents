@@ -1686,7 +1686,7 @@ mod tests {
     /// does. Run it optimized:
     ///
     /// ```sh
-    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    /// scripts/cargo-gate test --locked --profile local -p cagents-ui \
     ///     --lib -- --ignored --nocapture work_ui::tests::board_frame_workload
     /// ```
     #[test]

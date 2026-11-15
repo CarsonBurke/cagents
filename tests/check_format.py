@@ -148,7 +148,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt"],
+                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-ui"],
                         [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
                     ],
                 )

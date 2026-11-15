@@ -2584,7 +2584,7 @@ mod tests {
     /// of one call. Run it optimized:
     ///
     /// ```sh
-    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    /// scripts/cargo-gate test --locked --profile local -p cagents-ui \
     ///     --lib -- --ignored --nocapture workspace::tests::strip_workload
     /// ```
     #[test]

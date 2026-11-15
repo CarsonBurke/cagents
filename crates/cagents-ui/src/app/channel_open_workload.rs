@@ -9,7 +9,7 @@
 //! app:
 //!
 //! ```sh
-//! scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+//! scripts/cargo-gate test --locked --profile local -p cagents-ui \
 //!     --lib -- --ignored --nocapture app::channel_open_workload
 //! ```
 //!

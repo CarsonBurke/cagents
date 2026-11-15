@@ -312,7 +312,7 @@ pub fn surviving_process(
 #[cfg(any(feature = "host", feature = "ui"))]
 fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     const ATTEMPTS: usize = 4;
-    const WAIT: std::time::Duration = if cfg!(test) {
+    const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
         std::time::Duration::from_millis(1)
     } else {
         std::time::Duration::from_millis(100)
