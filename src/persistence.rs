@@ -4436,8 +4436,16 @@ fn save_workspace_transaction(
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
-        offered_cards.settled.remove(card_id);
     }
+    // A card the window no longer offers has nothing left to skip, whether
+    // its row was tombstoned above, never stored or has left this workspace.
+    // What this connection remembers is bounded by the snapshot it saved last.
+    offered_cards
+        .settled
+        .retain(|card, _| incoming_ids.contains(card));
+    offered_cards
+        .refused
+        .retain(|card, _| incoming_ids.contains(card));
 
     Ok(WorkspaceCommit {
         generation: next,
@@ -12944,6 +12952,53 @@ mod tests {
         let restored = store.load_card(card, None).unwrap().unwrap();
         assert_eq!(restored.title, "latest", "the latest content wins");
         assert_eq!(restored.generation, settled.0.cast_unsigned() + 5);
+    }
+
+    /// #2872: a card the window stops offering leaves what the connection
+    /// remembers, even when no tombstone is written for it because storage no
+    /// longer lists it under this workspace.
+    #[test]
+    fn a_card_the_window_stops_offering_is_forgotten() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let remembered = |store: &StateStore| {
+            store
+                .lock_inner()
+                .unwrap()
+                .offered_cards
+                .settled
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        // Tombstoned by the snapshot that drops it.
+        let dropped = workspace.cards.remove(workspace.cards.len() - 1).id;
+        lane.save(&store, &workspace).unwrap();
+        assert!(!remembered(&store).contains(&dropped));
+        // Gone from this workspace's rows without a tombstone.
+        let moved = workspace.cards.remove(workspace.cards.len() - 1).id;
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(&format!(
+                "DELETE FROM browser_restore WHERE card_id = '{moved}';
+                 DELETE FROM cards WHERE card_id = '{moved}';"
+            ))
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        store.shutdown().unwrap();
     }
 
     /// A settled open card whose row another path changed is written again:
