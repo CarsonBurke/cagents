@@ -16,30 +16,30 @@ pub fn version() -> &'static str {
 
 #[doc(hidden)]
 pub mod build_version;
-mod names;
+#[doc(hidden)]
+pub mod names;
 pub(crate) mod native_chat_capacity;
 pub mod search_match;
+// The repository fixtures the UI crate's tests share allocate through this;
+// that build uses only part of it.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod test_fixture;
 
 pub mod account;
 pub mod agent;
 pub mod agent_execution;
-#[cfg(feature = "ui")]
-pub mod app;
-#[cfg(feature = "ui")]
-pub mod automation_ui;
 pub mod automations;
-#[cfg(feature = "integrated-browser")]
-pub mod browser;
-#[cfg(feature = "ui")]
-pub mod capability;
 pub mod channel_work;
 pub mod channel_work_api;
 pub mod chat;
 pub mod companion;
 pub mod control;
-pub(crate) mod daemon;
+#[doc(hidden)]
+pub mod daemon;
 #[cfg(feature = "ui")]
-pub(crate) mod daemon_health;
+#[doc(hidden)]
+pub mod daemon_health;
 #[cfg(any(feature = "host", all(test, target_os = "linux")))]
 pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
@@ -48,31 +48,16 @@ pub mod device;
 pub mod device_service;
 pub mod diagnostics;
 #[cfg(feature = "ui")]
-pub mod diff_view;
-#[cfg(feature = "ui")]
 pub mod document_link;
-#[cfg(feature = "ui")]
-pub mod document_render;
-#[cfg(feature = "ui")]
-pub mod editor;
-#[cfg(feature = "ui")]
-pub(crate) mod editor_history;
-#[cfg(feature = "ui")]
-pub mod editor_search;
-#[cfg(feature = "ui")]
-pub mod external_editor;
-#[cfg(feature = "ui")]
-pub mod file_drop;
-#[cfg(feature = "ui")]
-pub mod file_icon;
-#[cfg(feature = "ui")]
-pub mod file_manager;
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) mod file_url;
-mod filesystem_recovery_context;
+#[doc(hidden)]
+pub mod file_url;
+#[doc(hidden)]
+pub mod filesystem_recovery_context;
+mod flock;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) mod git_watch;
+pub mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
 pub mod github_identity;
@@ -82,90 +67,60 @@ pub mod github_status;
 pub mod host;
 #[cfg(feature = "ui")]
 pub mod input_trace;
-#[cfg(feature = "ui")]
-pub mod inspector;
 mod install_guard;
 pub mod instance;
-#[cfg(feature = "ui")]
-pub mod interaction;
-#[cfg(feature = "latency-harness")]
-pub mod latency_fixture;
 pub mod layout_metrics;
-#[cfg(feature = "ui")]
-pub mod lifecycle;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
-#[cfg(feature = "ui")]
-pub mod lsp;
 pub mod model;
 pub mod notifications;
-#[cfg(feature = "ui")]
-pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
 pub mod process;
 pub mod project_location;
-#[cfg(feature = "ui")]
-pub mod pull_request_review;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod pull_request_signals;
 pub mod recovery_authority;
-#[cfg(feature = "ui")]
-pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod repository;
 #[cfg(feature = "ui")]
-pub mod repository_widget;
-mod secure_file;
+pub mod review_cache;
+#[doc(hidden)]
+pub mod secure_file;
 mod selected_file_path;
 #[cfg(feature = "ui")]
 mod separator;
-#[cfg(feature = "ui")]
-pub mod session;
 pub mod settings;
 #[cfg(feature = "ui")]
-pub mod settings_widgets;
-#[cfg(feature = "ui")]
-pub mod sidebar;
-#[cfg(feature = "ui")]
 pub mod splitter;
-#[cfg(feature = "ui")]
-mod sticky_tree;
-#[cfg(feature = "ui")]
-pub mod tab_history;
-#[cfg(feature = "ui")]
-pub mod tab_strip;
 pub mod terminal;
-#[cfg(all(test, any(feature = "host", feature = "ui")))]
-pub(crate) mod test_tracing;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_timing;
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(feature = "host", feature = "ui")
+))]
+#[doc(hidden)]
+pub mod test_tracing;
 pub(crate) mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]
 pub mod tray;
-#[cfg(feature = "ui")]
-pub mod ui_controls;
-#[cfg(feature = "ui")]
-pub mod ui_memory;
 pub mod update;
 pub mod upgrade;
 pub mod work;
-#[cfg(feature = "ui")]
-pub mod work_ui;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
 pub mod worktree_content;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_setup;
 pub use terminal::ipc as terminal_ipc;
-#[cfg(feature = "ui")]
-pub mod workspace;
 /// The shared half of the sidebar model. Ungated: the CLI mutates it, the
 /// daemon owns it and the UI mirrors it, so all three lanes name these types.
 pub mod workspace_model;
-#[cfg(feature = "ui")]
-pub mod workspace_widget;

@@ -23,24 +23,31 @@ DIR holds one private user. Its path must be short (sockets live below it).
   install DIR VERSION INSTALLER [INSTALLER-ARGS...]
                        Run INSTALLER (an install.sh) for the archive and
                        SHA256SUMS in DIR, as the private user.
+  stage DIR VERSION INSTALLER
+                       Stage a fresh candidate before seeding work; bind its
+                       verified archive and printed command in a receipt.
   run --old-dir DIR --old-version V --old-installer FILE
       --new-dir DIR --new-version V --new-installer FILE [OPTIONS]
                        Fresh-root scenario; always saves report.txt and stops.
                        --ceditor BIN_DIR, --answer TEXT (default yes), --yes,
-                       --working TEXT, --stop TEXT,
+                       --working TEXT, --stop TEXT, --require-working,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
-                       --uncarryable, --unreachable. See run --help.
+                       --uncarryable, --unreachable, --reopen-existing-only,
+                       --new-terminal-after-restore, --natural-idle,
+                       --expect-terminal-restart-failure (before example).
+                       See run --help.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
-  launch [main|NAME]   Open a named installed UI window on the desktop.
+  launch [--restore-existing-only] [main|NAME]
+                       Open a named installed UI window on the desktop.
   wm ARGS...           Private compositor IPC (niri msg).
   ceditor start DIR    Launch DIR/ceditor with its matched companions.
   seed [OPTIONS]       Open two projects and create channels, agents (chat and
                        console, named and untitled) and terminals through the
                        installed CLI.
   update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
-         [UPGRADE-ARGS...]
+         [--use-staged] [--require-working|--require-idle] [UPGRADE-ARGS...]
                        What scripts/install-local does after its build: stage
                        the archive with --stage-only, then run the staged
                        `cagents daemon upgrade` in a terminal (inside the
@@ -48,9 +55,15 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        [Y/n] confirmation, --working at the working-agents
                        choice (empty waits for them) and --stop at the stop
                        list (empty cancels it).
+                       --use-staged verifies the exact earlier stage receipt
+                       without running the installer again. --require-working
+                       declines an ordinary review before any consent.
+                       --require-idle checks the natural-idle receipt against
+                       the actual published Resumes (1) review before consent.
   desktop start [--limit SECONDS]
                        Start a headless desktop (KWin virtual + nested niri)
-                       under the native lock. Windows open there.
+                       in one of the host's native slots, for at most --limit
+                       seconds (default 900, at most 1800). Windows open there.
   desktop stop         End the desktop; the daemon and sessions keep running.
   env CMD...           Run CMD as the private user, without the desktop.
   app CMD...           Run CMD as the private user inside the desktop.
@@ -59,6 +72,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
   record NAME          Write DIR/records/NAME/: daemon status, terminals,
                        sessions, channels, saved panes and their processes.
   stop                 End everything the private user runs, the daemon too.
+  stop-daemon          Stop only the private daemon with counted confirmation.
   status               Report the desktop, daemon and processes.
 USAGE
 }
@@ -118,6 +132,17 @@ user_env() {
     for name in LANG LC_ALL LC_CTYPE TERM; do
         [ -z "${!name+x}" ] || passed+=("$name=${!name}")
     done
+    # Optional private retry fixture. Never inherit the caller's loader state or
+    # apply this outside its marked root; all installed executables stay intact.
+    if [ -e "$root/.fixture/startup-bind.so" ] || [ -L "$root/.fixture/startup-bind.so" ]; then
+        require_init
+        [ -d "$root/.fixture" ] && [ ! -L "$root/.fixture" ] &&
+            [ -f "$root/.fixture/startup-bind.so" ] && [ ! -L "$root/.fixture/startup-bind.so" ] &&
+            [ "$(stat -c %u "$root/.fixture/startup-bind.so")" = "$(id -u)" ] &&
+            [ "$(stat -c %a "$root/.fixture/startup-bind.so")" = 700 ] ||
+            die 'startup bind fixture must be an owned private regular library'
+        passed+=("LD_PRELOAD=$root/.fixture/startup-bind.so")
+    fi
     env -i -C "$user_home" "${passed[@]}" \
         HOME="$user_home" USER="$(id -un)" LOGNAME="$(id -un)" SHELL=/bin/bash \
         XDG_RUNTIME_DIR="$runtime" \
@@ -161,6 +186,11 @@ cmd_init() {
     printf '%s\n' "$root" >"$root/.rehearse-update"
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
     mkdir -m 700 -p -- "$runtime"
+    # The fixture ignores probes in this counter; real chat starts append once.
+    [ ! -L "$user_home/.claude/fixture-launches" ] \
+        && { [ ! -e "$user_home/.claude/fixture-launches" ] || [ -f "$user_home/.claude/fixture-launches" ]; } \
+        || die 'fixture launch counter must be a regular private file' 2
+    (umask 077; touch -- "$user_home/.claude/fixture-launches")
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$bin/claude"
     install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$bin/gh"
     printf '#!/bin/sh\necho "curl: (7) the rehearsal has no network access" >&2\nexit 7\n' >"$bin/curl"
@@ -203,6 +233,25 @@ cmd_seed() {
     /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" seed "$@"
 }
 
+cmd_stage() {
+    require_init
+    local archive_dir=${1:?stage needs the archive directory} version=${2:?stage needs a version} installer=${3:?stage needs an install.sh}
+    [ "$#" -eq 3 ] || die 'stage takes exactly DIR VERSION INSTALLER' 2
+    [[ $version =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die 'stage needs a single version name' 2
+    archive_dir=$(realpath -- "$archive_dir")
+    installer=$(realpath -- "$installer")
+    local prefix=$user_home/.local/share/cagents-install transcript=$logs/stage-candidate.log status=0 original
+    [ ! -e "$prefix/versions/$version" ] && [ ! -L "$prefix/versions/$version" ] || die 'stage requires an absent candidate' 2
+    [ ! -e "$root/staged-candidate.json" ] && [ ! -L "$root/staged-candidate.json" ] || die 'stage receipt already exists' 2
+    original=$(readlink -f -- "$prefix/current")
+    cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee "$transcript" || status=${PIPESTATUS[0]}
+    [ "$status" -eq 0 ] || return "$status"
+    # The reviewed 5fcce7e0e installer publishes the staged tree as current while the old daemon keeps serving.
+    case "$(readlink -f -- "$prefix/current")" in "$original"|"$prefix/versions/$version") ;; *) die 'staging changed current unexpectedly' 2 ;; esac
+    user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" staged-candidate \
+        "$archive_dir" "$version" "$installer" --record "$transcript"
+}
+
 # What scripts/install-local does once its archive is built: stage it, then run
 # the staged build's `daemon upgrade` in a terminal, as a person would. ANSWER
 # is typed at each confirmation, WORKING at the working-agents choice and STOP
@@ -211,19 +260,48 @@ cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= working= stop= upgrade_args=()
+    local answer= working= stop= fail_new_daemon=0 use_staged=0 upgrade_args=() pty_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --fail-new-daemon) fail_new_daemon=1; shift ;;
+            --use-staged) use_staged=1; shift ;;
+            --require-working) pty_args+=(--require-working); shift ;;
+            --require-idle) pty_args+=(--require-idle --review-root "$root" --review-output "$root/reviews/natural-idle"); shift ;;
             --answer) answer=${2?}; shift 2 ;;
             --working) working=${2?}; shift 2 ;;
             --stop) stop=${2?}; shift 2 ;;
             *) upgrade_args+=("$1"); shift ;;
         esac
     done
+    if [ "${#pty_args[@]}" -gt 0 ]; then
+        local arg
+        for arg in "${upgrade_args[@]}"; do
+            case $arg in --yes | --yes=*) die 'required review forbids --yes' 2 ;; esac
+        done
+    fi
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
     local prefix=$user_home/.local/share/cagents-install
-    if [[ $prefix/current -ef $prefix/versions/$version ]]; then
+    local staged_cli=$prefix/versions/$version/bin/cagents
+    if [ "$use_staged" -eq 1 ]; then
+        [ "$fail_new_daemon" -eq 0 ] || die '--use-staged cannot combine with --fail-new-daemon' 2
+        local arg
+        for arg in "${upgrade_args[@]}"; do
+            case $arg in --version | --version=*) die '--use-staged forbids a different release target' 2 ;; esac
+        done
+        archive_dir=$(realpath -- "$archive_dir")
+        installer=$(realpath -- "$installer")
+        staged_cli=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" staged-candidate \
+            "$archive_dir" "$version" "$installer") || return
+    fi
+    if [ "$fail_new_daemon" -eq 1 ]; then
+        [ ! -e "$prefix/versions/$version" ] || die 'startup failure requires an unstaged private candidate' 2
+        archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
+            "$root" "$version" --archive-dir "$archive_dir")
+    fi
+    if [ "$use_staged" -eq 1 ]; then
+        printf '%s verified against the early stage receipt.\n' "$version" | tee -a "$transcript"
+    elif [[ $prefix/current -ef $prefix/versions/$version ]]; then
         printf '%s is already current; skipping staging.\n' "$version"
     elif [ -e "$prefix/versions/$version" ]; then
         die "$prefix/versions/$version exists but is not current; remove it to reinstall"
@@ -233,8 +311,8 @@ cmd_update() {
         [ "$stage_status" -eq 0 ] || return "$stage_status"
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
-    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \
-        "$user_home/.local/share/cagents-install/current/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
+    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" "${pty_args[@]}" -- \
+        "$staged_cli" daemon upgrade "${upgrade_args[@]}" \
         2>&1 | tee -a "$transcript" || status=${PIPESTATUS[0]}
     printf 'daemon upgrade exited %s after %ss total\n' "$status" "$((SECONDS - started))" | tee -a "$transcript"
     return "$status"
@@ -262,13 +340,17 @@ cmd_desktop() {
 }
 
 desktop_start() {
-    local limit=3600
+    local limit=900
     while [ "$#" -gt 0 ]; do
         case $1 in
             --limit) limit=${2:?}; shift 2 ;;
             *) die "unknown desktop option: $1" 2 ;;
         esac
     done
+    [[ $limit =~ ^[1-9][0-9]*$ ]] || die 'the desktop limit must be a whole number of seconds' 2
+    # It holds one of the host's few native slots, which evidence sessions share.
+    [ "$limit" -le 1800 ] ||
+        die "a desktop may hold a native slot for at most 1800 seconds, so it cannot keep other sessions waiting; --limit $limit is longer" 2
     desktop_live && die 'the desktop is already running'
     rm -rf -- "$desktop"
     mkdir -p -- "$desktop"/{home,config,data,cache,state}
@@ -311,13 +393,37 @@ desktop_stop() {
 # evidence on this host takes the same lock.
 run_desktop() {
     local limit=$1
-    exec 9>"$native_lock"
+    # One of the host's native slots, which evidence sessions share; see
+    # scripts/native_slots.py. Only the slot taken stays open, on 9.
+    local paths path descriptor queue_descriptor slot_descriptors=() arguments=() lock_status=0 index
+    paths=$(/usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock") ||
+        die 'could not list the native slots'
+    exec {queue_descriptor}>>"$native_lock.queue" || die "could not open $native_lock.queue"
+    while IFS= read -r path; do
+        exec {descriptor}>>"$path" || die "could not open $path"
+        slot_descriptors+=("$descriptor")
+        arguments+=(--fd "$descriptor")
+    done <<<"$paths"
     printf 'waiting for the native lock %s\n' "$native_lock"
-    while ! flock -w 1 9; do
-        [ ! -e "$desktop/stop" ] || return 0
+    setpriv --pdeathsig TERM /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" \
+        "$root" "$self" wait-native-lock --queue-fd "$queue_descriptor" "${arguments[@]}" \
+        --parent-pid "$BASHPID" >"$desktop/slot" || lock_status=$?
+    index=$(cat -- "$desktop/slot")
+    if [ "$lock_status" -eq 0 ]; then
+        [[ $index =~ ^[0-9]+$ ]] && [ "$index" -lt "${#slot_descriptors[@]}" ] || lock_status=2
+    fi
+    [ "$lock_status" -ne 0 ] || exec 9>&"${slot_descriptors[$index]}"
+    for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+        exec {descriptor}>&-
     done
+    if [ "$lock_status" -ne 0 ]; then
+        [ "$lock_status" -eq 75 ] && [ -e "$desktop/stop" ] && return 0
+        die "native lock waiter exited $lock_status" "$lock_status"
+    fi
     [ ! -e "$desktop/stop" ] || return 0
-    printf 'holding the native lock\n'
+    printf 'holding native slot %s\n' "$index"
+    # The limit runs from taking the slot, so preparing the desktop counts.
+    local deadline=$((SECONDS + limit))
     : >"$desktop/locked"
     local runtime_desktop=$desktop/rt
     mkdir -m 700 -p -- "$runtime_desktop"
@@ -336,7 +442,7 @@ run_desktop() {
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
         --width 1596 --height 929 --exit-with-session \
         "$self --root $root __inner" >"$logs/kwin.log" 2>&1 9>&- &
-    local compositor=$! deadline=$((SECONDS + limit))
+    local compositor=$!
     while kill -0 "$compositor" 2>/dev/null; do
         if [ -e "$desktop/stop" ] || [ "$SECONDS" -ge "$deadline" ]; then
             [ -e "$desktop/stop" ] || printf 'desktop reached its %ss limit\n' "$limit"
@@ -452,6 +558,24 @@ cmd_record() {
         esac
         user_env timeout -k 2 15 "$cli" --no-start --json "${args[@]}" >"$out/$noun.json" 2>"$out/$noun.stderr" || :
     done
+    # The issued receipt alone is historical evidence. Re-run its read-only
+    # verifier so paused panes are accepted only from the same Ready owner now.
+    local evidence_status=0
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" prepare-recovery "$root" "$out" \
+        >"$out/recovery-prepare.stdout" 2>"$out/recovery-prepare.stderr" || evidence_status=$?
+    if [ "$evidence_status" -eq 0 ]; then
+        local verifier
+        IFS= read -r verifier <"$out/recovery-prepare.stdout"
+        user_env timeout -k 2 30 "$verifier" --no-start daemon verify-update-census \
+            --census "$out/recovery-census.json" --outcome "$out/recovery-current.json" \
+            >"$out/recovery-verify.stdout" 2>"$out/recovery-verify.stderr" || {
+                printf '%s\n' 'Current daemon readiness and inventory verification failed; inspect recovery-verify.stderr' >"$out/recovery-error.txt"
+                status=1
+            }
+    elif [ "$evidence_status" -ne 1 ]; then
+        cp -- "$out/recovery-prepare.stderr" "$out/recovery-error.txt"
+        status=1
+    fi
     if desktop_live; then
         /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
     else
@@ -470,11 +594,19 @@ cmd_compare() {
 
 cmd_launch() {
     require_init
-    local slot=${1:-main} args=()
+    local existing_only=0
+    if [ "${1:-}" = --restore-existing-only ]; then existing_only=1; shift; fi
+    local slot=${1:-main} args=() program=$user_home/.local/bin/cagents
     [[ $slot =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'invalid window name' 2
     [ "$slot" = main ] || args=(--window "$slot")
+    if [ "$existing_only" -eq 1 ]; then
+        program=$user_home/.local/share/cagents-install/current/bin/cagents-ui
+        args=(--restore-existing-only "${args[@]}")
+    else
+        args=(ui "${args[@]}")
+    fi
     # The display environment and private environment are retained by the UI.
-    (exec </dev/null; cmd_app "$user_home/.local/bin/cagents" ui "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
+    (exec </dev/null; cmd_app "$program" "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
     printf '%s\n' "$!" >"$root/ui-$slot.pid"
 }
 
@@ -592,6 +724,16 @@ cmd_stop() {
     return "$cleanup_status"
 }
 
+cmd_stop_daemon() {
+    require_init
+    local prefix=$user_home/.local/share/cagents-install cli capability
+    cli=$(readlink -f -- "$user_home/.local/bin/cagents")
+    [[ $cli == "$prefix"/versions/*/bin/cagents ]] || die 'private daemon stop requires its installed CLI' 2
+    [ "$cli" = "$(readlink -f -- "$prefix/current/bin/cagents")" ] || die 'private daemon stop requires the current build' 2
+    capability=$(user_env timeout -k 5 20 "$cli" --no-start daemon preflight) || return
+    user_env timeout -k 5 30 "$cli" --no-start --json daemon stop --confirm "$capability"
+}
+
 cmd_status() {
     if desktop_live; then printf 'desktop: running (pid %s)\n' "$(cat "$desktop/pid")"; else printf 'desktop: stopped\n'; fi
     printf 'installed: %s\n' "$(readlink -- "$user_home/.local/share/cagents-install/current" 2>/dev/null || echo none)"
@@ -603,6 +745,7 @@ command=${1:-}
 case $command in
     init) cmd_init ;;
     install) cmd_install "$@" ;;
+    stage) cmd_stage "$@" ;;
     update) cmd_update "$@" ;;
     seed) cmd_seed "$@" ;;
     run | scenario) /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" run "$@" ;;
@@ -618,6 +761,7 @@ case $command in
     shot) cmd_shot "$@" ;;
     record) cmd_record "$@" ;;
     stop) cmd_stop ;;
+    stop-daemon) cmd_stop_daemon ;;
     status) cmd_status ;;
     __desktop) run_desktop "$@" ;;
     __inner) run_inner ;;

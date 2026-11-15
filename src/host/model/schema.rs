@@ -45,6 +45,18 @@ pub(super) fn open(path: &Path) -> Result<Connection, String> {
     open_existing(path)
 }
 
+/// Inspection while a previous daemon is still the writer must neither
+/// migrate its published layout nor recover an unconfirmed rollback journal.
+pub(super) fn open_readonly(path: &Path) -> Result<Connection, String> {
+    reject_unjournaled_layout(path)?;
+    connect(path, true)
+}
+
+/// The caller pins this check and its reads in the same SQLite transaction.
+pub(super) fn require_published_snapshot(db: &Connection) -> Result<(), String> {
+    require_open_layout(db, inspect(db)?.version)
+}
+
 fn prepare_file(path: &Path) -> Result<(), String> {
     // POSIX close(any descriptor for an inode) releases the process's fcntl
     // locks, even if another SQLite connection owns them. Never open/close an
@@ -227,6 +239,32 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            26 => {
+                // Source stamps own no process or recovery custody. The
+                // model watermark remains monotonic across cold conversion.
+                tx.execute_batch("DROP TABLE terminal_pane_bindings;")
+                    .map_err(|error| error.to_string())?;
+            }
+            25 => {
+                tx.execute_batch("DROP TRIGGER session_channel_insert; DROP TRIGGER session_channel_move; DROP TABLE session_channels;")
+                    .map_err(|error| error.to_string())?;
+            }
+            24 => {
+                let retained: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM console_relaunches)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if retained {
+                    return Err(
+                        "Console recovery records remain; keep the new installation until its consoles are resolved".into(),
+                    );
+                }
+                tx.execute_batch("DROP TABLE console_relaunches;")
+                    .map_err(|error| error.to_string())?;
+            }
             23 => super::views::store::downgrade(&tx)?,
             _ => {
                 return Err(format!(
@@ -340,6 +378,9 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FIVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_SIX: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -353,6 +394,9 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
+        25 => &TWENTY_FIVE,
+        26 => &TWENTY_SIX,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -554,6 +598,7 @@ mod tests {
         model::{ChannelId, ChannelTitleSource, ProjectKind},
         workspace_model::ModelEdit,
     };
+    use rusqlite::OptionalExtension;
     use std::{cell::Cell, rc::Rc, time::Duration};
 
     fn fixture_dir() -> tempfile::TempDir {
@@ -776,7 +821,8 @@ mod tests {
         require_current(&registry.db).unwrap();
         let model = registry.model().unwrap();
         assert_eq!(model.identity.to_string(), identity);
-        assert_eq!(model.sequence, 7);
+        // New source bindings advance the watermark once, fencing old gestures.
+        assert_eq!(model.sequence, 8);
         assert_eq!(model.channels[0].id, channel);
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
         assert_eq!(view.revision, 9);
@@ -844,6 +890,9 @@ mod tests {
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (24, "DROP TABLE console_relaunches;"),
+            (25, "DROP TABLE session_channels;"),
+            (26, "DROP TABLE terminal_pane_bindings;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1027,6 +1076,144 @@ mod tests {
     }
 
     #[test]
+    fn console_schema24_preserves_published23_and_round_trips_through22() {
+        let directory = fixture_dir();
+        let path = directory.path().join("console-schema24.sqlite3");
+        let (identity, channel) = legacy(&path, 23);
+        let retired = crate::model::CardId::new();
+        let operation = uuid::Uuid::new_v4();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        assert!(inspect(&db).unwrap().objects.iter().any(|o| o.1 == "panes"));
+        db.execute(
+            "INSERT INTO view_scopes(channel,revision) VALUES(?1,19)",
+            [channel.to_string()],
+        )
+        .unwrap();
+        let scope = db.last_insert_rowid();
+        db.execute("UPDATE view_revision_clock SET last=19 WHERE id=1", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO retired_panes(scope,pane,ordinal,retired_at_unix_ms) VALUES(?1,?2,0,123)",
+            rusqlite::params![scope, retired.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO view_operations(operation,scope,applied_at_unix_ms) VALUES(?1,?2,124)",
+            rusqlite::params![operation.to_string(), scope],
+        )
+        .unwrap();
+        let expected = super::super::views::read(&db, &channel.into()).unwrap();
+        drop(db);
+
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM console_relaunches", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        drop(registry);
+
+        assert_eq!(downgrade(&path, 23).unwrap(), Some(SCHEMA_VERSION));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert_eq!(inspect(&db).unwrap().version, 23);
+        assert_eq!(
+            super::super::views::read(&db, &channel.into()).unwrap(),
+            expected
+        );
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        drop(db);
+
+        assert_eq!(downgrade(&path, 22).unwrap(), Some(23));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 22).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT operation FROM shared_view_edits WHERE operation=?1",
+                [operation.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            operation.to_string()
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn console_recovery_records_refuse_downgrade_without_changing_evidence() {
+        for target in [22, 23] {
+            let directory = fixture_dir();
+            let path = directory.path().join("retained-console.sqlite3");
+            legacy(&path, 24);
+            let db = Connection::open(&path).unwrap();
+            // Even opaque recovery evidence must be retained, not decoded or
+            // discarded by a schema conversion. Keep its actual FK parents.
+            db.execute_batch("PRAGMA foreign_keys=ON;
+                INSERT INTO native_actor_ownerships(actor,ownership) VALUES('actor','original ownership');
+                INSERT INTO agents(id,origin,record,closed) VALUES('agent','local','{}',0);
+                INSERT INTO console_relaunches(actor,agent,record) VALUES('actor','agent','original console recovery');").unwrap();
+            let before = inspect(&db).unwrap();
+            drop(db);
+            let original = bytes(&path);
+            assert!(
+                downgrade(&path, target)
+                    .unwrap_err()
+                    .contains("Console recovery records remain")
+            );
+            assert_eq!(bytes(&path), original);
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(inspect(&db).unwrap(), before);
+            assert_eq!(
+                db.query_row(
+                    "SELECT record FROM console_relaunches WHERE actor='actor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "original console recovery"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                    .optional()
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn published_eighteen_adds_only_empty_attention_outbox_and_preserves_audit() {
         use crate::{
             agent::Provider,
@@ -1087,7 +1274,8 @@ mod tests {
         tx.commit().unwrap();
         // Schema 23 replaces the view tables and repoints the terminal sources
         // at `panes`; `require_current` already holds those objects to the
-        // published 23 layout, so this comparison covers everything else.
+        // published 23 layout. Schema 24 adds the empty console recovery ledger;
+        // this comparison covers every other predecessor object.
         let replaced_views = [
             "shared_view_scopes",
             "shared_views",
@@ -1140,7 +1328,9 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20, run-attention21 and history22.
+            // This current opener also applies retention20, run-attention21,
+            // history22, the empty console recovery ledger24 and session
+            // channel history25 and source bindings26.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1152,6 +1342,9 @@ mod tests {
                 "automation_retired_manual_requests",
                 "automation_removed_history",
                 "automation_firing_successors",
+                "console_relaunches",
+                "session_channels",
+                "terminal_pane_bindings",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1166,6 +1359,9 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
+                "console_relaunches",
+                "session_channels",
+                "terminal_pane_bindings",
             ] {
                 assert_eq!(
                     registry
@@ -1192,7 +1388,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
+                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger and the exact history column may be added"
             );
             assert!(
                 registry
@@ -1519,7 +1715,8 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            26,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

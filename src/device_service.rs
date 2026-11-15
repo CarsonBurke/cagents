@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 /// Leave room for the response envelope without increasing the IPC frame cap.
-pub(crate) const MAX_DEVICE_IMAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
+pub const MAX_DEVICE_IMAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Home,
@@ -39,9 +39,6 @@ pub enum Operation {
     AccountProbe {
         account: crate::account::Account,
         force: bool,
-        /// A sign-in changed this home; discard its cached profile metadata.
-        #[serde(default)]
-        login_changed: bool,
     },
     Discover {
         path: PathBuf,
@@ -85,6 +82,12 @@ pub enum Operation {
     /// Spend one explicitly confirmed reset on a daemon-resolved account.
     AccountReset {
         request: crate::account::resets::ConsumeRequest,
+    },
+    /// A forced probe after a sign-in changed this home, which first discards
+    /// its cached profile metadata. Appended rather than added to
+    /// `AccountProbe`, whose fields a carried older CLI still encodes.
+    AccountProbeAfterLogin {
+        account: crate::account::Account,
     },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -262,33 +265,8 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             registry,
         } => update_accounts(expected_revision, registry),
         Operation::AccountLogin { account } => account_login(account),
-        Operation::AccountProbe {
-            account,
-            force,
-            login_changed,
-        } => {
-            let cache = crate::account::cache::Cache::installation();
-            if login_changed
-                && account.provider == crate::agent::Provider::Claude
-                && let (Some(cache), Some(key)) = (&cache, account.cache_key())
-            {
-                cache
-                    .invalidate_plan(&key)
-                    .map_err(|error| error.to_string())?;
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            let outcome = runtime.block_on(crate::account::probe::run(
-                account,
-                cache,
-                force || login_changed,
-            ));
-            serde_json::to_value(outcome)
-                .map(Reply::AccountProbe)
-                .map_err(|error| error.to_string())
-        }
+        Operation::AccountProbe { account, force } => probe_account(account, force, false),
+        Operation::AccountProbeAfterLogin { account } => probe_account(account, true, true),
         Operation::Home => {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -370,7 +348,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
 /// Read the producer's exact concrete filename on its owning device. Resolve
 /// relative names only against the verified conversation cwd; never search
 /// directories, expand patterns, or reinterpret a path on the UI computer.
-pub(crate) fn read_image_file(
+pub fn read_image_file(
     root: &std::path::Path,
     path: &std::path::Path,
     limit: usize,
@@ -1410,7 +1388,7 @@ mod tests {
         let path = directory.path().join("shared.txt");
         std::fs::write(&path, "before\n").unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let Some(group) = crate::fs_safety::tests::shared_group(&file) else {
+        let Some(group) = crate::fs_safety::acl_fixture::shared_group(&file) else {
             return;
         };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
@@ -1878,6 +1856,33 @@ fn update_accounts(expected_revision: u64, proposal: serde_json::Value) -> Resul
         .map(Reply::AccountRegistry)
         .map_err(|error| error.to_string())
 }
+/// Probe a home's usage. After a sign-in, a Claude home's cached profile
+/// metadata belongs to the previous login and is discarded first.
+#[cfg(feature = "host")]
+fn probe_account(
+    account: crate::account::Account,
+    force: bool,
+    login_changed: bool,
+) -> Result<Reply, String> {
+    let cache = crate::account::cache::Cache::installation();
+    if login_changed
+        && account.provider == crate::agent::Provider::Claude
+        && let (Some(cache), Some(key)) = (&cache, account.cache_key())
+    {
+        cache
+            .invalidate_plan(&key)
+            .map_err(|error| error.to_string())?;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let outcome = runtime.block_on(crate::account::probe::run(account, cache, force));
+    serde_json::to_value(outcome)
+        .map(Reply::AccountProbe)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "host")]
 fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     use crate::account::{home::Homes, probe, registry::Store};
@@ -2086,10 +2091,10 @@ mod wire_tests {
                 account: account.clone(),
             });
             roundtrip(&Operation::AccountProbe {
-                account,
+                account: account.clone(),
                 force: true,
-                login_changed: false,
             });
+            roundtrip(&Operation::AccountProbeAfterLogin { account });
         }
         use crate::account::remote::Operation as Lifecycle;
         for operation in [

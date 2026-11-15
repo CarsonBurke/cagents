@@ -41,6 +41,9 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.
+An admitted CLI from before protocol 179 receives store contention as a
+retryable `Internal` error so it can decode the reply. It keeps the response
+timeouts of its original executable.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused, withheld or restated. It checks
@@ -91,7 +94,7 @@ cagents daemon stop --confirm
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
 | `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
-| `daemon stop` | Request daemon termination (see below) |
+| `daemon stop` | Stop the daemon and wait for exit (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
 | `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
@@ -123,8 +126,17 @@ cagents daemon stop --confirm
   `cagents daemon preflight` instead: `--confirm "$(cagents daemon preflight)"`.
   Either way the confirmation is bound to that daemon and inventory and is
   valid for 60 seconds; inventory changes require a new one.
-- A successful stop means **termination requested**, not that every PTY has
-  exited. Plain `daemon stop` without these flags is a force stop.
+- After shutdown is accepted, `daemon stop` waits up to 30 seconds for that
+  daemon process to exit, so `cagents daemon stop && cagents daemon start` can
+  restart it after its listener and inventory lease drain. A timeout fails
+  with `shutdown_timeout`; the daemon may still be draining. Check
+  `cagents daemon status` before restarting. `--no-wait` returns at acceptance
+  instead, without confirming completion. If the daemon process cannot be
+  identified from its lease (for example, an older daemon's metadata), stop
+  still requests shutdown. After acceptance it succeeds with `stopped: null`
+  and explains why it could not wait; exit has not been confirmed.
+  Plain `daemon stop` without the confirmation or empty-inventory flags
+  requests a force stop.
 - Stopping the daemon ends each agent's provider process and any turn in
   progress, but does not close the agent. The agent keeps its ID, and its card
   stays in its channel, where its saved conversation can be resumed. A turn
@@ -195,17 +207,34 @@ requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
-The candidate drives supported source daemons through a frozen lifecycle subset:
-the current protocol, historical current-wire protocols 128 and 156, and bespoke
-protocols 68 and 77. Other source protocols are refused with the build to update
-to first, or, for a newer service, the newer build to install;
-the update is never handed to an older build's worker. `--yes` skips the
+The candidate drives qualified source daemons through a frozen lifecycle subset:
+the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
+protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
+(`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
+`f016f047b`) and 179 (`43f253ef8`), and the
+matched current protocol. A protocol bump never drops a pinned build; retiring
+one is a deliberate change that `scripts/check-update-sources` enforces.
+Protocols 180 from #2783, 181 from #2815 and 182 from #2801 are superseded
+by 183 without qualified installed update sources. Other source protocols,
+including 160, 165, 174, 176, 180, 181 and 182, are refused before preparation,
+shutdown or checkpoint changes. Use a cold installation instead: finish and close
+hosted sessions, quit every window, then use the installed build's matching CLI
+to run `cagents --no-start daemon stop --require-empty`. Confirm that its
+`cagents --no-start daemon status` reports stopped, run the verified installer
+without `--restart-daemon`, and reopen the application. For a newer service,
+choose a newer release. The update is never handed to an older build's worker.
+`--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
 Saved panes that cannot reconnect reopen stopped, with a reason and a recovery
 action in the review. A changed inventory requires another review.
 Unsaved window work blocks replacement, and failures remain visible in the
 application's update state. A compatible update closes and reopens windows
 without replacing the daemon or recovering sessions.
+
+Recovery windows first attach saved panes to existing work or display retained
+history, without starting replacement providers. Once startup finishes, new
+terminals and later reconnects use ordinary daemon startup behavior. Initial
+restores already in progress retain their attachment-only intent.
 
 ## Full daemon upgrades
 
@@ -263,7 +292,9 @@ makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
 confirming their release. While they run, native holders and retained Claude
 actors also reap tool processes that their provider left behind and that have
-exited, without signalling any process that is still running.
+exited, without signalling any process that is still running. They reap when a
+child exits, read from a signalfd, rather than on a timer, so an idle actor
+does not wake.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one

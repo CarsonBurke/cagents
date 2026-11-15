@@ -439,6 +439,7 @@ impl InputOrder {
 }
 
 struct PublishedState {
+    execution_instance: uuid::Uuid,
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
     acknowledged_generation: AtomicU64,
@@ -544,6 +545,7 @@ impl PublishedState {
         let cleanup_pool = admission::CleanupPool::new(capture_tx.clone());
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
+            execution_instance: uuid::Uuid::new_v4(),
             published_generation: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
             capture_tx,
@@ -1598,6 +1600,10 @@ impl TerminalHandle {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    pub(crate) fn execution_instance(&self) -> uuid::Uuid {
+        self.inner.published.execution_instance
+    }
+
     pub(crate) fn begin_completed_retirement(&self) -> Result<(), &'static str> {
         if !self.is_completed() {
             return Err("The original terminal has not completed");
@@ -2080,21 +2086,33 @@ impl TerminalHandle {
         let outcome = result
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
-        if matches!(outcome, TerminalCloseResult::Unknown(_))
-            && matches!(
-                *self
-                    .inner
-                    .published
-                    .archive
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()),
-                ArchivePhase::Frozen { .. }
-            )
-        {
-            return match self.shutdown() {
-                Ok(()) => TerminalCloseResult::Closed,
-                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
-            };
+        if matches!(outcome, TerminalCloseResult::Unknown(_)) {
+            // An adopted root can already be reaped when preparation tries to
+            // capture its live process identity. A checked close may then run
+            // before the queued exit report and PTY EOF finish publication.
+            // Give that ordinary completion the remainder of the close budget;
+            // neither the failed inspection nor elapsed time proves release.
+            let published = &self.inner.published;
+            let mut archive = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+            while matches!(*archive, ArchivePhase::Live | ArchivePhase::Preparing) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = published
+                    .archive_ready
+                    .wait_timeout(archive, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                archive = next;
+            }
+            let frozen = matches!(*archive, ArchivePhase::Frozen { .. });
+            drop(archive);
+            if frozen {
+                return match self.shutdown() {
+                    Ok(()) => TerminalCloseResult::Closed,
+                    Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+                };
+            }
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
@@ -2446,7 +2464,7 @@ impl TerminalHandle {
         if order.handoff {
             return Err(TerminalSendError::Closed);
         }
-        let input = matches!(
+        let _input = matches!(
             command,
             Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
         );
@@ -2661,6 +2679,9 @@ struct Worker {
     agent_provider: Option<crate::agent::Provider>,
     agent_process: Option<AgentProcess>,
     display_title: String,
+    /// A shell's title as it last reported it. A change means a command
+    /// started or ended even while what shows stays the same.
+    reported_title: String,
     agent_exited: bool,
     root_exit: Option<TerminalEvent>,
     terminal: Terminal<'static, 'static>,
@@ -2901,20 +2922,7 @@ impl Worker {
 
         let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
-            Some(environment) => {
-                let mut command = CommandBuilder::new(&execution.program);
-                command.args(&execution.arguments);
-                command.cwd(&execution.working_directory);
-                command.env_clear();
-                for (name, value) in &environment.0 {
-                    if !execution.unset_environment.contains(name) {
-                        command.env(name, value);
-                    }
-                }
-                scrub_inherited_markers(&mut command);
-                terminal_environment(&mut command);
-                command
-            }
+            Some(environment) => command_from_execution(&execution, environment),
             None => command_from_recipe(&execution),
         };
         for name in crate::account::launch_credential_overrides(&execution) {
@@ -2945,6 +2953,13 @@ impl Worker {
             }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
+        command.env_remove(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV);
+        if let Some(proof) = &config.console_startup_owner {
+            command.env(
+                crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV,
+                serde_json::to_string(proof).map_err(|error| error.to_string())?,
+            );
+        }
         if let Some(token) = config.agent_authority.token() {
             command.env(crate::agent_execution::AUTHORITY_ENV, token);
         }
@@ -2956,7 +2971,7 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (mut held, output) = match &config.adoption {
+        let (held, output) = match &config.adoption {
             Some(socket) => {
                 let adopted = holder::adopt_recoverable(
                     socket,
@@ -3132,6 +3147,7 @@ impl Worker {
             agent_provider: None,
             agent_process: None,
             display_title: String::new(),
+            reported_title: String::new(),
             agent_exited: false,
             root_exit: None,
             launch: execution,
@@ -3927,7 +3943,7 @@ impl Worker {
                             .and_then(crate::model::agent_recovery::recipe_from_hint).is_some()
                             && !self.agent_process.as_ref().is_some_and(|process| family.only_agent_tree(process.pid))
                         {
-                            return Err("Terminal also owns unrelated background jobs; finish or close them before upgrading".into());
+                            return Err("Terminal also owns unrelated background jobs that cannot be checkpointed".into());
                         }
                         Ok(UpgradeSnapshot {
                             hint: self.resume_hint.clone(),
@@ -4508,18 +4524,45 @@ impl Worker {
                             .activity_from_title(&title)
                             .map(|state| crate::agent::Activity { provider, state })
                     });
+                    // A shell's title that only says where it is gives way to
+                    // the foreground command's, as having no title does.
+                    let provider = self.agent_provider;
+                    let mut located = if provider.is_none() {
+                        self.foreground_title(Some(title))
+                    } else {
+                        None
+                    };
+                    let reported_changed = provider.is_none() && self.reported_title != title;
+                    if reported_changed {
+                        self.reported_title = title.to_owned();
+                    }
                     let display_changed = match agent_title_label(&title, activity) {
                         Some("") => self.display_title != "π",
                         Some(label) => self.display_title.strip_prefix("π ") != Some(label),
-                        None => self.display_title != title,
+                        None => self.display_title != located.as_deref().unwrap_or(title),
                     };
                     let previous = *self
                         .published
                         .agent_activity
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if display_changed || activity != previous {
+                    if display_changed || activity != previous || reported_changed {
                         self.refresh_resume_hint(true);
+                    }
+                    if reported_changed {
+                        // A shell titles a command as it starts, which can be
+                        // before the command holds the foreground: look again
+                        // soon rather than at the settled interval.
+                        self.foreground_poll = FOREGROUND_POLL_MIN;
+                    }
+                    if self.agent_provider != provider {
+                        // The observation found an agent arriving or leaving,
+                        // which decides whether this title is a location.
+                        located = if self.agent_provider.is_none() {
+                            self.foreground_title(Some(title))
+                        } else {
+                            None
+                        };
                     }
                     let observed = self.agent_provider.and_then(|provider| {
                         provider
@@ -4542,7 +4585,8 @@ impl Worker {
                         {
                             self.set_conversation_title(name.into());
                         }
-                        let display = canonical_agent_title(&title, observed);
+                        let display =
+                            located.unwrap_or_else(|| canonical_agent_title(&title, observed));
                         if display != self.display_title {
                             self.display_title = display.clone();
                             self.emit(TerminalEvent::TitleChanged(display));
@@ -4554,25 +4598,52 @@ impl Worker {
         self.reply_backpressured = false;
     }
 
-    /// OSC titles win. Shells that do not publish one still expose the
-    /// foreground command through the PTY owner's existing observation timer.
+    /// OSC titles win, except a shell's own that only says where it is:
+    /// fish's default abbreviates the whole path, which reads as noise
+    /// beside the checkout every pane row already names. Shells that publish
+    /// no title, or only that one, still expose the foreground command
+    /// through the PTY owner's existing observation timer, which also
+    /// catches a change of directory.
     fn publish_fallback_title(&mut self) {
-        if self
+        let reported = self
             .terminal
             .title()
-            .is_ok_and(|title| !title.trim().is_empty())
-        {
+            .ok()
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_owned);
+        if reported.is_some() && self.agent_provider.is_some() {
             return;
         }
-        let group = self.foreground_group();
-        let title = foreground_process_title(group, &self.launch);
-        if self.foreground_group() != group {
+        let Some(title) = self.foreground_title(reported.as_deref()) else {
             return;
-        }
+        };
         if title != self.display_title {
             self.display_title = title.clone();
             self.emit(TerminalEvent::TitleChanged(title));
         }
+    }
+
+    /// "command · directory" for the foreground group, unless `reported`,
+    /// the shell's own title, says more than where the group is.
+    fn foreground_title(&self, reported: Option<&str>) -> Option<String> {
+        // Only a title holding a path can say where a shell is; any other
+        // costs no /proc read.
+        if reported.is_some_and(|title| !title.contains(['/', '~'])) {
+            return None;
+        }
+        let group = self.foreground_group();
+        let (mut process, mut directory) = foreground_process(group, &self.launch);
+        let current = self.foreground_group();
+        if current != group {
+            // The group moved while it was read: read the one holding it now.
+            (process, directory) = foreground_process(current, &self.launch);
+        }
+        if reported
+            .is_some_and(|title| !title_locates_only(title, &directory, HOME_DIRECTORY.as_deref()))
+        {
+            return None;
+        }
+        Some(crate::names::process_title(&process, &directory))
     }
 
     fn publish_bell(&mut self) {
@@ -4813,7 +4884,9 @@ impl Worker {
             || !self.commands.is_empty()
             || !self.retained_commands.is_empty()
         {
-            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+            return Err(
+                "Terminal input or control is still pending and cannot be checkpointed".into(),
+            );
         }
         Ok(())
     }
@@ -5325,7 +5398,9 @@ impl Worker {
     }
 }
 
-fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+/// The foreground group's command name and working directory, read from
+/// /proc, each falling back to the launch's when it cannot be read.
+fn foreground_process(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> (String, PathBuf) {
     #[cfg(target_os = "linux")]
     let (process, directory) = match group.filter(|group| *group > 0) {
         Some(group) => {
@@ -5353,12 +5428,87 @@ fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -
             .to_string_lossy()
             .into_owned()
     });
-    let directory = directory.as_deref().unwrap_or(&launch.working_directory);
-    let basename = directory
-        .file_name()
-        .unwrap_or(directory.as_os_str())
-        .to_string_lossy();
-    format!("{process} · {basename}")
+    (
+        process,
+        directory.unwrap_or_else(|| launch.working_directory.clone()),
+    )
+}
+
+#[cfg(test)]
+fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+    let (process, directory) = foreground_process(group, launch);
+    crate::names::process_title(&process, &directory)
+}
+
+/// The home directory a shell writes as `~`.
+static HOME_DIRECTORY: std::sync::LazyLock<Option<PathBuf>> =
+    std::sync::LazyLock::new(|| std::env::var_os("HOME").map(PathBuf::from));
+
+/// Whether a shell's title only says where it is: fish's default
+/// `prompt_pwd` path, bash's and zsh's `user@host: ~/dir`, or a full path,
+/// possibly after the running command or a host. The path ending the title
+/// must name `directory` itself, in full, under `~` for `home`, or with its
+/// parents abbreviated as `prompt_pwd` does; a title naming anything else,
+/// such as an editor's file, says more and is kept.
+fn title_locates_only(
+    title: &str,
+    directory: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> bool {
+    let title = title.trim_end();
+    // A path starts the title or follows a space or a `host:` prefix; what
+    // precedes it is the command or the host, and only the path decides.
+    title
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '/' | '~')
+                && title[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| before.is_whitespace() || before == ':')
+        })
+        .any(|(index, _)| path_names(&title[index..], directory, home))
+}
+
+/// Whether `path`, as a shell writes it, names `directory`.
+fn path_names(path: &str, directory: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    fn names(path: &std::path::Path) -> Option<Vec<&str>> {
+        path.components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_str()),
+                _ => None,
+            })
+            .collect()
+    }
+    let Some(actual) = names(directory) else {
+        return false;
+    };
+    let (mut expected, rest) = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            let Some(home) = home.and_then(names) else {
+                return false;
+            };
+            (home, rest)
+        }
+        Some(_) => return false,
+        None => (Vec::new(), path),
+    };
+    let fixed = expected.len();
+    expected.extend(rest.split('/').filter(|name| !name.is_empty()));
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(&actual)
+            .enumerate()
+            .all(|(index, (written, name))| {
+                // Home and the directory's own name are written whole; the
+                // parents between may be cut to a prefix, `.l` for `.local`.
+                written == name
+                    || (index >= fixed
+                        && index + 1 < actual.len()
+                        && !written.is_empty()
+                        && name.starts_with(written))
+            })
 }
 
 fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) -> String {
@@ -5683,7 +5833,8 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "COLORTERM",
 ];
 
-/// Drops every inherited marker from a command's environment.
+/// Drops every inherited marker from a command's environment, and the
+/// identity of any provider session the host was started from.
 ///
 /// Separate from [`command_from_recipe`] so a test can plant all of them and
 /// watch them go, rather than observing that a host which never set them does
@@ -5692,6 +5843,15 @@ fn scrub_inherited_markers(command: &mut CommandBuilder) {
     command.env_remove("CAGENTS_TERMINAL_ID");
     command.env_remove("CAGENTS_RECOVERY_ORIGIN");
     for name in INHERITED_TERMINAL_MARKERS {
+        command.env_remove(name);
+    }
+    let sessions = command
+        .iter_full_env_as_str()
+        .map(|(name, _)| name)
+        .filter(|name| crate::agent::is_session_variable(name))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in sessions {
         command.env_remove(name);
     }
 }
@@ -5751,13 +5911,36 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     command.cwd(&recipe.working_directory);
     scrub_inherited_markers(&mut command);
     terminal_environment(&mut command);
-    // Last, so an explicit per-session entry still wins over our defaults.
+    // Last, so an explicit per-session entry still wins over our defaults. A
+    // recipe saved before parent sessions were withheld may still name one.
     for (name, value) in &recipe.environment {
-        command.env(name, value);
+        if !crate::agent::is_session_variable(name) {
+            command.env(name, value);
+        }
     }
     for name in crate::account::launch_credential_overrides(recipe) {
         command.env_remove(name);
     }
+    command
+}
+
+/// A returned conversation's exact execution environment, in place of the
+/// host's own.
+fn command_from_execution(
+    execution: &LaunchRecipe,
+    environment: &crate::terminal_ipc::ChatExecutionEnvironment,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::new(&execution.program);
+    command.args(&execution.arguments);
+    command.cwd(&execution.working_directory);
+    command.env_clear();
+    for (name, value) in &environment.0 {
+        if !execution.unset_environment.contains(name) {
+            command.env(name, value);
+        }
+    }
+    scrub_inherited_markers(&mut command);
+    terminal_environment(&mut command);
     command
 }
 
@@ -6374,15 +6557,9 @@ mod tests {
         }
     }
 
-    fn wait_for_retirement_fact(mut ready: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready() {
-            assert!(
-                Instant::now() < deadline,
-                "original retirement fact did not settle"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+    #[track_caller]
+    fn wait_for_retirement_fact(ready: impl FnMut() -> bool) {
+        crate::test_timing::eventually("the original retirement fact", ready);
     }
 
     #[test]
@@ -6391,17 +6568,22 @@ mod tests {
             return;
         }
         let (handle, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
-        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .unwrap();
         assert!(handle.is_completed());
         assert!(!handle.worker_joined_for_test());
         let source = shell_session("exit 0");
         let proof = retirement_test_proof();
-        let before = Instant::now();
-        handle.begin_completed_retirement().unwrap();
-        assert!(
-            before.elapsed() < Duration::from_secs(1),
-            "retirement request waited for TLS"
-        );
+        // The TLS stays blocked until released below, so a request that
+        // waited for it would not return, and one that waited for a bounded
+        // shutdown would take its whole timeout.
+        let started = Instant::now();
+        let handle = crate::test_timing::returns("the retirement request", move || {
+            handle.begin_completed_retirement().unwrap();
+            handle
+        });
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);
         assert!(matches!(
             handle.completed_retirement(&source, &proof),
             TerminalRetirement::Pending
@@ -6481,6 +6663,88 @@ mod tests {
             TerminalRetirement::Released
         ));
         assert!(handle.worker_joined_for_test());
+    }
+
+    #[test]
+    fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'already-reaped-console'; exit 1");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let config = TerminalConfig {
+            holder_recovery: Some(crate::terminal::holder::Recovery {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: super::super::TerminalSpawnOptions::default(),
+                execution_environment: None,
+                execution_recipe: None,
+            }),
+            ..TerminalConfig::default()
+        };
+        let (commands, receiver) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(published.clone(), joins::reserve().unwrap());
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published: published.clone(),
+                worker: owner.clone(),
+            }),
+        };
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        let worker_owner = owner.clone();
+        let worker_source = source.clone();
+        let worker_published = published.clone();
+        owner.install(thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let (mut worker, _) = Worker::start(
+                worker_source,
+                config,
+                None,
+                receiver,
+                events,
+                worker_published,
+            )
+            .unwrap();
+            assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+            // Adoption after this actual exit cannot capture a live root.
+            // Keep its real pending exit report and PTY output for the worker.
+            worker.child_identity = None;
+            ready.send(()).unwrap();
+            admitted.recv().unwrap();
+            worker.run();
+        }));
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = handle.holder_identity().unwrap().clone();
+        let closer = handle.clone();
+        let close_source = source.clone();
+        let close_proof = proof.clone();
+        let result = thread::spawn(move || closer.close_with_receipt(&close_source, &close_proof));
+        wait_for_retirement_fact(|| published.priority_close.lock().unwrap().is_some());
+        begin.send(()).unwrap();
+        result.join().unwrap().unwrap();
+        assert!(handle.is_completed());
+        assert!(
+            crate::terminal::holder::cleanup::confirmed_with_role(
+                &source,
+                &expected,
+                &proof,
+                published.original_holder_role.get(),
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -6655,6 +6919,143 @@ mod tests {
             super::foreground_process_title(None, &launch),
             "fish · alpha"
         );
+    }
+
+    /// Shell titles that only say where the shell is, which its pane's
+    /// place already names, against titles that say more.
+    #[test]
+    fn location_titles_are_told_from_titles_that_say_more() {
+        use std::path::Path;
+        let home = Path::new("/home/marvin");
+        let directory =
+            Path::new("/home/marvin/.local/share/cagents/projects/acme/billing-service");
+        let locates = |title: &str| super::title_locates_only(title, directory, Some(home));
+        // fish's default fish_title: `prompt_pwd -d 1 -D 1`, after the running
+        // command cut to 20 characters, and after an ssh host.
+        assert!(locates("/h/m/.l/s/c/p/a/billing-service"));
+        assert!(locates("~/.l/s/c/p/a/billing-service"));
+        assert!(locates("cargo build --releas ~/.l/s/c/p/a/billing-service"));
+        assert!(locates("[fw16] ~/.l/s/c/p/a/billing-service"));
+        // bash's and zsh's usual `user@host: dir`, with or without the space.
+        assert!(locates(
+            "marvin@fw16: ~/.local/share/cagents/projects/acme/billing-service"
+        ));
+        assert!(locates(
+            "marvin@fw16:~/.local/share/cagents/projects/acme/billing-service"
+        ));
+        // A full absolute path.
+        assert!(locates(
+            "/home/marvin/.local/share/cagents/projects/acme/billing-service"
+        ));
+        assert!(locates(
+            "/home/marvin/.local/share/cagents/projects/acme/billing-service/"
+        ));
+        // A directory with a space in its name.
+        let spaced = Path::new("/home/marvin/My Projects/billing service");
+        assert!(super::title_locates_only(
+            "marvin@fw16: ~/My Projects/billing service",
+            spaced,
+            Some(home)
+        ));
+        assert!(super::title_locates_only(
+            "~/M/billing service",
+            spaced,
+            Some(home)
+        ));
+        // Home is written as `~`.
+        assert!(super::title_locates_only("~", home, Some(home)));
+        assert!(super::title_locates_only(
+            "marvin@fw16: ~",
+            home,
+            Some(home)
+        ));
+        assert!(!locates("~"), "home is not where this shell is");
+
+        // Real titles are kept.
+        for title in [
+            "main.rs - VIM",
+            "htop",
+            "billing-service",
+            "vim src/billing-service",
+            "less /etc/billing-service.conf",
+            "/h/m/.l/s/c/p/a/other-service",
+            // The same name elsewhere is a file or another directory.
+            "vim ~/notes/billing-service",
+            "less /tmp/billing-service",
+            "cat /h/m/.l/s/c/p/x/billing-service",
+            "billing-service-ish /billing-service",
+            "Release review",
+            "",
+        ] {
+            assert!(!locates(title), "{title:?}");
+        }
+    }
+
+    /// A shell whose own title only says where it is shows the foreground
+    /// command and its directory instead; a title that says more shows as
+    /// it is.
+    #[test]
+    fn a_shell_location_title_gives_way_to_the_foreground_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let working = directory.path().join("billing-service");
+        std::fs::create_dir(&working).unwrap();
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+            working_directory: working.clone(),
+            environment: BTreeMap::new(),
+        });
+        let titles = |events: &Receiver<TerminalEvent>| {
+            events
+                .try_iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::TitleChanged(title) => Some(title),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let _ = titles(&events);
+        // fish's `prompt_pwd` form of where the shell is: each parent cut to
+        // its first character, or two for a hidden one.
+        let canonical = std::fs::canonicalize(&working).unwrap();
+        let abbreviated = canonical
+            .parent()
+            .unwrap()
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .map(|name| {
+                let keep = if name.starts_with('.') { 2 } else { 1 };
+                format!("/{}", name.chars().take(keep).collect::<String>())
+            })
+            .collect::<String>()
+            + "/billing-service";
+        worker.process_output(format!("\x1b]2;{abbreviated}\x07").into_bytes());
+        let shown = titles(&events);
+        assert!(
+            shown
+                .iter()
+                .all(|title| title.ends_with(" · billing-service") && !title.contains('/')),
+            "{shown:?}"
+        );
+        // Whatever holds the foreground in this harness names the command.
+        let fallback = worker.display_title.clone();
+        assert!(
+            fallback.ends_with(" · billing-service") && !fallback.contains('/'),
+            "{fallback:?}"
+        );
+        worker.process_output(b"\x1b]2;main.rs - VIM\x07".to_vec());
+        assert_eq!(titles(&events), vec!["main.rs - VIM".to_owned()]);
+        worker
+            .process_output(format!("\x1b]2;cargo build {}\x07", canonical.display()).into_bytes());
+        assert_eq!(titles(&events), vec![fallback.clone()]);
+        // The observation timer keeps the command title, rather than handing
+        // the row back to the location.
+        worker.publish_fallback_title();
+        assert_eq!(worker.display_title, fallback);
     }
 
     #[cfg(target_os = "linux")]
@@ -7060,7 +7461,7 @@ mod tests {
             let _ = delivered.send(());
         });
         later
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_timing::EVENTUALLY)
             .expect("the notifier stopped after one subscriber panicked");
     }
 
@@ -7077,12 +7478,13 @@ mod tests {
             .set_host_visibility(super::super::ipc::TerminalVisibility::Hidden)
             .unwrap();
         assert!(!handle.inner.published.visible.load(Ordering::Acquire));
-        let started = std::time::Instant::now();
-        assert_eq!(
-            handle.search(1, "query".into(), true),
-            Err(TerminalSendError::Closed)
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Preparation never finishes on its own, so a request that waited
+        // for it without a bound would not return.
+        let (handle, searched) = crate::test_timing::returns("the search request", move || {
+            let searched = handle.search(1, "query".into(), true);
+            (handle, searched)
+        });
+        assert_eq!(searched, Err(TerminalSendError::Closed));
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
         handle.inner.published.archive_ready.notify_all();
         handle.shutdown().unwrap();
@@ -9535,6 +9937,59 @@ mod tests {
     }
 
     #[test]
+    fn a_recipe_saved_inside_another_session_does_not_hand_the_child_its_socket() {
+        let command = command_from_recipe(&env_recipe(BTreeMap::from([
+            ("CLAUDECODE".to_owned(), "1".to_owned()),
+            (
+                "CLAUDE_CODE_MESSAGING_SOCKET".to_owned(),
+                "/run/parent.sock".to_owned(),
+            ),
+            ("CLAUDE_CODE_SESSION_ID".to_owned(), "parent".to_owned()),
+            ("CLAUDE_CONFIG_DIR".to_owned(), "/home/a/.claude".to_owned()),
+        ])));
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert_eq!(command.get_env(name), None, "{name} reached the child");
+        }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
+    }
+
+    #[test]
+    fn a_returned_conversation_does_not_hand_the_child_a_parent_session() {
+        let mut recipe = env_recipe(BTreeMap::new());
+        recipe.unset_environment = ["ANTHROPIC_API_KEY".to_owned()].into();
+        let command = command_from_execution(
+            &recipe,
+            &crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                ("CLAUDECODE".to_owned(), "1".to_owned()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".to_owned(),
+                    "/run/parent.sock".to_owned(),
+                ),
+                ("ANTHROPIC_API_KEY".to_owned(), "removed".to_owned()),
+                ("CLAUDE_CONFIG_DIR".to_owned(), "/home/a/.claude".to_owned()),
+            ])),
+        );
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "ANTHROPIC_API_KEY",
+        ] {
+            assert_eq!(command.get_env(name), None, "{name} reached the child");
+        }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
+    }
+
+    #[test]
     fn child_environment_advertises_our_own_terminal_identity() {
         let command = command_from_recipe(&env_recipe(BTreeMap::new()));
 
@@ -9572,12 +10027,25 @@ mod tests {
         for name in INHERITED_TERMINAL_MARKERS {
             command.env(name, "planted");
         }
+        let sessions = [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CODEX_ESCALATE_SOCKET",
+        ];
+        for name in sessions {
+            command.env(name, "planted");
+        }
+        command.env("CLAUDE_CONFIG_DIR", "/home/a/.claude");
 
         scrub_inherited_markers(&mut command);
 
-        for name in INHERITED_TERMINAL_MARKERS {
+        for name in INHERITED_TERMINAL_MARKERS.iter().chain(&sessions) {
             assert_eq!(command.get_env(name), None, "{name} survived the scrub");
         }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
         // Each control channel named as well, so that shortening the list is a
         // test failure and not merely a smaller loop: these reach the user's
         // real kitty instance, multiplexer session, Konsole and editor.

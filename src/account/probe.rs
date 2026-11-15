@@ -50,7 +50,7 @@ pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// A cached identity cannot override the provider explicitly rejecting its
 /// credentials. Unsupported quota reporting can still confirm an identity.
-pub(crate) fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
+pub fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
     status != UsageStatus::NeedsLogin
         && (identity.is_some()
             || matches!(
@@ -69,15 +69,25 @@ const MODELS_GRACE: Duration = Duration::from_secs(3);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Variables that would make a probe behave unlike the user's own shell:
-/// Claude Code's markers for "running inside Claude Code", and cagents' own
-/// launch handshake.
+/// cagents' own launch handshake. A provider session's markers, such as
+/// Claude Code's "running inside Claude Code", go too (see [`scrub`]).
 const SCRUBBED_ENVIRONMENT: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
     crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV,
 ];
+
+/// Removes [`SCRUBBED_ENVIRONMENT`], `extra` and every provider session
+/// variable this process holds from `command`'s environment.
+fn scrub(command: &mut Command, extra: &[&str]) {
+    for variable in SCRUBBED_ENVIRONMENT.iter().chain(extra) {
+        command.env_remove(variable);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(crate::agent::is_session_variable) {
+            command.env_remove(name);
+        }
+    }
+}
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
 /// else of its environment, after [`SHELL_PATH_MARKER`] and its length in
@@ -398,6 +408,8 @@ fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
     (!models.is_empty()).then_some(Catalog {
         models,
         observed_at,
+        default_model: None,
+        reasoning_defaults: Default::default(),
     })
 }
 
@@ -564,12 +576,7 @@ pub async fn refresh_search_path() -> Option<OsString> {
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args(["-i", "-c", SHELL_PATH_COMMAND]);
-    for variable in SCRUBBED_ENVIRONMENT
-        .iter()
-        .chain(SHELL_SCRUBBED_ENVIRONMENT)
-    {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }
@@ -666,9 +673,7 @@ fn command(account: &Account, program: &Path) -> Command {
 
 fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in SCRUBBED_ENVIRONMENT {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, &[]);
     match account.probe_environment() {
         Some((variable, home)) => {
             command.env(variable, home);
@@ -1269,10 +1274,10 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
 
 fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
     initialized.value.as_ref().ok().and_then(|value| {
-        observed_catalog(
-            models(value["models"].as_array(), Model::from_claude),
-            initialized.observed_at,
-        )
+        let entries = value["models"].as_array();
+        let mut listed = models(entries, Model::from_claude);
+        Model::resolve_claude_labels(&mut listed, entries.map(Vec::as_slice).unwrap_or_default());
+        observed_catalog(listed, initialized.observed_at)
     })
 }
 
@@ -1354,20 +1359,34 @@ async fn probe_codex_with_path(
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
+fn codex_catalog(answer: &Observed<RpcResult>) -> Option<Catalog> {
+    let result = answer.value.as_ref().ok()?;
+    let entries = result["data"].as_array();
+    let mut catalog =
+        observed_catalog(self::models(entries, Model::from_codex), answer.observed_at)?;
+    for entry in entries.into_iter().flatten() {
+        let Some(id) = entry["model"].as_str() else {
+            continue;
+        };
+        if entry["isDefault"].as_bool() == Some(true) {
+            catalog.default_model = Some(id.to_owned());
+        }
+        if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
+            catalog
+                .reasoning_defaults
+                .insert(id.to_owned(), effort.to_owned());
+        }
+    }
+    Some(catalog)
+}
+
 fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, String> {
     let CodexSession {
         account: account_read,
         limits: limits_read,
         models,
     } = result?;
-    let catalog = models.and_then(|answer| {
-        answer.value.ok().and_then(|result| {
-            observed_catalog(
-                self::models(result["data"].as_array(), Model::from_codex),
-                answer.observed_at,
-            )
-        })
-    });
+    let catalog = models.as_ref().and_then(codex_catalog);
     let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
@@ -1511,12 +1530,13 @@ fn rpc_result(mut frame: Value) -> RpcResult {
     }
 }
 
-#[cfg(all(test, feature = "ui"))]
-pub(crate) mod collector_fixture {
+#[cfg(all(any(test, feature = "test-support"), feature = "ui"))]
+#[doc(hidden)]
+pub mod collector_fixture {
     use super::*;
     use tokio::sync::oneshot;
 
-    pub(crate) enum Frames {
+    pub enum Frames {
         Claude {
             initialize: Value,
             quota: Value,
@@ -1531,7 +1551,7 @@ pub(crate) mod collector_fixture {
 
     // Exercise the production observers/finishers without preparing an account,
     // opening a session, invoking a CLI, or starting a detached cache writer.
-    pub(crate) async fn held_outcome(
+    pub async fn held_outcome(
         account: Account,
         frames: Frames,
         now: impl Fn() -> u64,
@@ -1613,7 +1633,7 @@ pub(crate) mod collector_fixture {
 
     /// The UI fixture receives the same completion policy as `run`, including
     /// an actual Failed outcome when a collected probe has no usable quota.
-    pub(crate) async fn held_completion(
+    pub async fn held_completion(
         account: Account,
         frames: Frames,
         now: impl Fn() -> u64,
@@ -1695,6 +1715,41 @@ mod tests {
         }
     }
 
+    /// A window started inside an agent's session must not probe as that
+    /// session's child, nor hand the CLI its messaging socket.
+    #[tokio::test]
+    async fn a_probe_never_runs_inside_the_session_cagents_was_started_from() {
+        const CHILD: &str = "CAGENTS_PROBE_SESSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::a_probe_never_runs_inside_the_session_cagents_was_started_from",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", directory.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("CLAUDECODE", "1")
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", "/run/parent.sock")
+                .env("CODEX_ESCALATE_SOCKET", "/run/parent-escalate.sock")
+                .env("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION", "10")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let script = "[ -z \"${CLAUDECODE+x}${CLAUDE_CODE_MESSAGING_SOCKET+x}${CODEX_ESCALATE_SOCKET+x}\" ] || exit 17\n\
+                      [ \"$CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION\" = 10 ] || exit 18";
+        let output = command(&Account::system(Provider::Claude), Path::new("/bin/sh"))
+            .args(["-c", script])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+    }
+
     #[test]
     fn only_the_matching_control_response_answers() {
         let success = json!({"type": "control_response", "response": {
@@ -1756,6 +1811,24 @@ mod tests {
             }]
         );
         assert!(models(None, Model::from_codex).is_empty());
+    }
+
+    #[test]
+    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
+        let answer = Observed {
+            observed_at: 7,
+            value: Ok(json!({"data": [
+                {"model":"mini", "displayName":"Mini", "isDefault":true,
+                 "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
+                     {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}]},
+                {"model":"other", "defaultReasoningEffort":"high"}
+            ]})),
+        };
+        let catalog = codex_catalog(&answer).unwrap();
+        assert_eq!(catalog.default_effort(None), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("other")), Some("high"));
+        assert_eq!(catalog.observed_at, 7);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use url::Url;
 ///
 /// Read afresh on each call: the name can change while a long-lived process
 /// runs, and the programs that put it into URLs read it when they run.
-pub(crate) fn host_name() -> Option<String> {
+pub fn host_name() -> Option<String> {
     url_host(&system_host_name()?)
 }
 
@@ -52,10 +52,7 @@ fn url_host(name: &str) -> Option<String> {
 /// host-less links never look this machine's name up. It must be spelled as
 /// [`host_name`] spells it; pass that or a name it returned earlier. Names
 /// compare without regard to ASCII case, as DNS names do.
-pub(crate) fn localize<S: AsRef<str>>(
-    url: &mut Url,
-    local_host: impl FnOnce() -> Option<S>,
-) -> bool {
+pub fn localize<S: AsRef<str>>(url: &mut Url, local_host: impl FnOnce() -> Option<S>) -> bool {
     let Some(host) = url.host_str().filter(|_| url.scheme() == "file") else {
         return false;
     };

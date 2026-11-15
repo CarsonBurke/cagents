@@ -400,6 +400,9 @@ pub fn menu_items<
                     trees.push(MenuTree::<Message>::with_children(
                         RcElementWrapper::new(crate::Element::from(
                             menu_button::<'static, _>(vec![
+                                // Align folders with the icon slot of adjacent actions.
+                                widget::space::horizontal().width(14).into(),
+                                widget::space::horizontal().width(spacing.space_xxs).into(),
                                 widget::text(l.clone())
                                     .ellipsize(iced_core::text::Ellipsize::Middle(
                                         iced_core::text::EllipsizeHeightLimit::Lines(1),

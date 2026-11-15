@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
@@ -157,6 +157,37 @@ pub enum TerminalCursorStyle {
     #[default]
     Beam,
     Underline,
+}
+
+/// Whether account allowance labels and gauges describe what remains or was used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountUsageDisplay {
+    #[default]
+    Left,
+    Used,
+}
+
+impl AccountUsageDisplay {
+    pub const ALL: [Self; 2] = [Self::Left, Self::Used];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Used => "used",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Used => "Used",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|display| display.key() == key)
+    }
 }
 
 const fn default_ui_scale() -> f32 {
@@ -901,6 +932,46 @@ pub enum WorktreeSort {
     Alphabetical,
 }
 
+/// How a project's checkouts appear beside its channels: the repository's
+/// root checkout and its linked worktrees. Hidden draws none of them; each
+/// pane open in one gets a row of its own instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarWorktrees {
+    #[default]
+    Grouped,
+    Expanded,
+    Hidden,
+}
+
+impl SidebarWorktrees {
+    pub const ALL: [Self; 3] = [Self::Grouped, Self::Expanded, Self::Hidden];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "Grouped",
+            Self::Expanded => "Expanded",
+            Self::Hidden => "Hidden",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Expanded => "expanded",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+
+    pub const fn shows_checkouts(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+}
+
 /// Syntax colors for native editors and diffs. `Auto` follows the app theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -954,6 +1025,33 @@ impl EditorSyntaxTheme {
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|theme| theme.key() == key)
+    }
+}
+
+/// A routine question the person may choose not to be asked again: its
+/// action is common and what it ends can be reopened. Questions about
+/// something that can't be undone are not listed, so they always ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Confirmation {
+    /// Closing a chat that may still be working; its conversation stays in
+    /// history.
+    StopWorkingChat,
+    /// Closing a terminal whose processes are still running.
+    CloseActiveTerminal,
+}
+
+impl Confirmation {
+    pub const ALL: [Self; 2] = [Self::StopWorkingChat, Self::CloseActiveTerminal];
+
+    /// The question's stable name: its key under `[confirmations]`, and in
+    /// widget ids. The terminal question is stored in the older top-level
+    /// `confirm_terminal_close` instead, which builds before this table
+    /// still read, so `close_active_terminal` never appears in the file.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::StopWorkingChat => "stop_working_chat",
+            Self::CloseActiveTerminal => "close_active_terminal",
+        }
     }
 }
 
@@ -1048,6 +1146,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
     #[serde(default)]
+    pub sidebar_worktrees: SidebarWorktrees,
+    #[serde(default)]
+    pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
+    /// The visible mode [`Self::sidebar_worktrees`] last had, which showing
+    /// checkouts again from the sidebar returns to. Never Hidden.
+    #[serde(default)]
+    pub sidebar_worktrees_when_shown: SidebarWorktrees,
+    #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
     pub default_channel_pane: DefaultPane,
@@ -1086,11 +1192,14 @@ pub struct AppSettings {
     #[serde(default = "default_native_fraction")]
     pub default_native_pane_fraction: f32,
     /// Whether the window keeps a status bar along its bottom edge, which
-    /// reports how much of each signed-in provider account's usage limits
-    /// is left. Hiding it also stops the account probes that feed it while
+    /// reports each signed-in provider account's usage limits.
+    /// Hiding it also stops the account probes that feed it while
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// What account allowance labels and gauges show throughout the app.
+    #[serde(default)]
+    pub account_usage_display: AccountUsageDisplay,
     /// Preview rows by provider: `window:<provider key>` or `credits`.
     /// An absent provider retains its automatic headline; an empty list
     /// deliberately shows only the provider control.
@@ -1100,6 +1209,11 @@ pub struct AppSettings {
     /// source-control data and agent activity indicators intact.
     #[serde(default = "default_show_worktree_changes_icons")]
     pub show_worktree_changes_icons: bool,
+    /// Whether the inspector lists the pull requests a channel only
+    /// mentioned, below those it worked on. Off, because a mention says
+    /// little about what the channel did.
+    #[serde(default)]
+    pub show_mentioned_pull_requests: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -1154,12 +1268,22 @@ pub struct AppSettings {
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
     pub notifications: crate::notifications::Preferences,
+    /// Routine questions the person chose not to be asked again, by
+    /// [`Confirmation::key`]; an absent key asks. Read through
+    /// [`AppSettings::asks`]. A table rather than a list, so windows that
+    /// each skip a different question merge by key instead of the last save
+    /// replacing the others, and a newer build's keys survive an older one.
+    /// Always written, even empty, so turning the last question back on
+    /// removes only its own key from what another window saved.
+    #[serde(default)]
+    pub confirmations: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             notifications: crate::notifications::Preferences::default(),
+            confirmations: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -1186,6 +1310,9 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            sidebar_worktrees: SidebarWorktrees::default(),
+            sidebar_worktree_overrides: BTreeMap::new(),
+            sidebar_worktrees_when_shown: SidebarWorktrees::default(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -1202,8 +1329,10 @@ impl Default for AppSettings {
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
+            account_usage_display: AccountUsageDisplay::default(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
+            show_mentioned_pull_requests: false,
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
@@ -1844,6 +1973,55 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    /// Whether to ask before the routine action `confirmation` guards.
+    pub fn asks(&self, confirmation: Confirmation) -> bool {
+        match confirmation {
+            // Older builds read this field, which predates the table, so it
+            // stays the one place this answer is kept.
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close,
+            _ => self
+                .confirmations
+                .get(confirmation.key())
+                .copied()
+                .unwrap_or(true),
+        }
+    }
+
+    pub fn set_asks(&mut self, confirmation: Confirmation, ask: bool) {
+        match confirmation {
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close = ask,
+            _ if ask => {
+                self.confirmations.remove(confirmation.key());
+            }
+            _ => {
+                self.confirmations
+                    .insert(confirmation.key().to_owned(), false);
+            }
+        }
+    }
+
+    /// Sets how every project shows its checkouts. Hiding them remembers the
+    /// visible mode they had, which [`Self::toggled_sidebar_worktrees`]
+    /// returns to.
+    pub fn set_sidebar_worktrees(&mut self, mode: SidebarWorktrees) {
+        if !mode.shows_checkouts() && self.sidebar_worktrees.shows_checkouts() {
+            self.sidebar_worktrees_when_shown = self.sidebar_worktrees;
+        }
+        self.sidebar_worktrees = mode;
+    }
+
+    /// The mode the sidebar's checkouts toggle switches the default to:
+    /// Hidden while checkouts show, otherwise the visible mode they had.
+    pub fn toggled_sidebar_worktrees(&self) -> SidebarWorktrees {
+        if self.sidebar_worktrees.shows_checkouts() {
+            SidebarWorktrees::Hidden
+        } else if self.sidebar_worktrees_when_shown.shows_checkouts() {
+            self.sidebar_worktrees_when_shown
+        } else {
+            SidebarWorktrees::default()
+        }
+    }
+
     pub fn editor_font_size(&self) -> f32 {
         self.editor_font_size.unwrap_or(self.terminal_font_size)
     }
@@ -1869,6 +2047,7 @@ impl AppSettings {
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
         self.palette_recents.truncate(24);
+        adopt_current_preview_rows(&mut self.usage_preview_rows);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -2020,6 +2199,24 @@ impl AppSettings {
 /// Validates the flattened language-server mapping. An empty list is valid and
 /// disables LSP. Nothing here touches the filesystem, resolves an executable,
 /// or invokes a shell.
+/// Renames the status-bar rows a selection saved against a window key that
+/// Claude has since renamed, so the bar keeps showing the window chosen.
+/// Two names for the same window become one row, in the place of its first.
+fn adopt_current_preview_rows(rows: &mut HashMap<String, Vec<String>>) {
+    let Some(rows) = rows.get_mut(crate::agent::Provider::Claude.executable()) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    *rows = std::mem::take(rows)
+        .into_iter()
+        .map(|row| match row.strip_prefix("window:") {
+            Some(key) => format!("window:{}", crate::account::claude::stable_window_key(key)),
+            None => row,
+        })
+        .filter(|row| seen.insert(row.clone()))
+        .collect();
+}
+
 fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), SettingsError> {
     let mut identifiers: HashSet<&str> = HashSet::new();
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
@@ -3218,6 +3415,48 @@ mod tests {
     }
 
     #[test]
+    fn account_usage_display_defaults_to_left_and_round_trips_both_choices() {
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.account_usage_display, AccountUsageDisplay::Left);
+        let mut legacy = toml::Value::try_from(&defaults).unwrap();
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("account_usage_display");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.account_usage_display, AccountUsageDisplay::Left);
+
+        for display in AccountUsageDisplay::ALL {
+            let settings = AppSettings {
+                account_usage_display: display,
+                ..defaults.clone()
+            };
+            let encoded = toml::to_string(&settings).unwrap();
+            assert!(encoded.contains(&format!("account_usage_display = {:?}", display.key())));
+            let restored: AppSettings = toml::from_str(&encoded).unwrap();
+            assert_eq!(restored.account_usage_display, display);
+        }
+    }
+
+    #[test]
+    fn account_usage_display_survives_another_windows_unrelated_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let mut first = base.clone();
+        first.account_usage_display = AccountUsageDisplay::Used;
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = base.clone();
+        second.terminal_font_size = 18.0;
+        save_merged(&path, &base, &second).unwrap();
+        save_merged(&path, &base, &base).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.account_usage_display, AccountUsageDisplay::Used);
+        assert_eq!(restored.terminal_font_size, 18.0);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -3240,6 +3479,52 @@ mod tests {
             .insert("codex".into(), Vec::new());
         let decoded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.usage_preview_rows, settings.usage_preview_rows);
+    }
+
+    /// Settings saved before Claude's live Fable window was renamed hold
+    /// its retired key; loading them keeps that window in the status bar.
+    #[test]
+    fn loading_renames_retired_claude_preview_rows() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Value::try_from(AppSettings::default()).unwrap();
+        document.as_table_mut().unwrap().insert(
+            "usage_preview_rows".into(),
+            toml::toml! {
+                claude = [
+                    "window:weekly_overage",
+                    "window:session",
+                    "window:weekly_scoped:Fable 5.1",
+                    "credits",
+                ]
+                codex = ["window:weekly_overage"]
+            }
+            .into(),
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&path)
+            .unwrap()
+            .write_all(toml::to_string(&document).unwrap().as_bytes())
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.usage_preview_rows["claude"],
+            ["window:weekly_scoped:Fable", "window:session", "credits"]
+        );
+        // Another provider's keys are its own.
+        assert_eq!(
+            loaded.usage_preview_rows["codex"],
+            ["window:weekly_overage"]
+        );
+        save(&path, &loaded).unwrap();
+        assert_eq!(
+            load(&path).unwrap().usage_preview_rows,
+            loaded.usage_preview_rows
+        );
     }
 
     #[test]
@@ -3570,6 +3855,55 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn sidebar_worktree_preferences_round_trip_default_and_merge_per_project() {
+        use SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let first = crate::model::ProjectId::new();
+        let second = crate::model::ProjectId::new();
+        let base = AppSettings::default();
+        let mut legacy = toml::Value::try_from(&base).unwrap();
+        legacy.as_table_mut().unwrap().remove("sidebar_worktrees");
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("sidebar_worktree_overrides");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.sidebar_worktrees, Grouped);
+        assert!(legacy.sidebar_worktree_overrides.is_empty());
+        save(&path, &base).unwrap();
+        let mut one = base.clone();
+        one.sidebar_worktrees = Hidden;
+        one.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &base, &one).unwrap();
+        let mut two = base.clone();
+        two.sidebar_worktree_overrides.insert(second, Grouped);
+        save_merged(&path, &base, &two).unwrap();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&first),
+            Some(&Expanded)
+        );
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        one.sidebar_worktree_overrides.remove(&first);
+        let mut one_base = base.clone();
+        one_base.sidebar_worktrees = Hidden;
+        one_base.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &one_base, &one).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&first));
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        assert_eq!(saved.sidebar_worktrees, Hidden);
     }
 
     #[test]
@@ -4814,59 +5148,6 @@ new_thread = "Alt+Shift+G"
         assert_eq!(load(&path).unwrap().terminal_scroll_speed, 2.5);
     }
 
-    #[cfg(feature = "ui")]
-    #[test]
-    fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
-        use crate::sidebar::{SidebarMode, effective_width};
-
-        let with_width = |sidebar_width| AppSettings {
-            sidebar_width,
-            ..AppSettings::default()
-        };
-
-        // A width outside the pane's bounds used to validate and then render
-        // clamped, so the file said 200 while the sidebar showed 240.
-        for width in [
-            EXPANDED_WIDTH_MIN - 40.0,
-            EXPANDED_WIDTH_MIN - 0.5,
-            EXPANDED_WIDTH_MAX + 0.5,
-            f32::NAN,
-        ] {
-            assert!(
-                matches!(
-                    with_width(width).validate(),
-                    Err(SettingsError::SidebarWidth { .. })
-                ),
-                "a width of {width} cannot be persisted: the pane will not render it"
-            );
-        }
-
-        for width in [
-            EXPANDED_WIDTH_MIN,
-            AppSettings::default().sidebar_width,
-            EXPANDED_WIDTH_MAX,
-        ] {
-            let accepted = with_width(width)
-                .validate()
-                .expect("a width the pane renders must validate");
-            assert_eq!(
-                effective_width(SidebarMode::Expanded, accepted.sidebar_width),
-                width
-            );
-        }
-
-        let message = SettingsError::SidebarWidth {
-            min: EXPANDED_WIDTH_MIN,
-            max: EXPANDED_WIDTH_MAX,
-        }
-        .to_string();
-        assert!(
-            message.contains(&EXPANDED_WIDTH_MIN.to_string())
-                && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
-            "the rejection must quote the bounds it enforces, not a copy of them: {message}"
-        );
-    }
-
     #[test]
     fn inspector_width_round_trips_only_within_rendered_bounds() {
         for width in [
@@ -5633,5 +5914,40 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn skipped_confirmations_merge_per_key_and_keep_unknown_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut base = AppSettings::default();
+        assert!(Confirmation::ALL.into_iter().all(|kind| base.asks(kind)));
+        // A newer build's question survives this build's saves.
+        base.confirmations.insert("future_question".into(), false);
+        save(&path, &base).unwrap();
+
+        // Two windows each skip a different question from the same base.
+        let mut chat = base.clone();
+        chat.set_asks(Confirmation::StopWorkingChat, false);
+        save_merged(&path, &base, &chat).unwrap();
+        let mut terminal = base.clone();
+        terminal.set_asks(Confirmation::CloseActiveTerminal, false);
+        save_merged(&path, &base, &terminal).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        // The terminal question stays where older builds read it.
+        assert!(!saved.confirm_terminal_close);
+        assert!(!saved.confirmations.contains_key("close_active_terminal"));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
+
+        // Asking again removes only that question's key.
+        let mut again = chat.clone();
+        again.set_asks(Confirmation::StopWorkingChat, true);
+        save_merged(&path, &chat, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
     }
 }

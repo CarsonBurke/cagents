@@ -5,12 +5,18 @@ mod account_isolation_tests;
 mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
+mod console_relaunch;
+pub(super) use console_relaunch::matched_cli;
+#[cfg(test)]
+mod console_relaunch_tests;
+pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
 mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
+pub(super) use native_recovery::restore_ready_checkpoint;
 mod owned_listener;
 pub(super) use owned_listener::{
     Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
@@ -58,6 +64,7 @@ use crate::{
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
+pub(super) use native_recovery::restore_orphaned_native_preserving;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -589,6 +596,17 @@ fn changed_for_instance(
                 report: report.clone(),
                 observed_at: *observed_at,
             },
+            // Every surface keeps them, whether or not it is showing this
+            // conversation, since it learns of them only as they change.
+            Update::AgentAddresses(addresses) => ServerMessage::ChatAgentAddresses {
+                chat_id: id,
+                addresses: addresses.clone(),
+            },
+            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+                chat_id: id,
+                revision: *revision,
+                model: model.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -637,6 +655,38 @@ fn session_snapshot(session: &Session, handle: &Handle) -> Result<ServerResponse
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
     Ok(ServerResponse::ChatAttached { session, snapshot })
+}
+
+/// What a new subscriber is told of how the provider addresses a chat's
+/// subagents, when it knows any.
+pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    // Read outside HostState: a retained actor answers from its last
+    // published metadata, a local one from its own lock.
+    let addresses = handle.agent_addresses();
+    (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
+}
+
+pub(super) fn active_model(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    let (revision, model) = handle.active_model();
+    Some(ServerMessage::ChatActiveModel {
+        chat_id,
+        revision,
+        model,
+    })
 }
 
 fn current_session_snapshot(
@@ -1858,8 +1908,53 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state.native_closing.contains_key(&terminal)
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()))
         || state.chat_handoffs.contains_key(&terminal)
+}
+
+pub(super) fn shared_removal_in_transition(
+    state: &HostState,
+    before: &crate::workspace_model::views::Pane,
+) -> bool {
+    let crate::model::CardKind::Chat(source) = &before.kind else {
+        unreachable!("chat removal source")
+    };
+    let claims = |session: &crate::chat::Session| {
+        session.id == source.id
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == source.id)
+    };
+    let same = |session: &crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..before.clone()
+            },
+        )
+    };
+    state.chat_bindings.contains_key(&source.id)
+        || state.chat_handoffs.contains_key(&source.id)
+        || state
+            .chat_spawning
+            .values()
+            .filter(|session| claims(session))
+            .any(|session| {
+                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+            })
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
 fn start_with_execution(
@@ -1873,6 +1968,14 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if crate::upgrade::floor::load()
+        .map_err(unavailable)?
+        .blocks_id(session.id)
+    {
+        return Err(unavailable(
+            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or start a new conversation if none was recorded.",
+        ));
+    }
     // A helper may have committed installation before host publication failed.
     // Recover its durable outbox through authenticated adoption before asking
     // an unexposed startup guard to retire it without a semantic consumer.
@@ -2301,7 +2404,7 @@ fn start_with_execution(
     }
     // Provider-specific process fields derive from the prepared launch.
     // No environment overlay may follow constructor history/title reads.
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2522,7 +2625,7 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
         let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
@@ -3073,8 +3176,10 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         &TerminalViewReservation {
-            owners: &owners,
-            closing,
+            kind: TerminalViewKind::Codex {
+                owners: &owners,
+                closing,
+            },
         },
     );
     let (descriptor, paired_terminal) = match spawned {
@@ -3596,6 +3701,11 @@ fn process_inner(
             dry_run,
         }),
         ClientRequest::ChatPrepareResume { source } => {
+            if let Some(session) =
+                floor_history::prepare_resume(host, &source).map_err(unavailable)?
+            {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             let proof = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -4323,20 +4433,46 @@ fn process_inner(
 /// Borrow the complete native transition only while its closing reservation is
 /// alive. Ordinary terminal spawns cannot bypass native admission with an ID.
 pub(super) struct TerminalViewReservation<'a> {
-    owners: &'a paired_close::Owners,
-    closing: &'a capacity::Reservation,
+    kind: TerminalViewKind<'a>,
+}
+
+enum TerminalViewKind<'a> {
+    Codex {
+        owners: &'a paired_close::Owners,
+        closing: &'a capacity::Reservation,
+    },
+    /// Only retained-actor recovery constructs this after authenticating the
+    /// helper and committing its exact console replacement intent.
+    RetainedConsole { requested: &'a Session },
 }
 
 impl TerminalViewReservation<'_> {
+    pub(super) fn retained_console(requested: &Session) -> TerminalViewReservation<'_> {
+        TerminalViewReservation {
+            kind: TerminalViewKind::RetainedConsole { requested },
+        }
+    }
+
     pub(super) fn authorizes(&self, state: &HostState, terminal_id: TerminalId) -> bool {
-        self.owners.target.source.id == terminal_id
-            && self.owners.require_locked(state, self.closing).is_ok()
-            && state.chats.get(&terminal_id).is_some_and(|record| {
-                record.returning_terminal
-                    && record.session.launch.provider == Provider::Codex
-                    && record.session.terminal.is_none()
-                    && record.paired_terminal.is_none()
-            })
+        match &self.kind {
+            TerminalViewKind::Codex { owners, closing } => {
+                owners.target.source.id == terminal_id
+                    && owners.require_locked(state, closing).is_ok()
+                    && state.chats.get(&terminal_id).is_some_and(|record| {
+                        record.returning_terminal
+                            && record.session.launch.provider == Provider::Codex
+                            && record.session.terminal.is_none()
+                            && record.paired_terminal.is_none()
+                    })
+            }
+            TerminalViewKind::RetainedConsole { requested } => {
+                requested.id == terminal_id
+                    && state.chat_spawning.get(&terminal_id) == Some(*requested)
+                    && !state.chats.contains_key(&terminal_id)
+                    && !state.native_closing.contains_key(&terminal_id)
+                    && !state.chat_handoffs.contains_key(&terminal_id)
+            }
+        }
     }
 }
 
@@ -4427,7 +4563,7 @@ pub(super) fn close_captured(
                 "The exact native attachment changed before close",
             ));
         }
-        capacity::Reservation::closing(host, &mut state, &source)?
+        capacity::Reservation::removing(host, &mut state, &source)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
@@ -4577,7 +4713,9 @@ pub(super) fn resolve_upgrade(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
         if !record.handle.owns_work()
-            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+            && !((source.is_saved_claude_history()
+                || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.blocks_chat(source)))
+                && record.handle.is_read_only_history())
         {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
@@ -4719,6 +4857,14 @@ fn prepare_native_process_launch(
 ) -> Result<chat::Launch, ProtocolError> {
     let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
     if let Some(daemon) = daemon {
+        // A client older than this daemon, started inside another agent's
+        // session, still sends that session along. Withhold it rather than
+        // refuse the conversation.
+        let selected = selected
+            .iter()
+            .filter(|(name, _)| !crate::agent::is_session_variable(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         if selected.iter().any(|(name, value)| {
             !crate::model::agent_recovery::fresh_environment_key(
                 launch.provider,
@@ -4731,7 +4877,7 @@ fn prepare_native_process_launch(
                 "Native execution environment contains an unrelated or private variable",
             ));
         }
-        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+        spec.environment = sourceless_environment(daemon, selected, spec.environment);
     }
     if let Some(source) = source {
         spec.environment = source.clone();
@@ -4771,7 +4917,7 @@ fn upgrade_environment(
     )
     .map_err(|error| error.message)?;
     let (mut spec, _) = chat::protocol::create(&process_launch)?;
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     Ok(spec.environment)
 }
 
@@ -4792,7 +4938,7 @@ pub(super) fn validate_upgrade_environment(
     )?;
     if !handle.recovery_environment_matches(&restored) {
         return Err(
-            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
+            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this conversation stopped after confirmation; no source was stopped."
                 .into(),
         );
     }
@@ -5710,6 +5856,31 @@ IFS= read -r finish < finish
                 )
                 .is_err()
             );
+            // An older client started inside another agent's session still
+            // sends it; the conversation starts without it.
+            let prepared = prepare_native_process_launch(
+                &launch,
+                Some(BTreeMap::new()),
+                &[
+                    ("PATH".into(), "/selected/bin".into()),
+                    ("CLAUDECODE".into(), "1".into()),
+                    (
+                        "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                        "/run/parent.sock".into(),
+                    ),
+                ]
+                .into(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/selected/bin");
+            assert!(!prepared.recipe.environment.contains_key("CLAUDECODE"));
+            assert!(
+                !prepared
+                    .recipe
+                    .environment
+                    .contains_key("CLAUDE_CODE_MESSAGING_SOCKET")
+            );
         }
     }
 
@@ -6095,7 +6266,7 @@ IFS= read -r finish < finish
         let selected = BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".into(), "gui-fixture".into())]);
         let (mut spec, _) = chat::protocol::create(&launch).unwrap();
         spec.environment = sourceless_environment(daemon.clone(), selected, spec.environment);
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         assert_eq!(
             spec.environment
                 .get("CLAUDE_CONFIG_DIR")
@@ -8274,6 +8445,134 @@ done
         assert!(client.list_chats().unwrap().is_empty());
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Every surface showing a conversation hears how the provider addresses
+    /// its subagents as each is learned, and one attaching later is told
+    /// those already known.
+    #[test]
+    fn agent_addresses_reach_every_subscriber_and_each_new_one() {
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({"tick": true})],
+                    events: Vec::new(),
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![Event::AgentAddress(chat::AgentAddress {
+                        address: "a1892b93e88999a7d".into(),
+                        subagent: "toolu_relocate".into(),
+                    })],
+                })
+            }
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("agent-addresses"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let handle = Handle::start(
+            spec,
+            Box::new(Addresser),
+            initial,
+            store,
+            None,
+            move |update| changed(&weak, chat_id, update),
+        )
+        .unwrap();
+        let queue = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let queue = state.register_client(1);
+            state.chats.insert(
+                chat_id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: Session {
+                        native_continuity: Default::default(),
+                        owned_codex_listener: None,
+                        id: chat_id,
+                        launch: chat::Launch {
+                            provider: Provider::Claude,
+                            recipe,
+                            session_id: None,
+                        },
+                        proof: Some(proof),
+                        terminal: None,
+                    },
+                    handle: handle.clone(),
+                    source_process: None,
+                    // Hidden, as most surfaces showing it are.
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+            queue
+        };
+        assert!(
+            agent_addresses(&host, chat_id).is_none(),
+            "a conversation that knows none tells a new subscriber nothing"
+        );
+        let (heard, hearing) = crossbeam_channel::unbounded();
+        let reader = thread::spawn({
+            let queue = queue.clone();
+            move || {
+                while let Some(outbound) = queue.pop() {
+                    if let ServerMessage::ChatAgentAddresses { chat_id, addresses } =
+                        outbound.message
+                    {
+                        let _ = heard.send((chat_id, addresses));
+                    }
+                }
+            }
+        });
+        handle.command(Command::Interrupt).unwrap();
+        let expected = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        assert_eq!(
+            hearing.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (chat_id, expected.clone())
+        );
+        let Some(ServerMessage::ChatAgentAddresses { addresses, .. }) =
+            agent_addresses(&host, chat_id)
+        else {
+            panic!("a new subscriber is told the addresses known");
+        };
+        assert_eq!(addresses, expected);
+        handle.close().unwrap();
+        queue.close_after_drain();
+        reader.join().unwrap();
     }
 
     #[test]

@@ -13,7 +13,14 @@ pub struct Query {
 
 /// Fixed-field wire projection. The persisted UsageSnapshot omits unknown JSON
 /// fields, which cannot be omitted from postcard's positional representation.
+///
+/// A client from before [`PLAN_AND_RESET_READINGS`] is sent the reading
+/// without its reset inventory and reported plan details: see the
+/// [`Serialize`] implementation below.
+///
+/// [`PLAN_AND_RESET_READINGS`]: crate::terminal_ipc::PLAN_AND_RESET_READINGS
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct UsageReading {
     pub resets: Vec<super::UsageReset>,
     pub windows: Vec<UsageWindow>,
@@ -26,6 +33,45 @@ pub struct UsageReading {
     pub plan_display_name: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub detail: Option<String>,
+}
+
+/// As derived, except that a client from before the reset inventory and plan
+/// details is sent the fields it decodes, in its positional order.
+impl Serialize for UsageReading {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !crate::terminal_ipc::encoding_before(crate::terminal_ipc::PLAN_AND_RESET_READINGS) {
+            return Self::serialize(self, serializer);
+        }
+        #[derive(Serialize)]
+        #[serde(rename = "UsageReading")]
+        struct Before<'a> {
+            windows: &'a [UsageWindow],
+            credits: &'a Option<Credits>,
+            status: super::UsageStatus,
+            ordinary_usage_allowed: Option<bool>,
+            observed_at: u64,
+            source: super::UsageSource,
+            plan: &'a Option<String>,
+            detail: &'a Option<String>,
+        }
+        Before {
+            windows: &self.windows,
+            credits: &self.credits,
+            status: self.status,
+            ordinary_usage_allowed: self.ordinary_usage_allowed,
+            observed_at: self.observed_at,
+            source: self.source,
+            plan: &self.plan,
+            detail: &self.detail,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageReading {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(deserializer)
+    }
 }
 
 impl From<UsageSnapshot> for UsageReading {

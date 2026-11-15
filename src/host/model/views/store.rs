@@ -345,6 +345,16 @@ pub(in crate::host::model) fn read(db: &Connection, scope: &Scope) -> Result<Vie
     read_at(db, id, scope.clone())
 }
 
+/// The stored view, or `None` when the scope has none.
+pub(in crate::host::model) fn read_stored(
+    db: &Connection,
+    scope: &Scope,
+) -> Result<Option<View>, String> {
+    scope_id(db, scope)?
+        .map(|id| read_at(db, id, scope.clone()))
+        .transpose()
+}
+
 fn read_at(db: &Connection, id: i64, scope: Scope) -> Result<View, String> {
     let revision: i64 = db
         .prepare_cached("SELECT revision FROM view_scopes WHERE id = ?1")
@@ -364,6 +374,53 @@ fn read_at(db: &Connection, id: i64, scope: Scope) -> Result<View, String> {
 /// Every stored view, in one pass over each table.
 pub(in crate::host::model) fn all(db: &Connection) -> Result<Vec<View>, String> {
     collect(db, false)
+}
+
+/// Read a published source snapshot without admitting a writer or migrating it.
+/// The caller holds one read transaction across layout admission and capture.
+/// Only this compatibility reader knows schema 22's per-scope arrays; every
+/// mutation still goes through the normalized store.
+pub(in crate::host::model) fn published_snapshot(db: &Connection) -> Result<Vec<View>, String> {
+    super::super::schema::require_published_snapshot(db)?;
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sql)?;
+    if version >= 23 {
+        return all(db);
+    }
+    let mut statement = db
+        .prepare(
+            "SELECT s.scope, s.channel, s.repository, v.revision, v.panes, v.retired
+             FROM shared_view_scopes s JOIN shared_views v USING(scope) ORDER BY s.scope",
+        )
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(sql)?;
+    rows.map(|row| {
+        let (key, channel, repository, revision, panes, retired) = row.map_err(sql)?;
+        let scope: Scope = serde_json::from_str(&key).map_err(|error| error.to_string())?;
+        let (expected_channel, expected_repository, _) = columns(&scope)?;
+        if channel != expected_channel || repository.as_deref() != expected_repository {
+            return Err("a saved view scope disagrees with its owner".into());
+        }
+        Ok(View {
+            scope,
+            revision,
+            panes: serde_json::from_str(&panes).map_err(|error| error.to_string())?,
+            retired: serde_json::from_str(&retired).map_err(|error| error.to_string())?,
+        })
+    })
+    .collect()
 }
 
 /// The views holding at least one pane. Nearly every scope a long-lived store

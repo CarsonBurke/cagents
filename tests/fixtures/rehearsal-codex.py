@@ -29,6 +29,36 @@ def private_directory(path):
     return path.resolve(strict=True)
 
 
+def configure_peer(root):
+    """Restore fixture settings after native launches filter CAGENTS_* values."""
+    path = root / "codex-fixture.json"
+    if not path.exists() and not path.is_symlink():
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as stream:
+        settings = json.load(stream)
+    names = {"pause": "CAGENTS_TOOL_ROWS_PAUSE",
+             "never_confirm_interrupt": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT",
+             "never_confirm_close": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE",
+             "history": "CAGENTS_TOOL_ROWS_HISTORY"}
+    if not isinstance(settings, dict) or settings.keys() - names.keys():
+        raise ValueError("unknown Codex fixture setting")
+    for key, value in settings.items():
+        if key == "pause":
+            if type(value) not in (int, float) or not 0 < value <= 300:
+                raise ValueError("Codex fixture pause must be between 0 and 300 seconds")
+            os.environ[names[key]] = str(value)
+        elif key == "history":
+            if (type(value) is not list or len(value) != 2
+                    or any(type(part) is not int or part < 0 for part in value)):
+                raise ValueError("Codex fixture history must be [COUNT, BYTES]")
+            os.environ[names[key]] = f"{value[0]} {value[1]}"
+        else:
+            if type(value) is not bool:
+                raise ValueError("Codex fixture confirmation settings must be boolean")
+            os.environ[names[key]] = "1" if value else "0"
+
+
 def listener_path(args, runtime):
     address = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--listen=")), None)
     if "--listen" in args:
@@ -81,16 +111,26 @@ def scenario_class(peer, storage, listener):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 state = json.load(stream)
-            if set(state) != {"thread", "child", "latest"}:
+            if (not isinstance(state, dict)
+                    or not {"thread", "child", "latest"} <= set(state)
+                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting",
+                                     "model", "reasoning"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
+            model = state.get("model", "fixture-mini")
+            reasoning = state.get("reasoning")
+            if not isinstance(model, str) or not model:
+                raise ValueError("invalid persisted rehearsal model")
+            if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
+                raise ValueError("invalid persisted rehearsal reasoning effort")
             thread_path(state["thread"])
             thread_path(state["child"])
-            if state["latest"] is not None and not isinstance(state["latest"], dict):
-                raise ValueError("invalid persisted rehearsal turn")
-            self.thread, self.child, self.latest = state["thread"], state["child"], state["latest"]
+            for turn in (state["latest"], state.get("child_latest")):
+                if turn is not None and not isinstance(turn, dict):
+                    raise ValueError("invalid persisted rehearsal turn")
+            self.restore(state)
 
         def save(self):
-            state = {"thread": self.thread, "child": self.child, "latest": self.latest}
+            state = self.state()
             for path in (index, thread_path(self.thread), thread_path(self.child)):
                 temporary = storage / f".state-{uuid.uuid4()}.tmp"
                 descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -101,6 +141,13 @@ def scenario_class(peer, storage, listener):
                     temporary.replace(path)
                 finally:
                     temporary.unlink(missing_ok=True)
+
+        def observe(self, notification, generations=None):
+            accepted = super().observe(notification, generations)
+            if accepted and notification.get("method") in (
+                    "turn/started", "turn/completed", "item/started", "item/completed"):
+                self.save()
+            return accepted
 
         def request(self, frame, codex_home):
             if frame.get("method") == "thread/resume":
@@ -145,6 +192,7 @@ def main():
         print("codex-cli 0.162.0 (offline update rehearsal fixture)")
         return
     root = private_directory(Path(os.environ["CAGENTS_TOOL_ROWS_FIXTURE_ROOT"]))
+    configure_peer(root)
     logs = root / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     # The harness may create logs with its ordinary umask; ROOT itself is 0700.
@@ -182,9 +230,21 @@ def main():
         path = listener_path(args, runtime)
 
         class LoggedScenario(scenario_class(peer, home / "rehearsal-app-server", path)):
+            def observe(self, notification, generations=None):
+                accepted = super().observe(notification, generations)
+                if accepted and notification.get("method") in ("turn/started", "turn/completed"):
+                    params = notification["params"]
+                    record("notification", method=notification["method"], socket=str(path),
+                           thread_id=params["threadId"], turn_id=params["turn"]["id"],
+                           status=params["turn"]["status"], parent=params["threadId"] == self.thread)
+                return accepted
+
             def request(self, frame, codex_home):
                 responses = super().request(frame, codex_home)
+                params = frame.get("params") or {}
                 record("request", method=frame.get("method"), request_id=frame.get("id"),
+                       socket=str(path), parent=params.get("threadId") == self.thread,
+                       thread_id=params.get("threadId"), turn_id=params.get("turnId"),
                        errors=[response["error"] for response in responses if "error" in response])
                 return responses
 

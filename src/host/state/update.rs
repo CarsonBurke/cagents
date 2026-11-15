@@ -187,7 +187,7 @@ impl HostState {
             } else {
                 (
                     Disposition::Blocked,
-                    "This terminal cannot preserve its live process through this update; finish it or close it before updating.",
+                    "This terminal cannot preserve its live process through this update; it can reopen stopped after confirmation.",
                 )
             };
             impact.sessions.push(SessionImpact {

@@ -4,7 +4,9 @@
 //! windows adopt its snapshot and due time instead of starting their own scan.
 use super::{HistoryPage, Page, scan::Scan, scan::Work};
 use crate::{
-    github::{GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, polling, pr_status},
+    github::{
+        GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, Revalidation, polling, pr_status,
+    },
     repository::{
         CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessFailureKind,
         ProcessOutput, SystemProcessExecutor,
@@ -19,6 +21,14 @@ const PACE: u64 = 6;
 const MAX_BACKOFF: u64 = 30 * 60;
 const OBSERVATION_AGE: u64 = 5 * 60;
 const OBSERVATION_PAGES: usize = 50;
+/// A settled census starts again only once GitHub says, for free, that one
+/// of the repository's issues or pull requests changed, as a review request
+/// does, or once the last is this old: a request to a team the viewer just
+/// joined changes no pull request.
+const CENSUS_AFTER: u64 = 5 * 60;
+/// A probe GitHub refused, such as for a repository with issues disabled, is
+/// asked again after this.
+const PROBE_REFUSED_FOR: u64 = 10 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observation {
@@ -49,6 +59,18 @@ struct Stored {
     due: u64,
     failures: u32,
     observed: Vec<Observation>,
+    /// The probe's validator from when the last complete census started,
+    /// and when that was.
+    #[serde(default)]
+    validator: Option<String>,
+    #[serde(default)]
+    census_at: u64,
+    /// The validator and start of the census under way, which it becomes
+    /// once that census completes.
+    #[serde(default)]
+    pending: Option<(Option<String>, u64)>,
+    #[serde(default)]
+    probe_refused_at: Option<u64>,
 }
 
 impl Default for Stored {
@@ -62,6 +84,10 @@ impl Default for Stored {
             due: 0,
             failures: 0,
             observed: Vec::new(),
+            validator: None,
+            census_at: 0,
+            pending: None,
+            probe_refused_at: None,
         }
     }
 }
@@ -86,7 +112,7 @@ impl Stored {
     }
 }
 
-enum Reply {
+pub enum Reply {
     Page(Page),
     History(HistoryPage),
 }
@@ -131,6 +157,14 @@ pub fn poll(
                         .into(),
                 )
             }
+        },
+        |validator, lease| {
+            GitHubService::new("gh", Arc::new(FlightExecutor(lease))).revalidate(
+                repository,
+                &crate::github::sidebar::repository_probe_path(repository),
+                validator,
+                cancellation,
+            )
         },
     )?;
     Ok(result)
@@ -183,6 +217,7 @@ fn poll_with(
     clock: impl Fn() -> u64,
     read: impl FnOnce(&Work, Arc<File>) -> Result<Reply, GitHubError>,
     validate_context: impl Fn() -> Result<(), String>,
+    probe: impl FnOnce(Option<&str>, Arc<File>) -> Result<Revalidation, GitHubError>,
 ) -> Result<PollResult, String> {
     repository.validate().map_err(|error| error.to_string())?;
     pr_status::private_directory(root).map_err(|error| error.to_string())?;
@@ -213,14 +248,54 @@ fn poll_with(
     if cancellation.is_cancelled() {
         return Err("Review-request read cancelled".into());
     }
-    let work = stored.scan.next();
     // Preserve this exclusive description in gh, while the scoped owner still
     // releases unrelated fork copies after the executor has reaped the child.
-    let lease = Arc::new(
+    let lease = || {
         flight
             .try_clone()
-            .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))?,
-    );
+            .map(Arc::new)
+            .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))
+    };
+    if stored.scan.settled()
+        && stored
+            .probe_refused_at
+            .is_none_or(|at| now.saturating_sub(at) >= PROBE_REFUSED_FOR)
+    {
+        // Asked before the census reads, so a change landing during it shows
+        // as a change next time rather than hiding under this validator.
+        let probe_lease = lease()?;
+        let probed = polling::with_scope(credentials, || {
+            probe(stored.validator.as_deref(), probe_lease)
+        });
+        let validator = match probed {
+            Ok(Revalidation::NotModified)
+                if stored.failures == 0 && now.saturating_sub(stored.census_at) < CENSUS_AFTER =>
+            {
+                validate_context()?;
+                stored.probe_refused_at = None;
+                // Not past the census due at CENSUS_AFTER, however the ticks fall.
+                stored.due = clock()
+                    .saturating_add(REFRESH)
+                    .min(stored.census_at.saturating_add(CENSUS_AFTER));
+                pr_status::store(&path, &stored).map_err(|error| error.to_string())?;
+                return Ok(stored.result(now));
+            }
+            Ok(Revalidation::Modified { etag, .. }) => {
+                stored.probe_refused_at = None;
+                etag
+            }
+            Ok(Revalidation::Refused) => {
+                stored.probe_refused_at = Some(now);
+                None
+            }
+            // Unchanged but due, or out of quota, deferred or unreachable:
+            // the validator is older than the census about to read.
+            Ok(Revalidation::NotModified) | Err(_) => stored.validator.clone(),
+        };
+        stored.pending = Some((validator, now));
+    }
+    let work = stored.scan.next();
+    let lease = lease()?;
     let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under
     // the credential context captured before it started.
@@ -283,6 +358,10 @@ fn poll_with(
         stored.failures = stored.failures.saturating_add(1);
     } else if stored.scan.settled() {
         stored.failures = 0;
+        if let Some((validator, at)) = stored.pending.take() {
+            stored.validator = validator;
+            stored.census_at = at;
+        }
     }
     stored.error = applied.err();
     stored.due = completed.saturating_add(if stored.failures > 0 {
@@ -337,31 +416,25 @@ fn poll_with(
     Ok(stored.result(completed))
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Census fixtures, including publisher processes, shared with the
+/// application's tests.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fixture {
     use super::*;
     use crate::github::review_requests::{Current, Entry, Viewer};
-    use std::{
-        fs::{self, OpenOptions},
-        io::Write,
-        process::{Command, Stdio},
-        sync::atomic::{AtomicUsize, Ordering},
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::{fs::OpenOptions, io::Write, process::Command, thread, time::Duration};
 
-    fn private_root() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        root
+    /// A probe that can't answer, so every census reads as before probes.
+    pub fn unprobed(_: Option<&str>, _: Arc<File>) -> Result<Revalidation, GitHubError> {
+        Err(GitHubError::Inspection("unprobed".into()))
     }
 
-    fn repository() -> GitHubRepoKey {
+    pub fn repository() -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, "owner", "repository").unwrap()
     }
 
-    fn page(viewer: &str, numbers: &[u64], next: Option<&str>) -> Reply {
+    pub fn page(viewer: &str, numbers: &[u64], next: Option<&str>) -> Reply {
         Reply::Page(Page {
             viewer: Viewer {
                 id: viewer.into(),
@@ -386,47 +459,9 @@ pub(crate) mod tests {
         })
     }
 
-    #[test]
-    fn an_exclusive_scan_flight_allows_its_actual_query_child_to_run() {
-        let root = private_root();
-        let cancellation = CancellationToken::new();
-        let result = poll_with(
-            root.path(),
-            "actual-flight-test",
-            &repository(),
-            &cancellation,
-            || 1000,
-            |_, lease| {
-                let output = FlightExecutor(lease)
-                    .execute(
-                        &CommandSpec::new("/bin/sh").args(["-c", "printf query"]),
-                        &cancellation,
-                    )
-                    .expect("the scan's real child must start while its flight is locked");
-                assert!(output.success);
-                assert_eq!(output.stdout, b"query");
-                Ok(page("viewer", &[1], None))
-            },
-            || Ok(()),
-        )
-        .unwrap();
-        assert!(result.error.is_none(), "{:?}", result.error);
-        assert!(result.scan.requested.contains_key(&1));
-        let cached = poll_with(
-            root.path(),
-            "actual-flight-test",
-            &repository(),
-            &cancellation,
-            || 1001,
-            |_, _| panic!("the completed real query must be cached"),
-            || Ok(()),
-        )
-        .unwrap();
-        assert_eq!(cached.observation, result.observation);
-    }
-
-    #[test]
-    fn process_worker() {
+    /// One publisher process. It does nothing unless [`published_fixture`]
+    /// started it, so the test that calls it passes in an ordinary run.
+    pub fn publisher_process() {
         let Some(root) = std::env::var_os("CAGENTS_REVIEW_POLL_TEST_ROOT") else {
             return;
         };
@@ -476,6 +511,7 @@ pub(crate) mod tests {
                 })
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert!(result.scan.requested.contains_key(&1));
@@ -483,16 +519,16 @@ pub(crate) mod tests {
 
     /// A publisher with no notification consumer exits between pages. A later
     /// follower must still see every validated page, not just the last one.
-    pub(crate) fn published_fixture(root: &Path, now: u64, count: u64) -> PollResult {
+    ///
+    /// `publisher` is the exact name of a test in the running test binary that
+    /// calls [`publisher_process`].
+    pub fn published_fixture(root: &Path, now: u64, count: u64, publisher: &str) -> PollResult {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let pages = count.div_ceil(50);
         for tick in (0..pages).map(|page| now + page * PACE) {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "github::review_requests::shared::tests::process_worker",
-                ])
+                .args(["--exact", publisher])
                 .env("CAGENTS_REVIEW_POLL_TEST_ROOT", root)
                 .env("CAGENTS_REVIEW_POLL_TEST_TICK", tick.to_string())
                 .env("CAGENTS_REVIEW_POLL_TEST_COUNT", count.to_string())
@@ -512,14 +548,181 @@ pub(crate) mod tests {
             || now + (pages - 1) * PACE + 1,
             |_, _| panic!("the follower must read both published pages without a network request"),
             || Ok(()),
+            unprobed,
         )
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::fixture::{page, published_fixture, publisher_process, repository, unprobed};
+    use super::*;
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_settled_census_starts_again_only_when_the_repository_changed_or_is_due() {
+        let root = private_root();
+        let cancellation = CancellationToken::new();
+        let etag = std::cell::RefCell::new("v1".to_owned());
+        let reads = std::cell::Cell::new(0);
+        let fails = std::cell::Cell::new(false);
+        let poll = |at: u64| {
+            let result = poll_with(
+                root.path(),
+                "census-probe-test",
+                &repository(),
+                &cancellation,
+                || at,
+                |_, _| {
+                    reads.set(reads.get() + 1);
+                    if fails.get() {
+                        Err(GitHubError::Inspection("unavailable".into()))
+                    } else {
+                        Ok(page("viewer", &[1], None))
+                    }
+                },
+                || Ok(()),
+                |validator, _| {
+                    let etag = etag.borrow().clone();
+                    Ok(if validator == Some(etag.as_str()) {
+                        Revalidation::NotModified
+                    } else {
+                        Revalidation::Modified {
+                            etag: Some(etag),
+                            body: Vec::new(),
+                            date: None,
+                        }
+                    })
+                },
+            )
+            .unwrap();
+            (reads.get(), result.due)
+        };
+        // The first census, then the first with a validator.
+        assert_eq!(poll(1000), (1, 1000 + REFRESH));
+        assert_eq!(poll(1060), (2, 1060 + REFRESH));
+        // Unchanged: no census until the last is CENSUS_AFTER old.
+        assert_eq!(poll(1120), (2, 1120 + REFRESH));
+        assert_eq!(
+            poll(1060 + CENSUS_AFTER - REFRESH),
+            (2, 1060 + CENSUS_AFTER)
+        );
+        let due = 1060 + CENSUS_AFTER;
+        assert_eq!(poll(due), (3, due + REFRESH));
+        assert_eq!(poll(due + 60), (3, due + 60 + REFRESH));
+        // A change: a census, which failing leaves the change to find again.
+        *etag.borrow_mut() = "v2".into();
+        fails.set(true);
+        assert_eq!(poll(due + 120).0, 4);
+        fails.set(false);
+        assert_eq!(poll(due + 240), (5, due + 240 + REFRESH));
+        assert_eq!(poll(due + 300), (5, due + 300 + REFRESH));
+        // A census that failed is read again though nothing changed.
+        let due = due + 240 + CENSUS_AFTER;
+        fails.set(true);
+        assert_eq!(poll(due).0, 6);
+        fails.set(false);
+        assert_eq!(poll(due + 600), (7, due + 600 + REFRESH));
+        assert_eq!(poll(due + 660), (7, due + 660 + REFRESH));
+        // A repository GitHub refuses to probe is censused as before probes,
+        // and asked again only after a while.
+        let probes = std::cell::Cell::new(0);
+        let censuses = std::cell::Cell::new(0);
+        let refused = |at: u64| {
+            poll_with(
+                root.path(),
+                "census-refused-test",
+                &repository(),
+                &cancellation,
+                || at,
+                |_, _| {
+                    censuses.set(censuses.get() + 1);
+                    Ok(page("viewer", &[1], None))
+                },
+                || Ok(()),
+                |_, _| {
+                    probes.set(probes.get() + 1);
+                    Ok(Revalidation::Refused)
+                },
+            )
+            .unwrap();
+            (probes.get(), censuses.get())
+        };
+        assert_eq!(refused(1000), (0, 1));
+        assert_eq!(refused(1060), (1, 2));
+        assert_eq!(refused(1120), (1, 3));
+        assert_eq!(refused(1060 + PROBE_REFUSED_FOR), (2, 4));
+    }
+
+    #[test]
+    fn an_exclusive_scan_flight_allows_its_actual_query_child_to_run() {
+        let root = private_root();
+        let cancellation = CancellationToken::new();
+        let result = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1000,
+            |_, lease| {
+                let output = FlightExecutor(lease)
+                    .execute(
+                        &CommandSpec::new("/bin/sh").args(["-c", "printf query"]),
+                        &cancellation,
+                    )
+                    .expect("the scan's real child must start while its flight is locked");
+                assert!(output.success);
+                assert_eq!(output.stdout, b"query");
+                Ok(page("viewer", &[1], None))
+            },
+            || Ok(()),
+            unprobed,
+        )
+        .unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.scan.requested.contains_key(&1));
+        let cached = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1001,
+            |_, _| panic!("the completed real query must be cached"),
+            || Ok(()),
+            unprobed,
+        )
+        .unwrap();
+        assert_eq!(cached.observation, result.observation);
+    }
+
+    #[test]
+    fn process_worker() {
+        publisher_process();
     }
 
     #[test]
     fn slow_follower_sees_every_page_published_by_other_processes() {
         let root = private_root();
-        let result = published_fixture(root.path(), 1000, 60);
+        let result = published_fixture(
+            root.path(),
+            1000,
+            60,
+            "github::review_requests::shared::tests::process_worker",
+        );
         assert_eq!(
             fs::read_to_string(root.path().join("calls")).unwrap(),
             "read\nread\n"
@@ -572,6 +775,7 @@ pub(crate) mod tests {
             || 1001,
             |_, _| panic!("a restarted window must reuse the same scan"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(cached.scan.viewer.unwrap().id, "viewer");
@@ -593,6 +797,7 @@ pub(crate) mod tests {
                 Ok(page("viewer", &[1], Some("second")))
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(first.due, 1006);
@@ -604,6 +809,7 @@ pub(crate) mod tests {
             || 1005,
             |_, _| panic!("continuation must obey the shared pace"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         let second = poll_with(
@@ -622,6 +828,7 @@ pub(crate) mod tests {
                 Ok(page("viewer", &[51], None))
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert!(second.scan.settled());
@@ -640,6 +847,7 @@ pub(crate) mod tests {
                 Ok(page("viewer", &[51], None))
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(
@@ -660,6 +868,7 @@ pub(crate) mod tests {
             || 1000,
             |_, _| Ok(page("alice", &[1], Some("alice-cursor"))),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         let bob = poll_with(
@@ -673,6 +882,7 @@ pub(crate) mod tests {
                 Ok(page("bob", &[2], None))
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(bob.scan.viewer.unwrap().id, "bob");
@@ -685,6 +895,7 @@ pub(crate) mod tests {
             || 1001,
             |_, _| panic!("Alice's cached cursor remains separate"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(alice.scan.viewer.unwrap().id, "alice");
@@ -708,6 +919,7 @@ pub(crate) mod tests {
                     Err("account changed".into())
                 }
             },
+            unprobed,
         );
         assert_eq!(result.unwrap_err(), "account changed");
         let next = poll_with(
@@ -721,6 +933,7 @@ pub(crate) mod tests {
                 Ok(page("alice", &[1], None))
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(next.scan.viewer.unwrap().id, "alice");
@@ -738,6 +951,7 @@ pub(crate) mod tests {
             || 1000,
             |_, _| Err(GitHubError::Inspection("offline".into())),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(failed.due, 1060);
@@ -750,6 +964,7 @@ pub(crate) mod tests {
             || 1059,
             |_, _| panic!("another window cannot bypass the failure backoff"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         let retry_at = polling::now() + 180;
@@ -765,6 +980,7 @@ pub(crate) mod tests {
                 })
             },
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(limited.due, retry_at);
@@ -777,6 +993,7 @@ pub(crate) mod tests {
             polling::now,
             |_, _| panic!("the host cooldown must cover every repository"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(paused.due, retry_at);
@@ -805,6 +1022,7 @@ pub(crate) mod tests {
                 || 1000,
                 |_, _| panic!("a cancelled waiter cannot fetch"),
                 || Ok(()),
+                unprobed,
             )
         });
         thread::sleep(Duration::from_millis(50));
@@ -821,6 +1039,7 @@ pub(crate) mod tests {
             || 1000,
             |_, _| Ok(page("viewer", &[1], None)),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
     }
@@ -843,6 +1062,7 @@ pub(crate) mod tests {
                 })
             },
             || Ok(()),
+            unprobed,
         );
         assert!(result.unwrap_err().contains("cancelled"));
         let snapshot = root
@@ -858,6 +1078,7 @@ pub(crate) mod tests {
             polling::now,
             |_, _| panic!("a cancelled caller must not discard the host's Retry-After"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(paused.due, retry_at);
@@ -875,6 +1096,7 @@ pub(crate) mod tests {
             || 1000,
             |_, _| Ok(page("viewer", &[1], None)),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert_eq!(observed.observed.len(), 1);
@@ -893,6 +1115,7 @@ pub(crate) mod tests {
             || 1300,
             |_, _| panic!("a cached observation expires without another request"),
             || Ok(()),
+            unprobed,
         )
         .unwrap();
         assert!(expired.observed.is_empty());

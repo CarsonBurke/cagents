@@ -1,15 +1,23 @@
-#!/bin/sh
+#!/bin/bash
 # Offline native-chat fixture. The first turn stays busy until interrupted,
 # allowing the UI to exercise both asynchronous delivery priorities. Later
 # turns complete immediately so the same session also covers the idle composer.
+# While fixture-first-turn-seconds holds a whole number of seconds, the first
+# turn instead finishes by itself that long after it starts, as real work
+# does, unless it is interrupted first.
 set -eu
 
 if [ "${1:-}" = --version ]; then
     printf '%s\n' '2.1.286 (Claude Code fixture)'
     exit 0
 fi
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 if [ "${1:-}" = auth ]; then
-    printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    if [ -f "$config/fixture-auth-status.json" ]; then
+        cat "$config/fixture-auth-status.json"
+    else
+        printf '%s\n' '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}'
+    fi
     exit 0
 fi
 
@@ -35,7 +43,6 @@ done
 # Native chat restores from the provider's exact on-disk transcript after a
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
-config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 task_scene=
 task_scene_file=$config/fixture-agent-task-receipt.json
 if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
@@ -215,6 +222,7 @@ subagents_turn() {
 # Claude Code reports each background agent that a Stop ended.
 background_agents=
 stop_agent() {
+    local remaining known
     emit_record "$(jq -cn --arg tool "$1" '{type:"system",subtype:"task_notification",uuid:("fixture-"+$tool+"-stopped"),task_id:("fixture-task-"+$tool),tool_use_id:$tool,status:"stopped",summary:"Agent stopped"}')"
     remaining=
     for known in $background_agents; do
@@ -253,6 +261,28 @@ tools_turn() {
     done < "$tools_file"
 }
 
+# One jq process writes the whole replay: a process per record would take
+# minutes for a hundred conversations.
+long_history_turn() {
+    local records
+    records=$(jq -cn --arg turn "$turn" --arg session "$session" --arg parent "$parent" \
+        --argjson count "${long_history% *}" --argjson bytes "${long_history#* }" '
+        ("Reviewed the failing step, its logs and the last good run. " as $phrase
+         | [range(0; $bytes / ($phrase | length) | ceil)] | map($phrase) | add // "" | .[:$bytes]) as $text
+        | reduce range(0; $count) as $at ({parent: (if $parent == "null" then null else $parent end), records: []};
+            ("fixture-history-" + $turn + "-" + ($at | tostring)) as $uuid
+            | .records += [(if $at % 2 == 0
+                then {type: "user", message: {role: "user", content: ("Step \($at): " + $text)}}
+                else {type: "assistant", message: {id: $uuid, role: "assistant", content: [{type: "text", text: ("Step \($at): " + $text)}]}}
+                end) + {uuid: $uuid, sessionId: $session, parentUuid: .parent}]
+            | .parent = $uuid)
+        | .records[]')
+    [ -n "$records" ] || return 0
+    printf '%s\n' "$records" >> "$history"
+    printf '%s\n' "$records"
+    parent=$(printf '%s\n' "$records" | tail -n 1 | jq -r '.uuid')
+}
+
 # Optional raw stream: each line of fixture-frames.jsonl is one stream-json
 # frame, emitted in order on every turn before its answer, with "@TURN@" in any
 # string replaced by the turn number so IDs stay unique. Assistant and user
@@ -261,7 +291,8 @@ tools_turn() {
 # with "_history": true is only recorded, as Claude records a queued
 # notification. A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
-# {"_sleep": SECONDS} pauses, so a running state can be observed. A line
+# {"_sleep": SECONDS} pauses while still servicing controls; interruption or
+# input EOF discards the remaining replay. A line
 # {"_end": true} ends the turn there: the frames supply its closing result,
 # such as a failed one, and the fixture adds no answer of its own. A line
 # {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
@@ -273,16 +304,28 @@ frames_ended=0
 frames_turn() {
     frames_ended=0
     frame_line=0
+    busy=true
     while IFS= read -r spec; do
         frame_line=$((frame_line + 1))
         [ -n "$spec" ] || continue
         delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
         if [ -n "$delay" ]; then
-            sleep "$delay"
+            if ! [[ $delay =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+                printf '%s\n' "fixture: line $frame_line of $frames_file: _sleep must hold nonnegative seconds, not $delay" >&2
+                exit 2
+            fi
+            delay_us=$(seconds_microseconds "$delay")
+            # Keep the input owner alive during a replay pause, just as while
+            # streaming answer deltas. EOF cancels this optional replay.
+            if ! wait_stream_input "$delay_us" cancel; then
+                frames_ended=1
+                return
+            fi
             continue
         fi
         if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
             frames_ended=1
+            busy=false
             return
         fi
         status=$(printf '%s' "$spec" | jq -r '._exit // empty')
@@ -323,9 +366,13 @@ frames_turn() {
 # Claude's Bash tool does, and reports its output and exit code. Checks of
 # where a provider's commands run, and of a command the system stops, use it.
 run_file=$config/fixture-run-command
+# fixture-run-once is the same for one turn: the first turn to start after it
+# is written takes it, so of several providers sharing this configuration,
+# only that one runs it.
+once_file=$config/fixture-run-once
 run_turn() {
     id="run-$turn"
-    command=$(head -n 1 "$run_file")
+    command=$(head -n 1 "$1")
     emit_record "$(jq -cn --arg id "$id" --arg command "$command" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:"Bash",input:{command:$command,description:"Run the fixture command"}}]}}')"
     status=0
     output=$(sh -c "$command" 2>&1 </dev/null) || status=$?
@@ -352,13 +399,37 @@ verbosity=0
 if fixture_switch "${CAGENTS_FIXTURE_VERBOSITY:-0}" fixture-verbosity; then verbosity=1; fi
 subagents=0
 if fixture_switch "${CAGENTS_FIXTURE_SUBAGENTS:-0}" fixture-subagents; then subagents=1; fi
-# The switch file may hold the delay between deltas in seconds.
+# The switch file may hold the delay between deltas in seconds on its first
+# line and the characters per delta on its second, so a provider's token rate
+# can be approximated (such as 0.03 and 24 for about 800 characters a second).
 stream_reply=0
 stream_delay=0.25
+stream_chunk=16384
 if fixture_switch "${CAGENTS_FIXTURE_STREAM_REPLY:-0}" fixture-stream-reply; then
     stream_reply=1
-    if [ -s "$config/fixture-stream-reply" ]; then stream_delay=$(head -n 1 "$config/fixture-stream-reply"); fi
+    if [ -s "$config/fixture-stream-reply" ]; then
+        stream_delay=$(sed -n 1p "$config/fixture-stream-reply")
+        stream_chunk=$(sed -n 2p "$config/fixture-stream-reply")
+        stream_chunk=${stream_chunk:-16384}
+    fi
 fi
+if ! [[ $stream_delay =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+    printf '%s\n' "fixture: fixture-stream-reply must hold seconds, such as 1 or 0.25, not '$stream_delay'" >&2
+    exit 2
+fi
+if ! [[ $stream_chunk =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "fixture: fixture-stream-reply's second line must be a positive number of characters, not '$stream_chunk'" >&2
+    exit 2
+fi
+# Bash's read timeout and clock share microsecond precision.
+seconds_microseconds() {
+    local seconds=${1%%.*} fraction=${1#*.}
+    if [[ $1 != *.* ]]; then fraction=; fi
+    fraction=${fraction}000000
+    fraction=${fraction:0:6}
+    printf '%s\n' "$((10#${seconds:-0} * 1000000 + 10#$fraction))"
+}
+stream_delay_us=$(seconds_microseconds "$stream_delay")
 
 # Optional slow start: while fixture-slow-start exists, a conversation's
 # provider waits before it reads anything, as a cold start does: the file's
@@ -376,6 +447,28 @@ if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
 fi
 
 busy=false
+# When the busy first turn finishes by itself, in microseconds of the clock.
+settle_at=
+first_turn_seconds=
+if [ "$probe" = false ] && [ -s "$config/fixture-first-turn-seconds" ]; then
+    first_turn_seconds=$(head -n 1 "$config/fixture-first-turn-seconds")
+    if ! [[ $first_turn_seconds =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "fixture: fixture-first-turn-seconds must hold whole seconds, such as 8, not '$first_turn_seconds'" >&2
+        exit 2
+    fi
+fi
+# While fixture-long-history holds "COUNT BYTES", the first turn of a
+# conversation started then first replays COUNT earlier exchanges of about
+# BYTES each, alternating prompt and answer, so a scale check gets the long
+# transcripts of conversations that have run for days.
+long_history=
+if [ "$probe" = false ] && [ -s "$config/fixture-long-history" ]; then
+    long_history=$(head -n 1 "$config/fixture-long-history")
+    if ! [[ $long_history =~ ^[0-9]+\ [0-9]+$ ]]; then
+        printf '%s\n' "fixture: fixture-long-history must hold a count and a size in bytes, such as 400 1536, not '$long_history'" >&2
+        exit 2
+    fi
+fi
 fast=off
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
@@ -400,69 +493,198 @@ resolved_model() {
 # Optional usage report: fixture-usage.json is the get_usage control
 # response's inner response, as Claude Code answers the account check.
 usage_file=$config/fixture-usage.json
-while IFS= read -r frame; do
+# Keep one reader/state owner even while a reply is streaming. A timed read
+# may return part of a JSON line; retain it until a newline arrives. EOF drops
+# an unterminated tail, as the ordinary read loop does, but finishes the reply.
+exec 3<&0
+input_partial=
+input_eof=false
+read_frame() {
+    local fragment= status=0
+    if [ "$input_eof" = true ]; then return 1; fi
+    if [ "$#" -eq 0 ]; then
+        IFS= read -r -u 3 fragment || status=$?
+    else
+        IFS= read -r -u 3 -t "$1" fragment || status=$?
+    fi
+    input_partial+=$fragment
+    if [ "$status" -eq 0 ]; then
+        frame=$input_partial
+        input_partial=
+        return 0
+    fi
+    if [ "$status" -eq 1 ]; then
+        input_eof=true
+        input_partial=
+    fi
+    return 1
+}
+
+handle_control() {
+    local frame=$1 id subtype metadata requested uuid task tool
+    id=$(printf '%s' "$frame" | jq -r '.request_id')
+    subtype=$(printf '%s' "$frame" | jq -r '.request.subtype')
+    metadata='{}'
+    if [ "$subtype" = initialize ]; then
+        metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
+        if [ "$fast_fixture" = 1 ]; then
+            metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
+        fi
+        if [ -f "$models_file" ]; then
+            metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile listed "$models_file" '$metadata + {models: $listed[0].models}')
+        fi
+        # Optional advertised commands and skills: a JSON object with
+        # `commands` ([{name, description}]) and `skills` ([name]).
+        if [ -f "$config/fixture-commands.json" ]; then
+            metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
+        fi
+        if [ -f "$config/fixture-unconfirmed-model" ]; then
+            metadata=$(printf '%s' "$metadata" | jq -c 'del(.model)')
+        fi
+    elif [ "$subtype" = get_settings ]; then
+        # No permission rule sources or flag overlays are configured in the
+        # default fixture. An empty success object is not a settings snapshot.
+        metadata='{"effective":{},"sources":[]}'
+    elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
+        metadata=$(jq -c . "$usage_file")
+    elif [ "$subtype" = set_model ]; then
+        model=$(printf '%s' "$frame" | jq -r '.request.model // "haiku"')
+    elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
+        requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
+        if [ "$requested" = true ]; then fast=on; else fast=off; fi
+        metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
+    fi
+    jq -cn --arg id "$id" --argjson metadata "$metadata" \
+        '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
+    case $subtype in
+        cancel_async_message)
+            uuid=$(printf '%s' "$frame" | jq -r '.request.message_uuid')
+            jq -cn --arg uuid "$uuid" \
+                '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
+            ;;
+        stop_task)
+            task=$(printf '%s' "$frame" | jq -r '.request.task_id')
+            case " $background_agents " in
+                *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
+                # Any other task, such as one fixture-frames.jsonl
+                # started, has already sent its notice: Claude Code
+                # 2.1.296 answers a stop for an agent waiting on its
+                # own background work by patching it killed, with no
+                # further notice.
+                *) jq -cn --arg task "$task" \
+                    '{type:"system",subtype:"task_updated",uuid:("fixture-"+$task+"-killed"),task_id:$task,patch:{status:"killed"}}' ;;
+            esac
+            ;;
+        interrupt)
+            busy=false
+            for tool in $background_agents; do stop_agent "$tool"; done
+            jq -cn --arg session "$session" --arg turn "$turn" \
+                '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+            ;;
+    esac
+}
+
+queue_user() {
+    local uuid
+    uuid=$(printf '%s' "$1" | jq -r '.uuid')
+    jq -cn --arg uuid "$uuid" \
+        '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
+}
+
+# Incoming controls do not restart the emission deadline. stdout and transcript
+# writes stay in this shell, so interruption cannot race a background writer.
+wait_stream_input() {
+    local now=${EPOCHREALTIME/./} deadline remaining timeout kind
+    local delay_us=${1:-$stream_delay_us} eof_mode=${2:-finish}
+    deadline=$((now + delay_us))
+    while :; do
+        now=${EPOCHREALTIME/./}
+        remaining=$((deadline - now))
+        if [ "$remaining" -le 0 ]; then
+            # read -t 0 only checks availability; it consumes nothing. Give
+            # already-ready input a bounded read even with a zero chunk delay.
+            if [ "$input_eof" = true ] || ! IFS= read -r -u 3 -t 0; then break; fi
+            timeout=0.001
+        else
+            printf -v timeout '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
+        fi
+        if [ "$input_eof" = true ]; then
+            if [ "$eof_mode" = cancel ]; then busy=false; return 1; fi
+            sleep "$timeout"
+            break
+        fi
+        if read_frame "$timeout"; then
+            kind=$(printf '%s' "$frame" | jq -r '.type')
+            case $kind in
+                control_request) handle_control "$frame" ;;
+                user) queue_user "$frame" ;;
+            esac
+            if [ "$busy" = false ]; then return 1; fi
+        fi
+        if [ "$input_eof" = true ] && [ "$eof_mode" = cancel ]; then
+            busy=false
+            return 1
+        fi
+        # A steady flow of controls must not starve the next delta.
+        if [ "$remaining" -le 0 ]; then break; fi
+    done
+}
+
+stream_reply_turn() {
+    local deltas delta
+    busy=true
+    jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+    jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
+    # Keep the loop in this shell; fd 3 still reads the provider input while
+    # stdin reads the precomputed frames. No producer survives an interruption.
+    # One jq renders every frame, so token-sized deltas cost no process each.
+    deltas=$(jq -cn --rawfile text "$reply" --argjson chunk "$stream_chunk" \
+        '$text | range(0; length; $chunk) as $at
+        | {type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$text[$at:$at + $chunk]}}}')
+    while IFS= read -r delta; do
+        printf '%s\n' "$delta"
+        if ! wait_stream_input; then return 1; fi
+    done <<< "$deltas"
+    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+}
+
+# Ends the busy first turn as finished, unless an interrupt ended it first.
+settle_first_turn() {
+    settle_at=
+    if [ "$busy" = true ]; then
+        busy=false
+        jq -cn --arg session "$session" --arg turn "$turn" \
+            '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+    fi
+}
+
+# Reads the next frame, or settles the first turn when its time comes first.
+next_frame() {
+    local now remaining timeout
+    while [ -n "$settle_at" ]; do
+        now=${EPOCHREALTIME/./}
+        remaining=$((settle_at - now))
+        if [ "$remaining" -le 0 ]; then
+            settle_first_turn
+            break
+        fi
+        printf -v timeout '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
+        if read_frame "$timeout"; then return 0; fi
+        if [ "$input_eof" = true ]; then return 1; fi
+    done
+    read_frame
+}
+
+while next_frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
         control_request)
-            id=$(printf '%s' "$frame" | jq -r '.request_id')
-            subtype=$(printf '%s' "$frame" | jq -r '.request.subtype')
-            metadata='{}'
-            if [ "$subtype" = initialize ]; then
-                metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
-                if [ "$fast_fixture" = 1 ]; then
-                    metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
-                fi
-                if [ -f "$models_file" ]; then
-                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile listed "$models_file" '$metadata + {models: $listed[0].models}')
-                fi
-                # Optional advertised commands and skills: a JSON object with
-                # `commands` ([{name, description}]) and `skills` ([name]).
-                if [ -f "$config/fixture-commands.json" ]; then
-                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
-                fi
-            elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
-                metadata=$(jq -c . "$usage_file")
-            elif [ "$subtype" = set_model ]; then
-                model=$(printf '%s' "$frame" | jq -r '.request.model // "haiku"')
-            elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
-                requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
-                if [ "$requested" = true ]; then fast=on; else fast=off; fi
-                metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
-            fi
-            jq -cn --arg id "$id" --argjson metadata "$metadata" \
-                '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
-            case $subtype in
-                cancel_async_message)
-                    uuid=$(printf '%s' "$frame" | jq -r '.request.message_uuid')
-                    jq -cn --arg uuid "$uuid" \
-                        '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
-                    ;;
-                stop_task)
-                    task=$(printf '%s' "$frame" | jq -r '.request.task_id')
-                    case " $background_agents " in
-                        *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
-                        # Any other task, such as one fixture-frames.jsonl
-                        # started, has already sent its notice: Claude Code
-                        # 2.1.296 answers a stop for an agent waiting on its
-                        # own background work by patching it killed, with no
-                        # further notice.
-                        *) jq -cn --arg task "$task" \
-                            '{type:"system",subtype:"task_updated",uuid:("fixture-"+$task+"-killed"),task_id:$task,patch:{status:"killed"}}' ;;
-                    esac
-                    ;;
-                interrupt)
-                    busy=false
-                    for tool in $background_agents; do stop_agent "$tool"; done
-                    jq -cn --arg session "$session" --arg turn "$turn" \
-                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
-                    ;;
-            esac
+            handle_control "$frame"
             ;;
         user)
             uuid=$(printf '%s' "$frame" | jq -r '.uuid')
             if [ "$busy" = true ]; then
-                jq -cn --arg uuid "$uuid" \
-                    '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
+                queue_user "$frame"
             elif [ "$(printf '%s' "$frame" | jq -r '.message.content | if type == "array" then map(.text // "") | join("") else . end')" = /compact ]; then
                 turn=$((turn + 1))
                 compact_turn
@@ -472,8 +694,10 @@ while IFS= read -r frame; do
                 printf '%s\n' "$frame"
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
-                jq -cn --arg session "$session" --arg model "$(resolved_model)" \
-                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                model_report=true
+                if [ -f "$config/fixture-unconfirmed-model" ]; then model_report=false; fi
+                jq -cn --arg session "$session" --arg model "$(resolved_model)" --argjson reported "$model_report" \
+                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286"} + (if $reported then {model:$model} else {} end)'
                 if [ -n "$task_scene" ]; then
                     task_receipt_turn
                     busy=false
@@ -509,11 +733,18 @@ while IFS= read -r frame; do
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
+                if [ -n "$long_history" ] && [ "$turn" -eq 1 ]; then long_history_turn; fi
                 if [ -f "$frames_file" ]; then
                     frames_turn
                     if [ "$frames_ended" = 1 ]; then continue; fi
                 fi
-                if [ -s "$run_file" ]; then run_turn; fi
+                taken=$once_file.$$
+                if mv "$once_file" "$taken" 2>/dev/null; then
+                    run_turn "$taken"
+                    rm -f "$taken"
+                elif [ -s "$run_file" ]; then
+                    run_turn "$run_file"
+                fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
@@ -525,14 +756,7 @@ while IFS= read -r frame; do
                 # Optionally stream the answer as Claude does, in text deltas
                 # before the final record, so a long answer grows across cuts.
                 if [ "$stream_reply" = 1 ] && [ -s "$reply" ]; then
-                    jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
-                    jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
-                    jq -cn --rawfile text "$reply" '$text | range(0; length; 16384) as $at | .[$at:$at + 16384]' |
-                        while IFS= read -r delta; do
-                            jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$delta}}}'
-                            sleep "$stream_delay"
-                        done
-                    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+                    if ! stream_reply_turn; then continue; fi
                 fi
                 assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
                     --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
@@ -541,7 +765,11 @@ while IFS= read -r frame; do
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
                     busy=true
+                    if [ -n "$first_turn_seconds" ]; then
+                        settle_at=$((${EPOCHREALTIME/./} + first_turn_seconds * 1000000))
+                    fi
                 else
+                    busy=false
                     jq -cn --arg session "$session" --arg turn "$turn" \
                         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
                 fi

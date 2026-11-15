@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::watch;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum State {
+pub enum State {
     #[default]
     Responsive,
     Unresponsive {
@@ -28,7 +28,7 @@ pub(crate) enum State {
 }
 
 impl State {
-    pub(crate) fn unavailable(&self) -> bool {
+    pub fn unavailable(&self) -> bool {
         !matches!(self, Self::Responsive)
     }
 }
@@ -127,10 +127,10 @@ fn monitor() -> &'static Monitor {
 pub(crate) fn begin() -> Request {
     monitor().begin()
 }
-pub(crate) fn current() -> State {
+pub fn current() -> State {
     monitor().sender.borrow().clone()
 }
-pub(crate) fn stream() -> impl cosmic::iced::futures::Stream<Item = State> {
+pub fn stream() -> impl cosmic::iced::futures::Stream<Item = State> {
     cosmic::iced::futures::stream::unfold(
         (monitor().sender.subscribe(), true),
         |(mut receiver, first)| async move {
@@ -252,7 +252,7 @@ pub(crate) fn disconnected(stream: &UnixStream, request: Request) {
         monitor().observe_request(Outcome::Unreachable, SystemTime::now(), request);
     }
 }
-pub(crate) fn retry_delay() -> Duration {
+pub fn retry_delay() -> Duration {
     if current().unavailable() {
         Duration::from_secs(30)
     } else {
@@ -262,7 +262,7 @@ pub(crate) fn retry_delay() -> Duration {
 /// Suppress only transport diagnostics replaced by the persistent banner.
 /// A provider or filesystem error remains a feature-level notice; a confirmed
 /// protocol mismatch has its own persistent explanation and recovery action.
-pub(crate) fn replaces_notice(message: &str) -> bool {
+pub fn replaces_notice(message: &str) -> bool {
     replaces_notice_for(&current(), message)
 }
 fn replaces_notice_for(state: &State, message: &str) -> bool {

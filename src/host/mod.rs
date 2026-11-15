@@ -22,6 +22,7 @@ mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
 mod state;
+mod update_recovery;
 mod work;
 mod workspace;
 mod worktree_removal;
@@ -204,6 +205,8 @@ pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
 /// Holds launch exclusion until the daemon listener is ready.
 pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
+    lease: Option<std::fs::File>,
+    retirement_owned_by_updater: bool,
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -213,12 +216,24 @@ pub struct DaemonAdmission {
 /// markers so later terminal children cannot inherit a consumed descriptor.
 pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     let admission = crate::instance::DaemonAdmissionGuard::acquire()?;
+    // The authenticated inherited launch fence belongs to the updater until
+    // it has reopened and verified every saved window. A plain cold start owns
+    // its own post-Ready completion instead.
+    let retirement_owned_by_updater = std::env::var_os(crate::instance::INSTALL_GUARD_ENV)
+        .is_some()
+        || crate::upgrade::recovery::has_inherited_receipt()?;
     // SAFETY: the caller guarantees that no other thread accesses environment.
     unsafe {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
     }
-    Ok(DaemonAdmission { _guard: admission })
+    // SAFETY: this is still the single-threaded entry point.
+    let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
+    Ok(DaemonAdmission {
+        _guard: admission,
+        lease,
+        retirement_owned_by_updater,
+    })
 }
 
 /// How often the daemon reclaims runtime-directory space that its chats no
@@ -291,12 +306,18 @@ fn listener_before_restore(
 /// daemon lease, so no daemon can open or convert the store meanwhile.
 fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
-    let _lease = HostLease::acquire_for_store_maintenance(&paths).map_err(|error| match error {
-        PlatformError::AlreadyRunning { .. } => {
-            "a cagents daemon is running; stop it before reading or converting its store".to_owned()
-        }
-        error => error.to_string(),
-    })?;
+    let inherited =
+        daemon::lease_handoff::clone_inherited_lease().map_err(|error| error.to_string())?;
+    let _lease =
+        HostLease::acquire_for_store_maintenance(&paths, inherited).map_err(
+            |error| match error {
+                PlatformError::AlreadyRunning { .. } => {
+                    "a cagents daemon is running; stop it before reading or converting its store"
+                        .to_owned()
+                }
+                error => error.to_string(),
+            },
+        )?;
     work()
 }
 
@@ -316,7 +337,14 @@ pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
     with_store_stopped(|| model::Registry::downgrade(target))
 }
 
-pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) {
+    exit_drain_tests::observe_startup(phase, error);
+}
+
+pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     let proof = HostSessionProof {
@@ -325,11 +353,17 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
+    let retirement_owned_by_updater = admission.retirement_owned_by_updater;
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    let _lease = HostLease::acquire(&paths, &proof)?;
+    let _lease = match admission.lease.take() {
+        Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
+        None => HostLease::acquire(&paths, &proof)?,
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("daemon lease acquired", None);
     // Before anything is launched, so the epoch precedes every launch.
     crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
     // Before anything is launched or adopted: sessions launched through this
@@ -351,6 +385,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
     // and donating its state over and over.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
         Ok(registry) => host
             .lock()
@@ -361,6 +397,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
         &std::env::current_exe()?,
         std::env::args_os()
@@ -404,41 +442,36 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // This mandatory thread service must be available before any adoption
     // can discard the holder's replay copy. It observes no process until the
     // same HostState publishes one; it initiates no execution.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting activity monitor", None);
     let _agent_activity = activity::Monitor::start(&host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("activity monitor started", None);
+    let mut recovered_prepared = false;
     let listener = listener_before_restore(&paths, || {
+        #[cfg(all(test, target_os = "linux"))]
+        observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
-            chat::retained_actor::reconcile_previous_boot_history(&host)
-                .map_err(io::Error::other)?;
-            let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-            state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-            if let Some(detail) = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .startup_recovery()
-            {
-                return Err(io::Error::other(detail.to_owned()));
+            if update_recovery::restore(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
             }
-            chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-            chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-            chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-            let retained_runs = chat::retained_actor::retained_runs(&host);
-            // A committed acceptance is not proof of provider delivery. Until a
-            // restored actor supplies exact run evidence, never authorize a resend.
-            if let Ok(registry) = agent_execution::registry(&host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .interrupt_unproven_agent_runs_except(
-                        crate::chat::now_ms().unwrap_or(0),
-                        &retained_runs,
-                    )
-                    .map_err(io::Error::other)?;
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore settled Prepared", None);
+            if update_recovery::restore_settled(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
             }
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore ordinary", None);
+            update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
             Ok(())
         })();
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
+                #[cfg(all(test, target_os = "linux"))]
+                observe_fixture_startup("restore error before cleanup", Some(&error.to_string()));
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state
                     .terminals
@@ -458,7 +491,11 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     })?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("restore complete; release admission", None);
     drop(admission);
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     // After restore, so the first pass covers every conversation it carried.
     if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
@@ -471,11 +508,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let recovery_only = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .startup_recovery()
-        .is_some();
+    let recovery_only = recovered_prepared
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .startup_recovery()
+            .is_some();
     if !recovery_only {
         let restore_host = Arc::downgrade(&host);
         if let Err(error) = std::thread::Builder::new()
@@ -506,6 +544,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting automation broker", None);
     let mut automation_broker = if recovery_only {
         None
     } else {
@@ -517,6 +557,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting Work board", None);
     let mut work_board = if recovery_only {
         None
     } else {
@@ -531,6 +573,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting mailbox courier", None);
     let mut courier = if recovery_only {
         None
     } else {
@@ -543,6 +587,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         }
     };
 
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("startup services started", None);
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
     let mut stall_watch = match host.watch(lock::STALL_LIMIT) {
@@ -569,6 +615,23 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
 
     #[cfg(all(test, target_os = "linux"))]
     exit_drain_tests::observe_ready(&host);
+    if !retirement_owned_by_updater {
+        // This thread must use the actual socket after startup, never a
+        // synchronous self-query in listener_before_restore. Its connection
+        // is served by the accept loop immediately below.
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-recovery-complete".into())
+            .spawn(|| {
+                if let Err(error) = crate::update::recovery::refresh_completed_service() {
+                    // Durable completion is separate from current daemon
+                    // readiness. Keep the serving owners and listener usable.
+                    tracing::warn!(%error, "recovery completion proof is unavailable; serving owners were kept");
+                }
+            })
+        {
+            tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
+        }
+    }
     loop {
         reap_finished(&mut clients);
         if daemon::termination_requested() {

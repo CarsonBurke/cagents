@@ -524,6 +524,13 @@ fn create_inner(
             service_tier_revision: 0,
             fast_models: Default::default(),
             effective_model: None,
+            effective_reasoning: None,
+            running_model: None,
+            running_reasoning: None,
+            model_turn: None,
+            model_turn_settled: false,
+            recent_model_turns: Default::default(),
+            default_reasoning: Default::default(),
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
@@ -582,6 +589,7 @@ enum Pending {
         revision: u64,
         notification_revision: u64,
         model: Option<String>,
+        reasoning: Option<String>,
         tier: Option<String>,
         /// Completion can precede this exact request's acknowledgement.
         /// Only the reply's turn ID may promote one of these bounded frames.
@@ -597,6 +605,7 @@ enum Pending {
         enabled: bool,
         revision: u64,
         model: Option<String>,
+        reasoning: Option<String>,
     },
     QueueAdd,
     /// Removing the named entry, whose answer says whether it left the queue
@@ -678,6 +687,15 @@ struct Codex {
     service_tier_revision: u64,
     fast_models: std::collections::BTreeSet<String>,
     effective_model: Option<String>,
+    effective_reasoning: Option<String>,
+    running_model: Option<String>,
+    running_reasoning: Option<String>,
+    /// Exact turn owning the displayed model, independent of the pricing
+    /// estimator's provisional request matching.
+    model_turn: Option<String>,
+    model_turn_settled: bool,
+    recent_model_turns: std::collections::VecDeque<String>,
+    default_reasoning: BTreeMap<String, String>,
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
@@ -1313,12 +1331,29 @@ impl Codex {
         let cwd = self.cwd.clone();
         self.call(step, "skills/list", json!({"cwds":[cwd]}), Pending::Skills)
     }
+    fn active_model_event(&self, step: &mut Step) {
+        step.events
+            .push(Event::ActiveModel(self.running_model.as_ref().map(|id| {
+                chat::ActiveModel {
+                    id: id.clone(),
+                    label: self
+                        .models
+                        .iter()
+                        .find(|model| &model.id == id)
+                        .map_or_else(|| id.clone(), |model| model.label.clone()),
+                    reasoning: self.running_reasoning.clone(),
+                    default_reasoning: self.default_reasoning.get(id).cloned(),
+                    aliases: Vec::new(),
+                }
+            })));
+    }
     fn model_events(&self, step: &mut Step) {
         step.events.push(Event::Models {
             models: self.models.clone(),
             selected: self.selected.clone(),
             reasoning: self.reasoning.clone(),
         });
+        self.active_model_event(step);
         step.events.push(Event::Capabilities(self.capabilities()));
         self.fast_mode_event(step);
     }
@@ -1340,6 +1375,22 @@ impl Codex {
             self.turn_pricing.pop_front();
         }
         self.turn_pricing.push_back((id.into(), model, tier));
+    }
+    fn remember_model_turn(&mut self, id: &str) {
+        if self.recent_model_turns.iter().any(|turn| turn == id) {
+            return;
+        }
+        if self.recent_model_turns.len() >= 32 {
+            self.recent_model_turns.pop_front();
+        }
+        self.recent_model_turns.push_back(id.to_owned());
+    }
+    fn bind_model_turn(&mut self, id: &str) {
+        self.remember_model_turn(id);
+        if self.model_turn.as_deref() != Some(id) {
+            self.model_turn_settled = false;
+        }
+        self.model_turn = Some(id.to_owned());
     }
     fn history(&mut self, step: &mut Step, cursor: Option<String>) -> Result<(), String> {
         if !self.materialized {
@@ -1973,7 +2024,7 @@ impl Adapter for Codex {
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
-                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), reasoning: self.reasoning.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
                         self.notification_turn = None;
                         step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
@@ -2047,6 +2098,7 @@ impl Adapter for Codex {
                 self.call(&mut step, "thread/settings/update", params, Pending::FastMode {
                     enabled, revision: self.service_tier_revision,
                     model: self.selection_dirty.then(|| self.selected.clone()).flatten(),
+                    reasoning: self.reasoning.clone(),
                 })?;
             }
             Command::SetPermissionMode { mode } => {
@@ -2372,6 +2424,10 @@ impl Adapter for Codex {
                     self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
+                    self.effective_reasoning = self.reasoning.clone();
+                    self.model_turn = None;
+                    self.running_model = self.effective_model.clone();
+                    self.running_reasoning = self.effective_reasoning.clone();
                     self.busy = thread["status"]["type"] == "active";
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
@@ -2404,6 +2460,9 @@ impl Adapter for Codex {
                             && self.notification_turn.is_none()
                         {
                             self.notification_turn = self.turn.clone();
+                            if let Some(id) = self.notification_turn.clone() {
+                                self.bind_model_turn(&id);
+                            }
                         }
                     } else {
                         self.history(&mut step, None)?;
@@ -2416,6 +2475,11 @@ impl Adapter for Codex {
                             "Unsupported Codex frame: missing string model".to_owned()
                         })?;
                         let id = model.id.clone();
+                        if let Some(effort) = value["defaultReasoningEffort"].as_str() {
+                            self.default_reasoning.insert(id.clone(), effort.to_owned());
+                        } else {
+                            self.default_reasoning.remove(&id);
+                        }
                         let tiers = value["serviceTiers"].as_array();
                         let fast = if let Some(tiers) = tiers {
                             tiers.iter().any(|tier| tier["id"].as_str() == Some("fast"))
@@ -2618,6 +2682,9 @@ impl Adapter for Codex {
                         && self.busy
                     {
                         self.notification_turn = self.turn.clone();
+                        if let Some(id) = self.notification_turn.clone() {
+                            self.bind_model_turn(&id);
+                        }
                     }
                     self.finish_history(&mut step)?;
                 }
@@ -2625,6 +2692,7 @@ impl Adapter for Codex {
                     enabled,
                     revision,
                     model,
+                    reasoning,
                 } => {
                     // A settings notification can confirm or supersede this
                     // request before its acknowledgement arrives.
@@ -2632,6 +2700,13 @@ impl Adapter for Codex {
                         self.service_tier = enabled.then(|| "fast".into());
                         if model.is_some() {
                             self.effective_model = model;
+                            self.effective_reasoning = reasoning;
+                            if !self.busy {
+                                self.model_turn = None;
+                                self.running_model = self.effective_model.clone();
+                                self.running_reasoning = self.effective_reasoning.clone();
+                                self.active_model_event(&mut step);
+                            }
                         }
                         self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                         self.fast_mode_event(&mut step);
@@ -2642,6 +2717,7 @@ impl Adapter for Codex {
                     revision,
                     notification_revision,
                     model,
+                    reasoning,
                     tier,
                     mut early,
                     ..
@@ -2662,6 +2738,19 @@ impl Adapter for Codex {
                             || (!self.busy
                                 && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
                     let early_completion = early_completion.filter(|_| owns_lifecycle);
+                    // A completion can beat its ACK too. Confirming that
+                    // exact last turn fills its model without reviving work.
+                    let owns_model = owns_lifecycle
+                        || (self.ready && self.attached && self.model_turn.as_deref() == Some(id));
+                    if owns_model {
+                        self.running_model = model.clone().or_else(|| self.effective_model.clone());
+                        self.running_reasoning = reasoning;
+                        self.bind_model_turn(id);
+                        self.active_model_event(&mut step);
+                    }
+                    // Even a late reply identifies its turn. Remember it so
+                    // a delayed start cannot replace a newer turn's status.
+                    self.remember_model_turn(id);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
@@ -2813,6 +2902,9 @@ impl Adapter for Codex {
                                 && child.busy
                             {
                                 child.notification_turn = child.turn.clone();
+                                if let Some(id) = child.notification_turn.clone() {
+                                    child.bind_model_turn(&id);
+                                }
                             }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
@@ -3015,6 +3107,14 @@ impl Adapter for Codex {
                 if settings.get("model").is_some() {
                     self.effective_model = settings["model"].as_str().map(str::to_owned);
                 }
+                if settings.get("effort").is_some() {
+                    self.effective_reasoning = settings["effort"].as_str().map(str::to_owned);
+                }
+                if !self.busy {
+                    self.model_turn = None;
+                    self.running_model = self.effective_model.clone();
+                    self.running_reasoning = self.effective_reasoning.clone();
+                }
                 if settings.get("serviceTier").is_some() {
                     self.service_tier = settings["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
@@ -3034,12 +3134,39 @@ impl Adapter for Codex {
                     self.reasoning = params["threadSettings"]["effort"]
                         .as_str()
                         .map(str::to_owned);
-                    self.model_events(&mut step);
                 }
+                self.model_events(&mut step);
             }
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
                 let turn_id = string(turn, "id")?;
+                if method == "turn/started" {
+                    let same_model_turn = self.model_turn.as_deref() == Some(turn_id);
+                    if (self.recent_model_turns.iter().any(|id| id == turn_id) && !same_model_turn)
+                        || (same_model_turn
+                            && (self.model_turn_settled
+                                || (!self.busy
+                                    && self.notification_turn.as_deref() != Some(turn_id))))
+                    {
+                        step.suppress_current_notification = true;
+                        return Ok(step);
+                    }
+                    if !same_model_turn {
+                        // A start has no request ID. An outstanding override
+                        // cannot be attributed until its exact ACK arrives.
+                        let awaiting_ack = self
+                            .pending
+                            .values()
+                            .any(|pending| matches!(pending, Pending::Turn { .. }));
+                        self.running_model = (!awaiting_ack)
+                            .then(|| self.effective_model.clone())
+                            .flatten();
+                        self.running_reasoning = (!awaiting_ack)
+                            .then(|| self.effective_reasoning.clone())
+                            .flatten();
+                        self.bind_model_turn(turn_id);
+                    }
+                }
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
                 let current =
@@ -3102,17 +3229,24 @@ impl Adapter for Codex {
                     }
                 }
                 if method == "turn/started" {
-                    let (model, tier) = self
+                    let (model, _reasoning, tier) = self
                         .pending
                         .values()
                         .find_map(|pending| match pending {
-                            Pending::Turn { model, tier, .. } => {
-                                Some((model.clone(), tier.clone()))
-                            }
+                            Pending::Turn {
+                                model,
+                                reasoning,
+                                tier,
+                                ..
+                            } => Some((model.clone(), reasoning.clone(), tier.clone())),
                             _ => None,
                         })
                         .unwrap_or_else(|| {
-                            (self.effective_model.clone(), self.service_tier.clone())
+                            (
+                                self.effective_model.clone(),
+                                self.effective_reasoning.clone(),
+                                self.service_tier.clone(),
+                            )
                         });
                     self.remember_turn_pricing(turn_id, model, tier);
                     self.prediction_turn = Some(turn_id.into());
@@ -3124,6 +3258,9 @@ impl Adapter for Codex {
                 }
                 if current {
                     if method == "turn/completed" {
+                        if self.model_turn.as_deref() == Some(turn_id) {
+                            self.model_turn_settled = true;
+                        }
                         step.events.push(Event::TurnSettled);
                     }
                     self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
@@ -3137,6 +3274,7 @@ impl Adapter for Codex {
                     };
                     step.events.push(Event::Waiting(false));
                     self.turn = self.busy.then(|| turn_id.to_owned());
+                    self.model_events(&mut step);
                 }
                 for value in array(turn, "items")? {
                     self.note_file_change(turn_id, value, &mut step);
@@ -5395,6 +5533,152 @@ mod tests {
     }
 
     #[test]
+    fn tool_rows_fixture_settles_parent_and_child_without_leaving_update_work() {
+        // Use the actual offline peer's frames and RPC responses, including
+        // child hydration. No provider executable, account or socket is used.
+        let export = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"
+import json, runpy, sys
+peer = runpy.run_path(sys.argv[1])
+scenario = peer['Scenario']()
+scenario.thread, scenario.child = 'thread-exact', 'child-exact'
+frames = scenario.request({'id': 1, 'method': 'turn/start', 'params': {
+    'threadId': scenario.thread}}, '/private/codex')[1:]
+resume = scenario.request({'id': 2, 'method': 'thread/resume', 'params': {
+    'threadId': scenario.child}}, '/private/codex')
+turn = frames[0]['params']['turn']['id']
+prediction = scenario.request({'id': 3, 'method': 'thread/prediction/request', 'params': {
+    'threadId': scenario.thread, 'sourceTurnId': turn}}, '/private/codex')
+print(json.dumps({'frames': frames, 'replies': {
+    'thread/resume': resume, 'thread/prediction/request': prediction}}))
+"#,
+            ])
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex-tool-rows.py"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "fixture export failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let fixture: Value = serde_json::from_slice(&export.stdout).unwrap();
+        let frames = fixture["frames"].as_array().unwrap();
+        let pause = frames
+            .iter()
+            .position(|frame| frame.get("_sleep").is_some())
+            .unwrap();
+
+        struct Fixture {
+            parser: Codex,
+            replies: Value,
+        }
+        impl Adapter for Fixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture accepts provider frames only".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                let mut pending = std::collections::VecDeque::from([frame]);
+                let mut result = Step::default();
+                let mut consumed = 0;
+                while let Some(frame) = pending.pop_front() {
+                    consumed += 1;
+                    assert!(consumed < 32, "fixture RPC responses did not settle");
+                    let step = self.parser.receive(frame)?;
+                    result.events.extend(step.events);
+                    for request in step.writes {
+                        let method = request["method"].as_str().unwrap();
+                        let replies = self.replies[method]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("unexpected fixture RPC: {request}"));
+                        for mut reply in replies.iter().cloned() {
+                            if reply.get("id").is_some() {
+                                reply["id"] = request["id"].clone();
+                            }
+                            pending.push_back(reply);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+        let snapshot = |frames: Vec<Value>, replies: Value| {
+            crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                Box::new(Fixture {
+                    parser: adapter(),
+                    replies,
+                }),
+                frames,
+                false,
+            )
+            .1
+        };
+        // There is deliberately no outcome before the pause. Inspect the
+        // parser directly rather than asking a notification-outcome harness
+        // to synthesize a completion for still-running work.
+        let mut active = Fixture {
+            parser: adapter(),
+            replies: fixture["replies"].clone(),
+        };
+        for frame in &frames[..pause] {
+            active.receive(frame.clone()).unwrap();
+        }
+        assert!(active.parser.busy);
+        assert!(
+            active.parser.children["child-exact"].busy,
+            "the pause must represent actual delegated work"
+        );
+        assert_eq!(
+            active.parser.children["child-exact"].subagent_status,
+            Some(ToolStatus::Running)
+        );
+        let completed: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.get("_sleep").is_none())
+            .cloned()
+            .collect();
+        let settled = snapshot(completed.clone(), fixture["replies"].clone());
+        assert!(!settled.busy && !settled.is_working());
+        assert!(settled.requests.is_empty());
+        assert_eq!(settled.subagents.len(), 1);
+        assert_eq!(settled.subagents[0].status, ToolStatus::Succeeded);
+
+        // Recreate the old fixture: hydration says idle, completed collab
+        // items assert Running again, and no child lifecycle ever follows.
+        // A parent's success alone cannot prove its background work ended.
+        let broken: Vec<_> = completed
+            .into_iter()
+            .filter(|frame| frame["params"]["threadId"] != "child-exact")
+            .map(|mut frame| {
+                if frame["method"] == "item/completed"
+                    && frame["params"]["item"]["type"] == "collabAgentToolCall"
+                {
+                    frame["params"]["item"]["agentsStates"]["child-exact"]["status"] =
+                        json!("running");
+                }
+                frame
+            })
+            .collect();
+        let mut replies = fixture["replies"].clone();
+        replies["thread/resume"][0]["result"]["thread"]["status"]["type"] = json!("idle");
+        replies["thread/resume"][0]["result"]["initialTurnsPage"]["data"] = json!([]);
+        let stranded = snapshot(broken, replies);
+        assert!(!stranded.busy, "the parent turn really completed");
+        assert!(
+            stranded.is_working(),
+            "the old update check still sees the orphaned Running child"
+        );
+        assert_eq!(stranded.subagents[0].status, ToolStatus::Running);
+    }
+
+    #[test]
     fn rejected_turn_start_releases_optimistic_activity_for_sign_in_recovery() {
         let mut adapter = adapter();
         let submitted = adapter
@@ -6406,6 +6690,13 @@ mod tests {
             service_tier_revision: 0,
             fast_models: Default::default(),
             effective_model: None,
+            effective_reasoning: None,
+            running_model: None,
+            running_reasoning: None,
+            model_turn: None,
+            model_turn_settled: false,
+            recent_model_turns: Default::default(),
+            default_reasoning: Default::default(),
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
@@ -9622,6 +9913,383 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
             event,
             Event::Models { models, .. } if models.len() == 1 && models[0].id == "gpt-a"
         )));
+    }
+
+    fn active_model_turn_fixture() -> (Codex, Value) {
+        let mut adapter = adapter();
+        adapter.models.push(Model {
+            id: "override-model".into(),
+            label: "Override model".into(),
+            reasoning: vec!["high".into()],
+        });
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("medium".into());
+        adapter.running_model = adapter.effective_model.clone();
+        adapter.running_reasoning = adapter.effective_reasoning.clone();
+        adapter
+            .command(Command::SetModel {
+                model: "override-model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "Use the override".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = sent
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        (adapter, request)
+    }
+
+    fn active_model_turn_started(id: &str) -> Value {
+        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+    }
+
+    fn active_model_turn_completed(id: &str) -> Value {
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[]}}})
+    }
+
+    fn assert_active_model_selection(adapter: &Codex, model: Option<&str>, effort: Option<&str>) {
+        let mut step = Step::default();
+        adapter.active_model_event(&mut step);
+        assert!(
+            step.events.iter().any(|event| match event {
+                Event::ActiveModel(Some(actual)) =>
+                    Some(actual.id.as_str()) == model && actual.reasoning.as_deref() == effort,
+                Event::ActiveModel(None) => model.is_none() && effort.is_none(),
+                _ => false,
+            }),
+            "wrong active model status: {:?}",
+            step.events
+        );
+    }
+
+    #[test]
+    fn active_model_turn_ack_then_started_keeps_both_overrides() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-exact","threadSettings":{"model":"new-default","effort":"low"}
+            }}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+    }
+
+    #[test]
+    fn active_model_turn_default_reset_sends_null_for_the_next_accepted_turn() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"high-turn"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("high-turn"))
+            .unwrap();
+        let cleared = adapter
+            .command(Command::SetModel {
+                model: "override-model".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        assert!(cleared.events.iter().any(|event| matches!(event,
+            Event::Models { selected, reasoning: None, .. }
+                if selected.as_deref() == Some("override-model"))));
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_completed("high-turn"))
+            .unwrap();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "Use the default effort".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = sent
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(request["params"]["model"], "override-model");
+        assert_eq!(request["params"].get("effort"), Some(&Value::Null));
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        let accepted = adapter
+            .receive(json!({"id":request["id"],"result":{"turn":{"id":"default-turn"}}}))
+            .unwrap();
+        assert!(accepted.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model))
+                if model.id == "override-model" && model.reasoning.is_none())));
+        adapter
+            .receive(active_model_turn_started("default-turn"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), None);
+        assert!(adapter.reasoning.is_none());
+    }
+
+    #[test]
+    fn active_model_turn_started_then_ack_does_not_guess_the_pending_selection() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        assert!(
+            adapter
+                .turn_pricing
+                .iter()
+                .any(|(turn, model, _)| turn == "chosen"
+                    && model.as_deref() == Some("override-model"))
+        );
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+    }
+
+    #[test]
+    fn active_model_turn_unrelated_start_and_late_ack_cannot_borrow_overrides() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("foreign"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        let late = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"requested"}}}))
+            .unwrap();
+        assert!(late.suppress_current_notification);
+        assert_active_model_selection(&adapter, None, None);
+        assert_eq!(adapter.notification_turn.as_deref(), Some("foreign"));
+        adapter
+            .receive(active_model_turn_completed("foreign"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("genuinely-new"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        adapter
+            .receive(active_model_turn_started("requested"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("genuinely-new"));
+    }
+
+    #[test]
+    fn active_model_turn_old_duplicate_cannot_replace_a_newer_turn() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        adapter.receive(active_model_turn_started("newer")).unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("model"), Some("medium"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn active_model_turn_completed_before_ack_is_confirmed_without_restarting() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        assert_active_model_selection(&adapter, None, None);
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+        assert!(!adapter.busy);
+        assert!(adapter.turn.is_none());
+        assert!(adapter.notification_turn.is_none());
+        let duplicate = adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert!(duplicate.suppress_current_notification);
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn active_model_turn_settled_duplicate_cannot_claim_a_new_scalar_lifecycle() {
+        let (mut adapter, request) = active_model_turn_fixture();
+        adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"chosen"}}}))
+            .unwrap();
+        adapter
+            .receive(active_model_turn_completed("chosen"))
+            .unwrap();
+        adapter
+            .receive(json!({"method":"thread/status/changed","params":{
+                "threadId":"thread-exact","status":{"type":"active","activeFlags":[]}
+            }}))
+            .unwrap();
+        assert!(adapter.busy);
+        let lifecycle = adapter.lifecycle_revision;
+        let notifications = adapter.notification_revision;
+        let stale = adapter
+            .receive(active_model_turn_started("chosen"))
+            .unwrap();
+        assert!(stale.suppress_current_notification);
+        assert_eq!(adapter.lifecycle_revision, lifecycle);
+        assert_eq!(adapter.notification_revision, notifications);
+        assert!(adapter.notification_turn.is_none());
+        assert!(adapter.turn.is_none());
+        assert_active_model_selection(&adapter, Some("override-model"), Some("high"));
+    }
+
+    #[test]
+    fn active_model_stays_visible_when_a_different_model_is_staged() {
+        let mut adapter = adapter();
+        adapter.models.push(Model {
+            id: "next-model".into(),
+            label: "Next model".into(),
+            reasoning: vec!["high".into()],
+        });
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("future-effort".into());
+        adapter
+            .receive(json!({"method":"turn/started","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
+        let change = adapter
+            .command(Command::SetModel {
+                model: "next-model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        assert!(change.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model))
+                if model.id == "model" && model.reasoning.as_deref() == Some("future-effort"))));
+        assert_eq!(adapter.selected.as_deref(), Some("next-model"));
+        let completed = adapter
+            .receive(json!({"method":"turn/completed","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"completed","items":[]}
+            }}))
+            .unwrap();
+        assert!(completed.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "model")));
+        assert_eq!(adapter.effective_model.as_deref(), Some("model"));
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "next turn".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let started = adapter
+            .receive(json!({"id":sent.writes[0]["id"],"result":{
+                "turn":{"id":"next","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
+        assert!(started.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model))
+                if model.id == "next-model" && model.reasoning.as_deref() == Some("high"))));
+        assert_eq!(adapter.running_model.as_deref(), Some("next-model"));
+    }
+
+    #[test]
+    fn active_model_does_not_change_when_thread_defaults_change_during_a_turn() {
+        let mut adapter = adapter();
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("future-effort".into());
+        adapter
+            .receive(json!({"method":"turn/started","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
+        let change = adapter
+            .receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-exact","threadSettings":{"model":"next-model","effort":"high"}
+            }}))
+            .unwrap();
+        assert_eq!(adapter.selected.as_deref(), Some("next-model"));
+        assert_eq!(adapter.effective_model.as_deref(), Some("next-model"));
+        assert!(change.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "model"
+                && model.reasoning.as_deref() == Some("future-effort"))));
+        adapter
+            .receive(json!({"method":"turn/completed","params":{
+                "threadId":"thread-exact","turn":{"id":"active","status":"completed","items":[]}
+            }}))
+            .unwrap();
+        let started = adapter
+            .receive(json!({"method":"turn/started","params":{
+                "threadId":"thread-exact","turn":{"id":"next","status":"inProgress","items":[]}
+            }}))
+            .unwrap();
+        assert!(started.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "next-model"
+                && model.reasoning.as_deref() == Some("high"))));
+    }
+
+    #[test]
+    fn catalog_default_reasoning_is_reported_separately_from_selected_effort() {
+        let mut adapter = adapter();
+        let mut listing = Step::default();
+        adapter
+            .call(
+                &mut listing,
+                "model/list",
+                json!({"limit":100}),
+                Pending::Models,
+            )
+            .unwrap();
+        adapter.reasoning = Some("medium".into());
+        adapter.effective_model = Some("model".into());
+        adapter.effective_reasoning = Some("medium".into());
+        adapter.running_model = adapter.effective_model.clone();
+        adapter.running_reasoning = adapter.effective_reasoning.clone();
+        let catalog = adapter.receive(json!({"id":listing.writes[0]["id"],"result":{
+            "data":[{"model":"model","displayName":"Model", "defaultReasoningEffort":"medium",
+                "supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}],
+            "nextCursor":null
+        }})).unwrap();
+        assert!(catalog.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "model"
+                && model.reasoning.as_deref() == Some("medium")
+                && model.default_reasoning.as_deref() == Some("medium"))));
+        assert_eq!(adapter.reasoning.as_deref(), Some("medium"));
+        let high = adapter
+            .command(Command::SetModel {
+                model: "model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        assert!(high.events.iter().any(|event| matches!(event,
+            Event::Models {reasoning: Some(effort), ..} if effort == "high")));
     }
 
     #[test]

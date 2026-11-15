@@ -27,9 +27,9 @@ use std::{
 /// public: `crate::lsp` terminates language-server process groups through the
 /// same primitives so that the crate keeps exactly one implementation of
 /// process-group signalling, and therefore exactly one `unsafe` block.
-pub(crate) const TERMINATION_GRACE: Duration = Duration::from_millis(150);
-pub(crate) const SIGTERM: i32 = 15;
-pub(crate) const SIGKILL: i32 = 9;
+pub const TERMINATION_GRACE: Duration = Duration::from_millis(150);
+pub const SIGTERM: i32 = 15;
+pub const SIGKILL: i32 = 9;
 /// How long the executor waits, after a child has been terminated, for the
 /// pipes to drain and for the kernel to report the exit status, before it
 /// stops draining its pipes and returns without one.
@@ -38,10 +38,10 @@ pub(crate) const SIGKILL: i32 = 9;
 /// background process that escapes the killed process group while still
 /// holding the child's stdout or stderr, and the caller of a mutation holds
 /// that repository's mutation lock for the whole call.
-pub(crate) const CLEANUP_GRACE: Duration = Duration::from_millis(500);
+pub const CLEANUP_GRACE: Duration = Duration::from_millis(500);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
-pub(crate) const DEFAULT_STDERR_LIMIT: usize = 4 * 1024 * 1024;
+pub const DEFAULT_STDERR_LIMIT: usize = 4 * 1024 * 1024;
 const FAILURE_EXCERPT_LIMIT: usize = 64 * 1024;
 
 /// Descriptor numbers are part of an invocation's identity. Keeping the owner
@@ -304,7 +304,7 @@ impl ProcessFailure {
     ///
     /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
     /// nothing: `Display` renders it as `{program}: process exited with status
-    /// Some(4)`, a number standing in for the two sentences `gh` wrote about
+    /// 4`, a number standing in for the two sentences `gh` wrote about
     /// how to log in, or for `fatal: not a git repository`. So it is the one
     /// kind whose stderr is preferred, and only when there is some.
     ///
@@ -361,7 +361,11 @@ impl ProcessOutput {
                 signal: self.signal,
                 stdout: self.stdout,
                 stderr: self.stderr,
-                message: format!("process exited with status {:?}", self.exit_code),
+                message: match (self.exit_code, self.signal) {
+                    (Some(code), _) => format!("process exited with status {code}"),
+                    (None, Some(signal)) => format!("process was terminated by signal {signal}"),
+                    (None, None) => "process exited unsuccessfully".to_owned(),
+                },
                 started: true,
             })
         }
@@ -546,7 +550,7 @@ impl ProcessExecutor for SystemProcessExecutor {
     }
 }
 
-pub(crate) fn process_failure(
+pub fn process_failure(
     spec: &CommandSpec,
     kind: ProcessFailureKind,
     message: &str,
@@ -582,7 +586,7 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 /// `crate::lsp` reuses this single implementation — and its single `unsafe`
 /// block — instead of declaring `kill` a second time; it is not public API.
 #[cfg(unix)]
-pub(crate) fn signal_process_group(process_group: u32, signal: i32) {
+pub fn signal_process_group(process_group: u32, signal: i32) {
     unsafe extern "C" {
         #[link_name = "kill"]
         fn send_signal(pid: i32, signal: i32) -> i32;
@@ -599,7 +603,7 @@ pub(crate) fn signal_process_group(process_group: u32, signal: i32) {
 /// This application only builds on Linux — `persistence` and `session` both
 /// depend on Unix-only APIs — so there is no non-Unix process group to signal.
 #[cfg(not(unix))]
-pub(crate) fn signal_process_group(_process_group: u32, _signal: i32) {}
+pub fn signal_process_group(_process_group: u32, _signal: i32) {}
 
 /// A sole-reaper waiter keeps the leader unreaped through every group signal.
 /// Exit observation wakes the executor immediately; final reaping requires the
@@ -887,6 +891,28 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_exit_names_its_status_or_signal_rather_than_an_option() {
+        let failure = |exit_code, signal| {
+            ProcessOutput {
+                exit_code,
+                signal,
+                success: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+            .require_success(Path::new("gh"))
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(failure(Some(1), None), "gh: process exited with status 1");
+        assert_eq!(
+            failure(None, Some(9)),
+            "gh: process was terminated by signal 9"
+        );
+        assert_eq!(failure(None, None), "gh: process exited unsuccessfully");
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

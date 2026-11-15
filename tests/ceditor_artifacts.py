@@ -22,7 +22,7 @@ class CeditorArtifacts(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         (self.checkout / "scripts").mkdir(parents=True)
         (self.checkout / "packaging").mkdir()
-        for name in ("run-ceditor-development", "install-ceditor", "build-ceditor-product"):
+        for name in ("run-ceditor-development", "install-ceditor", "build-ceditor-product", "cargo_artifacts.py"):
             source = ROOT / "scripts" / name
             if source.exists():
                 shutil.copy2(source, self.checkout / "scripts" / name)
