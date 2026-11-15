@@ -2381,7 +2381,7 @@ impl Runtime {
             .selected_subagent
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
-        let mut anchors = Vec::new();
+        let anchors = Vec::new();
         let mut transcript = VirtualRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
@@ -6955,7 +6955,7 @@ mod tests {
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
-        use iced::advanced::{Layout, Shell, Widget, clipboard, layout, mouse, widget::Tree};
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
         use iced::{Event, Point, Rectangle, Size};
         let question = "Compare tree-real-*.png and [Expanded](docs/tree%20expanded.png).";
         let request = chat::Request {
@@ -9690,7 +9690,7 @@ mod tests {
             preparation::drain_fixture(runtime);
             let mut element = runtime.prompt_view(runtime.active_item("same#opaque-id").unwrap());
             let mut tree = Tree::new(element.as_widget());
-            let mut node = element.as_widget_mut().layout(
+            let _ = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
@@ -9698,7 +9698,7 @@ mod tests {
             for cached in runtime.cache.values().chain(runtime.child_cache.values()) {
                 cached.flow_cache.complete_fixture();
             }
-            node = element.as_widget_mut().layout(
+            let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
@@ -14037,11 +14037,11 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100_000.0));
-        let mut node = element
+        let _ = element
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
         runtime.cache[&item.id].flow_cache.complete_fixture();
-        node = element
+        let node = element
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
         #[derive(Default)]
@@ -17071,7 +17071,7 @@ mod tests {
         runtime.attachment_chooser_pending = Some(uuid::Uuid::new_v4());
         assert!(runtime.is_draft());
         assert!(!runtime.choosing());
-        let mut renderer = crate::app::tests::headless_renderer();
+        let renderer = crate::app::tests::headless_renderer();
         let mut view = app.chat_view(card);
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(

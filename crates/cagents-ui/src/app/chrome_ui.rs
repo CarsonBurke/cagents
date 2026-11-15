@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn tab_density_fits_four_compact_and_real_titles_when_comfortable() {
-        let mut app = tab_fixture(30, 900.0);
+        let app = tab_fixture(30, 900.0);
         let (available, width) = app.tab_strip_geometry();
         assert!(
             4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET

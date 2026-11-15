@@ -380,7 +380,6 @@ pub fn run(request: Request) -> Result<(), Box<dyn std::error::Error>> {
     request.validate()?;
     let context_ready = crate::device::select(request.device.as_deref()).is_ok();
     type Shell = Cosmic<Window>;
-    use cosmic::Application;
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     let request = std::cell::RefCell::new(Some((request, context_ready)));
     iced::daemon(

@@ -710,7 +710,7 @@ mod tests {
             )
         };
         let mut tree = Tree::new(&build(false));
-        let mut offered = |widget: &mut Element<'_, Press>, tree: &mut Tree, focus| {
+        let offered = |widget: &mut Element<'_, Press>, tree: &mut Tree, focus| {
             tree.diff(widget.as_widget_mut());
             let node = widget.as_widget_mut().layout(
                 tree,

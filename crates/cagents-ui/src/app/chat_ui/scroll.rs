@@ -2589,7 +2589,7 @@ mod tests {
         let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
         let mut element = transcript(40);
         let mut tree = Tree::new(&element);
-        let mut end_distance = |element: &mut Element<'static, Message>, tree: &mut Tree| {
+        let end_distance = |element: &mut Element<'static, Message>, tree: &mut Tree| {
             let node = element.as_widget_mut().layout(tree, &renderer, &limits);
             let mut top = ReadTop::default();
             element

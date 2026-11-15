@@ -1,10 +1,12 @@
 use std::{path::Path, time::Duration};
 
+#[cfg(test)]
+use crate::upgrade::ensure_no_surviving_process;
 use crate::{
     control::ControlClient,
     model::{HostSessionProof, TerminalSession},
     terminal::ensure_daemon_ready,
-    upgrade::{ScanError, UnreadableProcess, ensure_no_surviving_process, exact_conversation},
+    upgrade::{ScanError, UnreadableProcess, exact_conversation},
 };
 
 pub(super) struct RecoveredTerminal {
@@ -2377,7 +2379,6 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let saved = session(directory.path(), &proof("before-restart"));
         let current = proof("after-restart");
-        let boot = current.boot_id.clone();
         let id = saved.id;
         let _lease = lease(directory.path(), &current);
         let served = Inventory {
