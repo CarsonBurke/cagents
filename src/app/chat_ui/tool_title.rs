@@ -840,8 +840,6 @@ mod tests {
         }
     }
 
-    /// A refused or failed edit is shown as its call: it says what it tried,
-    /// not that it edited the file.
     #[test]
     fn a_call_on_one_file_keeps_its_whole_path() {
         let deep = format!("/work/{}/main.rs", "nested/".repeat(30));
@@ -867,6 +865,8 @@ mod tests {
         assert!(!title.path);
     }
 
+    /// A refused or failed edit is shown as its call: it says what it tried,
+    /// not that it edited the file.
     #[test]
     fn an_edit_that_did_not_happen_says_what_it_tried() {
         let input = json!({"file_path":"src/lib.rs","old_string":"a","new_string":"b"});

@@ -69,13 +69,7 @@ impl Headline {
             // row's resting, hovered, pressed and focused paint alike.
             Self::Text(text) => line(text).width(Length::Fill).into(),
             Self::Path { verb, path } => {
-                // A path from the home directory or the root keeps that
-                // anchor in view, so a file outside the working directory
-                // still reads as outside once the rest of its path fades.
-                let anchor = ["~/", "/"]
-                    .into_iter()
-                    .find(|anchor| path.len() > anchor.len() && path.starts_with(anchor));
-                let (anchor, rest) = path.split_at(anchor.map_or(0, str::len));
+                let (anchor, rest) = path.split_at(anchor(&path));
                 let mut path = vec![];
                 if !anchor.is_empty() {
                     path.push(line(anchor.to_owned()).into());
@@ -99,6 +93,21 @@ impl Headline {
             }
         }
     }
+}
+
+/// How much of a shown path, from its start, says where it lies outside
+/// the working directory: `~/`, `/`, or a run of `../`. A row keeps it in
+/// view, so the path still reads as outside once the rest of it fades.
+fn anchor(path: &str) -> usize {
+    let anchor = if path.starts_with("~/") {
+        2
+    } else if path.starts_with('/') {
+        1
+    } else {
+        path.len() - path.trim_start_matches("../").len()
+    };
+    // A path that is nothing but its anchor is shown whole.
+    if anchor < path.len() { anchor } else { 0 }
 }
 
 /// One disclosure row. Its accessible name carries the trailing metadata,
@@ -201,6 +210,16 @@ pub(super) fn row_named(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_keeps_what_says_it_lies_outside_in_view() {
+        assert_eq!(anchor("~/.claude/settings.json"), 2);
+        assert_eq!(anchor("/etc/hosts"), 1);
+        assert_eq!(anchor("../../other/a.rs"), 6);
+        assert_eq!(anchor("src/a.rs"), 0);
+        assert_eq!(anchor("/"), 0);
+        assert_eq!(anchor("../"), 0);
+    }
 
     #[test]
     fn transcript_duration_uses_whole_seconds_and_minutes() {

@@ -15322,6 +15322,33 @@ mod tests {
         assert_eq!(runtime.strip_summary(&turn), format!("Stopped {name}"));
     }
 
+    /// A turn whose one step failed an edit to one file names that file on
+    /// its collapsed strip as its open row does, from the working directory,
+    /// with the turn's state after the file's name.
+    #[test]
+    fn a_lone_file_step_names_its_file_on_the_collapsed_strip() {
+        let items = vec![chat::Item {
+            id: "toolu_edit".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Changes {
+                changes: vec![chat::FileChange {
+                    path: "/project/src/platform/a.rs".into(),
+                    kind: chat::ChangeKind::Updated,
+                    diff: String::new(),
+                }],
+                status: chat::ToolStatus::Failed,
+            },
+            started_at: Some(1000),
+            at: Some(1000),
+        }];
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let turn = runtime.turns[0].clone();
+        assert_eq!(
+            runtime.strip_summary(&turn),
+            "Tried to edit src/platform/a.rs · failed"
+        );
+    }
+
     #[test]
     fn new_turn_activity_keeps_completed_historical_reasoning_retained() {
         let items = frame_cost::transcript(3);

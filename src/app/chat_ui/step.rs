@@ -252,6 +252,7 @@ impl Runtime {
     /// names them as its open row does, by what this conversation calls them,
     /// which grouping, formed only when the transcript's structure changes,
     /// cannot know.
+    #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
         match self.strip_headline(turn) {
             disclosure::Headline::Text(text) => text,

@@ -633,19 +633,43 @@ pub(super) fn names_path(content: &ItemContent, title: Option<&Title>) -> bool {
 /// A path as a step row shows it: relative to the working directory when it
 /// is inside it, as the agent itself would name it, and otherwise from the
 /// home directory or the root, so it still reads as lying outside.
+///
+/// An absolute path is read as written, without resolving links, but with
+/// `.`, `..` and repeated separators taken out, so `/work/../etc/x` is not
+/// shown as though it lay in `/work`.
 pub(super) fn shown_path<'a>(path: &'a str, working_directory: &std::path::Path) -> Cow<'a, str> {
-    let inside = working_directory
-        .to_str()
-        .map(|root| root.trim_end_matches('/'))
-        .filter(|root| !root.is_empty())
-        .and_then(|root| path.strip_prefix(root))
-        .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|rest| !rest.is_empty());
-    match inside {
-        Some(relative) => Cow::Borrowed(relative),
-        None if path.starts_with('/') => crate::app::display_path(std::path::Path::new(path)),
-        None => Cow::Borrowed(path),
+    if !path.starts_with('/') {
+        return Cow::Borrowed(path);
     }
+    let path = lexical(std::path::Path::new(path));
+    let root = lexical(working_directory);
+    // Relative to the root itself, every path would lose the slash that
+    // says where it lies.
+    let inside = root.parent().is_some() && working_directory.is_absolute();
+    match path.strip_prefix(&root) {
+        Ok(relative) if inside && !relative.as_os_str().is_empty() => {
+            Cow::Owned(relative.to_string_lossy().into_owned())
+        }
+        _ => Cow::Owned(crate::app::display_path(&path).into_owned()),
+    }
+}
+
+/// `path` with `.`, `..` and repeated separators taken out, as written.
+fn lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normal = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normal.pop() {
+                    normal.push(component);
+                }
+            }
+            component => normal.push(component),
+        }
+    }
+    normal
 }
 
 /// The verb a step is introduced with, kept separate from its target so the two
@@ -1891,5 +1915,17 @@ mod tests {
             shown_path("/etc/hosts", std::path::Path::new("/")),
             "/etc/hosts"
         );
+        // Repeated separators, `.` and `..` are read as written.
+        assert_eq!(
+            shown_path("/home/user/project//src/./a.rs", root),
+            "src/a.rs"
+        );
+        assert_eq!(
+            shown_path("/home/user/project/../etc/x", root),
+            "/home/user/etc/x"
+        );
+        assert_eq!(shown_path("/home/user/project/src/../a.rs", root), "a.rs");
+        // A relative path is the agent's own, shown as it gave it.
+        assert_eq!(shown_path("../other/a.rs", root), "../other/a.rs");
     }
 }
