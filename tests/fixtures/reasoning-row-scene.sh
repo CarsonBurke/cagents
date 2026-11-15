@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -319,6 +319,51 @@ if [ "$scene" = activity ]; then
     scroll_top
     shot activity-finished
     printf '%s\n' 'Captured a working turn at two points and the same turn finished.'
+    exit 0
+fi
+
+# Subagents still working after the lead has answered, beside an older
+# background command: the transcript keeps one activity indicator.
+if [ "$scene" = agents ]; then
+    cp "$here/reasoning-row-scene/agents.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: start the reviewers and wait for the receipt.' \
+        "$fixture/state/reasoning-agents-spawn.json" 'Agents at work'
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"agents-answer-1"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the lead did not answer' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot agents-idle
+    printf '%s\n' 'Captured subagents working after the lead answered.'
+    exit 0
+fi
+
+# A Codex turn of running tool, collaboration and event rows with a plan step
+# in progress, held working for 40 seconds, then finished.
+if [ "$scene" = plan ]; then
+    [ -x "$fixture/bin/codex" ] && [ -d "$fixture/home/.codex" ] || {
+        printf '%s\n' 'reasoning-row-scene: start with --codex tool-rows for plan' >&2
+        exit 2
+    }
+    evidence cli project open "$fixture/project" >/dev/null
+    printf '40\n' >"$fixture/home/.codex/fixture-plan"
+    spawn_scene codex fixture-mini 'Plan fixture: work through the recorded rows.' \
+        "$fixture/state/reasoning-plan-spawn.json" 'Plan at work'
+    evidence drive wait 'Check the running items' --timeout 20 >/dev/null
+    sleep 4
+    scroll_top
+    shot plan-working
+    evidence drive wait 'Done' --timeout 60 >/dev/null
+    sleep 2
+    scroll_top
+    shot plan-finished
+    rm -f "$fixture/home/.codex/fixture-plan"
+    printf '%s\n' 'Captured a working Codex turn with its plan, then finished.'
     exit 0
 fi
 
