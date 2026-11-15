@@ -1000,7 +1000,15 @@ fn orphan_registry_failure_keeps_the_committed_original_in_recovery_until_explic
             let state = successor.lock().unwrap();
             assert_eq!(state.terminals.len(), 1);
             assert_eq!(state.startup_recovery().is_some(), faulted);
-            state.terminals[&source.id].handle.clone()
+            // Whether publication refused or committed, the kept original
+            // resolves by the previous daemon's source.
+            let record = &state.terminals[&source.id];
+            assert_eq!(
+                record.upgrade_sources.last().map(|s| s.id),
+                Some(source.id),
+                "{registry_fault:?}"
+            );
+            record.handle.clone()
         };
         assert_eq!(adopted.holder_identity(), Some(&owner));
         assert!(owner.root.is_current() && owner.holder.is_current());
