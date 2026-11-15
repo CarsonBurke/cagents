@@ -377,9 +377,12 @@ fn insertion_indices(
 impl Cagents {
     /// Merge navigation into the full descriptor; never snapshot the projected
     /// strip over durable cards belonging to a hidden scope.
-    pub(super) fn snapshot_workspace_scope(&mut self) {
+    ///
+    /// Returns whether a channel's panes changed, in membership or order,
+    /// which is what a shared view reads of this.
+    pub(super) fn snapshot_workspace_scope(&mut self) -> bool {
         if self.active_workspace.is_none() {
-            return;
+            return false;
         }
         let focused = self.workspace.focused();
         let active_order = self.durable.active_channel.and_then(|id| {
@@ -424,20 +427,24 @@ impl Cagents {
             .filter(|card| card.existence.is_open())
             .map(|card| card.id)
             .collect::<HashSet<_>>();
-        let needs_update = self.durable.active_worktree != self.active_workspace
+        let moved = active_order.as_ref().is_some_and(|(id, order)| {
+            self.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == *id && &channel.cards != order)
+        }) || self
+            .durable
+            .channels
+            .iter()
+            .any(|channel| channel.cards.iter().any(|id| !open.contains(id)));
+        let needs_update = moved
+            || self.durable.active_worktree != self.active_workspace
             || self.durable.worktree_focus != self.worktree_focus
-            || active_order.as_ref().is_some_and(|(id, order)| {
-                self.durable
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == *id && &channel.cards != order)
-            })
             || self.durable.channels.iter().any(|channel| {
-                (Some(channel.id) == self.durable.active_channel && channel.focused != focused)
-                    || channel.cards.iter().any(|id| !open.contains(id))
+                Some(channel.id) == self.durable.active_channel && channel.focused != focused
             });
         if !needs_update {
-            return;
+            return false;
         }
         let durable = Arc::make_mut(&mut self.durable);
         if let Some((id, order)) = active_order {
@@ -461,6 +468,7 @@ impl Cagents {
         }
         durable.active_worktree.clone_from(&self.active_workspace);
         durable.worktree_focus.clone_from(&self.worktree_focus);
+        moved
     }
 
     pub(super) fn register_channel_card(&mut self, card: CardId) {

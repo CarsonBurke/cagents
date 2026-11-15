@@ -2054,7 +2054,8 @@ impl Cagents {
     /// are everything [`Self::reconcile_workspace_model`] projects, so only
     /// the channel itself is absorbed rather than every view the window
     /// holds. Its save waits like a navigation save: the registry already
-    /// holds the name, and a burst of renames is saved once.
+    /// holds the name, and a burst of renames is saved once. Nor does that
+    /// save project views, since none of them reads a name.
     ///
     /// `None` leaves a channel this window does not show as an ordinary
     /// member, such as one it has yet to adopt or is deleting, to the full
@@ -2074,7 +2075,7 @@ impl Cagents {
             self.sort_durable_channels();
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
-            tasks.push(self.save_navigation_soon());
+            tasks.push(self.save_snapshot_soon());
         }
         // A manual name ends a pending suggestion, and a name arriving can
         // release one this window was holding back.
@@ -7800,7 +7801,7 @@ mod tests {
                 assert_eq!(app.workspace_model.channel(channel).unwrap().title, title);
                 assert_eq!(app.durable.channels[0].title, title);
                 assert!(
-                    app.navigation_save_pending,
+                    app.navigation_save.is_some(),
                     "the canonical title is saved soon"
                 );
             }

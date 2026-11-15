@@ -3151,7 +3151,7 @@ mod tests {
             assert_eq!(app.durable.active_channel, Some(channel));
             assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
             assert_eq!(persists(), saved, "a click alone waits for the burst");
-            assert!(app.navigation_save_pending);
+            assert!(app.navigation_save.is_some());
             // The burst's first click arms the one timer; later clicks don't
             // push it back, so a long burst is still saved within the delay.
             let generation = *armed.get_or_insert(app.navigation_save_generation);
@@ -3160,7 +3160,7 @@ mod tests {
         let burst = app.navigation_save_generation;
         drop(app.update(Message::NavigationSaveDue(burst)));
         assert_eq!(persists(), saved + 1, "the burst is saved once");
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
 
         // A timer armed for a burst some other save already wrote does not
         // cut the next burst short.
@@ -3175,7 +3175,7 @@ mod tests {
         let stale = app.navigation_save_generation - 1;
         drop(app.update(Message::NavigationSaveDue(stale)));
         assert_eq!(persists(), saved + 2, "the earlier burst's timer is spent");
-        assert!(app.navigation_save_pending);
+        assert!(app.navigation_save.is_some());
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         assert_eq!(persists(), saved + 3);
         assert_eq!(app.durable.active_channel, Some(first));
