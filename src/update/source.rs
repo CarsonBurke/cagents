@@ -631,7 +631,7 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     },
     ReleasedSource {
         protocol: 178,
-        release: "main at 0cb9789a3",
+        release: "0.1.3+local.f016f047b",
         family: ClientFamily::Current,
     },
 ];
@@ -912,7 +912,8 @@ mod admission_message_tests {
             assert!(message.contains(&format!(
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
-                 protocol 178 (main at 0cb9789a3) and protocol {}.",
+                 protocol 178 (0.1.3+local.f016f047b) \
+                 and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
             assert!(message.contains("did not request preparation or shutdown"));

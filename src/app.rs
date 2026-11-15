@@ -57,6 +57,8 @@ mod terminal_ui;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
+#[cfg(test)]
+use workspace_model_sync::{TestModelRequests, test_model_channel};
 mod workspace_switcher;
 mod worktree_dialog;
 mod worktree_operations;
@@ -3269,7 +3271,7 @@ impl SettingsField {
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
-            Self::SidebarWorktrees => "Worktrees in sidebar",
+            Self::SidebarWorktrees => "Checkouts in sidebar",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
             Self::DefaultColumnFraction => "New pane width",
@@ -3988,7 +3990,7 @@ fn settings_update(
             .map(|enabled| next.check_for_updates = enabled)
             .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
         SettingsField::SidebarWorktrees => settings::SidebarWorktrees::from_key(value)
-            .map(|mode| next.sidebar_worktrees = mode)
+            .map(|mode| next.set_sidebar_worktrees(mode))
             .ok_or_else(|| "Choose Grouped, Expanded, or Hidden.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
@@ -4870,6 +4872,7 @@ pub enum Message {
     Lsp(LspEvent),
     LanguageServersReaped,
     RetrySessionSave,
+    RetrySharedViewSeeds,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
     DismissStatus,
@@ -5434,7 +5437,7 @@ pub struct Cagents {
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
-    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
+    workspace_model_tx: async_channel::Sender<workspace_model_sync::ModelRequest>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
     attention_focus_epoch: u64,
@@ -8963,13 +8966,12 @@ impl Cagents {
             {
                 return Cow::Borrowed(chrome.title.as_str());
             }
-            let basename = directory.file_name().unwrap_or_default().to_string_lossy();
             let title = if TerminalTitleSource::fallback(title) {
                 let process = Path::new(&session.launch.program)
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy();
-                Cow::Owned(format!("{process} · {basename}"))
+                Cow::Owned(crate::names::process_title(&process, directory))
             } else {
                 Cow::Borrowed(title)
             };
@@ -9017,6 +9019,43 @@ impl Cagents {
                     .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty()),
             )
         })
+    }
+
+    /// `title`, as a row that names the pane's checkout `place` beside it
+    /// shows it. A shell that sets no title worth showing is titled
+    /// "command · directory"; while the shell is in that checkout the place
+    /// already says where it is, so the row keeps the command. A shell
+    /// elsewhere, a channel's place, and a title the user gave keep it whole.
+    pub(super) fn titled_beside_place<'a>(
+        &self,
+        card: &CardState,
+        title: &'a str,
+        place: Option<&Path>,
+    ) -> &'a str {
+        let CardKind::Terminal(session) = &card.kind else {
+            return title;
+        };
+        if self.chrome_ui.user_titles.contains_key(&card.id) {
+            return title;
+        }
+        let directory = self
+            .terminal_working_directories
+            .get(&card.id)
+            .unwrap_or(&session.launch.working_directory);
+        if !place.is_some_and(|place| directory.starts_with(place)) {
+            return title;
+        }
+        crate::names::process_title_command(title, directory).unwrap_or(title)
+    }
+
+    /// The title of a pane's sidebar row, which names the checkout the
+    /// workspace files the pane under.
+    pub(super) fn pane_row_title<'a>(&'a self, card: &'a CardState) -> &'a str {
+        self.titled_beside_place(
+            card,
+            self.card_display_title(card),
+            self.card_worktree(card),
+        )
     }
 
     /// The title a chat card shows from `channel`, the first titled channel
@@ -16680,6 +16719,13 @@ impl Application for Cagents {
                     | SidebarAction::ToggleWorktrees(_)
                     | SidebarAction::ToggleInProgress
                     => Task::none(),
+                    // The settings page edits the same default, so this goes
+                    // through its path: the page's draft, the save and the
+                    // sidebar all follow.
+                    SidebarAction::ToggleCheckouts => self.apply_setting_input(
+                        SettingsField::SidebarWorktrees,
+                        self.settings.toggled_sidebar_worktrees().key().to_owned(),
+                    ),
                     SidebarAction::SetWorktreeDisplay { project_id, mode } => {
                         if let Some(mode) = mode {
                             self.settings.sidebar_worktree_overrides.insert(project_id, mode);
@@ -16903,6 +16949,7 @@ impl Application for Cagents {
                         into.account_usage_display = settings.account_usage_display;
                         into.confirm_terminal_close = settings.confirm_terminal_close;
                         into.confirmations = settings.confirmations.clone();
+                        into.sidebar_worktrees_when_shown = settings.sidebar_worktrees_when_shown;
                     };
                     if let Some(saved) = lane.as_mut() {
                         adopt(&mut saved.settings);
@@ -18499,6 +18546,10 @@ impl Application for Cagents {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
+                Task::none()
+            }
+            Message::RetrySharedViewSeeds => {
+                self.retry_view_seeds();
                 Task::none()
             }
             Message::RetrySessionSave => {
@@ -30998,6 +31049,58 @@ mod tests {
     }
 
     #[test]
+    fn the_checkouts_toggle_hides_every_checkout_and_returns_to_the_mode_they_had() {
+        use settings::SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        drop(app.apply_setting_input(SettingsField::SidebarWorktrees, "expanded".into()));
+        let project = ProjectId::new();
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SetWorktreeDisplay {
+                project_id: project,
+                mode: Some(Grouped),
+            })),
+        );
+        for (shown, expected) in [(true, Hidden), (false, Expanded), (true, Hidden)] {
+            assert_eq!(app.settings.sidebar_worktrees.shows_checkouts(), shown);
+            let generation = app.settings_save_generation;
+            drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+            assert_eq!(app.settings.sidebar_worktrees, expected);
+            assert_eq!(
+                app.settings_draft.sidebar_worktrees, expected,
+                "the settings page shows the same default"
+            );
+            assert_eq!(
+                app.sidebar_state.worktree_display(project),
+                if expected == Hidden { Hidden } else { Grouped },
+                "a hidden default wins over the project's own mode, which then applies again"
+            );
+            assert!(
+                app.settings_save_generation > generation,
+                "the toggle saves"
+            );
+        }
+        assert_eq!(app.settings.sidebar_worktrees_when_shown, Expanded);
+        app.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(saved.sidebar_worktrees_when_shown, Expanded);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&project),
+            Some(&Grouped)
+        );
+        // The settings page choosing a visible mode is what the toggle returns
+        // to after hiding them again.
+        drop(app.apply_setting_input(SettingsField::SidebarWorktrees, "grouped".into()));
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleCheckouts)));
+        assert_eq!(app.settings.sidebar_worktrees, Grouped);
+    }
+
+    #[test]
     fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -31016,9 +31119,15 @@ mod tests {
             generation: app.settings_ack_generation,
             settings: external,
         }));
+        // A hidden default hides every project's checkouts; the project's
+        // own mode is kept for when they show again.
         assert_eq!(
             app.sidebar_state.worktree_display(project),
-            settings::SidebarWorktrees::Expanded
+            settings::SidebarWorktrees::Hidden
+        );
+        assert_eq!(
+            app.settings.sidebar_worktree_overrides.get(&project),
+            Some(&settings::SidebarWorktrees::Expanded)
         );
         app.settings.sidebar_worktree_overrides.remove(&project);
         app.save_settings_now().unwrap();
@@ -31877,6 +31986,135 @@ mod tests {
         );
     }
 
+    /// With checkouts hidden, the unfiltered list names every open pane, a
+    /// quiet one included, and Reveal and Open treat its row as the Attention
+    /// list does; a checkout's own row never comes back to stand in for it.
+    #[test]
+    fn hidden_checkouts_reveal_and_open_a_pane_by_its_row() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        app.context_inspector_open = false;
+        let card_row = sidebar::SelectionRow::Card(card);
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::All,
+        ))));
+        app.refresh_sidebar_channels();
+        assert!(
+            attention_lists(&app, card_row),
+            "a pane with no news has a row"
+        );
+        app.sidebar_state
+            .apply(&SidebarAction::ToggleProject(project));
+        drop(app.update_chrome(chrome_ui::Action::Reveal(card)));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(attention_lists(&app, card_row), "its project unfolds");
+        assert_eq!(app.reveal_card_row(card), Some(card_row));
+
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        assert_eq!(app.workspace.focused(), Some(card));
+        let rows = sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(
+            !rows.contains(&sidebar::SelectionRow::Worktree(project, worktree)),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&card_row), "{rows:?}");
+    }
+
+    /// A plain New terminal records no scope: the workspace files it under
+    /// the checkout holding its launch directory, and its row goes there too
+    /// while checkouts are hidden. Without one the pane had no row and
+    /// nothing in the sidebar led to it.
+    #[test]
+    fn hidden_checkouts_list_a_plain_terminal_under_its_launch_checkout() {
+        let (app, card, project, worktree, terminal) = hidden_checkouts_plain_terminal();
+        assert_ne!(terminal, card);
+        assert!(
+            matches!(
+                &app.card_state(terminal).unwrap().kind,
+                CardKind::Terminal(session)
+                    if session.launch.working_directory == Path::new("/repo/feature")
+            ),
+            "a terminal launched in the checkout"
+        );
+        assert!(
+            !app.durable.card_scopes.contains_key(&terminal),
+            "a plain terminal records no scope"
+        );
+        assert!(attention_lists(&app, sidebar::SelectionRow::Card(terminal)));
+        let row = pane_row(&app, project, terminal).expect("the terminal has a row in its project");
+        assert_eq!(row.worktree, Some(worktree));
+        assert!(row.terminal);
+    }
+
+    /// With checkouts hidden, an open New terminal in /repo/feature: the
+    /// app, the pre-existing pane, its project and checkout, and the
+    /// terminal.
+    fn hidden_checkouts_plain_terminal()
+    -> (Cagents, CardId, ProjectId, crate::model::WorktreeId, CardId) {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::All,
+        ))));
+        // New terminal opens in the selected checkout, through the update
+        // path that refreshes the sidebar.
+        app.active_workspace = Some(PathBuf::from("/repo/feature"));
+        drop(app.update(Message::NewTerminal));
+        let terminal = app.workspace.focused().unwrap();
+        (app, card, project, worktree, terminal)
+    }
+
+    fn pane_row(app: &Cagents, project: ProjectId, card: CardId) -> Option<&sidebar::SidebarCard> {
+        app.sidebar_model
+            .projects
+            .iter()
+            .find(|entry| entry.id == project)?
+            .panes
+            .iter()
+            .find(|row| row.id == card)
+    }
+
+    /// A shell's host title, "command · directory", names its directory,
+    /// which the row's place already does by its checkout: the row keeps the
+    /// command, and reads "fish · feature" rather than "fish · feature ·
+    /// feature". Any other title, and one the user gave, shows whole.
+    #[test]
+    fn a_pane_row_titles_a_shell_by_its_command_beside_its_place() {
+        let (mut app, _, project, _, terminal) = hidden_checkouts_plain_terminal();
+        let retitle = |app: &mut Cagents, title: &str| {
+            assert!(app.apply_reported_title(terminal, title.into()));
+            app.refresh_attention_card_rows();
+            pane_row(app, project, terminal).unwrap().title.clone()
+        };
+        assert_eq!(retitle(&mut app, "fish · feature"), "fish");
+        // The shell moved: the directory it reports comes from where it is.
+        app.terminal_working_directories
+            .insert(terminal, PathBuf::from("/repo/feature/src"));
+        assert_eq!(retitle(&mut app, "cargo · src"), "cargo");
+        assert_eq!(retitle(&mut app, "cargo · feature"), "cargo · feature");
+        assert_eq!(retitle(&mut app, "main.rs - VIM"), "main.rs - VIM");
+        // The tab keeps the whole title; it names no place.
+        assert_eq!(
+            app.card_display_title(app.card_state(terminal).unwrap()),
+            "main.rs - VIM"
+        );
+        assert!(app.apply_reported_title(terminal, "fish · src".into()));
+        app.chrome_ui
+            .user_titles
+            .insert(terminal, "fish · src".into());
+        app.refresh_attention_card_rows();
+        assert_eq!(
+            pane_row(&app, project, terminal).unwrap().title,
+            "fish · src",
+            "a title the user gave is theirs"
+        );
+    }
+
     /// Renaming a pane renames its row in the Attention list at once.
     #[test]
     fn renaming_a_pane_retitles_its_attention_row() {
@@ -31892,7 +32130,7 @@ mod tests {
             .sidebar_model
             .projects
             .iter()
-            .flat_map(|project| &project.attention_cards)
+            .flat_map(|project| &project.panes)
             .find(|row| row.id == card)
             .expect("the pane keeps its row");
         assert_eq!(row.title, "Release review");
@@ -33476,7 +33714,9 @@ mod tests {
                 Some(&Expanded)
             );
         }
-        assert_eq!(app.sidebar_state.worktree_display(project), Expanded);
+        // A hidden default hides every project's checkouts, the project
+        // with its own mode included; that mode is kept for when they show.
+        assert_eq!(app.sidebar_state.worktree_display(project), Hidden);
         assert_eq!(app.sidebar_state.worktree_display(ProjectId::new()), Hidden);
 
         // The next click back to Left must persist a change, rather than look

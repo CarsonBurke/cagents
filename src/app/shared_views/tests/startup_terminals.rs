@@ -807,7 +807,7 @@ fn observed_window_model(window: &Window) -> crate::workspace_model::WorkspaceMo
     }
 }
 
-fn emitted_seeds(requests: &async_channel::Receiver<ModelEdit>) -> HashMap<Scope, ModelEdit> {
+fn emitted_seeds(requests: &TestModelRequests) -> HashMap<Scope, ModelEdit> {
     let mut seeds = HashMap::new();
     while let Ok(edit) = requests.try_recv() {
         let ModelEdit::SeedView { scope, .. } = &edit else {
@@ -901,8 +901,8 @@ fn emitted_seed_replies_are_additive_and_apply_closed_before_panes() {
         panes: vec![stale, closed.clone(), added.clone()],
         closed: vec![closed.id],
     };
-    let (publisher, requests) = async_channel::unbounded();
-    publisher.try_send(edit.clone()).unwrap();
+    let (publisher, requests) = test_model_channel();
+    publisher.try_send(edit.clone().into()).unwrap();
     let mut seeds = emitted_seeds(&requests);
     let reply = apply_emitted_seed(&mut model, &mut seeds, scope.clone());
     assert!(seeds.is_empty());
@@ -912,7 +912,7 @@ fn emitted_seed_replies_are_additive_and_apply_closed_before_panes() {
     assert_eq!(model.views[0].revision, 2);
     assert_eq!(model.sequence, 2);
 
-    publisher.try_send(edit).unwrap();
+    publisher.try_send(edit.into()).unwrap();
     let mut duplicate = emitted_seeds(&requests);
     assert_eq!(apply_emitted_seed(&mut model, &mut duplicate, scope), reply);
     assert!(duplicate.is_empty());
@@ -922,7 +922,7 @@ fn emitted_seed_replies_are_additive_and_apply_closed_before_panes() {
 fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
     let directory = tempfile::tempdir().unwrap();
     let mut window = reopened_observed_window(false);
-    let (publisher, requests) = async_channel::unbounded();
+    let (publisher, requests) = test_model_channel();
     window.app.workspace_model_tx = publisher;
     let mut model = observed_window_model(&window);
     // This saved row differs from authority, so it still needs its own
@@ -1000,7 +1000,7 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
     for ack_before_release in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let mut window = reopened_observed_window(true);
-        let (publisher, requests) = async_channel::unbounded();
+        let (publisher, requests) = test_model_channel();
         window.app.workspace_model_tx = publisher;
         let mut model = observed_window_model(&window);
         drop(
@@ -1231,7 +1231,7 @@ fn attach_cached_publishing(
     window: &mut Window,
     directory: &Path,
 ) -> (std::os::unix::net::UnixStream, Scope, uuid::Uuid, Change) {
-    let (publisher, requests) = async_channel::unbounded();
+    let (publisher, requests) = test_model_channel();
     window.app.workspace_model_tx = publisher;
     let connection = attach_cached(window, directory);
     assert!(window.app.shared_views.has_pending_update(window.cached.id));
@@ -1517,7 +1517,7 @@ fn a_failure_after_the_report_is_shown_until_a_later_attach_succeeds() {
 fn window_seeding_a_saved_terminal() -> (
     Window,
     crate::workspace_model::WorkspaceModel,
-    async_channel::Receiver<ModelEdit>,
+    TestModelRequests,
 ) {
     let registered = live_terminal();
     let mut saved = registered.clone();
@@ -1528,7 +1528,7 @@ fn window_seeding_a_saved_terminal() -> (
         host_incarnation: proof.host_incarnation,
     };
     let mut window = reopened_window_saving(false, saved);
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = test_model_channel();
     window.app.workspace_model_tx = tx;
     let mut view = View::empty(Scope::Channel(window.hidden));
     let mut registered_card = window.cached.clone();
@@ -1561,7 +1561,7 @@ fn window_seeding_a_saved_terminal() -> (
 fn acknowledge_seed(
     window: &mut Window,
     model: &crate::workspace_model::WorkspaceModel,
-    rx: &async_channel::Receiver<ModelEdit>,
+    rx: &TestModelRequests,
 ) -> Vec<(Pane, Pane)> {
     while rx.try_recv().is_ok() {}
     drop(

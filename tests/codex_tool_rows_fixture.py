@@ -153,6 +153,26 @@ class CodexToolRowsFixture(unittest.TestCase):
                 "threadId": scenario.thread}}, str(home))
             self.assertEqual(resumed[0]["result"]["initialTurnsPage"]["data"], [scenario.latest])
 
+    def test_private_plan_has_a_step_in_progress_while_the_turn_works(self):
+        with tempfile.TemporaryDirectory(prefix="codex-plan-") as directory:
+            home = Path(directory)
+            (home / "fixture-plan").write_text("30\n")
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.assertEqual(replies[pause]["_sleep"], 30.0)
+            plans = [(i, reply["params"]["plan"]["plan"]) for i, reply in enumerate(replies)
+                     if reply.get("method") == "turn/plan/updated"]
+            self.assertEqual(len(plans), 2)
+            (working, steps), (settled, done) = plans
+            self.assertLess(working, pause)
+            self.assertGreater(settled, pause)
+            self.assertEqual([step["status"] for step in steps],
+                             ["completed", "in_progress", "pending"])
+            self.assertTrue(all(step["status"] == "completed" for step in done))
+            self.assertEqual(replies[-1]["method"], "turn/completed")
+
     def test_interrupt_private_web_scene_fences_delayed_results(self):
         with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
             home = Path(directory)

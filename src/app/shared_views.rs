@@ -1,5 +1,7 @@
 //! A client projection of daemon-owned scope views. Pending local intentions
 //! are layered over snapshots until acknowledged; snapshots never erase them.
+pub(super) mod seed_refusal;
+
 use super::*;
 use crate::workspace_model::{
     ModelEdit,
@@ -136,6 +138,8 @@ fn view_scope_hold<'a>(
     scopes.find_map(|scope| {
         if !state.initialized.contains(scope) {
             Some("the shared workspace has not admitted its view")
+        } else if state.seed_failures.contains_key(scope) {
+            Some("the shared workspace refused its saved view")
         } else if state.seeding.contains(scope) {
             Some("its view is still being restored into the shared workspace")
         } else if state.blocked.contains(scope) {
@@ -187,6 +191,9 @@ pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
+    pub(super) seed_attempts: HashMap<Scope, uuid::Uuid>,
+    /// Definitive failures stay held until an explicit retry or a new registry.
+    pub(super) seed_failures: HashMap<Scope, String>,
     pub(super) pending: Vec<(uuid::Uuid, Scope, Change)>,
     /// Immutable logical-source identity captured when each Update is queued.
     /// A later watcher snapshot must not redefine the origin of a stale edit.
@@ -1151,6 +1158,7 @@ impl Cagents {
         if !self.shared_views.initialized.contains(&before.scope)
             || self.shared_views.blocked.contains(&before.scope)
             || self.shared_views.seeding.contains(&before.scope)
+            || self.shared_views.seed_failures.contains_key(&before.scope)
             || self.channel_ui.is_deleting(*channel)
             || self.channel_ui.was_deleted(*channel)
         {
@@ -1386,6 +1394,7 @@ impl Cagents {
             .iter()
             .find(|view| view.panes.iter().any(|pane| pane.id == card))?;
         if self.shared_views.blocked.contains(&source.scope)
+            || self.shared_views.seed_failures.contains_key(&source.scope)
             || matches!(&source.scope, Scope::Channel(id) if self.channel_ui.is_deleting(*id) || self.channel_ui.was_deleted(*id))
         {
             return None;
@@ -1409,6 +1418,10 @@ impl Cagents {
                 .shared_views
                 .blocked
                 .contains(&Scope::Channel(destination.id))
+            && !self
+                .shared_views
+                .seed_failures
+                .contains_key(&Scope::Channel(destination.id))
             && !self.channel_ui.is_deleting(destination.id)
             && !self.channel_ui.was_deleted(destination.id)
     }
@@ -1525,12 +1538,15 @@ impl Cagents {
         self.shared_views
             .requested_transfers
             .insert(operation, card);
-        if let Err(error) = self.workspace_model_tx.try_send(ModelEdit::ChangeView {
-            scope,
-            expected_revision,
-            operation,
-            change,
-        }) {
+        if let Err(error) = self.workspace_model_tx.try_send(
+            ModelEdit::ChangeView {
+                scope,
+                expected_revision,
+                operation,
+                change,
+            }
+            .into(),
+        ) {
             self.reject_pane_transfer(operation, format!("Could not queue the move: {error}"));
         }
         // Runtime and local placement remain authoritative until the daemon
@@ -1766,6 +1782,8 @@ impl Cagents {
                     if !self.shared_views.initialized.contains(&source)
                         || self.shared_views.blocked.contains(&source)
                         || self.shared_views.blocked.contains(destination)
+                        || self.shared_views.seed_failures.contains_key(&source)
+                        || self.shared_views.seed_failures.contains_key(destination)
                     {
                         continue;
                     }
@@ -1802,7 +1820,9 @@ impl Cagents {
             }
         }
         for scope in scopes {
-            if self.shared_views.blocked.contains(&scope) {
+            if self.shared_views.blocked.contains(&scope)
+                || self.shared_views.seed_failures.contains_key(&scope)
+            {
                 continue;
             }
             if matches!(&scope, Scope::Channel(id) if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
@@ -1938,6 +1958,8 @@ impl Cagents {
                 .retain(|(id, _, _)| *id != operation);
         } else {
             self.shared_views.seeding.remove(&scope);
+            self.shared_views.seed_attempts.remove(&scope);
+            self.shared_views.seed_failures.remove(&scope);
             self.shared_views.initialized.insert(scope.clone());
             // The receipt admits only this scope. Other scopes retain their
             // own seed/baseline and pending edits until their receipts arrive.
@@ -2118,6 +2140,7 @@ impl Cagents {
                 selected.is_none_or(|selected| selected.contains(&view.scope))
                     && !self.shared_views.initialized.contains(&view.scope)
                     && !self.shared_views.seeding.contains(&view.scope)
+                    && !self.shared_views.seed_failures.contains_key(&view.scope)
                     && !self.shared_views.blocked.contains(&view.scope)
                     && self
                         .shared_views
@@ -2576,6 +2599,7 @@ impl Cagents {
             }
             if !self.shared_views.initialized.contains(&view.scope)
                 || self.shared_views.seeding.contains(&view.scope)
+                || self.shared_views.seed_failures.contains_key(&view.scope)
             {
                 continue;
             }
@@ -3705,6 +3729,7 @@ mod tests {
     mod published_card_edits;
     #[cfg(not(feature = "integrated-browser"))]
     mod replica_capture;
+    mod seed_refusal;
     mod startup_admission;
     mod startup_terminals;
 
@@ -3883,7 +3908,7 @@ mod tests {
         for watcher_first in [false, true] {
             let kind = moving_terminal_kind();
             let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             drop(app.move_pane_to_channel(pane.id, destination));
             let ModelEdit::ChangeView {
@@ -4039,7 +4064,7 @@ mod tests {
         use super::super::workspace_model_sync::ModelUpdate;
         let kind = moving_terminal_kind();
         let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
         let ModelEdit::ChangeView {
@@ -4104,7 +4129,7 @@ mod tests {
                 *boot_id = crate::model::BootId::new("");
             }
             let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             drop(app.move_pane_to_channel(pane.id, destination));
             let ModelEdit::ChangeView {
@@ -4232,7 +4257,7 @@ mod tests {
         use super::super::workspace_model_sync::ModelUpdate;
         let (mut app, source, destination, pane) =
             channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
         let ModelEdit::ChangeView {
@@ -4356,7 +4381,7 @@ mod tests {
         use super::super::workspace_model_sync::ModelUpdate;
         for control in ["uncaptured", "foreign-watch-first", "foreign-registry"] {
             let (mut app, source, destination, pane) = channel_move_fixture();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             drop(app.move_pane_to_channel(pane.id, destination));
             let ModelEdit::ChangeView {
@@ -4436,7 +4461,7 @@ mod tests {
         use super::super::workspace_model_sync::ModelUpdate;
         for can_retry in [true, false] {
             let (mut app, source, _, before) = channel_move_fixture();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             let operation = uuid::Uuid::new_v4();
             let mut desired = before.clone();
@@ -4502,7 +4527,7 @@ mod tests {
             "later-title",
         ] {
             let (mut app, source, _, before) = channel_move_fixture();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             let operation = uuid::Uuid::new_v4();
             let mut desired = before.clone();
@@ -4678,7 +4703,7 @@ mod tests {
             .panes
             .push(other.clone());
         drop(app.reconcile_shared_views());
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
         let ModelEdit::ChangeView {
@@ -4729,7 +4754,7 @@ mod tests {
     #[test]
     fn active_repository_save_blocks_channel_commands_picker_and_direct_moves() {
         let (mut app, source, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert!(app.pane_has_move_destination(pane.id));
         let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(pane.id);
@@ -4778,7 +4803,7 @@ mod tests {
         use super::super::terminal_close::CloseOutcome;
         let (mut app, source, destination, pane) =
             channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         // Starting the real application close reserves its asynchronous owner,
@@ -4825,7 +4850,7 @@ mod tests {
     #[test]
     fn focus_handoff_close_keeps_its_source_until_commit() {
         let (mut app, _, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.request_card_removal(pane.id));
         assert_eq!(app.workspace.pending_close().unwrap().unmounting, pane.id);
@@ -4839,7 +4864,7 @@ mod tests {
     #[test]
     fn channel_move_waits_for_host_acknowledgment_and_preserves_the_pane() {
         let (mut app, source, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let kind = app.card_state(pane.id).unwrap().kind.clone();
         let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
@@ -4927,7 +4952,7 @@ mod tests {
     #[test]
     fn channel_move_rejects_other_projects_and_reports_host_refusal_without_rehoming() {
         let (mut app, source, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         app.workspace_model
             .channels
@@ -5067,7 +5092,7 @@ mod tests {
             destinations.iter().any(|channel| channel.id == destination),
             "authoritative channels remain selectable without a local channel descriptor"
         );
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
         assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
@@ -5085,7 +5110,7 @@ mod tests {
             .find(|channel| channel.id == destination)
             .unwrap()
             .title = "Destination needle".into();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
         assert!(app.palette.is_open());
@@ -5121,7 +5146,7 @@ mod tests {
                 .find(|channel| channel.id == destination)
                 .unwrap()
                 .title = "Other needle destination".into();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
             if query {
@@ -5143,7 +5168,7 @@ mod tests {
     #[test]
     fn move_palette_does_not_substitute_another_live_destination_when_selected_one_disappears() {
         let (mut app, _, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
         let mut replacement = app.workspace_model.channel(destination).unwrap().clone();
@@ -5161,7 +5186,7 @@ mod tests {
     #[test]
     fn a_queued_channel_drop_from_an_old_workspace_is_ignored() {
         let (mut app, _, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update(Message::PaneDropToChannel {
             generation: app.workspace_view_generation.wrapping_add(1),
@@ -5462,7 +5487,7 @@ mod tests {
                     ));
             }
         }
-        let (tx, _rx) = async_channel::unbounded();
+        let (tx, _rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(
             app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
@@ -5514,7 +5539,7 @@ mod tests {
     fn observed_channel_renames_project_no_view_and_save_once_per_burst() {
         use super::super::workspace_model_sync::ModelUpdate;
         let (mut app, model) = desktop_inventory_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
         app.navigation_save_pending = false;
@@ -5622,7 +5647,7 @@ mod tests {
     fn a_rename_of_a_channel_this_window_lacks_reconciles_in_full() {
         use super::super::workspace_model_sync::ModelUpdate;
         let (mut app, mut model) = desktop_inventory_fixture();
-        let (tx, _rx) = async_channel::unbounded();
+        let (tx, _rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let unseen = ChannelId::new();
         model.channels.push(crate::workspace_model::ModelChannel {
@@ -5660,7 +5685,7 @@ mod tests {
     fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
         use super::super::workspace_model_sync::ModelUpdate;
         let (mut app, mut model) = desktop_inventory_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let before = app.durable.clone();
         for _ in 0..8 {
@@ -5704,7 +5729,7 @@ mod tests {
         let scope = Scope::Channel(source);
         app.shared_views.initialized.remove(&scope);
         app.shared_views.baseline.remove(&scope);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         assert!(app.shared_views.initialized.contains(&scope));
@@ -5757,7 +5782,7 @@ mod tests {
             }
             app.workspace_model.views.push(view);
         }
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         let seeds = std::iter::from_fn(|| rx.try_recv().ok())
@@ -5783,7 +5808,7 @@ mod tests {
             pane.id,
             "Saved unsent draft  ".into(),
         )]));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         assert!(app.shared_views.initialized.contains(&scope));
@@ -5822,7 +5847,7 @@ mod tests {
         app.shared_views.initialized.remove(&scope);
         app.shared_views.baseline.remove(&scope);
         let _ = app.workspace.reorder(next.id, 0).unwrap();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         assert!(!app.shared_views.initialized.contains(&scope));
@@ -5858,7 +5883,7 @@ mod tests {
         let (mut app, existing, absent, _) = fixture();
         app.shared_views.initialized.clear();
         app.workspace_model.views = vec![View::empty(existing)];
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -5977,7 +6002,7 @@ mod tests {
             .push((unrelated, destination.clone(), change.clone()));
         app.shared_views.seeding.insert(source.clone());
         app.shared_views.initialized.remove(&source);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         app.shared_views.local_projection_count.set(0);
         app.acknowledge_view_edit(source.clone(), None);
@@ -6033,7 +6058,7 @@ mod tests {
         app.shared_views
             .initialized
             .remove(&Scope::Channel(destination));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
         let requests = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -6374,7 +6399,7 @@ mod tests {
         app.shared_views.selected_projection_count.set(0);
         app.shared_views.structural_tail_count = 0;
         app.shared_views.chrome_tail_count = 0;
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(
@@ -6433,7 +6458,7 @@ mod tests {
         let (mut app, source, destination, pane) = channel_move_fixture();
         let source = Scope::Channel(source);
         let destination = Scope::Channel(destination);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         // Preserve first canonical-view semantics in the scoped lookup too.
         let mut duplicate = app.workspace_model.views[0].clone();
@@ -6761,7 +6786,7 @@ mod tests {
         app.shared_views.chrome_cards_visited.set(0);
         app.shared_views.selected_projection_count.set(0);
         let update = presentation_edge(&app, Scope::Channel(source), 24, "Independent title", 0.61);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
@@ -7312,9 +7337,9 @@ mod tests {
         full.workspace = Cagents::rebuild_workspace(&full.durable);
         full.shared_views.initialized = selected.shared_views.initialized.clone();
         drop(full.reconcile_workspace_model());
-        let (selected_tx, selected_rx) = async_channel::unbounded();
+        let (selected_tx, selected_rx) = test_model_channel();
         selected.workspace_model_tx = selected_tx;
-        let (full_tx, full_rx) = async_channel::unbounded();
+        let (full_tx, full_rx) = test_model_channel();
         full.workspace_model_tx = full_tx;
         let failure = match selected.cards.get(&pane.id) {
             Some(CardRuntime::Failed(error)) => format!("{error:?}"),
@@ -7379,9 +7404,8 @@ mod tests {
             selected.cards.get(&pane.id).unwrap() as *const CardRuntime,
             runtime
         );
-        let published = |rx: async_channel::Receiver<ModelEdit>| {
-            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
-        };
+        let published =
+            |rx: TestModelRequests| std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(published(selected_rx), published(full_rx));
         assert!(
             matches!(selected.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
@@ -7495,7 +7519,7 @@ mod tests {
             let _ = app
                 .workspace
                 .set_card_width(pane.id, CardWidth::Fraction(0.69));
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             drop(app.sync_chrome());
             app.shared_views.chrome_cards_visited.set(0);
@@ -7605,7 +7629,7 @@ mod tests {
         app.shared_views.local_projection_count.set(0);
         app.shared_views.selected_projection_count.set(0);
         app.shared_views.pane_attachment_count = 0;
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(app.shared_views.local_projection_count.get(), 1);
@@ -7719,7 +7743,7 @@ mod tests {
             .clone();
         accepted.apply(&change).unwrap();
         accepted.revision = 18;
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         app.shared_views.local_projection_count.set(0);
         app.shared_views.selected_projection_count.set(0);
@@ -7835,7 +7859,7 @@ mod tests {
             .panes
             .push(next.clone());
         drop(app.reconcile_shared_views());
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let _ = app.workspace.reorder(next.id, 0).unwrap();
         // The next echo projects the view over the mounted strip before the
@@ -8783,7 +8807,7 @@ mod tests {
         }];
         drop(app.reconcile_shared_views());
         assert!(app.card_state(pane.id).unwrap().existence.is_open());
-        let (sender, published) = async_channel::unbounded();
+        let (sender, published) = test_model_channel();
         app.workspace_model_tx = sender;
         for channel in &mut Arc::make_mut(&mut app.durable).channels {
             channel.cards.retain(|id| *id != pane.id);
@@ -9936,7 +9960,7 @@ mod tests {
             .baseline
             .insert(Scope::Channel(a), vec![first.clone()]);
         app.shared_views.pending.clear();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
         drop(app.insert_terminal_card(session, Some((0, 0))));
@@ -9985,7 +10009,7 @@ mod tests {
         let (mut app, a, _, _) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
         Arc::make_mut(&mut app.durable).active_channel = Some(a);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::Terminal));
         let id = app.workspace.focused().unwrap();
@@ -10005,13 +10029,13 @@ mod tests {
         ChannelId,
         CardId,
         super::super::chat_ui::Target,
-        async_channel::Receiver<ModelEdit>,
+        TestModelRequests,
     ) {
         let (mut app, channel, _, _) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
         Arc::make_mut(&mut app.durable).active_channel = Some(channel);
         app.workspace_model.views = vec![View::empty(channel)];
-        let (sender, receiver) = async_channel::unbounded();
+        let (sender, receiver) = test_model_channel();
         app.workspace_model_tx = sender;
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
         let card = app.workspace.focused().unwrap();
@@ -10457,7 +10481,7 @@ mod tests {
         app.shared_views.initialized.remove(&Scope::Channel(a));
         app.shared_views.seeding.insert(Scope::Channel(a));
         app.shared_views.baseline.insert(Scope::Channel(a), vec![]);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.project_shared_view(
             &View {
@@ -10490,7 +10514,7 @@ mod tests {
         // Hold that Task and exercise the ordinary menu/direct/drop handlers.
         let attach = app.reconcile_shared_views();
         assert!(app.terminal_start_in_flight(pane.id));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
         drop(attach);
@@ -10510,7 +10534,7 @@ mod tests {
 
     fn assert_lifecycle_refuses_moves(
         app: &mut Cagents,
-        rx: &async_channel::Receiver<ModelEdit>,
+        rx: &TestModelRequests,
         source: ChannelId,
         destination: ChannelId,
         card: CardId,
@@ -10541,7 +10565,7 @@ mod tests {
     #[test]
     fn channel_move_waits_for_an_existing_workspace_close_handoff() {
         let (mut app, source, destination, pane) = channel_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         // Hold the real close's focus task before it can commit removal.
@@ -10565,7 +10589,7 @@ mod tests {
     fn channel_move_waits_for_pending_terminal_cleanup_and_explicit_dismissal() {
         let (mut app, source, destination, pane) =
             channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         // Begin the actual production close, but hold its worker task unpolled.
@@ -10605,7 +10629,7 @@ mod tests {
             .panes
             .push(other.clone());
         drop(app.reconcile_shared_views());
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let close = app.begin_card_close(other.id);
         assert!(app.terminal_close_pending(other.id));
@@ -10664,7 +10688,7 @@ mod tests {
     #[test]
     fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
         let (mut app, source, destination, pane) = retained_chat_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         let close = app.begin_chat_close(pane.id);
@@ -10677,7 +10701,7 @@ mod tests {
     #[test]
     fn pending_channel_move_refuses_native_close_and_switch_until_refused() {
         let (mut app, source, destination, pane) = retained_chat_move_fixture();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let before = app.workspace_model.clone();
         drop(app.move_pane_to_channel(pane.id, destination));
@@ -10713,7 +10737,7 @@ mod tests {
     fn pending_channel_move_refuses_bulk_channel_delete_before_close_capture() {
         let (mut app, source, destination, pane) =
             channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
         let ModelEdit::ChangeView {
@@ -10748,7 +10772,7 @@ mod tests {
     fn held_bulk_channel_delete_refuses_moves_from_its_source_only() {
         let (mut app, source, destination, pane) =
             channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let close = app.delete_channel(source);
         assert!(app.channel_ui.is_deleting(source));
@@ -10803,7 +10827,7 @@ mod tests {
         ] {
             let (mut app, source, destination, pane) =
                 channel_move_fixture_with_kind(Some(moving_terminal_kind()));
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             let inactive = CardId::new();
             if matches!(changed, "reopened member" | "previously missing member") {
@@ -10941,7 +10965,7 @@ mod tests {
                     app.workspace_model.views[0].panes.push(other);
                     drop(app.reconcile_shared_views());
                 }
-                let (tx, rx) = async_channel::unbounded();
+                let (tx, rx) = test_model_channel();
                 app.workspace_model_tx = tx;
                 let close = app.delete_channel(source);
                 let operation = app.channel_ui.close_operation(source);
@@ -11033,7 +11057,7 @@ mod tests {
             "moved",
         ] {
             let (mut app, source, destination, pane) = retained_chat_move_fixture();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             let close = app.delete_channel(source);
             let operation = app.channel_ui.close_operation(source);

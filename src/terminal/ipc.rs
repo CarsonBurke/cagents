@@ -242,6 +242,8 @@ use crate::{
 /// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
 /// a window watching notifications that a project's pending automation
 /// requests changed, so it reads them then rather than polling.
+/// Version 179 appends retryable `StoreBusy` errors for mailbox contention.
+/// Older clients cannot decode the new error code; replace the matched set.
 pub const PROTOCOL_VERSION: u16 = 179;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
@@ -1221,11 +1223,32 @@ pub enum ShutdownOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct ProtocolError {
     pub code: ProtocolErrorCode,
     pub message: String,
     pub retryable: bool,
+}
+
+impl Serialize for ProtocolError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Carried CLIs know Internal for transient daemon contention. Preserve
+        // the diagnostic and retryability without sending a new enum variant.
+        let code = match self.code {
+            ProtocolErrorCode::StoreBusy
+                if older_clients::encoding_before(older_clients::STORE_BUSY_ERROR) =>
+            {
+                ProtocolErrorCode::Internal
+            }
+            code => code,
+        };
+        let mut error = serializer.serialize_struct("ProtocolError", 3)?;
+        error.serialize_field("code", &code)?;
+        error.serialize_field("message", &self.message)?;
+        error.serialize_field("retryable", &self.retryable)?;
+        error.end()
+    }
 }
 
 impl ProtocolError {
@@ -1255,6 +1278,7 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    StoreBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -9481,21 +9481,6 @@
               ]
             ]
           }
-        ],
-        [
-          "RetryPendingTerminalSave",
-          {
-            "Struct": [
-              [
-                "pane",
-                "Bytes"
-              ],
-              [
-                "terminal_id",
-                "Bytes"
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -9607,6 +9592,10 @@
         ],
         [
           "chat_capacity",
+          "Unit"
+        ],
+        [
+          "store_busy",
           "Unit"
         ]
       ]
