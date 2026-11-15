@@ -163,7 +163,6 @@ mod tests {
         for compact in [false, true] {
             let (mut app, _, _) = fixture();
             app.chrome_ui.projects_collapsed = compact;
-            app.context_inspector_open = false;
             drop(app.update(Message::Sidebar(SidebarAction::ToggleControls)));
             drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
                 "channel".into(),

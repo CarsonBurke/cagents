@@ -816,8 +816,7 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = current {
-            let on_screen = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-                && self.workspace_surfaces_visible();
+            let on_screen = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
             if !on_screen {
                 self.set_exposure(
                     card,

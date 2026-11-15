@@ -238,7 +238,6 @@ mod tests {
 
     fn tab_fixture(count: usize, width: f32) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
         let cards: Vec<_> = (0..count)
             .map(|_| super::super::tests::terminal_card_state())
             .collect();
@@ -252,13 +251,14 @@ mod tests {
     }
 
     #[test]
-    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+    fn tab_density_fits_four_compact_and_real_titles_when_comfortable() {
         let mut app = tab_fixture(30, 900.0);
         let (available, width) = app.tab_strip_geometry();
         assert!(
             4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
                 <= available + 0.1
         );
+        let mut app = tab_fixture(2, 1600.0);
         let id = app.durable.cards[0].id;
         app.chrome_ui
             .user_titles
@@ -299,6 +299,46 @@ mod tests {
                 >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
             "the real title allocation must fit, after its icon, padding and controls"
         );
+    }
+
+    #[test]
+    fn tab_density_compacts_overflowing_rows_even_in_wide_workspaces() {
+        for viewport in [900.0, 1500.0, 1600.0] {
+            let mut app = tab_fixture(12, viewport);
+            for card in app.durable.cards.iter() {
+                app.chrome_ui
+                    .user_titles
+                    .insert(card.id, "A long conversation title".into());
+            }
+            drop(app.sync_chrome());
+            let (available, width) = app.tab_strip_geometry();
+            assert!(width < design::TAB_MIN_WIDTH, "{viewport}: compact tabs");
+            let visible = ((available - 2.0 * crate::tab_strip::EDGE_INSET)
+                / (width + crate::tab_strip::SPACING))
+                .floor();
+            assert!(visible >= if viewport >= 1500.0 { 9.0 } else { 4.0 });
+            app.open_pane_inspector_now(app.workspace.focused().unwrap());
+            assert_eq!(app.tab_strip_geometry(), (available, width));
+        }
+    }
+
+    #[test]
+    fn tab_density_changes_at_the_rows_fit_boundary_not_a_workspace_breakpoint() {
+        let mut app = tab_fixture(2, 900.0);
+        let (_, comfortable) = app.tab_strip_geometry();
+        assert!(
+            comfortable >= design::TAB_MIN_WIDTH,
+            "few tabs fit below 1100 px"
+        );
+        let (available, _) = app.tab_strip_geometry();
+        let overhead = app.workspace.viewport_width() - available;
+        let fitting = overhead
+            + 2.0 * (comfortable + crate::tab_strip::SPACING)
+            + 2.0 * crate::tab_strip::EDGE_INSET;
+        app.workspace.resize_viewport(fitting + 0.5);
+        assert_eq!(app.tab_strip_geometry().1, comfortable);
+        app.workspace.resize_viewport(fitting - 0.5);
+        assert!(app.tab_strip_geometry().1 < design::TAB_MIN_WIDTH);
     }
 
     #[test]
@@ -489,7 +529,6 @@ mod tests {
 
     fn rename_test_app() -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
@@ -685,33 +724,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_toggle_synchronizes_the_inspector_overlay() {
-        let mut app = super::super::tests::context_inspector_test_app(true);
-        let _ = app.update(Message::WindowResized(1000.0, 900.0));
-        assert!(app.context_inspector_overlay_active);
-        let _ = app.update_chrome(Action::ToggleProjects);
-        assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
-        assert!(!app.context_inspector_overlay_active);
-        assert!(!app.workspace_inputs_blocked());
-        let _ = app.update_chrome(Action::ToggleProjects);
-        assert_eq!(
-            app.context_inspector_mount(),
-            Some(InspectorLayout::Overlay)
-        );
-        assert!(app.context_inspector_overlay_active);
-        assert!(app.workspace_inputs_blocked());
-    }
-
-    #[test]
-    fn revealing_a_card_expands_the_sidebar_and_synchronizes_the_inspector() {
+    fn revealing_a_card_expands_the_sidebar() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let _ = app.update(Message::WindowResized(1000.0, 900.0));
         let _ = app.update_chrome(Action::ToggleProjects);
-        assert!(!app.context_inspector_overlay_active);
+        assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
         let _ = app.update_chrome(Action::Reveal(card));
         assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
-        assert!(app.context_inspector_overlay_active);
+        assert!(!app.workspace_inputs_blocked());
     }
 
     fn focus_main_window(app: &mut Cagents, focused: bool) {
@@ -794,14 +815,13 @@ mod tests {
         assert_eq!(app.notices.next_expiry(), None);
     }
 
-    /// The header's notices control beside the inspector toggle, as the
-    /// window header mounts them.
+    /// The header's notices control, and the focused pane's inspector
+    /// toggle below it, where the keyboard goes when the control does.
+    /// The header's notices control. The focused pane's inspector toggle,
+    /// where the keyboard goes when the control does, is mounted with the
+    /// pane in [`notice_focus_fixture`].
     fn notice_header(app: &Cagents) -> Element<'_, Message> {
-        widget::row::with_children(vec![
-            app.sidebar_toggle(),
-            widget::row::with_children(app.notice_control()).into(),
-        ])
-        .into()
+        widget::row::with_children(app.notice_control()).into()
     }
 
     fn notice_focus_fixture(app: &Cagents) -> Element<'_, Message> {
@@ -900,7 +920,9 @@ mod tests {
     /// beside it rather than to nowhere; otherwise it stays where it is.
     #[test]
     fn the_last_notice_going_moves_the_keyboard_off_its_control() {
-        let toggle = context_inspector_toggle_id().to_string();
+        let toggle = |app: &Cagents| {
+            card_control_id(app.workspace.focused().unwrap(), "inspector.toggle").to_string()
+        };
         let control = widget::Id::new(NOTICES_CONTROL_ID).to_string();
         // A confirmation retiring on its timer, and a failure withdrawn by
         // the reader giving up on what failed.
@@ -959,7 +981,7 @@ mod tests {
                 assert!(app.notice_control().is_none(), "{path}");
                 let (_, focused) = apply_to_header(&app, &mut tree, &renderer, moved);
                 if holds_keyboard {
-                    assert_eq!(focused, [toggle.clone()], "{path}");
+                    assert_eq!(focused, [toggle(&app)], "{path}");
                 } else {
                     assert!(focused.is_empty(), "{path}: {focused:?}");
                 }
@@ -2108,34 +2130,26 @@ impl Cagents {
             }),
             Action::Reveal(id) => {
                 let was_collapsed = self.chrome_ui.projects_collapsed;
-                // FocusCard must see the new mounting decision so it does not
-                // focus a workspace widget underneath an inspector overlay.
                 self.chrome_ui.projects_collapsed = false;
                 let focus = self.update(Message::FocusCard(id));
                 if self.workspace.focused() != Some(id) {
                     self.chrome_ui.projects_collapsed = was_collapsed;
-                    let overlay = self.sync_context_overlay_state();
-                    return Task::batch([focus, overlay]);
+                    return focus;
                 }
-                let overlay = self.sync_context_overlay_state();
                 self.synchronize_sidebar_selection();
                 if let Some(row) = self.reveal_card_row(id) {
                     self.persist();
-                    let reveal = if self.context_inspector_is_overlay() {
-                        Task::none()
-                    } else {
-                        sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
-                            .map(cosmic::Action::App)
-                    };
-                    Task::batch([focus, reveal, overlay])
+                    let reveal = sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                        .map(cosmic::Action::App);
+                    Task::batch([focus, reveal])
                 } else {
-                    Task::batch([focus, overlay])
+                    focus
                 }
             }
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
                 self.persist();
-                self.sync_context_overlay_state()
+                Task::none()
             }
             Action::AttentionPage(page) => {
                 if !self.attention_is_open() || !self.attention_backend_current() {
@@ -2214,7 +2228,7 @@ impl Cagents {
     }
 
     fn new_tab_control(&self) -> Element<'_, Message> {
-        let enabled = !self.modal_is_open() && !self.context_inspector_is_overlay();
+        let enabled = !self.modal_is_open();
         let control = command(
             Icon::Plus,
             format!(
@@ -2349,13 +2363,23 @@ impl Cagents {
         iced::runtime::task::widget(RetireNoticeFocus {
             source: widget::Id::new(NOTICES_CONTROL_ID),
             marker: widget::Id::new(RETIRING_NOTICES_ID),
-            target: context_inspector_toggle_id(),
+            target: self.notice_focus_fallback(),
             retiring: false,
             focused: false,
             target_present: false,
         })
         .collect()
         .map(|_| cosmic::Action::App(Message::NoticeControlRetired))
+    }
+
+    /// Where focus lands when the notices control it was on goes away: the
+    /// focused pane's inspector toggle, the nearest control below the header.
+    fn notice_focus_fallback(&self) -> widget::Id {
+        self.workspace
+            .focused()
+            .map_or_else(widget::Id::unique, |card| {
+                card_control_id(card, "inspector.toggle")
+            })
     }
 
     pub(super) fn notice_control_retired(&mut self) -> Task<Message> {
@@ -2377,7 +2401,7 @@ impl Cagents {
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
-            iced::widget::operation::focus(context_inspector_toggle_id()).map(cosmic::Action::App)
+            iced::widget::operation::focus(self.notice_focus_fallback()).map(cosmic::Action::App)
         } else {
             Task::none()
         }
@@ -2790,54 +2814,27 @@ impl Cagents {
             .into()
     }
 
-    fn sidebar_toggle(&self) -> Element<'_, Message> {
-        crate::ui_controls::icon_button(
-            Icon::SplitPanel,
-            workspace_widget::shortcut_tooltip(
-                workspace_widget::GlobalShortcut::ToggleInspector,
-                &self.settings.keyboard_shortcuts,
-            ),
-        )
-        .on_press_maybe((!self.modal_is_open()).then_some(Message::ToggleContextInspector))
-        .id(context_inspector_toggle_id())
-        .into()
-    }
-
     fn workspace_header_width(&self) -> f32 {
-        let controls = if self.context_inspector_open {
-            0.0
-        } else {
-            let count = usize::from(self.core.window.show_close)
-                + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
-                + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
-            count as f32 * design::WINDOW_CONTROL_SIZE
-                // libcosmic's header bar lays the controls out on the
-                // desktop's density, so this gap has to follow it too.
-                + count.saturating_sub(1) as f32
-                    * f32::from(cosmic::theme::spacing().space_xxs)
-                + design::PRIMARY_CONTROL_SIZE
-                + 12.0
-        };
-        // The docked inspector owns both the alerts control and the update
-        // control. Reserving the update here as well pushed it onto the
-        // workspace header, on the far side of the bar from the alerts.
-        let update = if !self.context_inspector_visible() && self.has_update_control() {
+        let count = usize::from(self.core.window.show_close)
+            + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
+            + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
+        let controls = count as f32 * design::WINDOW_CONTROL_SIZE
+            // libcosmic's header bar lays the controls out on the
+            // desktop's density, so this gap has to follow it too.
+            + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
+            + 12.0;
+        let update = if self.has_update_control() {
             design::PRIMARY_CONTROL_SIZE + 4.0
         } else {
             0.0
         };
-        // Same predicate `workflow_header` mounts the notice control behind,
-        // so the strip never reserves room for a control the panel is holding.
-        let notice = if !self.context_inspector_visible() && self.has_chrome_notices() {
+        // Same predicate `workflow_header` mounts the notice control behind.
+        let notice = if self.has_chrome_notices() {
             design::PRIMARY_CONTROL_SIZE + 2.0
         } else {
             0.0
         };
-        let attention = if !self.context_inspector_visible() {
-            design::PRIMARY_CONTROL_SIZE + 2.0
-        } else {
-            0.0
-        };
+        let attention = design::PRIMARY_CONTROL_SIZE + 2.0;
         let width = controls + update + notice + attention + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
@@ -2861,21 +2858,18 @@ impl Cagents {
             .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        let width = if self.workspace.viewport_width() > 0.0
-            && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
-        {
-            // Keep four compact tabs visible in a tiled workspace. Full names
-            // remain available in each tab's tooltip.
+        let count = self.workspace.order().count();
+        let comfortable = count as f32 * (desired + crate::tab_strip::SPACING)
+            + 2.0 * crate::tab_strip::EDGE_INSET;
+        let width = if comfortable > available {
+            // Compact whenever the comfortable row would scroll, regardless
+            // of the workspace width. Full names remain in the tooltips.
             let visible = self.workspace.order().count().clamp(1, 4) as f32;
             let fitting = (available / visible
                 - crate::tab_strip::SPACING
                 - 2.0 * crate::tab_strip::EDGE_INSET / visible)
                 .max(56.0);
-            if visible < 4.0 {
-                desired.min(fitting)
-            } else {
-                fitting.min(112.0)
-            }
+            fitting.min(112.0)
         } else {
             desired
         };
@@ -2968,11 +2962,7 @@ impl Cagents {
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let header = self.native_header(
-            tabs.into(),
-            Some(actions.into()),
-            !self.context_inspector_open,
-        );
+        let header = self.native_header(tabs.into(), Some(actions.into()), true);
         widget::column::with_children(vec![
             header,
             crate::design::horizontal_rule().into(),
@@ -2983,47 +2973,14 @@ impl Cagents {
         .into()
     }
 
+    /// The header's controls beside the window controls: attention and
+    /// notices, then the update control right of them. The tab strip names
+    /// every pane and marks the focused one, so there is no separate pager,
+    /// and each pane carries its own inspector toggle.
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
-        if self.context_inspector_is_overlay() {
-            return Vec::new();
-        }
-        // The tab strip already names every pane and marks the focused one,
-        // and the pane shortcuts move between them, so the header carries no
-        // separate "1 / 2" pager.
-        // The inspector panel's own header mounts the notice control, the update
-        // control and the inspector toggle, and the two headers must never
-        // mount the same one at once: a custom `widget::Id` may name only one
-        // node in a frame. The pinned runtime lifts every named node's state
-        // into one thread-local map keyed by that name before diffing, hands
-        // it to the first widget that asks for the name, and leaves any later
-        // claimant holding the `State::None` the lift left behind - which the
-        // next draw downcasts, aborting the process.
-        //
-        // Ownership therefore changes hands when the panel mounts and
-        // unmounts, not when it is asked to open or close. Those differ for
-        // the whole of the collapse animation: `context_inspector_open` goes
-        // false at the click, while the panel stays mounted and keeps drawing
-        // its header until the transition ends.
-        //
-        // The update control sits immediately to the right of the alerts.
-        // Leaving it on the workspace header while the panel held the alerts
-        // put the two icons on opposite ends of the window.
-        let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
-            widget::row::with_children(
-                (!panel_owns_shared_controls).then(|| self.attention_and_notice_controls()),
-            )
-            .into(),
-            widget::row::with_children(
-                (!panel_owns_shared_controls)
-                    .then(|| self.update_control())
-                    .flatten(),
-            )
-            .into(),
-            widget::row::with_children(
-                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
-            )
-            .into(),
+            self.attention_and_notice_controls(),
+            widget::row::with_children(self.update_control()).into(),
         ]
     }
 
@@ -3394,42 +3351,5 @@ impl Cagents {
             })
             .map(sidebar::worktree_indicators)
             .unwrap_or_default()
-    }
-
-    pub(super) fn context_panel(&self, width: f32) -> Element<'_, Message> {
-        // Keep named controls in fixed slots as notices and updates come and go.
-        // Alerts and updates remain beside the window controls; the toggle
-        // belongs at the leading edge of the inspector it controls.
-        // This header is the one mounted while the panel owns those controls,
-        // including a docked inspector: the workspace header must not also
-        // show the update or the icon stays on the far side of the window.
-        let end = widget::row::with_children(vec![
-            self.attention_and_notice_controls(),
-            widget::row::with_children(self.update_control()).into(),
-        ])
-        .spacing(space::XXS)
-        .align_y(Alignment::Center)
-        .into();
-        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        // The panel, its header and the rule under it run to the window edge.
-        // The sections keep their scrollbar out of the resize border.
-        let inset = self.trailing_edge_inset();
-        widget::container(
-            widget::column::with_children(vec![
-                heading.into(),
-                crate::design::horizontal_rule().into(),
-                widget::container(self.context_sections_view(width))
-                    .padding(Padding::ZERO.right(inset))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill),
-        )
-        .class(cosmic::theme::Container::Background)
-        .width(width + inset)
-        .height(Length::Fill)
-        .into()
     }
 }
