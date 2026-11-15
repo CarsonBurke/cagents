@@ -36,11 +36,7 @@ fn view(runtime: &Runtime) -> Element<'_, Message> {
         true,
         &Default::default(),
         620.0,
-        Place {
-            name: "figures".into(),
-            branch: None,
-            channel: None,
-        },
+        Place { branch: None },
         true,
         None,
         vec![],
