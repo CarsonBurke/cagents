@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Offline Codex child-error peer using the existing fixture WebSocket framing.
 
 Use a private CAGENTS_CHILD_ERROR_FIXTURE_ROOT, CODEX_HOME beneath that root,
@@ -122,6 +122,9 @@ class Scenario:
         elif method == "turn/start":
             if params.get("threadId") != self.parent:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture parent"}}]
+            if "auth-required" in json.dumps(params.get("input", [])):
+                return [{"id": identifier, "error": {
+                    "code": -32000, "message": "Not logged in. Sign in again to continue."}}]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             after = self.notifications(json.dumps(params.get("input", [])), turn)
@@ -170,7 +173,7 @@ def main():
     if not address or not address.startswith("unix://"):
         raise SystemExit("fixture requires --listen unix://PATH")
     path = Path(address[len("unix://"):])
-    if not path.parent.resolve(strict=True).is_relative_to(runtime) or path.exists() or path.is_symlink():
+    if not transport.private_listener(path.parent, runtime) or path.exists() or path.is_symlink():
         raise SystemExit("fixture requires a fresh socket beneath its private runtime")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))

@@ -2,197 +2,459 @@
 """Exercise held-command lifetime with private locks and owned processes only."""
 
 import contextlib
-import ctypes
 import errno
 import fcntl
-import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Isolated Python (-I) leaves this directory off sys.path.
+_custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT / "tests/fixture_custody.py")
+fixture_custody = importlib.util.module_from_spec(_custody_spec)
+_custody_spec.loader.exec_module(fixture_custody)
+FixtureDirectory = fixture_custody.FixtureDirectory
 
 
-class CargoGateApplicability(unittest.TestCase):
-    """Run CI's exact inline Cargo block against private source-head fixtures."""
+# Builds here run in place: no test makes a systemd scope or starts the
+# host's jobserver.
+os.environ["CAGENTS_BUILD_SCOPE"] = "0"
+# Nor may a guard they run trim the host's real offload slots.
+os.environ["CAGENTS_BUILD_OFFLOAD_SLOTS"] = ""
+# What a checkout's gate runs beside it to build here.
+GATE_FILES = ("cargo-gate", "cargo-gate-command.py", "build-host")
 
-    paths = ("scripts/cargo-gate", "scripts/cargo-gate-command.py", "tests/cargo_gate.py")
 
-    @classmethod
-    def setUpClass(cls):
-        lines = (ROOT / ".github/workflows/script-contracts.yml").read_text().splitlines(keepends=True)
-        step = "      - name: Check Cargo gate source and contracts\n"
-        starts = [index for index, line in enumerate(lines) if line == step]
-        if len(starts) != 1 or lines[starts[0] + 1] != "        run: |\n":
-            raise AssertionError("expected exactly one inline Cargo applicability step")
-        body = []
-        for line in lines[starts[0] + 2:]:
-            if line.startswith("          "):
-                body.append(line[10:])
-            elif not line.strip():
-                body.append("\n")
-            else:
-                break
-        cls.run_block = "".join(body)
-        if not cls.run_block.startswith("python3 -I -B - <<'PY'\n"):
-            raise AssertionError("Cargo applicability must run inline isolated Python")
+def copy_gate(directory):
+    for name in GATE_FILES:
+        shutil.copy2(ROOT / "scripts" / name, Path(directory) / name)
+    return Path(directory) / "cargo-gate"
+
+
+class InstalledGateDeferral(unittest.TestCase):
+    """A checkout whose gate has fallen behind the installed one runs that."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cargo-contract-applicability-")
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-deferral-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        (self.root / "checkout").mkdir()
+        self.gate = copy_gate(self.root / "checkout")
+        self.version = int(re.search(r"^gate_version=(\d+)$", self.gate.read_text(), re.M)[1])
+        self.installed = self.root / "cagents-cargo-gate"
+        self.env = os.environ | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+                                 "CAGENTS_BUILD_REMOTE": "local",
+                                 "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
+        self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
 
-    def case(self, name):
-        root = self.root / name
-        root.mkdir(mode=0o700)
-        return root
+    def install(self, version):
+        self.installed.write_text(f"#!/bin/sh\ngate_version={version}\necho installed \"$@\"\n")
+        self.installed.chmod(0o755)
 
-    def sources(self, root, *, legacy=False, exit_code=0):
-        gate, source, fixture = (root / name for name in self.paths)
-        gate.parent.mkdir(parents=True)
-        gate.write_text("#!/bin/sh\n" + ("" if legacy else "# cargo-gate-command.py\n") + "exit 0\n")
-        if legacy:
-            return
-        source.write_text("fixture supervisor placeholder; never execute this file\n")
-        fixture.parent.mkdir()
-        fixture.write_text(
-            "import json\nfrom pathlib import Path\nimport sys\n"
-            "Path('calls.json').write_text(json.dumps({'arguments': sys.argv[1:], "
-            "'isolated': sys.flags.isolated, 'bytecode': sys.flags.dont_write_bytecode}))\n"
-            f"raise SystemExit({exit_code})\n"
-        )
+    def run_gate(self, env=None):
+        return subprocess.run([str(self.gate), "exec", "echo", "checkout"], env=env or self.env,
+                              cwd=self.root, capture_output=True, text=True, timeout=30)
 
-    def invoke(self, root):
-        # No Cargo, Git, production script, environment override or global lock
-        # is involved. Only the private fixture test file can be executed.
-        return subprocess.run(
-            ["/bin/sh", "-e", "-c", self.run_block], cwd=root,
-            capture_output=True, text=True, timeout=15,
-        )
+    def test_a_newer_installed_gate_runs_instead(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate().stdout, "installed exec echo checkout\n")
 
-    def assert_hash(self, result, root, name):
-        digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
-        self.assertIn(f"{digest}  {name}\n", result.stdout)
+    def test_an_installed_gate_no_newer_than_this_one_does_not(self):
+        for version in (self.version, self.version - 1):
+            with self.subTest(version=version):
+                self.install(version)
+                self.assertEqual(self.run_gate().stdout, "checkout\n")
 
-    def test_old_head_without_gate_files_is_explicitly_not_applicable(self):
-        root = self.case("old")
-        result = self.invoke(root)
+    def test_an_empty_setting_runs_this_gate_always(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate(self.env | {"CAGENTS_BUILD_INSTALLED_GATE": ""}).stdout,
+                         "checkout\n")
+
+
+class ThroughAMiseShim(unittest.TestCase):
+    """Under a moved HOME a mise shim finds itself on PATH and re-executes forever."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-shim-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        self.gate = copy_gate(checkout)
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
+        self.shims = self.root / "real/.local/share/mise/shims"
+        self.shims.mkdir(parents=True)
+        # Like mise: runs the real tool only if this is its data directory's shims.
+        mise = self.root / "mise"
+        mise.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            data=${{MISE_DATA_DIR:-${{XDG_DATA_HOME:-$HOME/.local/share}}/mise}}
+            [ "$data/shims" = "{self.shims}" ] || exec "$0" "$@"
+            exec {shlex.quote(sys.executable)} "$@"
+        """))
+        mise.chmod(0o755)
+        (self.shims / "python3").symlink_to(mise)
+        self.env = os.environ | {
+            "HOME": str(self.scratch), "PATH": f"{self.shims}:{os.defpath}",
+            "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_INSTALLED_GATE": ""}
+        for name in ("MISE_DATA_DIR", "XDG_DATA_HOME", "CAGENTS_BUILD_SLOT_HELD"):
+            self.env.pop(name, None)
+
+    def gate_runs(self, *command):
+        try:
+            return subprocess.run([str(self.gate), "exec", *command], env=self.env, cwd=self.root,
+                                  capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("the gate never finished: the shim kept re-executing itself")
+
+    def test_the_gate_finishes_under_a_moved_home(self):
+        result = self.gate_runs("echo", "finished")
+        self.assertEqual(result.stdout, "finished\n", result.stderr)
+
+    def test_what_moves_home_under_the_gate_can_still_use_the_shim(self):
+        self.env["HOME"] = str(self.root / "real")
+        result = self.gate_runs("sh", "-c", f'HOME={self.scratch} python3 -c "print(1)"')
+        self.assertEqual(result.stdout, "1\n", result.stderr)
+
+    def test_a_callers_data_directory_is_theirs(self):
+        self.env["HOME"] = str(self.root / "real")
+        theirs = str(self.root / "their-own-data")
+        self.env["MISE_DATA_DIR"] = theirs
+        result = self.gate_runs("sh", "-c", 'echo "$MISE_DATA_DIR"')
+        self.assertEqual(result.stdout.strip(), theirs, result.stderr)
+
+    def test_an_empty_data_directory_counts_as_unset(self):
+        # As it does to mise, which would keep re-executing.
+        self.env["HOME"] = str(self.root / "real")
+        self.env["MISE_DATA_DIR"] = ""
+        result = self.gate_runs("sh", "-c", f'HOME={self.scratch} python3 -c "print(1)"')
+        self.assertEqual(result.stdout, "1\n", result.stderr)
+
+
+class ScriptsNameTheirPython(unittest.TestCase):
+    """`python3` found on PATH can be a shim, which can re-execute forever or stop to ask."""
+
+    # What cargo-offload starts over SSH on the build host, under that host's own
+    # HOME: no moved HOME there, and its path to Python isn't this host's to name.
+    on_the_build_host = {
+        ("cargo-offload", 'return ["python3", "-c", BOOTSTRAP, encoded]'),
+        ("cargo-offload", 'RUNNER = ["python3", "-c",'),
+    }
+    bare = re.compile(r"(?<![\w/.-])python3?(?:\.\d+)?(?![\w.-])")
+
+    def test_no_script_finds_python_on_path(self):
+        found = []
+        for script in sorted((ROOT / "scripts").rglob("*")):
+            if not script.is_file():
+                continue
+            try:
+                lines = script.read_text().splitlines()
+            except UnicodeDecodeError:
+                continue
+            if lines and lines[0].startswith("#!") and "python" in lines[0] and not lines[0].startswith("#!/usr/bin/python3"):
+                found.append(f"{script.name}:1: {lines[0]}")
+            for number, line in enumerate(lines, 1):
+                text = line.strip()
+                if text.startswith("#") or (script.name, text) in self.on_the_build_host:
+                    continue
+                if self.bare.search(line):
+                    found.append(f"{script.name}:{number}: {text}")
+        self.assertEqual(found, [], "name /usr/bin/python3; see docs/development.md, Scripts and mise shims")
+
+
+class InstalledGateSync(unittest.TestCase):
+    """A gate change merged into main is installed by the next gate run."""
+
+    files = ("cargo-gate", "build-host", "cargo-gate-command.py", "cargo-gate-sync.py",
+             "cargo-host-test-helper.py", "cargo_artifacts.py",
+             "cargo-gate-rustc-guard", "cargo-offload", "memory-capped",
+             "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-sync-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.checkout = self.root / "checkout"
+        (self.checkout / "scripts").mkdir(parents=True)
+        for name in self.files:
+            shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
+        self.clock = int(time.time()) - 1000
+        self.git_env = os.environ | {
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        self.git("init", "-q", "-b", "main")
+        self.first = self.commit("gate")
+        self.destination = self.root / "installed"
+        self.destination.mkdir()
+        self.installed = self.destination / "cagents-cargo-gate"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("CAGENTS_BUILD_")} | {
+            "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_SCOPE": "0",
+            "CAGENTS_BUILD_OFFLOAD_SLOTS": "",
+            "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
+        self.install()
+        self.assertEqual(self.recorded(), self.first)
+
+    def install(self):
+        result = subprocess.run([str(self.checkout / "scripts/install-cargo-gate"),
+                                 str(self.destination)], env=self.env, capture_output=True,
+                                text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "Not applicable: Cargo gate (source absent at this head)",
-            "Not applicable: held-command cancellation (source and fixture both absent at this head)",
-        ])
-        self.assertEqual(list(root.iterdir()), [])
 
-    def test_legacy_gate_is_hashed_and_missing_supervisor_pair_is_not_applicable(self):
-        root = self.case("legacy")
-        self.sources(root, legacy=True)
-        result = self.invoke(root)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_hash(result, root, self.paths[0])
-        self.assertIn("Not applicable: held-command cancellation", result.stdout)
-        self.assertFalse((root / "calls.json").exists())
+    def git(self, *arguments, env=None):
+        return subprocess.run(["git", *arguments], cwd=self.checkout, env=env or self.git_env,
+                              check=True, capture_output=True, text=True).stdout.strip()
 
-    def test_complete_source_hashes_all_members_and_runs_the_isolated_fixture(self):
-        root = self.case("current")
-        self.sources(root)
-        result = self.invoke(root)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for name in self.paths:
-            self.assert_hash(result, root, name)
-        self.assertIn("Checking: held-command cancellation\n", result.stdout)
-        self.assertEqual(json.loads((root / "calls.json").read_text()), {
-            "arguments": ["-v"], "isolated": 1, "bytecode": 1,
-        })
+    def commit(self, message, at=None):
+        """Commits everything, by default at a time before any installation."""
+        if at is None:
+            self.clock += 1
+            at = self.clock
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message,
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{at} +0000",
+                                     "GIT_AUTHOR_DATE": f"@{at} +0000"})
+        return self.git("rev-parse", "HEAD")
 
-    def test_partial_or_inconsistent_current_source_is_refused_before_execution(self):
-        for index, missing in enumerate((
-            (self.paths[0],), (self.paths[1],), (self.paths[2],), self.paths[1:],
-        )):
-            with self.subTest(missing=missing):
-                root = self.case(f"partial-{index}")
-                self.sources(root)
-                for name in missing:
-                    (root / name).unlink()
-                result = self.invoke(root)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("Incomplete ", result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertFalse((root / "calls.json").exists())
+    def later(self):
+        return int(time.time()) + 100
 
-    def test_fixture_failure_status_is_preserved(self):
-        root = self.case("failure")
-        self.sources(root, exit_code=19)
-        result = self.invoke(root)
-        self.assertEqual(result.returncode, 19, result.stderr)
-        self.assertTrue((root / "calls.json").exists())
+    def main_moves_to(self, commit):
+        self.git("update-ref", "refs/remotes/origin/main", commit)
 
-    def test_runner_requiring_an_absent_gate_is_refused(self):
-        root = self.case("current-runner-without-gate")
-        runner = root / "scripts/run-development"
-        runner.parent.mkdir()
-        runner.write_text('#!/bin/sh\n"$root/scripts/cargo-gate" build\n')
-        result = self.invoke(root)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("references missing scripts/cargo-gate", result.stderr)
-        self.assertFalse((root / "calls.json").exists())
+    def record(self):
+        return json.loads((self.destination / "cagents-cargo-gate.installation").read_text())
 
-    def test_legacy_shell_syntax_is_still_required(self):
-        root = self.case("bad-syntax")
-        self.sources(root, legacy=True)
-        (root / self.paths[0]).write_text("#!/bin/sh\nif\n")
-        result = self.invoke(root)
-        self.assertNotEqual(result.returncode, 0)
-        self.assert_hash(result, root, self.paths[0])
-        self.assertNotIn("Not applicable: held-command cancellation", result.stdout)
+    def recorded(self):
+        return self.record()["commit"]
 
-    def test_symlink_dangling_and_nonregular_members_fail_without_execution(self):
-        for index, member in enumerate(self.paths):
-            for kind in ("symlink", "dangling", "directory"):
-                with self.subTest(member=member, kind=kind):
-                    root = self.case(f"invalid-{index}-{kind}")
-                    self.sources(root)
-                    path = root / member
-                    contents = path.read_bytes()
-                    path.unlink()
-                    if kind == "directory":
-                        path.mkdir()
-                    else:
-                        target = root / "private-target"
-                        if kind == "symlink":
-                            target.write_bytes(contents)
-                        path.symlink_to(target)
-                    result = self.invoke(root)
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertIn("Invalid contract path:", result.stderr)
-                    self.assertFalse((root / "calls.json").exists())
+    def target(self):
+        return os.readlink(self.installed)
 
-    def test_nonregular_parent_components_fail_closed(self):
-        for parent in ("scripts", "tests"):
-            for kind in ("file", "symlink"):
-                with self.subTest(parent=parent, kind=kind):
-                    root = self.case(f"parent-{parent}-{kind}")
-                    path = root / parent
-                    if kind == "file":
-                        path.write_text("non-directory fixture parent\n")
-                    else:
-                        target = root / "private-directory"
-                        target.mkdir()
-                        path.symlink_to(target, target_is_directory=True)
-                    result = self.invoke(root)
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertIn("Invalid contract path:", result.stderr)
-                    self.assertFalse((root / "calls.json").exists())
+    def run_installed(self, cwd=None):
+        return subprocess.run([str(self.installed), "exec", "sh", "-c", "printf ran"],
+                              cwd=cwd or self.checkout, env=self.env, capture_output=True,
+                              text=True, timeout=120)
+
+    def change_gate(self, line):
+        """Adds LINE to the gate, run before anything else it does."""
+        gate = self.checkout / "scripts/cargo-gate"
+        shebang, rest = gate.read_text().split("\n", 1)
+        gate.write_text(f"{shebang}\n{line}\n{rest}")
+
+    def test_main_changing_the_gate_installs_it_and_runs_it(self):
+        self.change_gate("printf 'main gate\\n' >&2")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        # Main's gate ran this command, not the one it replaced.
+        self.assertIn("main gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+        # Once installed, the next run has nothing to do.
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", "main gate\n"))
+
+    def test_main_changing_nothing_of_the_gate_installs_nothing(self):
+        (self.checkout / "README").write_text("unrelated\n")
+        merged = self.commit("unrelated", at=self.later())
+        self.main_moves_to(merged)
+        before = self.target()
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        self.assertEqual(self.recorded(), self.first)
+        self.assertEqual((self.destination / "cagents-cargo-gate.checked").read_text(),
+                         merged + "\n")
+
+    def test_an_installation_newer_than_mains_change_stays_until_main_changes_the_gate(self):
+        # Installed from a branch under test after main last changed the gate.
+        self.change_gate("# branch change")
+        self.commit("branch")
+        self.install()
+        branch = self.target()
+        self.git("checkout", "-q", "-b", "later", self.first)
+        (self.checkout / "README").write_text("unrelated\n")
+        self.main_moves_to(self.commit("unrelated", at=self.later()))
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), branch)
+        # Main changes the gate after the branch was installed.
+        self.change_gate("# another change")
+        merged = self.commit("another change", at=self.later() + 1)
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertNotEqual(self.target(), branch)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_branch_main_merged_as_other_commits_is_current(self):
+        self.change_gate("# branch change")
+        self.commit("branch")
+        self.install()
+        installed = self.target()
+        # Main squashes the branch: other commits, later, with the same files.
+        squashed = self.git("commit-tree", "-p", self.first, "-m", "squash", "HEAD^{tree}",
+                            env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        self.main_moves_to(squashed)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), installed)
+
+    def test_an_installation_from_before_records_is_replaced_by_mains_newer_gate(self):
+        (self.destination / "cagents-cargo-gate.installation").unlink()
+        os.utime(self.installed, (self.clock, self.clock))
+        self.change_gate("# merged change")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_gate_main_cannot_install_is_reported_and_not_retried(self):
+        installer = self.checkout / "scripts/install-cargo-gate"
+        installer.write_text("#!/bin/sh\necho broken installer >&2\nexit 1\n")
+        broken = self.commit("break the installer", at=self.later())
+        self.main_moves_to(broken)
+        before = self.target()
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("could not install origin/main's gate", result.stderr)
+        self.assertIn("broken installer", result.stderr)
+        self.assertEqual(self.target(), before)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout), (0, "ran"), again.stderr)
+        self.assertIn("could not be installed", again.stderr)
+        self.assertNotIn("broken installer", again.stderr)
+
+    def test_an_installer_that_records_nothing_is_not_run_again(self):
+        installer = self.checkout / "scripts/install-cargo-gate"
+        installer.write_text(installer.read_text().replace(
+            'mv -f -- "$destination/cagents-cargo-gate.installation.new" '
+            '"$destination/cagents-cargo-gate.installation"', ':'))
+        self.change_gate("# merged change")
+        merged = self.commit("an installer that records nothing", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("did not record what it installed", result.stderr)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout), (0, "ran"), again.stderr)
+        self.assertIn("could not be installed", again.stderr)
+
+    def test_a_gate_finding_another_installing_goes_on_and_installs_later(self):
+        self.change_gate("# merged change")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        before = self.target()
+        with open(self.destination / "cagents-cargo-gate.install.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_merged_branch_counts_from_when_main_merged_it(self):
+        # Installed from a branch main never takes.
+        self.git("checkout", "-q", "-b", "unmerged")
+        self.change_gate("# unmerged change")
+        self.commit("unmerged")
+        self.install()
+        # A branch written before that installation, merged into main after.
+        self.git("checkout", "-q", "-b", "written-earlier", self.first)
+        self.change_gate("# merged change")
+        self.commit("written earlier")
+        self.git("checkout", "-q", "-b", "trunk", self.first)
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "written-earlier",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        merged = self.git("rev-parse", "HEAD")
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_newer_gate_installed_from_changed_files_stays(self):
+        gate = self.checkout / "scripts/cargo-gate"
+        text = gate.read_text()
+        version = int(re.search(r"^gate_version=(\d+)$", text, re.M).group(1))
+        gate.write_text(text.replace(f"gate_version={version}\n", f"gate_version={version + 1}\n"))
+        self.install()
+        # Files that are not their commit's record no commit.
+        self.assertIsNone(self.recorded())
+        installed = self.target()
+        gate.write_text(text + "# merged change\n")
+        self.main_moves_to(self.commit("change the gate", at=self.later()))
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), installed)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", ""))
+
+    def test_another_clone_of_the_same_repository_installs_mains(self):
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
+        clone = self.root / "clone"
+        subprocess.run(["git", "clone", "-q", str(self.checkout), str(clone)], env=self.git_env,
+                       check=True, capture_output=True)
+        def in_clone(*arguments, env=None):
+            subprocess.run(["git", *arguments], cwd=clone, env=env or self.git_env, check=True,
+                           capture_output=True)
+        # Another way to the same repository, which ignores case.
+        in_clone("remote", "set-url", "origin", "ssh://git@github.com:22/Example/gate")
+        with open(clone / "scripts/cargo-gate", "a") as gate:
+            gate.write("# merged change\n")
+        in_clone("commit", "-qam", "change the gate",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        in_clone("update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.run_installed(cwd=clone)
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.record()["origin"], "ssh://git@github.com:22/Example/gate")
+
+    def test_a_checkout_of_another_repository_changes_nothing(self):
+        other = self.root / "other"
+        (other / "scripts").mkdir(parents=True)
+        for name in self.files:
+            shutil.copy2(self.checkout / "scripts" / name, other / "scripts" / name)
+        with open(other / "scripts/cargo-gate", "a") as gate:
+            gate.write("# a fork's change\n")
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
+        for arguments in (["init", "-q", "-b", "main"], ["add", "-A"],
+                          ["remote", "add", "origin", "https://github.com/fork/gate.git"],
+                          ["commit", "-q", "-m", "x"],
+                          ["update-ref", "refs/remotes/origin/main", "HEAD"]):
+            subprocess.run(["git", *arguments], cwd=other, env=self.git_env, check=True,
+                           capture_output=True)
+        before = self.target()
+        result = self.run_installed(cwd=other)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        self.assertEqual(self.recorded(), self.first)
 
 
 class HeldCommand(unittest.TestCase):
@@ -200,32 +462,23 @@ class HeldCommand(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-held-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.gate = self.root / "cargo-gate"
-        shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
-        helper = ROOT / "scripts/cargo-gate-command.py"
-        if helper.exists():
-            shutil.copy2(helper, self.root / helper.name)
+        self.gate = copy_gate(self.root)
         self.lock = self.root / "slot.lock"
         self.env = os.environ | {
             "CAGENTS_BUILD_LOCK": str(self.lock),
             "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1",
+            # This copy of the gate, not a newer installed one, building here.
+            "CAGENTS_BUILD_INSTALLED_GATE": "",
+            "CAGENTS_BUILD_REMOTE": "local",
+            # A gate these tests kill leaves its command directory behind.
+            "TMPDIR": str(self.root),
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []
@@ -233,8 +486,9 @@ class HeldCommand(unittest.TestCase):
         self.addCleanup(self.cleanup_processes)
 
     def cleanup_processes(self):
-        # Every pidfd comes from this fixture's private ready receipt. Release
-        # graceful handlers first, then kill only the original owned handles.
+        # Every pidfd comes from a private ready receipt or a verified child
+        # of this fixture's live gate. Release graceful handlers first, then
+        # kill only the original owned handles.
         (self.root / "release").touch()
         for _pid, pidfd in self.descendants:
             if not select.select([pidfd], [], [], 0)[0]:
@@ -269,44 +523,22 @@ class HeldCommand(unittest.TestCase):
             except BlockingIOError:
                 return False
 
-    def assert_reaped(self, pidfd):
-        self.assertTrue(select.select([pidfd], [], [], 0)[0])
-        pid = next(pid for pid, owned in self.descendants if owned == pidfd)
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            return
-        self.fail("supervisor exited without reaping its descendant")
-
-    def launch_descendant(self, *, detached=False, background=False, resistant_primary=False):
-        # The shell is the supported `exec COMMAND`; its child deliberately
-        # takes time to finish after TERM so an early slot release is observable.
+    def launch_background_service(self):
+        # A held command that leaves a service running behind it, as a build
+        # starting a compiler cache does.
         worker = self.root / "worker.py"
         worker.write_text("""
-import json, os, pathlib, signal, sys, time
+import json, os, pathlib, sys, time
 root = pathlib.Path(sys.argv[1])
-if sys.argv[2] == 'detached':
-    os.setsid()
-def stop(_signal, _frame):
-    (root / 'terminated').touch()
-    while not (root / 'release').exists():
-        time.sleep(0.01)
-    sys.exit(0)
-signal.signal(signal.SIGTERM, stop)
 (root / 'ready.tmp').write_text(json.dumps({'pid': os.getpid()}))
 (root / 'ready.tmp').rename(root / 'ready')
 while True:
     time.sleep(1)
 """)
-        command = '"$1" "$2" "$3" "$4" & wait'
-        if background:
-            command = '"$1" "$2" "$3" "$4" & while [ ! -f "$3/ready" ]; do sleep 0.01; done'
-        if resistant_primary:
-            command = 'trap \'touch "$3/parent-terminated"\' TERM; "$1" "$2" "$3" "$4" & while :; do wait; done'
         child = subprocess.Popen(
-            [str(self.gate), "exec", "/bin/sh", "-c", command, "fixture",
-             sys.executable, str(worker), str(self.root),
-             "detached" if detached else "ordinary"],
+            [str(self.gate), "exec", "/bin/sh", "-c",
+             '"$1" "$2" "$3" & while [ ! -f "$3/ready" ]; do sleep 0.01; done', "fixture",
+             sys.executable, str(worker), str(self.root)],
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
@@ -315,48 +547,54 @@ while True:
         pid = json.loads((self.root / "ready").read_text())["pid"]
         pidfd = os.pidfd_open(pid)
         self.descendants.append((pid, pidfd))
-        if not background:
-            self.assertFalse(self.slot_is_free(), "live command owns its slot")
         return child, pidfd
 
-    def test_cancellation_keeps_slot_until_descendant_exits(self):
-        child, pidfd = self.launch_descendant()
-        child.send_signal(signal.SIGTERM)
-        self.wait_for(
-            lambda: (self.root / "terminated").exists() or child.poll() is not None,
-            "forwarded cancellation",
-        )
-        self.assertIsNone(child.poll(), "gate exited with an owned descendant alive")
-        self.assertFalse(self.slot_is_free(), "cleanup must retain the slot")
-        self.assertFalse(select.select([pidfd], [], [], 0)[0])
-        (self.root / "release").touch()
-        self.assertEqual(child.wait(timeout=5), 143)
-        self.assert_reaped(pidfd)
-        self.assertTrue(self.slot_is_free())
-
-    def test_cancellation_reaps_a_descendant_that_left_the_command_group(self):
-        child, pidfd = self.launch_descendant(detached=True)
-        child.send_signal(signal.SIGTERM)
-        self.assertEqual(child.wait(timeout=6), 143)
-        self.assert_reaped(pidfd)
-        self.assertTrue(self.slot_is_free())
-
     def test_success_leaves_background_cache_services_outside_the_slot(self):
-        child, pidfd = self.launch_descendant(background=True)
+        child, pidfd = self.launch_background_service()
         self.assertEqual(child.wait(timeout=5), 0)
         self.assertFalse(select.select([pidfd], [], [], 0)[0])
         self.assertTrue(self.slot_is_free())
 
-    def test_cancellation_drains_children_after_a_resistant_parent_is_killed(self):
-        child, pidfd = self.launch_descendant(resistant_primary=True)
-        child.send_signal(signal.SIGTERM)
-        self.wait_for((self.root / "parent-terminated").exists, "parent cancellation handler")
-        self.assertIsNone(child.poll())
-        self.assertFalse(self.slot_is_free())
-        self.assertFalse(select.select([pidfd], [], [], 0)[0])
-        self.assertEqual(child.wait(timeout=6), 143)
-        self.assert_reaped(pidfd)
-        self.assertTrue(self.slot_is_free())
+    def test_cancelling_a_held_command_interrupts_it_and_frees_its_shares(self):
+        # The command answers an interrupt, as Cargo does by giving back its
+        # jobserver tokens; whoever cancels the gate cancels it.
+        command = self.root / "interruptible.py"
+        command.write_text("""
+import pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+def stop(number, _frame):
+    (root / 'received').write_text(signal.Signals(number).name)
+    sys.exit(130)
+for number in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, stop)
+(root / 'ready').touch()
+while True:
+    time.sleep(0.05)
+""")
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=number):
+                for name in ("ready", "received"):
+                    (self.root / name).unlink(missing_ok=True)
+                child = subprocess.Popen(
+                    [str(self.gate), "exec", sys.executable, str(command), str(self.root)],
+                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                )
+                self.children.append(child)
+                try:
+                    self.wait_for((self.root / "ready").exists, "the held command")
+                    self.assertFalse(self.slot_is_free(), "the held command owns its share")
+                    child.send_signal(number)
+                    status = child.wait(timeout=10)
+                    self.assertIn(status, (-number, 128 + number))
+                    self.wait_for((self.root / "received").exists, "the command's interrupt", timeout=2)
+                    self.assertEqual((self.root / "received").read_text(), "SIGINT")
+                    # Nothing of the gate is left holding the share or waiting on it.
+                    self.wait_for(self.slot_is_free, "the share of a cancelled gate", timeout=2)
+                    self.assertEqual(list(self.root.glob("cagents-cargo-shim.*")), [])
+                finally:
+                    # Whatever the gate left in its group ends before the next signal.
+                    self.end_group(child.pid)
+                    self.wait_for(self.slot_is_free, "the group's share")
 
     def run_gate(self, *arguments, **options):
         return subprocess.run(
@@ -381,11 +619,15 @@ while True:
 
     def test_stdin_and_caller_descriptor_reach_the_command(self):
         with (self.root / "caller-output").open("w") as output:
-            result = self.run_gate(
-                "exec", sys.executable, "-c",
-                "import os,sys; os.write(int(sys.argv[1]), sys.stdin.buffer.read())",
-                str(output.fileno()), pass_fds=(output.fileno(),), input="caller data\n",
-            )
+            descriptor = fcntl.fcntl(output.fileno(), fcntl.F_DUPFD_CLOEXEC, 20)
+            try:
+                result = self.run_gate(
+                    "exec", sys.executable, "-c",
+                    "import os,sys; os.write(int(sys.argv[1]), sys.stdin.buffer.read())",
+                    str(descriptor), pass_fds=(descriptor,), input="caller data\n",
+                )
+            finally:
+                os.close(descriptor)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "caller-output").read_text(), "caller data\n")
 
@@ -456,7 +698,8 @@ while True:
                 self.children.append(child)
                 self.wait_for(ready.exists, "stub Cargo build")
                 child.send_signal(number)
-                self.assertEqual(child.wait(timeout=5), 128 + number)
+                # The gate is build-host by now, which ends as the signal would.
+                self.assertEqual(child.wait(timeout=5), -number)
                 expected = "build --locked" if command == "run" else f"{command} --no-run --locked"
                 self.assertEqual(calls.read_text().splitlines(), [expected])
                 self.assertTrue(self.slot_is_free())
@@ -482,6 +725,14 @@ exec sleep 60
         cargo.chmod(0o755)
         self.env["PATH"] = f"{binary}:{self.env['PATH']}"
 
+    def open_files(self, pid):
+        # A process still starting closes files as it loads, so one listed may be gone.
+        files = []
+        for entry in Path(f"/proc/{pid}/fd").iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                files.append(os.readlink(entry))
+        return files
+
     def kill_gate_and_check_the_daemon(self, child):
         self.wait_for((self.root / "ready").exists, "the leftover daemon")
         daemon, stub = map(int, (self.root / "ready").read_text().split())
@@ -491,8 +742,7 @@ exec sleep 60
         child.kill()
         child.wait(timeout=5)
         os.kill(daemon, 0)
-        open_files = [os.readlink(entry) for entry in Path(f"/proc/{daemon}/fd").iterdir()]
-        self.assertNotIn(str(self.lock), open_files)
+        self.assertNotIn(str(self.lock), self.open_files(daemon))
         self.wait_for(self.slot_is_free, "the slot of a killed gate")
         os.kill(daemon, 0)
 
@@ -578,7 +828,7 @@ exec sleep 60
         self.hold_slot_elsewhere()
         self.assert_gate_queues("flock", "--close", str(second))
 
-    def test_flock_on_the_queue_or_cost_file_is_not_a_slot(self):
+    def test_flock_on_the_queue_or_another_file_is_not_a_slot(self):
         self.hold_slot_elsewhere()
         for name in (".queue", ".cost", ".1.queue", ".00"):
             self.assert_gate_queues("flock", "--close", f"{self.lock}{name}")
@@ -622,28 +872,156 @@ exec sleep 60
         time.sleep(1)
         self.assertIsNone(child.poll(), "only a running flock's slot counts")
 
-    def test_a_killed_gate_leaves_nobody_holding_the_queue(self):
+    def wait_for_gate_request(self, gate):
+        """Pin this private gate's waiting tree until its build-host waits on
+        the queue: blocked on it behind the head, or holding it as the head."""
+        pinned = {pid for pid, _pidfd in self.descendants}
+        queue = os.path.realpath(f"{self.lock}.queue")
+
+        def requesting():
+            parents = [gate.pid]
+            found = False
+            for parent in parents:
+                try:
+                    children = Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                for value in children:
+                    pid = int(value)
+                    try:
+                        pidfd = os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        # Bind the handle to this still-live owned parent before
+                        # registering it for cleanup; a recycled unrelated PID
+                        # must never become a fixture descendant.
+                        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                        if int(stat[1]) != parent:
+                            continue
+                        if pid not in pinned:
+                            self.descendants.append((pid, pidfd))
+                            pinned.add(pid)
+                            pidfd = None
+                        parents.append(pid)
+                        found |= self.waits_on_queue(pid, queue)
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
+                    finally:
+                        if pidfd is not None:
+                            os.close(pidfd)
+            # The gate itself becomes build-host when it builds Cargo.
+            return found or self.waits_on_queue(gate.pid, queue)
+
+        self.wait_for(requesting, "the gate's owned lock request")
+
+    def waits_on_queue(self, pid, queue):
+        try:
+            arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if not any(argument.endswith(b"/build-host") for argument in arguments):
+                return False
+            for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+                with contextlib.suppress(FileNotFoundError):
+                    if os.readlink(descriptor) == queue:
+                        return True
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        return False
+
+    def assert_killed_waiter_releases_callers(self, *, behind_head, command):
         self.hold_slot_elsewhere()
+        slot_holder = self.children[-1]
+        head = None
+        if behind_head:
+            head = subprocess.Popen(
+                [str(self.gate), "exec", "true"], env=self.env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            self.children.append(head)
+            self.addCleanup(self.end_group, head.pid)
+            self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the live queue head")
+            self.wait_for_gate_request(head)
+
+        unrelated = self.root / "unrelated.lock"
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        descriptor = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 20)
+        os.close(writer)
+        try:
+            with unrelated.open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                inherited_lock = fcntl.fcntl(lock.fileno(), fcntl.F_DUPFD_CLOEXEC, 20)
+                try:
+                    gate = subprocess.Popen(
+                        [str(self.gate), *command], env=self.env,
+                        pass_fds=(descriptor, inherited_lock),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                    )
+                finally:
+                    os.close(inherited_lock)
+        finally:
+            os.close(descriptor)
+        self.children.append(gate)
+        self.addCleanup(self.end_group, gate.pid)
+        self.wait_for_gate_request(gate)
+        self.assertTrue(self.is_locked(unrelated), "the gate inherited the caller's lock")
+        self.assertFalse(select.select([reader], [], [], 0)[0], "the gate inherited the extra pipe")
+        gate.kill()
+        deadline = time.monotonic() + 1
+        gate.wait(timeout=1)
+        pending = {gate.stdout.fileno(): "stdout", gate.stderr.fileno(): "stderr", reader: "extra pipe"}
+        while pending or self.is_locked(unrelated):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for stream in select.select(list(pending), [], [], min(remaining, 0.01))[0]:
+                if not os.read(stream, 4096):
+                    pending.pop(stream)
+        self.assertIsNone(slot_holder.poll(), "the original slot holder must stay alive")
+        self.assertFalse(self.slot_is_free(), "the original slot must stay occupied")
+        if head is not None:
+            self.assertIsNone(head.poll(), "the live queue head must stay alive")
+            self.assertTrue(self.is_locked(f"{self.lock}.queue"), "the live head keeps its queue")
+        retained = dict(streams=list(pending.values()), unrelated_lock_held=self.is_locked(unrelated))
+        self.assertEqual(retained, dict(streams=[], unrelated_lock_held=False),
+                         "killed waiter retained caller resources beyond one second")
+
+    # `exec` runs build-host beside the gate's shell; a Cargo command's gate
+    # becomes build-host.
+    SCRIPT, CARGO = ("exec", "true"), ("check", "--locked")
+
+    def test_killed_queue_head_releases_extra_descriptors_without_releasing_holder(self):
+        self.assert_killed_waiter_releases_callers(behind_head=False, command=self.SCRIPT)
+
+    def test_killed_cargo_queue_head_releases_extra_descriptors_without_releasing_holder(self):
+        self.assert_killed_waiter_releases_callers(behind_head=False, command=self.CARGO)
+
+    def test_killed_waiter_behind_live_head_releases_all_caller_descriptors(self):
+        self.assert_killed_waiter_releases_callers(behind_head=True, command=self.SCRIPT)
+
+    def test_killed_cargo_waiter_behind_live_head_releases_all_caller_descriptors(self):
+        self.assert_killed_waiter_releases_callers(behind_head=True, command=self.CARGO)
+
+    def test_a_killed_gate_leaves_nobody_holding_the_queue(self):
+        self.assert_killed_gate_frees_the_queue(self.SCRIPT)
+
+    def test_a_killed_cargo_gate_leaves_nobody_holding_the_queue(self):
+        self.assert_killed_gate_frees_the_queue(self.CARGO)
+
+    def assert_killed_gate_frees_the_queue(self, command):
+        self.hold_slot_elsewhere()
+        queue = Path(f"{self.lock}.queue")
         gate = subprocess.Popen(
-            [str(self.gate), "exec", "true"], env=self.env,
+            [str(self.gate), *command], env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         )
         self.children.append(gate)
         self.addCleanup(self.end_group, gate.pid)
-        queue = Path(f"{self.lock}.queue")
         self.wait_for(lambda: self.is_locked(queue), "the gate at the head of the queue")
-        children = Path(f"/proc/{gate.pid}/task/{gate.pid}/children")
-        def requesting():
-            return any(
-                Path(f"/proc/{pid}/comm").read_text().strip() == "flock"
-                for pid in children.read_text().split()
-                if Path(f"/proc/{pid}/comm").exists()
-            )
-        self.wait_for(requesting, "the gate's request for the slot")
+        self.wait_for_gate_request(gate)
         gate.kill()
         gate.wait(timeout=5)
         self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
-        # Its request is still waiting for the slot, without the caller's streams.
         # Read to EOF without blocking: anything the gate wrote first also reads ready.
         for stream in (gate.stdout, gate.stderr):
             deadline = time.monotonic() + 5
@@ -738,8 +1116,12 @@ if config.get("hold") == phase:
 if phase == "metadata":
     if config.get("metadata_exit"):
         raise SystemExit(config["metadata_exit"])
-    print(json.dumps(dict(build_directory=config.get("build_directory", str(root / "owned-build"))),
-                     separators=(",", ":")))
+    metadata = (dict(target_directory=config["target_directory"]) if "target_directory" in config else
+                dict(build_directory=config.get("build_directory", str(root / "owned-build"))))
+    print(json.dumps(metadata, separators=(",", ":")))
+    sys.stdout.flush()
+    if config.get("metadata_exit_after_output"):
+        raise SystemExit(config["metadata_exit_after_output"])
 elif phase == "compiler":
     data = sys.stdin.buffer.read()
     if "FIXTURE_OUTPUT_FD" in os.environ:
@@ -757,24 +1139,13 @@ class PreflightCancellation(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-", dir="/tmp")
+        temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        for name in ("cargo-gate", "cargo-gate-command.py"):
-            shutil.copy2(ROOT / "scripts" / name, self.root / name)
+        copy_gate(self.root)
         (self.root / "bin").mkdir()
         for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
             path = self.root / name
@@ -790,6 +1161,8 @@ class PreflightCancellation(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1", "FIXTURE_ROOT": str(self.root),
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
+            "CAGENTS_BUILD_SCOPE": "0",
         }
         self.children = []
         self.descendants = []
@@ -935,8 +1308,31 @@ class PreflightCancellation(unittest.TestCase):
                     self.assertEqual((self.root / "caller-output").read_text(), "")
                 self.assertTrue(self.slot_is_free())
 
+    def test_a_cargo_reporting_no_build_directory_is_guarded_at_its_target(self):
+        target = str(self.root / "owned-target")
+        self.configure(guard_exit=2, target_directory=target)
+        process = self.start()
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
+        self.assertEqual(calls[1]["arguments"], [target])
+
+    def test_a_named_cargo_is_the_one_asked_for_the_directory(self):
+        (self.root / "named").mkdir()
+        named = self.root / "named/cargo"
+        (self.root / "bin/cargo").rename(named)
+        target = str(self.root / "owned-target")
+        self.configure(guard_exit=2, target_directory=target)
+        process = self.start(environment=self.env | {"CAGENTS_BUILD_CARGO": str(named)})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
+        self.assertEqual(calls[1]["arguments"], [target])
+
     def test_failed_or_empty_metadata_still_skips_helpers_and_builds(self):
-        for config in ({"metadata_exit": 37}, {"build_directory": ""}):
+        for config in ({"metadata_exit": 37}, {"metadata_exit_after_output": 37}, {"build_directory": ""}):
             with self.subTest(config=config):
                 self.clear()
                 self.configure(guard_exit=2, **config)
@@ -949,142 +1345,183 @@ class PreflightCancellation(unittest.TestCase):
                 self.assertTrue(self.slot_is_free())
 
 
-class TwoSlots(unittest.TestCase):
-    """Two private slots, one of which a gated build can hold."""
+class TestsUnderAMemoryLimit(unittest.TestCase):
+    """A stand-in limit beside build-host, recording what it is asked to run."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.gate = self.root / "cargo-gate"
-        shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
-        shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.root / "cargo-gate-command.py")
+        self.scope = FixtureDirectory(prefix="cagents-gate-memory-")
+        self.addCleanup(self.scope.close)
+        self.root = Path(self.scope.name)
+        self.gate = copy_gate(self.root)
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
-              "CAGENTS_BUILD_CPU_PRESSURE": "0"}
+             "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
+             "CAGENTS_BUILD_SCOPE": "0", "CAGENTS_BUILD_SEED": "0", "TMPDIR": str(self.root)}
+        self.ran = self.root / "ran"
+        # build-host runs the limit with its own Python, as it does the real one.
+        limit = self.root / "memory-capped"
+        limit.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/python3
+            import os, sys
+            with open({str(self.ran)!r}, "a") as ran:
+                ran.write("limited " + " ".join(sys.argv[1:]) + "\\n")
+            os.execvp(sys.argv[4], sys.argv[4:])
+        """))
+        limit.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text(f'#!/bin/sh\necho "cargo $*" >>"{self.ran}"\n')
+        cargo.chmod(0o755)
+        self.env["CAGENTS_BUILD_CARGO"] = str(cargo)
 
-    def hold(self, cost):
-        holder = subprocess.Popen(
-            [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
-             f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
-            stderr=subprocess.DEVNULL,
-        )
-        self.addCleanup(holder.wait, 10)
-        self.holder = holder
-        self.addCleanup((self.root / "release").touch)
-        deadline = time.monotonic() + 10
-        while not (self.root / "held").exists():
-            self.assertLess(time.monotonic(), deadline, "holder never admitted")
-            time.sleep(0.02)
-        return holder
-
-    def build(self, cost, timeout):
-        return subprocess.run(
-            [str(self.gate), "exec", "sh", "-c", 'printf "%s" "$CARGO_BUILD_JOBS"'],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
-            capture_output=True, text=True, timeout=timeout,
-        )
-
-
-class MemoryAdmission(TwoSlots):
-    """One slot held by a gated build that records its expected cost."""
-
-    def test_a_build_that_fits_starts_beside_a_running_one(self):
-        self.hold(1)
-        result = self.build(1, timeout=10)
+    def gate_run(self, *arguments, wrapper=()):
+        result = self.scope.run([*wrapper, str(self.gate), *arguments], env=self.env, cwd=self.root,
+                                capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("waiting", result.stderr)
-        cpus = os.cpu_count()
-        self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
-        # Released, the slot no longer prices its last holder.
-        (self.root / "release").touch()
-        self.holder.wait(timeout=10)
-        self.assertFalse(any(self.root.glob("slot.lock*.cost")))
+        return [line.replace(str(self.root) + "/", "") for line in self.ran.read_text().splitlines()]
 
-    def test_a_build_that_does_not_fit_waits_for_the_running_one(self):
-        self.hold(1)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.build(10**6, timeout=2)
-        (self.root / "release").touch()
-        result = self.build(10**6, timeout=10)
+    def test_tests_under_it_keep_the_runner_that_unstamps_them(self):
+        offload = self.root / "cargo-offload"
+        offload.write_text('#!/bin/sh\n[ "$1" = --stamp ] || exit 75\necho 1.2.3+stamp\n')
+        offload.chmod(0o755)
+        self.env["CARGO_HOME"] = str(self.root / "cargo-home")
+        for route in (("test", "--lib"), ("exec", str(self.gate), "test", "--lib")):
+            with self.subTest(route[0]):
+                self.ran.unlink(missing_ok=True)
+                limited = [line for line in self.gate_run(*route) if line.startswith("limited ")]
+                self.assertEqual(len(limited), 1)
+                self.assertIn("--slice app-cagents-test.slice --stop-leftovers cargo test --config target.'cfg(all())'.runner=",
+                              limited[0])
+
+    def test_tests_and_benchmarks_run_under_it_after_their_build_without_it(self):
+        for subcommand in ("test", "bench"):
+            with self.subTest(subcommand):
+                self.ran.unlink(missing_ok=True)
+                self.assertEqual(self.gate_run(subcommand, "--lib", "filter"), [
+                    f"cargo {subcommand} --no-run --lib filter",
+                    f"limited --slice app-cagents-test.slice --stop-leftovers cargo {subcommand} --lib filter",
+                    f"cargo {subcommand} --lib filter",
+                ])
+
+    def test_doctests_build_and_run_under_it_in_one(self):
+        self.assertEqual(self.gate_run("test", "--doc"), [
+            "limited --slice app-cagents-test.slice --stop-leftovers cargo test --doc",
+            "cargo test --doc",
+        ])
+
+    def test_a_program_or_a_build_does_not(self):
+        for arguments in (("run", "--bin", "app"), ("build",), ("test", "--no-run")):
+            with self.subTest(arguments):
+                self.ran.unlink(missing_ok=True)
+                self.assertNotIn("limited", "\n".join(self.gate_run(*arguments)))
+
+    def test_tests_inside_a_held_slot_run_under_it(self):
+        for subcommand in ("test", "bench"):
+            with self.subTest(subcommand):
+                self.ran.unlink(missing_ok=True)
+                lines = self.gate_run("exec", str(self.gate), subcommand, "--lib")
+                self.assertIn(f"limited --slice app-cagents-test.slice --stop-leftovers cargo {subcommand} --lib", lines)
+                self.assertIn(f"cargo {subcommand} --lib", lines)
+
+    def test_an_updated_gate_brings_the_limit_and_build_host_with_it(self):
+        synced = (ROOT / "scripts/cargo-gate-sync.py").read_text()
+        for name in ("scripts/memory-capped", "scripts/build-host"):
+            self.assertIn(f'"{name}"', synced)
+        installer = (ROOT / "scripts/install-cargo-gate").read_text()
+        for name in ("memory-capped", "build-host"):
+            self.assertRegex(installer, rf"(?m)^(files=')?{name}:{name}$")
+
+
+class SharesByKind(unittest.TestCase):
+    """What the gate asks build-host for, read from a stand-in build-host."""
+
+    def setUp(self):
+        self.scope = FixtureDirectory(prefix="cagents-gate-shares-")
+        self.addCleanup(self.scope.close)
+        self.root = Path(self.scope.name)
+        self.gate = copy_gate(self.root)
+        self.asked = self.root / "asked"
+        (self.root / "build-host").write_text(textwrap.dedent(f"""\
+            #!/usr/bin/python3
+            import json, sys
+            with open({str(self.asked)!r}, "a") as asked:
+                asked.write(json.dumps(sys.argv[1:]) + "\\n")
+        """))
+        (self.root / "build-host").chmod(0o755)
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("CAGENTS_BUILD_")} | {
+            "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_SCOPE": "0",
+            "CAGENTS_BUILD_CARGO": "cargo", "TMPDIR": str(self.root)}
+
+    def ask(self, *arguments, env=None, wrapper=()):
+        self.asked.unlink(missing_ok=True)
+        result = self.scope.run([*wrapper, str(self.gate), *arguments], env=env or self.env, cwd=self.root,
+                                capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
+        [asked] = [json.loads(line) for line in self.asked.read_text().splitlines()]
+        return asked
 
-    def test_a_running_builds_expected_peak_is_reserved(self):
-        # The holder has claimed almost none of an expected peak larger than
-        # any host's memory, so even a small newcomer must wait.
-        self.hold(10**6)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.build(1, timeout=2)
+    def test_a_build_takes_shares_by_its_lane_and_kind(self):
+        for arguments, shares in (
+                (("build", "--locked"), "1"),
+                (("test", "--no-default-features", "--bin", "cagents"), "1"),
+                (("check", "--features", "ui"), "1"),
+                (("clippy", "--all-features"), "1"),
+                (("doc", "--features=host"), "1"),
+                (("build", "--features", "host"), "2"),
+                (("build", "-Fui", "--bin", "cagents-ui"), "2"),
+                (("test", "--features", "integrated-browser"), "2"),
+                (("build", "--bin=cagentsd"), "2"),
+                (("build", "--all-features"), "2"),
+                (("test", "-p", "cagents-ui"), "2"),
+                (("test", "-pcagents-ui"), "2"),
+                (("test", "--package=cagents-ui"), "2"),
+                (("test", "--package", "cagents"), "1"),
+                (("build", "--package", "cagents", "--features", "cagents/host"), "2"),
+                (("test", "--package", "cagents", "--package", "cagents-ui", "--features", "cagents/ui"), "2"),
+                (("build", "--package", "cagents-ui", "--features", "integrated-browser"), "2"),
+                (("run", "--", "--features", "ui"), "1")):
+            with self.subTest(arguments):
+                self.assertEqual(self.ask(*arguments),
+                                 ["cargo", "--shares", shares, "--", "cargo", *arguments])
 
-    def test_a_lone_build_gets_half_the_cpus(self):
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(int(result.stdout), max(4, min(8, os.cpu_count() // 2)))
+    def test_a_script_of_builds_takes_two_until_it_exits(self):
+        asked = self.ask("exec", "true")
+        # build-host removes the gate's Cargo shim when the script ends.
+        [shims] = self.root.glob("cagents-cargo-shim.*")
+        self.assertEqual(asked, ["build", "--shares", "2", "--remove", str(shims), "--", "true"])
+        self.assertEqual((shims / "cargo").read_text().splitlines()[-1],
+                         f"exec '{self.gate}' cargo \"$@\"")
 
-    def test_a_slot_held_by_a_plain_flock_is_priced_not_fatal(self):
-        holder = subprocess.Popen(
-            ["flock", self.root / "slot.lock", "sh", "-c",
-             f"touch {self.root}/held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
-        self.addCleanup((self.root / "release").touch)
-        while not (self.root / "held").exists():
-            time.sleep(0.02)
-        # Priced as the largest build, so whether a small build fits depends
-        # on this host; either way the gate admits or keeps waiting.
-        waiter = subprocess.Popen(
-            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
-            cwd=self.root, stderr=subprocess.PIPE, text=True)
-        try:
-            status = waiter.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            waiter.kill()
-            status = waiter.wait()
-            stderr = waiter.stderr.read()
-            self.assertNotIn("unbound", stderr)
-        else:
-            stderr = waiter.stderr.read()
-            self.assertEqual(status, 0, stderr)
-        # Its missing cost file is expected, not an error to report.
-        self.assertNotIn("No such file", stderr)
-        waiter.stderr.close()
+    def test_a_setting_overrides_the_kind_and_must_be_a_positive_integer(self):
+        self.assertEqual(self.ask("build", env=self.env | {"CAGENTS_BUILD_SHARES": "3"})[:3],
+                         ["cargo", "--shares", "3"])
+        self.asked.unlink()
+        for value in ("0", "03", "x", "-1"):
+            with self.subTest(value=value):
+                result = self.scope.run([str(self.gate), "build"],
+                                        env=self.env | {"CAGENTS_BUILD_SHARES": value}, cwd=self.root,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("CAGENTS_BUILD_SHARES must be a positive integer", result.stderr)
+                self.assertFalse(self.asked.exists())
 
-    def test_an_invalid_cost_is_refused(self):
-        result = self.build("08", timeout=10)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("CAGENTS_BUILD_COST_GIB", result.stderr)
+    def test_an_admission_budget_becomes_a_deadline(self):
+        before = time.monotonic_ns()
+        asked = self.ask("check", env=self.env | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "5"})
+        after = time.monotonic_ns()
+        self.assertEqual(asked[:3], ["cargo", "--shares", "1"])
+        self.assertEqual(asked[3], "--deadline")
+        self.assertLessEqual(before + 5 * 10**9, int(asked[4]))
+        self.assertLessEqual(int(asked[4]), after + 5 * 10**9)
+        self.assertEqual(asked[5:], ["--", "cargo", "check"])
 
-
-ADMISSION_FLOCK = r'''#!/usr/bin/python3
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import time
-root = Path(os.environ["FIXTURE_ROOT"])
-arguments = sys.argv[1:]
-if arguments in (["6"], ["8"]):
-    info = os.fstat(int(arguments[0]))
-    for kind, name in (("queue", "slot.lock.queue"), ("base", "slot.lock")):
-        path = root / name
-        if path.exists() and (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
-            suffix = os.environ.get("FIXTURE_ORDER_ID", "")
-            receipt = root / (kind + ("-" + suffix if suffix else "") + ".waiting")
-            receipt.with_suffix(".tmp").write_text(json.dumps({"pid":os.getpid()}))
-            receipt.with_suffix(".tmp").replace(receipt)
-if arguments == ["-n", "6"] and os.environ.get("FIXTURE_GRANT_DELAY"):
-    info = os.fstat(6)
-    base = root / "slot.lock"
-    if base.exists() and info.st_ino == base.stat().st_ino:
-        status = subprocess.call(["/usr/bin/flock", *arguments], close_fds=False)
-        if status == 0:
-            time.sleep(float(os.environ["FIXTURE_GRANT_DELAY"]))
-        raise SystemExit(status)
-os.execv("/usr/bin/flock", ["flock", *arguments])
-'''
+    def test_a_command_under_a_held_share_takes_none(self):
+        # Under `flock --close` on the first share, as a caller's own script.
+        asked = self.ask("build", wrapper=("flock", "--close", str(self.root / "slot.lock")))
+        self.assertEqual(asked, ["cargo", "--shares", "0", "--", "cargo", "build"])
 
 
 class AdmissionTimeout(unittest.TestCase):
@@ -1118,9 +1555,6 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertIn('phase + ".delaying"', tool)
         for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
             (self.fixture.root / name).write_text(tool)
-        flock = self.fixture.root / "bin/flock"
-        flock.write_text(ADMISSION_FLOCK)
-        flock.chmod(0o700)
         self.fixture.env[self.setting] = "1"
 
     def reset(self, **config):
@@ -1130,14 +1564,46 @@ class AdmissionTimeout(unittest.TestCase):
                 path.unlink()
         self.fixture.configure(fast_cancel=True, **config)
 
-    def pin(self, receipt):
-        self.fixture.wait_for(receipt.exists, receipt.name)
-        pid = json.loads(receipt.read_text())["pid"]
-        pidfd = os.pidfd_open(pid)
-        self.fixture.descendants.append((pid, pidfd))
-        return pid, pidfd
+    def pin(self, receipt, *, process=None):
+        if process is None:
+            self.fixture.wait_for(receipt.exists, receipt.name)
+            pid = json.loads(receipt.read_text())["pid"]
+            pidfd = os.pidfd_open(pid)
+            self.fixture.descendants.append((pid, pidfd))
+            return pid, pidfd
+        # The gate has become build-host, which waits on the exact private
+        # lock: blocked in the kernel on the queue, or holding the queue and
+        # waiting for a share. It has no child of its own to reap.
+        queue = os.path.realpath(self.fixture.root / "slot.lock.queue")
+
+        def waiting():
+            try:
+                arguments = Path(f"/proc/{process.pid}/cmdline").read_bytes().split(b"\0")
+                if not any(argument.endswith(b"/build-host") for argument in arguments):
+                    return False
+                opened = False
+                for descriptor in Path(f"/proc/{process.pid}/fd").iterdir():
+                    with contextlib.suppress(FileNotFoundError):
+                        opened |= os.readlink(descriptor) == queue
+                if not opened:
+                    return False
+                if receipt.name.startswith("queue"):
+                    return "lock" in Path(f"/proc/{process.pid}/wchan").read_text()
+                with open(queue, "a") as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return True
+                    return False
+            except (FileNotFoundError, ProcessLookupError):
+                return False
+
+        self.fixture.wait_for(waiting, "build-host waiting for " + receipt.name)
+        return None
 
     def retire(self, owned):
+        if owned is None:
+            return False
         pid, pidfd = owned
         self.fixture.wait_for(lambda: bool(select.select([pidfd], [], [], 0)[0]), "owned waiter exit")
         try:
@@ -1178,56 +1644,72 @@ class AdmissionTimeout(unittest.TestCase):
                 self.fixture.assert_preflight_unslotted(self.fixture.calls())
 
     def test_one_budget_covers_cumulative_hooks_and_seed_is_not_fail_soft_on_expiry(self):
-        # Two seconds, so a loaded host still reaches the seed hook within the budget.
-        self.reset(delays={"metadata":0.7, "guard":0.7, "seed":1.2})
+        # Advance only admission time, not cleanup's real monotonic clock. The
+        # contract is one deadline across hooks, regardless of host scheduling.
+        root = self.fixture.root
+        clock = root / "admission-clock"
+        temporary = clock.with_suffix(".tmp")
+        temporary.write_text("0")
+        temporary.replace(clock)
+        helper = root / "cargo-gate-command.py"
+        source = helper.read_text().replace(
+            "import time\n",
+            "import time\nfrom pathlib import Path\n"
+            f"time.monotonic_ns = lambda: int(Path({str(clock)!r}).read_text())\n",
+            1,
+        )
+        parsed = "        admission_deadline = positive_integer(arguments[1])\n"
+        self.assertEqual(source.count(parsed), 1)
+        source = source.replace(parsed, parsed +
+            '        os.environ["FIXTURE_ADMISSION_DEADLINE"] = str(admission_deadline)\n')
+        helper.write_text(source)
+        for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
+            tool = root / name
+            source = tool.read_text()
+            self.assertEqual(source.count("record(event)\n"), 1)
+            source = source.replace("record(event)\n",
+                'event["admission_deadline"] = os.environ.get("FIXTURE_ADMISSION_DEADLINE")\n'
+                'record(event)\n'
+                'advance = config.get("clock_ns", {}).get(phase)\n'
+                'if advance is not None:\n'
+                '    clock = root / "admission-clock"\n'
+                '    temporary = clock.with_suffix(".tmp")\n'
+                '    temporary.write_text(str(advance))\n'
+                '    temporary.replace(clock)\n'
+                '    if phase == "seed":\n'
+                '        while True: time.sleep(0.01)\n')
+            tool.write_text(source)
+        self.reset(clock_ns={"metadata":700_000_000, "guard":1_400_000_000,
+                             "seed":2_600_000_000})
         process = self.fixture.start(environment=self.fixture.env | {self.setting:"2"})
         _stdout, stderr = process.communicate("", timeout=8)
         self.assert_timeout(process, stderr)
-        self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
+        calls = self.fixture.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard", "seed"])
+        self.assertEqual({event["admission_deadline"] for event in calls}, {"2000000000"})
 
-    def test_queue_base_and_no_fit_expiry_withdraws_owned_waiter_and_preserves_holder(self):
-        for kind in ("queue", "base", "memory", "cpu-pressure", "cpu-settle"):
+    def test_queue_and_share_expiry_withdraws_the_waiter_and_preserves_the_holder(self):
+        for kind in ("queue", "base"):
             with self.subTest(kind=kind):
                 self.reset()
                 root = self.fixture.root
                 path = root / ("slot.lock.queue" if kind == "queue" else "slot.lock")
-                cost = root / "slot.lock.cost"
-                if kind != "queue":
-                    cost.write_text("outside-holder-sentinel\n")
-                environment = self.fixture.env.copy()
-                if kind == "memory":
-                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1000000",
-                                    "CAGENTS_BUILD_CPU_PRESSURE":"0"}
-                if kind.startswith("cpu-"):
-                    pressure = root / "cpu-pressure"
-                    pressure.write_text("some avg10=" + ("99.00" if kind == "cpu-pressure" else "0.00")
-                                        + " avg60=0.00 avg300=0.00 total=0\n")
-                    since = Path("/proc/uptime").read_text().split()[0].split(".")[0]
-                    cost.write_text(f"{os.getpid()} 0\n{since}\n")
-                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1",
-                                    "CAGENTS_BUILD_CPU_PRESSURE_FILE":str(pressure),
-                                    "CAGENTS_BUILD_CPU_PRESSURE":"60",
-                                    "CAGENTS_BUILD_CPU_SETTLE_SECS":"0" if kind == "cpu-pressure" else "3600"}
-                expected_cost = cost.read_text() if kind != "queue" else None
                 with path.open("a") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
-                    process = self.fixture.start(environment=environment)
-                    owned = self.pin(root / ("queue.waiting" if kind == "queue" else "base.waiting"))
+                    process = self.fixture.start()
+                    self.pin(root / ("queue.waiting" if kind == "queue" else "base.waiting"), process=process)
                     completed, _stdout, stderr = self.finish_blocked(process, holder)
-                    caller_reaped = self.retire(owned)
                     self.assertTrue(completed, "gate required its outside holder to release")
                     self.assertEqual(process.returncode, 124, stderr)
-                    self.assertIn("admission", stderr.lower())
-                    self.assertFalse(caller_reaped)
-                    if kind != "queue":
-                        self.assertEqual(cost.read_text(), expected_cost)
-                    if kind == "cpu-pressure":
-                        self.assertIn("CPUs busy (99% pressure, limit 60%)", stderr)
+                    self.assertEqual(stderr.count("build admission timed out"), 1, stderr)
                     self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
+                    # The outside holder keeps what it held.
+                    with path.open("a") as probe:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertTrue(self.fixture.slot_is_free())
                 with (root / "slot.lock.queue").open("a") as queue:
                     fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.assertFalse((root / "slot.lock.1.cost").exists())
 
     def test_each_direct_signal_cancels_queued_wait_without_timeout_or_orphan(self):
         for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
@@ -1236,13 +1718,12 @@ class AdmissionTimeout(unittest.TestCase):
                 with (self.fixture.root / "slot.lock.queue").open("a") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
                     process = self.fixture.start(environment=self.fixture.env | {self.setting:"5"})
-                    owned = self.pin(self.fixture.root / "queue.waiting")
+                    self.pin(self.fixture.root / "queue.waiting", process=process)
                     process.send_signal(number)
                     completed, _stdout, stderr = self.finish_blocked(process, holder, seconds=1)
-                    caller_reaped = self.retire(owned)
                     self.assertTrue(completed, "cancellation left a waiter behind its outside holder")
-                    self.assertEqual(process.returncode, 128 + number, stderr)
-                    self.assertFalse(caller_reaped)
+                    # build-host ends as the signal would end it.
+                    self.assertEqual(process.returncode, -number, stderr)
                     self.assertNotIn("timed out", stderr.lower())
                     self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
 
@@ -1256,10 +1737,7 @@ class AdmissionTimeout(unittest.TestCase):
                 process = self.fixture.start(environment=self.fixture.env | {
                     self.setting:"5", "FIXTURE_ORDER_ID":identifier})
                 processes.append(process)
-                pid, _pidfd = self.pin(root / ("queue-" + identifier + ".waiting"))
-                # Recorder readiness precedes exec. Confirm the first real
-                # flock is kernel-blocked before submitting the next one.
-                self.fixture.wait_for(lambda: "lock" in Path(f"/proc/{pid}/wchan").read_text(), "kernel FIFO waiter")
+                self.pin(root / ("queue-" + identifier + ".waiting"), process=process)
             fcntl.flock(holder, fcntl.LOCK_UN)
             for process in processes:
                 _stdout, stderr = process.communicate("", timeout=5)
@@ -1286,22 +1764,16 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard"])
 
     def test_leading_zero_budget_does_not_limit_an_admitted_build(self):
-        self.reset(delays={"compiler":1.25}, compiler_exit=17)
-        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0001"})
-        _stdout, stderr = process.communicate("", timeout=5)
+        # Admission must fit in the budget on a loaded host; the compiler then outlasts it.
+        self.reset(delays={"compiler":3.25}, compiler_exit=17)
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0003"})
+        _stdout, stderr = process.communicate("", timeout=10)
         self.assertEqual(process.returncode, 17, stderr)
         self.assertNotIn("timed out", stderr.lower())
         compiler = next(event for event in self.fixture.calls() if event["phase"] == "compiler")
         self.assertTrue(compiler["held"])
         self.assertTrue(compiler["marker"])
         self.assertTrue(self.fixture.slot_is_free())
-
-    def test_grant_after_deadline_does_not_create_a_claim_or_start_compiler(self):
-        self.reset()
-        process = self.fixture.start(environment=self.fixture.env | {"FIXTURE_GRANT_DELAY":"1.15"})
-        _stdout, stderr = process.communicate("", timeout=5)
-        self.assert_timeout(process, stderr)
-        self.assertFalse(any(self.fixture.root.glob("slot.lock*.cost")))
 
     def test_unset_budget_waits_until_private_holder_releases(self):
         self.reset()
@@ -1310,7 +1782,7 @@ class AdmissionTimeout(unittest.TestCase):
         with (self.fixture.root / "slot.lock.queue").open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
             process = self.fixture.start(environment=environment)
-            self.pin(self.fixture.root / "queue.waiting")
+            self.pin(self.fixture.root / "queue.waiting", process=process)
             time.sleep(0.35)
             self.assertIsNone(process.poll())
             self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
@@ -1319,236 +1791,32 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         self.assertNotIn("timed out", stderr.lower())
 
-class CpuPressureAdmission(TwoSlots):
-    """Two slots and memory to spare; the CPU pressure comes from a fixture."""
-
-    def setUp(self):
-        super().setUp()
-        self.pressure = self.root / "pressure"
-        self.env |= {
-            "CAGENTS_BUILD_CPU_PRESSURE": "60", "CAGENTS_BUILD_CPU_SETTLE_SECS": "0",
-            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
-        }
-
-    def report(self, some, full="0.00"):
-        self.pressure.write_text(
-            f"some avg10={some} avg60=40.12 avg300=38.40 total=30831090039\n"
-            f"full avg10={full} avg60=0.00 avg300=0.00 total=0\n")
-
-    def test_a_build_starts_beside_a_running_one_while_cpus_have_room(self):
-        self.report("59.99", full="99.00")
-        self.hold(1)
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("waiting", result.stderr)
-
-    def test_a_build_waits_while_cpu_pressure_is_at_the_limit(self):
-        self.report("60.00")
-        self.hold(1)
-        waiter = subprocess.Popen(
-            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
-            cwd=self.root, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(waiter.stderr.close)
+class FixtureCustody(unittest.TestCase):
+    def test_a_timed_out_command_and_its_new_session_child_end_before_the_directory_goes(self):
+        scope = FixtureDirectory()
+        self.addCleanup(scope.close)
+        root = Path(scope.name)
         with self.assertRaises(subprocess.TimeoutExpired):
-            waiter.wait(timeout=2)
-        # Pressure falling admits it beside the running build.
-        self.report("12.50")
-        self.assertEqual(waiter.wait(timeout=10), 0)
-        self.assertIsNone(self.holder.poll())
-        self.assertIn("CPUs busy (60% pressure, limit 60%)", waiter.stderr.read())
+            # The command execs so nothing but the sweep can reap its children.
+            scope.run(["sh", "-c", f"sleep 60 & echo $! >{root}/ordinary; "
+                       f"setsid sleep 60 & echo $! >{root}/detached; exec sleep 60"], timeout=1)
+        pidfds = [os.pidfd_open(int((root / name).read_text())) for name in ("ordinary", "detached")]
+        self.addCleanup(lambda: [os.close(pidfd) for pidfd in pidfds])
+        # The command's group is gone; the child in its own session is not.
+        self.assertFalse(select.select([pidfds[1]], [], [], 0)[0])
+        settled = fixture_custody.settle
+        survivors = None
 
-    def test_a_lone_build_starts_whatever_the_pressure(self):
-        self.report("100.00")
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        def settle():
+            nonlocal survivors
+            self.assertTrue(root.is_dir())
+            settled()
+            survivors = [pidfd for pidfd in pidfds if not select.select([pidfd], [], [], 0)[0]]
 
-    def test_a_build_waits_until_the_newest_one_can_show_in_the_pressure(self):
-        self.report("0.00")
-        self.hold(1)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            subprocess.run(
-                [str(self.gate), "exec", "true"],
-                env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_BUILD_CPU_SETTLE_SECS": "3600"},
-                cwd=self.root, capture_output=True, timeout=2)
-
-    def test_a_host_without_pressure_reports_has_room(self):
-        self.hold(1)
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_zero_disables_the_pressure_limit(self):
-        self.report("100.00")
-        self.env["CAGENTS_BUILD_CPU_PRESSURE"] = "0"
-        self.hold(1)
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_invalid_limits_are_refused(self):
-        for name, value in (("CAGENTS_BUILD_CPU_PRESSURE", "060"),
-                            ("CAGENTS_BUILD_CPU_PRESSURE", "101"),
-                            ("CAGENTS_BUILD_CPU_PRESSURE", "high"),
-                            ("CAGENTS_BUILD_CPU_SETTLE_SECS", "-1")):
-            self.env[name] = value
-            result = self.build(1, timeout=10)
-            self.assertEqual(result.returncode, 2, (name, value))
-            self.assertIn(name, result.stderr)
-            del self.env[name]
-
-    def held_slot(self, index, sidecar):
-        """Holds slot `index` with a plain `flock` and prices it with `sidecar`,
-        a gate's cost file, whose holder is this test."""
-        path = self.root / ("slot.lock" if index == 0 else f"slot.lock.{index}")
-        holder = subprocess.Popen(
-            ["flock", path, "sh", "-c",
-             f"touch {path}.held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
-        self.addCleanup((self.root / "release").touch)
-        while not Path(f"{path}.held").exists():
-            time.sleep(0.02)
-        Path(f"{path}.cost").write_text(sidecar.format(pid=os.getpid()))
-
-    @staticmethod
-    def uptime():
-        return int(float(Path("/proc/uptime").read_text().split()[0]))
-
-    def test_the_newest_of_several_running_builds_must_have_settled(self):
-        self.report("0.00")
-        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
-        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
-        self.held_slot(2, f"{{pid}} 1\n{self.uptime()}\n")
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.build(1, timeout=2)
-
-    def test_a_start_from_before_a_reboot_has_settled(self):
-        self.report("0.00")
-        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
-        self.held_slot(1, f"{{pid}} 1\n{self.uptime() + 10**6}\n")
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def assert_start_selection(self, starts, *, waits, disabled=False, readable=True):
-        # Redirect only meminfo through the actual sed executable. The tested
-        # 7 GiB cost always fits this synthetic 64 GiB; no RAM is allocated.
-        binary = self.root / "start-tools"
-        binary.mkdir(exist_ok=True)
-        memory = self.root / "start-meminfo"
-        memory.write_text("MemTotal:       67108864 kB\nMemAvailable:   67108864 kB\n")
-        sed = binary / "sed"
-        sed.write_text(
-            "#!/usr/bin/python3\nimport os,sys\n"
-            "arguments = [os.environ['FIXTURE_MEMINFO'] if argument == '/proc/meminfo' "
-            "else argument for argument in sys.argv[1:]]\n"
-            "os.execv('/usr/bin/sed', ['sed', *arguments])\n"
-        )
-        sed.chmod(0o700)
-        temporary = self.root / "start-tmp"
-        temporary.mkdir(exist_ok=True)
-        command = self.root / "start-command"
-        command.unlink(missing_ok=True)
-        self.report("0.00")
-        if not readable:
-            self.pressure.write_text("some total=12\n")
-        environment = {
-            "PATH": str(binary) + ":/usr/bin:/bin", "TMPDIR": str(temporary), "LC_ALL": "C",
-            "FIXTURE_MEMINFO": str(memory), "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
-            "CAGENTS_BUILD_SLOTS": "3", "CARGO_BUILD_JOBS": "1",
-            "CAGENTS_BUILD_CPU_PRESSURE": "0" if disabled else "60",
-            "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
-            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
-            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
-        }
-        now = self.uptime()
-        dates = {"future":now + 10**6, "fresh":now, "old":now - 600}
-        holders, costs = [], {}
-        try:
-            for index, start in enumerate(starts, 1):
-                path = self.root / f"slot.lock.{index}"
-                holder = path.open("a")
-                holders.append(holder)
-                fcntl.flock(holder, fcntl.LOCK_EX)
-                cost = Path(str(path) + ".cost")
-                cost.write_text(f"{os.getpid()} 1\n{dates[start]}\n")
-                costs[cost] = cost.read_bytes()
-            process = subprocess.Popen(
-                [str(self.gate), "exec", "/bin/sh", "-c", 'printf admitted > "$1"',
-                 "fixture", str(command)], cwd=self.root, env=environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                start_new_session=True,
-            )
-            try:
-                _stdout, stderr = process.communicate(timeout=5)
-            finally:
-                if process.poll() is None:
-                    process.send_signal(signal.SIGTERM)
-                process.communicate(timeout=5)
-            for cost, expected in costs.items():
-                self.assertEqual(cost.read_bytes(), expected)
-                with Path(str(cost).removesuffix(".cost")).open("a") as probe:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for name in ("slot.lock", "slot.lock.queue"):
-                with (self.root / name).open("a") as probe:
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertFalse((self.root / "slot.lock.cost").exists())
-            self.assertEqual((process.returncode, command.exists()), (124, False) if waits else (0, True), stderr)
-            if waits:
-                self.assertIn("admission", stderr.lower())
-        finally:
-            for holder in holders:
-                holder.close()
-
-    def test_a_future_start_cannot_mask_a_fresh_holder_in_either_scan_order(self):
-        for starts in (("future", "fresh"), ("fresh", "future")):
-            with self.subTest(starts=starts):
-                self.assert_start_selection(starts, waits=True)
-
-    def test_start_selection_preserves_admission_and_pressure_read_error_controls(self):
-        for starts, waits, disabled, readable in (
-            (("future",), False, False, True), (("old",), False, False, True),
-            (("fresh",), True, False, True), (("future", "fresh"), False, True, True),
-            (("old",), False, False, False), (("future", "fresh"), True, False, False),
-        ):
-            with self.subTest(starts=starts, disabled=disabled, readable=readable):
-                self.assert_start_selection(starts, waits=waits, disabled=disabled, readable=readable)
-
-    def test_settled_and_undated_running_builds_leave_room(self):
-        # A build priced by a gate that does not date its start is not waited for.
-        self.report("0.00")
-        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
-        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
-        self.held_slot(2, "{pid} 1\n")
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_a_dated_cost_still_reads_as_a_cost_to_gates_that_only_price(self):
-        self.report("0.00")
-        self.hold(1)
-        cost = next(self.root.glob("slot.lock*.cost")).read_text()
-        # The one-line read of gates that predate dated starts.
-        result = subprocess.run(
-            ["sh", "-c", 'read -r holder claimed; printf "%s:%s" "$holder" "$claimed"'],
-            input=cost, capture_output=True, text=True, check=True)
-        holder, claimed = result.stdout.split(":")
-        self.assertEqual(int(holder), self.holder.pid)
-        self.assertEqual(int(claimed), 2**20)
-
-    def test_an_unreadable_pressure_report_leaves_room(self):
-        self.pressure.write_text("some total=12\n")
-        self.hold(1)
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_default_slots_are_capped_at_four(self):
-        del self.env["CAGENTS_BUILD_SLOTS"]
-        result = self.build(1, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        slots = {path.name for path in self.root.glob("slot.lock*")
-                 if not path.name.endswith((".queue", ".cost"))}
-        self.assertLessEqual(slots, {"slot.lock", "slot.lock.1", "slot.lock.2", "slot.lock.3"})
-        memory_gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
-        if os.cpu_count() >= 20 and memory_gib >= 28:
-            self.assertEqual(len(slots), 4)
-
+        with unittest.mock.patch.object(fixture_custody, "settle", settle):
+            scope.close()
+        self.assertEqual(survivors, [])
+        self.assertFalse(root.exists())
 
 
 if __name__ == "__main__":

@@ -19,6 +19,12 @@ impl Staged {
                     .is_ok()
                 {
                     Ok(impact::Preview {
+                        from_version: String::new(),
+                        windows: 0,
+                        stopped: Vec::new(),
+                        stopped_windows: Vec::new(),
+                        labels: Default::default(),
+                        editors: crate::install_guard::editor_companions(),
                         candidate: self.identity.clone(),
                         replaces_daemon: false,
                         daemon: None,
@@ -143,7 +149,7 @@ impl Staged {
     }
 }
 
-fn inherit(command: &mut Command, fd: i32) {
+pub(super) fn inherit(command: &mut Command, fd: i32) {
     // SAFETY: the caller keeps the File alive through spawn; only an
     // async-signal-safe descriptor operation executes in the child.
     unsafe {

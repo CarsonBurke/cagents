@@ -4,7 +4,7 @@ Source: `iced/core` from [pop-os/libcosmic](https://github.com/pop-os/libcosmic/
 
 `Tree::diff_children_custom` now assembles reconciled children in widget order. The pinned implementation diffs named children at their old indices and truncates before matching. Reordering a named button across an unnamed spacer leaves the spacer's childless tree under the button, which panics during layout. Reordering, inserting, and removing children must retain each surviving named tree at its new index. Unnamed children retain positional matching; repeated names are consumed in order instead of overwriting a prior tree. Custom names must still be unique within a native frame because the runtime named-state cache is keyed by name.
 
-Regression coverage includes core tree state continuity and a native `UserInterface` rebuild of mixed named buttons and spacers in `src/interaction.rs`. Remove this patch when the pinned upstream core provides equivalent reconciliation.
+Regression coverage includes core tree state continuity and a native `UserInterface` rebuild of mixed named buttons and spacers in `crates/cagents-ui/src/interaction.rs`. Remove this patch when the pinned upstream core provides equivalent reconciliation.
 
 Run the core regressions as a standalone package:
 
@@ -42,3 +42,32 @@ depend on the number of enclosing wrappers. The patched Winit consumer uses
 `into_native_rectangles` to reverse once when registering the final native list.
 App regressions cover plain, nested surface, real Scrollable, file-drop scaling,
 and combined wrappers with a preceding root sibling.
+
+## Text cursor blink schedule
+
+`text::Blink` is the one schedule for every text cursor: an interval, and a
+timeout after the last input when the cursor rests visible and needs no more
+frames. Its default, 500 ms with a ten-second timeout, matches GTK's
+`gtk-cursor-blink-timeout`. iced's `TextEditor` and `TextInput`
+(`vendor/iced-widget`), libcosmic's `TextInput` (`vendor/libcosmic`), and the
+app's code editor and terminal use it, so a focused field stops repainting its
+window twice a second while nobody types.
+
+`Blink::current()` is the schedule those cursors draw with: the desktop's, once
+the app has read it and recorded it with `Blink::set_preferred`, otherwise the
+default. A desktop that turns blinking off records `Blink::STEADY`, whose zero
+timeout keeps the cursor visible and asks for no frames at all.
+
+```sh
+cargo test --manifest-path vendor/iced-core/Cargo.toml text::blink
+```
+
+## Focus stops
+
+`Focusable::is_focus_stop`, true by default, lets a widget that cannot be
+activated now, such as a disabled button, stay out of keyboard traversal while
+still being reported to operations. `count`, `focus_next` and `focus_previous`
+consider only stops, plus the focused widget, so traversal moves on from a
+control disabled while it held focus. `focus` by id is unchanged. libcosmic's
+button uses this (`vendor/libcosmic/PATCH.md`); the app regression is
+`ui_controls::button::tests::disabled_buttons_are_not_focus_stops`.

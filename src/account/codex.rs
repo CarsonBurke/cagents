@@ -47,6 +47,7 @@ pub fn parse_account(result: &Value) -> Result<Identity, UsageStatus> {
         email: text("email"),
         organization: None,
         plan: text("planType").filter(|plan| plan != "unknown"),
+        disputed_by: None,
     })
 }
 
@@ -315,6 +316,13 @@ pub fn error_status(error: &Value) -> Option<UsageStatus> {
     }
 }
 
+/// The bucket a window belongs to, where it is not the account's own: its
+/// name, as the label shows it after the span, else the bucket's id.
+pub fn window_scope(window: &UsageWindow) -> Option<&str> {
+    let (id, _) = window.key.split_once(':')?;
+    (id != DEFAULT_LIMIT_ID).then(|| window.label.split_once(" · ").map_or(id, |(_, name)| name))
+}
+
 fn bucket_windows(id: &str, bucket: &Value) -> Vec<UsageWindow> {
     let name = bucket["limitName"]
         .as_str()
@@ -440,6 +448,8 @@ mod tests {
             labels,
             ["5h window", "Weekly", "5h window · GPT-5.3-Codex-Spark"]
         );
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, None, Some("GPT-5.3-Codex-Spark")]);
         assert_eq!(usage.windows[0].kind, WindowKind::Session);
         assert_eq!(usage.windows[1].kind, WindowKind::Weekly);
         assert!((usage.windows[0].used - 0.42).abs() < 1e-6);
@@ -466,7 +476,7 @@ mod tests {
         assert_eq!(usage.windows.len(), 1);
         assert_eq!(usage.windows[0].key, "codex:primary");
         assert_eq!(usage.status, UsageStatus::Limited);
-        assert_eq!(usage.credits.unwrap().summary(), "12.50 left");
+        assert_eq!(usage.credits.unwrap().summary(), "13 credits left");
     }
 
     #[test]
@@ -769,7 +779,10 @@ mod tests {
         let unknown = parse_rate_limits(&result, 1_000);
         assert_eq!(unknown.status, UsageStatus::Unavailable);
         assert_eq!(unknown.plan.as_deref(), Some("pro"));
-        assert_eq!(unknown.credits.as_ref().unwrap().summary(), "12.50 left");
+        assert_eq!(
+            unknown.credits.as_ref().unwrap().summary(),
+            "13 credits left"
+        );
         assert!(!super::super::routing::available(&unknown, 1_000));
         for (percent, status, available) in [
             (0, UsageStatus::Ok, true),

@@ -588,16 +588,10 @@ fn login_recipe_with_path(
     search_path: Option<&std::ffi::OsStr>,
 ) -> Result<crate::model::LaunchRecipe, String> {
     let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        super::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.into(), home.display().to_string());
-    }
     if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
-    Ok(crate::model::LaunchRecipe {
+    let mut recipe = crate::model::LaunchRecipe {
         program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
@@ -613,7 +607,9 @@ fn login_recipe_with_path(
             .iter()
             .map(|name| (*name).into())
             .collect(),
-    })
+    };
+    account.bind_home(&mut recipe)?;
+    Ok(recipe)
 }
 
 #[cfg(all(test, feature = "host"))]

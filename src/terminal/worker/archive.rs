@@ -203,6 +203,23 @@ pub(super) struct Source {
     columns: u16,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_capture_budget<T>(budget: usize, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAPTURE_BUDGET.set(self.0);
+        }
+    }
+    let _reset = Reset(CAPTURE_BUDGET.replace(Some(budget)));
+    action()
+}
+
 impl History {
     /// Captures the current active screen before carry switches to primary.
     /// The budget accounts for owned capacities, including indices and styles.
@@ -211,6 +228,8 @@ impl History {
         _base: &RenderSnapshot,
         budget: usize,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        let budget = CAPTURE_BUDGET.get().unwrap_or(budget);
         let scroll = terminal.scrollbar().map_err(|e| e.to_string())?;
         let height = scroll.len.max(1);
         let mut visual = VisualResources::new().map_err(|e| e.to_string())?;
@@ -311,13 +330,13 @@ impl History {
     pub(super) fn snapshot_at(
         &self,
         offset: Option<u64>,
-        rows: u16,
+        rows: Option<u16>,
         generation: u64,
     ) -> Arc<RenderSnapshot> {
         let mut snapshot = self.base.clone();
         snapshot.generation = generation;
         snapshot.detached = false;
-        snapshot.rows = rows.max(1).min(500);
+        snapshot.rows = rows.unwrap_or(self.base.rows).max(1).min(500);
         snapshot.scroll.len = u64::from(snapshot.rows).min(snapshot.scroll.total);
         snapshot.scroll.offset = offset
             // Following output aligns the last meaningful row rather than
@@ -624,12 +643,12 @@ mod tests {
             history.meaningful_end, 2,
             "Ghostty default padding is empty"
         );
-        let smaller = history.snapshot_at(None, 2, 9);
+        let smaller = history.snapshot_at(None, Some(2), 9);
         assert_eq!(smaller.scroll.offset, 0);
         assert_eq!(smaller.scroll.total, 8);
         assert_eq!(line_text(&smaller.lines[0]), "first");
         assert_eq!(line_text(&smaller.lines[1]), "second");
-        let explicit = history.snapshot_at(Some(6), 2, 10);
+        let explicit = history.snapshot_at(Some(6), Some(2), 10);
         assert_eq!(
             explicit.scroll.offset, 6,
             "explicit offsets are absolute top rows"
@@ -651,7 +670,7 @@ mod tests {
             history.meaningful_end, 0,
             "cleared prefix cannot leave a stale content end"
         );
-        assert_eq!(history.snapshot_at(None, 1, 11).scroll.offset, 0);
+        assert_eq!(history.snapshot_at(None, Some(1), 11).scroll.offset, 0);
     }
 
     #[test]
@@ -666,10 +685,10 @@ mod tests {
             "fixture must retain older scrollback"
         );
         assert!(history.meaningful_end as u64 <= history.active_start);
-        let tail = history.snapshot_at(None, 2, 1);
+        let tail = history.snapshot_at(None, Some(2), 1);
         assert_eq!(tail.scroll.offset, history.active_start);
         assert!(tail.lines.iter().all(|row| line_text(row).is_empty()));
-        let top = history.snapshot_at(Some(0), 2, 2);
+        let top = history.snapshot_at(Some(0), Some(2), 2);
         assert_eq!(
             line_text(&top.lines[0]),
             "old00",
@@ -681,15 +700,15 @@ mod tests {
     fn completed_tail_keeps_full_screen_and_intentionally_styled_blank_rows() {
         let screen = tall_history("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven");
         assert_eq!(screen.meaningful_end, 8);
-        let tail = screen.snapshot_at(None, 2, 1);
+        let tail = screen.snapshot_at(None, Some(2), 1);
         assert_eq!(tail.scroll.offset, 6);
         assert_eq!(line_text(&tail.lines[0]), "six");
         assert_eq!(line_text(&tail.lines[1]), "seven");
-        let top = screen.snapshot_at(Some(0), 2, 2);
+        let top = screen.snapshot_at(Some(0), Some(2), 2);
         assert_eq!(line_text(&top.lines[0]), "zero");
         let styled = tall_history("top\x1b[8;1H\x1b[41m\x1b[2K\x1b[0m");
         assert_eq!(styled.meaningful_end, 8);
-        let tail = styled.snapshot_at(None, 2, 3);
+        let tail = styled.snapshot_at(None, Some(2), 3);
         assert_eq!(tail.scroll.offset, 6);
         assert!(line_text(&tail.lines[1]).is_empty());
         assert!(
@@ -703,7 +722,10 @@ mod tests {
             spaces.meaningful_end, 8,
             "an explicitly written space remains content"
         );
-        assert_eq!(line_text(&spaces.snapshot_at(None, 1, 4).lines[0]), " ");
+        assert_eq!(
+            line_text(&spaces.snapshot_at(None, Some(1), 4).lines[0]),
+            " "
+        );
     }
 
     #[test]

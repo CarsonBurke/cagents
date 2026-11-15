@@ -2,11 +2,12 @@
 //! decision (or an earlier COMMENTED review) does not identify a request.
 use super::*;
 pub mod scan;
+pub mod shared;
 
 const CURRENT: &str =
     "viewerLatestReviewRequest{id asCodeOwner requestedReviewer{__typename ... on Node{id}}}";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Viewer {
     pub id: String,
     pub login: String,
@@ -29,7 +30,7 @@ pub struct Current {
     pub requested_reviewer: Option<Reviewer>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
     pub number: u64,
@@ -72,7 +73,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<Page, GitHubError> {
         repository.validate()?;
         let query = format!(
-            "query($owner:String!,$name:String!,$cursor:String){{viewer{{id login}} repository(owner:$owner,name:$name){{pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{number title url {CURRENT}}} pageInfo{{hasNextPage endCursor}}}}}}}}"
+            "query CagentsReviewRequests($owner:String!,$name:String!,$cursor:String){{rateLimit{{cost}} viewer{{id login}} repository(owner:$owner,name:$name){{pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{number title url {CURRENT}}} pageInfo{{hasNextPage endCursor}}}}}}}}"
         );
         let mut variables = vec![
             ("owner", repository.owner.as_str().into()),
@@ -117,7 +118,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<HistoryPage, GitHubError> {
         key.validate()?;
         let query = format!(
-            "query($owner:String!,$name:String!,$number:Int!,$before:String){{viewer{{id login}} repository(owner:$owner,name:$name){{pullRequest(number:$number){{{CURRENT} timelineItems(last:50,before:$before,itemTypes:[REVIEW_REQUESTED_EVENT]){{nodes{{... on ReviewRequestedEvent{{id createdAt requestedReviewer{{__typename ... on Node{{id}}}}}}}} pageInfo{{hasPreviousPage startCursor}}}}}}}}}}"
+            "query CagentsReviewRequestHistory($owner:String!,$name:String!,$number:Int!,$before:String){{rateLimit{{cost}} viewer{{id login}} repository(owner:$owner,name:$name){{pullRequest(number:$number){{{CURRENT} timelineItems(last:50,before:$before,itemTypes:[REVIEW_REQUESTED_EVENT]){{nodes{{... on ReviewRequestedEvent{{id createdAt requestedReviewer{{__typename ... on Node{{id}}}}}}}} pageInfo{{hasPreviousPage startCursor}}}}}}}}}}"
         );
         let mut variables = Self::pull_request_variables(key);
         if let Some(before) = before {
