@@ -160,6 +160,19 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
         "provider never confirmed its first turn",
     );
     let confirmed = handle.confirmed_session_id().unwrap();
+    wait(
+        || {
+            matches!(registry.lock().unwrap().retained_agent_authority_source(id).unwrap(),
+            Some(crate::agent_execution::HostedSession::Chat(source))
+                if source.launch.session_id.as_deref() == Some(confirmed.as_str()))
+        },
+        "daemon did not publish the confirmed conversation without a window",
+    );
+    let durable = registry
+        .lock()
+        .unwrap()
+        .retained_agent_authority_source(id)
+        .unwrap();
     let inspection = Handle::inspect_remote(&identity.record, first).unwrap();
     assert!(
         inspection.source == published || inspection.previous_sources.contains(&published),
@@ -205,9 +218,7 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
             .unwrap()
             .retained_agent_authority_source(id)
             .unwrap(),
-        Some(crate::agent_execution::HostedSession::Chat(
-            published.clone()
-        ))
+        durable
     );
     fault
         .execute_batch("DROP TRIGGER reject_publication;")
