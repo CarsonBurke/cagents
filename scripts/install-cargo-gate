@@ -23,9 +23,9 @@ usage() {
 Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
-cargo-gate-command.py, cargo-host-test-helper.py, cargo_artifacts.py, cargo-gate-sync.py, cargo-gate-rustc-guard,
-cargo-offload, seed-build-dir, build-disk-guard and
-prune-build-dirs beside it (default DIRECTORY: /var/tmp). Exits 3, changing
+build-host, cargo-gate-command.py, cargo-host-test-helper.py, cargo_artifacts.py,
+cargo-gate-sync.py, cargo-gate-rustc-guard, cargo-offload, seed-build-dir,
+build-disk-guard, memory-capped and prune-build-dirs beside it (default DIRECTORY: /var/tmp). Exits 3, changing
 nothing, when the installed gate's version is newer than this checkout's.
 EOF
 }
@@ -39,7 +39,8 @@ destination=${1:-/var/tmp}
 source=$(cd "$(dirname "$0")" && pwd -P)
 
 # Installed name, then this checkout's file. The gate goes last.
-files='cargo-gate-command.py:cargo-gate-command.py
+files='build-host:build-host
+cargo-gate-command.py:cargo-gate-command.py
 cargo-host-test-helper.py:cargo-host-test-helper.py
 cargo_artifacts.py:cargo_artifacts.py
 cargo-gate-sync.py:cargo-gate-sync.py
@@ -73,7 +74,7 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
     cp -- "$source/$file" "$stage/$installed"
     chmod 755 -- "$stage/$installed"
     case $file in
-        *.py|cargo-offload|memory-capped|prune-build-dirs) /usr/bin/python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
+        *.py|build-host|cargo-offload|memory-capped|prune-build-dirs) /usr/bin/python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
         *) sh -n "$stage/$installed" ;;
     esac
 done
@@ -88,7 +89,7 @@ smoke() {
     status=0
     output=$(cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
         CAGENTS_BUILD_FREE_FLOOR_GIB=0 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= CAGENTS_BUILD_SCOPE=0 \
         "$1" exec sh -c 'printf admitted' 2>"$lock/errors") || status=$?
     errors=$(cat -- "$lock/errors")
     rm -rf -- "$lock"

@@ -167,7 +167,7 @@ class TestLib(unittest.TestCase):
         self.root = Path(temporary.name)
         scripts = self.root / "scripts"
         scripts.mkdir()
-        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py"):
+        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py", "build-host"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         for name in ("seed-build-dir", "build-disk-guard"):
             if (ROOT / "scripts" / name).exists():
@@ -189,6 +189,8 @@ class TestLib(unittest.TestCase):
             "CAGENTS_BUILD_SEED": "0", "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
             "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_REMOTE": "local",
+            # Build in place: no systemd scope or shared jobserver.
+            "CAGENTS_BUILD_SCOPE": "0",
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
         self.configure()
@@ -281,11 +283,12 @@ class TestLib(unittest.TestCase):
     def test_the_test_binary_runs_under_a_memory_limit(self):
         ran = self.root / "limited"
         limit = self.root / "scripts/memory-capped"
-        limit.write_text(f'#!/bin/sh\necho "$1" >"{ran}"\nexec "$@"\n')
+        limit.write_text(f'#!/bin/sh\necho "$1 $2" >"{ran}"\nshift\nexec "$@"\n')
         limit.chmod(0o755)
         result = self.invoke("cli", "module::one")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(ran.read_text().strip(), str(self.root / "libtest"))
+        # What a test leaves running is stopped with it.
+        self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
@@ -672,7 +675,9 @@ class TestLib(unittest.TestCase):
                     _stdout, stderr = process.communicate("", timeout=5)
                     self.assertEqual(process.returncode, 128 + number, stderr)
                     received = [event["signal"] for event in self.events(phase) if "signal" in event]
-                    self.assertIn(signal.SIGTERM if phase == "compiler" else number, received)
+                    # build-host interrupts the build as Ctrl-C would, whatever
+                    # signal cancelled it; test-lib forwards a listing's own.
+                    self.assertIn(signal.SIGINT if phase == "compiler" else number, received)
                     self.assertFalse(self.held())
                     self.assert_no_test()
 

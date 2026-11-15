@@ -934,7 +934,8 @@ run_app() {
     session_variables='WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS NIRI_SOCKET XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XCURSOR_THEME XCURSOR_SIZE'
     write_session_cargo "$side" "$checkout"
     session_path=$state/session-bin:
-    # The runner still calls scripts/cargo-gate, which must not join the shared queue.
+    # The runner still calls scripts/cargo-gate, which must not join the shared queue,
+    # nor the build host's slice and jobserver: it builds in place.
     # Its builds replay the recorded ones through the session's cargo, here.
     # They write nothing, so their disk guard is off: it would start the
     # pruner, under this private HOME, beside the app being captured, and
@@ -949,7 +950,7 @@ run_app() {
         RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
     )
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless "${runner_instance[@]}" \
             --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.

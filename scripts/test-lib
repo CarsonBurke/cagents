@@ -244,7 +244,7 @@ def main():
     # A filtered mutation loop runs here too, and a mutant can allocate forever.
     limit = ROOT / "scripts/memory-capped"
     if os.access(limit, os.X_OK):
-        os.execv(limit, [str(limit), executable, *command[1:]])
+        os.execv(limit, [str(limit), "--stop-leftovers", executable, *command[1:]])
     os.execv(executable, command)
 
 

@@ -26,6 +26,7 @@ class BuildDiskGuard(unittest.TestCase):
             if not key.startswith("CAGENTS_BUILD_")
         }
         self.env["CAGENTS_BUILD_LOCK"] = str(self.root / "cargo.lock")
+        self.env["CAGENTS_BUILD_SCOPE"] = "0"
         self.env["CAGENTS_BUILD_INSTALLED_GATE"] = ""
         self.env["CAGENTS_BUILD_REMOTE"] = "local"
         self.env["CAGENTS_BUILD_PRUNE"] = f"echo pruned >> {self.pruned}"
@@ -438,7 +439,7 @@ class BuildDiskGuard(unittest.TestCase):
     def test_the_gate_refuses_before_admitting(self):
         gate = self.root / "gate"
         gate.mkdir()
-        for name in ("cargo-gate", "cargo-gate-command.py", "build-disk-guard"):
+        for name in ("cargo-gate", "cargo-gate-command.py", "build-host", "build-disk-guard"):
             shutil.copy2(ROOT / "scripts" / name, gate / name)
         result = subprocess.run(
             [str(gate / "cargo-gate"), "exec", "sh", "-c", "echo admitted"],
@@ -460,6 +461,9 @@ class InstallCargoGate(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_")
         }
+        # The installer's smoke check runs a command through the new gate,
+        # which here builds in place: no systemd scope or shared jobserver.
+        self.env["CAGENTS_BUILD_SCOPE"] = "0"
 
     def test_installs_the_gate_with_every_helper(self):
         result = subprocess.run(
@@ -467,7 +471,7 @@ class InstallCargoGate(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        names = ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py",
+        names = ["build-disk-guard", "build-host", "cagents-cargo-gate", "cargo-gate-command.py",
                  "cargo-host-test-helper.py", "cargo_artifacts.py",
                  "cargo-gate-rustc-guard", "cargo-gate-sync.py", "cargo-offload",
                  "memory-capped", "prune-build-dirs", "seed-build-dir"]
@@ -512,7 +516,7 @@ class InstallCargoGate(unittest.TestCase):
     def test_a_gate_that_cannot_run_is_not_installed(self):
         scripts = self.root / "checkout/scripts"
         scripts.mkdir(parents=True)
-        for name in ("install-cargo-gate", "cargo-gate", "cargo-gate-command.py",
+        for name in ("install-cargo-gate", "cargo-gate", "build-host", "cargo-gate-command.py",
                      "cargo-host-test-helper.py", "cargo_artifacts.py",
                      "cargo-gate-sync.py", "cargo-gate-rustc-guard", "cargo-offload",
                      "seed-build-dir", "memory-capped",
