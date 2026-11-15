@@ -29,11 +29,13 @@ use std::{
 mod daemon_admission;
 #[doc(hidden)]
 pub mod ui_options;
+#[cfg(any(feature = "host", test))]
+pub(crate) use daemon_admission::AdmissionFence;
 #[cfg(feature = "host")]
 pub(crate) use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
+    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -973,6 +975,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
 /// Windows launched meanwhile wait for it rather than report an update.
+#[cfg(feature = "host")]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
