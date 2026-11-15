@@ -813,10 +813,9 @@ fn agent_addresses_are_beyond_every_older_recording() {
 }
 
 /// Only a window watching notifications is told a project's automation
-/// requests changed, and no update source watches them, so no recorded older
-/// protocol has a message at its position.
+/// requests changed. Protocols before 178 cannot read that notification.
 #[test]
-fn automation_request_changes_are_beyond_every_older_recording() {
+fn automation_request_changes_are_beyond_recordings_before_178() {
     let changed = ServerMessage::AutomationProposalsChanged {
         repository: "/fixture".into(),
     };
@@ -826,7 +825,7 @@ fn automation_request_changes_are_beyond_every_older_recording() {
         .iter()
         .map(|client| client.protocol)
         .chain(crate::update::source::current_client_protocols())
-        .filter(|&protocol| protocol < PROTOCOL_VERSION);
+        .filter(|&protocol| protocol < 178);
     for protocol in older {
         assert!(
             variant_count(&recorded(protocol), "ServerMessage") <= index,
