@@ -39,14 +39,16 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and selected providers.
 
-  build SIDE CHECKOUT [--executables DIR]
+  build SIDE CHECKOUT [--integrated | --executables DIR]
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
                   target. A clean checkout of a main commit that
                   scripts/main-build-sentinel built takes its executables
                   instead, without compiling. --executables moves those in DIR,
                   built elsewhere from exactly this checkout, into the target.
-                  scripts/prune-build-dirs reclaims a task's targets
+                  --integrated builds the UI with the embedded browser instead,
+                  always in a slot, and the side's sessions run the runner
+                  without --browserless. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
@@ -219,20 +221,27 @@ zig_executable() (
         -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'
 )
 
-# What `build` compiles in CHECKOUT, and all a session's cargo accepts. Keep these in
-# step with scripts/run-development's browserless builds, which cannot be asked to only
-# build: the before side may predate any option. A real-runner test fails if they drift.
+# What `build` compiles, and all a session's cargo accepts, for the lane in $1:
+# browserless, or integrated for the UI with the embedded browser, in the
+# checkout in $2, by default the current directory. Keep these in step with
+# scripts/run-development's builds, which cannot be asked to only build: the
+# before side may predate any option. A real-runner test fails if they drift.
 # A checkout from before the UI became its own package builds it from the root package.
 build_arguments() {
-    local checkout=$1 common='--locked --profile dev-runtime --no-default-features --features'
+    local lane=${1:-browserless} checkout=${2:-.} ui
+    local common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
         "$common development,host --bin cagentsd"
     if [ -e "$checkout/crates/cagents-ui/Cargo.toml" ]; then
-        printf '%s\n' '--locked --profile dev-runtime -p cagents-ui --features development --bin cagents-ui'
+        ui='--locked --profile dev-runtime -p cagents-ui --features development'
+        [ "$lane" != integrated ] || ui+=',integrated-browser'
+    elif [ "$lane" = integrated ]; then
+        ui='--locked --profile dev-runtime --features development,integrated-browser'
     else
-        printf '%s\n' "$common development,ui --bin cagents-ui"
+        ui="$common development,ui"
     fi
+    printf '%s\n' "$ui --bin cagents-ui"
 }
 
 refuse_running_side() {
@@ -253,7 +262,7 @@ main_build_of() {
     [ -z "$(cd -- "$checkout" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
         git -c core.excludesFile=/dev/null status --porcelain=v1)" ] || return 1
     directory=$main_builds/$(git -C "$checkout" rev-parse HEAD) || return 1
-    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments)" ] || return 1
+    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] || return 1
     printf '%s\n' "$directory"
 }
 
@@ -268,7 +277,7 @@ take_built() {
     exec 8<"$target"
     rm -f -- "$target/evidence-source"
     revision=$(source_state "$checkout")
-    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments)" ] ||
+    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] ||
         die "$from was not built as this native-evidence builds; build it again"
     # Main's are of one commit, which the checkout must still be at.
     [ "$how" != copy ] || [ "$(main_build_of "$checkout")" = "$from" ] ||
@@ -290,16 +299,18 @@ take_built() {
     {
         printf '%s\n' "$checkout" "$zig" "$cargo_bin"
         printf '%s\n' "$revision"
+        printf 'lane browserless\n'
     } >"$target/evidence-source"
 }
 
 cmd_build() {
-    local side=${1:-} checkout=${2:-} executables=''
+    local side=${1:-} checkout=${2:-} lane=browserless executables=''
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --integrated) lane=integrated; shift ;;
             --executables)
                 executables=${2:?--executables needs a directory}
                 shift 2
@@ -313,6 +324,9 @@ cmd_build() {
             *) die "unknown build option: $1" 2 ;;
         esac
     done
+    # Executables built elsewhere, and main's prebuilt ones, are browserless.
+    [ "$lane" = browserless ] || [ -z "$executables" ] ||
+        die '--executables takes browserless executables; build --integrated in a slot' 2
     refuse_running_side "$side"
     checkout=$(cd -- "$checkout" && pwd -P)
     git -C "$checkout" rev-parse --git-dir >/dev/null
@@ -344,7 +358,7 @@ cmd_build() {
         return
     fi
     local prebuilt
-    if prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
+    if [ "$lane" = browserless ] && prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
         # The sentinel removes old builds only while nothing reads them. A
         # copy that fails says why, and the side is compiled instead.
         if (
@@ -368,7 +382,7 @@ cmd_build() {
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
-        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}" "$lane")
 }
 
 # Whether this build compiles on this host: in its own slots, reached by
@@ -393,7 +407,7 @@ mark_used() {
 }
 
 run_build() {
-    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 lane=${5:-browserless} target revision
     # A session may have started during the wait for this slot.
     refuse_running_side "$side"
     target=$(target_of "$side")
@@ -415,15 +429,16 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments "$checkout")
+        done < <(build_arguments "$lane" "$checkout")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
     {
         printf '%s\n' "$checkout" "$zig" "$cargo_bin"
         printf '%s\n' "$revision"
+        printf 'lane %s\n' "$lane"
     } >"$target/evidence-source"
-    printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
+    printf 'built %s (%s) at %s\n' "$side" "$lane" "$(head -n1 <<<"$revision")"
 }
 
 # What a side without a build says. scripts/prune-build-dirs reclaims one that
@@ -443,7 +458,11 @@ load_side() {
         read -r cargo_bin
         read -r built_revision
         read -r built_tree
+        # A record from before lanes has no such line: it was browserless.
+        read -r lane || :
     } <"$record"
+    lane=${lane#lane }
+    [ "$lane" = integrated ] || lane=browserless
     target=$(target_of "$side")
 }
 
@@ -1013,7 +1032,7 @@ write_session_cargo() {
         printf '#!/bin/bash\n'
         printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
-        printf 'recorded=%q\n' "$(build_arguments "$checkout")"
+        printf 'recorded=%q\n' "$(build_arguments "$lane" "$checkout")"
         cat <<'CARGO'
 [ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {
@@ -1079,7 +1098,8 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=() runner_instance=() window_arguments=()
+    local status=0 stage_environment=() runner_instance=() window_arguments=() runner_lane=(--browserless)
+    [ "$lane" != integrated ] || runner_lane=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "$slot" ] || window_arguments=(-- --window "$slot")
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
@@ -1098,7 +1118,7 @@ run_app() {
     )
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development --browserless "${runner_instance[@]}" \
+        scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" \
             --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
