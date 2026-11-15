@@ -33,8 +33,7 @@ pub fn popover<'a, Message: Clone + 'static>(
 /// The viewport runs to the frame's border, so content leaves through the
 /// popover's edge and fades into it, rather than being cut off a padding's
 /// width short of it. The sides keep the frame's inset, which holds the fade
-/// clear of the rounded corners; the scrollbar takes its rail out of the
-/// trailing side.
+/// and the scrollbar's thumb clear of the rounded corners.
 pub fn scrolling_popover<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     content: Option<Element<'a, Message>>,
@@ -50,13 +49,14 @@ pub fn scrolling_popover<'a, Message: Clone + 'static>(
             top: design::BORDER_WIDTH,
             bottom: design::BORDER_WIDTH,
             left: SCROLLING_FRAME,
-            right: SCROLLING_FRAME - design::SCROLLBAR_GUTTER,
+            right: SCROLLING_FRAME,
         },
     )
 }
 
 /// The scrolling body of a [`scrolling_popover`], at most `max_height` tall,
-/// with its content `inset` from every side of the popover's frame.
+/// with its content `inset` from every side of the popover's frame and the
+/// scrollbar's rail besides on the trailing side.
 ///
 /// The vertical inset scrolls with the content, so the first and last items
 /// sit `inset` from the frame until it scrolls, and what passes an edge fades
@@ -90,7 +90,8 @@ pub fn popover_scroll<'a, Message: 'a>(
 }
 
 /// How far a [`scrolling_popover`]'s scroll region sits from each side of
-/// the frame. A fade drawn this far in stays inside the rounded corners.
+/// the frame. A fade or a scrollbar thumb this far in stays inside the
+/// rounded corners.
 pub const SCROLLING_FRAME: f32 = space::S;
 
 fn framed<'a, Message: Clone + 'static>(

@@ -23,8 +23,8 @@ pub(crate) fn surface<'a, M: 'a>(
 /// The viewport runs to the dialog's border, so content leaves through the
 /// dialog's edge and fades into it, rather than being cut off a padding's
 /// width short of it: the vertical padding scrolls with the content. The
-/// sides keep theirs, which holds the fade clear of the rounded corners;
-/// the scrollbar takes its rail out of the trailing side.
+/// sides keep theirs, which holds the fade and the scrollbar's thumb clear
+/// of the rounded corners.
 pub(crate) fn scrolling_surface<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     max_width: f32,
@@ -52,7 +52,7 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
             top: design::BORDER_WIDTH,
             bottom: design::BORDER_WIDTH,
             left: space::L,
-            right: space::L - design::SCROLLBAR_GUTTER,
+            right: space::L,
         })
         .width(Length::Fill)
         .height(height)
@@ -427,12 +427,12 @@ pub(super) mod tests {
         assert_eq!(viewport.y, dialog.y + design::BORDER_WIDTH);
         assert_eq!(viewport.height, dialog.height - 2.0 * design::BORDER_WIDTH);
         assert_eq!(content, 1000.0 + 2.0 * (space::L - design::BORDER_WIDTH));
-        // The sides keep the dialog's inset, and the rail is the trailing
-        // side's: content sits `space::L` in from either side.
+        // The sides keep the dialog's inset, which keeps the scrollbar's
+        // thumb clear of the rounded corners.
         assert_eq!(viewport.x, dialog.x + space::L);
         assert_eq!(
             dialog.x + dialog.width - (viewport.x + viewport.width),
-            space::L - design::SCROLLBAR_GUTTER
+            space::L
         );
         // Short content: the dialog fits it, with the same padding as an
         // ordinary dialog.

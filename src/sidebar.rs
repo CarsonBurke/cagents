@@ -6207,14 +6207,20 @@ fn project_scroll(
             filter,
             viewport,
         ),
-        pinned_header_fill,
+        pane_fill,
     )
 }
 
-/// The pane's own fill, which a pinned project header is painted with and
-/// rows passing an edge of the list fade into.
+/// The fill of a pinned project header, which hides the rows passing under
+/// it: opaque even when the pane itself is translucent.
 fn pinned_header_fill(theme: &cosmic::Theme) -> cosmic::iced::Color {
     cosmic::iced::Color::from(theme.cosmic().primary(false).base)
+}
+
+/// The pane's own fill, as [`crate::design::docked_primary`] draws it, which
+/// rows passing an edge of the list fade into.
+fn pane_fill(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    cosmic::iced::Color::from(theme.cosmic().primary(theme.transparent).base)
 }
 
 fn loading() -> Element<'static, SidebarAction> {
@@ -14259,7 +14265,7 @@ mod row_interaction {
                             crate::interaction::fade_below_header(
                                 renderer,
                                 area,
-                                super::pinned_header_fill(theme),
+                                super::pane_fill(theme),
                             );
                         });
                     }
