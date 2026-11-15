@@ -791,9 +791,17 @@ mod tests {
         let model = registry.model().unwrap();
         drop(registry);
         let path = directory.path().join("model.sqlite3");
-        assert_eq!(Registry::downgrade_at(&path, 24).unwrap(), Some(25));
+        assert_eq!(
+            Registry::downgrade_at(&path, 24).unwrap(),
+            Some(super::super::SCHEMA_VERSION)
+        );
         let registry = Registry::at(&path).unwrap();
-        assert_eq!(registry.model().unwrap(), model);
+        let mut reopened = registry.model().unwrap();
+        // Re-seeding schema 26's terminal source bindings advances the
+        // watermark once, so no gesture from before the conversion is current.
+        assert_eq!(reopened.sequence, model.sequence + 1);
+        reopened.sequence = model.sequence;
+        assert_eq!(reopened, model);
         assert_eq!(
             registry.session_channels(&[session]).unwrap()[&session].id,
             channel

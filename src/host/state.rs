@@ -7870,10 +7870,17 @@ for line in sys.stdin:
         for delivery in &deliveries {
             delivery.close_after_drain();
         }
+        // The spawning client first learns which worker it started.
+        assert!(matches!(
+            deliveries[0].pop().unwrap().message,
+            ServerMessage::TerminalWorker { terminal_id: id, instance }
+                if id == terminal_id && instance == stream.handle.execution_instance()
+        ));
         assert!(matches!(
             deliveries[0].pop().unwrap().message,
             ServerMessage::Snapshot { snapshot, .. } if snapshot.generation == 7
         ));
+        assert!(deliveries[0].pop().is_none());
         assert!(deliveries[1].pop().is_none());
         assert!(deliveries[2].pop().is_none());
     }

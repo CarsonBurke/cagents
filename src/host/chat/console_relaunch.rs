@@ -37,7 +37,8 @@ pub(super) fn checkpoint(_point: &'static str) -> Result<(), String> {
     Ok(())
 }
 
-fn matched_cli() -> Result<std::path::PathBuf, String> {
+/// The CLI matched to this daemon, which every agent console runs.
+pub(in crate::host) fn matched_cli() -> Result<std::path::PathBuf, String> {
     #[cfg(test)]
     if let Some(path) = std::env::var_os("CAGENTS_TEST_CONSOLE_CLI") {
         let path = std::path::PathBuf::from(path);
@@ -50,7 +51,7 @@ fn matched_cli() -> Result<std::path::PathBuf, String> {
         .beside_current()
         .map_err(|e| e.to_string())?;
     if !program.is_file() {
-        return Err("The matched cagents CLI for console recovery is unavailable".into());
+        return Err("The matched cagents CLI for the console is unavailable".into());
     }
     Ok(program)
 }
