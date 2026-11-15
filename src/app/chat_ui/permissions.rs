@@ -225,9 +225,21 @@ impl Runtime {
             }
             if let Some(input) = &denial.tool_input {
                 details.push(
-                    widget::container(widget::scrollable(view::body(input.as_str())))
-                        .max_height(140)
-                        .into(),
+                    // The input is on the denial's card, which is the
+                    // component fill of the surface it sits on.
+                    widget::container(crate::interaction::overflow_fade_y(
+                        widget::scrollable(
+                            widget::container(view::body(input.as_str()))
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(Length::Shrink),
+                        design::component_base,
+                    ))
+                    .max_height(140)
+                    .into(),
                 );
             } else {
                 details.push(design::caption("Exact input is unavailable. Review the tool in the transcript before authorizing a retry.").into());
@@ -467,19 +479,14 @@ fn permissions_surface(
     width: f32,
     card: CardId,
 ) -> Element<'_, Message> {
-    widget::container(
-        widget::scrollable(
-            widget::column::with_children(content)
-                .spacing(step::GAP_M)
-                .padding(step::GAP_S),
-        )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        )),
-    )
+    widget::container(crate::ui_controls::popover_scroll(
+        widget::column::with_children(content).spacing(step::GAP_M),
+        card_control_id(card, "chat-permissions-scroll"),
+        440.0,
+        space::XS + step::GAP_S,
+    ))
     .id(card_control_id(card, "chat-permissions-surface"))
     .width(width.clamp(1.0, 520.0))
-    .max_height(440)
     .into()
 }
 

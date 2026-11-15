@@ -19,6 +19,87 @@ pub fn popover<'a, Message: Clone + 'static>(
     position: widget::popover::Position,
     on_close: Message,
 ) -> Element<'a, Message> {
+    framed(
+        anchor,
+        content,
+        position,
+        on_close,
+        iced::Padding::new(space::XS),
+    )
+}
+
+/// A [`popover`] framing a [`popover_scroll`]: a body that scrolls as a whole.
+///
+/// The viewport runs to the frame's border, so content leaves through the
+/// popover's edge and fades into it, rather than being cut off a padding's
+/// width short of it. The sides keep the frame's inset, which holds the fade
+/// clear of the rounded corners; the scrollbar takes its rail out of the
+/// trailing side.
+pub fn scrolling_popover<'a, Message: Clone + 'static>(
+    anchor: impl Into<Element<'a, Message>>,
+    content: Option<Element<'a, Message>>,
+    position: widget::popover::Position,
+    on_close: Message,
+) -> Element<'a, Message> {
+    framed(
+        anchor,
+        content,
+        position,
+        on_close,
+        iced::Padding {
+            top: design::BORDER_WIDTH,
+            bottom: design::BORDER_WIDTH,
+            left: SCROLLING_FRAME,
+            right: SCROLLING_FRAME - design::SCROLLBAR_GUTTER,
+        },
+    )
+}
+
+/// The scrolling body of a [`scrolling_popover`], at most `max_height` tall,
+/// with its content `inset` from every side of the popover's frame.
+///
+/// The vertical inset scrolls with the content, so the first and last items
+/// sit `inset` from the frame until it scrolls, and what passes an edge fades
+/// into the popover. `inset` is at least [`SCROLLING_FRAME`].
+pub fn popover_scroll<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    id: widget::Id,
+    max_height: f32,
+    inset: f32,
+) -> Element<'a, Message> {
+    let side = (inset - SCROLLING_FRAME).max(0.0);
+    let end = inset - design::BORDER_WIDTH;
+    widget::container(crate::interaction::overflow_fade_y(
+        widget::scrollable(
+            widget::container(content).padding(design::with_vertical_rail(iced::Padding {
+                top: end,
+                bottom: end,
+                left: side,
+                right: side,
+            })),
+        )
+        .id(id)
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            design::scrollbar(),
+        ))
+        .height(Length::Shrink),
+        design::component_base,
+    ))
+    .max_height(max_height)
+    .into()
+}
+
+/// How far a [`scrolling_popover`]'s scroll region sits from each side of
+/// the frame. A fade drawn this far in stays inside the rounded corners.
+pub const SCROLLING_FRAME: f32 = space::S;
+
+fn framed<'a, Message: Clone + 'static>(
+    anchor: impl Into<Element<'a, Message>>,
+    content: Option<Element<'a, Message>>,
+    position: widget::popover::Position,
+    on_close: Message,
+    padding: iced::Padding,
+) -> Element<'a, Message> {
     let mut popup = widget::popover(anchor)
         .position(position)
         .on_close(on_close);
@@ -28,7 +109,7 @@ pub fn popover<'a, Message: Clone + 'static>(
         // content, which otherwise report None and expose controls beneath.
         popup = popup.popup(crate::interaction::opaque(
             widget::container(content)
-                .padding(space::XS)
+                .padding(padding)
                 .class(design::elevated()),
         ));
     }

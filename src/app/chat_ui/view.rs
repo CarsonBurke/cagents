@@ -3599,7 +3599,7 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         };
-        let footer = crate::ui_controls::popover(
+        let footer = crate::ui_controls::scrolling_popover(
             footer_row,
             self.permission_picker
                 .then(|| self.permissions_view(available, content_width - 32.0)),
