@@ -2140,8 +2140,8 @@ impl Cagents {
 }
 
 impl Cagents {
-    /// Folds attention into the rows the Attention list draws: counts first,
-    /// then the pane rows they give. Every projection goes through here, so
+    /// Folds attention into the rows the sidebar draws: counts first, then
+    /// the pane rows they give. Every projection goes through here, so
     /// no caller can leave the pane rows behind the counts.
     pub(super) fn refresh_attention_projection(&mut self) {
         self.sidebar_state
@@ -2149,30 +2149,28 @@ impl Cagents {
         self.refresh_attention_card_rows();
     }
 
-    /// The Attention list's pane rows, titled as their panes are. Every title
+    /// The sidebar's pane rows, titled as their panes are beside their
+    /// place: one per open conversation outside every channel. Every title
     /// report comes through here, and most change no row: those compare the
     /// rows in place and stop, and the rest rebuild only the projects whose
     /// rows changed.
     pub(super) fn refresh_attention_card_rows(&mut self) {
-        let stale = self
-            .sidebar_model
-            .stale_attention_cards(&self.sidebar_state, |id| {
-                self.card_state(id)
-                    .map(|card| self.card_display_title(card))
-            });
+        let stale = self.sidebar_model.stale_panes(&self.sidebar_state, |id| {
+            self.card_state(id).map(|card| self.pane_row_title(card))
+        });
         if stale.is_empty() {
             return;
         }
         let mut titles = self
             .sidebar_state
-            .attention_pane_cards()
+            .pane_cards()
             .filter_map(|id| {
                 let card = self.card_state(id)?;
-                Some((id, self.card_display_title(card).to_owned()))
+                Some((id, self.pane_row_title(card).to_owned()))
             })
             .collect::<HashMap<_, _>>();
         self.sidebar_model
-            .set_attention_cards(&self.sidebar_state, &stale, |id| titles.remove(&id));
+            .set_panes(&self.sidebar_state, &stale, |id| titles.remove(&id));
     }
 }
 

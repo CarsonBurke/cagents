@@ -1177,10 +1177,28 @@ impl Cagents {
     /// A pane that is not drawn live: its icon, name and what it is doing.
     fn workspace_switcher_pane_heading(&self, card: CardId) -> Element<'_, Message> {
         let state = self.card_state(card);
-        let title = self.card_chrome.get(&card).map_or_else(
+        let chrome = self.card_chrome.get(&card);
+        let title = chrome.map_or_else(
             || state.map_or("Pane", |state| self.card_display_title(state)),
             |chrome| chrome.title.as_str(),
         );
+        // Its destination's heading above names the checkout a shell is in.
+        // The tab's ordinal stays, telling a checkout's shells apart.
+        let title = match state {
+            Some(state) => {
+                let suffix = chrome
+                    .and_then(|chrome| chrome.terminal_ordinal_suffix.as_deref())
+                    .unwrap_or("");
+                let base = title.strip_suffix(suffix).unwrap_or(title);
+                let shown = self.titled_beside_place(state, base, self.card_worktree(state));
+                if shown.len() == base.len() {
+                    Cow::Borrowed(title)
+                } else {
+                    Cow::Owned(format!("{shown}{suffix}"))
+                }
+            }
+            None => Cow::Borrowed(title),
+        };
         let mut text = vec![design::body(title).into()];
         if let Some(doing) = self.workspace_switcher_pane_doing(card) {
             text.push(design::caption(doing).into());

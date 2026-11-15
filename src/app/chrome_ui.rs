@@ -1891,24 +1891,29 @@ impl Cagents {
     }
 
     /// The sidebar row that shows the focused pane `card`, made visible:
-    /// the pane's own row while the Attention list draws it, otherwise the
-    /// row of the channel, checkout or folder the pane is in, revealed in
-    /// the unfiltered list, which draws no pane rows.
+    /// the pane's own row wherever the list draws one - the Attention list,
+    /// or a project whose checkouts are hidden - otherwise the row of the
+    /// channel, checkout or folder the pane is in, revealed in the unfiltered
+    /// list. A checkout whose row is hidden leaves its project's.
     pub(super) fn reveal_card_row(&mut self, card: CardId) -> Option<sidebar::SelectionRow> {
         // Unfold only the section that holds the row: a project or In
-        // progress folded for other reasons stays as the user left it.
-        if let Some(shown_on) = self.sidebar_state.attention_card_row(card) {
-            let row = sidebar::SelectionRow::Card(shown_on);
-            match sidebar::attention_place(
+        // progress folded for other reasons stays as the user left it. A list
+        // that draws no pane rows holds none.
+        let pane = self
+            .sidebar_state
+            .attention_card_row(card)
+            .map(sidebar::SelectionRow::Card);
+        if let Some(row) = pane {
+            match sidebar::pane_row_place(
                 &self.sidebar_model,
                 &self.sidebar_state,
                 self.projects_sidebar_mode() == SidebarMode::Compact,
                 row,
             ) {
-                Some(sidebar::AttentionPlace::Project(project)) => {
+                Some(sidebar::PaneRowPlace::Project(project)) => {
                     self.sidebar_state.expand_project(project);
                 }
-                Some(sidebar::AttentionPlace::InProgress) => {
+                Some(sidebar::PaneRowPlace::InProgress) => {
                     self.sidebar_state.unfold_in_progress();
                 }
                 None => {}
@@ -1938,7 +1943,22 @@ impl Cagents {
             Some((project.id, row))
         })?;
         self.sidebar_state.reveal_project(project);
-        Some(row)
+        if let Some(pane) = pane
+            && self.visible_sidebar_rows().contains(&pane)
+        {
+            return Some(pane);
+        }
+        Some(match row {
+            sidebar::SelectionRow::Worktree(..)
+                if !self
+                    .sidebar_state
+                    .worktree_display(project)
+                    .shows_checkouts() =>
+            {
+                sidebar::SelectionRow::Project(project)
+            }
+            row => row,
+        })
     }
 
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
