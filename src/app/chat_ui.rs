@@ -117,7 +117,6 @@ mod text_copy;
 mod thumbnails;
 mod tool_text;
 mod tool_title;
-mod trailing;
 mod turn;
 mod view;
 mod virtualized;
@@ -400,6 +399,16 @@ pub enum Action {
     OpenImage(Target, String),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
+    /// A Markdown image came near the viewport and may need loading.
+    LoadFigure(Target, u64),
+    FigureLoaded(Target, u64, u64, images::figure::Outcome),
+    /// A while after a Markdown image could not be shown: it is looked at
+    /// again if it is still near the viewport.
+    RecheckFigure(Target, u64),
+    /// A Markdown image left the viewport, so coming back asks for it again.
+    FigureOutOfSight,
+    /// A click or context menu entry acting on a Markdown image.
+    Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
@@ -780,6 +789,11 @@ impl Action {
             Self::OpenImage(..) => "OpenImage",
             Self::LoadImage(..) => "LoadImage",
             Self::ImageLoaded(..) => "ImageLoaded",
+            Self::LoadFigure(..) => "LoadFigure",
+            Self::FigureLoaded(..) => "FigureLoaded",
+            Self::RecheckFigure(..) => "RecheckFigure",
+            Self::FigureOutOfSight => "FigureOutOfSight",
+            Self::Figure(..) => "Figure",
             Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
             Self::RetryThumbnails(..) => "RetryThumbnails",
             Self::CloseImage => "CloseImage",
@@ -896,6 +910,10 @@ impl Action {
                 | Self::ImageSaved(..)
                 | Self::AttachmentsPrepared(..)
                 | Self::ImageLoaded(..)
+                | Self::LoadFigure(..)
+                | Self::FigureLoaded(..)
+                | Self::RecheckFigure(..)
+                | Self::FigureOutOfSight
                 | Self::MarkdownPrepared(..)
                 | Self::LocalPromptPrepared(..)
                 | Self::ThumbnailLoaded(..)
@@ -1750,6 +1768,8 @@ struct CachedItem {
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
+    /// The conversation's Markdown images, which this item's images draw from.
+    figures: images::figure::Shared,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
     /// palette is the runtime's, applied when the block is highlighted, so a
@@ -1772,6 +1792,9 @@ struct CachedItem {
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
+    /// The decoded preview's pixel size, kept after its pixels are released
+    /// so the preview's room is held while they are read again.
+    image_size: Option<(u32, u32)>,
     /// What the step did to work with other agents, where it did.
     coordination: Option<Box<coordination::Coordinated>>,
     /// What a plain tool call's row says it did, read from its input once
@@ -1842,6 +1865,15 @@ fn recorded_message_stamp(
 }
 
 impl CachedItem {
+    /// Whether this item's Markdown, or Markdown it carries, shows an image.
+    fn shows_figures(&self) -> bool {
+        !self.markdown.images().is_empty()
+            || self.coordination.as_ref().is_some_and(|coordinated| {
+                coordinated
+                    .contents()
+                    .any(|content| !content.images().is_empty())
+            })
+    }
     /// Marks this message to be prepared again with the current labels, and
     /// gives the id to forget its preparation by. What is shown stays until
     /// the worker returns the relabelled text, as when the syntax theme
@@ -1910,6 +1942,7 @@ impl CachedItem {
             cached.image_attempt = previous.image_attempt;
             cached.image_wait = previous.image_wait.clone();
             cached.image_evicted = previous.image_evicted;
+            cached.image_size = previous.image_size;
         }
         cached
     }
@@ -2048,6 +2081,10 @@ impl CachedItem {
         let reader_context = previous
             .as_ref()
             .and_then(|cached| cached.reader_context.clone());
+        let figures = previous
+            .as_ref()
+            .map(|cached| cached.figures.clone())
+            .unwrap_or_default();
         let (
             image,
             image_source,
@@ -2057,6 +2094,7 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_size,
         ) = previous
             .as_ref()
             .filter(|cached| cached.token == ChangeToken::of(content))
@@ -2070,6 +2108,7 @@ impl CachedItem {
                     cached.image_attempt,
                     cached.image_wait.clone(),
                     cached.image_evicted,
+                    cached.image_size,
                 )
             })
             .unwrap_or_default();
@@ -2203,6 +2242,7 @@ impl CachedItem {
             flow_cache,
             reader_memory,
             reader_context,
+            figures,
             blocks: retained_blocks,
             palette_views: retained_palettes,
             open: None,
@@ -2216,6 +2256,7 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_size,
             coordination: coordination
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
                 .or(retained_coordination),
@@ -2928,6 +2969,8 @@ pub(super) struct Runtime {
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
+    /// The images answers' Markdown shows, decoded as they come into view.
+    figures: images::figure::Figures,
     child_picker: Option<child_navigation::Picker>,
     /// The child whose tab holds keyboard focus. The tab strip reports it, so
     /// the next frame keeps that tab mounted wherever its state sorts it.
@@ -4052,6 +4095,7 @@ impl Runtime {
             selected_subagent: None,
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
+            figures: Default::default(),
             child_picker: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
@@ -4933,6 +4977,7 @@ impl Runtime {
                     cached.diagnostic = true;
                     cached.item = Some(item.clone());
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     cache.insert(item.id.clone(), cached);
                     presentation_changed = true;
@@ -4953,6 +4998,7 @@ impl Runtime {
                         CachedItem::updated(&item.content, theme, previous, false, false, None);
                     cached.item = Some(item.clone());
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     cache.insert(item.id.clone(), cached);
                     presentation_changed = true;
@@ -5082,6 +5128,7 @@ impl Runtime {
                         cached.placeholder |= report_reveal;
                     }
                     cached.reader_memory = self.scroll_memory.clone();
+                    cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
                         // A saved row that waits is met again at the head of
@@ -5111,6 +5158,7 @@ impl Runtime {
                 });
             if let Some(cached) = cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
+                cached.figures = self.figures.shared(context.is_some());
                 cached.reader_context.clone_from(&context);
                 if matches!(item.content, ItemContent::Image { .. }) {
                     // Snapshot items are immutable. A retained Arc makes the
@@ -5165,6 +5213,7 @@ impl Runtime {
             }
             cached.item = Some(item.clone());
             cached.reader_memory = self.scroll_memory.clone();
+            cached.figures = self.figures.shared(context.is_some());
             cached.reader_context.clone_from(&context);
             cache.insert(item.id.clone(), cached);
             presentation_changed = true;
@@ -7774,14 +7823,15 @@ impl Cagents {
                 .into(),
         );
         Some(
-            widget::container(
+            widget::container(crate::interaction::overflow_fade_y(
                 widget::scrollable(
                     widget::column::with_children(content)
                         .spacing(6)
                         .padding(space::S),
                 )
                 .height(Length::Shrink),
-            )
+                design::base,
+            ))
             .max_height(180)
             .into(),
         )
@@ -9012,8 +9062,12 @@ impl Cagents {
         }
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
+        let offer = self.snapshot_offer(snapshot, true);
         if let Some(writer) = self.session.as_ref() {
-            writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
+            let accepted = writer
+                .offer_chat_identity(card, pending.candidate.id, current, offer)
+                .is_ok();
+            self.snapshot_offer_answered(accepted);
         }
     }
     /// Forgets a chat runtime whose card is going away for good.
@@ -10111,12 +10165,20 @@ impl Cagents {
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
-        let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
         // Send never re-arms unrelated quarantined workspace writes.
-        writer.replace_chat_identity(target.card, source.id, candidate, snapshot);
-        let receipt = writer.request_flush();
+        let offer = self.snapshot_offer(snapshot, true);
+        let writer = self.session.as_ref().expect("writer was checked above");
+        let accepted = writer
+            .offer_chat_identity(target.card, source.id, candidate, offer)
+            .is_ok();
+        self.snapshot_offer_answered(accepted);
+        let receipt = self
+            .session
+            .as_ref()
+            .expect("writer was checked above")
+            .request_flush();
         cosmic::task::future(async move {
             let result = match receipt {
                 Ok(receipt) => tokio::task::spawn_blocking(move || {
@@ -11420,6 +11482,14 @@ impl Cagents {
                     // start is still checked against the inventory, because a
                     // lost reply is not proof the daemon started nothing.
                     return self.retire_chat(target.card, result.ok(), Some(session));
+                }
+                // Drain replica-only debt while the current start phase still
+                // supplies the snapshot's admission projection. Recovery below
+                // can commit identity authority without a complete snapshot.
+                if matches!(self.chat_ui.phases.get(&target.card),
+                    Some(Phase::Starting(attempt)) if attempt.target == target)
+                {
+                    self.materialize_replica_snapshot();
                 }
                 let Some(Phase::Starting(mut attempt)) = self
                     .chat_ui
@@ -13855,6 +13925,25 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     images::request(runtime, &id);
                 }
+            }
+            Action::LoadFigure(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    return images::figure::load(runtime, id);
+                }
+            }
+            Action::FigureLoaded(target, id, attempt, outcome) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    return images::figure::complete(runtime, id, attempt, outcome);
+                }
+            }
+            Action::RecheckFigure(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    images::figure::recheck(runtime, id);
+                }
+            }
+            Action::FigureOutOfSight => {}
+            Action::Figure(target, id, command) => {
+                return self.figure_command(target, id, command);
             }
             Action::RetryThumbnails(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -22667,6 +22756,141 @@ mod tests {
         );
         assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
         assert!(app.chat_ui.channel_names[&target].pending);
+    }
+
+    #[test]
+    fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::repository::RepositoryId;
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit, ModelProject,
+            delta::{EditEffects, ViewChanges, ViewRevision},
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "repo".into(),
+                repository.clone(),
+                vec![],
+                vec![],
+            ));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: crate::model::ProjectKind::Git,
+            ordinal: 0,
+        }];
+        app.workspace_model.channels = vec![ModelChannel {
+            id: channel,
+            repository,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let scope = Scope::Channel(channel);
+        let before = View {
+            scope: scope.clone(),
+            revision: 17,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        };
+        app.workspace_model.views = vec![before.clone()];
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        app.shared_views
+            .initialize(scope.clone(), vec![pane.clone()]);
+        app.shared_views.attached.insert(card);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Current provider title".into());
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                session: Some(KNOWN_THREAD.into()),
+                title: Some((
+                    "Current provider title".into(),
+                    ChannelTitleSource::Provider,
+                )),
+                last_view: Some((channel, 17)),
+                pending: true,
+                ..Default::default()
+            },
+        );
+        let mut accepted = before.clone();
+        accepted.revision = 21;
+        accepted.panes[0].width_fraction = 0.68;
+        assert_eq!(
+            app.presentation_projection_ready(&before, &accepted, None),
+            Ok(())
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let update = ModelUpdate::Changed {
+            sequence: 18,
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 17,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Update {
+                    before: pane,
+                    pane: accepted.panes[0].clone(),
+                },
+            },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: 21,
+                    views: vec![accepted],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope,
+                        before: Some(17),
+                        after: Some(18),
+                    }],
+                    ..Default::default()
+                },
+            },
+        };
+        let (_, projection) = app.apply_workspace_model_update_projection(update);
+        assert!(matches!(projection, super::super::Projection::Chrome));
+        assert_eq!(app.durable.channels[0].title, "Current provider title");
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::SuggestConversationTitle { id, card: candidate, expected_revision: 21, title, .. }
+                if id == channel && candidate == card && title == "Current provider title")));
+        assert_eq!(
+            app.chat_ui.channel_names[&target].last_view,
+            Some((channel, 21))
+        );
     }
 
     #[test]

@@ -434,3 +434,284 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
     let live = directory(&host, &Authority::default(), Scope::All).unwrap();
     assert!(live.sessions.iter().all(|entry| entry.id != session.id));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
+    retained_identity_case(false, false, ProviderHome::Original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn confirmed_identity_retries_after_census_publication_failure() {
+    retained_identity_case(true, false, ProviderHome::Original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
+    retained_identity_case(false, true, ProviderHome::Original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_saves_confirmed_identity_after_provider_home_is_removed() {
+    retained_identity_case(false, true, ProviderHome::Removed);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_saves_confirmed_identity_after_provider_home_is_replaced() {
+    retained_identity_case(false, true, ProviderHome::Replaced);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderHome {
+    Original,
+    Removed,
+    Replaced,
+}
+
+#[cfg(target_os = "linux")]
+fn retained_identity_case(
+    fail_census: bool,
+    shutdown_before_confirmation: bool,
+    home: ProviderHome,
+) {
+    if super::retained_automation::isolated_retained() {
+        return;
+    }
+    fn wait(mut condition: impl FnMut() -> bool, reason: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{reason}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let (host, mut request, path) = fixture();
+    request.prompt = "HOLD_CLEANUP_BUSY".into();
+    let root = path.parent().unwrap();
+    let proof = host.lock().unwrap().proof().clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = crate::host::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let store = registry(&host).unwrap();
+    wait(
+        || {
+            store
+                .lock()
+                .unwrap()
+                .agent(accepted.agent.id)
+                .unwrap()
+                .session
+                .is_some()
+        },
+        "agent never bound its provider",
+    );
+    let session = store
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap();
+    let id = session.id();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle
+        .actor_identity()
+        .expect("real retained Claude helper");
+    assert!(
+        host.lock().unwrap().chats[&id]
+            .subscribers
+            .iter()
+            .all(|(client, visible)| *client == EXECUTION_CLIENT && !visible),
+        "no window displayed this chat"
+    );
+    wait(
+        || root.join("cleanup-busy").exists(),
+        "provider never reached its confirmation fence",
+    );
+    assert!(handle.confirmed_session_id().is_none());
+    let HostedSession::Chat(unconfirmed) = &session else {
+        panic!("managed native conversation");
+    };
+    assert!(unconfirmed.launch.session_id.is_none());
+    let pane_id = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
+    // Model an existing saved pane without displaying or attaching its chat.
+    // The fixture only publishes the initial, still-unconfirmed descriptor.
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: accepted.agent.placement.clone(),
+            closed: vec![],
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Unshown managed conversation".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: crate::model::CardKind::Chat(unconfirmed.clone()),
+                scope: None,
+            }],
+        })
+        .unwrap();
+    let saved_pane = || {
+        let (descriptor, provider_session): (String, Option<String>) = db
+            .query_row(
+                "SELECT descriptor, provider_session FROM panes WHERE id=?1",
+                [pane_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let crate::model::CardKind::Chat(pane) = serde_json::from_str(&descriptor).unwrap() else {
+            panic!("saved chat pane");
+        };
+        (pane, provider_session)
+    };
+    let (before, provider_session) = saved_pane();
+    assert!(before.launch.session_id.is_none());
+    assert!(provider_session.is_none());
+    if fail_census {
+        // Install the fault after ordinary model edits validate the published
+        // schema, and before the provider can publish its confirmed identity.
+        db.execute_batch("CREATE TRIGGER reject_confirmed_census BEFORE UPDATE ON native_actor_ownerships WHEN json_extract(NEW.ownership, '$.source.launch.session_id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture census publication failure'); END;").unwrap();
+    }
+    if shutdown_before_confirmation {
+        let (terminals, _) = host.lock().unwrap().graceful_shutdown();
+        assert!(terminals.is_empty());
+        wait(
+            || !crate::host::chat::retained_actor::broker_running(&host),
+            "background broker did not stop before confirmation",
+        );
+        assert!(host.lock().unwrap().shutting_down);
+        if home != ProviderHome::Original {
+            std::fs::rename(root.join("home/.claude"), root.join("home/original-claude")).unwrap();
+            if home == ProviderHome::Replaced {
+                std::fs::create_dir(root.join("home/.claude")).unwrap();
+            }
+        }
+    }
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    wait(
+        || handle.confirmed_session_id().is_some(),
+        "provider never confirmed its conversation",
+    );
+    let confirmed = handle.confirmed_session_id().unwrap();
+    if home == ProviderHome::Original {
+        save_claude_transcript(&host, id, root);
+    }
+    if shutdown_before_confirmation {
+        let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+        assert!(
+            matches!(agent.session, Some(HostedSession::Chat(source)) if source.launch.session_id.is_none()),
+            "the stopped broker must leave confirmation for synchronous shutdown"
+        );
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
+    // No window publishes the later confirmed descriptor.
+    wait(
+        || {
+            let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+            matches!(agent.session, Some(HostedSession::Chat(saved)) if saved.launch.session_id.as_deref() == Some(confirmed.as_str()))
+        },
+        "daemon never persisted the confirmed conversation ID",
+    );
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    if fail_census {
+        let ownership = store
+            .lock()
+            .unwrap()
+            .native_actor_ownership(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ownership.source().launch.session_id,
+            None,
+            "the injected census write must fail after agent adoption"
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .agent_run(accepted.run.id)
+                .unwrap()
+                .state
+                .is_terminal(),
+            "uncommitted identity must not acknowledge the run outcome"
+        );
+        db.execute_batch("DROP TRIGGER reject_confirmed_census;")
+            .unwrap();
+    }
+    wait(
+        || {
+            store
+                .lock()
+                .unwrap()
+                .native_actor_ownership(identity.instance)
+                .unwrap()
+                .unwrap()
+                .source()
+                .launch
+                .session_id
+                .as_deref()
+                == Some(confirmed.as_str())
+        },
+        "confirmed census publication was not retried",
+    );
+    let ownership = store
+        .lock()
+        .unwrap()
+        .native_actor_ownership(identity.instance)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ownership.owner(), &identity.record);
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let (pane, provider_session) = saved_pane();
+    assert_eq!(pane.launch.session_id.as_deref(), Some(confirmed.as_str()));
+    assert_eq!(provider_session.as_deref(), Some(confirmed.as_str()));
+    // Use the daemon's real stop boundary, then reopen only its durable model.
+    if !shutdown_before_confirmation {
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
+    assert!(!handle.owns_work());
+    wait(
+        || !identity.record.root.is_current() && !identity.record.holder.is_current(),
+        "daemon stop left retained processes alive",
+    );
+    if home != ProviderHome::Original {
+        let retirement = store
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retirement.scope(), handle.launch_account_scope());
+        assert_eq!(retirement.confirmed_session(), Some(confirmed.as_str()));
+        return;
+    }
+    let mut restarted = HostState::new(proof);
+    restarted.install_model(Registry::at(&path).unwrap());
+    assert!(restarted.chats.is_empty());
+    let restarted = Arc::new(crate::host::state::HostLock::new(restarted));
+    for query_id in [id.to_string(), confirmed[..8].to_owned()] {
+        let page = read(
+            &restarted,
+            &Authority::default(),
+            query(&query_id, None, 10),
+        )
+        .unwrap();
+        assert!(page.session.exited);
+        assert!(
+            matches!(&page.entries.last().unwrap().content, Content::User(text) if text.text == "Now open a PR")
+        );
+    }
+}
