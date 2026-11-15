@@ -754,10 +754,11 @@ class Jobserver(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def compiling(self, jobservers, seconds=2):
+    def compiling(self, jobservers, seconds=2, *, include_queued=False):
         """How many tokens each build held on average over the last two
         thirds of `seconds`, with its compilers ending a job now and then and
-        starting as many as they can."""
+        starting as many as they can. Include its private pipes when measuring
+        allocation fairness, rather than the compilers' token utilization."""
         stop = threading.Event()
         samples = [[] for _ in jobservers]
 
@@ -767,7 +768,10 @@ class Jobserver(unittest.TestCase):
                     self.give_back(jobserver, 1)
                 with contextlib.suppress(BlockingIOError):
                     jobserver.client.held += len(os.read(jobserver.client.reader, self.TOKENS))
-                held.append(jobserver.client.held)
+                count = jobserver.client.held
+                if include_queued:
+                    count += waiting(jobserver.give) + waiting(jobserver.back)
+                held.append(count)
                 time.sleep(0.01)
 
         workers = [threading.Thread(target=compile, args=pair) for pair in zip(jobservers, samples)]
@@ -784,9 +788,10 @@ class Jobserver(unittest.TestCase):
         first = self.join()
         self.take(first, self.TOKENS)
         second = self.join()
-        first_held, second_held = self.compiling([first, second])
-        self.assertGreaterEqual(second_held, self.TOKENS / 2 - 1, (first_held, second_held))
-        self.assertGreaterEqual(first_held, self.TOKENS / 2 - 1, (first_held, second_held))
+        first_tokens, second_tokens = self.compiling([first, second], include_queued=True)
+        self.assertGreaterEqual(second_tokens, self.TOKENS / 2 - 1, (first_tokens, second_tokens))
+        self.assertGreaterEqual(first_tokens, self.TOKENS / 2 - 1, (first_tokens, second_tokens))
+        self.assertLess(abs(first_tokens - second_tokens), 1, (first_tokens, second_tokens))
 
     def test_a_build_alone_in_wanting_more_gets_what_the_others_leave(self):
         self.at_build_pace()
