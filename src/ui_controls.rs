@@ -8,6 +8,8 @@ mod culled_column;
 pub use culled_column::{CulledColumn, culled_column, keep_in_place};
 mod display;
 mod editable;
+mod fade_text;
+pub use fade_text::{FadeEdge, FadeText, fade_line, fade_text};
 pub mod field;
 mod find_options;
 pub use find_options::{FindOption, find_options};
@@ -24,6 +26,8 @@ mod pull_request_state;
 mod responsive;
 mod shrinkable;
 mod tabs;
+mod trailing;
+pub use trailing::trailing;
 
 pub use display::{badge, change_counts, comment_card};
 #[cfg(test)]
