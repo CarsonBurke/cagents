@@ -821,7 +821,8 @@ mod tests {
         require_current(&registry.db).unwrap();
         let model = registry.model().unwrap();
         assert_eq!(model.identity.to_string(), identity);
-        assert_eq!(model.sequence, 7);
+        // New source bindings advance the watermark once, fencing old gestures.
+        assert_eq!(model.sequence, 8);
         assert_eq!(model.channels[0].id, channel);
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
         assert_eq!(view.revision, 9);
@@ -1329,7 +1330,7 @@ mod tests {
             );
             // This current opener also applies retention20, run-attention21,
             // history22, the empty console recovery ledger24 and session
-            // channel history25.
+            // channel history25 and source bindings26.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1343,6 +1344,7 @@ mod tests {
                 "automation_firing_successors",
                 "console_relaunches",
                 "session_channels",
+                "terminal_pane_bindings",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1359,6 +1361,7 @@ mod tests {
                 "automation_retired_manual_requests",
                 "console_relaunches",
                 "session_channels",
+                "terminal_pane_bindings",
             ] {
                 assert_eq!(
                     registry
@@ -1385,7 +1388,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects, the console ledger and the exact history column may be added"
+                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger and the exact history column may be added"
             );
             assert!(
                 registry
