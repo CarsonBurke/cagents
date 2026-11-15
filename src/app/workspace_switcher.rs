@@ -976,23 +976,35 @@ impl Cagents {
         let project = row
             .project
             .and_then(|project| self.sidebar_model.project(project));
-        // What kind of workspace the row is, in the sidebar's glyphs: a
-        // project's own row carries its chip, and a worktree or channel row
-        // its kind, leaving the project to the caption.
-        let glyph = |handle: widget::icon::Handle| -> Element<'a, Message> {
-            widget::container(widget::icon(handle).size(design::ROW_ICON_SIZE))
+        // What kind of workspace the row is, drawn as the sidebar draws it:
+        // a worktree's pull request or branch, a channel's chat. A folder of
+        // its own carries its project's chip, and the caption names the
+        // project for the rest. The list draws every row at full strength.
+        let glyph = |kind| -> Element<'a, Message> {
+            sidebar::row_glyph(kind, sidebar::RowInk::Full, design::ROW_ICON_SIZE)
                 .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
                 .into()
         };
         let chip = match (row.destination, project) {
             (WorkspaceDestination::Folder(_), Some(project)) => sidebar::project_chip(project),
-            (WorkspaceDestination::Folder(_), None) => {
-                glyph(widget::icon::from_name("folder-symbolic").handle())
+            (WorkspaceDestination::Folder(_), None) => widget::container(
+                widget::icon::from_name("folder-symbolic").size(design::ROW_ICON_SIZE),
+            )
+            .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
+            .into(),
+            (WorkspaceDestination::Worktree(id), project) => {
+                match project
+                    .and_then(|project| project.worktrees.iter().find(|worktree| worktree.id == id))
+                {
+                    Some(worktree) => glyph(sidebar::WorkspaceGlyph::Worktree(worktree)),
+                    None => widget::container(
+                        widget::icon(sidebar::worktree_icon()).size(design::ROW_ICON_SIZE),
+                    )
+                    .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
+                    .into(),
+                }
             }
-            (WorkspaceDestination::Worktree(_), _) => glyph(sidebar::worktree_icon()),
-            (WorkspaceDestination::Channel(_), _) => {
-                glyph(crate::ui_controls::Icon::Channel.handle())
-            }
+            (WorkspaceDestination::Channel(_), _) => glyph(sidebar::WorkspaceGlyph::Channel),
         };
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())
