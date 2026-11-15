@@ -126,8 +126,10 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
 VERSION=$(jq -er '.packages[] | select(.name == "cagents") | .version' <<< "$metadata")
 editor_version=$(jq -er '.packages[] | select(.name == "ceditor") | .version' <<< "$metadata")
+application_version=$(jq -er '.packages[] | select(.name == "cagents-ui") | .version' <<< "$metadata")
 [[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'expected a stable version'
 [[ $editor_version == "$VERSION" ]] || fail 'cagents and ceditor versions must match'
+[[ $application_version == "$VERSION" ]] || fail 'cagents and cagents-ui versions must match'
 # Explicit commits and branches are useful for pre-release verification, while
 # a selected version tag may never disagree with the exported manifests.
 case $SOURCE_REF in
@@ -164,8 +166,10 @@ retained_actor_helper=$(python3 scripts/build-ceditor-product cagentsd \
 CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
     cargo test --locked --profile release-test --no-default-features --features host --all-targets
 cargo test --locked --profile release-test --no-default-features --features ui --all-targets
+cargo test --locked --profile release-test --package cagents-ui --all-targets
 cargo test --locked --profile release-test --package ceditor --all-targets
 cargo test --locked --profile release-test --features integrated-browser --all-targets
+cargo test --locked --profile release-test --package cagents-ui --features integrated-browser --all-targets
 ./scripts/package-linux.sh --variant full
 ./scripts/package-linux.sh --variant browserless
 ./scripts/package-ceditor-linux.sh

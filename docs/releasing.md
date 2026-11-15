@@ -37,15 +37,16 @@ Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally,
 then build:
 
 ```sh
-./scripts/build-release-linux --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
+mise run release:build -- --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
 ```
 
-Run `./scripts/build-release-linux --help` for the cache location and other
-details. `CARGO_BUILD_JOBS` defaults to one job per CPU, limited to one per 2 GiB of
-available memory; set it lower on a shared host. Tests run two at a time. Download and build temporary files stay in
-its private disk cache rather than a RAM-backed `/tmp`. The cache also keeps
-one checkout of the source, and each build rewrites only the files that changed,
-so Cargo recompiles only the crates they belong to.
+`release:build` runs `scripts/build-release-linux`; its `--help` gives the cache
+location and other details. `CARGO_BUILD_JOBS` defaults to one job per CPU,
+limited to one per 2 GiB of available memory; set it lower on a shared host.
+Tests run two at a time. Download and build temporary files stay in its private
+disk cache rather than a RAM-backed `/tmp`. The cache also keeps one checkout of
+the source, and each build rewrites only the files that changed, so Cargo
+recompiles only the crates they belong to.
 
 ## Native integrated browser capability smoke
 
@@ -131,7 +132,7 @@ contract remain Linux-specific until a qualified target has its own contract.
 Verify first, then publish:
 
 ```sh
-./scripts/publish-release --version 0.1.2 --dist /var/tmp/cagents-v0.1.2 --verify-only
+mise run release:verify -- --version 0.1.2 --dist /var/tmp/cagents-v0.1.2
 gh auth login --hostname github.com
 ./scripts/publish-release --version 0.1.2 --dist /var/tmp/cagents-v0.1.2
 ```
@@ -157,8 +158,8 @@ variants to compare their measurement reports without either overwriting the
 other:
 
 ```sh
-./scripts/package-linux.sh --variant full
-./scripts/package-linux.sh --variant browserless
+mise run package -- --variant full
+mise run package -- --variant browserless
 cat dist/cagents-"${VERSION}"-sizes.txt \
   dist/cagents-browserless-"${VERSION}"-sizes.txt
 ```

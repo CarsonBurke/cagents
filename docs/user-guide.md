@@ -142,8 +142,16 @@ determine which models and permission modes are available.
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Activate panes on hover** is off by default. When enabled, it previews the
-  pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
+- **Focus follows mouse** is on by default: resting the pointer on a pane for
+  300 ms focuses it, without scrolling, and puts the keyboard in its message
+  input, terminal or editor. Typing, clicking or dragging during the dwell
+  cancels it, and an open chat menu or picker, dialog or palette suppresses it.
+  Turn it off in **Settings > General > Workspace** to focus panes only by
+  clicking them or with pane navigation.
+- Focusing a chat pane in any way, by clicking it, navigating to it, switching
+  channel or opening a new or resumed chat, puts the keyboard in its message
+  input with the draft and caret where you left them. Typing while a chat pane
+  is focused but its input is not sends the text to the input.
 - Hold **Alt+Tab** to switch workspace. Recently used worktrees and channels
   come first, then the rest in sidebar order; a quick tap goes back to the
   previous one. **Tab**, **Shift+Tab** and the arrow keys move the selection;
@@ -165,12 +173,32 @@ determine which models and permission modes are available.
 
 ## Inspector and source control
 
-The right-hand inspector has icon tabs for **Files**, **Changes**, **Pull
-request**, and **Details**; the sidebar toggle hides or reveals it.
+The right-hand inspector stacks collapsible sections; the sidebar toggle hides
+or reveals it. Each header counts what its section holds, so a collapsed one
+still reads at a glance, and the inspector remembers which are expanded.
+
+- **Pull requests** lists the PRs the focused conversation worked on (see
+  [A conversation's pull requests](#a-conversations-pull-requests)). It appears
+  once there is one.
+- **Worktrees** lists the other worktrees the conversation edited, most
+  recently edited first: those whose branch heads no PR it worked on, such as
+  the default branch. Each row shows its branch, uncommitted changes
+  (untracked files included) and their line counts. The row for the current
+  worktree says so; choosing another opens it, which moves the workspace to
+  that worktree.
+- **Source control** and **Files** share one section, titled for the view
+  shown, behind a switch in its header; both show the current worktree. It starts collapsed while the sections
+  above have something to show, and is always shown when they have nothing.
+  A folder that is not a Git worktree has only **Files**.
+- With an editor focused, **Problems** lists its language server's
+  diagnostics, and a references or definitions request lists its results.
+  Neither appears while there is nothing to show.
+
+The Source control and Files views:
 
 - **Files** browses the selected worktree and can list untracked, nonignored
   file names.
-- **Changes** provides diffs, staging, commits, push/publish, and history. Its
+- **Source control** provides diffs, staging, commits, push/publish, and history. Its
   views are **Changes** (staged, unstaged, and untracked files), **Branch**
   (everything changed since the merge base with the default branch), and
   **History** (commits, their changed files, and diffs against the first
@@ -182,9 +210,6 @@ request**, and **Details**; the sidebar toggle hides or reveals it.
   A running Git command keeps its progress and blocks another command in that
   worktree until it finishes, including after leaving and returning.
   `Ctrl+Enter` commits when either field is focused and staged changes are ready.
-- **Pull request** inspects the worktree's matching PR, grouping description,
-  checks, and discussion in collapsible sections.
-- **Details** follows the focused pane.
 
 File lists support **Tree** and **Flat** modes, and filters open from their
 search icons. Change rows color their status and line counts and swap them for
@@ -408,42 +433,39 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
-## Channel work
+## A conversation's work
 
-Open a channel and choose **Work** beside **Conversations** to see the PRs
-tracked in that channel. Return to **Conversations** to use its terminals and
-chats. Changing this view keeps those sessions running.
+The inspector's **Work** section lists what the focused conversation worked
+on: each pull request it created, pushed, edited or checked out, and each
+worktree it edited whose branch heads none of them. Nobody declares them:
+cagents reads them from what the conversation and its subagents did, such as
+`gh pr create` output, pushed branches, checkouts, reviews, and PR links or
+`#123` references. The list updates on its own; there is nothing to refresh.
 
-Use **Track PR…** to enter the forge host, repository and PR number, or type or
-paste a full PR URL into **Repository**. The URL stays editable while the host
-and number update. Editing the host or number switches to separate identity
-fields. Review the identity and choose the channel's role before submitting:
+A row's glyph is the PR's state: open, draft, merged or closed. An open PR's
+row ends with a glyph for its checks, the worst of them, and one for its
+review decision, as the board shows them; hover either for the detail.
+Beneath its title, the row gives how many files its worktree has not
+committed yet, the lines it adds and removes, and why it is listed. A PR in
+another repository names that repository beneath its title. When GitHub can't
+be reached, rows keep their last known state and say when it was read.
 
-| Role | Meaning |
-| --- | --- |
-| **Contributing** | Declared implementation work |
-| **Stewarding** | Responsibility for progressing the work |
-| **Review only** | Reviewing without claiming implementation |
-| **Reference** | Related context without claiming ownership |
+The **Changes** and **Files** section below shows one piece of work: its header
+names which while it is collapsed, and its first row once it is open. Choose a
+row to show it there. Until you do, it shows the worktree the conversation runs
+in, else the first work checked out in Projects.
+Work whose worktree isn't in Projects says so in place of changes, rather than
+showing another worktree's.
+Choosing work changes only what the inspector shows; the sidebar keeps its
+selection, and each conversation keeps its choice while cagents runs. The
+chosen PR also lists its checks, the ones most in need of
+attention first; choose a check to open its page, or **Open pull request** to
+open it where **Settings → Open pull requests in** says: the review pane, or
+GitHub. A PR with no worktree here says so in place of changes.
 
-**Working on** groups contributions and stewardship. **Reviews and references**
-keeps related PRs separate. A channel can track several PRs, including PRs in
-different repositories or forks. Checking out a branch does not declare a
-contribution, and switching branches or removing a checkout does not move the
-channel's tracked work.
-
-PR observations show when they were last read. **Refresh** checks tracked PRs;
-an unavailable forge preserves the previous observation. Closed, merged and
-ended work remains in **History**. Confirm a fresh work role before an earlier
-contribution to a reopened PR counts as ongoing work again. A new review alone
-does not restart that contribution. Page counts describe only the loaded
-pages; use the current-page and history controls to browse further.
-
-**Change role** corrects a relation, and **End tracking** moves it to history.
-Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
-Submitted changes continue independently of the view. If a result is
-unconfirmed, use **Check result** or **Retry original change**; retry preserves
-the original target, role and operation.
+PRs the conversation only mentioned are left out unless **Settings →
+Appearance → Mentioned pull requests** is on. They then fold under
+**Mentioned** at the foot of the list; choose one to open it.
 
 ## Work board
 
@@ -626,13 +648,29 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**Run history** includes runs from removed definitions. It pages through
-their original names, times, outcomes, and bounded results. Opening history does
-not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. A completion alert
-opens its run under **Automations**, with a trail back to the list, and
-survives provider cleanup. Removing a definition prevents future runs and
-retains its past runs.
+**Run history** pages through original names, times, outcomes, and bounded
+results. Consecutive scheduled skips with the same reason share one entry
+showing how many times the schedule was skipped and the first and last times, so
+a run waiting for you stays near the top instead of behind pages of skips. A
+manual request, a successful run, a different reason, or a change to what the
+automation runs starts another entry. A name-only edit keeps a group's original
+name. Time the daemon was not running is summarized without a count, because
+those times were never individually recorded.
+
+Each automation keeps up to 500 finished entries. Runs still in progress or
+needing your attention stay however old they are. A removed automation's
+finished entries are kept for 30 days and then deleted; its saved definition and
+agent sessions stay, so this limits history, not total storage. Opening an alert
+or entry whose details were already removed says they are no longer available.
+An old manual request ID still cannot run again when its details expire: retries
+report that the original request was recorded. Use a new request ID only for an
+intentional new run.
+
+Opening history does not start or attach a provider. **Open agent** explicitly
+opens a still-live session; retained completed sessions remain readable in
+history. A completion alert opens its run under **Automations**, with a trail
+back to the list, and survives provider cleanup. Removing a definition prevents
+future runs without bypassing active ownership or cleanup.
 
 The same operations are available without a window:
 
@@ -1006,18 +1044,44 @@ is also removed for provider/version compatibility.
 `CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
 `~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
 Every cagents terminal and conversation exports its account's home, and one on
-a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
-cagents window, daemon, or `cagents` command started from one - by you or by an
-agent - ignores a variable that still holds the listed home, or any path inside
-a cagents `accounts/<provider>/<id>` directory, when deciding the system
-default. A daemon started before this protection keeps its environment until it
-restarts.
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`.
+The one exception is Claude's default home: unless cagents was started with
+`CLAUDE_CONFIG_DIR`, a terminal, conversation or sign-in on the System default
+Claude login leaves `CLAUDE_CONFIG_DIR` unset, as your own shell does, whichever
+cagents process starts it. Claude Code keeps who a login is in `~/.claude.json`,
+and an explicit `CLAUDE_CONFIG_DIR=~/.claude` moves that record to
+`~/.claude/.claude.json` instead, although history and credentials stay in
+`~/.claude` either way. If you set it yourself, cagents keeps it and uses that
+record too. Its terminals and conversations then list it in
+`CAGENTS_SYSTEM_HOMES`, so a cagents window, daemon or command started from
+them keeps it as well, provided the cagents daemon was started with the same
+setting; restart the daemon after changing it. Earlier versions of cagents
+exported it for every launch, so their conversations kept a second record;
+conversations saved then still resume with the setting they started with, and
+can rewrite that record.
+A cagents window, daemon, or `cagents` command started from a cagents terminal
+or conversation - by you or by an agent - ignores a variable that still holds
+the listed home, any path inside a cagents `accounts/<provider>/<id>`
+directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
+exported, when deciding the system default. A daemon started before this
+protection keeps its environment until it restarts.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one
 it was added with (the recorded login is kept; sign that account in again to
 accept the new one, or remove it), and **Same home** or **Same login** when two
 rows are the same directory or signed in to the same login.
+
+**Identity conflict** means a row's login is not known to be the one it names.
+On the System default Claude login, the two records described above name
+different logins: the row names one and lists the other beneath it, its figures
+may be either one's, and **Sign in again** settles it. Signing in again from
+your own terminal settles it as well when it changes the login `~/.claude.json`
+names. On another row, it reports the same login as a row whose records
+disagree, or as a row whose weekly limit resets at a different time, which one
+login's could not; **Sign in again** on a row whose limit differs settles which
+login it is. Neither row offers **Archive duplicate**, and neither prevents a
+new sign-in to that login.
 
 For an unchanged **Same login** row, its menu offers **Archive duplicate**.
 This hides the extra account from choices without signing out or deleting its
@@ -1027,6 +1091,15 @@ own login). To restore an archived account, link its existing home again.
 New managed sign-ins cannot duplicate a listed system, managed, or linked login.
 The account picker compares weekly allowances consistently; the status bar still
 highlights the limit currently constraining the selected account.
+
+A Claude account's **Weekly · Fable** row is Fable's own weekly allowance.
+Reaching it stops only Fable: the account's other models keep working, so a
+conversation can switch model rather than account. Some Claude accounts also
+hold Fable resets, which give back what Fable used this week. Claude Code
+offers them only in its own terminal, through `/limit-reset`, and reports how
+many an account holds only there, so cagents does not show that count. After
+you use one, the Fable and Weekly rows show the new figures at the account's
+next usage check, or as soon as a conversation on that account runs Fable.
 
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies
