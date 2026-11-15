@@ -1935,7 +1935,6 @@ mod tests {
                 snapshot.notices.extend(replacement_snapshot.notices);
                 drop(app.update_notifications(Action::Snapshot(snapshot)));
                 app.core.set_main_window_id(Some(window::Id::RESERVED));
-                app.context_inspector_open = false;
                 app.refresh_ui.focused = true;
                 drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
                 let previous_epoch = app.attention_focus_epoch;
@@ -2011,7 +2010,6 @@ mod tests {
         let notice = snapshot.notices[0].id;
         drop(app.update_notifications(Action::Snapshot(snapshot)));
         app.core.set_main_window_id(Some(window::Id::RESERVED));
-        app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         let previous_epoch = app.attention_focus_epoch;
@@ -2059,7 +2057,6 @@ mod tests {
         let notice = snapshot.notices[0].id;
         drop(app.update_notifications(Action::Snapshot(snapshot)));
         app.core.set_main_window_id(Some(window::Id::RESERVED));
-        app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         let epoch = app.attention_focus_epoch;
