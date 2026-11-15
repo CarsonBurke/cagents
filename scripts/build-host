@@ -5,14 +5,16 @@ Each build waits for its share of the memory set aside for builds, then runs
 in a systemd scope in background-cagents.slice. That slice sits in the user
 manager's background.slice, whose CPU weight is below interactive work and
 tests, and its memory is capped as a whole, so the kernel throttles builds
-before they push everything else into swap. Every
-build joins one GNU make jobserver, which bounds how many compiler jobs run
-on the host at once: a lone build uses every CPU, and several share them,
-without waiting for each other to start. Tests run after their build has
+before they push everything else into swap. Every build draws from one pool of
+GNU make jobserver tokens, which bounds how many compiler jobs run on the host
+at once: a lone build uses every CPU, and several share them, without waiting
+for each other to start. Tests run after their build has
 given its share back, in app-cagents-test.slice under memory-capped.
 
 Without a systemd user manager, or with CAGENTS_BUILD_SCOPE=0, builds still
-wait for their shares but run in place, each with its own Cargo jobs.
+wait for their shares but run in place, each with its own Cargo jobs. A build
+started within another's shares runs in place too, in that build's scope and
+with its jobserver.
 """
 import array
 import contextlib
@@ -23,6 +25,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -58,24 +61,20 @@ Environment:
   CAGENTS_BUILD_SCOPE=0
                        Run builds in place, without a scope or the jobserver
   CAGENTS_BUILD_JOBSERVER
-                       The jobserver's unit and directory name, for tests
+                       The jobserver's directory, for tests
+                       (default /run/user/UID/cagents-jobserver)
 """
 HERE = os.path.dirname(os.path.realpath(__file__))
 SHARE = 4 * 2**30
-# Builds and the jobserver go in systemd's background.slice, whose CPUWeight
-# of 30 is below the 100 of app.slice, where agent sessions, the desktop's
-# applications and tests run.
+# Builds go in systemd's background.slice, whose CPUWeight of 30 is below the
+# 100 of app.slice, where agent sessions, the desktop's applications and tests
+# run.
 BUILD_SLICE = "background-cagents.slice"
 TEST_SLICE = "app-cagents-test.slice"
-# Raise when the jobserver's behaviour changes: a holder of another version
-# keeps serving the builds that joined it, and new builds start their own.
-JOBSERVER_VERSION = 1
-# How often the jobserver looks for returned and lost tokens, how long a
-# generation may have tokens out before builds move on to a fresh one, and
-# how long it waits idle before exiting.
-TICK = 2.0
-ROTATE = 60.0
-IDLE_EXIT = 900.0
+# How often build-host restocks its build's tokens from the pool.
+TOKEN_TICK = 0.02
+# Cargo's short names for what this splits.
+ALIASES = {"t": "test", "r": "run"}
 # Marks a command run by a build that holds shares, for the gates it starts.
 HELD_MARK = "CAGENTS_BUILD_SLOT_HELD"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
@@ -225,69 +224,115 @@ def prepare_slice():
     return True
 
 
-def jobserver_name():
-    """The jobserver's unit and directory name; a test names its own."""
-    return os.environ.get("CAGENTS_BUILD_JOBSERVER") or f"cagents-jobserver-{JOBSERVER_VERSION}"
-
-
 def jobserver_directory():
-    return f"/run/user/{os.getuid()}/{jobserver_name()}"
+    return os.environ.get("CAGENTS_BUILD_JOBSERVER") or f"/run/user/{os.getuid()}/cagents-jobserver"
 
 
-def jobserver_alive(directory):
-    try:
-        with open(os.path.join(directory, "pid")) as file:
-            pid = int(file.read())
-        with open(f"/proc/{pid}/cmdline", "rb") as file:
-            return os.fsencode(directory) in file.read().split(b"\0")
-    except (OSError, ValueError):
-        return False
+def pending(descriptor):
+    """How many tokens wait in the pipe `descriptor`."""
+    count = array.array("i", [0])
+    fcntl.ioctl(descriptor, termios.FIONREAD, count)
+    return count[0]
 
 
-def join_jobserver():
-    """Open descriptors on the host's jobserver and its path, starting it if
-    need be, or None. The descriptors, which the build inherits, hold a
-    shared lock on the generation's users file: while any process of the
-    build is alive, the jobserver counts the generation in use."""
-    directory = jobserver_directory()
-    for _ in range(3):
-        if not jobserver_alive(directory):
+def drain(descriptor):
+    while True:
+        try:
+            if not os.read(descriptor, 4096):
+                return
+        except BlockingIOError:
+            return
+
+
+class Jobserver:
+    """A build's place in the host's jobserver.
+
+    The host's tokens wait in a pool, a named pipe holding one for each CPU.
+    A build does not read the pool itself: it gets a pipe of its own, which
+    this keeps stocked from the pool while the build runs. When the build
+    has taken what its pipe held, more follows, and what it gives back beyond
+    what it is likely to take again returns to the pool. When the build
+    ends, however it ends, every token taken for it goes back, including any
+    its processes held when they were killed.
+
+    Only build-host processes hold the pool open, each with a shared lock on
+    its users file. A pipe's contents go with the last process holding it
+    open, so a build that finds no other using the pool fills it afresh,
+    which also makes up what a killed build-host could not give back."""
+
+    def __init__(self, directory, tokens):
+        self.tokens = tokens
+        self.users = self.pool = self.own = self.directory = None
+        try:
             os.makedirs(directory, mode=0o700, exist_ok=True)
-            # The jobserver runs a copy of this file, which no checkout or
-            # installation replaces under it.
-            copy = os.path.join(directory, "build-host")
-            with open(__file__, "rb") as source, open(copy + ".new", "wb") as target:
-                target.write(source.read())
-            os.replace(copy + ".new", copy)
-            # Another build may have started it meanwhile; it serves both.
-            subprocess.run(
-                ["systemd-run", "--user", "--quiet", "--collect", f"--slice={BUILD_SLICE}",
-                 f"--unit={jobserver_name()}",
-                 sys.executable, "-I", copy, "serve", directory, str(os.cpu_count() or 1)],
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=30, env=manager_environment())
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            users = descriptor = None
+            with open(os.path.join(directory, "join"), "a") as join:
+                # One build joins at a time, so none sees another's refill.
+                fcntl.flock(join, fcntl.LOCK_EX)
+                self.users = os.open(os.path.join(directory, "users"), os.O_RDONLY | os.O_CREAT, 0o600)
+                path = os.path.join(directory, "pool")
+                with contextlib.suppress(FileExistsError):
+                    os.mkfifo(path, 0o600)
+                self.pool = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+                if not stat.S_ISFIFO(os.fstat(self.pool).st_mode):
+                    raise OSError(f"{path} is not a named pipe")
+                try:
+                    fcntl.flock(self.users, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    drain(self.pool)
+                    os.write(self.pool, b"+" * tokens)
+                fcntl.flock(self.users, fcntl.LOCK_SH)
+            self.directory = tempfile.mkdtemp(prefix="build-", dir=directory)
+            self.path = os.path.join(self.directory, "fifo")
+            os.mkfifo(self.path, 0o600)
+            self.own = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        except BaseException:
+            self.close_descriptors()
+            raise
+        self.taken = 0
+        self.reserve = 1
+        self.stopping = threading.Event()
+        self.stocker = threading.Thread(target=self.stock, daemon=True)
+        self.stocker.start()
+
+    def stock(self):
+        """Keeps `reserve` tokens in the build's pipe: twice as many after
+        the build took them all, and half as many after it left some."""
+        while not self.stopping.wait(TOKEN_TICK):
+            level = pending(self.own)
+            if level == 0:
+                self.reserve = min(2 * self.reserve, self.tokens)
+            else:
+                self.reserve = max(1, self.reserve // 2)
             try:
-                path = os.path.realpath(os.path.join(directory, "current"), strict=True)
-                users = os.open(path + ".users", os.O_RDONLY)
-                # Waits out the jobserver refilling a generation it found unused.
-                fcntl.flock(users, fcntl.LOCK_SH)
-                # A generation retired meanwhile is gone; the next is current.
-                descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-            except OSError:
-                if users is not None:
-                    os.close(users)
-                time.sleep(0.05)
-                continue
-            if stat.S_ISFIFO(os.fstat(descriptor).st_mode):
-                for held in (users, descriptor):
-                    os.set_inheritable(held, True)
-                return (users, descriptor), path
-            os.close(users)
-            os.close(descriptor)
-            break
-    return None
+                if level > self.reserve:
+                    returned = os.read(self.own, level - self.reserve)
+                    os.write(self.pool, returned)
+                    self.taken -= len(returned)
+                elif level < self.reserve:
+                    taken = os.read(self.pool, self.reserve - level)
+                    os.write(self.own, taken)
+                    self.taken += len(taken)
+            except BlockingIOError:
+                pass
+
+    def close(self):
+        """Gives back every token taken for the build, which has ended."""
+        self.stopping.set()
+        self.stocker.join()
+        if self.taken:
+            os.write(self.pool, b"+" * self.taken)
+        self.close_descriptors()
+
+    def close_descriptors(self):
+        for descriptor in (self.own, self.pool, self.users):
+            if descriptor is not None:
+                os.close(descriptor)
+        self.users = self.pool = self.own = None
+        if self.directory:
+            shutil.rmtree(self.directory, ignore_errors=True)
+            self.directory = None
 
 
 def build_environment(environment, path):
@@ -325,12 +370,14 @@ class Interrupted(Exception):
         self.number = number
 
 
-def run(command, environment, scoped, capture=False):
+def run(command, environment, scoped, group=True, capture=False):
     """Runs `command` to its end, in a scope of the build slice when
     `scoped`, and returns its status, with its standard output when
     `capture`. A signal to this process interrupts it: first as a Ctrl-C
-    would, which Cargo answers by giving back its jobserver tokens, then, if
-    it is still running five seconds later, by stopping its whole scope."""
+    would, then, if it is still running five seconds later, by stopping its
+    whole scope. Unscoped, the command's own process group stands in for the
+    scope, unless `group` is false, as for a command within another build,
+    whose scope or group ends it."""
     unit = f"cagents-build-{os.getpid()}-{time.monotonic_ns()}.scope"
     if scoped:
         # The command runs as this child: systemd-run execs it after making
@@ -345,10 +392,10 @@ def run(command, environment, scoped, capture=False):
                        if key not in MANAGER_VARIABLES} | manager_environment_only()
     parent = os.getpid()
     try:
-        # Unscoped, the command's process group stands in for its scope.
+        group = group and not scoped
         child = subprocess.Popen(command, env=environment, close_fds=False,
                                  stdout=subprocess.PIPE if capture else None,
-                                 process_group=None if scoped else 0,
+                                 process_group=0 if group else None,
                                  preexec_fn=lambda: follow_parent(parent))
     except OSError as error:
         say(f"build-host: {command[0]}: {error.strerror}")
@@ -362,10 +409,10 @@ def run(command, environment, scoped, capture=False):
 
     def signal_command(number):
         with contextlib.suppress(ProcessLookupError):
-            if scoped:
-                child.send_signal(number)
-            else:
+            if group:
                 os.killpg(child.pid, number)
+            else:
+                child.send_signal(number)
 
     def forward(number, _frame):
         if not interrupted:
@@ -423,21 +470,28 @@ class Build:
                 waited = time.monotonic() - started
                 if waited >= 2:
                     say(f"admitted after {waited:.0f}s")
-                self.scoped = prepare_slice()
-                joined = join_jobserver() if self.scoped else None
-                self.path = joined[1] if joined else None
+                # A build within another's shares runs in its scope, with
+                # its jobserver, which its environment names.
+                self.scoped = bool(self.shares) and prepare_slice()
+                self.jobserver = None
+                if self.scoped:
+                    try:
+                        self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
+                    except OSError as error:
+                        say(f"building without the shared jobserver: {error}")
                 try:
                     yield self
                 finally:
-                    if joined:
-                        for descriptor in joined[0]:
-                            os.close(descriptor)
+                    if self.jobserver:
+                        self.jobserver.close()
         except Expired:
             say("build admission timed out")
             raise SystemExit(124)
 
     def run(self, command, capture=False):
-        return run(command, build_environment(os.environ, self.path), self.scoped, capture)
+        path = self.jobserver.path if self.jobserver else None
+        return run(command, build_environment(os.environ, path), self.scoped,
+                   group=bool(self.shares), capture=capture)
 
 
 def separate(arguments):
@@ -483,6 +537,8 @@ def runs_tests(arguments, index):
 
 def cargo_command(build, cargo, arguments):
     index = 1 if arguments[:1] and arguments[0].startswith("+") else 0
+    if arguments[index:index + 1] and arguments[index] in ALIASES:
+        arguments = [*arguments[:index], ALIASES[arguments[index]], *arguments[index + 1:]]
     tests = runs_tests(arguments, index)
     if build.runner and arguments[index:index + 1] in (["run"], ["test"], ["bench"]):
         arguments = [*arguments[:index + 1], "--config", build.runner, *arguments[index + 1:]]
@@ -513,136 +569,6 @@ def cargo_command(build, cargo, arguments):
     os.execvp(command[0], command)
 
 
-def serve(directory, tokens):
-    """The jobserver: a named pipe holding a token for each CPU, which every
-    build's Cargo and compilers take one from for each job beyond their
-    first and give back when it ends. A process killed outright never gives
-    back what it held, so its tokens would be lost to every later build:
-    while tokens are out, builds that start move on to a fresh generation of
-    the pipe, the tokens returned to the old one move across, and once no
-    build uses the old one, what it never got back is made up. A build uses
-    a generation while any of its processes holds the shared lock on its
-    users file that it joined with."""
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    generations = []
-    number = 0
-
-    def create():
-        nonlocal number
-        number += 1
-        path = os.path.join(directory, f"fifo-{number}")
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
-        os.mkfifo(path, 0o600)
-        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-        users = os.open(path + ".users", os.O_RDONLY | os.O_CREAT, 0o600)
-        generation = {"path": path, "fd": descriptor, "users": users, "issued": 0}
-        link = os.path.join(directory, "current.new")
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(link)
-        os.symlink(os.path.basename(path), link)
-        os.replace(link, os.path.join(directory, "current"))
-        return generation
-
-    def give(generation, count):
-        if count > 0:
-            os.write(generation["fd"], b"+" * count)
-            generation["issued"] += count
-
-    def drain(generation):
-        taken = 0
-        while True:
-            try:
-                taken += len(os.read(generation["fd"], 4096))
-            except BlockingIOError:
-                return taken
-
-    def waiting(generation):
-        count = array.array("i", [0])
-        fcntl.ioctl(generation["fd"], termios.FIONREAD, count)
-        return count[0]
-
-    @contextlib.contextmanager
-    def unused(generation):
-        """Whether no build uses `generation`, which none may join until the
-        block ends."""
-        try:
-            fcntl.flock(generation["users"], fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            # Unless removing it closed the descriptor, and its lock with it.
-            with contextlib.suppress(OSError):
-                fcntl.flock(generation["users"], fcntl.LOCK_UN)
-
-    def remove(generation):
-        """Takes `generation` away while unused, as builds joining find it."""
-        for name in (generation["path"], generation["path"] + ".users"):
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(name)
-        os.close(generation["fd"])
-        os.close(generation["users"])
-
-    def fill(generation):
-        """Leaves exactly `tokens` in the pipe of a generation no build uses."""
-        count = waiting(generation)
-        if count < tokens:
-            os.write(generation["fd"], b"+" * (tokens - count))
-        elif count > tokens:
-            os.read(generation["fd"], count - tokens)
-        generation["issued"] = tokens
-
-    current = create()
-    give(current, tokens)
-    with open(os.path.join(directory, "pid.new"), "w") as file:
-        file.write(f"{os.getpid()}\n")
-    os.replace(os.path.join(directory, "pid.new"), os.path.join(directory, "pid"))
-    rotated = idle = time.monotonic()
-    while True:
-        time.sleep(TICK)
-        now = time.monotonic()
-        # Tokens a retired generation's builds give back and do not take
-        # again at once move to the current one.
-        for old in generations[:]:
-            returned = drain(old)
-            old["issued"] -= returned
-            give(current, returned)
-            with unused(old) as free:
-                if free:
-                    remove(old)
-            if free:
-                generations.remove(old)
-                # What it never got back was lost with the processes that
-                # held it.
-                give(current, tokens - current["issued"])
-        if generations:
-            idle = now
-        else:
-            with unused(current) as free:
-                if free:
-                    # Nothing holds any token now, so any missing were lost.
-                    fill(current)
-                    if now - idle >= IDLE_EXIT:
-                        for name in ("pid", "current"):
-                            with contextlib.suppress(OSError):
-                                os.unlink(os.path.join(directory, name))
-                        remove(current)
-                        return 0
-            if free:
-                continue
-            idle = now
-        if not generations and now - rotated >= ROTATE and waiting(current) < current["issued"]:
-            generations.append(current)
-            current = create()
-            rotated = now
-            moved = drain(generations[0])
-            generations[0]["issued"] -= moved
-            give(current, moved)
-
-
 def options(arguments):
     shares, deadline, runner, remove = 1, None, None, []
     while arguments and arguments[0] != "--":
@@ -671,8 +597,6 @@ def options(arguments):
 
 
 def main(arguments):
-    if arguments[:1] == ["serve"] and len(arguments) == 3:
-        return serve(arguments[1], int(arguments[2]))
     if arguments == ["count"]:
         print(share_count())
         return 0
@@ -695,7 +619,10 @@ def main(arguments):
     except Interrupted as interruption:
         for path in remove:
             shutil.rmtree(path, ignore_errors=True)
-        # Ends as the signal it was sent, as the command would have.
+        # Ends as the signal it was sent, as the command would have, without
+        # the core dump SIGQUIT's default action would write.
+        import ctypes
+        ctypes.CDLL(None).prctl(4, 0)  # PR_SET_DUMPABLE
         signal.signal(interruption.number, signal.SIG_DFL)
         os.kill(os.getpid(), interruption.number)
         return 128 + interruption.number

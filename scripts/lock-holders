@@ -166,7 +166,9 @@ def looks_legitimate(pid):
         return False
     if fields[0] in LEGITIMATE:
         return True
-    arguments = (read(f"/proc/{pid}/cmdline") or "").split("\0")[:3]
+    # A script run as `python3 -I -B PATH`, as an offloaded build-host is,
+    # has its path fourth.
+    arguments = (read(f"/proc/{pid}/cmdline") or "").split("\0")[:4]
     return any(os.path.basename(argument) in SCRIPTS for argument in arguments)
 
 

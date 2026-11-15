@@ -1446,10 +1446,6 @@ elif command == "run":
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
     os.chdir(os.path.join(base, "src", directory))
-    # Every offloaded build takes its shares of this host's build memory with
-    # the builds started here, whatever family the caller named on its own.
-    for name in ("CAGENTS_BUILD_LOCK", "CAGENTS_BUILD_SLOTS"):
-        environment.pop(name, None)
     environment = dict(os.environ, **environment)
     # Temporary files go in a directory of this slot's own, rather than in
     # the host's /tmp, which others use: temporary_directory puts it in the
@@ -2403,6 +2399,9 @@ class Offload:
             return 101
         executable = rewrite(launch["program"], mappings)
         environment = dict(self.environment)
+        # The gate's share count was for the build; a gate the program
+        # starts counts its own.
+        environment.pop("CAGENTS_BUILD_SHARES", None)
         for name, value in launch["environment"].items():
             environment[name] = rewrite(value, mappings)
         environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")

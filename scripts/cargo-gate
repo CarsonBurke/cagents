@@ -324,9 +324,10 @@ inside_gate() {
     case ${CAGENTS_BUILD_SLOT_HELD:-} in
         ''|*[!0-9]*) return 1 ;;
     esac
-    # scripts/build-host runs as `python3 -I PATH/build-host ...`; a gate of
-    # an older version as `sh PATH/cargo-gate ...`.
-    script=$(tr '\0' '\n' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline | sed -n 2,3p) ||
+    # scripts/build-host runs as `python3 -I PATH/build-host ...`, and as
+    # `python3 -I -B PATH/build-host ...` for an offloaded build; a gate of an
+    # older version as `sh PATH/cargo-gate ...`.
+    script=$(tr '\0' '\n' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline | sed -n 2,4p) ||
         return 1
     for word in $script; do
         case $word in

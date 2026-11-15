@@ -588,24 +588,29 @@ systemd gives that a `CPUWeight` of 30, below the 100 of `app.slice`, where
 agent sessions, the desktop's applications and tests run, so builds yield the
 CPU to them. The build slice's `MemoryHigh` is the three quarters of memory
 set aside for builds, so the kernel throttles builds as a whole before they
-push everything else into swap. Every build shares one GNU make
-jobserver: a named pipe holding a token for each CPU, which `systemd-run`
-starts as the user service `cagents-jobserver-1` on first use and stops after
-15 idle minutes. Cargo, rustc's parallel code generation and C builds take a
-token for each job beyond their first. A lone build uses every CPU, and
-several share them without waiting for each other to start, so the gate sets
-`CARGO_BUILD_JOBS` to the CPU count unless the caller set it. A process
-killed outright never gives its tokens back. Cancelling a build therefore
-interrupts it as Ctrl-C does first, which Cargo answers by giving them back.
-While tokens are out, new builds move to a fresh generation of the pipe every
-minute. A build holds a shared lock on its generation's users file, which its
-processes inherit, and once no process holds an old generation's lock, the
-tokens it lost are made up. Without a systemd user manager, or with `CAGENTS_BUILD_SCOPE=0`,
+push everything else into swap.
+
+Every build draws from one pool of GNU make jobserver tokens, one for each
+CPU, kept in a named pipe under `/run/user/UID/cagents-jobserver`. Cargo,
+rustc's parallel code generation and C builds take a token for each job
+beyond their first. A lone build uses every CPU, and several share them
+without waiting for each other to start, so the gate sets `CARGO_BUILD_JOBS`
+to the CPU count unless the caller set it. The build itself reads a pipe of
+its own, which `scripts/build-host` keeps stocked from the pool: more follows
+as the build takes what is there, and what it leaves goes back. When the
+build ends, cancelled or killed included, every token taken for it returns
+to the pool, so tokens its compilers held when they died are not lost. No
+service runs the pool: the first build to find nobody using it fills it. A
+build started within another's shares, such as Cargo under `cargo-gate
+exec`, runs in that build's scope with its tokens. Without a systemd user
+manager, or with `CAGENTS_BUILD_SCOPE=0`,
 builds wait for their shares the same way but run in place, each with its
 own Cargo jobs.
 
 For `test`, `bench` and `run`, only the build (`--no-run`, or `build`) holds
-the shares, so do not wrap the gate in another lock. The tests or program run
+the shares, so do not wrap the gate in another lock. Give `run` its `--bin`:
+its build is `cargo build` with the same options, which builds every binary
+the package has when none is named. The tests or program run
 after the shares are given back, tests and benchmarks in their own scope in
 `app-cagents-test.slice`, under a memory limit; see [Memory limits](#memory-limits).
 Rustdoc compiles doctests while they run, so `cargo test --doc` keeps its

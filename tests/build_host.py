@@ -2,9 +2,8 @@
 """Exercise scripts/build-host with private share locks and stand-in tools.
 
 Every build here runs in place (CAGENTS_BUILD_SCOPE=0): no test makes a
-systemd scope or starts the host's jobserver. The jobserver loop runs in a
-thread of this process, on a private directory, with what holds its pipes
-stated by the test.
+systemd scope or joins the host's jobserver. Jobserver tests join one on a
+private directory, in this process.
 """
 
 import array
@@ -18,6 +17,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -336,6 +336,15 @@ class TheBuildsEnvironment(BuildHostFixture):
         self.assertEqual(int(marker), call["parent"])
         self.assertNotEqual(call["parent"], os.getpid())
 
+    def test_a_build_within_anothers_shares_stays_in_its_process_group(self):
+        # Its own group would stop a command reading the terminal; the outer
+        # build's group or scope already ends it.
+        leads = "import os; print(os.getpgrp() == os.getpid())"
+        for shares, expected in (("1", "True"), ("0", "False")):
+            with self.subTest(shares=shares):
+                result = self.run_host("build", "--shares", shares, "--", sys.executable, "-c", leads)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+
     def test_a_build_in_place_gets_cargo_jobs_unless_the_caller_set_them(self):
         cpus = os.cpu_count() or 1
         for env, expected in ((self.env, str(max(2, min(8, cpus // 2)))),
@@ -397,6 +406,18 @@ class CargoPhases(BuildHostFixture):
                                        subcommand, "--lib", "--", "filter", "--no-run"], []),
                     ("cargo", [subcommand, "--lib", "--", "filter", "--no-run"], []),
                 ])
+
+    def test_cargos_short_names_split_as_the_long_ones(self):
+        self.assertEqual(self.phases("t", "--lib"), [
+            ("cargo", ["test", "--no-run", "--lib"], [0, 1]),
+            ("memory-capped", ["--slice", "app-cagents-test.slice", str(self.cargo), "test", "--lib"], []),
+            ("cargo", ["test", "--lib"], []),
+        ])
+        (self.root / "calls.jsonl").unlink()
+        self.assertEqual(self.phases("r", "--bin", "app"), [
+            ("cargo", ["build", "--bin", "app"], [0, 1]),
+            ("cargo", ["run", "--bin", "app"], []),
+        ])
 
     def test_a_program_builds_then_runs_without_shares_or_the_limit(self):
         self.assertEqual(self.phases("run", "--bin", "app", "--", "argument with spaces"), [
@@ -631,232 +652,119 @@ def waiting(descriptor):
 
 
 class Jobserver(unittest.TestCase):
-    """The jobserver loop, in a thread, on a private directory."""
+    """Builds' places in a jobserver on a private directory, each stocked by
+    a thread of this process, with this test taking and giving back tokens
+    as the builds' compilers would."""
 
     TOKENS = 4
 
     def setUp(self):
-        self.directory = Path(tempfile.mkdtemp(prefix="cagents-jobserver-"))
-        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
-        # The users locks this test holds for generations, as builds would.
-        self.users = {}
-        self.addCleanup(self.leave_all)
-        clock = types.SimpleNamespace(monotonic=time.monotonic, monotonic_ns=time.monotonic_ns,
-                                      sleep=lambda seconds: time.sleep(min(seconds, 0.05)))
-        for name, value in (("TICK", 0.02), ("ROTATE", 60.0), ("IDLE_EXIT", 60.0), ("time", clock)):
-            patcher = unittest.mock.patch.object(build_host, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.descriptors = {}
-        self.addCleanup(lambda: [os.close(fd) for fd in self.descriptors.values()])
-        self.result = []
-        self.thread = None
-
-    def serve(self, **settings):
-        for name, value in settings.items():
-            setattr(build_host, name, value)
-        self.thread = threading.Thread(
-            target=lambda: self.result.append(build_host.serve(str(self.directory), self.TOKENS)),
-            daemon=True)
-        self.thread.start()
-        self.addCleanup(self.stop)
-        self.wait_for((self.directory / "pid").exists, "the jobserver")
-        self.assertEqual(int((self.directory / "pid").read_text()), os.getpid())
-        return self.current()
-
-    def use(self, path):
-        """Holds the generation's users lock, as a build that joined it does."""
-        descriptor = os.open(path + ".users", os.O_RDONLY)
-        fcntl.flock(descriptor, fcntl.LOCK_SH)
-        self.users[path] = descriptor
-
-    def leave(self, path):
-        os.close(self.users.pop(path))
-
-    def leave_all(self):
-        for path in list(self.users):
-            self.leave(path)
-
-    def stop(self):
-        self.leave_all()
-        build_host.IDLE_EXIT = 0
-        self.thread.join(timeout=5)
-        self.assertFalse(self.thread.is_alive(), "the jobserver did not exit")
-
-    def current(self):
-        return os.path.realpath(self.directory / "current")
-
-    def open(self, path):
-        """This test's own descriptor on a generation, as a build's."""
-        if path not in self.descriptors:
-            self.descriptors[path] = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-        return self.descriptors[path]
-
-    def take(self, path, count):
-        taken = len(os.read(self.open(path), count))
-        self.assertEqual(taken, count)
-        return taken
-
-    def give_back(self, path, count):
-        os.write(self.open(path), b"+" * count)
-
-    def in_pipes(self):
-        return sum(waiting(fd) for fd in self.descriptors.values())
-
-    def wait_for(self, predicate, label, timeout=5, held=None):
-        """Waits for `predicate`, checking meanwhile that the pipes and
-        `held`, the tokens builds still have, never exceed the count."""
-        deadline = time.monotonic() + timeout
-        while True:
-            if held is not None:
-                self.assertLessEqual(self.in_pipes() + held(), self.TOKENS, label)
-            if predicate():
-                return
-            if time.monotonic() >= deadline:
-                self.fail(f"timed out waiting for {label}")
-            time.sleep(0.005)
-
-    def test_tokens_no_build_has_open_are_made_up(self):
-        path = self.serve()
-        descriptor = self.open(path)
-        self.assertEqual(waiting(descriptor), self.TOKENS)
-        # A build killed with three tokens; nothing has the pipe open now.
-        self.take(path, 3)
-        self.wait_for(lambda: waiting(descriptor) == self.TOKENS, "the lost tokens made up")
-        # Tokens it gives back late are more than there should be.
-        self.give_back(path, 3)
-        self.wait_for(lambda: waiting(descriptor) == self.TOKENS, "the surplus taken back")
-        self.assertEqual(self.current(), path)
-
-    def test_tokens_out_with_a_build_are_not_made_up_before_it_moves_on(self):
-        path = self.serve()
-        self.use(path)
-        self.take(path, 2)
-        time.sleep(0.3)
-        self.assertEqual(waiting(self.open(path)), 2)
-        self.assertEqual(self.current(), path, "rotated before its time")
-        self.give_back(path, 2)
-        time.sleep(0.1)
-        self.assertEqual(waiting(self.open(path)), self.TOKENS)
-
-    def test_tokens_out_too_long_move_builds_to_a_new_generation(self):
-        old = self.serve(ROTATE=0.1)
-        self.use(old)
-        held = [3]
-        self.take(old, 3)
-        self.wait_for(lambda: self.current() != old, "a new generation", held=lambda: held[0])
-        new = self.current()
-        # What was waiting in the old pipe moved to the new one.
-        self.wait_for(lambda: waiting(self.open(new)) == 1, "the waiting token to move",
-                      held=lambda: held[0])
-        self.assertEqual(waiting(self.open(old)), 0)
-        # A token the old generation's build gives back moves across too.
-        self.give_back(old, 1)
-        held[0] = 2
-        self.wait_for(lambda: waiting(self.open(new)) == 2 and waiting(self.open(old)) == 0,
-                      "the returned token to move", held=lambda: held[0])
-        # While a build still has the old one open, its tokens may come back.
-        self.use(new)
-        time.sleep(0.2)
-        self.assertEqual(waiting(self.open(new)), 2, "tokens made up while their build still ran")
-        self.assertEqual(self.current(), new, "a second generation while one is retiring")
-        self.assertTrue(os.path.exists(old))
-        # Its build is gone, with the two it held: they are made up once.
-        self.leave(old)
-        held[0] = 0
-        self.wait_for(lambda: not os.path.exists(old), "the old generation to go", held=lambda: held[0])
-        self.wait_for(lambda: waiting(self.open(new)) == self.TOKENS, "the lost tokens made up",
-                      held=lambda: held[0])
-        time.sleep(0.2)
-        self.assertEqual(self.in_pipes(), self.TOKENS)
-        self.assertEqual(self.current(), new)
-
-    def test_an_idle_jobserver_exits_and_removes_what_names_it(self):
-        path = self.serve(IDLE_EXIT=0.2)
-        self.use(path)
-        time.sleep(0.4)
-        self.assertTrue(self.thread.is_alive(), "it exited while a build had its pipe")
-        self.leave_all()
-        self.thread.join(timeout=5)
-        self.assertEqual(self.result, [0])
-        for name in ("pid", "current", os.path.basename(path), os.path.basename(path) + ".users"):
-            self.assertFalse((self.directory / name).exists(), name)
-
-    def test_a_build_that_joins_uses_the_generation_until_it_ends(self):
-        path = self.serve()
-        with unittest.mock.patch.object(build_host, "jobserver_directory", lambda: str(self.directory)), \
-                unittest.mock.patch.object(build_host, "jobserver_alive", lambda _directory: True):
-            joined = build_host.join_jobserver()
-        self.assertIsNotNone(joined)
-        descriptors, joined_path = joined
-        self.assertEqual(joined_path, path)
-        # A build holding tokens, which the jobserver must not make up.
-        self.take(path, 3)
-        time.sleep(0.3)
-        self.assertEqual(waiting(self.open(path)), 1)
-        # Its processes end, and the tokens with them.
-        for descriptor in descriptors:
-            os.close(descriptor)
-        self.wait_for(lambda: waiting(self.open(path)) == self.TOKENS, "the lost tokens made up")
-
-
-class JoiningTheJobserver(unittest.TestCase):
-    """A build joins a running jobserver's current generation."""
-
-    def setUp(self):
-        self.scope = FixtureDirectory(prefix="cagents-jobserver-join-")
+        self.scope = FixtureDirectory(prefix="cagents-jobserver-")
         self.addCleanup(self.scope.close)
-        self.directory = Path(self.scope.name) / "jobserver"
-        self.directory.mkdir()
-        patcher = unittest.mock.patch.object(build_host, "jobserver_directory", lambda: str(self.directory))
+        self.directory = Path(self.scope.name)
+        patcher = unittest.mock.patch.object(build_host, "TOKEN_TICK", 0.002)
         patcher.start()
         self.addCleanup(patcher.stop)
-        # Starting one would need the user manager.
-        patcher = unittest.mock.patch.object(build_host.subprocess, "run",
-                                             side_effect=AssertionError("started a jobserver"))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        # A process whose arguments name the directory, as the jobserver's do.
-        self.server = self.scope.popen([sys.executable, "-I", "-c", "import time; time.sleep(60)",
-                                        str(self.directory)])
-        (self.directory / "pid").write_text(f"{self.server.pid}\n")
-        self.wait_for_arguments()
 
-    def wait_for_arguments(self):
+    def join(self):
+        jobserver = build_host.Jobserver(str(self.directory), self.TOKENS)
+        self.addCleanup(lambda: jobserver.stocker.is_alive() and jobserver.close())
+        return jobserver
+
+    def in_pool(self, jobserver):
+        return waiting(jobserver.pool)
+
+    def take(self, jobserver, count):
+        """Takes `count` tokens from the build's own pipe, waiting for each."""
+        build = os.open(jobserver.path, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, build)
+        taken = 0
         deadline = time.monotonic() + 5
-        while str(self.directory).encode() not in Path(f"/proc/{self.server.pid}/cmdline").read_bytes():
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
+        while taken < count:
+            try:
+                taken += len(os.read(build, count - taken))
+            except BlockingIOError:
+                self.assertLess(time.monotonic(), deadline, f"only {taken} of {count} tokens came")
+                time.sleep(0.001)
+        return build
 
-    def test_a_build_joins_the_current_generation(self):
-        fifo = self.directory / "fifo-3"
-        os.mkfifo(fifo, 0o600)
-        (self.directory / "fifo-3.users").touch()
-        (self.directory / "current").symlink_to("fifo-3")
-        joined = build_host.join_jobserver()
-        self.assertIsNotNone(joined)
-        descriptors, path = joined
-        self.addCleanup(lambda: [os.close(descriptor) for descriptor in descriptors])
-        self.assertEqual(path, str(fifo))
-        self.assertTrue(all(os.get_inheritable(descriptor) for descriptor in descriptors))
-        # It holds the generation's users lock shared.
-        with open(self.directory / "fifo-3.users") as users:
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(users, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(users, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        environment = build_host.build_environment({"MFLAGS": "-s", "CARGO_BUILD_JOBS": "5"}, path)
-        self.assertEqual(environment["MAKEFLAGS"], f"-j --jobserver-auth=fifo:{fifo}")
-        self.assertEqual(environment["CARGO_MAKEFLAGS"], environment["MAKEFLAGS"])
+    def wait_for(self, predicate, label):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
+            time.sleep(0.002)
+
+    def test_the_first_build_fills_the_pool_and_gets_a_pipe_of_its_own(self):
+        jobserver = self.join()
+        self.assertTrue(stat.S_ISFIFO(os.stat(jobserver.path).st_mode))
+        self.assertNotEqual(Path(jobserver.path).parent, self.directory)
+        self.wait_for(lambda: waiting(jobserver.own) == 1, "a token in its pipe")
+        self.assertEqual(self.in_pool(jobserver) + waiting(jobserver.own), self.TOKENS)
+        environment = build_host.build_environment({"MFLAGS": "-s"}, jobserver.path)
+        self.assertEqual(environment["MAKEFLAGS"], f"-j --jobserver-auth=fifo:{jobserver.path}")
         self.assertNotIn("MFLAGS", environment)
-        self.assertEqual(environment["CARGO_BUILD_JOBS"], "5")
-        self.assertEqual(environment["CAGENTS_BUILD_SLOT_HELD"], str(os.getpid()))
-        self.assertEqual(build_host.build_environment({}, path)["CARGO_BUILD_JOBS"], str(os.cpu_count()))
+        jobserver.close()
+        self.assertFalse(os.path.exists(Path(jobserver.path).parent))
 
-    def test_a_current_that_is_not_a_pipe_is_not_joined(self):
-        (self.directory / "fifo-1").write_text("")
-        (self.directory / "fifo-1.users").touch()
-        (self.directory / "current").symlink_to("fifo-1")
-        self.assertIsNone(build_host.join_jobserver())
+    def test_a_build_gets_more_as_it_takes_them_and_gives_back_what_it_leaves(self):
+        jobserver = self.join()
+        build = self.take(jobserver, 3)
+        # Never more out than the pool holds.
+        self.wait_for(lambda: self.in_pool(jobserver) == 0, "the rest to follow")
+        self.assertEqual(waiting(jobserver.own), 1)
+        os.write(build, b"+++")
+        self.wait_for(lambda: waiting(jobserver.own) == 1, "the surplus to go back")
+        self.assertEqual(self.in_pool(jobserver), self.TOKENS - 1)
+
+    def test_a_build_that_ends_holding_tokens_loses_none(self):
+        jobserver = self.join()
+        # Its compilers are killed with three.
+        self.take(jobserver, 3)
+        jobserver.close()
+        other = self.join()
+        self.wait_for(lambda: waiting(other.own) == 1, "a token for the next build")
+        self.assertEqual(self.in_pool(other) + waiting(other.own), self.TOKENS)
+
+    def test_builds_share_one_pool_which_a_build_joining_does_not_refill(self):
+        first = self.join()
+        self.take(first, 2)
+        second = self.join()
+        self.wait_for(lambda: waiting(second.own) == 1, "a token for the second build")
+        # Two with the first build, one in each pipe; the pool keeps the rest.
+        self.wait_for(lambda: self.in_pool(first) + waiting(first.own) + waiting(second.own)
+                      == self.TOKENS - 2, "the shared count")
+        first.close()
+        second.close()
+        third = self.join()
+        self.wait_for(lambda: waiting(third.own) == 1, "a token for the third build")
+        self.assertEqual(self.in_pool(third) + waiting(third.own), self.TOKENS)
+
+    def test_what_a_killed_build_host_held_is_made_up_once_the_pool_is_unused(self):
+        first = self.join()
+        self.take(first, 2)
+        first.stopping.set()
+        first.stocker.join()
+        # Gone without giving back what it took, while another build runs.
+        second = self.join()
+        first.close_descriptors()
+        self.wait_for(lambda: waiting(second.own) == 1, "a token for the second build")
+        self.assertEqual(self.in_pool(second) + waiting(second.own), self.TOKENS - 2)
+        second.close()
+        third = self.join()
+        self.wait_for(lambda: waiting(third.own) == 1, "a token for the third build")
+        self.assertEqual(self.in_pool(third) + waiting(third.own), self.TOKENS)
+
+    def test_a_pool_that_is_not_a_pipe_is_not_joined(self):
+        (self.directory / "pool").write_text("")
+        with self.assertRaises(OSError):
+            build_host.Jobserver(str(self.directory), self.TOKENS)
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()),
+                         ["join", "pool", "users"])
+
+    def test_a_build_joins_without_a_server(self):
+        self.assertEqual(build_host.build_environment({}, "/pipe")["CARGO_BUILD_JOBS"], str(os.cpu_count()))
+        self.assertEqual(build_host.build_environment({"CARGO_BUILD_JOBS": "5"}, "/pipe")["CARGO_BUILD_JOBS"],
+                         "5")
 
 
 if __name__ == "__main__":
