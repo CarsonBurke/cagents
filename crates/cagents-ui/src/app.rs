@@ -2471,6 +2471,15 @@ struct WindowView {
     context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
     worktree_offsets: HashMap<PathBuf, f32>,
+    /// Each channel's strip offset. Absent from a window saved before
+    /// channels kept their own.
+    #[serde(default)]
+    channel_offsets: HashMap<crate::model::ChannelId, f32>,
+    /// Absent from a window saved before Settings kept its page.
+    #[serde(default)]
+    settings_category: Option<SettingsCategory>,
+    #[serde(default)]
+    settings_search: String,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -2558,7 +2567,7 @@ async fn flush_workspace(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SettingsCategory {
     Notifications,
     General,
@@ -5842,6 +5851,26 @@ impl Cagents {
             bootstrap,
             window_view,
         })
+    }
+
+    /// Restore this window's saved presentation around its saved scope.
+    /// Strip offsets must be known before the scope binds its camera, and
+    /// binding the scope's source control clears the panel's disclosures, so
+    /// the sidebar view is applied after that first binding.
+    fn restore_window_view(&mut self, view: Option<WindowView>) -> Task<Message> {
+        if let Some(view) = &view {
+            self.worktree_offsets.clone_from(&view.worktree_offsets);
+            self.channel_offsets.clone_from(&view.channel_offsets);
+        }
+        let scope = self.restore_workspace_scope(view.is_some());
+        if let Some(view) = view {
+            self.sidebar_state.restore_view(view.sidebar);
+            if let Some(category) = view.settings_category {
+                self.settings_category = category;
+            }
+            self.settings_search = view.settings_search;
+        }
+        scope
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -14090,10 +14119,14 @@ impl Cagents {
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
+            channel_offsets: self.channel_offsets.clone(),
+            settings_category: Some(self.settings_category),
+            settings_search: self.settings_search.clone(),
         };
-        if self.durable.active_channel.is_none()
-            && let Some(path) = &self.active_workspace
-        {
+        if let Some(channel) = self.durable.active_channel {
+            view.channel_offsets
+                .insert(channel, self.workspace.camera().offset());
+        } else if let Some(path) = &self.active_workspace {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
@@ -15054,10 +15087,6 @@ impl Application for Cagents {
         for warning in restore_warnings.into_iter().chain(settings_warnings) {
             app.notices.record(TransientNotice::warning(warning));
         }
-        if let Some(view) = window_view {
-            app.sidebar_state.restore_view(view.sidebar);
-            app.worktree_offsets = view.worktree_offsets;
-        }
         app.sidebar_state
             .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
@@ -15109,7 +15138,7 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
-        let scope = app.restore_worktree_scope();
+        let scope = app.restore_window_view(window_view);
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
             let terminal = match &card.kind {
@@ -27999,6 +28028,14 @@ mod tests {
             assert_eq!(runtime(&app, reopened).navigation(), None);
             assert_eq!(runtime(&app, source).navigation(), original_navigation);
         }
+    }
+
+    mod window_restore {
+        include!("app/window_restore_tests.rs");
+    }
+
+    mod home_admission {
+        include!("app/home_admission_tests.rs");
     }
 
     mod repository_clone_lsp_ownership {
