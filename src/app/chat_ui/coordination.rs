@@ -889,12 +889,32 @@ impl Row {
     }
 }
 
+/// The still mark beside a live caption: the accent, in a dot the size of
+/// the caption's lowercase letters.
+fn live_dot() -> Element<'static, Message> {
+    const SIZE: f32 = 6.0;
+    widget::container(widget::Space::new())
+        .width(Length::Fixed(SIZE))
+        .height(Length::Fixed(SIZE))
+        .class(cosmic::theme::Container::custom(|theme| {
+            widget::container::Style {
+                background: Some(iced::Background::Color(design::accent_color(theme))),
+                border: iced::Border {
+                    radius: (SIZE / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
 struct RowStatus {
     text: &'static str,
     tone: Tone,
-    /// Still under way, which a spinner beside it says.
+    /// Still under way, which a still dot beside its caption marks.
     live: bool,
     detail: Option<String>,
 }
@@ -1016,7 +1036,7 @@ impl BackgroundState {
         }
     }
 
-    /// The row's status for this state: a spinner while the agent works,
+    /// The row's status for this state: a live caption while the agent works,
     /// and a warning while it waits on the person.
     fn status(self) -> RowStatus {
         match self {
@@ -1419,11 +1439,10 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        if row.state.live {
-            line.push(crate::ui_controls::activity_spinner(
-                f32::from(design::COMPACT_ICON_SIZE),
-                design::muted_color,
-            ));
+        // Work under way is marked by a still dot beside its caption; the
+        // transcript's one activity indicator says that something moves.
+        if row.state.live && matches!(row.state.tone, Tone::Plain) {
+            line.push(live_dot());
         }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {

@@ -185,10 +185,15 @@ STUBS = {
             fi
             printf '%s\\n' "${arguments[*]}" > "$STUB_LOG/ui-ran"
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
+            env > "$STUB_LOG/ui-env"
             printf '%s\\n' "${RUST_LOG:-unset}" > "$STUB_LOG/ui-rust-log"
             exec sleep 300
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
+        if [ "$*" = 'daemon start' ]; then
+            env > "$STUB_LOG/daemon-start-env"
+            [ ! -e "$STUB_LOG/daemon-start-fails" ] || exit 7
+        fi
         if [ "$*" = '--no-start daemon preflight' ]; then printf 'capability'; exit 0; fi
         if [ "${1:-}" = print-env ]; then env; fi
     """,
@@ -849,6 +854,50 @@ class Evidence(unittest.TestCase):
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
+    def test_scoped_ui_fixture_leaves_daemon_env_and_cli_as_user_and_resets_on_next_start(self) -> None:
+        self.built()
+        token = "native-evidence-invalid-session"
+        self.run_tool("start", "after", "--ui-scoped-fixture")
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "runner-env").read_text())
+        self.assertIn(f"CAGENTS_AGENT_AUTHORITY={token}\n", (self.logs / "ui-env").read_text())
+        daemon_environment = (self.logs / "daemon-start-env").read_text()
+        fixture_environment = self.run_tool("env", "env").stdout
+        cli_environment = self.run_tool("cli", "print-env").stdout
+        for name in AUTHORITY_NAMES:
+            for environment in (daemon_environment, fixture_environment, cli_environment):
+                self.assertNotIn(f"{name}=", environment)
+        self.assertNotIn(token, daemon_environment + fixture_environment + cli_environment)
+        self.assertIn("daemon start", (self.logs / "cli").read_text().splitlines())
+        self.run_tool("stop")
+        (self.logs / "ui-ran").unlink()
+        (self.logs / "runner-env").unlink()
+        self.run_tool("start", "after")
+        self.assertEqual((self.task / "session/ui-scoped-fixture").read_text(), "\n")
+        for name in AUTHORITY_NAMES:
+            self.assertNotIn(f"{name}=", (self.logs / "runner-env").read_text())
+            self.assertNotIn(f"{name}=", (self.logs / "ui-env").read_text())
+        self.run_tool("stop")
+
+    def test_scoped_ui_fixture_still_refuses_inherited_authority_before_start(self) -> None:
+        for name in AUTHORITY_NAMES:
+            for value in ("", "inherited-caller-token"):
+                with self.subTest(name=name, value=value):
+                    result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False,
+                                           extra={name: value})
+                    self.assertEqual(result.returncode, 77)
+                    self.assertIn("genuine User shell", result.stderr)
+                    self.assertFalse(self.task.exists())
+        self.assertFalse((self.logs / "runner").exists())
+
+    def test_scoped_ui_fixture_daemon_start_failure_never_launches_the_ui(self) -> None:
+        self.built()
+        (self.logs / "daemon-start-fails").touch()
+        result = self.run_tool("start", "after", "--ui-scoped-fixture", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not start the User fixture daemon", result.stderr)
+        self.assertFalse((self.logs / "runner").exists())
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_workspace_trace_reaches_only_the_session_that_asked_for_it(self) -> None:
         self.built()
         tracing = "cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn"
@@ -1070,8 +1119,14 @@ class Evidence(unittest.TestCase):
                 self.assertFalse((self.logs / "ui-peer-pid").exists())
 
     def test_open_window_uses_built_products_and_a_new_native_identity(self) -> None:
+        self.assert_open_window_uses_built_products()
+
+    def test_scoped_ui_fixture_applies_to_additional_windows(self) -> None:
+        self.assert_open_window_uses_built_products(scoped=True)
+
+    def assert_open_window_uses_built_products(self, scoped=False) -> None:
         self.built()
-        self.run_tool("start", "after", "--workspace-trace")
+        self.run_tool("start", "after", "--workspace-trace", *(["--ui-scoped-fixture"] if scoped else []))
         primary = int((self.logs / "ui-pid").read_text())
         cargo_before = (self.logs / "cargo").read_text()
         receipt = self.task / "session/window-window-2"
@@ -1093,6 +1148,12 @@ class Evidence(unittest.TestCase):
             arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
             self.assertEqual(arguments[-3:], ["--", "--window", "window-2"])
             self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
             self.assertIn(str(self.task / "logs/ui-after-window-2.log"), (self.logs / "runner").read_text())
             os.kill(primary, 0)
             self.assertFalse((self.task / "session/replaying").exists())
@@ -1172,9 +1233,13 @@ class Evidence(unittest.TestCase):
     def test_relaunch_preserves_workspace_trace(self) -> None:
         self.assert_relaunch_keeps_built_products(workspace_trace=True)
 
-    def assert_relaunch_keeps_built_products(self, workspace_trace=False) -> None:
+    def test_relaunch_preserves_scoped_ui_fixture(self) -> None:
+        self.assert_relaunch_keeps_built_products(workspace_trace=True, scoped=True)
+
+    def assert_relaunch_keeps_built_products(self, workspace_trace=False, scoped=False) -> None:
         self.built()
-        self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []))
+        self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []),
+                      *(["--ui-scoped-fixture"] if scoped else []))
         original_pid = int((self.logs / "ui-pid").read_text())
         # A previous runner receipt cannot establish that the current window closed.
         (self.task / "niri" / "session.rc").write_text("0")
@@ -1207,6 +1272,12 @@ class Evidence(unittest.TestCase):
             self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
             if workspace_trace:
                 self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
+            if scoped:
+                self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
+                              (self.logs / "ui-env").read_text())
+                for name in AUTHORITY_NAMES:
+                    self.assertNotIn(f"{name}=", (self.logs / "daemon-start-env").read_text())
+                    self.assertNotIn(f"{name}=", self.run_tool("cli", "print-env").stdout)
             self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
             self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
             self.run_tool("stop")
@@ -1512,6 +1583,61 @@ class Evidence(unittest.TestCase):
             self.run_tool("stop")
         self.run_tool("save-seed")
         self.assertNotIn("will not reopen", self.run_tool("start", "after").stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses read-only file permissions")
+    def test_seed_restores_read_only_files_in_place_without_following_symlinks(self) -> None:
+        self.built("after")
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        provider_home = fixture / "home" / ".claude"
+        transcript = provider_home / "session.jsonl"
+        git_object = fixture / "project" / ".git" / "objects" / "aa" / ("0" * 38)
+        git_object.parent.mkdir(parents=True, exist_ok=True)
+        unchanged = fixture / "home" / "unchanged-read-only"
+        files = {transcript: 0o400, git_object: 0o444, unchanged: 0o444}
+        for path, mode in files.items():
+            path.write_text("seeded\n")
+            path.chmod(mode)
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_file = outside / "read-only"
+        outside_file.write_text("outside the fixture\n")
+        outside_file.chmod(0o444)
+        (fixture / "home" / "file-link").symlink_to(outside_file)
+        (fixture / "home" / "directory-link").symlink_to(outside, target_is_directory=True)
+        recorded = {path: path.stat().st_ino for path in [provider_home, *files]}
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+
+        transcript.chmod(0o600)
+        transcript.write_text("changed transcript\n")
+        transcript.chmod(0o400)
+        for path in (transcript, git_object):
+            # A Git scene can recreate the same object with a different mtime.
+            os.utime(path, (1_700_000_120, 1_700_000_120))
+        self.run_tool("start", "after")
+        self.assertEqual(recorded, {path: path.stat().st_ino for path in recorded})
+        for path, mode in files.items():
+            self.assertEqual(path.read_text(), "seeded\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            self.assertEqual(path.stat().st_mtime_ns, 1_700_000_000_000_000_000)
+        self.assertTrue((fixture / "home" / "file-link").is_symlink())
+        self.assertTrue((fixture / "home" / "directory-link").is_symlink())
+        self.assertEqual(outside_file.read_text(), "outside the fixture\n")
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
+        self.run_tool("stop")
+
+        # If the transfer fails, permissions return to their pre-restore mode.
+        git_object.chmod(0o400)
+        os.utime(git_object, (1_700_000_240, 1_700_000_240))
+        write_executable(self.bin / "rsync", "#!/bin/sh\nexit 23\n", self.logs)
+        failed = self.run_tool("start", "after", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("could not restore the seed", failed.stderr)
+        self.assertEqual(git_object.stat().st_ino, recorded[git_object])
+        self.assertEqual(stat.S_IMODE(git_object.stat().st_mode), 0o400)
+        self.assertEqual(stat.S_IMODE(outside_file.stat().st_mode), 0o444)
 
     def test_a_seed_saved_before_its_home_was_recorded_is_said_not_to_reopen(self) -> None:
         self.built("after")
@@ -2415,12 +2541,12 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace", "--ui-scoped-fixture")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace --ui-scoped-fixture", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 

@@ -52,7 +52,7 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME] [--ui-trace] [--workspace-trace]
+        [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -69,6 +69,10 @@ both use the same fixture data and selected providers.
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
                   tree's work, and every call over 50 ms.
+                  --ui-scoped-fixture starts the fixture daemon as User, then
+                  launches only the UI runner with a hardcoded invalid synthetic
+                  session authority. Fixture env and cli commands remain User;
+                  inherited caller authority is still refused.
                   --workspace-trace logs shared-model update timing, scope
                   projection choices and activity redraw intervals. Both trace
                   options persist through relaunch, until the session stops.
@@ -485,6 +489,57 @@ seeded_home_identity() {
     stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
 }
 
+restore_seed_in_place() {
+    # Older rsync receivers cannot open an owned read-only file for an
+    # in-place update. Lend write permission only to regular files the seed
+    # needs to update; archive mode restores their exact saved permissions.
+    # Neither the walk nor chmod follows fixture symlinks.
+    /usr/bin/python3 - "$seed" "$fixture" <<'PY'
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+seed, fixture = map(Path, sys.argv[1:])
+lent = []
+restored = False
+try:
+    for directory, _, names in os.walk(fixture, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            current = path.lstat()
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                    or current.st_mode & stat.S_IWUSR):
+                continue
+            try:
+                saved = (seed / path.relative_to(fixture)).lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISREG(saved.st_mode)
+                    and (current.st_size, current.st_mtime_ns) != (saved.st_size, saved.st_mtime_ns)):
+                path.chmod(stat.S_IMODE(current.st_mode) | stat.S_IWUSR, follow_symlinks=False)
+                lent.append((path, current))
+    result = subprocess.run([
+        "rsync", "-aH", "--inplace", "--delete", "--force", "--", f"{seed}/", f"{fixture}/",
+    ])
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    restored = True
+finally:
+    if not restored:
+        # A failed restore must not leave its existing files writable. Avoid
+        # changing a file that rsync removed or replaced before it failed.
+        for path, original in lent:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                path.chmod(stat.S_IMODE(original.st_mode), follow_symlinks=False)
+PY
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
@@ -495,7 +550,7 @@ prepare_fixture() {
             # and a transcript's location records its file's. Syncing in
             # place keeps every directory and file both share, so a
             # conversation saved in the seed reopens on either side.
-            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+            if ! restore_seed_in_place 2>"$logs/seed.log"; then
                 printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
                 return 1
             fi
@@ -1024,6 +1079,15 @@ run_app() {
     [ -z "$slot" ] || window_arguments=(-- --window "$slot")
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
+        # Start the isolated daemon as User before adding the synthetic caller
+        # to the UI runner. It must not inherit even this invalid capability.
+        if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
+            printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+            return 1
+        fi
+        stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
+    fi
     [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
         RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
     )
@@ -1184,7 +1248,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= workspace_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1202,6 +1266,7 @@ cmd_start() {
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --ui-trace) ui_trace=1; shift ;;
+            --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
@@ -1252,6 +1317,7 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.

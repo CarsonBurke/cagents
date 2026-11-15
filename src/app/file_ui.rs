@@ -327,7 +327,6 @@ mod tests {
 
     fn app() -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         app.settings.editor_auto_save = false;
         app.settings.link_open_destination = LinkOpenDestination::SystemDefault;
         app.workspace.resize_viewport(1200.0);

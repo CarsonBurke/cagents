@@ -6,7 +6,7 @@ impl Runtime {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
-    pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
+    pub(super) fn pending_admission_view(&self, trailing_clearance: f32) -> Element<'_, Message> {
         let text = self.unsent_text();
         let copy = widget::button::custom(design::body("Copy saved draft"))
             .class(crate::ui_controls::control_style(false, None))
@@ -64,7 +64,7 @@ impl Runtime {
         .spacing(space::M)
         .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
-            .padding(space::L)
+            .padding(iced::Padding::new(space::L).right(space::L.max(trailing_clearance)))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

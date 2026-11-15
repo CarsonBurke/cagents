@@ -12,21 +12,67 @@ use crate::{
 
 use super::{schedule::Compiled, target};
 
+#[derive(Debug, thiserror::Error)]
+pub(in crate::host) enum Error {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    PermissionDenied(String),
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+impl From<crate::host::model::AuthorityError> for Error {
+    fn from(error: crate::host::model::AuthorityError) -> Self {
+        match error {
+            crate::host::model::AuthorityError::Denied(message) => Self::PermissionDenied(message),
+            crate::host::model::AuthorityError::Failed(message) => Self::Invalid(message),
+        }
+    }
+}
+
+impl Error {
+    pub(in crate::host) fn into_protocol(self) -> crate::terminal_ipc::ProtocolError {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let (code, message) = match self {
+            Self::Invalid(message) => (ProtocolErrorCode::InvalidRequest, message),
+            Self::PermissionDenied(message) => (ProtocolErrorCode::PermissionDenied, message),
+        };
+        ProtocolError::new(code, message, false)
+    }
+}
+
 /// Synchronous management entry: the host IPC dispatcher owns control.read().
 /// No registry or HostState guard crosses target validation or actor cleanup.
 pub(in crate::host) fn process_under_control(
     host: &SharedHost,
     authority: crate::agent_execution::Authority,
     request: crate::automations::Request,
-) -> Result<crate::automations::Response, String> {
-    use crate::automations::{Request, Response};
+) -> Result<crate::automations::Response, Error> {
+    use crate::automations::Request;
     if authority.token().is_some() && !request.allowed_from_hosted_conversation() {
-        return Err("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into());
+        return Err(Error::PermissionDenied("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into()));
     }
-    let registry = agent_execution::registry(host)?;
     if authority.token().is_some() {
         return process_hosted(host, &authority, request);
     }
+    process_user(host, request).map_err(Error::Invalid)
+}
+
+fn process_user(
+    host: &SharedHost,
+    request: crate::automations::Request,
+) -> Result<crate::automations::Response, String> {
+    use crate::automations::{Request, Response};
+    let registry = agent_execution::registry(host)?;
     let handle = || {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -186,10 +232,11 @@ fn process_hosted(
     host: &SharedHost,
     authority: &crate::agent_execution::Authority,
     request: crate::automations::Request,
-) -> Result<crate::automations::Response, String> {
+) -> Result<crate::automations::Response, Error> {
     use crate::automations::{Request, Response};
-    let (owner, source) = agent_execution::caller(host, authority)?;
-    let source = source.ok_or("A live hosted conversation is required")?;
+    let (owner, source) = agent_execution::checked_caller(host, authority)?;
+    let source = source
+        .ok_or_else(|| Error::PermissionDenied("A live hosted conversation is required".into()))?;
     let registry = agent_execution::registry(host)?;
     // Waiters need only their lineage's immutable receipt. Avoid loading the
     // project model on every poll, and let a retry recover its saved decision
@@ -200,7 +247,11 @@ fn process_hosted(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_proposal(*id, Some(&owner))?
-                .ok_or("This conversation has no such automation proposal")?;
+                .ok_or_else(|| {
+                    Error::PermissionDenied(
+                        "This conversation has no such automation proposal".into(),
+                    )
+                })?;
             return Ok(Response::Proposal(Box::new(proposal)));
         }
         Request::Propose {
@@ -230,7 +281,9 @@ fn process_hosted(
         } else {
             host.terminals
                 .get(&source)
-                .ok_or("The requesting session is no longer live")?
+                .ok_or_else(|| {
+                    Error::PermissionDenied("The requesting session is no longer live".into())
+                })?
                 .session
                 .launch
                 .working_directory
@@ -245,7 +298,7 @@ fn process_hosted(
         if target == repository {
             Ok(())
         } else {
-            Err("Hosted conversations can inspect and propose automations only in their own project".to_owned())
+            Err(Error::PermissionDenied("Hosted conversations can inspect and propose automations only in their own project".into()))
         }
     };
     match request {
@@ -260,7 +313,7 @@ fn process_hosted(
             let channel_title = definition.agent.target.channel().map(|channel| {
                 let channel = model.channel(channel).ok_or("The selected channel is unavailable")?;
                 require_scope(&channel.repository)?;
-                Ok::<_, String>(channel.title.clone())
+                Ok::<_, Error>(channel.title.clone())
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
                 .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
@@ -268,7 +321,7 @@ fn process_hosted(
             Ok(Response::Proposal(Box::new(proposal)))
         }
         Request::List { after, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
-            .project_automations(&repository, after, limit).map(Response::Listed),
+            .project_automations(&repository, after, limit).map(Response::Listed).map_err(Into::into),
         Request::Show { id } => {
             let automation = registry.lock().unwrap_or_else(|p| p.into_inner()).automation(id)?;
             require_scope(&automation.definition.agent.target.repository)?;
@@ -277,11 +330,11 @@ fn process_hosted(
         Request::History { id: Some(id), before, limit } => {
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_scope(&registry.automation(id)?.definition.agent.target.repository)?;
-            registry.automation_history(Some(id), before, limit).map(Response::History)
+            registry.automation_history(Some(id), before, limit).map(Response::History).map_err(Into::into)
         }
         Request::Audit { id, before, limit } => {
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            registry.project_automation_audit(&repository, id, before, limit).map(Response::Audit)
+            registry.project_automation_audit(&repository, id, before, limit).map(Response::Audit).map_err(Into::into)
         }
         Request::ShowFiring { id } => {
             let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_run_detail(id)?;
@@ -294,7 +347,7 @@ fn process_hosted(
             Ok(Response::Detail(detail))
         }
         Request::History { id: None, .. } => Err("Choose an automation ID for scoped run history".into()),
-        _ => Err("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into()),
+        _ => Err(Error::PermissionDenied("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into())),
     }
 }
 
@@ -515,8 +568,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("does not grant automation management"));
-        assert!(!error.contains("private-child-capability"));
+        assert!(matches!(&error, Error::PermissionDenied(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("does not grant automation management")
+        );
+        assert!(!error.to_string().contains("private-child-capability"));
     }
 
     #[test]
@@ -540,8 +598,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("Invalid agent session authority"));
-        assert!(!error.contains("unregistered-capability"));
+        assert!(matches!(&error, Error::PermissionDenied(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid agent session authority")
+        );
+        assert!(!error.to_string().contains("unregistered-capability"));
     }
     #[test]
     fn automation_lifecycle_audit_scopes_live_hosted_reads_and_never_dispatches() {
@@ -633,6 +696,23 @@ mod tests {
                 panic!("expected audit");
             };
             assert_eq!(page.events.len(), 2);
+            let invalid_cursor = crate::host::client::process_request(
+                &host,
+                1,
+                crate::terminal_ipc::ClientRequest::Automation {
+                    authority: authority.clone(),
+                    operation: Request::Audit {
+                        id: own,
+                        before: Some(u64::MAX),
+                        limit: 100,
+                    },
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                invalid_cursor.code,
+                crate::terminal_ipc::ProtocolErrorCode::InvalidRequest
+            );
             assert!(
                 !serde_json::to_string(&page)
                     .unwrap()
@@ -648,7 +728,30 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert!(error.contains("only in their own project"), "{error}");
+            assert!(matches!(&error, Error::PermissionDenied(_)));
+            assert!(
+                error.to_string().contains("only in their own project"),
+                "{error}"
+            );
+            // Exercise the real dispatcher classification as well as the
+            // service's project-scoped typed failure, without another actor.
+            let error = crate::host::client::process_request(
+                &host,
+                1,
+                crate::terminal_ipc::ClientRequest::Automation {
+                    authority: authority.clone(),
+                    operation: Request::Audit {
+                        id: other,
+                        before: None,
+                        limit: 100,
+                    },
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                crate::terminal_ipc::ProtocolErrorCode::PermissionDenied
+            );
         }
         assert_eq!(std::fs::read(root.join("prompts")).unwrap(), prompts);
         assert_eq!(std::fs::read(root.join("spawns")).unwrap(), spawns);
