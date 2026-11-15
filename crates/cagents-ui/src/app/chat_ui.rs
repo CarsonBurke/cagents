@@ -9417,6 +9417,9 @@ impl Cagents {
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
         self.clear_close_refusal(card);
+        if let Some(closed) = self.close_fenced_card(card) {
+            return closed;
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();

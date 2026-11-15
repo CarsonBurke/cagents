@@ -623,6 +623,10 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
 }
 
 fn visible_text(app: &Cagents, card: CardId) -> String {
+    element_text(app.chat_view(card))
+}
+
+fn element_text(mut element: cosmic::Element<'_, Message>) -> String {
     use cosmic::iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree},
@@ -638,7 +642,6 @@ fn visible_text(app: &Cagents, card: CardId) -> String {
         }
     }
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = app.chat_view(card);
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -758,6 +761,242 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
             .durable
             .pending_chat_admissions
             .contains_key(&pane.id)
+    );
+}
+
+/// The managed agent behind `pane`, reporting the same chat under a later
+/// boot's proof than the pane saved, as after an unclean restart.
+fn stale_agent(pane: &Pane, channel: ChannelId) -> crate::agent_execution::Agent {
+    use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Target};
+    let CardKind::Chat(mut reported) = pane.kind.clone() else {
+        unreachable!()
+    };
+    reported.proof.as_mut().unwrap().boot_id = "a later boot".into();
+    Agent {
+        id: crate::model::AgentId::from_uuid(pane.id.as_uuid()),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: crate::agent::Provider::Claude,
+            account: None,
+            target: Target {
+                repository: PathBuf::from("/fixture-project"),
+                directory: PathBuf::from("/fixture-project"),
+                placement: Some(Placement::Channel(channel)),
+            },
+            surface: Default::default(),
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement: Placement::Channel(channel),
+        session: Some(HostedSession::Chat(reported)),
+        console: None,
+        created_ms: 0,
+        closed: false,
+    }
+}
+
+/// A cached chat in the shown channel whose managed agent reports a later
+/// boot than the pane's saved proof, admitted so the pane is fenced.
+fn fenced_managed_chat(
+    text: &str,
+) -> (
+    ScriptedDaemon,
+    Cagents,
+    ChannelId,
+    Pane,
+    crate::workspace_model::WorkspaceModel,
+) {
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let agent = stale_agent(&pane, hidden);
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut model = model(identity, active, hidden, view);
+    model.agents = vec![agent];
+    admit(&mut app, active, hidden, model.clone());
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    (daemon, app, hidden, pane, model)
+}
+
+#[test]
+fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
+    if isolated("fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session") {
+        return;
+    }
+    let text = "Unsent text beside a stale session";
+    let (daemon, mut app, hidden, pane, mut model) = fenced_managed_chat(text);
+    assert!(app.chat_awaiting_admission(pane.id));
+    let visible = visible_text(&app, pane.id);
+    assert!(
+        visible.contains(text)
+            && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
+            && visible.contains("Agent connection unavailable")
+            && visible.contains("Close"),
+        "{visible}"
+    );
+    // The tab's close button routes a chat through the chat close. A fenced
+    // pane closes like any other, but no session is asked to stop.
+    let task = app.update(Message::CloseCard(pane.id));
+    settle(&mut app, task);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(!app.workspace.order().any(|id| id == pane.id));
+    assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
+    assert!(
+        app.recently_closed
+            .iter()
+            .any(|(card, _)| card.id == pane.id)
+    );
+    assert!(app.shared_views.pending.iter().any(|(_, scope, change)| {
+        *scope == Scope::Channel(hidden) && *change == Change::Remove { id: pane.id }
+    }));
+    // Snapshots that still hold it before the removal is acknowledged leave
+    // it closed.
+    for _ in 0..2 {
+        model.sequence += 1;
+        let read = app.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::Read(model.clone()),
+        );
+        settle(&mut app, read);
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == pane.id));
+    }
+    assert!(
+        daemon.requests().is_empty(),
+        "a fenced pane must not reconnect or close its stale session"
+    );
+}
+
+/// The occurrence recorded on #1922: after an unclean restart one managed
+/// chat's pane and agent name the same chat under different proofs. Only that
+/// pane is fenced. Its sibling in the same view is admitted and attaches, the
+/// fenced pane starts nothing, and startup reports it rather than waiting.
+#[test]
+fn stale_managed_chat_is_fenced_alone_while_its_sibling_attaches() {
+    if isolated("stale_managed_chat_is_fenced_alone_while_its_sibling_attaches") {
+        return;
+    }
+    let (mut app, active, hidden, stale, identity) = cached_chat();
+    let mut sibling = stale.clone();
+    sibling.id = CardId::new();
+    sibling.title = "Sibling".into();
+    let CardKind::Chat(session) = &mut sibling.kind else {
+        unreachable!()
+    };
+    session.id = TerminalId::new();
+    session.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+    let durable = Arc::make_mut(&mut app.durable);
+    durable
+        .channels
+        .iter_mut()
+        .find(|c| c.id == hidden)
+        .unwrap()
+        .cards
+        .push(sibling.id);
+    durable.cards.push(CardState {
+        id: sibling.id,
+        generation: durable.generation,
+        title: sibling.title.clone(),
+        width_fraction: sibling.width_fraction,
+        kind: sibling.kind.clone(),
+        existence: Existence::Open,
+    });
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    // The registry's descriptor differs from this window's cache, so the
+    // sibling attaches exactly what the shared view names.
+    let CardKind::Chat(canonical) = &mut sibling.kind else {
+        unreachable!()
+    };
+    canonical.launch.recipe.arguments = vec!["--permission-mode=plan".into()];
+    let expected = current_owner(&mut sibling);
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+        stale.id,
+        "Text beside a stale session".into(),
+    )]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.panes.push(stale.clone());
+    view.panes.push(sibling.clone());
+    let mut model = model(identity, active, hidden, view);
+    model.agents = vec![stale_agent(&stale, hidden)];
+    admit(&mut app, active, hidden, model.clone());
+
+    assert_eq!(
+        app.shared_views.quarantined,
+        HashSet::from([stale.id]),
+        "only the stale pane is fenced"
+    );
+    assert!(app.shared_views.blocked.is_empty());
+    assert!(
+        !app.chat_awaiting_admission(sibling.id),
+        "the sibling is admitted beside the fenced pane"
+    );
+    assert!(app.chat_awaiting_admission(stale.id));
+    assert_eq!(
+        daemon.requests(),
+        vec![expected],
+        "only the sibling attaches; nothing is started for the stale pane"
+    );
+    // Repeated snapshots neither admit the stale pane nor attach it again.
+    for _ in 0..2 {
+        model.sequence += 1;
+        let read = app.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::Read(model.clone()),
+        );
+        settle(&mut app, read);
+    }
+    assert!(app.chat_awaiting_admission(stale.id));
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(
+        app.card_state(stale.id).unwrap().kind,
+        stale.kind,
+        "the fenced pane keeps its saved descriptor"
+    );
+    // Startup qualification names the fenced pane instead of waiting on it.
+    let report = app.startup_pending().unwrap_err();
+    assert!(report.contains("can't confirm"), "{report}");
+    assert!(report.contains("Close it"), "{report}");
+}
+
+#[test]
+fn fenced_pane_whose_attachment_failed_offers_no_retry() {
+    if isolated("fenced_pane_whose_attachment_failed_offers_no_retry") {
+        return;
+    }
+    // The pane failed to attach before a snapshot fenced it, as when the
+    // daemon is replaced while the app runs.
+    let (daemon, mut app, _, pane, _) = fenced_managed_chat("");
+    app.cards
+        .insert(pane.id, CardRuntime::Failed("connection lost".into()));
+    // The pane body, not the chat view: a failed runtime is drawn there.
+    let visible = element_text(app.card_view(pane.id, true, false));
+    assert!(
+        visible.contains("Agent connection unavailable")
+            && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
+            && !visible.contains("Retry")
+            && !visible.contains("connection lost"),
+        "{visible}"
+    );
+    // Retry also arrives from the inspector, outside the pane's own view.
+    let task = app.update(Message::RetryCard(pane.id));
+    settle(&mut app, task);
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(
+        daemon.requests().is_empty(),
+        "a fenced pane must not reattach or relaunch its stale session"
     );
 }
 

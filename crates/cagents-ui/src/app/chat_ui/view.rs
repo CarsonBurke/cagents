@@ -1210,6 +1210,12 @@ impl Cagents {
             0.0
         };
         match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime))
+                if runtime.awaiting_admission()
+                    && self.shared_views.quarantined.contains(&card) =>
+            {
+                runtime.pending_admission_view(trailing_clearance, true)
+            }
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
                 let accounts = self.chat_accounts(
@@ -2362,7 +2368,7 @@ impl Runtime {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
-            return self.pending_admission_view(transcript_clearance);
+            return self.pending_admission_view(transcript_clearance, false);
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.

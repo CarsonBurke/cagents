@@ -6,63 +6,97 @@ impl Runtime {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
-    pub(super) fn pending_admission_view(&self, trailing_clearance: f32) -> Element<'_, Message> {
+    /// `fenced`: the saved descriptor failed its agent's proof, so this pane
+    /// stays as saved rather than waiting to reconnect, and says so.
+    pub(super) fn pending_admission_view(
+        &self,
+        trailing_clearance: f32,
+        fenced: bool,
+    ) -> Element<'_, Message> {
         let text = self.unsent_text();
-        let copy = widget::button::custom(design::body("Copy saved draft"))
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([space::S as u16, space::M as u16])
-            .on_press_maybe(
-                (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
-            );
-        let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
-            .align_items(Alignment::Center)
-            .spacing(space::M as u16);
-        // A long draft scrolls inside its card, so it fades into the card's
-        // own fill at the card's edges. The vertical inset scrolls with the
-        // text; the side inset keeps the fade clear of the rounded corners.
-        // The card hugs a short draft; the space it may grow into is laid out
-        // last, so the attachment caption below it keeps its room.
-        let card = widget::container(crate::interaction::overflow_fade_y(
-            widget::scrollable(
-                widget::container(view::body(text))
-                    .width(Length::Fill)
-                    .padding(design::with_vertical_rail(iced::Padding::from([
-                        space::M,
-                        0.0,
-                    ]))),
-            ),
-            design::sunken,
-        ))
-        .width(Length::Fill)
-        .padding([0.0, space::M])
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_M; 4],
-            false,
-        ));
-        let draft = widget::container(card)
-            .width(Length::Fill)
-            .height(Length::Fill);
         // Files and images wait with the text; their names say they were kept.
         let attached = self
             .unsent_attachments()
             .iter()
             .map(Attachment::label)
             .collect::<Vec<_>>();
-        let content = widget::column::with_children(
-            [
-                header.into(),
-                design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into(),
-                draft.into(),
-            ]
-            .into_iter()
-            .chain((!attached.is_empty()).then(|| {
-                design::caption(format!("Attached: {}", attached.join(", "))).into()
-            }))
-            .collect::<Vec<_>>(),
-        )
-        .spacing(space::M)
-        .width(Length::Fill);
+        let mut children = Vec::new();
+        if fenced {
+            // The same heading, explanation and Close as a fenced pane with no
+            // chat runtime, which is drawn as an unavailable pane.
+            let card = self.target.card;
+            children.push(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Warning, design::STATUS_ICON_SIZE),
+                    design::title("Agent connection unavailable").into(),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .into(),
+            );
+            children.push(design::body(super::super::shared_views::FENCED_PANE_EXPLANATION).into());
+            children.push(
+                crate::ui_controls::button::primary("Close")
+                    .id(card_control_id(card, "failed.close"))
+                    .name("Close Agent")
+                    .on_press(Message::CloseCard(card))
+                    .into(),
+            );
+        }
+        // A fenced pane may have nothing unsent; an empty saved draft would
+        // only look like something to copy.
+        if !fenced || !text.is_empty() || !attached.is_empty() {
+            let copy = widget::button::custom(design::body("Copy saved draft"))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([space::S as u16, space::M as u16])
+                .on_press_maybe(
+                    (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
+                );
+            children.push(
+                widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
+                    .align_items(Alignment::Center)
+                    .spacing(space::M as u16)
+                    .into(),
+            );
+            if !fenced {
+                children.push(design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into());
+            }
+            // A long draft scrolls inside its card, so it fades into the card's
+            // own fill at the card's edges. The vertical inset scrolls with the
+            // text; the side inset keeps the fade clear of the rounded corners.
+            // The card hugs a short draft; the space it may grow into is laid
+            // out last, so the attachment caption below it keeps its room.
+            let card = widget::container(crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::container(view::body(text))
+                        .width(Length::Fill)
+                        .padding(design::with_vertical_rail(iced::Padding::from([
+                            space::M,
+                            0.0,
+                        ]))),
+                ),
+                design::sunken,
+            ))
+            .width(Length::Fill)
+            .padding([0.0, space::M])
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M; 4],
+                false,
+            ));
+            children.push(
+                widget::container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            );
+            if !attached.is_empty() {
+                children.push(design::caption(format!("Attached: {}", attached.join(", "))).into());
+            }
+        }
+        let content = widget::column::with_children(children)
+            .spacing(space::M)
+            .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
             .padding(iced::Padding::new(space::L).right(space::L.max(trailing_clearance)))
             .width(Length::Fill)
