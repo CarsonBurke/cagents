@@ -15,6 +15,9 @@ use cosmic::{Element, Renderer, Theme};
 
 use crate::design;
 
+mod highlighted;
+pub use highlighted::fade_highlighted;
+
 /// How far into the text the fade reaches.
 ///
 /// About two narrow glyphs at body size: enough to read as the text running
@@ -189,28 +192,6 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
             cut,
         })
     }
-}
-
-/// Fades the end of any one line of text that overflows, such as a
-/// [`rich_text`] label with highlighted matches, as [`FadeText`] fades plain
-/// text. Only the end: a line moved back to show its end is drawn outside its
-/// own bounds, which rich text skips drawing.
-///
-/// The line must not wrap or ellipsize, and must keep its default shrinking
-/// width, which is how its full width is measured; size the row around it
-/// instead. Spans keep the colour the line is
-/// drawn with unless they set their own: a span with its own colour is drawn
-/// at full strength even where the line fades, so keep coloured spans to the
-/// line's start, where a fade rarely reaches.
-///
-/// [`rich_text`]: cosmic::iced::widget::rich_text
-pub fn fade_line<'a, Message: 'a>(line: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    Element::new(Faded {
-        line: line.into(),
-        class: None,
-        edge: FadeEdge::End,
-        cut: false,
-    })
 }
 
 /// `content` on a single line: a line break would make the label a line
@@ -579,22 +560,6 @@ mod tests {
         let (narrow, width) = measure(fade_text(title).into(), 80.0);
         assert!((narrow - natural).abs() < 0.5, "measured whatever the room");
         assert!(width <= 80.0 && narrow > width + 0.5, "{narrow} in {width}");
-    }
-
-    #[test]
-    fn rich_lines_are_measured_as_plain_ones_are() {
-        let title = "A conversation title long enough to run out of room";
-        let (plain, _) = measure(fade_text(title).into(), 80.0);
-        let rich = cosmic::iced::widget::rich_text(vec![
-            cosmic::iced::widget::text::Span::<'_, (), Font>::new("A conversation")
-                .color(cosmic::iced::Color::from_rgb(0.9, 0.2, 0.2)),
-            cosmic::iced::widget::text::Span::new(" title long enough to run out of room"),
-        ])
-        .size(design::TEXT_BODY)
-        .wrapping(Wrapping::None);
-        let (natural, width) = measure(fade_line(rich), 80.0);
-        assert!((natural - plain).abs() < 1.0, "{natural} vs {plain}");
-        assert!(width <= 80.0);
     }
 
     #[test]

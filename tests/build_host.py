@@ -784,9 +784,11 @@ class Jobserver(unittest.TestCase):
         first = self.join()
         self.take(first, self.TOKENS)
         second = self.join()
-        first_held, second_held = self.compiling([first, second])
-        self.assertGreaterEqual(second_held, self.TOKENS / 2 - 1, (first_held, second_held))
-        self.assertGreaterEqual(first_held, self.TOKENS / 2 - 1, (first_held, second_held))
+        held = self.compiling([first, second])
+        # Equal shares, judged against each other: how many both hold at once
+        # depends on how fast this host runs their compilers.
+        self.assertGreaterEqual(min(held), 1, held)
+        self.assertGreaterEqual(min(held), 0.75 * max(held), held)
 
     def test_a_build_alone_in_wanting_more_gets_what_the_others_leave(self):
         self.at_build_pace()

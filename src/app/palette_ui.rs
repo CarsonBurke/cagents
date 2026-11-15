@@ -214,41 +214,18 @@ fn match_score(label: &str, query: &str) -> Option<usize> {
 }
 
 fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static, Message> {
-    use iced::widget::text::Span;
     if query.is_empty() {
         return crate::ui_controls::fade_text(label.to_owned())
             .width(Length::Fill)
             .into();
     }
-    let accent = design::accent_color(&cosmic::theme::active());
-    let font = cosmic::font::default();
     let searchable = search_label(label, moving);
     let offset = label.len() - searchable.len();
     let matches = matching::highlighted_ranges(searchable, query, offset);
-    let mut spans: Vec<Span<'static, ()>> = Vec::new();
-    let mut start = 0;
-    for range in matches {
-        if start < range.start {
-            spans.push(Span::new(label[start..range.start].to_owned()));
-        }
-        spans.push(
-            Span::new(label[range.clone()].to_owned())
-                .color(accent)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..font
-                }),
-        );
-        start = range.end;
-    }
-    if start < label.len() || spans.is_empty() {
-        spans.push(Span::new(label[start..].to_owned()));
-    }
-    widget::container(crate::ui_controls::fade_line(
-        iced::widget::rich_text(spans)
-            .size(design::TEXT_BODY)
-            .font(font)
-            .wrapping(iced::widget::text::Wrapping::None),
+    widget::container(crate::ui_controls::fade_highlighted(
+        label,
+        &matches,
+        cosmic::theme::Text::Custom(design::accent_text),
     ))
     .width(Length::Fill)
     .clip(true)
