@@ -14044,10 +14044,15 @@ mod row_interaction {
             operation: &mut dyn Operation,
         ) {
             self.capture_viewport_origin(layout);
-            if let Kind::Reorder { viewport, .. } = &self.kind {
+            if let Kind::Reorder {
+                viewport, project, ..
+            } = &self.kind
+            {
                 viewport.0.set(viewport.content_top(layout));
                 // The list's top fade keeps clear of its groups' headers.
-                operation.custom(None, layout.bounds(), &mut PinnedHeaders::List);
+                if project.is_none() {
+                    operation.custom(None, layout.bounds(), &mut PinnedHeaders::List);
+                }
             }
             if matches!(self.kind, Kind::Group { .. }) {
                 operation.custom(None, layout.bounds(), &mut PinnedHeaders::Group);
@@ -20539,65 +20544,68 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, projects);
         let state = expanded_worktree_state();
         let mut renderer = headless_renderer();
-        let mut depths = Vec::new();
-        for offset in (0..=450).map(|step| step as f32) {
-            let mut ui = UserInterface::build(
-                widget::container(project_list(&model, &state, false, false)).height(180),
-                Size::new(280.0, 180.0),
-                Cache::new(),
-                &mut renderer,
-            );
-            ui.operate(
-                &renderer,
-                &mut operation::scrollable::scroll_to::<()>(
-                    stable_id("projects.scroll"),
-                    operation::scrollable::AbsoluteOffset {
-                        x: None,
-                        y: Some(offset),
-                    },
-                ),
-            );
-            // An event lets the fade read the scroll it now has.
-            ui.update(
-                &[cosmic::iced::Event::Mouse(mouse::Event::CursorLeft)],
-                mouse::Cursor::Unavailable,
-                &mut renderer,
-                &mut clipboard::Null,
-                &mut Vec::new(),
-            );
-            let drawn = crate::interaction::capture_top_fades(|| {
-                ui.draw(
+        // The compact rail wraps each project in a container of its own.
+        for compact in [false, true] {
+            let mut depths = Vec::new();
+            for offset in (0..=450).map(|step| step as f32) {
+                let mut ui = UserInterface::build(
+                    widget::container(project_list(&model, &state, compact, false)).height(180),
+                    Size::new(280.0, 180.0),
+                    Cache::new(),
                     &mut renderer,
-                    &cosmic::Theme::dark(),
-                    &cosmic::iced::advanced::renderer::Style::default(),
-                    mouse::Cursor::Unavailable,
                 );
-            });
-            assert_eq!(drawn.len(), 1, "one list, one fade");
-            depths.push((offset, drawn[0]));
-        }
-        for pair in depths.windows(2) {
-            let ((_, before), (offset, after)) = (pair[0], pair[1]);
+                ui.operate(
+                    &renderer,
+                    &mut operation::scrollable::scroll_to::<()>(
+                        stable_id("projects.scroll"),
+                        operation::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(offset),
+                        },
+                    ),
+                );
+                // An event lets the fade read the scroll it now has.
+                ui.update(
+                    &[cosmic::iced::Event::Mouse(mouse::Event::CursorLeft)],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut Vec::new(),
+                );
+                let drawn = crate::interaction::capture_top_fades(|| {
+                    ui.draw(
+                        &mut renderer,
+                        &cosmic::Theme::dark(),
+                        &cosmic::iced::advanced::renderer::Style::default(),
+                        mouse::Cursor::Unavailable,
+                    );
+                });
+                assert_eq!(drawn.len(), 1, "one list, one fade");
+                depths.push((offset, drawn[0]));
+            }
+            for pair in depths.windows(2) {
+                let ((_, before), (offset, after)) = (pair[0], pair[1]);
+                assert!(
+                    (after - before).abs() <= 1.0 + 0.01,
+                    "the top fade jumped from {before} to {after} at {offset} (compact: {compact})"
+                );
+            }
             assert!(
-                (after - before).abs() <= 1.0 + 0.01,
-                "the top fade jumped from {before} to {after} at {offset}"
+                depths.iter().any(|(_, depth)| *depth == 0.0),
+                "a pinned header holds the edge (compact: {compact})"
+            );
+            // Well past the start of the list, where the fade could otherwise
+            // be at its full depth, it stops short as a gap between projects
+            // crosses the edge.
+            assert!(
+                depths.iter().any(
+                    |(offset, depth)| *offset > crate::interaction::OVERFLOW_FADE
+                        && *depth > 0.0
+                        && *depth < crate::interaction::OVERFLOW_FADE
+                ),
+                "the fade stops short of a header between projects (compact: {compact}): {depths:?}"
             );
         }
-        assert!(
-            depths.iter().any(|(_, depth)| *depth == 0.0),
-            "a pinned header holds the edge"
-        );
-        // Well past the start of the list, where the fade could otherwise
-        // be at its full depth, it stops short as a gap between projects
-        // crosses the edge.
-        assert!(
-            depths.iter().any(
-                |(offset, depth)| *offset > crate::interaction::OVERFLOW_FADE
-                    && *depth > 0.0
-                    && *depth < crate::interaction::OVERFLOW_FADE
-            ),
-            "the fade stops short of a header between projects: {depths:?}"
-        );
     }
 
     #[test]

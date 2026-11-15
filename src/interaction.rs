@@ -468,10 +468,13 @@ pub(crate) enum PinnedHeaders {
     Group,
 }
 
-/// How deep below its scrollable a [`PinnedHeaders::List`] is looked for:
-/// it sits near the top of the content, and looking no deeper keeps the rows
-/// beside it from being walked on every event.
-const PINNED_HEADERS_DEPTH: usize = 6;
+/// How deep below its scrollable a [`PinnedHeaders::List`] is looked for,
+/// and below the list each [`PinnedHeaders::Group`]. Both sit near the top of
+/// what wraps them; looking no deeper keeps the rows beside them from being
+/// walked on every event, and counting each from its own start keeps a
+/// wrapper around the list from hiding its groups.
+const PINNED_LIST_DEPTH: usize = 8;
+const PINNED_GROUP_DEPTH: usize = 4;
 
 #[cfg(test)]
 thread_local! {
@@ -481,7 +484,14 @@ thread_local! {
 /// The depth of every top fade drawn under pinned headers while `draw` runs.
 #[cfg(test)]
 pub(crate) fn capture_top_fades(draw: impl FnOnce()) -> Vec<f32> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TOP_FADES.with(|fades| fades.replace(None));
+        }
+    }
     TOP_FADES.with(|fades| assert!(fades.replace(Some(Vec::new())).is_none()));
+    let _reset = Reset;
     draw();
     TOP_FADES.with(|fades| fades.take().unwrap())
 }
@@ -1576,6 +1586,8 @@ struct OverflowProbe {
     headers: bool,
     /// The strip's start, where the scrollable lays its content out.
     edge: f32,
+    /// How far below the scrollable, or once inside the list below it, the
+    /// walk has come.
     depth: usize,
     seek: Seek,
 }
@@ -1618,23 +1630,25 @@ impl<T> Operation<T> for OverflowProbe {
         if !self.headers {
             return;
         }
-        let mut descend = |probe: &mut Self| {
-            if probe.depth < PINNED_HEADERS_DEPTH {
+        let mut descend = |probe: &mut Self, limit: usize| {
+            if probe.depth < limit {
                 probe.depth += 1;
                 operate(probe);
                 probe.depth -= 1;
             }
         };
         match self.seek {
-            Seek::Looking => descend(self),
+            Seek::Looking => descend(self, PINNED_LIST_DEPTH),
             Seek::Entering => {
                 self.seek = Seek::Groups;
-                descend(self);
+                let outside = std::mem::take(&mut self.depth);
+                descend(self, PINNED_GROUP_DEPTH);
+                self.depth = outside;
                 self.seek = Seek::Done;
             }
             // A group's own rows say nothing more.
             Seek::Group => self.seek = Seek::Groups,
-            Seek::Groups => descend(self),
+            Seek::Groups => descend(self, PINNED_GROUP_DEPTH),
             Seek::Done => {}
         }
     }
@@ -4176,16 +4190,27 @@ mod tests {
                 widget::Space::new().width(300).height(100).into(),
             ))
         };
+        // Wrapped as deep as the sidebar wraps its list and groups, plus
+        // room to spare: the compact rail puts each group in a container, and
+        // the Attention filter adds sections after the list.
+        let wrap = |content: Element<'static, ()>, times: usize| {
+            (0..times).fold(content, |content, _| widget::container(content).into())
+        };
+        let list = Element::new(Marked(
+            || PinnedHeaders::List,
+            widget::column::with_children(vec![wrap(group(), 2), wrap(group(), 2)])
+                .spacing(8)
+                .into(),
+        ));
         let mut list: Element<'static, ()> = overflow_fade_y_under_headers(
-            widget::scrollable(widget::column::with_children(vec![
-                Element::new(Marked(
-                    || PinnedHeaders::List,
-                    widget::column::with_children(vec![group(), group()])
-                        .spacing(8)
-                        .into(),
-                )),
-                widget::Space::new().width(300).height(300).into(),
-            ]))
+            widget::scrollable(wrap(
+                widget::column::with_children(vec![
+                    wrap(list, 4),
+                    widget::Space::new().width(300).height(300).into(),
+                ])
+                .into(),
+                2,
+            ))
             .height(Length::Fill),
             crate::design::base,
         );
