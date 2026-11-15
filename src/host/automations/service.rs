@@ -57,7 +57,6 @@ pub(in crate::host) fn process_under_control(
     authority: crate::agent_execution::Authority,
     request: crate::automations::Request,
 ) -> Result<crate::automations::Response, Error> {
-    use crate::automations::Request;
     if authority.token().is_some() && !request.allowed_from_hosted_conversation() {
         return Err(Error::PermissionDenied("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into()));
     }

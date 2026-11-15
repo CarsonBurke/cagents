@@ -25,9 +25,10 @@ mod ownership;
 pub(super) mod terminals;
 mod transcript;
 pub(super) use ownership::{
-    Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
-    reconcile_agent_run, reconcile_agent_run_under_control,
+    Reconciliation, cancel_agent_run_under_control, interactive, reconcile_agent_run_under_control,
 };
+#[cfg(test)]
+pub(super) use ownership::{cancel_agent_run, reconcile_agent_run};
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.

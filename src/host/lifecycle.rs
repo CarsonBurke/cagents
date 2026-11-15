@@ -1056,7 +1056,7 @@ mod tests {
                 .forget_retention_pin(source.id, &generation)
                 .unwrap();
         }
-        let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
+        let (lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
         assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
         assert!(host.lock().unwrap().terminal_retirements.is_empty());
 

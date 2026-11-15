@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    terminal::RenderStreamFixture,
-    workspace_model::views::{TerminalRemovalBasis, View},
-};
+use crate::{terminal::RenderStreamFixture, workspace_model::views::TerminalRemovalBasis};
 
 fn prepared() -> (
     tempfile::TempDir,

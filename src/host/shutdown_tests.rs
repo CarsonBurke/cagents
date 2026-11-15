@@ -9,7 +9,6 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     sync::mpsc,
-    time::{Duration, Instant},
 };
 
 const ROOT: &str = "CAGENTS_SHUTDOWN_BATCH_ROOT";

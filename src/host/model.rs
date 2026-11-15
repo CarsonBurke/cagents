@@ -28,7 +28,7 @@ mod archived_history;
 mod automation_attention;
 mod automation_audit;
 pub(super) use archived_history::ArchivedHistory;
-pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
+pub(super) use automation_attention::AutomationAttentionReceipt;
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
@@ -1301,7 +1301,7 @@ mod tests {
         let repeated = registry.apply(&drag).unwrap();
         assert!(!repeated.changed);
         assert_eq!(repeated.model.sequence, applied.model.sequence);
-        let mut peer = Registry::at(&database).unwrap();
+        let peer = Registry::at(&database).unwrap();
         assert_eq!(
             peer.model().unwrap().navigation_orders,
             applied.model.navigation_orders

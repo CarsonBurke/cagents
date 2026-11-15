@@ -6,14 +6,13 @@ mod retention;
 pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{
-        Arc, Mutex, OnceLock, RwLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak, atomic::AtomicBool},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
