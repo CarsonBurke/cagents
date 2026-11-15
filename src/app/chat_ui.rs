@@ -22858,7 +22858,7 @@ mod tests {
             app.presentation_projection_ready(&before, &accepted, None),
             Ok(())
         );
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         let update = ModelUpdate::Changed {
             sequence: 18,
@@ -25297,7 +25297,7 @@ mod tests {
                     focused: (id == source).then_some(card),
                 });
             }
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             assert!(app.can_move_pane_to_channel(card, destination));
             if close_first {
@@ -27031,7 +27031,7 @@ mod tests {
                 panes,
                 retired: Vec::new(),
             });
-            let (publish, published) = async_channel::unbounded();
+            let (publish, published) = test_model_channel();
             app.workspace_model_tx = publish;
             let occupied = app.workspace_model.clone();
             drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {

@@ -834,6 +834,7 @@ impl Cagents {
         let kind = project.kind;
         let worktrees = project.worktrees.clone();
         let roots = project_worktree_roots(project);
+        self.forget_project_view_seeds(&repository);
         let scope = &closure.scope;
         // The terminal host was closed before the shared edit. Retire this
         // window's saved cards too, so reopening the project does not revive
@@ -1604,6 +1605,10 @@ impl Cagents {
                     return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
+                    self.forget_view_seed(&crate::workspace_model::views::Scope::Worktree {
+                        repository: target.repository.clone(),
+                        path: target.path.clone(),
+                    });
                     let current = self
                         .original_removal_cards(&target, &capture)
                         .into_iter()

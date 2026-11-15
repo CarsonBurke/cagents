@@ -486,6 +486,87 @@ class Evidence(unittest.TestCase):
                                           extra={"STUB_CARGO_FAILS": "1"}).returncode, 0)
         self.assertIn("has not been built", self.run_tool("start", "after", check=False).stderr)
 
+    def main_build(self, checkout: Path, arguments: str | None = None) -> Path:
+        """Executables the sentinel kept of CHECKOUT's commit."""
+        builds = self.root / "real-home" / ".local" / "state" / "cagents-main-sentinel" / "builds"
+        head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], check=True,
+                              env=self.env, capture_output=True, text=True).stdout.strip()
+        directory = builds / head
+        self.executables(directory)
+        if arguments is not None:
+            (directory / "arguments").write_text(arguments)
+        (builds / ".lock").touch()
+        return directory
+
+    def executables(self, directory: Path) -> None:
+        """Executables as build would make them, and what it built them with."""
+        directory.mkdir(parents=True)
+        for name in ("cagents", "cagentsd", "cagents-ui"):
+            shutil.copy(self.bin / "fixture-cli", directory / name)
+        (directory / "arguments").write_text(self.run_tool("__build-arguments").stdout)
+
+    def test_a_main_commit_the_sentinel_built_is_taken_without_compiling(self) -> None:
+        checkout = self.checkout()
+        prebuilt = self.main_build(checkout)
+        result = self.run_tool("build", "after", str(checkout))
+        self.assertIn("from main's prebuilt executables", result.stdout)
+        self.assertFalse((self.logs / "cargo").exists())
+        # The sentinel's copy stays for the next task.
+        self.assertTrue((prebuilt / "cagents-ui").exists())
+        self.run_tool("start", "after")
+        self.assertTrue((self.logs / "ui-ran").exists())
+
+    def test_a_prebuilt_copy_that_fails_is_compiled_instead(self) -> None:
+        checkout = self.checkout()
+        (self.main_build(checkout) / "cagentsd").unlink()
+        result = self.run_tool("build", "after", str(checkout))
+        self.assertIn("has no cagentsd", result.stderr)
+        self.assertTrue((self.logs / "cargo").exists())
+        self.run_tool("start", "after")
+
+    def test_a_changed_checkout_or_other_build_of_main_is_compiled(self) -> None:
+        checkout = self.checkout()
+        self.main_build(checkout, arguments="--features something-else\n")
+        self.run_tool("build", "after", str(checkout))
+        self.assertTrue((self.logs / "cargo").exists())
+        (self.logs / "cargo").unlink()
+        other = self.checkout("before")
+        self.main_build(other)
+        (other / "edited").write_text("new")
+        self.run_tool("build", "before", str(other))
+        self.assertTrue((self.logs / "cargo").exists())
+
+    def test_executables_built_elsewhere_are_moved_into_the_target(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent))
+        self.assertIn(f"from {sent}", result.stdout)
+        self.assertFalse((self.logs / "cargo").exists())
+        self.assertFalse(sent.exists())
+        self.run_tool("start", "after")
+        self.assertTrue((self.logs / "ui-ran").exists())
+
+    def test_executables_built_otherwise_are_refused(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        (sent / "arguments").write_text("--profile release\n")
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not built as this native-evidence builds", result.stderr)
+        self.assertFalse((self.logs / "cargo").exists())
+
+    def test_executables_missing_one_are_refused(self) -> None:
+        checkout = self.checkout()
+        sent = self.root / "sent"
+        self.executables(sent)
+        (sent / "cagentsd").unlink()
+        result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no cagentsd", result.stderr)
+        self.assertIn("has not been built", self.run_tool("start", "after", check=False).stderr)
+
     def test_a_running_side_cannot_be_rebuilt_under_its_evidence(self) -> None:
         checkout = self.built()
         self.run_tool("start", "after")
@@ -2018,15 +2099,47 @@ REMOTE_STUBS = {
         host=$1
         shift
         [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
+        login=(env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" GIT_CONFIG_GLOBAL=/dev/null)
+        # An rsync server speaks its protocol over this connection until the
+        # client hangs up, which it does only once ssh has exited.
+        case $1 in
+            rsync) exec "${login[@]}" sh -c "$*" ;;
+        esac
         # What travels to the host: its arguments, above, and its input.
-        tee -a "$STUB_LOG/ssh-input" | env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" \\
-            GIT_CONFIG_GLOBAL=/dev/null sh -c "$*"
+        tee -a "$STUB_LOG/ssh-input" | "${login[@]}" sh -c "$*"
+    """,
+    # Only to say where a checkout's builds go, as Cargo would.
+    "cargo": """
+        #!/bin/bash
+        [ "$1" = metadata ] || { echo "cargo: only metadata here" >&2; exit 101; }
+        printf '{"target_directory":"%s"}\\n' "${CARGO_TARGET_DIR:-$PWD/target}"
     """,
 }
+
+# A checkout's own gate: each build writes a stand-in executable naming the
+# checkout's state, and is recorded.
+GATE_STUB = """
+    #!/bin/bash
+    if [ "$1 $2" = "exec --hold" ]; then
+        printf '%s\\t%s\\n' "$PWD" "exec --hold" >> "$STUB_LOG/gate"
+        shift 2
+        exec "$@"
+    fi
+    printf '%s\\t%s\\n' "$PWD" "$*" >> "$STUB_LOG/gate"
+    target=${CARGO_TARGET_DIR:-target}
+    mkdir -p "$target/dev-runtime"
+    executable=$target/dev-runtime/${*: -1}
+    printf '%s %s\\n' "${*: -1}" "$(cat src.rs 2>/dev/null)" > "$executable"
+    chmod +x "$executable"
+"""
 
 # The build host's native-evidence: records each command and what it ran with.
 REMOTE_TOOL = """
     #!/bin/bash
+    if [ "$1" = __build-arguments ]; then
+        printf -- '--profile dev-runtime --bin %s\\n' cagents cagentsd cagents-ui
+        exit 0
+    fi
     [ "$1" = --task ] && task=$2 && shift 2
     printf '%s\\t%s\\n' "$task" "$*" >> "$STUB_LOG/remote-tool"
     env > "$STUB_LOG/remote-env"
@@ -2046,7 +2159,15 @@ REMOTE_TOOL = """
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
         shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
-        build) printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2" ;;
+        build) [ ! -e "$task/build-fails" ] || exit 1
+               printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2"
+               mkdir -p "$task/target-$2"
+               (cd "$3" && pwd -P) > "$task/target-$2/evidence-source"
+               if [ "${4:-}" = --executables ]; then
+                   printf '%s\\n' "$5" > "$task/executables-$2"
+                   cat "$5"/* > "$task/took-$2"
+                   rm -r "$5"
+               fi ;;
         cli) printf '%s\\n' "$*" > "$task/cli" ;;
     esac
 """
@@ -2090,6 +2211,13 @@ class RemoteEvidence(unittest.TestCase):
             check=True, env=self.env, capture_output=True, text=True,
         ).stdout.strip()
 
+    def checkout(self, name: str, files: dict[str, str]) -> Path:
+        """A checkout whose gate builds stand-in executables in its target,
+        as `mise run dev` would build the real ones."""
+        path = self.repository(name, {**files, "scripts/cargo-gate": GATE_STUB}, executable=True)
+        (path / ".git/info/exclude").write_text("target/\n")
+        return path
+
     def repository(self, name: str, files: dict[str, str], executable: bool = False) -> Path:
         path = self.root / name
         for relative, body in files.items():
@@ -2129,7 +2257,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("--remote fw16", result.stderr)
 
     def test_a_hosted_shell_runs_it_on_the_host_without_its_authority(self) -> None:
-        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         self.run_tool("build", "after", str(checkout))
         environment = (self.logs / "remote-env").read_text()
         self.assertNotIn("CAGENTS_AGENT_AUTHORITY", environment)
@@ -2143,13 +2271,98 @@ class RemoteEvidence(unittest.TestCase):
         built = (self.remote_task / "built-after").read_text().strip()
         self.assertEqual(built, str(self.remote_repository / ".worktrees" / "cev-mytask-after"))
         self.assertEqual(self.git(Path(built), "rev-parse", "HEAD"), self.git(checkout, "rev-parse", "HEAD"))
-        # The host's login shell may not be Bash: every script travels on its input.
+        # The host's login shell may not be Bash: every script travels on its
+        # input. Git and rsync start their own servers, which take only words.
         commands = {line.split(" buildhost ", 1)[-1] for line in (self.logs / "ssh").read_text().splitlines()
-                    if "receive-pack" not in line}
+                    if "receive-pack" not in line and " buildhost rsync --server " not in line}
         self.assertEqual(commands, {"bash -s"})
 
+    def test_a_checkout_builds_through_its_own_gate_and_sends_what_it_built(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        (checkout / "src.rs").write_text("fn main() { edited(); }\n")
+        self.run_tool("build", "after", str(checkout))
+        gate = [line.split("\t") for line in (self.logs / "gate").read_text().splitlines()]
+        self.assertEqual({directory for directory, _ in gate}, {str(checkout)})
+        # In one slot, held for the three, as the tool says to build them.
+        self.assertEqual([arguments for _, arguments in gate], [
+            "exec --hold",
+            *(f"build --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
+        ])
+        # The host takes the executables built here, of the edited files, and
+        # what they were built with.
+        self.assertEqual((self.remote_task / "executables-after").read_text().strip(),
+                         str(self.remote_task / "upload-after"))
+        took = (self.remote_task / "took-after").read_text()
+        self.assertEqual(took.count("fn main() { edited(); }"), 3)
+        self.assertIn("--profile dev-runtime --bin cagents-ui", took)
+        # Nor does the checkout keep anything it did not have.
+        self.assertEqual(self.git(checkout, "status", "--porcelain"), "M src.rs")
+
+    def test_builds_are_taken_from_where_cargo_puts_them(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "moved\n"})
+        elsewhere = self.root / "elsewhere"
+        self.run_tool("build", "after", str(checkout), extra={"CARGO_TARGET_DIR": str(elsewhere)})
+        self.assertEqual((self.remote_task / "took-after").read_text().count("moved"), 3)
+        self.assertFalse((checkout / "target").exists())
+
+    def test_what_was_sent_for_a_failed_build_does_not_stay(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        (self.remote_task / "build-fails").touch()
+        result = self.run_tool("build", "after", str(checkout), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"build after {self.remote_repository}/.worktrees/cev-mytask-after --executables "
+                      f"{self.remote_task}/upload-after", self.tool_calls())
+        self.assertFalse((self.remote_task / "upload-after").exists(), result.stderr)
+
+    def test_a_main_commit_the_host_has_built_is_not_built_again(self) -> None:
+        checkout = self.checkout("before", {"src.rs": "fn main() {}\n"})
+        head = self.git(checkout, "rev-parse", "HEAD")
+        prebuilt = self.remote_home / ".local/state/cagents-main-sentinel/builds" / head
+        prebuilt.mkdir(parents=True)
+        (prebuilt / "arguments").write_text("as native-evidence builds\n")
+        self.run_tool("build", "before", str(checkout))
+        self.assertFalse((self.logs / "gate").exists())
+        self.assertFalse((self.remote_task / "executables-before").exists())
+        self.assertEqual((self.remote_task / "built-before").read_text().strip(),
+                         str(self.remote_repository / ".worktrees" / "cev-mytask-before"))
+
+    def test_the_tools_own_checkout_is_built_from_where_the_tool_already_is(self) -> None:
+        write_executable(self.tool / "scripts" / "cargo-gate", GATE_STUB, self.logs)
+        (self.tool / ".git/info/exclude").write_text("target/\n")
+        self.run_tool("build", "after", str(self.tool))
+        tool_checkout = self.remote_repository / ".worktrees" / "cev-mytask-tool"
+        self.assertEqual((self.remote_task / "built-after").read_text().strip(), str(tool_checkout))
+        self.assertFalse((self.remote_repository / ".worktrees" / "cev-mytask-after").exists())
+        self.assertTrue((tool_checkout / "scripts" / "cargo-gate").exists())
+
+    def test_the_same_uncommitted_files_are_the_same_commit(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "\n"})
+        (checkout / "new.rs").write_text("fn new() {}\n")
+        self.run_tool("build", "after", str(checkout))
+        first = (self.task / "sources.tsv").read_text().split()[3]
+        self.run_tool("build", "after", str(checkout))
+        self.assertEqual((self.task / "sources.tsv").read_text().split()[3], first)
+
+    def test_a_session_running_from_the_tool_checkout_is_not_changed_under_it(self) -> None:
+        write_executable(self.tool / "scripts" / "cargo-gate", GATE_STUB, self.logs)
+        (self.tool / ".git/info/exclude").write_text("target/\n")
+        self.run_tool("build", "after", str(self.tool))
+        self.run_tool("start", "after")
+        before = self.checkout("before", {"src.rs": "\n"})
+        # The tool unchanged, the other side builds.
+        self.run_tool("build", "before", str(before))
+        (self.tool / "edited").write_text("new\n")
+        result = self.run_tool("build", "before", str(before), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runs from this tool's checkout", result.stderr)
+        self.assertFalse((self.remote_repository / ".worktrees" / "cev-mytask-tool" / "edited").exists())
+        self.run_tool("stop")
+        self.run_tool("build", "before", str(before))
+        self.assertTrue((self.remote_repository / ".worktrees" / "cev-mytask-tool" / "edited").exists())
+
     def test_uncommitted_and_untracked_files_are_built_without_touching_the_checkout(self) -> None:
-        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         head = self.git(checkout, "rev-parse", "HEAD")
         (checkout / "src.rs").write_text("fn main() { changed(); }\n")
         (checkout / "new.rs").write_text("fn new() {}\n")
@@ -2180,7 +2393,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(self.git(remote, "rev-parse", "HEAD"), self.git(self.tool, "rev-parse", "base"))
 
     def test_shots_come_back_with_their_manifest(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         result = self.run_tool("shot", "home")
@@ -2189,15 +2402,15 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("cli", "project", "open", "{fixture}/project", "it's quoted")
         self.assertEqual((self.remote_task / "cli").read_text().strip(),
                          f"cli project open {self.remote_task}/fixture/project it's quoted")
 
     def test_pair_runs_the_steps_on_both_sides_and_brings_back_every_shot(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
-        after = self.repository("after", {"src.rs": "new\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
+        after = self.checkout("after", {"src.rs": "new\n"})
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
@@ -2212,7 +2425,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(calls.count("stop"), 2)
 
     def test_open_window_is_forwarded_to_the_owned_remote_task(self) -> None:
-        checkout = self.repository("after", {"src.rs": "new\n"})
+        checkout = self.checkout("after", {"src.rs": "new\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("open-window", "window-2")
         self.assertIn("open-window window-2", self.tool_calls())
@@ -2225,8 +2438,8 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse((self.logs / "remote-tool").exists())
 
     def test_pair_forwards_a_real_codex_host_path_without_shell_evaluation(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
-        after = self.repository("after", {"src.rs": "new\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
+        after = self.checkout("after", {"src.rs": "new\n"})
         steps = self.root / "steps.sh"
         steps.write_text('evidence shot "real-$SIDE"\n')
         marker = self.root / "must-not-be-created"
@@ -2241,14 +2454,14 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_steps_name_the_fixture_on_the_host(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         steps.write_text("evidence cli project open '{fixture}/project'\n")
         self.run_tool("pair", "--before", str(before), "--after", str(before), "--steps", str(steps))
         self.assertIn(f"cli project open {self.remote_task}/fixture/project", self.tool_calls())
 
     def test_a_running_side_is_not_rebuilt_under_its_session(self) -> None:
-        checkout = self.repository("after", {"src.rs": "one\n"})
+        checkout = self.checkout("after", {"src.rs": "one\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         (checkout / "src.rs").write_text("two\n")
@@ -2259,7 +2472,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(built.read_text(), "one\n")
 
     def test_a_task_with_another_owner_on_the_host_is_left_alone(self) -> None:
-        checkout = self.repository("after", {"src.rs": "one\n"})
+        checkout = self.checkout("after", {"src.rs": "one\n"})
         self.run_tool("build", "after", str(checkout))
         owner = self.remote_home / ".local/state/cev-owners/mytask"
         self.assertTrue(owner.read_text().endswith(f":{self.task}\n"))
@@ -2298,7 +2511,7 @@ class RemoteEvidence(unittest.TestCase):
     def test_a_task_an_earlier_route_started_is_claimed_as_the_refusal_says(self) -> None:
         # Before owner records, the route left a task and no record, and a
         # host with only such tasks has no record directory either.
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         (self.remote_task / "shots").mkdir(parents=True)
         (self.remote_task / ".native-evidence").touch()
         refused = self.run_tool("build", "after", str(checkout), check=False)
@@ -2320,7 +2533,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("run scripts/native-evidence here without --remote", result.stderr)
 
     def test_clean_keeps_everything_when_the_session_does_not_stop(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         (self.remote_task / "stop-fails").touch()
@@ -2331,7 +2544,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertTrue(self.remote_task.exists())
 
     def test_clean_removes_the_task_from_the_host_and_keeps_the_shots_here(self) -> None:
-        checkout = self.repository("after", {"src.rs": "\n"})
+        checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
         self.run_tool("shot", "home")
@@ -2344,7 +2557,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertTrue((self.task / "shots" / "after-home.webp").exists())
 
     def test_a_failing_step_still_stops_its_session(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         steps.write_text("evidence shot first\nfalse\nevidence shot never\n")
         result = self.run_tool("pair", "--before", str(before), "--after", str(before),
@@ -2356,7 +2569,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(self.tool_calls()[-1], "stop")
 
     def test_a_lost_connection_still_stops_the_session(self) -> None:
-        before = self.repository("before", {"src.rs": "old\n"})
+        before = self.checkout("before", {"src.rs": "old\n"})
         steps = self.root / "steps.sh"
         # What the host's watcher sends once the connection has gone: TERM
         # to the work's process group, which the steps run in.

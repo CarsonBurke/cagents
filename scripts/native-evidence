@@ -28,6 +28,9 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 export CAGENTS_BUILD_SEED=0
 # The session's own commands run below a compositor with a private HOME.
 real_home=${CAGENTS_EVIDENCE_REAL_HOME:-$HOME}
+# Executables scripts/main-build-sentinel keeps for recent main commits, one
+# directory per commit.
+main_builds=${CAGENTS_EVIDENCE_MAIN_BUILDS:-$real_home/.local/state/cagents-main-sentinel/builds}
 
 usage() {
     cat <<'USAGE'
@@ -36,10 +39,14 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and selected providers.
 
-  build SIDE CHECKOUT
+  build SIDE CHECKOUT [--executables DIR]
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. scripts/prune-build-dirs reclaims a task's targets
+                  target. A clean checkout of a main commit that
+                  scripts/main-build-sentinel built takes its executables
+                  instead, without compiling. --executables moves those in DIR,
+                  built elsewhere from exactly this checkout, into the target.
+                  scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
@@ -225,13 +232,69 @@ refuse_running_side() {
     fi
 }
 
+# The executables a build makes, one per line.
+built_executables() {
+    build_arguments | sed 's/.* //'
+}
+
+# The directory of main's prebuilt executables for CHECKOUT: a clean checkout
+# of a commit scripts/main-build-sentinel built with these build arguments.
+main_build_of() {
+    local checkout=$1 directory
+    [ -z "$(cd -- "$checkout" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -c core.excludesFile=/dev/null status --porcelain=v1)" ] || return 1
+    directory=$main_builds/$(git -C "$checkout" rev-parse HEAD) || return 1
+    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments)" ] || return 1
+    printf '%s\n' "$directory"
+}
+
+# Puts executables built elsewhere from CHECKOUT in the side's target, as a
+# build there would have: copied from main's prebuilt ones, which stay, or
+# moved from a directory given to build. Either holds an arguments file, what
+# build_arguments printed where they were built.
+take_built() {
+    local side=$1 checkout=$2 from=$3 how=$4 zig=$5 cargo_bin=$6 target revision executable
+    target=$(target_of "$side")
+    mkdir -p -- "$target/dev-runtime" || die "could not create $target"
+    exec 8<"$target"
+    rm -f -- "$target/evidence-source"
+    revision=$(source_state "$checkout")
+    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments)" ] ||
+        die "$from was not built as this native-evidence builds; build it again"
+    # Main's are of one commit, which the checkout must still be at.
+    [ "$how" != copy ] || [ "$(main_build_of "$checkout")" = "$from" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    while IFS= read -r executable; do
+        [ -f "$from/$executable" ] && [ -x "$from/$executable" ] ||
+            die "$from has no $executable; build it again"
+        if [ "$how" = copy ]; then
+            cp --reflink=auto -- "$from/$executable" "$target/dev-runtime/.$executable.new" &&
+                mv -f -- "$target/dev-runtime/.$executable.new" "$target/dev-runtime/$executable" ||
+                die "could not copy $from/$executable into $target"
+        else
+            mv -f -- "$from/$executable" "$target/dev-runtime/$executable" ||
+                die "could not move $from/$executable into $target"
+        fi
+    done < <(built_executables)
+    [ "$(source_state "$checkout")" = "$revision" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    {
+        printf '%s\n' "$checkout" "$zig" "$cargo_bin"
+        printf '%s\n' "$revision"
+    } >"$target/evidence-source"
+}
+
 cmd_build() {
-    local side=${1:-} checkout=${2:-}
+    local side=${1:-} checkout=${2:-} executables=''
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --executables)
+                executables=${2:?--executables needs a directory}
+                shift 2
+                ;;
             --seed-target)
                 # A slot already holds a nearby build; a copied target adds only disk.
                 : "${2:?--seed-target needs a directory}"
@@ -264,6 +327,26 @@ cmd_build() {
     # The other side stays in use while this one builds, even if the guard
     # below starts the pruner.
     mark_used
+    if [ -n "$executables" ]; then
+        take_built "$side" "$checkout" "$executables" move "$zig" "${cargo_path%/*}"
+        rm -f -- "$executables/arguments"
+        rmdir -- "$executables" 2>/dev/null || :
+        printf 'took %s at %s from %s\n' "$side" "$(git -C "$checkout" rev-parse HEAD)" "$executables"
+        return
+    fi
+    local prebuilt
+    if prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
+        # The sentinel removes old builds only while nothing reads them. A
+        # copy that fails says why, and the side is compiled instead.
+        if (
+            flock -s 9 || exit 1
+            [ -d "$prebuilt" ] || exit 1
+            take_built "$side" "$checkout" "$prebuilt" copy "$zig" "${cargo_path%/*}"
+        ) 9<"$main_builds/.lock"; then
+            printf 'took %s at %s from main'"'"'s prebuilt executables\n' "$side" "$(git -C "$checkout" rev-parse HEAD)"
+            return
+        fi
+    fi
     # Builds in shared slots skip the gate's disk guard, which starts the
     # pruner on its schedule and refuses a build when the disk is too full.
     # When the slots are this host's, they share its disk, so run it here; a
@@ -1331,6 +1414,13 @@ cmd_status() {
         printf 'this session: slot %s\n' "$(cat "$state/slot")"
     fi
 }
+
+# What build compiles, for builds made elsewhere: in the caller's own checkout
+# by native-evidence-remote, and of main by scripts/main-build-sentinel.
+if [ "${1:-}" = __build-arguments ]; then
+    build_arguments
+    exit 0
+fi
 
 # On another host, over SSH; nothing native runs here. See native-evidence-remote.
 # Only as a leading option, beside --task: a later --remote is a command's.
