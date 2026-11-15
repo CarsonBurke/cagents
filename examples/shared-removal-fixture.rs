@@ -472,6 +472,17 @@ fn main() -> Result<()> {
         closed: vec![],
     })?;
     if restored.is_some() {
+        let placed = peer.model()?.views.into_iter().any(|view| {
+            view.scope == scope
+                && view.panes.iter().any(|pane| {
+                    pane.id == card && pane.kind == CardKind::Terminal(original.clone())
+                })
+        });
+        if !placed {
+            return Err(
+                "Completed fixture pane was not placed; prepare it while the UI is stopped".into(),
+            );
+        }
         println!(
             "Completed Close fixture ready: its saved pane has no resident worker or final screen"
         );

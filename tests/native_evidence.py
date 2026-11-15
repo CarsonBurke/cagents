@@ -2383,5 +2383,80 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse((self.logs / "ssh").exists())
 
 
+class SeedRestore(unittest.TestCase):
+    def test_read_only_files_restore_bytes_modes_and_inodes(self):
+        # Root bypasses read-only modes, so use an unprivileged child there.
+        # Ordinary CI users exercise the same filesystem behavior directly.
+        for changed, saved_mode in ((False, 0o444), (True, 0o444), (True, 0o640)):
+            with self.subTest(changed=changed, saved_mode=saved_mode), tempfile.TemporaryDirectory(
+                    prefix="native-seed-", dir="/var/tmp") as temporary:
+                root = Path(temporary)
+                seed, fixture = root / "seed", root / "fixture"
+                relatives = ("project/.git/objects/4b/object", "home/.claude/session.jsonl")
+                original = {}
+                for relative in relatives:
+                    for parent, content in ((seed, "saved"),
+                                            (fixture, "changed" if changed else "saved")):
+                        path = parent / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(content)
+                        path.chmod(saved_mode if parent == seed else 0o444)
+                    target = fixture / relative
+                    os.utime(target, (1, 1))
+                    original[relative] = target.stat().st_ino
+                provider = fixture / "home/.claude"
+                provider_identity = (provider.stat().st_dev, provider.stat().st_ino)
+                unrelated = root / "unrelated"
+                unrelated.write_text("outside the fixture")
+                unrelated.chmod(0o444)
+                for parent in (seed, fixture):
+                    (parent / "external").symlink_to(unrelated)
+                helper = root / "restore.py"
+                shutil.copyfile(REPOSITORY / "scripts/native-evidence-seed.py", helper)
+                credentials = {}
+                if os.geteuid() == 0:
+                    for directory, subdirs, files in os.walk(root):
+                        for path in [Path(directory), *(Path(directory) / name for name in files)]:
+                            os.chown(path, 65534, 65534, follow_symlinks=False)
+                    credentials = {"user": 65534, "group": 65534, "extra_groups": []}
+                result = subprocess.run(
+                    ["/usr/bin/python3", "-I", str(helper), str(seed), str(fixture)],
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(root)},
+                    capture_output=True, text=True, timeout=15, **credentials)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for relative in relatives:
+                    path = fixture / relative
+                    self.assertEqual(path.read_text(), "saved")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), saved_mode)
+                    self.assertEqual(path.stat().st_ino, original[relative])
+                self.assertEqual((provider.stat().st_dev, provider.stat().st_ino), provider_identity)
+                self.assertEqual(unrelated.read_text(), "outside the fixture")
+                self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o444)
+
+    def test_failed_restore_returns_the_original_file_permissions(self):
+        with tempfile.TemporaryDirectory(prefix="native-seed-failure-", dir="/var/tmp") as temporary:
+            root = Path(temporary)
+            seed, fixture, binaries = root / "seed", root / "fixture", root / "bin"
+            for directory in (seed, fixture, binaries):
+                directory.mkdir()
+            (seed / "file").write_text("saved")
+            target = fixture / "file"
+            target.write_text("changed")
+            target.chmod(0o444)
+            original_inode = target.stat().st_ino
+            rsync = binaries / "rsync"
+            rsync.write_text("#!/bin/sh\nexit 23\n")
+            rsync.chmod(0o755)
+            result = subprocess.run(
+                ["/usr/bin/python3", "-I", str(REPOSITORY / "scripts/native-evidence-seed.py"),
+                 str(seed), str(fixture)],
+                env={"PATH": str(binaries), "HOME": str(root)},
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual(target.read_text(), "changed")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)
+            self.assertEqual(target.stat().st_ino, original_inode)
+
+
 if __name__ == "__main__":
     unittest.main()

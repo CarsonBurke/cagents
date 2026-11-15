@@ -412,7 +412,7 @@ prepare_fixture() {
             # and a transcript's location records its file's. Syncing in
             # place keeps every directory and file both share, so a
             # conversation saved in the seed reopens on either side.
-            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+            if ! /usr/bin/python3 -I "$tool_root/scripts/native-evidence-seed.py" "$seed" "$fixture" 2>"$logs/seed.log"; then
                 printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
                 return 1
             fi
