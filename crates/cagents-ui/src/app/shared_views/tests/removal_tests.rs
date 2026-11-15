@@ -410,3 +410,97 @@ fn a_refused_close_readmits_an_ended_successor_as_retained_output_only() {
         })
     );
 }
+
+/// This window changed the pane's source and the registry has not answered:
+/// the window shows the new source, and its update is published ahead of Close.
+fn with_own_source_update_pending(app: &mut Cagents, original: &Pane) -> Pane {
+    let (tx, _published) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    let mut shown = original.clone();
+    if let CardKind::Browser(browser) = &mut shown.kind {
+        browser.id = BrowserId::new();
+    }
+    app.card_state_mut(original.id).unwrap().kind = shown.kind.clone();
+    app.publish_view_changes();
+    assert!(app.shared_views.pending.iter().any(|(_, _, change)| matches!(
+        change,
+        Change::Update { before, pane } if before.kind == original.kind && pane.kind == shown.kind
+    )));
+    shown
+}
+
+#[test]
+fn close_during_this_windows_own_update_removes_the_source_it_shows() {
+    let (mut app, channel, _, original) = channel_move_fixture();
+    let shown = with_own_source_update_pending(&mut app, &original);
+
+    assert!(app.capture_shared_removal(original.id));
+    assert!(app.prepare_shared_removal(original.id));
+    // The update lands; the Close still refers to the same source.
+    app.workspace_model.views[0].panes[0] = shown.clone();
+    app.workspace_model.views[0].revision += 1;
+    app.shared_views.pending.clear();
+    assert!(app.prepare_shared_removal(original.id));
+    assert!(matches!(
+        app.shared_removal_change(original.id, &Scope::Channel(channel)),
+        Some(Change::RemoveSource { before, .. }) if before == shown
+    ));
+}
+
+#[test]
+fn close_during_this_windows_own_update_cannot_take_another_windows_replacement() {
+    let (mut app, _, _, original) = channel_move_fixture();
+    with_own_source_update_pending(&mut app, &original);
+    // Another window replaced the source first, so the registry refuses the
+    // update this window still shows.
+    let mut replacement = original.clone();
+    if let CardKind::Browser(browser) = &mut replacement.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes[0] = replacement;
+    app.workspace_model.views[0].revision += 1;
+
+    assert!(!app.capture_shared_removal(original.id));
+    assert!(app.card_state(original.id).unwrap().existence.is_open());
+}
+
+#[test]
+fn close_captured_during_own_update_refuses_once_that_update_is_refused() {
+    let (mut app, _, _, original) = channel_move_fixture();
+    with_own_source_update_pending(&mut app, &original);
+    assert!(app.capture_shared_removal(original.id));
+
+    let mut replacement = original.clone();
+    if let CardKind::Browser(browser) = &mut replacement.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes[0] = replacement.clone();
+    app.workspace_model.views[0].revision += 1;
+    // Before and after the refusal returns this window to the registry's pane.
+    assert!(!app.prepare_shared_removal(original.id));
+    app.shared_views.pending.clear();
+    app.card_state_mut(original.id).unwrap().kind = replacement.kind;
+    assert!(!app.prepare_shared_removal(original.id));
+    assert!(app.card_state(original.id).unwrap().existence.is_open());
+}
+
+#[test]
+fn a_refused_own_update_leaves_close_to_the_registrys_pane() {
+    let (mut app, channel, _, original) = channel_move_fixture();
+    with_own_source_update_pending(&mut app, &original);
+    // Another window's replacement reached this window's pane first; this
+    // window's earlier update will be refused, and Close refers to what it shows.
+    let mut replacement = original.clone();
+    if let CardKind::Browser(browser) = &mut replacement.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes[0] = replacement.clone();
+    app.workspace_model.views[0].revision += 1;
+    app.card_state_mut(original.id).unwrap().kind = replacement.kind.clone();
+
+    assert!(app.capture_shared_removal(original.id));
+    assert!(matches!(
+        app.shared_removal_change(original.id, &Scope::Channel(channel)),
+        Some(Change::RemoveSource { before, .. }) if before == replacement
+    ));
+}

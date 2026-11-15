@@ -547,6 +547,20 @@ pub enum Change {
     },
 }
 
+impl Change {
+    /// The pane this change is about.
+    pub fn pane_id(&self) -> CardId {
+        match self {
+            Self::Insert { pane, .. }
+            | Self::InsertIfEmpty { pane }
+            | Self::Update { pane, .. }
+            | Self::UpdateTerminalSource { pane, .. } => pane.id,
+            Self::Transfer { id, .. } | Self::Remove { id } | Self::Move { id, .. } => *id,
+            Self::RemoveSource { before, .. } => before.id,
+        }
+    }
+}
+
 impl View {
     /// Stable conversation identity: utilities never displace the first chat.
     pub fn primary_chat(&self) -> Option<CardId> {
@@ -708,6 +722,27 @@ pub fn removal_source_current(
     scope: &Scope,
     change: &Change,
 ) -> bool {
+    let Change::RemoveSource { before, .. } = change else {
+        return false;
+    };
+    let mut owners = model.views.iter().flat_map(|view| {
+        view.panes
+            .iter()
+            .filter(move |pane| pane.id == before.id)
+            .map(move |pane| (&view.scope, pane))
+    });
+    let owner = owners.next();
+    owners.next().is_none() && removal_source_holds(model, scope, change, owner)
+}
+
+/// Whether `current`, the one pane holding the card, is the source a removal
+/// captured, in the registry and project the removal was captured under.
+pub fn removal_source_holds(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+    current: Option<(&Scope, &Pane)>,
+) -> bool {
     let Change::RemoveSource {
         registry,
         repository,
@@ -731,15 +766,9 @@ pub fn removal_source_current(
     {
         return false;
     }
-    let mut owners = model.views.iter().flat_map(|view| {
-        view.panes
-            .iter()
-            .filter(move |pane| pane.id == before.id)
-            .map(move |pane| (&view.scope, pane))
-    });
-    owners.next().is_some_and(|(current_scope, pane)| {
+    current.is_some_and(|(current_scope, pane)| {
         current_scope == scope && same_removal_source(before, pane)
-    }) && owners.next().is_none()
+    })
 }
 
 /// Exact cleanup can retire the original pane before its UI reply arrives.
