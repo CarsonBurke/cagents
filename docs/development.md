@@ -595,23 +595,27 @@ CPU, kept in a named pipe under `/run/user/UID/cagents-jobserver`. Cargo,
 rustc's parallel code generation and C builds take a token for each job
 beyond their first. A lone build uses every CPU, and several share them
 without waiting for each other to start, so the gate sets `CARGO_BUILD_JOBS`
-to the CPU count unless the caller set it. The build itself reads a pipe of
-its own, which `scripts/build-host` keeps stocked from the pool: more follows
-as the build takes what is there, and what it leaves goes back. When the
-build ends, cancelled or killed included, every token taken for it returns
-to the pool, so tokens its compilers held when they died are not lost. No
-service runs the pool: the first build to find nobody using it fills it. A
-build started within another's shares, such as Cargo under `cargo-gate
-exec`, runs in that build's scope with its tokens. Without a systemd user
-manager, or with `CAGENTS_BUILD_SCOPE=0`,
-builds wait for their shares the same way but run in place, each with its
-own Cargo jobs.
+to the CPU count unless the caller set it. A build's Cargo and compilers do
+not use the pool directly: `scripts/build-host` gives the build a pipe to
+take tokens from, which it keeps stocked from the pool, and another to give
+them back into, which it empties into the pool. While several builds want
+more tokens than they have, each gets an equal share; a build alone in
+wanting more gets everything the others leave. When a build ends, cancelled
+or killed included, every token taken for it returns to the pool. If
+`build-host` itself is killed outright, another build gives back what it had
+taken, from the record each keeps under `builds/`. No service runs the pool:
+the first build to find nobody using it fills it. A build that another
+`build-host` started, such as Cargo under `cargo-gate exec`, runs in that
+build's scope with its tokens.
+
+Without a systemd user manager, or with `CAGENTS_BUILD_SCOPE=0`, builds wait
+for their shares the same way but run in place, each with its own Cargo jobs.
 
 For `test`, `bench` and `run`, only the build (`--no-run`, or `build`) holds
 the shares, so do not wrap the gate in another lock. Give `run` its `--bin`:
 its build is `cargo build` with the same options, which builds every binary
-the package has when none is named. The tests or program run
-after the shares are given back, tests and benchmarks in their own scope in
+the package has when none is named. The tests or program run after the
+shares are given back, tests and benchmarks in their own scope in
 `app-cagents-test.slice`, under a memory limit; see [Memory limits](#memory-limits).
 Rustdoc compiles doctests while they run, so `cargo test --doc` keeps its
 shares throughout, under the same memory limit; a plain `cargo test` compiles its doctests after they are

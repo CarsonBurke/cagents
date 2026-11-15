@@ -13,13 +13,14 @@ given its share back, in app-cagents-test.slice under memory-capped.
 
 Without a systemd user manager, or with CAGENTS_BUILD_SCOPE=0, builds still
 wait for their shares but run in place, each with its own Cargo jobs. A build
-started within another's shares runs in place too, in that build's scope and
+that another build-host started runs in place too, in that build's scope and
 with its jobserver.
 """
 import array
 import contextlib
 import fcntl
 import os
+import select
 import shutil
 import signal
 import stat
@@ -71,8 +72,10 @@ SHARE = 4 * 2**30
 # run.
 BUILD_SLICE = "background-cagents.slice"
 TEST_SLICE = "app-cagents-test.slice"
-# How often build-host restocks its build's tokens from the pool.
+# How often build-host restocks its build's tokens from the pool, and how
+# often it counts the builds sharing it.
 TOKEN_TICK = 0.02
+SWEEP_SECONDS = 0.25
 # Cargo's short names for what this splits.
 ALIASES = {"t": "test", "r": "run"}
 # Marks a command run by a build that holds shares, for the gates it starts.
@@ -248,26 +251,31 @@ class Jobserver:
     """A build's place in the host's jobserver.
 
     The host's tokens wait in a pool, a named pipe holding one for each CPU.
-    A build does not read the pool itself: it gets a pipe of its own, which
-    this keeps stocked from the pool while the build runs. When the build
-    has taken what its pipe held, more follows, and what it gives back beyond
-    what it is likely to take again returns to the pool. When the build
-    ends, however it ends, every token taken for it goes back, including any
-    its processes held when they were killed.
+    A build does not use the pool itself. Its Cargo and compilers take tokens
+    from a pipe this keeps stocked from the pool, and give them back into
+    another, whose tokens this passes straight on to the pool. So every
+    token a build takes comes through here: while other builds want tokens,
+    none gets more than its fair share of the CPUs, and once the build ends,
+    however it ends, every token taken for it goes back, including any its
+    processes held when they were killed.
 
     Only build-host processes hold the pool open, each with a shared lock on
-    its users file. A pipe's contents go with the last process holding it
-    open, so a build that finds no other using the pool fills it afresh,
-    which also makes up what a killed build-host could not give back."""
+    its users file and an exclusive one on its record in `builds`, which
+    says how many tokens it took. A build-host killed outright cannot give
+    them back, so another gives back what its record says once its lock is
+    free. A pipe's contents go with the last process holding it open, so a
+    build that finds no other using the pool fills it afresh."""
 
     def __init__(self, directory, tokens):
         self.tokens = tokens
-        self.users = self.pool = self.own = self.directory = None
+        self.taken = 0
+        self.users = self.pool = self.record = None
+        self.own = []
         try:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            with open(os.path.join(directory, "join"), "a") as join:
-                # One build joins at a time, so none sees another's refill.
-                fcntl.flock(join, fcntl.LOCK_EX)
+            self.mutex = os.path.join(directory, "join")
+            self.records = os.path.join(directory, "builds")
+            os.makedirs(self.records, mode=0o700, exist_ok=True)
+            with self.serialized():
                 self.users = os.open(os.path.join(directory, "users"), os.O_RDONLY | os.O_CREAT, 0o600)
                 path = os.path.join(directory, "pool")
                 with contextlib.suppress(FileExistsError):
@@ -280,68 +288,152 @@ class Jobserver:
                 except BlockingIOError:
                     pass
                 else:
+                    # No build-host is running: what the pool and records
+                    # held went with them.
                     drain(self.pool)
+                    for name in os.listdir(self.records):
+                        os.unlink(os.path.join(self.records, name))
                     os.write(self.pool, b"+" * tokens)
                 fcntl.flock(self.users, fcntl.LOCK_SH)
-            self.directory = tempfile.mkdtemp(prefix="build-", dir=directory)
-            self.path = os.path.join(self.directory, "fifo")
-            os.mkfifo(self.path, 0o600)
-            self.own = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+                self.record_path = os.path.join(self.records, f"{os.getpid()}-{time.monotonic_ns()}")
+                self.record = os.open(self.record_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                fcntl.flock(self.record, fcntl.LOCK_EX)
+            # Two pipes of the build's own. This end of each never blocks;
+            # the build's, which jobserver clients expect to, do.
+            with tempfile.TemporaryDirectory(dir=directory) as private:
+                ends = {}
+                for name in ("give", "back"):
+                    fifo = os.path.join(private, name)
+                    os.mkfifo(fifo, 0o600)
+                    ends[name] = (os.open(fifo, os.O_RDWR | os.O_NONBLOCK), os.open(fifo, os.O_RDWR))
+                    self.own += ends[name]
+            (self.give, reader), (self.back, writer) = ends["give"], ends["back"]
+            for descriptor in (reader, writer):
+                os.set_inheritable(descriptor, True)
+            self.auth = f"{reader},{writer}"
         except BaseException:
             self.close_descriptors()
             raise
-        self.taken = 0
+        self.hungry = False
         self.reserve = 1
         self.stopping = threading.Event()
         self.stocker = threading.Thread(target=self.stock, daemon=True)
-        self.stocker.start()
+        # Signals go to the main thread, which a signal while giving tokens
+        # back would otherwise not reach in time.
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.stocker.start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
+
+    @contextlib.contextmanager
+    def serialized(self):
+        """One build-host at a time joins or reads the records."""
+        with open(self.mutex, "a") as mutex:
+            fcntl.flock(mutex, fcntl.LOCK_EX)
+            yield
+
+    def note(self):
+        """Records how many tokens the build has, and whether it wants more."""
+        os.pwrite(self.record, f"{self.taken:<20}{int(self.hungry)}".encode(), 0)
+
+    def move(self, source, target, count):
+        """Moves up to `count` tokens between pipes, returning how many."""
+        if count <= 0:
+            return 0
+        try:
+            tokens = os.read(source, count)
+        except BlockingIOError:
+            return 0
+        os.write(target, tokens)
+        return len(tokens)
+
+    def sweep(self):
+        """Gives back what build-hosts killed outright took, and counts the
+        other builds that want more tokens than they have."""
+        hungry = 0
+        with self.serialized():
+            for name in os.listdir(self.records):
+                path = os.path.join(self.records, name)
+                try:
+                    record = os.open(path, os.O_RDWR)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        hungry += path != self.record_path and os.pread(record, 21, 0)[20:] == b"1"
+                        continue
+                    owed = os.pread(record, 20, 0).strip()
+                    if owed.isdigit() and int(owed):
+                        os.write(self.pool, b"+" * int(owed))
+                    os.unlink(path)
+                finally:
+                    os.close(record)
+        return hungry
 
     def stock(self):
-        """Keeps `reserve` tokens in the build's pipe: twice as many after
-        the build took them all, and half as many after it left some."""
-        while not self.stopping.wait(TOKEN_TICK):
-            level = pending(self.own)
-            if level == 0:
-                self.reserve = min(2 * self.reserve, self.tokens)
+        """Passes returned tokens to the pool as they come, and keeps up to
+        `reserve` in the build's pipe: twice as many after the build took them
+        all, and half as many after it left some. A build that took them all
+        wants more, and while others do too, each gets an equal share of the
+        tokens; one alone may have every token the others leave."""
+        poller = select.poll()
+        poller.register(self.back, select.POLLIN)
+        swept = 0.0
+        others = 0
+        while not self.stopping.is_set():
+            poller.poll(TOKEN_TICK * 1000)
+            now = time.monotonic()
+            before = self.taken, self.hungry
+            self.taken -= self.move(self.back, self.pool, self.tokens)
+            if now - swept >= SWEEP_SECONDS:
+                others, swept = self.sweep(), now
+            level = pending(self.give)
+            self.hungry = level == 0
+            share = -(-self.tokens // (others + 1))
+            self.reserve = min(2 * self.reserve, self.tokens) if level == 0 else max(1, self.reserve // 2)
+            wanted = max(0, min(self.reserve, share - (self.taken - level)))
+            if level > wanted:
+                self.taken -= self.move(self.give, self.pool, level - wanted)
             else:
-                self.reserve = max(1, self.reserve // 2)
-            try:
-                if level > self.reserve:
-                    returned = os.read(self.own, level - self.reserve)
-                    os.write(self.pool, returned)
-                    self.taken -= len(returned)
-                elif level < self.reserve:
-                    taken = os.read(self.pool, self.reserve - level)
-                    os.write(self.own, taken)
-                    self.taken += len(taken)
-            except BlockingIOError:
-                pass
+                self.taken += self.move(self.pool, self.give, wanted - level)
+            if (self.taken, self.hungry) != before:
+                self.note()
 
     def close(self):
         """Gives back every token taken for the build, which has ended."""
-        self.stopping.set()
-        self.stocker.join()
-        if self.taken:
-            os.write(self.pool, b"+" * self.taken)
-        self.close_descriptors()
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.stopping.set()
+            self.stocker.join()
+            if self.taken > 0:
+                os.write(self.pool, b"+" * self.taken)
+            self.taken = 0
+            self.close_descriptors()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
 
     def close_descriptors(self):
-        for descriptor in (self.own, self.pool, self.users):
+        if self.record is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.record_path)
+        for descriptor in (*self.own, self.record, self.pool, self.users):
             if descriptor is not None:
                 os.close(descriptor)
-        self.users = self.pool = self.own = None
-        if self.directory:
-            shutil.rmtree(self.directory, ignore_errors=True)
-            self.directory = None
+        self.users = self.pool = self.record = None
+        self.own = []
 
 
-def build_environment(environment, path):
-    """What a build runs with: the jobserver when it has one, and otherwise
-    Cargo jobs of its own. A caller's own CARGO_BUILD_JOBS stays."""
+def build_environment(environment, auth):
+    """What a build runs with: the jobserver, given as its read and write
+    descriptors, when it has one, and otherwise Cargo jobs of its own. A
+    caller's own CARGO_BUILD_JOBS stays."""
     environment = dict(environment)
     cpus = os.cpu_count() or 1
-    if path:
-        flags = f"-j --jobserver-auth=fifo:{path}"
+    if auth:
+        flags = f"-j --jobserver-auth={auth}"
         environment["MAKEFLAGS"] = environment["CARGO_MAKEFLAGS"] = flags
         environment.pop("MFLAGS", None)
         # The jobserver bounds the jobs; this only overrides the
@@ -455,6 +547,19 @@ def status_of(status):
     return status if status >= 0 else 128 - status
 
 
+def within_build():
+    """Whether a build-host that is still running started this."""
+    holder = os.environ.get(HELD_MARK, "")
+    if not holder.isdecimal():
+        return False
+    try:
+        with open(f"/proc/{holder}/cmdline", "rb") as file:
+            arguments = file.read().split(b"\0")[:4]
+    except OSError:
+        return False
+    return any(os.path.basename(argument) == b"build-host" for argument in arguments)
+
+
 class Build:
     """One build's slot in the host: its shares, scope and jobserver."""
 
@@ -470,9 +575,11 @@ class Build:
                 waited = time.monotonic() - started
                 if waited >= 2:
                     say(f"admitted after {waited:.0f}s")
-                # A build within another's shares runs in its scope, with
-                # its jobserver, which its environment names.
-                self.scoped = bool(self.shares) and prepare_slice()
+                # A build that another build-host started, such as Cargo
+                # under `cargo-gate exec`, runs in its scope, with its
+                # jobserver, which its environment names.
+                self.nested = within_build()
+                self.scoped = not self.nested and prepare_slice()
                 self.jobserver = None
                 if self.scoped:
                     try:
@@ -489,9 +596,9 @@ class Build:
             raise SystemExit(124)
 
     def run(self, command, capture=False):
-        path = self.jobserver.path if self.jobserver else None
-        return run(command, build_environment(os.environ, path), self.scoped,
-                   group=bool(self.shares), capture=capture)
+        auth = self.jobserver.auth if self.jobserver else None
+        return run(command, build_environment(os.environ, auth), self.scoped,
+                   group=not self.nested, capture=capture)
 
 
 def separate(arguments):
