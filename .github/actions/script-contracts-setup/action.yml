@@ -27,11 +27,20 @@ runs:
         rustup toolchain install 1.93.0 --profile minimal --component rustfmt
         dirname "$(rustup which --toolchain 1.93.0 cargo)" >> "$GITHUB_PATH"
 
+    # The task interface's forwarding contract runs the real mise; nothing
+    # installs the tools mise.toml pins, which no contract suite needs.
+    - name: Install mise
+      uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      with:
+        version: 2026.11.8
+        install: false
+        cache: false
+
     - name: Verify required tools
       shell: bash
       run: |
         set -euo pipefail
-        for tool in git cargo rustc rustfmt rustup sh bash python3; do
+        for tool in git cargo rustc rustfmt rustup sh bash python3 mise; do
           command -v "$tool"
         done
         python3 -c 'import sys, tomllib; assert sys.version_info >= (3, 11), "Python 3.11+ is required for TOML contract coverage"; print(sys.version)'
