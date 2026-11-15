@@ -358,7 +358,8 @@ if [ "$scene" = plan ]; then
     sleep 4
     scroll_top
     shot plan-working
-    evidence drive wait 'Done' --timeout 60 >/dev/null
+    # The plan's own heading reads "done", so wait for the turn to end.
+    evidence drive wait 'Steer this turn' --gone --timeout 60 >/dev/null
     sleep 2
     scroll_top
     shot plan-finished
