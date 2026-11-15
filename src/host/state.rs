@@ -3370,6 +3370,21 @@ pub(super) fn restore_orphaned_holders_preserving(
         })();
         if let Err(error) = restored {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // A failed source publication returns before the inheritance is
+            // recorded. Record it on the worker this attempt installed, live
+            // or already completed, so it keeps the lineage and recovery facts
+            // of an original whose later restoration failed. Recording it
+            // also releases client 0.
+            let inherited = match unrecorded.take() {
+                Some((recovery, screen_lost)) if state.terminals.contains_key(&record.terminal) => {
+                    Some(state.record_adopted_original(
+                        &recovery,
+                        screen_lost,
+                        recovery.source.resume_hint.as_deref(),
+                    ))
+                }
+                _ => None,
+            };
             if state
                 .terminals
                 .get(&record.terminal)
@@ -3383,21 +3398,10 @@ pub(super) fn restore_orphaned_holders_preserving(
                     "Orphan terminal {} retained its original owner after restore failed: {error}",
                     record.terminal
                 );
-                // A failed source publication returns before the inheritance is
-                // recorded. Record it now, so the original kept for recovery
-                // has the same lineage and recovery facts as one whose later
-                // restoration failed; recording it also releases client 0.
-                // Otherwise release client 0 directly: restoration starts the
-                // view attached. If the worker refuses the visibility change,
-                // detach keeps client 0 attached.
-                let released = match unrecorded.take() {
-                    Some((recovery, screen_lost)) => state.record_adopted_original(
-                        &recovery,
-                        screen_lost,
-                        recovery.source.resume_hint.as_deref(),
-                    ),
-                    None => state.detach(0, record.terminal),
-                };
+                // Restoration starts the view attached. With nothing left to
+                // record, release client 0 directly. If the worker refuses the
+                // visibility change, detach keeps client 0 attached.
+                let released = inherited.unwrap_or_else(|| state.detach(0, record.terminal));
                 if let Err(detach) = released {
                     tracing::warn!(terminal = %record.terminal, error = %detach.message, "failed orphan restore could not release its client 0 attachment");
                     message.push_str(&format!(
@@ -3408,6 +3412,10 @@ pub(super) fn restore_orphaned_holders_preserving(
                 state.retain_startup_recovery(message.clone());
                 tracing::warn!(terminal = %record.terminal, %error, "orphan adoption retained original ownership; recovery-only startup required");
                 return Err(message);
+            }
+            if let Some(Err(lineage)) = inherited {
+                tracing::warn!(terminal = %record.terminal, error = %lineage.message,
+                    "completed orphan could not record its lineage");
             }
             drop(state);
             tracing::warn!(terminal = %record.terminal, %error, "could not adopt orphaned terminal; preserved its holder");
@@ -4035,11 +4043,14 @@ fn adopt_carried_terminal(
                             .get(&id)
                             .is_some_and(|record| !record.handle.is_completed())
                     {
-                        // The holder committed to this worker before its source
-                        // publication failed. Keep this exact original for
-                        // inspection and explicit Close, with everything a
-                        // successful adoption records, and stop the restore
-                        // without restoring its execution authority.
+                        // This attempt installed a live worker before failing:
+                        // the holder committed to it, or its commit is
+                        // ambiguous. Either way, never adopt again or retry
+                        // its source publication automatically. Keep this
+                        // exact original for inspection and explicit Close,
+                        // with everything a successful adoption records, and
+                        // stop the restore without restoring its execution
+                        // authority.
                         let mut message = format!(
                             "Terminal {id} adoption retained its original owner but its source publication failed: {error}"
                         );
@@ -4057,6 +4068,19 @@ fn adopt_carried_terminal(
                             "adopted a carried terminal whose source publication failed; recovery-only startup required");
                         state.retain_startup_recovery(message);
                         return true;
+                    }
+                    // A worker this attempt installed that already completed
+                    // keeps its final screen; it still inherits the lineage.
+                    if !hosted_before
+                        && state.terminals.contains_key(&id)
+                        && let Err(lineage) = state.record_adopted_original(
+                            &previous,
+                            screen_lost,
+                            terminal.source.resume_hint.as_deref(),
+                        )
+                    {
+                        tracing::warn!(terminal = %id, error = %lineage.message,
+                            "completed carried terminal could not record its lineage");
                     }
                     if state.startup_recovery().is_some() {
                         return false; // never re-adopt an ACK-ambiguous original
