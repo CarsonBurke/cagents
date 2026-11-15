@@ -104,6 +104,18 @@ impl Summary {
         self.limited += other.limited;
     }
 
+    /// What `self` counts beyond `other`: the news of a total that rows
+    /// drawn on their own do not show. Never below nothing.
+    pub(super) fn without(self, other: Self) -> Self {
+        Self {
+            unread: self.unread.saturating_sub(other.unread),
+            working: self.working.saturating_sub(other.working),
+            failed: self.failed.saturating_sub(other.failed),
+            waiting: self.waiting.saturating_sub(other.waiting),
+            limited: self.limited.saturating_sub(other.limited),
+        }
+    }
+
     pub(super) fn remove(&mut self, other: Self) {
         self.unread -= other.unread;
         self.working -= other.working;

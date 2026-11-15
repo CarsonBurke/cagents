@@ -2673,6 +2673,9 @@ struct Worker {
     agent_provider: Option<crate::agent::Provider>,
     agent_process: Option<AgentProcess>,
     display_title: String,
+    /// A shell's title as it last reported it. A change means a command
+    /// started or ended even while what shows stays the same.
+    reported_title: String,
     agent_exited: bool,
     root_exit: Option<TerminalEvent>,
     terminal: Terminal<'static, 'static>,
@@ -3138,6 +3141,7 @@ impl Worker {
             agent_provider: None,
             agent_process: None,
             display_title: String::new(),
+            reported_title: String::new(),
             agent_exited: false,
             root_exit: None,
             launch: execution,
@@ -4514,18 +4518,45 @@ impl Worker {
                             .activity_from_title(&title)
                             .map(|state| crate::agent::Activity { provider, state })
                     });
+                    // A shell's title that only says where it is gives way to
+                    // the foreground command's, as having no title does.
+                    let provider = self.agent_provider;
+                    let mut located = if provider.is_none() {
+                        self.foreground_title(Some(title))
+                    } else {
+                        None
+                    };
+                    let reported_changed = provider.is_none() && self.reported_title != title;
+                    if reported_changed {
+                        self.reported_title = title.to_owned();
+                    }
                     let display_changed = match agent_title_label(&title, activity) {
                         Some("") => self.display_title != "π",
                         Some(label) => self.display_title.strip_prefix("π ") != Some(label),
-                        None => self.display_title != title,
+                        None => self.display_title != located.as_deref().unwrap_or(title),
                     };
                     let previous = *self
                         .published
                         .agent_activity
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if display_changed || activity != previous {
+                    if display_changed || activity != previous || reported_changed {
                         self.refresh_resume_hint(true);
+                    }
+                    if reported_changed {
+                        // A shell titles a command as it starts, which can be
+                        // before the command holds the foreground: look again
+                        // soon rather than at the settled interval.
+                        self.foreground_poll = FOREGROUND_POLL_MIN;
+                    }
+                    if self.agent_provider != provider {
+                        // The observation found an agent arriving or leaving,
+                        // which decides whether this title is a location.
+                        located = if self.agent_provider.is_none() {
+                            self.foreground_title(Some(title))
+                        } else {
+                            None
+                        };
                     }
                     let observed = self.agent_provider.and_then(|provider| {
                         provider
@@ -4548,7 +4579,8 @@ impl Worker {
                         {
                             self.set_conversation_title(name.into());
                         }
-                        let display = canonical_agent_title(&title, observed);
+                        let display =
+                            located.unwrap_or_else(|| canonical_agent_title(&title, observed));
                         if display != self.display_title {
                             self.display_title = display.clone();
                             self.emit(TerminalEvent::TitleChanged(display));
@@ -4560,25 +4592,52 @@ impl Worker {
         self.reply_backpressured = false;
     }
 
-    /// OSC titles win. Shells that do not publish one still expose the
-    /// foreground command through the PTY owner's existing observation timer.
+    /// OSC titles win, except a shell's own that only says where it is:
+    /// fish's default abbreviates the whole path, which reads as noise
+    /// beside the checkout every pane row already names. Shells that publish
+    /// no title, or only that one, still expose the foreground command
+    /// through the PTY owner's existing observation timer, which also
+    /// catches a change of directory.
     fn publish_fallback_title(&mut self) {
-        if self
+        let reported = self
             .terminal
             .title()
-            .is_ok_and(|title| !title.trim().is_empty())
-        {
+            .ok()
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_owned);
+        if reported.is_some() && self.agent_provider.is_some() {
             return;
         }
-        let group = self.foreground_group();
-        let title = foreground_process_title(group, &self.launch);
-        if self.foreground_group() != group {
+        let Some(title) = self.foreground_title(reported.as_deref()) else {
             return;
-        }
+        };
         if title != self.display_title {
             self.display_title = title.clone();
             self.emit(TerminalEvent::TitleChanged(title));
         }
+    }
+
+    /// "command · directory" for the foreground group, unless `reported`,
+    /// the shell's own title, says more than where the group is.
+    fn foreground_title(&self, reported: Option<&str>) -> Option<String> {
+        // Only a title holding a path can say where a shell is; any other
+        // costs no /proc read.
+        if reported.is_some_and(|title| !title.contains(['/', '~'])) {
+            return None;
+        }
+        let group = self.foreground_group();
+        let (mut process, mut directory) = foreground_process(group, &self.launch);
+        let current = self.foreground_group();
+        if current != group {
+            // The group moved while it was read: read the one holding it now.
+            (process, directory) = foreground_process(current, &self.launch);
+        }
+        if reported
+            .is_some_and(|title| !title_locates_only(title, &directory, HOME_DIRECTORY.as_deref()))
+        {
+            return None;
+        }
+        Some(crate::names::process_title(&process, &directory))
     }
 
     fn publish_bell(&mut self) {
@@ -5333,7 +5392,9 @@ impl Worker {
     }
 }
 
-fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+/// The foreground group's command name and working directory, read from
+/// /proc, each falling back to the launch's when it cannot be read.
+fn foreground_process(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> (String, PathBuf) {
     #[cfg(target_os = "linux")]
     let (process, directory) = match group.filter(|group| *group > 0) {
         Some(group) => {
@@ -5361,12 +5422,87 @@ fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -
             .to_string_lossy()
             .into_owned()
     });
-    let directory = directory.as_deref().unwrap_or(&launch.working_directory);
-    let basename = directory
-        .file_name()
-        .unwrap_or(directory.as_os_str())
-        .to_string_lossy();
-    format!("{process} · {basename}")
+    (
+        process,
+        directory.unwrap_or_else(|| launch.working_directory.clone()),
+    )
+}
+
+#[cfg(test)]
+fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+    let (process, directory) = foreground_process(group, launch);
+    crate::names::process_title(&process, &directory)
+}
+
+/// The home directory a shell writes as `~`.
+static HOME_DIRECTORY: std::sync::LazyLock<Option<PathBuf>> =
+    std::sync::LazyLock::new(|| std::env::var_os("HOME").map(PathBuf::from));
+
+/// Whether a shell's title only says where it is: fish's default
+/// `prompt_pwd` path, bash's and zsh's `user@host: ~/dir`, or a full path,
+/// possibly after the running command or a host. The path ending the title
+/// must name `directory` itself, in full, under `~` for `home`, or with its
+/// parents abbreviated as `prompt_pwd` does; a title naming anything else,
+/// such as an editor's file, says more and is kept.
+fn title_locates_only(
+    title: &str,
+    directory: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> bool {
+    let title = title.trim_end();
+    // A path starts the title or follows a space or a `host:` prefix; what
+    // precedes it is the command or the host, and only the path decides.
+    title
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '/' | '~')
+                && title[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| before.is_whitespace() || before == ':')
+        })
+        .any(|(index, _)| path_names(&title[index..], directory, home))
+}
+
+/// Whether `path`, as a shell writes it, names `directory`.
+fn path_names(path: &str, directory: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    fn names(path: &std::path::Path) -> Option<Vec<&str>> {
+        path.components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_str()),
+                _ => None,
+            })
+            .collect()
+    }
+    let Some(actual) = names(directory) else {
+        return false;
+    };
+    let (mut expected, rest) = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            let Some(home) = home.and_then(names) else {
+                return false;
+            };
+            (home, rest)
+        }
+        Some(_) => return false,
+        None => (Vec::new(), path),
+    };
+    let fixed = expected.len();
+    expected.extend(rest.split('/').filter(|name| !name.is_empty()));
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(&actual)
+            .enumerate()
+            .all(|(index, (written, name))| {
+                // Home and the directory's own name are written whole; the
+                // parents between may be cut to a prefix, `.l` for `.local`.
+                written == name
+                    || (index >= fixed
+                        && index + 1 < actual.len()
+                        && !written.is_empty()
+                        && name.starts_with(written))
+            })
 }
 
 fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) -> String {
@@ -6777,6 +6913,143 @@ mod tests {
             super::foreground_process_title(None, &launch),
             "fish · alpha"
         );
+    }
+
+    /// Shell titles that only say where the shell is, which its pane's
+    /// place already names, against titles that say more.
+    #[test]
+    fn location_titles_are_told_from_titles_that_say_more() {
+        use std::path::Path;
+        let home = Path::new("/home/marvin");
+        let directory =
+            Path::new("/home/marvin/.local/share/cagents/projects/acme/billing-service");
+        let locates = |title: &str| super::title_locates_only(title, directory, Some(home));
+        // fish's default fish_title: `prompt_pwd -d 1 -D 1`, after the running
+        // command cut to 20 characters, and after an ssh host.
+        assert!(locates("/h/m/.l/s/c/p/a/billing-service"));
+        assert!(locates("~/.l/s/c/p/a/billing-service"));
+        assert!(locates("cargo build --releas ~/.l/s/c/p/a/billing-service"));
+        assert!(locates("[fw16] ~/.l/s/c/p/a/billing-service"));
+        // bash's and zsh's usual `user@host: dir`, with or without the space.
+        assert!(locates(
+            "marvin@fw16: ~/.local/share/cagents/projects/acme/billing-service"
+        ));
+        assert!(locates(
+            "marvin@fw16:~/.local/share/cagents/projects/acme/billing-service"
+        ));
+        // A full absolute path.
+        assert!(locates(
+            "/home/marvin/.local/share/cagents/projects/acme/billing-service"
+        ));
+        assert!(locates(
+            "/home/marvin/.local/share/cagents/projects/acme/billing-service/"
+        ));
+        // A directory with a space in its name.
+        let spaced = Path::new("/home/marvin/My Projects/billing service");
+        assert!(super::title_locates_only(
+            "marvin@fw16: ~/My Projects/billing service",
+            spaced,
+            Some(home)
+        ));
+        assert!(super::title_locates_only(
+            "~/M/billing service",
+            spaced,
+            Some(home)
+        ));
+        // Home is written as `~`.
+        assert!(super::title_locates_only("~", home, Some(home)));
+        assert!(super::title_locates_only(
+            "marvin@fw16: ~",
+            home,
+            Some(home)
+        ));
+        assert!(!locates("~"), "home is not where this shell is");
+
+        // Real titles are kept.
+        for title in [
+            "main.rs - VIM",
+            "htop",
+            "billing-service",
+            "vim src/billing-service",
+            "less /etc/billing-service.conf",
+            "/h/m/.l/s/c/p/a/other-service",
+            // The same name elsewhere is a file or another directory.
+            "vim ~/notes/billing-service",
+            "less /tmp/billing-service",
+            "cat /h/m/.l/s/c/p/x/billing-service",
+            "billing-service-ish /billing-service",
+            "Release review",
+            "",
+        ] {
+            assert!(!locates(title), "{title:?}");
+        }
+    }
+
+    /// A shell whose own title only says where it is shows the foreground
+    /// command and its directory instead; a title that says more shows as
+    /// it is.
+    #[test]
+    fn a_shell_location_title_gives_way_to_the_foreground_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let working = directory.path().join("billing-service");
+        std::fs::create_dir(&working).unwrap();
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+            working_directory: working.clone(),
+            environment: BTreeMap::new(),
+        });
+        let titles = |events: &Receiver<TerminalEvent>| {
+            events
+                .try_iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::TitleChanged(title) => Some(title),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let _ = titles(&events);
+        // fish's `prompt_pwd` form of where the shell is: each parent cut to
+        // its first character, or two for a hidden one.
+        let canonical = std::fs::canonicalize(&working).unwrap();
+        let abbreviated = canonical
+            .parent()
+            .unwrap()
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .map(|name| {
+                let keep = if name.starts_with('.') { 2 } else { 1 };
+                format!("/{}", name.chars().take(keep).collect::<String>())
+            })
+            .collect::<String>()
+            + "/billing-service";
+        worker.process_output(format!("\x1b]2;{abbreviated}\x07").into_bytes());
+        let shown = titles(&events);
+        assert!(
+            shown
+                .iter()
+                .all(|title| title.ends_with(" · billing-service") && !title.contains('/')),
+            "{shown:?}"
+        );
+        // Whatever holds the foreground in this harness names the command.
+        let fallback = worker.display_title.clone();
+        assert!(
+            fallback.ends_with(" · billing-service") && !fallback.contains('/'),
+            "{fallback:?}"
+        );
+        worker.process_output(b"\x1b]2;main.rs - VIM\x07".to_vec());
+        assert_eq!(titles(&events), vec!["main.rs - VIM".to_owned()]);
+        worker
+            .process_output(format!("\x1b]2;cargo build {}\x07", canonical.display()).into_bytes());
+        assert_eq!(titles(&events), vec![fallback.clone()]);
+        // The observation timer keeps the command title, rather than handing
+        // the row back to the location.
+        worker.publish_fallback_title();
+        assert_eq!(worker.display_title, fallback);
     }
 
     #[cfg(target_os = "linux")]

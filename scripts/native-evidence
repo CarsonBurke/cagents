@@ -28,6 +28,9 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 export CAGENTS_BUILD_SEED=0
 # The session's own commands run below a compositor with a private HOME.
 real_home=${CAGENTS_EVIDENCE_REAL_HOME:-$HOME}
+# Executables scripts/main-build-sentinel keeps for recent main commits, one
+# directory per commit.
+main_builds=${CAGENTS_EVIDENCE_MAIN_BUILDS:-$real_home/.local/state/cagents-main-sentinel/builds}
 
 usage() {
     cat <<'USAGE'
@@ -36,18 +39,22 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and selected providers.
 
-  build SIDE CHECKOUT [--integrated]
+  build SIDE CHECKOUT [--integrated | --executables DIR]
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. --integrated builds the UI with the embedded
-                  browser instead, and the side's sessions run the runner
+                  target. A clean checkout of a main commit that
+                  scripts/main-build-sentinel built takes its executables
+                  instead, without compiling. --executables moves those in DIR,
+                  built elsewhere from exactly this checkout, into the target.
+                  --integrated builds the UI with the embedded browser instead,
+                  always in a slot, and the side's sessions run the runner
                   without --browserless. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME] [--ui-trace] [--workspace-trace]
+        [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -64,6 +71,10 @@ both use the same fixture data and selected providers.
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
                   tree's work, and every call over 50 ms.
+                  --ui-scoped-fixture starts the fixture daemon as User, then
+                  launches only the UI runner with a hardcoded invalid synthetic
+                  session authority. Fixture env and cli commands remain User;
+                  inherited caller authority is still refused.
                   --workspace-trace logs shared-model update timing, scope
                   projection choices and activity redraw intervals. Both trace
                   options persist through relaunch, until the session stops.
@@ -231,14 +242,71 @@ refuse_running_side() {
     fi
 }
 
+# The executables a build makes, one per line.
+built_executables() {
+    build_arguments | sed 's/.* //'
+}
+
+# The directory of main's prebuilt executables for CHECKOUT: a clean checkout
+# of a commit scripts/main-build-sentinel built with these build arguments.
+main_build_of() {
+    local checkout=$1 directory
+    [ -z "$(cd -- "$checkout" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -c core.excludesFile=/dev/null status --porcelain=v1)" ] || return 1
+    directory=$main_builds/$(git -C "$checkout" rev-parse HEAD) || return 1
+    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments)" ] || return 1
+    printf '%s\n' "$directory"
+}
+
+# Puts executables built elsewhere from CHECKOUT in the side's target, as a
+# build there would have: copied from main's prebuilt ones, which stay, or
+# moved from a directory given to build. Either holds an arguments file, what
+# build_arguments printed where they were built.
+take_built() {
+    local side=$1 checkout=$2 from=$3 how=$4 zig=$5 cargo_bin=$6 target revision executable
+    target=$(target_of "$side")
+    mkdir -p -- "$target/dev-runtime" || die "could not create $target"
+    exec 8<"$target"
+    rm -f -- "$target/evidence-source"
+    revision=$(source_state "$checkout")
+    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments)" ] ||
+        die "$from was not built as this native-evidence builds; build it again"
+    # Main's are of one commit, which the checkout must still be at.
+    [ "$how" != copy ] || [ "$(main_build_of "$checkout")" = "$from" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    while IFS= read -r executable; do
+        [ -f "$from/$executable" ] && [ -x "$from/$executable" ] ||
+            die "$from has no $executable; build it again"
+        if [ "$how" = copy ]; then
+            cp --reflink=auto -- "$from/$executable" "$target/dev-runtime/.$executable.new" &&
+                mv -f -- "$target/dev-runtime/.$executable.new" "$target/dev-runtime/$executable" ||
+                die "could not copy $from/$executable into $target"
+        else
+            mv -f -- "$from/$executable" "$target/dev-runtime/$executable" ||
+                die "could not move $from/$executable into $target"
+        fi
+    done < <(built_executables)
+    [ "$(source_state "$checkout")" = "$revision" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    {
+        printf '%s\n' "$checkout" "$zig" "$cargo_bin"
+        printf '%s\n' "$revision"
+        printf 'lane browserless\n'
+    } >"$target/evidence-source"
+}
+
 cmd_build() {
-    local side=${1:-} checkout=${2:-} lane=browserless
+    local side=${1:-} checkout=${2:-} lane=browserless executables=''
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
             --integrated) lane=integrated; shift ;;
+            --executables)
+                executables=${2:?--executables needs a directory}
+                shift 2
+                ;;
             --seed-target)
                 # A slot already holds a nearby build; a copied target adds only disk.
                 : "${2:?--seed-target needs a directory}"
@@ -248,6 +316,9 @@ cmd_build() {
             *) die "unknown build option: $1" 2 ;;
         esac
     done
+    # Executables built elsewhere, and main's prebuilt ones, are browserless.
+    [ "$lane" = browserless ] || [ -z "$executables" ] ||
+        die '--executables takes browserless executables; build --integrated in a slot' 2
     refuse_running_side "$side"
     checkout=$(cd -- "$checkout" && pwd -P)
     git -C "$checkout" rev-parse --git-dir >/dev/null
@@ -271,6 +342,26 @@ cmd_build() {
     # The other side stays in use while this one builds, even if the guard
     # below starts the pruner.
     mark_used
+    if [ -n "$executables" ]; then
+        take_built "$side" "$checkout" "$executables" move "$zig" "${cargo_path%/*}"
+        rm -f -- "$executables/arguments"
+        rmdir -- "$executables" 2>/dev/null || :
+        printf 'took %s at %s from %s\n' "$side" "$(git -C "$checkout" rev-parse HEAD)" "$executables"
+        return
+    fi
+    local prebuilt
+    if [ "$lane" = browserless ] && prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
+        # The sentinel removes old builds only while nothing reads them. A
+        # copy that fails says why, and the side is compiled instead.
+        if (
+            flock -s 9 || exit 1
+            [ -d "$prebuilt" ] || exit 1
+            take_built "$side" "$checkout" "$prebuilt" copy "$zig" "${cargo_path%/*}"
+        ) 9<"$main_builds/.lock"; then
+            printf 'took %s at %s from main'"'"'s prebuilt executables\n' "$side" "$(git -C "$checkout" rev-parse HEAD)"
+            return
+        fi
+    fi
     # Builds in shared slots skip the gate's disk guard, which starts the
     # pruner on its schedule and refuses a build when the disk is too full.
     # When the slots are this host's, they share its disk, so run it here; a
@@ -414,6 +505,57 @@ seeded_home_identity() {
     stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
 }
 
+restore_seed_in_place() {
+    # Older rsync receivers cannot open an owned read-only file for an
+    # in-place update. Lend write permission only to regular files the seed
+    # needs to update; archive mode restores their exact saved permissions.
+    # Neither the walk nor chmod follows fixture symlinks.
+    /usr/bin/python3 - "$seed" "$fixture" <<'PY'
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+seed, fixture = map(Path, sys.argv[1:])
+lent = []
+restored = False
+try:
+    for directory, _, names in os.walk(fixture, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            current = path.lstat()
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                    or current.st_mode & stat.S_IWUSR):
+                continue
+            try:
+                saved = (seed / path.relative_to(fixture)).lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISREG(saved.st_mode)
+                    and (current.st_size, current.st_mtime_ns) != (saved.st_size, saved.st_mtime_ns)):
+                path.chmod(stat.S_IMODE(current.st_mode) | stat.S_IWUSR, follow_symlinks=False)
+                lent.append((path, current))
+    result = subprocess.run([
+        "rsync", "-aH", "--inplace", "--delete", "--force", "--", f"{seed}/", f"{fixture}/",
+    ])
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    restored = True
+finally:
+    if not restored:
+        # A failed restore must not leave its existing files writable. Avoid
+        # changing a file that rsync removed or replaced before it failed.
+        for path, original in lent:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                path.chmod(stat.S_IMODE(original.st_mode), follow_symlinks=False)
+PY
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
@@ -424,7 +566,7 @@ prepare_fixture() {
             # and a transcript's location records its file's. Syncing in
             # place keeps every directory and file both share, so a
             # conversation saved in the seed reopens on either side.
-            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+            if ! restore_seed_in_place 2>"$logs/seed.log"; then
                 printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
                 return 1
             fi
@@ -954,6 +1096,15 @@ run_app() {
     [ -z "$slot" ] || window_arguments=(-- --window "$slot")
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
+        # Start the isolated daemon as User before adding the synthetic caller
+        # to the UI runner. It must not inherit even this invalid capability.
+        if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
+            printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+            return 1
+        fi
+        stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
+    fi
     [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
         RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
     )
@@ -1114,7 +1265,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= workspace_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1132,6 +1283,7 @@ cmd_start() {
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --ui-trace) ui_trace=1; shift ;;
+            --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
@@ -1182,6 +1334,7 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
@@ -1344,6 +1497,13 @@ cmd_status() {
         printf 'this session: slot %s\n' "$(cat "$state/slot")"
     fi
 }
+
+# What build compiles, for builds made elsewhere: in the caller's own checkout
+# by native-evidence-remote, and of main by scripts/main-build-sentinel.
+if [ "${1:-}" = __build-arguments ]; then
+    build_arguments
+    exit 0
+fi
 
 # On another host, over SSH; nothing native runs here. See native-evidence-remote.
 # Only as a leading option, beside --task: a later --remote is a command's.

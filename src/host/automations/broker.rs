@@ -1235,13 +1235,14 @@ mod tests {
             .unwrap(),
             Response::Proposal(Box::new(proposals[0].clone()))
         );
-        assert_eq!(
-            without_wake(Request::Proposal {
-                id: Uuid::from_u128(4)
-            })
-            .unwrap_err(),
-            "The automation proposal is unavailable"
-        );
+        let error = without_wake(Request::Proposal {
+            id: Uuid::from_u128(4),
+        })
+        .unwrap_err();
+        let service::Error::Invalid(message) = error else {
+            panic!("a missing proposal must remain an invalid request: {error}");
+        };
+        assert_eq!(message, "The automation proposal is unavailable");
         {
             let registry = registry.lock().unwrap();
             assert_eq!(registry.model().unwrap(), before_model);
