@@ -564,8 +564,8 @@ several agents build on one host, run Cargo through the build gate rather than
 a single global lock:
 
 ```sh
-scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
-scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+mise run check:ui -- --bin cagents-ui  # scripts/cargo-gate check --locked ... --features ui
+mise run test:host                     # scripts/cargo-gate test --locked ... --features host
 ```
 
 On the host that compiles, `scripts/build-host` runs each build. Memory, not
@@ -633,7 +633,7 @@ share, or inside a gated `exec`, runs without waiting again.
 
 Admission waits are unbounded by default. To give one invocation a budget,
 set `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS` to a positive integer, for example
-`CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS=120 scripts/cargo-gate check --locked --no-default-features --bin cagents`.
+`CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS=120 mise run check:cli -- --bin cagents`.
 The single budget includes metadata, disk reclamation and seeding, the wait for
 the build host and the wait for shares. Expiry exits 124. Once admitted, the
 build and its tests or program have no admission timeout.
@@ -1100,11 +1100,12 @@ infer a historical producer from timestamps. Other cached packages remain
 available, though Cargo may rebuild dependents of the selected package.
 
 ```sh
-# Reduce compilation concurrency further on a memory-constrained host.
-CARGO_BUILD_JOBS=1 scripts/run-development --browserless
-
-# Opt into more compilation jobs when system RAM is available.
-scripts/cargo-gate check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+# Cap one build's compilation jobs, as on a memory-constrained host; through
+# the gate, a build otherwise takes as many as the shared jobserver gives it.
+mise run check:ui -- -j 4 --bin cagents-ui
+# Cap every build a command runs: CAGENTS_BUILD_REMOTE_JOBS on the build host,
+# CARGO_BUILD_JOBS where Rust compiles on this host.
+CAGENTS_BUILD_REMOTE_JOBS=2 mise run dev
 ```
 
 Compilation jobs and test threads are separate controls: `-j` does not
