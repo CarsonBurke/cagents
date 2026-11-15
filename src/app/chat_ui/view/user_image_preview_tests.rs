@@ -27,35 +27,46 @@ fn image(id: &str, number: u64) -> chat::Item {
 }
 
 fn ready(cached: &mut CachedItem) {
+    ready_sized(cached, 640, 480);
+}
+
+fn ready_sized(cached: &mut CachedItem, width: u32, height: u32) {
     cached.image = Some(iced::widget::image::Handle::from_rgba(
-        1,
-        1,
-        vec![12, 34, 56, 255],
+        width,
+        height,
+        [12, 34, 56, 255].repeat((width * height) as usize),
     ));
     cached.image_source = None;
     cached.image_unavailable = false;
     cached.image_error = None;
 }
 
+/// What a click on each preview of a laid out prompt found.
+struct Clicked {
+    texts: Vec<String>,
+    /// Plain text widgets, such as a preview's caption, where they are drawn.
+    labels: Vec<(String, Rectangle)>,
+    previews: Vec<Rectangle>,
+    messages: Vec<Message>,
+}
+
 /// Lay out the actual prompt widget, inspect its displayed text and
 /// click its actual image button using its rendered focusable bounds. The
 /// pinned Iced hover wrapper forwards operations/input, but not accessibility.
-fn click_prompt(
-    renderer: &cosmic::Renderer,
-    runtime: &Runtime,
-    item: &chat::Item,
-) -> (Vec<String>, Vec<Message>) {
+fn click_prompt(renderer: &cosmic::Renderer, runtime: &Runtime, item: &chat::Item) -> Clicked {
     #[derive(Default)]
     struct Prompt {
         texts: Vec<String>,
+        labels: Vec<(String, Rectangle)>,
         controls: Vec<Rectangle>,
     }
     impl Operation for Prompt {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
         }
-        fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+        fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
             self.texts.push(text.to_owned());
+            self.labels.push((text.to_owned(), bounds));
         }
         fn custom(&mut self, _: Option<&widget::Id>, _: Rectangle, state: &mut dyn std::any::Any) {
             if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
@@ -81,12 +92,12 @@ fn click_prompt(
     element
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), renderer, &mut prompt);
-    // The preview occupies its rendered image area (280 logical pixels tall).
-    // The message-copy footer is a compact icon button outside that area.
+    // The preview button hugs its rendered image. The message-copy footer is
+    // a compact icon button, smaller than any fixture image.
     let previews: Vec<_> = prompt
         .controls
         .iter()
-        .filter(|bounds| bounds.height >= 200.0)
+        .filter(|bounds| bounds.width > 48.0 && bounds.height > 48.0)
         .copied()
         .collect();
     let mut messages = Vec::new();
@@ -125,7 +136,12 @@ fn click_prompt(
         "rendered prompt {:?}: controls={:?}, preview bounds={previews:?}, actions={actions:?}",
         item.id, prompt.controls
     );
-    (prompt.texts, messages)
+    Clicked {
+        texts: prompt.texts,
+        labels: prompt.labels,
+        previews,
+        messages,
+    }
 }
 
 #[test]
@@ -134,7 +150,9 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     ready(runtime.cache.get_mut(&item.id).unwrap());
     let renderer = crate::app::tests::headless_renderer();
-    let (texts, messages) = click_prompt(&renderer, &runtime, &item);
+    let Clicked {
+        texts, messages, ..
+    } = click_prompt(&renderer, &runtime, &item);
     assert!(
         texts
             .iter()
@@ -190,7 +208,9 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
     cached.image_unavailable = true;
     cached.image_error = Some("The attachment does not provide an image file path.".into());
     let renderer = crate::app::tests::headless_renderer();
-    let (texts, messages) = click_prompt(&renderer, &runtime, &item);
+    let Clicked {
+        texts, messages, ..
+    } = click_prompt(&renderer, &runtime, &item);
     assert!(
         texts
             .iter()
@@ -230,7 +250,9 @@ fn claude_document_placeholder_keeps_its_title_without_image_actions() {
     cached.image_unavailable = true;
     cached.image_error = Some("The attachment does not provide an image file path.".into());
     let renderer = crate::app::tests::headless_renderer();
-    let (texts, messages) = click_prompt(&renderer, &runtime, &item);
+    let Clicked {
+        texts, messages, ..
+    } = click_prompt(&renderer, &runtime, &item);
     assert!(
         texts
             .iter()
@@ -280,7 +302,9 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     let renderer = crate::app::tests::headless_renderer();
     let runtime = app.chat_runtime_mut(target).unwrap();
     ready(runtime.child_cache.get_mut(&child.id).unwrap());
-    let (texts, messages) = click_prompt(&renderer, runtime, &child);
+    let Clicked {
+        texts, messages, ..
+    } = click_prompt(&renderer, runtime, &child);
     assert!(
         texts
             .iter()
@@ -296,7 +320,7 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     drop(app.handle_chat_ui(Action::CloseImage));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     let runtime = app.chat_runtime_mut(target).unwrap();
-    let (_, messages) = click_prompt(&renderer, runtime, &parent);
+    let Clicked { messages, .. } = click_prompt(&renderer, runtime, &parent);
     assert!(
         !messages
             .iter()
@@ -311,7 +335,9 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     runtime.cache.remove(&item.id);
     let renderer = crate::app::tests::headless_renderer();
-    let (texts, messages) = click_prompt(&renderer, &runtime, &item);
+    let Clicked {
+        texts, messages, ..
+    } = click_prompt(&renderer, &runtime, &item);
     assert!(texts.iter().any(|text| text == "Image 59"));
     assert!(
         !texts
@@ -322,5 +348,108 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
         !messages
             .iter()
             .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..))))
+    );
+}
+
+#[test]
+fn a_wide_short_attachment_hugs_its_picture_with_the_caption_beneath() {
+    let item = image("wide-user-image", 5);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    ready_sized(runtime.cache.get_mut(&item.id).unwrap(), 2400, 300);
+    let renderer = crate::app::tests::headless_renderer();
+    let Clicked {
+        labels,
+        previews,
+        messages,
+        ..
+    } = click_prompt(&renderer, &runtime, &item);
+    let [preview] = previews.as_slice() else {
+        panic!("one preview button: {previews:?}");
+    };
+    // The prompt draws within 600 px, less its own padding: the picture
+    // fills that width at its own ratio, with no letterbox bands around it.
+    assert!(
+        preview.width <= 600.0 && preview.width > 400.0,
+        "{preview:?}"
+    );
+    assert!(
+        (preview.width / preview.height - 8.0).abs() < 0.05,
+        "the button is the picture's own shape: {preview:?}"
+    );
+    let caption = labels
+        .iter()
+        .find(|(text, _)| text == "Image 5 · Click to enlarge")
+        .map(|(_, bounds)| *bounds)
+        .expect("the preview keeps its caption");
+    let gap = caption.y - (preview.y + preview.height);
+    assert!(
+        (0.0..=step::GAP_S).contains(&gap),
+        "the caption sits just beneath the picture: {gap} px"
+    );
+    assert!(matches!(messages.as_slice(),
+        [Message::ChatUi(Action::OpenImage(target, id))]
+            if *target == runtime.target && id == &item.id));
+}
+
+#[test]
+fn a_tall_attachment_keeps_to_the_height_cap_at_its_own_ratio() {
+    let item = image("tall-user-image", 6);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    ready_sized(runtime.cache.get_mut(&item.id).unwrap(), 400, 2000);
+    let renderer = crate::app::tests::headless_renderer();
+    let Clicked { previews, .. } = click_prompt(&renderer, &runtime, &item);
+    let [preview] = previews.as_slice() else {
+        panic!("one preview button: {previews:?}");
+    };
+    assert!(
+        (preview.height - images::preview::MAX_HEIGHT).abs() < 0.5
+            && (preview.width - 72.0).abs() < 0.5,
+        "{preview:?}"
+    );
+}
+
+#[test]
+fn an_attachment_read_again_keeps_its_room_until_its_pixels_return() {
+    let item = image("returning-user-image", 7);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    runtime.visible.store(true, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    let source = runtime.cache[&item.id]
+        .image_source
+        .clone()
+        .expect("a visible recent attachment is read");
+    let attempt = runtime.cache[&item.id].image_attempt;
+    images::complete(
+        &mut runtime,
+        &source,
+        attempt,
+        images::Loaded::Ready(iced::widget::image::Handle::from_rgba(
+            1200,
+            300,
+            [12, 34, 56, 255].repeat(1200 * 300),
+        )),
+    );
+    let renderer = crate::app::tests::headless_renderer();
+    let caption = |runtime: &Runtime, text: &str| {
+        click_prompt(&renderer, runtime, &item)
+            .labels
+            .into_iter()
+            .find(|(label, _)| label == text)
+            .map(|(_, bounds)| bounds)
+            .unwrap_or_else(|| panic!("{text:?} is shown"))
+    };
+    let shown = caption(&runtime, "Image 7 · Click to enlarge");
+
+    // Leaving the conversation releases the pixels; returning reads them again.
+    runtime.visible.store(false, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    runtime.visible.store(true, Ordering::Relaxed);
+    images::sync(&mut runtime);
+    let cached = &runtime.cache[&item.id];
+    assert!(cached.image.is_none() && cached.image_source.is_some());
+    let loading = caption(&runtime, "Image 7 · Loading preview…");
+    assert_eq!(
+        loading.y, shown.y,
+        "the caption stays where the returning picture puts it"
     );
 }

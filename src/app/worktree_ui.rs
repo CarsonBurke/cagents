@@ -351,7 +351,6 @@ fn scope_descriptor(
         chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
-        workspace_visits: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.

@@ -45,3 +45,18 @@ restarts the blink; the last is new, since upstream's blink never stopped.
 It reads the schedule through `Blink::current()`, so the desktop's blink
 interval and timeout apply, and a desktop that turns blinking off holds the
 cursor steady.
+
+# Disabled buttons are not focus stops
+
+`Button::operate` reported every button to focus operations as a stop, so Tab
+and Shift+Tab landed on buttons without `on_press` or `on_press_down`, which
+nothing can activate. A disabled button now reports its focus state through a
+wrapper whose `Focusable::is_focus_stop` is false (see
+`vendor/iced-core/README.cagents.md`), so traversal passes it over. It is still
+reported, because the app locates buttons such as a selected tab through focus
+operations. A button disabled while focused keeps its focus, as Refresh does
+while it runs, and Tab moves on from it.
+
+The application regression `disabled_buttons_are_not_focus_stops` in
+`src/ui_controls/button.rs` covers traversal in both directions, locating, and
+disabling a focused button.

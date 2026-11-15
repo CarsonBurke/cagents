@@ -2169,6 +2169,7 @@ impl Runtime {
             self.item_expanded(&item.id),
             self.child_find_revision(),
             dark,
+            cached.shows_figures().then(|| self.figures.version()),
         )
             .hash(&mut revision);
         if item.content.is_step() {
@@ -4701,6 +4702,15 @@ impl Runtime {
                     )
                 })
                 .hash(&mut hasher);
+            // What a Markdown image draws lives with the conversation, so a
+            // preview that finished decoding redraws the exchange showing it.
+            if self
+                .cache
+                .get(&item.id)
+                .is_some_and(CachedItem::shows_figures)
+            {
+                self.figures.version().hash(&mut hasher);
+            }
             // A coordinating step names agents by what this conversation
             // calls them, links their transcripts while it lists them, tells
             // how those it left in the background are doing, and
@@ -6624,6 +6634,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod figure_tests;
 
 #[cfg(test)]
 mod provider_context_tests;
