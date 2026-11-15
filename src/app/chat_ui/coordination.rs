@@ -1770,7 +1770,8 @@ mod identity_tests {
     fn cli_spawn_preview_names_the_destination_without_repeating_the_task() {
         let (runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
         let name = "cross-project-reviewer-with-a-distinctive-name";
-        let long_task = "Review the deployment carefully. ".repeat(8);
+        // Longer than the task preview, within the channel title's limit.
+        let long_task = "Review the deployment carefully. ".repeat(7);
         let long_destination = format!("in channel “{}”", long_task.trim());
         for (placed, title, task, expected) in [
             (
