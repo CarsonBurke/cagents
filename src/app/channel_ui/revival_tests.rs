@@ -424,7 +424,9 @@ fn shortcut_and_picker_preserve_manual_pane_names_after_retirement() {
             }
             let saved = fixture.saved();
             fixture.close_card();
-            fixture.retire();
+            // Keep the workspace connection open: a seed sent into a closed one
+            // is refused until an explicit retry, and the successor must seed.
+            let _requests = fixture.retire();
             let before_settings = fixture.app.settings_save_generation;
             if picker {
                 drop(fixture.app.resume_saved_conversation(saved));
