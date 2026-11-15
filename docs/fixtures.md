@@ -307,8 +307,8 @@ its patch is synthetic. None of the described commands or tools executes.
 `activity` opens its own named workspace and loads
 [`activity.jsonl`](../tests/fixtures/reasoning-row-scene/activity.jsonl): an
 empty thought, a command and a background command, then a second empty thought
-that stays live for 20 seconds while that command group is still running, then
-a newer command that runs for 15 seconds in a group of its own. It captures the
+that stays live for 30 seconds while that command group is still running, then
+a newer command that runs for 25 seconds in a group of its own. It captures the
 working turn at both points, waits for the answer, and captures the finished
 turn.
 
