@@ -541,3 +541,70 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+## A refused shared-view seed
+
+[`seed-refusal-scene.sh`](../tests/fixtures/seed-refusal-scene.sh) creates an
+offline Claude conversation with an unsent launch-note draft. Its `refuse`
+step closes only the UI, keeps the daemon and provider alive, then uses
+[`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
+remove that channel's shared view and its active placement mappings. It keeps
+both monotonic clocks, actor/history records, window retention pins and other
+scopes. The helper then adds a trigger that published-schema admission does
+not recognize. While armed, the real registry can refuse all writes, before
+the trigger's channel-conditional body runs. The native notice reports the
+registry's schema-mismatch reason, not the trigger body's SQLite sentence.
+The fixture does not inject UI state, replace transport or weaken schema checks.
+Dropping the trigger restores admission; the selected panes can register again
+with fresh placement generations.
+
+Run the scene on the native-evidence host, with both fixture scripts in the
+same directory. When comparing a revision that predates the scripts, copy them
+into the evidence task's `tools/` directory and use that copy on both sides.
+Keep the helper outside the before and after checkouts so their recorded source
+stays unchanged. Build both revisions before taking a native slot.
+
+```sh
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/seed-refusal
+export CAGENTS_EVIDENCE_TOOL=/path/to/checkout/scripts/native-evidence
+scene=$CAGENTS_EVIDENCE_TASK/tools/seed-refusal-scene.sh
+
+# Once, with a native session running; every later start restores these bytes.
+bash "$scene" seed
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" stop
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" save-seed
+
+# After starting either side at the comparison's width:
+# Observe the closed inspector's notices icon and set its point. Passing the
+# point to refuse clears unrelated transient headless-desktop notices.
+export NOTICE_CONTROL_POINT=$observed_point
+bash "$scene" refuse wide
+# On the fixed side:
+bash "$scene" notice wide
+bash "$scene" retry wide
+```
+
+`refuse` captures the saved draft before opening notices. `notice` checks the
+existing warning control's tooltip and captures the refusal and Retry action.
+`retry` removes the fixture refusal, presses Retry and waits for the saved pane
+to reopen. Repeat with `narrow` in a new session at the narrower viewport;
+both widths restore the same seed. To avoid taking another native slot, a
+1500×900 session can instead use `native-evidence nested niri msg action
+set-column-width 900` and return to `1500`; first confirm the actual app-window
+size with `drive observe`. Capture the full native window. The manifest retains
+the requested headless viewport and separately records the actual image size;
+report the latter for a resized capture. Apply identical geometry on both sides.
+The notices icon's position depends on that
+viewport and the inspector state, so observe it instead of reusing a guessed
+point. Stop immediately after capturing the states.
+
+The helper refuses a HOME or data directory outside the private evidence
+fixture. Its offline contracts cover selected-view/placement cleanup, foreign-key
+cascades, unchanged unrelated rows and monotonic clocks, and refusal to modify
+an unrelated home or missing channel. A separate direct-SQL check exercises the
+conditional trigger body only; it does not test daemon schema admission. Real
+registry refusal and successful recovery must be checked in the native app:
+
+```sh
+python3 -I -B tests/fixtures/test_seed_refusal_registry.py -v
+```

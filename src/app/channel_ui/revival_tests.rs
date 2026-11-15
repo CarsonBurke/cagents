@@ -144,8 +144,8 @@ impl Fixture {
 
     /// The registry's view of the channel settles empty, and the window asks
     /// it to retire the channel.
-    fn send_retirement(&mut self) -> async_channel::Receiver<ModelEdit> {
-        let (send, received) = async_channel::unbounded();
+    fn send_retirement(&mut self) -> TestModelRequests {
+        let (send, received) = test_model_channel();
         self.app.workspace_model_tx = send;
         let view = &mut self.app.workspace_model.views[0];
         view.panes.clear();
@@ -191,7 +191,7 @@ impl Fixture {
     }
 
     /// The registry retires the channel, and the window learns it.
-    fn retire(&mut self) -> async_channel::Receiver<ModelEdit> {
+    fn retire(&mut self) -> TestModelRequests {
         let received = self.send_retirement();
         let channel = self.channel;
         self.answer_retirement(true);
@@ -246,8 +246,8 @@ impl Fixture {
     }
 
     /// Replaces the publisher so what the window asks next can be read.
-    fn listen(&mut self) -> async_channel::Receiver<ModelEdit> {
-        let (send, received) = async_channel::unbounded();
+    fn listen(&mut self) -> TestModelRequests {
+        let (send, received) = test_model_channel();
         self.app.workspace_model_tx = send;
         received
     }
@@ -683,7 +683,7 @@ fn a_conversation_deleted_while_open_resumes_in_its_worktree() {
 fn reopening_before_retirement_keeps_the_channel() {
     let mut fixture = fixture();
     fixture.close_card();
-    let (send, published) = async_channel::unbounded();
+    let (send, published) = test_model_channel();
     fixture.app.workspace_model_tx = send;
 
     fixture.reopen_pane();
@@ -1416,7 +1416,7 @@ fn a_channel_named_from_its_conversation_gets_the_name_back() {
     assert!(published.try_recv().is_err());
 }
 
-fn retirements(received: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+fn retirements(received: &TestModelRequests) -> Vec<ModelEdit> {
     std::iter::from_fn(|| received.try_recv().ok())
         .filter(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. }))
         .collect()

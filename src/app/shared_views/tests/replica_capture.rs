@@ -138,7 +138,7 @@ fn presentation_replica_capture_updates_immediately_and_reopens_the_latest_sqlit
         .unwrap() as *const CardState;
     let captures = app.replica_capture.captures;
     let offers = app.replica_capture.offers;
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = test_model_channel();
     app.workspace_model_tx = tx;
     let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
     let mut separated_card = None;
@@ -416,7 +416,7 @@ fn presentation_replica_capture_normal_save_absorbs_once_and_keeps_reported_titl
     app.reported_title_save.cards.insert(pane.id);
     app.card_state_mut(pane.id).unwrap().title = "Held local reported title".into();
     let captures = app.replica_capture.captures;
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = test_model_channel();
     app.workspace_model_tx = tx;
     app.save_workspace();
     assert!(app.reported_title_save.cards.contains(&pane.id));

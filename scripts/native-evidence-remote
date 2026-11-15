@@ -37,9 +37,13 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   --codex tool-rows, --ui-scoped-fixture or --codex-executable /host/path/codex,
                   go to each side's start. Executable paths name files on HOST.
   build SIDE SOURCE
-                  Copy SOURCE to HOST and build it there. SOURCE is a checkout
-                  directory, whose uncommitted and untracked files are
-                  included, or a revision such as origin/main.
+                  Copy SOURCE to HOST and give HOST its executables. SOURCE is
+                  a checkout directory, whose uncommitted and untracked files
+                  are included, or a revision such as origin/main. A main
+                  commit the host's sentinel has built needs no build. A
+                  checkout otherwise builds through its own gate, as
+                  `mise run dev` does, reusing what that built, and the
+                  executables go to HOST; a revision builds on HOST.
   shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
   fetch           Bring back every shot and the manifest.
   where           Print the task and checkouts on HOST.
@@ -215,7 +219,7 @@ mkdir -p -- "$task/shots"
 # A commit holding exactly what a checkout's working tree holds, tracked or
 # not, without touching its index, branch or files. A clean checkout is its HEAD.
 snapshot() {
-    local checkout=$1 head index tree
+    local checkout=$1 head index tree date
     head=$(git -C "$checkout" rev-parse --verify HEAD^{commit}) ||
         die "$checkout has no commit to start from"
     if [ -z "$(git -C "$checkout" --no-optional-locks status --porcelain=v1 --untracked-files=all)" ]; then
@@ -234,8 +238,11 @@ snapshot() {
         die "could not record the uncommitted state of $checkout"
     }
     rm -f -- "$index"
-    GIT_AUTHOR_NAME=native-evidence GIT_AUTHOR_EMAIL=native-evidence@localhost \
-        GIT_COMMITTER_NAME=native-evidence GIT_COMMITTER_EMAIL=native-evidence@localhost \
+    # Dated as HEAD is, so the same files make the same commit, and a checkout
+    # on the host already at it is left as it is.
+    date="@$(git -C "$checkout" show -s --format=%ct "$head") +0000"
+    GIT_AUTHOR_NAME=native-evidence GIT_AUTHOR_EMAIL=native-evidence@localhost GIT_AUTHOR_DATE=$date \
+        GIT_COMMITTER_NAME=native-evidence GIT_COMMITTER_EMAIL=native-evidence@localhost GIT_COMMITTER_DATE=$date \
         git -C "$checkout" commit-tree "$tree" -p "$head" -m "native-evidence: uncommitted state of $checkout"
 }
 
@@ -281,9 +288,78 @@ sync_checkout() {
 }
 
 sync_tool() {
-    local commit
-    commit=$(snapshot "$tool_source")
-    sync_checkout tool "$tool_source" "$commit" >/dev/null
+    tool_checkout=$(sync_checkout tool "$tool_source" "$tool_commit")
+}
+
+# What a checkout's working tree holds, as a Git tree.
+tree_of() {
+    git -C "$1" rev-parse "$(snapshot "$1")^{tree}"
+}
+
+# What the host's native-evidence, a copy of the tool's, builds: one build's
+# arguments per line, its executable last.
+build_arguments() {
+    "$tool_source/scripts/native-evidence" __build-arguments
+}
+
+# Builds what native-evidence runs from CHECKOUT's own gate, into its own
+# target and the build host's slot for it, as `mise run dev` does: what that
+# already built is reused, and Cargo rebuilds only what changed since. The
+# build must be of TREE, what the host is given.
+build_in_checkout() {
+    local checkout=$1 tree=$2 metadata directory
+    evidence_arguments=$(build_arguments) && [ -n "$evidence_arguments" ] ||
+        die "could not ask $tool_source what native-evidence builds"
+    [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed while it was copied; build it again"
+    # One slot for the three, as scripts/run-development holds it.
+    # shellcheck disable=SC2016 # Expanded by the inner shell.
+    (cd -- "$checkout" && scripts/cargo-gate exec --hold bash -ec '
+        gate=$1
+        while IFS= read -r arguments; do
+            # Deliberately one word per argument.
+            "$gate" build $arguments
+        done <<<"$2"
+    ' build-evidence "$checkout/scripts/cargo-gate" "$evidence_arguments") ||
+        die "could not build $checkout; see the build's messages above"
+    [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed during its build; build it again"
+    # Where the gate brought them, which Cargo's configuration may move.
+    metadata=$(cd -- "$checkout" && cargo metadata --locked --format-version 1 --no-deps) ||
+        die "could not find $checkout's Cargo target directory"
+    directory=$(sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' <<<"$metadata")
+    [ -n "$directory" ] || die "could not find $checkout's Cargo target directory"
+    built_executables=$directory/dev-runtime
+}
+
+# Sends the executables in DIRECTORY, which build_in_checkout built, to the
+# task on HOST, for build's --executables; prints where they went. A side's
+# earlier executables, or the other side's, are the basis for sending only
+# what differs.
+send_executables() {
+    local side=$1 directory=$2 answer remote_task executables=() bases=() base
+    answer=$(on_host "$remote_prelude"'
+        # Made a task first, which only native-evidence does.
+        "$tool/scripts/native-evidence" --task "$task" status >/dev/null
+        printf "%s\n" "$task"
+        for side in "$1" before after; do
+            [ ! -d "$task/target-$side/dev-runtime" ] || printf "%s\n" "$task/target-$side/dev-runtime"
+        done
+    ' "$side") || die "could not prepare the task on $host"
+    remote_task=$(head -n 1 <<<"$answer")
+    while IFS= read -r base; do
+        [[ " ${bases[*]} " == *" --copy-dest=$base "* ]] || bases+=("--copy-dest=$base")
+    done < <(tail -n +2 <<<"$answer")
+    local executable
+    while IFS= read -r executable; do
+        executables+=("$directory/${executable##* }")
+    done <<<"$evidence_arguments"
+    # What they were built with, which the host checks against its own.
+    mkdir -p -- "$task/upload"
+    printf '%s\n' "$evidence_arguments" >"$task/upload/arguments"
+    executables+=("$task/upload/arguments")
+    rsync --perms --compress --mkpath -e "${ssh_command[*]}" "${bases[@]}" \
+        -- "${executables[@]}" "$host:$remote_task/upload-$side/" ||
+        die "could not send the executables to $host"
+    printf '%s\n' "$remote_task/upload-$side"
 }
 
 # Brings back the task's shots directory, manifest included.
@@ -325,29 +401,61 @@ cmd_build() {
     case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
     [ -n "$source" ] || die 'build needs a checkout or revision' 2
     resolve_source "$source"
+    tool_commit=$(snapshot "$tool_source")
     # Take the task's name on the host, or be refused, before anything is
     # sent there; and not while a session runs from what would be rewritten.
-    local running=0
-    on_host "claim=true
+    local running=0 prebuilt=false answer
+    answer=$(on_host "claim=true
 $remote_prelude"'
+        # Executables the sentinel here built of a main commit, which
+        # native-evidence here takes instead of building.
+        [ ! -f "$HOME/.local/state/cagents-main-sentinel/builds/$2/arguments" ] || echo prebuilt
         [ -x "$tool/scripts/native-evidence" ] || exit 0
         # Read whole: grep -q would end the pipe early, and status, killed
         # by SIGPIPE under pipefail, would read as no session.
         status=$(evidence status 2>/dev/null) || :
-        if grep -q "^session: $1," <<<"$status"; then exit 10; fi
-    ' "$side" || running=$?
+        running=$(sed -n "s/^session: \([a-z]*\),.*/\1/p" <<<"$status")
+        [ -n "$running" ] || exit 0
+        [ "$running" != "$1" ] || exit 10
+        # A side that runs from the tool checkout, which the build updates.
+        if [ "$(sed -n 1p "$task/target-$running/evidence-source" 2>/dev/null)" = "$(cd -- "$tool" && pwd -P)" ] &&
+            [ "$(git -C "$tool" rev-parse HEAD)" != "$3" ]; then
+            exit 11
+        fi
+    ' "$side" "$source_commit" "$tool_commit") || running=$?
+    [ "$answer" != prebuilt ] || prebuilt=true
     case $running in
         0) ;;
         10) die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop" ;;
+        11) die "a session on $host runs from this tool's checkout, which has changed since; stop it before building: scripts/native-evidence --remote $host --task $task stop" ;;
         255) die "could not reach $host over ssh, or it lost the connection" 255 ;;
         *) exit "$running" ;;
     esac
     sync_tool
-    checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
+    local options=()
+    if [ -d "$source" ] && [ "$prebuilt" = false ]; then
+        build_in_checkout "$source_checkout" "$(git -C "$source_checkout" rev-parse "$source_commit^{tree}")"
+        options=(--executables "$(send_executables "$side" "$built_executables")")
+    fi
+    if [ -d "$source" ] && [ "$source_checkout" = "$(cd -- "$tool_source" && pwd -P)" ] &&
+        [ "$(git -C "$source_checkout" rev-parse "$source_commit^{tree}")" = "$(git -C "$source_checkout" rev-parse "$tool_commit^{tree}")" ]; then
+        # The tool's own checkout already holds this source.
+        checkout=$tool_checkout
+        source_commit=$tool_commit
+    else
+        checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
+    fi
     if [ "$source_commit" != "$source_head" ]; then
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
-    forward build "$side" "$checkout"
+    local built=0
+    forward build "$side" "$checkout" "${options[@]}" || built=$?
+    if [ "$built" -ne 0 ]; then
+        # What was sent for it is no use to the next build.
+        [ "${#options[@]}" -eq 0 ] || on_host "$remote_prelude"'
+            rm -rf -- "$task/upload-$1"' "$side" || :
+        exit "$built"
+    fi
     record_source "$side"
 }
 

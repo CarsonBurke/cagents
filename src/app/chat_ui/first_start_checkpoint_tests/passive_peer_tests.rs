@@ -574,7 +574,7 @@ fn run(initialized: bool) {
     view.panes.push(pane_a.clone());
     creator.workspace_model.identity = uuid::Uuid::new_v4();
     creator.workspace_model.views = vec![view.clone()];
-    let (publish, published) = async_channel::unbounded();
+    let (publish, published) = test_model_channel();
     creator.workspace_model_tx = publish;
     creator.publish_view_changes(); // actual SeedView A establishes its baseline
     assert!(matches!(
