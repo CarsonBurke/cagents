@@ -13,13 +13,18 @@ import time
 
 TITLE = "Main Rust build sentinel: compilation failure"
 # Each lane's selection after `check --locked --no-default-features --all-targets`.
-# `app` is the application package, absent from commits before it was split out.
+# `app` is the application package, absent from commits before it was split out;
+# `browser` is that package's integrated-browser graph. Its protocol-fixture
+# feature adds only the Wayland registry test server, so one check covers every
+# integrated-browser target.
 LANES = {
     "cli": [],
     "host": ["--features", "host"],
     "ui": ["--features", "ui"],
     "app": ["-p", "cagents-ui"],
+    "browser": ["-p", "cagents-ui", "--features", "browser-protocol-fixture"],
 }
+APPLICATION_LANES = {"app", "browser"}
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -207,7 +212,8 @@ def tick_locked(repository, directory, github_repository):
                 (directory / "logs").mkdir(exist_ok=True)
                 statuses = {}
                 for lane, selection in LANES.items():
-                    if lane == "app" and not (checkout / "crates/cagents-ui/Cargo.toml").exists():
+                    if (lane in APPLICATION_LANES
+                            and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
                         continue
                     command = [str(checkout / "scripts/cargo-gate"), "check", "--locked",
                                "--no-default-features", "--all-targets", *selection]

@@ -81,8 +81,8 @@ usage = "{{vars.all_targets}}"
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.ui}} "$@"'
 
 [tasks."check:browser"]
-description = "Type-check the integrated-browser UI client"
-usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--bin=cagents-ui" help="Cargo arguments, after --; they replace the default --bin=cagents-ui"'
+description = "Type-check the integrated-browser UI lane"
+usage = "{{vars.all_targets}}"
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.browser}} "$@"'
 
 [tasks."check:editor"]

@@ -212,12 +212,13 @@ class Behavior(unittest.TestCase):
         self.assertIn("--", result.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_browser_and_editor_default_to_their_one_binary(self):
+    def test_browser_checks_all_targets_and_editor_its_one_binary(self):
+        # Tests gated on the browserless lane must still compile without it.
         self.assertEqual(self.mise_run("check:browser").returncode, 0)
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
             ["cargo-gate", "check", "--locked", "--package", "cagents-ui", "--features", "integrated-browser",
-             "--bin=cagents-ui"],
+             "--all-targets"],
             ["cargo-gate", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 

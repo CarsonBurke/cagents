@@ -39,8 +39,9 @@ class SentinelTests(unittest.TestCase):
         gate.write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
 from pathlib import Path
-lane = (sys.argv[sys.argv.index('--features') + 1] if '--features' in sys.argv
-        else 'app' if '-p' in sys.argv else 'cli')
+selection = sys.argv[sys.argv.index('--all-targets') + 1:]
+lane = next(name for name, value in json.loads(os.environ['SENTINEL_LANES']).items()
+            if value == selection)
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with open(os.environ['SENTINEL_CALLS'], 'a') as out:
     out.write(json.dumps([sha, lane, sys.argv[1:], os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
@@ -72,7 +73,8 @@ if sys.argv[1:3] == ['issue', 'create']:
 ''')
         gh.chmod(0o755)
         self.environment = patch.dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
-                                      SENTINEL_CALLS=str(self.calls))
+                                      SENTINEL_CALLS=str(self.calls),
+                                      SENTINEL_LANES=json.dumps(sentinel.LANES))
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.now = 2000
@@ -109,7 +111,7 @@ if sys.argv[1:3] == ['issue', 'create']:
             self.assertEqual(entry[2][:4], ['check', '--locked', '--no-default-features', '--all-targets'])
             self.assertEqual(entry[3], 'fw16')
 
-    def test_commit_before_the_application_package_skips_only_its_lane(self):
+    def test_commit_before_the_application_package_skips_only_its_lanes(self):
         self.tick()
         self.command("git", "-C", str(self.origin), "rm", "-q", "crates/cagents-ui/Cargo.toml")
         earlier = self.commit("before the application package")

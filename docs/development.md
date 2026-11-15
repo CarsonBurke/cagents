@@ -42,8 +42,8 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `doctor` | Report each missing prerequisite with its fix, and whether the build host answers |
 | `dev` | Run the browserless [development UI](#development-runner) |
 | `dev:browser` | Run the development UI with the embedded browser |
-| `check:cli`, `check:host`, `check:ui` | Type-check one [lane](#feature-boundaries), all targets by default |
-| `check:browser`, `check:editor` | Type-check the integrated-browser UI client or ceditor |
+| `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check one [lane](#feature-boundaries), all targets by default |
+| `check:editor` | Type-check ceditor |
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
@@ -155,8 +155,11 @@ mise run check:browser
 mise run check:editor
 ```
 
-Without arguments, `check:cli`, `check:host` and `check:ui` check all targets,
-tests included, and `check` runs all three: what a change needs before review.
+Without arguments, `check:cli`, `check:host`, `check:ui` and `check:browser`
+check all targets, tests included, and `check` runs the first three: what a
+change needs before review. The integrated-browser lane compiles the
+application's tests too, so a test that uses a browserless-only fixture must be
+gated like that fixture.
 Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
@@ -686,9 +689,11 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
 at most once every two minutes and checks every new first-parent commit in
-order. Its first run checks the current tip. Each commit gets four separate
+order. Its first run checks the current tip. Each commit gets five separate
 `scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
-CLI, `--features host`, `--features ui`, and `-p cagents-ui`. These use the ordinary shared queue
+CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
+`-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
+graph with its Wayland registry test server. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 
