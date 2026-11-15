@@ -411,40 +411,59 @@ impl Runtime {
         // A step that worked with another agent says what it did in the
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
-        let (verb, label) = match coordinated {
-            Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
+        let (verb, label, path) = match coordinated {
+            Some(coordinated) => {
+                let (verb, label) = coordinated.line(&|id| self.listed_agent_name(id));
+                (verb, label, false)
+            }
             None => {
-                let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
-                (verb.to_owned(), label.into_owned())
+                let title = cached.title_of(item);
+                let (verb, label) = turn::step_title(&item.content, title);
+                // A file is named the way the agent working in this
+                // directory names it, by the part that tells it apart.
+                let path = turn::names_path(&item.content, title);
+                let label = if path {
+                    turn::shown_path(&label, &self.session.launch.recipe.working_directory)
+                        .to_owned()
+                } else {
+                    label.into_owned()
+                };
+                (verb.to_owned(), label, path)
             }
         };
         let glyph = coordinated
             .and_then(Coordinated::glyph)
             .unwrap_or_else(|| kind_glyph(&item.content));
-        let mut label = if verb.is_empty() {
-            label
-        } else {
-            format!("{verb} {label}")
-        };
+        let mut said = label;
         if let ItemContent::Command {
             exit_code: Some(code),
             ..
         } = item.content
             && code != 0
         {
-            label.push_str(&format!(" · exit {code}"));
+            said.push_str(&format!(" · exit {code}"));
         } else if let Some(word) = item.content.status().and_then(unsettled_word)
             && item.content.status() != Some(ToolStatus::Running)
         {
-            label.push_str(&format!(" · {word}"));
+            said.push_str(&format!(" · {word}"));
         }
+        let label = if verb.is_empty() {
+            said.clone()
+        } else {
+            format!("{verb} {said}")
+        };
         let elapsed = disclosure::item_duration(item, self.source_now_ms());
         let mut name = label.clone();
         if let Some(description) = turn::command_description(&item.content) {
             name.push_str(&format!(" · {description}"));
         }
+        let headline = if path {
+            disclosure::Headline::Path { verb, path: said }
+        } else {
+            disclosure::Headline::Text(turn::headline(label))
+        };
         disclosure::row(
-            turn::headline(label),
+            headline,
             name,
             glyph,
             self.step_status(item),

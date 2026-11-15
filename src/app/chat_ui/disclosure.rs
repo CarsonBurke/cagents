@@ -44,10 +44,53 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     }
 }
 
+/// What a row says. A path is told apart from its neighbours by its last
+/// components, so a row that names one keeps those in view and lets the
+/// start of the path give way instead, behind a verb that always shows.
+pub(super) enum Headline {
+    Text(String),
+    Path { verb: String, path: String },
+}
+
+impl From<String> for Headline {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl Headline {
+    fn view(self) -> Element<'static, Message> {
+        let line = |text: String| {
+            crate::ui_controls::fade_text(text)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+        };
+        match self {
+            // The fade is in the glyphs themselves, so it is right on the
+            // row's resting, hovered, pressed and focused paint alike.
+            Self::Text(text) => line(text).width(Length::Fill).into(),
+            Self::Path { verb, path } if verb.is_empty() => line(path)
+                .edge(crate::ui_controls::FadeEdge::Start)
+                .width(Length::Fill)
+                .into(),
+            // The space leads the path, so it is drawn while the path fits
+            // and fades with it once the path no longer does.
+            Self::Path { verb, path } => widget::row::with_children(vec![
+                line(verb).into(),
+                line(format!(" {path}"))
+                    .edge(crate::ui_controls::FadeEdge::Start)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .width(Length::Fill)
+            .into(),
+        }
+    }
+}
+
 /// One disclosure row. Its accessible name carries the trailing metadata,
 /// which is drawn in a cell of its own.
 pub(super) fn row(
-    label: String,
+    label: impl Into<Headline>,
     name: String,
     icon: Icon,
     status: Option<chat::ToolStatus>,
@@ -66,7 +109,7 @@ pub(super) fn row(
 /// Delivered reports retain their canonical full heading even when the title
 /// and outcome are drawn in separate cells.
 pub(super) fn row_named(
-    label: String,
+    label: impl Into<Headline>,
     name: String,
     icon: Icon,
     status: Option<chat::ToolStatus>,
@@ -74,12 +117,7 @@ pub(super) fn row_named(
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
-    // The fade is in the glyphs themselves, so it is right on the row's
-    // resting, hovered, pressed and focused paint alike.
-    let text = crate::ui_controls::fade_text(label)
-        .class(cosmic::theme::Text::Custom(design::muted_text))
-        .width(Length::Fill)
-        .into();
+    let text = label.into().view();
     let indicator = match status {
         Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -188,7 +226,7 @@ mod tests {
         let mut times = Vec::new();
         for expanded in [None, Some(false), Some(true)] {
             let mut element = row(
-                "Thinking".into(),
+                "Thinking".to_owned(),
                 "Reasoning".into(),
                 Icon::Agent,
                 None,

@@ -612,6 +612,37 @@ pub(super) fn step_title<'a>(
     }
 }
 
+/// Whether a step's label is the path of the one file it acted on, which a
+/// row shows by its last components; see [`super::disclosure::Headline`].
+pub(super) fn names_path(content: &ItemContent, title: Option<&Title>) -> bool {
+    match content {
+        ItemContent::Changes { changes, .. } => changes.len() == 1,
+        // A built-in read carries its file as both its label and command; a
+        // shell read or a stored "Read <file>" label is a command, not a path.
+        ItemContent::Command {
+            action: chat::CommandAction::Read,
+            label,
+            command,
+            ..
+        } => !label.is_empty() && label == command,
+        ItemContent::Tool { .. } => title.is_some_and(|title| title.path),
+        _ => false,
+    }
+}
+
+/// A path as a step row shows it: relative to the conversation's working
+/// directory when it is inside it, as the agent itself would name it.
+pub(super) fn shown_path<'a>(path: &'a str, working_directory: &std::path::Path) -> &'a str {
+    working_directory
+        .to_str()
+        .map(|root| root.trim_end_matches('/'))
+        .filter(|root| !root.is_empty())
+        .and_then(|root| path.strip_prefix(root))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(path)
+}
+
 /// The verb a step is introduced with, kept separate from its target so the two
 /// can be typeset differently.
 pub(super) fn step_verb(content: &ItemContent) -> &'static str {
@@ -1777,6 +1808,72 @@ mod tests {
         assert_eq!(
             format!("{} {}", step_verb(&edits), step_label(&edits)),
             "Edited 2 files"
+        );
+    }
+
+    #[test]
+    fn a_step_on_one_file_names_it_from_the_working_directory() {
+        let edits = |paths: &[&str]| ItemContent::Changes {
+            changes: paths
+                .iter()
+                .map(|path| FileChange {
+                    path: (*path).into(),
+                    kind: ChangeKind::Updated,
+                    diff: String::new(),
+                })
+                .collect(),
+            status: ToolStatus::Succeeded,
+        };
+        let read = |label: &str, command: &str| ItemContent::Command {
+            label: label.into(),
+            command: command.into(),
+            working_directory: "/work".into(),
+            action: CommandAction::Read,
+            status: ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        };
+        assert!(names_path(&edits(&["/work/src/a.rs"]), None));
+        assert!(!names_path(&edits(&["a.rs", "b.rs"]), None));
+        assert!(!names_path(&edits(&[]), None));
+        assert!(names_path(&read("/work/a.rs", "/work/a.rs"), None));
+        assert!(!names_path(&read("Read a.rs", "cat a.rs"), None));
+        let tool = ItemContent::Tool {
+            name: "Write".into(),
+            input: String::new(),
+            output: String::new(),
+            status: ToolStatus::Succeeded,
+        };
+        let written = Title::of(
+            "Write",
+            r#"{"file_path":"/work/a.rs"}"#,
+            ToolStatus::Succeeded,
+        );
+        assert!(names_path(&tool, Some(&written)));
+        let searched = Title::of("Grep", r#"{"pattern":"a.rs"}"#, ToolStatus::Succeeded);
+        assert!(!names_path(&tool, Some(&searched)));
+
+        let root = std::path::Path::new("/home/user/project");
+        assert_eq!(shown_path("/home/user/project/src/a.rs", root), "src/a.rs");
+        assert_eq!(
+            shown_path(
+                "/home/user/project/src/a.rs",
+                std::path::Path::new("/home/user/project/")
+            ),
+            "src/a.rs"
+        );
+        // A sibling that shares the directory's name as a prefix is outside it.
+        assert_eq!(
+            shown_path("/home/user/project-two/a.rs", root),
+            "/home/user/project-two/a.rs"
+        );
+        assert_eq!(shown_path("/home/user/project", root), "/home/user/project");
+        assert_eq!(shown_path("/etc/hosts", root), "/etc/hosts");
+        assert_eq!(shown_path("src/a.rs", root), "src/a.rs");
+        assert_eq!(
+            shown_path("/etc/hosts", std::path::Path::new("/")),
+            "/etc/hosts"
         );
     }
 }

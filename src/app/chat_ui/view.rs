@@ -5608,7 +5608,7 @@ impl Runtime {
                 widget::column::with_children(vec![
                     text,
                     disclosure::row(
-                        if expanded { "Show less" } else { "Show more" }.into(),
+                        if expanded { "Show less" } else { "Show more" }.to_owned(),
                         if expanded { "Show less" } else { "Show more" }.into(),
                         Icon::Chat,
                         None,
