@@ -24,7 +24,7 @@ mod save_local;
 use save_local::{SaveLocalPlacement, SaveTargetAuthority};
 
 #[derive(Debug, Clone)]
-pub(crate) struct FilesystemRecoveryPlacement(Placement);
+pub struct FilesystemRecoveryPlacement(Placement);
 #[derive(Debug, Clone)]
 enum Placement {
     Outside(Arc<RecoveryPlacement>, Option<Arc<SaveTargetAuthority>>),
@@ -37,7 +37,7 @@ impl FilesystemRecoveryPlacement {
             Placement::SaveLocal(p) => Some(p.target()),
         }
     }
-    pub(crate) fn directory(&self) -> &Root {
+    pub fn directory(&self) -> &Root {
         match &self.0 {
             Placement::Outside(p, _) => p.directory(),
             Placement::SaveLocal(p) => p.directory(),
@@ -49,7 +49,7 @@ impl FilesystemRecoveryPlacement {
             Placement::SaveLocal(p) => p.namespace(),
         }
     }
-    pub(crate) fn validate(&self) -> io::Result<()> {
+    pub fn validate(&self) -> io::Result<()> {
         match &self.0 {
             Placement::Outside(p, target) => {
                 if let Some(target) = target {
@@ -98,9 +98,9 @@ impl BootstrapPlacement {
 }
 
 #[derive(Debug)]
-pub(crate) struct RecoveryAcquireError {
-    pub(crate) message: String,
-    pub(crate) authority: Option<RecoveryAuthority>,
+pub struct RecoveryAcquireError {
+    pub message: String,
+    pub authority: Option<RecoveryAuthority>,
 }
 impl From<io::Error> for RecoveryAcquireError {
     fn from(error: io::Error) -> Self {
@@ -151,7 +151,7 @@ struct BootstrapCleanup {
     slot: Option<RecoverySlot>,
 }
 
-pub(crate) struct FilesystemRecoveryReservation {
+pub struct FilesystemRecoveryReservation {
     context: FilesystemRecoveryContext,
     slot: RecoverySlot,
 }
@@ -162,7 +162,7 @@ impl FilesystemRecoveryReservation {
 }
 
 #[derive(Clone)]
-pub(crate) struct FilesystemRecoveryContext {
+pub struct FilesystemRecoveryContext {
     placement: FilesystemRecoveryPlacement,
     context: RecoveryContext,
     bootstrap: Option<Arc<Mutex<BootstrapCleanup>>>,
@@ -258,7 +258,7 @@ impl FilesystemRecoveryContext {
 
     /// Bind custody to the actual retained edited parent, while original
     /// checkout identity/path and both cleanup leases remain authoritative.
-    pub(crate) fn acquire_for_save(
+    pub fn acquire_for_save(
         source: &Root,
         relative: &std::path::Path,
         known: &[PathBuf],
@@ -302,8 +302,33 @@ impl FilesystemRecoveryContext {
                     bootstrap: None,
                 })
             }
-            Err(_) => {
-                let sticky = StickyParent::acquire(target.parent().clone())?;
+            Err(ref _local_error) => {
+                #[cfg(test)]
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "retained-save diagnostic: stage=save-local-placement; kind={:?}; \
+                         raw_errno={:?}; error={}",
+                        _local_error.kind(),
+                        _local_error.raw_os_error(),
+                        _local_error
+                    );
+                }
+                let sticky = StickyParent::acquire(target.parent().clone());
+                #[cfg(test)]
+                if let Err(error) = &sticky {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "retained-save diagnostic: stage=save-local-sticky-fallback; kind={:?}; \
+                         raw_errno={:?}; error={}",
+                        error.kind(),
+                        error.raw_os_error(),
+                        error
+                    );
+                }
+                let sticky = sticky?;
                 Self::bootstrap(
                     target.source().clone(),
                     Arc::from([]),
@@ -443,12 +468,12 @@ impl FilesystemRecoveryContext {
     /// Resolve the owned sibling only after all leaf payloads have resolved.
     /// A reserved retry owns both original guards and the exact creation
     /// receipt; Drop never mutates names and never recursively removes data.
-    pub(crate) fn finish(&self, leaf: Option<RecoveryAuthority>) -> Option<RecoveryAuthority> {
+    pub fn finish(&self, leaf: Option<RecoveryAuthority>) -> Option<RecoveryAuthority> {
         self.bootstrap
             .as_ref()
             .and_then(|cleanup| Self::finish_bootstrap(cleanup, leaf))
     }
-    pub(crate) fn take_directory_warnings(&self) -> Vec<String> {
+    pub fn take_directory_warnings(&self) -> Vec<String> {
         let Some(cleanup) = &self.bootstrap else {
             return Vec::new();
         };
@@ -531,7 +556,7 @@ impl FilesystemRecoveryContext {
         })
     }
 
-    pub(crate) fn validate_save_parent(
+    pub fn validate_save_parent(
         &self,
         parent: &Root,
         relative: &std::path::Path,
@@ -552,16 +577,16 @@ impl FilesystemRecoveryContext {
         Ok(())
     }
 
-    pub(crate) fn validate_for_source(&self, source: &Root) -> io::Result<()> {
+    pub fn validate_for_source(&self, source: &Root) -> io::Result<()> {
         self.placement.validate_for_source(source)
     }
-    pub(crate) fn placement(&self) -> &FilesystemRecoveryPlacement {
+    pub fn placement(&self) -> &FilesystemRecoveryPlacement {
         &self.placement
     }
-    pub(crate) fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
+    pub fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
         self.placement.validate_payload_root(payload)
     }
-    pub(crate) fn reserve_directory(&self) -> Result<FilesystemRecoveryReservation, String> {
+    pub fn reserve_directory(&self) -> Result<FilesystemRecoveryReservation, String> {
         let slot = self.reserve()?;
         Ok(FilesystemRecoveryReservation {
             context: self.clone(),
@@ -576,15 +601,16 @@ impl FilesystemRecoveryContext {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) mod fixtures {
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[doc(hidden)]
+pub mod fixtures {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    pub(crate) fn fixture_context(source: &Root) -> io::Result<FilesystemRecoveryContext> {
+    pub fn fixture_context(source: &Root) -> io::Result<FilesystemRecoveryContext> {
         fixture_context_with_guard(source, ())
     }
-    pub(crate) fn fixture_context_with_guard(
+    pub fn fixture_context_with_guard(
         source: &Root,
         guard: impl Send + Sync + 'static,
     ) -> io::Result<FilesystemRecoveryContext> {

@@ -1,4 +1,4 @@
-//! Resident actors and in-flight starts share one bounded admission budget.
+//! Resident actors, in-flight starts and retained startup custody share one budget.
 use super::*;
 
 pub(in crate::host) fn usage(state: &HostState) -> usize {
@@ -7,6 +7,20 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .chat_spawning
             .keys()
             .filter(|id| !state.chats.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .count()
+}
+
+fn pending(state: &HostState) -> usize {
+    state.chat_spawning.len()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chat_spawning.contains_key(id))
             .count()
 }
 
@@ -18,7 +32,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
             format!(
                 "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
                 state.chats.len(),
-                state.chat_spawning.len(),
+                pending(state),
                 state.native_chat_capacity,
                 used,
             ),
@@ -52,6 +66,21 @@ impl Reservation {
             host: host.clone(),
             source: source.clone(),
         })
+    }
+
+    /// Explicit pane Close may publish its removal while teardown runs.
+    /// Other users of the teardown fence, such as recovery and conversion,
+    /// retain their ordinary transition fence against pane removal.
+    pub(super) fn removing(
+        host: &SharedHost,
+        state: &mut HostState,
+        source: &Session,
+    ) -> Result<Self, ProtocolError> {
+        let reservation = Self::closing(host, state, source)?;
+        state
+            .chat_close_reservations
+            .insert(source.id, source.clone());
+        Ok(reservation)
     }
 
     pub(super) fn holds(&self, state: &HostState, id: TerminalId) -> bool {
@@ -171,6 +200,13 @@ impl Reservation {
         {
             return Err(error("Native chat admission reservation changed"));
         }
+        // Installation may retarget an admission. It is no longer evidence
+        // that only the original source's explicit Close is in flight.
+        if let Some(admission) = admission.as_ref()
+            && state.chat_close_reservations.get(&admission.source.id) == Some(&admission.source)
+        {
+            state.chat_close_reservations.remove(&admission.source.id);
+        }
         state.chat_spawning.insert(source.id, source.clone());
         if let Some(admission) = admission {
             admission.source = source.clone();
@@ -187,9 +223,13 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_close_reservations.get(&self.source.id) == Some(&self.source) {
+            state.chat_close_reservations.remove(&self.source.id);
+        }
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
+            crate::daemon::wake();
         }
     }
 }
@@ -225,6 +265,97 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             native_continuity: Default::default(),
+        }
+    }
+
+    #[test]
+    fn shared_chat_removal_allows_exact_cleanup_but_fences_identical_startup() {
+        use crate::{
+            host::{model::Registry, workspace},
+            model::{CardId, CardKind},
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        for purpose in ["startup", "transition", "close"] {
+            let cleanup = purpose == "close";
+            let directory = tempfile::tempdir().unwrap();
+            let host = host();
+            host.lock()
+                .unwrap()
+                .install_model(Registry::at(&directory.path().join("workspace.sqlite")).unwrap());
+            workspace::edit(
+                &host,
+                0,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "Fixture".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+            let mut source = session();
+            source.proof = Some(host.lock().unwrap().proof().clone());
+            source.launch.recipe.working_directory = directory.path().into();
+            let scope = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            let pane = Pane {
+                id: CardId::new(),
+                title: "Original chat".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                scope: None,
+                kind: CardKind::Chat(source.clone()),
+            };
+            let model = workspace::edit(
+                &host,
+                0,
+                ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                },
+            )
+            .unwrap();
+            let operation = uuid::Uuid::new_v4();
+            let removal = ModelEdit::ChangeView {
+                scope,
+                expected_revision: model.views[0].revision,
+                operation,
+                change: Change::RemoveSource {
+                    registry: model.identity,
+                    repository: directory.path().into(),
+                    before: pane.clone(),
+                    terminal: None,
+                    capture: None,
+                },
+            };
+            let reservation = if cleanup {
+                Reservation::removing(&host, &mut host.lock().unwrap(), &source).unwrap()
+            } else if purpose == "transition" {
+                Reservation::closing(&host, &mut host.lock().unwrap(), &source).unwrap()
+            } else {
+                Reservation::new(&host, &source).unwrap().unwrap()
+            };
+            let result = workspace::edit(&host, 0, removal);
+            assert_eq!(result.is_ok(), cleanup, "cleanup={cleanup}: {result:?}");
+            let writer = workspace::writer(&host).unwrap();
+            assert_eq!(
+                writer
+                    .lock()
+                    .unwrap()
+                    .view_operation_seen(operation)
+                    .unwrap(),
+                cleanup
+            );
+            let current = workspace::snapshot(&host, None).unwrap();
+            assert_eq!(current.views[0].panes.contains(&pane), !cleanup);
+            drop(reservation);
+            assert!(host.lock().unwrap().chat_close_reservations.is_empty());
         }
     }
 
@@ -374,8 +505,14 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        // The reader publishes its read-only reason and its exit as separate
+        // events of one frame, and a snapshot can fall between them. Release
+        // inspection requires both, so wait for the last.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.snapshot(None).unwrap().read_only_reason.is_none() {
+        while !handle
+            .snapshot(None)
+            .is_some_and(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
+        {
             assert!(
                 Instant::now() < deadline,
                 "history initialization did not complete"
@@ -507,14 +644,28 @@ mod tests {
     #[test]
     fn recovery_reservation_counts_existing_resident_once_above_lowered_limit() {
         let host = host();
-        let (_directory, source, _) = closed_history(&host);
+        let (directory, source, _) = closed_history(&host);
         let mut admission = Reservation::new(&host, &source).unwrap();
         assert!(admission.is_some());
         {
             let mut state = host.lock().unwrap();
             state.native_chat_capacity = 1;
             Reservation::install(&mut admission, &host, &mut state, &source).unwrap();
+            // Even an unclaimed context is custody until its exact owner
+            // reconciles it; a cached NoProvider outcome is not a release.
+            let context =
+                Arc::new(chat::protocol::ExecutionContext::capture(directory.path()).unwrap());
+            state.native_actor_startups.insert(
+                source.id,
+                retained_actor::Startup {
+                    source: source.clone(),
+                    requested: source.clone(),
+                    context,
+                    failed_close: None,
+                },
+            );
             assert_eq!(usage(&state), 1);
+            assert_eq!(status_from_state(&state).spawning, 1);
             assert!(require_available(&state).is_err());
         }
         drop(admission);
@@ -733,10 +884,20 @@ mod tests {
         let (directory, mut source, _) = closed_history(host);
         std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
         let program = directory.path().join("completed-provider");
-        // A real pipe transport consumes initialization and exits normally.
+        // A real pipe transport acknowledges initialization and exits normally.
         // Its transcript comes from the real Claude history adapter, not a
         // hand-built Store or a history reader relabeled as a writer.
-        std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+read -r initialization
+id=${initialization#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+exit 0
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         source.launch.recipe.program = program.to_string_lossy().into_owned();
         // Enter through the real daemon start path: ordinary UI writers also
@@ -1048,13 +1209,8 @@ mod tests {
         let (_directory, source, handle) = history_reader(&host, false);
         let proof = inspect(&host, source.id).unwrap().proof;
         let verified_registry = host.lock().unwrap().execution_registry.take().unwrap();
-        let blocked = inspect(&host, source.id).unwrap();
-        assert!(
-            blocked
-                .release_blocked
-                .unwrap()
-                .contains("registry is unavailable")
-        );
+        let blocked = inspect(&host, source.id).unwrap().release_blocked.unwrap();
+        assert!(blocked.contains("registry is unavailable"), "{blocked}");
         assert!(release(&host, &proof, false).is_err());
         assert!(
             !handle.is_completed(),
@@ -1155,7 +1311,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = client.snapshot();
-            if (!read_only || snapshot.read_only_reason.is_some())
+            // A reader's single initial frame applies its history, read-only
+            // reason and exit one event at a time, so a view can attach between
+            // them. Release requires the settled reader, so wait for its exit.
+            if (!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
                 && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
             {
                 return;
@@ -1586,7 +1745,7 @@ pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCap
 pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
     crate::terminal_ipc::ChatCapacity {
         resident: state.chats.len() as u32,
-        spawning: state.chat_spawning.len() as u32,
+        spawning: pending(state) as u32,
         limit: state.native_chat_capacity as u32,
         used: usage(&state) as u32,
         residents: state
