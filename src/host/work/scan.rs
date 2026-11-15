@@ -80,6 +80,9 @@ pub(super) struct Local {
     pub ancestry: BTreeMap<(String, String), bool>,
     pub plan: Option<Arc<git_watch::Project>>,
     pub plan_error: Option<String>,
+    /// Checkouts a failed plan read was asked to re-read. A retry re-reads
+    /// them again while reusing every other retained census.
+    plan_retry: BTreeSet<WorktreeId>,
     divergence: HashMap<(String, String), Divergence>,
 }
 
@@ -393,6 +396,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 .any(|worktree| roots.get(&worktree.id).copied() != Some(&worktree.root))
     });
     let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
+    let mut plan_retry = BTreeSet::new();
     let (plan, plan_error) =
         if membership_changed || change.membership || change.topology || retry_plan {
             let listed = records
@@ -400,20 +404,30 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 .filter(|record| roots.contains_key(&record.id))
                 .cloned()
                 .collect::<Vec<_>>();
+            // A failed read may have been the only one told which checkouts
+            // changed. Carry those IDs until a read succeeds, so a retry
+            // refreshes them without discarding every other census.
+            let changed = previous
+                .map(|previous| &previous.plan_retry)
+                .into_iter()
+                .flatten()
+                .chain(&change.worktrees)
+                .copied()
+                .collect::<BTreeSet<_>>();
             match git_watch::Project::read_changed(
                 id,
                 repository.to_path_buf(),
                 &listed,
                 cancellation,
-                // A failed membership read may have lost its changed checkout IDs.
-                // Rebuild all current censuses once instead of clearing the error
-                // by reusing the stale plan on an unrelated later event.
-                previous_plan.as_deref().filter(|_| !retry_plan),
-                &change.worktrees,
+                previous_plan.as_deref(),
+                &changed,
             ) {
                 Ok(plan) => (Some(Arc::new(plan)), None),
                 // Without a plan the project is polled; its cards still stand.
-                Err(error) => (previous_plan, Some(error)),
+                Err(error) => {
+                    plan_retry = changed;
+                    (previous_plan, Some(error))
+                }
             }
         } else {
             (
@@ -432,6 +446,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         ancestry,
         plan,
         plan_error,
+        plan_retry,
         divergence,
     })
 }
@@ -903,6 +918,7 @@ mod tests {
                 .any(|worktree| worktree.root == added)
         );
     }
+
     #[test]
     fn polling_retries_failed_plan_when_checkout_membership_is_unchanged() {
         let fixture = fixture();
@@ -976,5 +992,39 @@ mod tests {
             Arc::ptr_eq(plan, unchanged.plan.as_ref().unwrap()),
             "successful recovery restores ordinary reuse"
         );
+    }
+
+    #[test]
+    fn persistent_plan_failure_retries_only_the_checkouts_it_could_not_read() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let linked = first
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fixture.linked)
+            .unwrap()
+            .id;
+        let marker = fixture.linked.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let only_linked = git_watch::Change {
+            membership: true,
+            worktrees: BTreeSet::from([linked]),
+            ..Default::default()
+        };
+        let failed = run(&fixture, Some(&first), &only_linked);
+        assert!(failed.plan_error.is_some());
+        assert_eq!(failed.plan_retry, BTreeSet::from([linked]));
+
+        // While the checkout stays unreadable, unrelated scans retry it alone
+        // rather than rebuilding every retained census each time.
+        let still = run(&fixture, Some(&failed), &git_watch::Change::default());
+        assert!(still.plan_error.is_some());
+        assert_eq!(still.plan_retry, BTreeSet::from([linked]));
+
+        std::fs::write(&marker, original).unwrap();
+        let recovered = run(&fixture, Some(&still), &git_watch::Change::default());
+        assert!(recovered.plan_error.is_none());
+        assert!(recovered.plan_retry.is_empty());
     }
 }
