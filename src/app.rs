@@ -8943,13 +8943,12 @@ impl Cagents {
             {
                 return Cow::Borrowed(chrome.title.as_str());
             }
-            let basename = directory.file_name().unwrap_or_default().to_string_lossy();
             let title = if TerminalTitleSource::fallback(title) {
                 let process = Path::new(&session.launch.program)
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy();
-                Cow::Owned(format!("{process} · {basename}"))
+                Cow::Owned(crate::names::process_title(&process, directory))
             } else {
                 Cow::Borrowed(title)
             };
@@ -8997,6 +8996,43 @@ impl Cagents {
                     .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty()),
             )
         })
+    }
+
+    /// `title`, as a row that names the pane's checkout `place` beside it
+    /// shows it. A shell that sets no title worth showing is titled
+    /// "command · directory"; while the shell is in that checkout the place
+    /// already says where it is, so the row keeps the command. A shell
+    /// elsewhere, a channel's place, and a title the user gave keep it whole.
+    pub(super) fn titled_beside_place<'a>(
+        &self,
+        card: &CardState,
+        title: &'a str,
+        place: Option<&Path>,
+    ) -> &'a str {
+        let CardKind::Terminal(session) = &card.kind else {
+            return title;
+        };
+        if self.chrome_ui.user_titles.contains_key(&card.id) {
+            return title;
+        }
+        let directory = self
+            .terminal_working_directories
+            .get(&card.id)
+            .unwrap_or(&session.launch.working_directory);
+        if !place.is_some_and(|place| directory.starts_with(place)) {
+            return title;
+        }
+        crate::names::process_title_command(title, directory).unwrap_or(title)
+    }
+
+    /// The title of a pane's sidebar row, which names the checkout the
+    /// workspace files the pane under.
+    pub(super) fn pane_row_title<'a>(&'a self, card: &'a CardState) -> &'a str {
+        self.titled_beside_place(
+            card,
+            self.card_display_title(card),
+            self.card_worktree(card),
+        )
     }
 
     /// The title a chat card shows from `channel`, the first titled channel
@@ -31949,19 +31985,7 @@ mod tests {
     /// nothing in the sidebar led to it.
     #[test]
     fn hidden_checkouts_list_a_plain_terminal_under_its_launch_checkout() {
-        let (mut app, card, channel) = attention_channel_test_app();
-        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
-        Arc::make_mut(&mut app.durable).active_channel = None;
-        app.sidebar_state
-            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
-        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
-            sidebar::SidebarFilter::All,
-        ))));
-        // New terminal opens in the selected checkout, through the update
-        // path that refreshes the sidebar.
-        app.active_workspace = Some(PathBuf::from("/repo/feature"));
-        drop(app.update(Message::NewTerminal));
-        let terminal = app.workspace.focused().unwrap();
+        let (app, card, project, worktree, terminal) = hidden_checkouts_plain_terminal();
         assert_ne!(terminal, card);
         assert!(
             matches!(
@@ -31976,15 +32000,76 @@ mod tests {
             "a plain terminal records no scope"
         );
         assert!(attention_lists(&app, sidebar::SelectionRow::Card(terminal)));
-        let row = app
-            .sidebar_model
-            .projects
-            .iter()
-            .find(|entry| entry.id == project)
-            .and_then(|entry| entry.panes.iter().find(|row| row.id == terminal))
-            .expect("the terminal has a row in its project");
+        let row = pane_row(&app, project, terminal).expect("the terminal has a row in its project");
         assert_eq!(row.worktree, Some(worktree));
         assert!(row.terminal);
+    }
+
+    /// With checkouts hidden, an open New terminal in /repo/feature: the
+    /// app, the pre-existing pane, its project and checkout, and the
+    /// terminal.
+    fn hidden_checkouts_plain_terminal()
+    -> (Cagents, CardId, ProjectId, crate::model::WorktreeId, CardId) {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let (project, worktree) = add_attention_worktree(&mut app, card, channel);
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Hidden);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::All,
+        ))));
+        // New terminal opens in the selected checkout, through the update
+        // path that refreshes the sidebar.
+        app.active_workspace = Some(PathBuf::from("/repo/feature"));
+        drop(app.update(Message::NewTerminal));
+        let terminal = app.workspace.focused().unwrap();
+        (app, card, project, worktree, terminal)
+    }
+
+    fn pane_row(app: &Cagents, project: ProjectId, card: CardId) -> Option<&sidebar::SidebarCard> {
+        app.sidebar_model
+            .projects
+            .iter()
+            .find(|entry| entry.id == project)?
+            .panes
+            .iter()
+            .find(|row| row.id == card)
+    }
+
+    /// A shell's host title, "command · directory", names its directory,
+    /// which the row's place already does by its checkout: the row keeps the
+    /// command, and reads "fish · feature" rather than "fish · feature ·
+    /// feature". Any other title, and one the user gave, shows whole.
+    #[test]
+    fn a_pane_row_titles_a_shell_by_its_command_beside_its_place() {
+        let (mut app, _, project, _, terminal) = hidden_checkouts_plain_terminal();
+        let retitle = |app: &mut Cagents, title: &str| {
+            assert!(app.apply_reported_title(terminal, title.into()));
+            app.refresh_attention_card_rows();
+            pane_row(app, project, terminal).unwrap().title.clone()
+        };
+        assert_eq!(retitle(&mut app, "fish · feature"), "fish");
+        // The shell moved: the directory it reports comes from where it is.
+        app.terminal_working_directories
+            .insert(terminal, PathBuf::from("/repo/feature/src"));
+        assert_eq!(retitle(&mut app, "cargo · src"), "cargo");
+        assert_eq!(retitle(&mut app, "cargo · feature"), "cargo · feature");
+        assert_eq!(retitle(&mut app, "main.rs - VIM"), "main.rs - VIM");
+        // The tab keeps the whole title; it names no place.
+        assert_eq!(
+            app.card_display_title(app.card_state(terminal).unwrap()),
+            "main.rs - VIM"
+        );
+        assert!(app.apply_reported_title(terminal, "fish · src".into()));
+        app.chrome_ui
+            .user_titles
+            .insert(terminal, "fish · src".into());
+        app.refresh_attention_card_rows();
+        assert_eq!(
+            pane_row(&app, project, terminal).unwrap().title,
+            "fish · src",
+            "a title the user gave is theirs"
+        );
     }
 
     /// Renaming a pane renames its row in the Attention list at once.

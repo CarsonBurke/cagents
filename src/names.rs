@@ -18,6 +18,17 @@ pub fn process_title(process: &str, directory: &std::path::Path) -> String {
     format!("{process}{PROCESS_TITLE_SEPARATOR}{name}")
 }
 
+/// The command of a [`process_title`] for `directory`, for a row whose
+/// place already says where the shell is; `None` for any other title.
+#[cfg(feature = "ui")]
+pub fn process_title_command<'a>(title: &'a str, directory: &std::path::Path) -> Option<&'a str> {
+    let name = directory.file_name()?.to_str()?;
+    title
+        .strip_suffix(name)?
+        .strip_suffix(PROCESS_TITLE_SEPARATOR)
+        .filter(|command| !command.is_empty())
+}
+
 pub fn normalize_card_name(name: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut kept = 0usize;
