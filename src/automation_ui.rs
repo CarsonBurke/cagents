@@ -3300,13 +3300,7 @@ fn breadcrumb<'a>(
     name: Option<usize>,
     busy: bool,
 ) -> Element<'a, Action> {
-    let label = |text: &'a str| {
-        crate::design::body(text)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
-    };
+    let label = |text: &'a str| crate::ui_controls::fade_text(text);
     let mut trail = widget::row::with_capacity(5)
         .spacing(space::XXS)
         .align_y(Alignment::Center);

@@ -320,7 +320,7 @@ impl Runtime {
             text,
             name,
             kind,
-            turn.glyph(),
+            self.strip_status(turn),
             elapsed,
             Some(open),
             Some(Action::ToggleTurn(target, key.to_owned())),
@@ -447,11 +447,27 @@ impl Runtime {
             turn::headline(label),
             name,
             glyph,
-            item.content.status(),
+            self.step_status(item),
             elapsed,
             Some(open),
             Some(Action::Toggle(target, item.id.clone())),
         )
+    }
+
+    /// What a step's row draws for its status. A step inside a strip leaves
+    /// the activity indicator to the strip above it; in a subagent's own
+    /// transcript, where steps stand alone, only the newest row carries it.
+    /// A running step that does not keeps its kind glyph, while its verb and
+    /// counting time still say it is running.
+    pub(super) fn step_status(&self, item: &chat::Item) -> Option<ToolStatus> {
+        let newest = self.selected_subagent.is_some()
+            && self
+                .step_items()
+                .last()
+                .is_some_and(|last| last.id == item.id);
+        item.content
+            .status()
+            .filter(|status| *status != ToolStatus::Running || newest)
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it

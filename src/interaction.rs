@@ -397,17 +397,6 @@ pub fn horizontal_wheel_around_vertical<'a, Message: 'a>(
     })
 }
 
-/// Lets the enclosing native scrollable own wheel gestures over a read-only
-/// editor while preserving the editor's selection and keyboard handling.
-pub fn parent_wheel<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    Element::new(WheelInput {
-        content: content.into(),
-        route: WheelRoute::Parent,
-    })
-}
-
 /// Fade the leading/trailing edges of a horizontal strip when it can scroll.
 ///
 /// Tab rows hide their scrollbar; the fade is the usual hint that more tabs
@@ -445,22 +434,6 @@ pub fn overflow_fade_y<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-    })
-}
-
-/// Fade into the actual surface behind a strip, including an enclosing
-/// control's hover/focus paint. The surface is resolved at draw time.
-pub fn overflow_fade_x_on<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-    surface: impl Fn(&Theme) -> Color + 'a,
-) -> Element<'a, Message> {
-    Element::new(OverflowFade {
-        content: content.into(),
-        axis: Axis::Horizontal,
-        fill: Box::new(move |theme| Color {
-            a: 1.0,
-            ..surface(theme)
-        }),
     })
 }
 
@@ -666,9 +639,15 @@ pub fn focus_scope<'a, Message: 'a>(
     .into()
 }
 
-/// Counts the focusable controls in a subtree and finds the focused one.
-/// Selectable text registers as focusable without an id; it is for the
-/// pointer to copy from, not a stop on the way between a dialog's choices.
+/// Whether Tab within a scope stops on a control. Selectable text registers
+/// as focusable without an id; it is for the pointer to copy from, not a stop
+/// on the way between a dialog's choices. A disabled button is no stop either,
+/// unless it holds focus, so Tab moves on from it.
+fn is_scope_stop(id: Option<&Id>, state: &dyn operation::Focusable) -> bool {
+    id.is_some() && (state.is_focus_stop() || state.is_focused())
+}
+
+/// Counts the stops in a subtree and finds the focused one.
 #[derive(Default)]
 struct ScopeFocus {
     count: usize,
@@ -685,7 +664,7 @@ impl Operation for ScopeFocus {
         _bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if id.is_none() {
+        if !is_scope_stop(id, state) {
             return;
         }
         if state.is_focused() {
@@ -695,7 +674,7 @@ impl Operation for ScopeFocus {
     }
 }
 
-/// Focuses the subtree's `target`th focusable control and no other.
+/// Focuses the subtree's `target`th stop and no other control.
 struct FocusNth {
     target: usize,
     index: usize,
@@ -711,12 +690,13 @@ impl Operation for FocusNth {
         _bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if id.is_some() && self.index == self.target {
+        let stop = is_scope_stop(id, state);
+        if stop && self.index == self.target {
             state.focus();
         } else {
             state.unfocus();
         }
-        self.index += usize::from(id.is_some());
+        self.index += usize::from(stop);
     }
 }
 
@@ -1128,8 +1108,6 @@ enum WheelRoute {
     /// that moves vertically, even one already at its end; any other wheel
     /// moves the content sideways.
     AroundVertical,
-    /// The wheel skips the content for the enclosing scrollable.
-    Parent,
 }
 
 /// The wheel gesture in progress, and whether it keeps its vertical motion.
@@ -1319,11 +1297,6 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if self.route == WheelRoute::Parent
-            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
-        {
-            return;
-        }
         let gesture = tree.state.downcast_mut::<WheelGesture>();
         gesture.observe(event);
         let remapped;

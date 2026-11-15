@@ -116,6 +116,8 @@ pub(super) const NOTICE_CHARS: usize = 480;
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
 const FOOTER_LABEL: usize = 32;
+/// The most of a channel's name the footer shows after its `# `.
+const CHANNEL_LABEL: usize = 26;
 /// The same, in a pane too narrow for the conversation's place.
 const NARROW_FOOTER_LABEL: usize = 20;
 /// The same where the model is named only on hover, for the text drawn in
@@ -826,19 +828,23 @@ pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
 }
 
 /// The row that closes a working transcript: a small muted spinner, or the
-/// waiting glyph, beside what the agent is doing.
+/// waiting glyph, beside what the agent is doing. Without a glyph its place
+/// stays empty, so the words keep their position.
 fn activity_row<'a>(
-    glyph: Icon,
+    glyph: Option<Icon>,
     label: String,
     failure: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let glyph = if glyph == Icon::AgentWorking {
-        crate::ui_controls::activity_spinner(
+    let glyph = match glyph {
+        Some(Icon::AgentWorking) => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::muted_icon_color,
-        )
-    } else {
-        crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+        ),
+        Some(glyph) => crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE),
+        None => widget::Space::new()
+            .width(design::COMPACT_ICON_SIZE)
+            .height(design::COMPACT_ICON_SIZE)
+            .into(),
     };
     let caption = |label: String| -> Element<'a, Message> {
         design::caption(label.replace(['\n', '\r'], " "))
@@ -889,13 +895,8 @@ fn menu_row<'a>(
             .into(),
     );
     cells.push(
-        design::caption(description)
-            .class(cosmic::theme::Text::Custom(design::muted_text))
+        crate::ui_controls::FadeText::caption(description)
             .width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
             .into(),
     );
     cells.extend(kind.map(|kind| {
@@ -1322,6 +1323,14 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
             .iter()
             .position(|item| item.id == id)
             .is_some_and(|index| index + 1 < items.len())
+}
+
+/// Whether `item` shows, with a spinner of its own, work still under way: a
+/// running step or card, or a thought still streaming while its agent works.
+/// Callers pass the newest item, the only one whose thought can be live.
+fn row_live(item: &chat::Item, working: bool) -> bool {
+    item.content.status() == Some(chat::ToolStatus::Running)
+        || working && matches!(item.content, ItemContent::Text { thinking: true, .. })
 }
 
 /// The thought's own timestamps describe its work. Older providers without an
@@ -1762,6 +1771,89 @@ impl Runtime {
         }
     }
 
+    /// Whether the newest row of the shown transcript shows, with a spinner
+    /// of its own, the work under way: a thought still streaming, or a step
+    /// or card still running. The transcript shows one activity indicator,
+    /// and it belongs there; otherwise the closing line carries it.
+    fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
+        match selected {
+            Some(agent) => agent
+                .items
+                .last()
+                .is_some_and(|item| row_live(item, agent.status == chat::ToolStatus::Running)),
+            None => {
+                let snapshot = &self.snapshot;
+                snapshot.busy
+                    && !snapshot.has_later
+                    && !self.sending()
+                    && snapshot
+                        .items
+                        .last()
+                        .is_some_and(|item| row_live(item, true))
+            }
+        }
+    }
+
+    /// What a step strip draws for its status. While the lead works, a
+    /// running strip carries the activity indicator only when it holds the
+    /// newest row; otherwise a newer row or the closing line does. When the
+    /// lead is idle, only the group with the newest running step, such as a
+    /// background command, carries it. A strip that does not keeps its kind
+    /// glyph, and its caption and counting time still say it is working.
+    pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<chat::ToolStatus> {
+        let status = turn.glyph();
+        if status != Some(chat::ToolStatus::Running) {
+            return status;
+        }
+        let snapshot = &self.snapshot;
+        let carries = if snapshot.busy && !snapshot.has_later {
+            self.work_shown(None)
+                && turn
+                    .steps
+                    .last()
+                    .is_some_and(|step| step.index + 1 == snapshot.items.len())
+        } else {
+            turn.newest_running
+        };
+        carries.then_some(chat::ToolStatus::Running)
+    }
+
+    /// The glyph and words of the line that closes a working transcript.
+    /// Where the newest row already shows the work with a spinner, the line
+    /// drops the words that repeat that row and its spinner. What it says
+    /// beyond them, such as subagents working, a provider failure or the
+    /// provider's own detail, stays; with nothing left, its place stays empty.
+    fn closing_line(
+        &self,
+        glyph: Icon,
+        label: String,
+        failure: bool,
+        selected: Option<&chat::Subagent>,
+    ) -> (Option<Icon>, String) {
+        if glyph != Icon::AgentWorking || !self.work_shown(selected) {
+            return (Some(glyph), label);
+        }
+        let plain = match selected {
+            Some(agent) => items_activity(&agent.items),
+            None => activity_label(&self.snapshot),
+        };
+        let rest = if label == plain {
+            ""
+        } else {
+            label
+                .strip_prefix(plain)
+                .and_then(|rest| rest.strip_prefix(" · "))
+                .unwrap_or(&label)
+        };
+        // A blank caption keeps the row's height.
+        let rest = if rest.is_empty() && !failure {
+            " "
+        } else {
+            rest
+        };
+        (None, rest.to_owned())
+    }
+
     /// Whether a message is on its way to the provider. Other commands -
     /// choosing a model or permissions, paging history, answering, stopping -
     /// leave what the conversation is doing as it was until it says otherwise.
@@ -2189,11 +2281,17 @@ impl Runtime {
             self.item_expanded(&item.id),
             self.child_find_revision(),
             dark,
+            cached.shows_figures().then(|| self.figures.version()),
         )
             .hash(&mut revision);
         if item.content.is_step() {
             disclosure::item_duration_ms(item, now)
                 .map(|millis| millis / 1_000)
+                .hash(&mut revision);
+            agent
+                .items
+                .last()
+                .is_some_and(|last| last.id == item.id)
                 .hash(&mut revision);
         }
         if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
@@ -2554,6 +2652,7 @@ impl Runtime {
             } else {
                 label
             };
+            let (glyph, label) = self.closing_line(glyph, label, failure.is_some(), selected);
             transcript.push(activity_row(glyph, label, failure));
         }
         // A chat's heading is the conversation's own name or nothing at all.
@@ -3400,8 +3499,8 @@ impl Runtime {
             if let Some(channel) = &place.channel {
                 status.push(
                     crate::interaction::tooltip_above(
-                        design::caption(format!("# {}", Self::short_description(channel, 24)))
-                            .wrapping(iced::widget::text::Wrapping::None),
+                        crate::ui_controls::FadeText::caption(format!("# {channel}"))
+                            .limit(CHANNEL_LABEL),
                         format!("Channel: {channel}"),
                     )
                     .into(),
@@ -3409,8 +3508,8 @@ impl Runtime {
             }
             if !place.name.is_empty() {
                 status.push(bounded(
-                    design::caption(Self::short_description(&place.name, FOOTER_LABEL))
-                        .wrapping(iced::widget::text::Wrapping::None)
+                    crate::ui_controls::FadeText::caption(place.name.clone())
+                        .limit(FOOTER_LABEL)
                         .into(),
                     &place.name,
                     "Project",
@@ -3421,9 +3520,8 @@ impl Runtime {
                 status.push(bounded(
                     widget::row::with_children(vec![
                         crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                        design::caption(Self::short_description(branch, FOOTER_LABEL))
-                            .class(cosmic::theme::Text::Custom(design::muted_text))
-                            .wrapping(iced::widget::text::Wrapping::None)
+                        crate::ui_controls::FadeText::caption(branch.clone())
+                            .limit(FOOTER_LABEL)
                             .into(),
                     ])
                     .spacing(step::GAP_XS)
@@ -4076,7 +4174,9 @@ impl Runtime {
             };
             if transitioning {
                 controls.push(bounded(
-                    design::caption(Self::short_description(&label, fit.label_limit())).into(),
+                    crate::ui_controls::FadeText::caption(label.clone())
+                        .limit(fit.label_limit())
+                        .into(),
                     &label,
                     "Model",
                     fit.label_limit(),
@@ -4166,31 +4266,25 @@ impl Runtime {
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor =
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            // Cut rather than wrapped where a narrow footer
-                            // leaves the leading group little room.
-                            design::caption(selected.map_or("Permissions", |index| {
+                let anchor = widget::button::custom(
+                    // Faded rather than wrapped where a narrow footer leaves
+                    // the leading group little room; the chevron that says
+                    // this is a picker keeps its place either way.
+                    crate::ui_controls::trailing(
+                        crate::ui_controls::FadeText::caption(
+                            selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
-                            }))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .into(),
-                            widget::icon(Icon::PanDown.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .name("Choose permission mode")
-                    .id(card_control_id(target.card, "chat-permission-picker"))
-                    .class(crate::ui_controls::control_style(open, None))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                            }),
+                        ),
+                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        step::GAP_XS,
+                    ),
+                )
+                .name("Choose permission mode")
+                .id(card_control_id(target.card, "chat-permission-picker"))
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
                 context.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -4218,12 +4312,7 @@ impl Runtime {
         // and to assistive technology, so the controls beside it keep room.
         let named = fit == FooterFit::Wide;
         let label = || -> Element<'a, Message> {
-            design::caption(accounts.current.clone())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into()
+            crate::ui_controls::FadeText::caption(accounts.current.clone()).into()
         };
         let icon = Icon::Avatar.handle();
         if transitioning || !self.choosing() {
@@ -4312,14 +4401,8 @@ impl Runtime {
                                     .into(),
                             ),
                         }
-                        let mut text: Vec<Element<'a, Message>> = vec![
-                            design::body(choice.label.clone())
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .ellipsize(iced::widget::text::Ellipsize::End(
-                                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                ))
-                                .into(),
-                        ];
+                        let mut text: Vec<Element<'a, Message>> =
+                            vec![crate::ui_controls::fade_text(choice.label.clone()).into()];
                         if !choice.detail.is_empty() {
                             text.push(
                                 design::caption(choice.detail)
@@ -4425,7 +4508,6 @@ impl Runtime {
         } else {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
-        let label = Self::short_description(&label, limit);
         let anchor = widget::button::custom(
             widget::row::with_children(
                 std::iter::once(
@@ -4436,8 +4518,8 @@ impl Runtime {
                     .into(),
                 )
                 .chain(named.then(|| {
-                    design::caption(label)
-                        .wrapping(iced::widget::text::Wrapping::None)
+                    crate::ui_controls::FadeText::caption(label)
+                        .limit(limit)
                         .into()
                 }))
                 .chain(std::iter::once(
@@ -4610,6 +4692,7 @@ impl Runtime {
         // The preview is a picture of the chat, so it carries no failure
         // control to press.
         if let Some((glyph, label)) = self.timeline_activity(false, None) {
+            let (glyph, label) = self.closing_line(glyph, label, false, None);
             transcript.push(activity_row(glyph, label, None));
         }
         Some(virtualized::column(transcript.children, Default::default()))
@@ -4681,7 +4764,7 @@ impl Runtime {
         (
             &turn.key,
             &turn.summary,
-            turn.glyph().map(|status| status as u8),
+            self.strip_status(turn).map(|status| status as u8),
         )
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
@@ -4772,6 +4855,15 @@ impl Runtime {
                     )
                 })
                 .hash(&mut hasher);
+            // What a Markdown image draws lives with the conversation, so a
+            // preview that finished decoding redraws the exchange showing it.
+            if self
+                .cache
+                .get(&item.id)
+                .is_some_and(CachedItem::shows_figures)
+            {
+                self.figures.version().hash(&mut hasher);
+            }
             // A coordinating step names agents by what this conversation
             // calls them, links their transcripts while it lists them, tells
             // how those it left in the background are doing, and
@@ -5515,7 +5607,7 @@ impl Runtime {
             if long {
                 widget::column::with_children(vec![
                     text,
-                    disclosure::row_on(
+                    disclosure::row(
                         if expanded { "Show less" } else { "Show more" }.into(),
                         if expanded { "Show less" } else { "Show more" }.into(),
                         Icon::Chat,
@@ -5523,7 +5615,6 @@ impl Runtime {
                         None,
                         Some(expanded),
                         Some(Action::Toggle(self.target, item.id.clone())),
-                        design::accent_wash,
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -5797,7 +5888,7 @@ impl Runtime {
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
             let expanded = has_text && self.item_expanded(&item.id);
-            let elapsed = reasoning_elapsed(item, items, finished, finished_at);
+            let mut elapsed = reasoning_elapsed(item, items, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
                 if finished {
@@ -5807,16 +5898,17 @@ impl Runtime {
                 }
                 .clone()
             } else if finished {
-                if elapsed.is_some() {
-                    "Thought for".to_owned()
-                } else {
-                    "Thought process".to_owned()
+                // With no text to name it, the duration completes the
+                // sentence rather than standing apart from it.
+                match elapsed.take() {
+                    Some(elapsed) => format!("Thought for {elapsed}"),
+                    None => "Thought process".to_owned(),
                 }
             } else {
                 "Thinking".to_owned()
             };
             let name = format!("Reasoning: {label}");
-            let header = disclosure::row_on(
+            let header = disclosure::row(
                 label,
                 name,
                 Icon::Agent,
@@ -5824,13 +5916,6 @@ impl Runtime {
                 elapsed,
                 has_text.then_some(expanded),
                 has_text.then(|| Action::Toggle(target, item.id.clone())),
-                move |theme| {
-                    if expanded {
-                        design::sunken(theme)
-                    } else {
-                        theme.current_container().base.into()
-                    }
-                },
             );
             let mut rows = vec![header];
             if expanded {
@@ -6567,6 +6652,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod figure_tests;
 
 #[cfg(test)]
 mod provider_context_tests;
@@ -7838,7 +7926,7 @@ mod tests {
         let mut renderer = crate::app::tests::headless_renderer();
         let mut ui = UserInterface::build(
             activity_row(
-                Icon::Warning,
+                Some(Icon::Warning),
                 String::new(),
                 runtime.agent_failure_control(),
             ),
@@ -7905,7 +7993,7 @@ mod tests {
         use iced::advanced::{layout, widget::Tree};
         let renderer = crate::app::tests::headless_renderer();
         let mut row = activity_row(
-            Icon::AgentWorking,
+            Some(Icon::AgentWorking),
             "7 agents working\n1 waiting on background work · ".repeat(20),
             None,
         );
@@ -7920,6 +8008,182 @@ mod tests {
             node.size().height < 30.0,
             "status wrapped: {:?}",
             node.size()
+        );
+    }
+
+    #[test]
+    fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
+        use iced::advanced::{layout, widget::Tree};
+        let item = |id: &str, role, content| chat::Item {
+            id: id.into(),
+            role,
+            content,
+            started_at: Some(1_000),
+            at: Some(2_000),
+        };
+        let command = |id: &str, status| {
+            item(
+                id,
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: "cargo test".into(),
+                    working_directory: "/project".into(),
+                    action: chat::CommandAction::Run,
+                    status,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: String::new(),
+                },
+            )
+        };
+        let thought = item(
+            "thought",
+            chat::Role::Assistant,
+            ItemContent::Text {
+                text: String::new(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        );
+        let prompt = item(
+            "prompt",
+            chat::Role::User,
+            ItemContent::Text {
+                text: "Run the tests".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        );
+        let regroup = |runtime: &mut Runtime| {
+            runtime.turns = turn::group(
+                &runtime.snapshot.items,
+                &runtime.asked_after,
+                crate::app::chat_ui::Presentations(&runtime.cache),
+            );
+        };
+        let running = command("c1", chat::ToolStatus::Running);
+        let (mut runtime, _handle) =
+            frame_cost::live_runtime(&[prompt.clone(), running.clone(), thought.clone()]);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        regroup(&mut runtime);
+        let closing = |runtime: &Runtime| {
+            let (glyph, label) = runtime
+                .timeline_activity(false, None)
+                .expect("the lead is working");
+            runtime.closing_line(glyph, label, false, None)
+        };
+        let blank = (None, " ".to_owned());
+        let turn = runtime.turns.last().unwrap();
+        // A command still running while the agent thinks: the thought is the
+        // newest work, so the strip keeps its glyph and the closing line
+        // keeps its place empty.
+        assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running));
+        assert!(turn.summary.ends_with(" · working"));
+        assert_eq!(runtime.strip_status(turn), None);
+        assert!(runtime.work_shown(None));
+        assert_eq!(closing(&runtime), blank);
+        assert_eq!(
+            runtime.step_status(&runtime.snapshot.items[1]),
+            None,
+            "a step inside a strip leaves the indicator to the strip"
+        );
+
+        // A closing line that says more than the row keeps its words.
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
+        assert_eq!(closing(&runtime), (None, "1 agent working".to_owned()));
+        Arc::make_mut(&mut runtime.snapshot).subagents.clear();
+
+        // The command left running in the background while the agent goes
+        // on to newer steps: one group per stretch of tools, and only the
+        // newest work carries the indicator, whichever group holds it.
+        let next = command("c2", chat::ToolStatus::Running);
+        Arc::make_mut(&mut runtime.snapshot)
+            .items
+            .push(Arc::new(next.clone()));
+        regroup(&mut runtime);
+        assert_eq!(runtime.turns.len(), 2);
+        let (older, newer) = (&runtime.turns[0], &runtime.turns[1]);
+        assert_eq!(older.glyph(), Some(chat::ToolStatus::Running));
+        assert_eq!(runtime.strip_status(older), None);
+        assert_eq!(runtime.strip_status(newer), Some(chat::ToolStatus::Running));
+        assert_eq!(closing(&runtime), blank);
+
+        // Between steps nothing in the transcript is live, so the closing
+        // line says what the agent is doing, and no strip spins beside it.
+        Arc::make_mut(&mut runtime.snapshot).items[3] =
+            Arc::new(command("c2", chat::ToolStatus::Succeeded));
+        regroup(&mut runtime);
+        assert!(!runtime.work_shown(None));
+        assert!(
+            runtime
+                .turns
+                .iter()
+                .all(|turn| runtime.strip_status(turn) != Some(chat::ToolStatus::Running))
+        );
+        assert_eq!(
+            closing(&runtime),
+            (Some(Icon::AgentWorking), "Working".to_owned())
+        );
+
+        // Once the lead is idle, the background command's group is the work
+        // still under way.
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        assert_eq!(
+            runtime.strip_status(&runtime.turns[0]),
+            Some(chat::ToolStatus::Running)
+        );
+        assert_eq!(
+            runtime.strip_status(&runtime.turns[1]),
+            Some(chat::ToolStatus::Succeeded)
+        );
+
+        // In a subagent's own transcript steps stand alone, and only the
+        // newest one carries the indicator.
+        let mut agent = chat::Subagent {
+            id: "child".into(),
+            items: vec![Arc::new(running.clone())],
+            ..native_child_fixture()
+        };
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(agent.clone());
+        runtime.selected_subagent = Some("child".into());
+        assert_eq!(
+            runtime.step_status(&running),
+            Some(chat::ToolStatus::Running)
+        );
+        assert!(runtime.work_shown(Some(&agent)));
+        agent.items.push(Arc::new(thought.clone()));
+        Arc::make_mut(&mut runtime.snapshot).subagents[0] = agent.clone();
+        assert_eq!(runtime.step_status(&running), None);
+        assert!(runtime.work_shown(Some(&agent)));
+        assert_eq!(
+            runtime.closing_line(Icon::AgentWorking, "Thinking".into(), false, Some(&agent)),
+            blank
+        );
+
+        // The empty closing line is the activity row's height.
+        let renderer = crate::app::tests::headless_renderer();
+        let height = |mut element: Element<'_, Message>| {
+            let mut tree = Tree::new(element.as_widget());
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0)),
+                )
+                .size()
+                .height
+        };
+        assert_eq!(
+            height(activity_row(None, " ".into(), None)),
+            height(activity_row(
+                Some(Icon::AgentWorking),
+                "Thinking".into(),
+                None
+            ))
         );
     }
 
@@ -14178,7 +14442,7 @@ mod tests {
                     .filter_map(|node| node.node().label())
                     .collect::<Vec<_>>();
                 let expected = if body.is_empty() {
-                    "Thought for"
+                    "Thought for 12s"
                 } else {
                     "Reasoning: Earlier thought · 12s"
                 };
@@ -14282,20 +14546,19 @@ mod tests {
                         buttons.is_empty(),
                         "empty/redacted reasoning has nothing to expand"
                     );
+                    let labels = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter_map(|node| node.node().label())
+                        .collect::<Vec<_>>();
                     assert!(
-                        accessible
-                            .root()
-                            .iter()
-                            .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("Thought for"))
+                        labels.contains(&"Thought for 12s"),
+                        "empty/redacted finished reasoning reads as one phrase: {labels:?}"
                     );
                     assert!(
-                        accessible
-                            .root()
-                            .iter()
-                            .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("12s")),
-                        "empty/redacted finished reasoning retains its right-aligned duration"
+                        !labels.contains(&"12s"),
+                        "its duration is not repeated apart from it: {labels:?}"
                     );
                 }
             }

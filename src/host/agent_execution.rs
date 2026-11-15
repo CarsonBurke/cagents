@@ -1072,6 +1072,12 @@ fn dispatch(
             }
         }
         announce(host, &registry);
+        // Startup may capture its reply before identity publication finishes.
+        // Reconcile once more after binding, even if that confirmation's edge
+        // was already consumed while the launch was private.
+        if handle.actor_identity().is_some() {
+            super::chat::retained_actor::wake(host, session.id);
+        }
         (session, handle)
     };
     // A visible, bound startup may be closed or interrupted while a provider
@@ -1747,8 +1753,8 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
-/// Preserve typed mailbox backpressure at the service boundary. Existing
-/// operations retain their original validation and String-returning API.
+/// Preserve typed mailbox capacity and store contention at the service boundary.
+/// Other operations retain their original validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
     authority: Authority,
@@ -1763,6 +1769,16 @@ pub(super) fn process_request(
         }
         crate::agent_execution::Operation::Deliver(outgoing) => {
             mailbox::hand(host, &authority, outgoing).map(crate::agent_execution::Reply::Handed)
+        }
+        crate::agent_execution::Operation::Inbox(query) => {
+            mailbox::inbox(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::PeekInbox(query) => {
+            mailbox::peek(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::AcknowledgeInbox(receipt) => {
+            mailbox::acknowledge(host, &authority, receipt)
+                .map(|()| crate::agent_execution::Reply::InboxAcknowledged)
         }
         other => process(host, authority, other).map_err(Into::into),
     }
@@ -1827,11 +1843,15 @@ pub(super) fn process(
         Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
             .map(Reply::Sent)
             .map_err(|error| error.to_string()),
-        Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
-        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
-        Operation::AcknowledgeInbox(receipt) => {
-            mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
-        }
+        Operation::Inbox(query) => mailbox::inbox(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::AcknowledgeInbox(receipt) => mailbox::acknowledge(host, &authority, receipt)
+            .map(|()| Reply::InboxAcknowledged)
+            .map_err(|error| error.to_string()),
         Operation::Transcript(query) => {
             transcript::read(host, &authority, query).map(Reply::Transcript)
         }
