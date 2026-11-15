@@ -30,7 +30,7 @@ impl Proxy {
         let updates = Arc::new(server.notifier());
         let socket = server.socket.clone();
         let (control, startup) = UnixStream::pair().unwrap();
-        let helper = thread::spawn(move || server.serve(control));
+        let helper = thread::spawn(move || server.serve(control, None));
         let attached = receive::<Result<Attached, String>>(&startup, TIMEOUT)
             .unwrap()
             .unwrap();

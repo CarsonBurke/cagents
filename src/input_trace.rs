@@ -76,7 +76,7 @@ struct Sample {
 
 impl InputTrace {
     /// Records one event the window delivered.
-    pub(crate) fn record(&self, event: &Event) {
+    pub fn record(&self, event: &Event) {
         let mut sample = self.0.get();
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {

@@ -8,6 +8,10 @@ synthetic account. It advertises asynchronous message support, holds its first
 turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
+The permission picker can read `get_settings` both idle and during a turn:
+the fixture returns an empty effective settings object and no rule sources,
+matching its default permission setup. Reading settings keeps the turn active;
+this does not simulate editing permission rules or inherited configuration.
 
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
@@ -230,12 +234,27 @@ default list, and from the provider's next start each turn's `init` names the
 full ID the chosen model resolves to, as Claude Code's does: `opus` runs
 `claude-opus-5-5`. The model chosen with `--model` or in the picker is the one
 resolved; without either, the conversation starts on the list's `default`
-entry, as Claude Code's does. To give the account check figures, write a
+entry, as Claude Code's does. With `fixture-unconfirmed-model` present, the
+initialize response and each turn's `init` omit the active model while keeping
+the catalog and normal turn activity. Remove it to report the resolved model
+on the next turn. To give the account check figures, write a
 `get_usage` control response's inner `response` to `fixture-usage.json`; the
 account check and each conversation read it whenever they ask. A live usage change is a
 `rate_limit_event` frame in `fixture-frames.jsonl`, such as
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
-reported.
+reported. The login the account check reads is `fixture@example.test` on a
+Pro plan; to report another, such as one in an organization, write it to
+`fixture-auth-status.json` as below, adding `orgName`.
+
+For multiple synthetic accounts, put an `auth status --json` response in each
+account's `fixture-auth-status.json`, such as
+`{"loggedIn":true,"email":"account-one@example.test","subscriptionType":"pro"}`.
+The fixture reads it from `CLAUDE_CONFIG_DIR`, or `HOME/.claude` when no config
+directory is selected. Give each account a distinct email so the app treats
+the homes as separate sign-ins, and put its usage response in that home's
+`fixture-usage.json`. Without an auth file, the fixture keeps its default
+`fixture@example.test` identity. Keep all these homes inside the isolated fixture;
+never write them into a real provider home.
 
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads
@@ -273,3 +292,13 @@ provider home; `CAGENTS_FIXTURE_IMAGE` overrides the path when the script runs
 directly. Each turn then also returns that image as a provider-produced base64
 image block, recorded in the synthetic history like other frames. Paste an image into the composer to
 cover a user-attached image in the same transcript. Use synthetic images only.
+
+For task-delivery checks, `tests/fixtures/delivery-notices-scene.sh wide` (or
+`narrow`, with a session started at 900 pixels wide) opens an invented Claude
+transcript containing successful and failed background commands, a Monitor
+event, a background agent report and a teammate message. Its shell commands
+contain `&&`, `>` and `<`; notification XML escapes them while peer message
+bodies retain their literal text. The fixture records the same user frames
+for history replay. Capture the closed rows, then expand command details and
+the report to check literal output and disclosure. The scene uses only the
+native-evidence fixture's provider home and never calls a live model.

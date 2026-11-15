@@ -1,16 +1,34 @@
 #!/usr/bin/python3
-"""Check every new first-parent main commit, serially, through the fw16 gate."""
+"""Check every new first-parent main commit, serially, through the fw16 gate,
+then build the newest one that passes for native evidence to start from."""
 import argparse
 import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import time
 
 TITLE = "Main Rust build sentinel: compilation failure"
-LANES = ("cli", "host", "ui")
+# Each lane's selection after `check --locked --no-default-features --all-targets`.
+# `app` is the application package, absent from commits before it was split out;
+# `browser` is that package's integrated-browser graph. Its protocol-fixture
+# feature adds only the Wayland registry test server, so one check covers every
+# integrated-browser target.
+LANES = {
+    "cli": [],
+    "host": ["--features", "host"],
+    "ui": ["--features", "ui"],
+    "app": ["-p", "cagents-ui"],
+    "browser": ["-p", "cagents-ui", "--features", "browser-protocol-fixture"],
+}
+APPLICATION_LANES = {"app", "browser"}
+# How many main commits keep their native-evidence executables, about 0.6 GiB each.
+BUILDS_KEPT = 6
+# native-evidence's task for these builds: its path must be short, for sockets.
+EVIDENCE_TASK = Path.home() / ".local/state/cev-main-sentinel"
 
 
 def run(*command, **kwargs):
@@ -51,7 +69,7 @@ def report(repository, directory, state):
     if not failed:
         if state.get("failing"):
             gh("issue", "comment", str(state["issue"]), "--body",
-               f"Recovered at `{pending['sha']}`: CLI, host and UI all-targets checks passed on fw16.")
+               f"Recovered at `{pending['sha']}`: all-targets checks passed on fw16 in every lane.")
         state["failing"] = False
         return
     if not state.get("issue"):
@@ -67,7 +85,8 @@ def report(repository, directory, state):
             f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
             f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
             "Checks use `scripts/cargo-gate check --locked --no-default-features --all-targets` "
-            "in separate CLI, host and UI lanes.\n\n")
+            "in separate CLI, host, shared UI (`--features ui`) and application "
+            "(`-p cagents-ui`) lanes.\n\n")
     for lane, status in pending["lanes"].items():
         body += f"- {lane}: exit {status}\n"
     for lane in failed:
@@ -85,6 +104,54 @@ def report(repository, directory, state):
         # Reopen is idempotent, including when the issue is already open.
         gh("issue", "reopen", str(state["issue"]))
     state["failing"] = True
+
+
+def keep_main_build(repository, directory, state):
+    """Builds the executables native evidence runs for the newest checked
+    commit, if it passed, into builds/SHA, as scripts/native-evidence would
+    build them for its "before" side, which takes them from there."""
+    sha = state.get("checked")
+    if not sha or state.get("last_good") != sha or state.get("built") == sha:
+        return
+    builds = directory / "builds"
+    builds.mkdir(exist_ok=True)
+    (builds / ".lock").touch()
+    checkout = repository / ".worktrees" / "main-build-sentinel"
+    tool = checkout / "scripts/native-evidence"
+    if not (builds / sha).is_dir() and tool.exists() and git(checkout, "rev-parse", "HEAD") == sha:
+        # The commit's own tool, which says what its builds compile; one
+        # older than that builds nothing here.
+        listed = subprocess.run([str(tool), "__build-arguments"], cwd=checkout, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if listed.returncode == 0 and listed.stdout.strip():
+            print(f"main-build-sentinel: {sha} native-evidence build", flush=True)
+            with (directory / "logs" / f"{sha}-evidence.log").open("w") as log:
+                built = subprocess.run([str(tool), "--task", str(EVIDENCE_TASK), "build", "before", str(checkout)],
+                                       cwd=checkout, stdout=log, stderr=subprocess.STDOUT).returncode
+            staging = builds / f".{sha}.new"
+            try:
+                if built == 0:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    staging.mkdir()
+                    for line in listed.stdout.splitlines():
+                        executable = line.rsplit(" ", 1)[-1]
+                        (EVIDENCE_TASK / "target-before/dev-runtime" / executable).replace(staging / executable)
+                    (staging / "arguments").write_text(listed.stdout)
+                    staging.replace(builds / sha)
+            except OSError as error:
+                # Evidence then builds this commit itself; the checks are unaffected.
+                print(f"main-build-sentinel: could not keep {sha}'s build: {error}", flush=True)
+                shutil.rmtree(staging, ignore_errors=True)
+    state["built"] = sha
+    save(directory / "state.json", state)
+    with (builds / ".lock").open("a") as lock:
+        # native-evidence holds this shared while it copies from a build.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        kept = sorted((entry for entry in builds.iterdir() if entry.is_dir() and not entry.name.startswith(".")),
+                      key=lambda entry: entry.stat().st_mtime, reverse=True)
+        # And what a run stopped before it was done left behind.
+        for old in [*kept[BUILDS_KEPT:], *builds.glob(".*.new")]:
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def tick(repository, directory, github_repository):
@@ -144,11 +211,12 @@ def tick_locked(repository, directory, github_repository):
                     git(repository, "worktree", "add", "--detach", str(checkout), sha)
                 (directory / "logs").mkdir(exist_ok=True)
                 statuses = {}
-                for lane in LANES:
+                for lane, selection in LANES.items():
+                    if (lane in APPLICATION_LANES
+                            and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
+                        continue
                     command = [str(checkout / "scripts/cargo-gate"), "check", "--locked",
-                               "--no-default-features", "--all-targets"]
-                    if lane != "cli":
-                        command += ["--features", lane]
+                               "--no-default-features", "--all-targets", *selection]
                     print(f"main-build-sentinel: {sha} {lane}", flush=True)
                     with (directory / "logs" / f"{sha}-{lane}.log").open("w") as log:
                         # No priority bypass, held lease, or local compilation override.
@@ -167,6 +235,7 @@ def tick_locked(repository, directory, github_repository):
                 state["last_good"] = pending["sha"]
             state["queue"].pop(0)
             save(path, state)
+        keep_main_build(repository, directory, state)
 
 
 def main():

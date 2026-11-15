@@ -66,13 +66,13 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
 
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 
-pub(crate) fn sign_in_verification_detail(message: &str) -> Option<&str> {
+pub fn sign_in_verification_detail(message: &str) -> Option<&str> {
     message
         .split_once(SIGN_IN_VERIFICATION_MARKER)
         .map(|(_, detail)| detail)
 }
 
-pub(crate) fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
+pub fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
     let original = failure
         .split_once(SIGN_IN_VERIFICATION_MARKER)
         .map_or(failure, |(original, _)| original);
@@ -200,7 +200,7 @@ pub struct Launch {
 impl Launch {
     /// Claude's exact saved transcript remains readable after its working
     /// directory is removed, without starting a provider in another directory.
-    pub(crate) fn needs_read_only_history(&self) -> bool {
+    pub fn needs_read_only_history(&self) -> bool {
         self.provider == Provider::Claude
             && self
                 .session_id
@@ -219,10 +219,7 @@ impl Launch {
     /// Resume with the last provider-confirmed Claude policy. A permission
     /// change is session state, so an original CLI bypass must not restore it
     /// when the user returns from native chat.
-    pub(crate) fn terminal_recipe_with_permission_mode(
-        &self,
-        mode: Option<&str>,
-    ) -> Option<LaunchRecipe> {
+    pub fn terminal_recipe_with_permission_mode(&self, mode: Option<&str>) -> Option<LaunchRecipe> {
         let mut recipe = self.terminal_recipe()?;
         if self.provider == Provider::Claude
             && let Some(mode) = mode
@@ -237,7 +234,7 @@ impl Launch {
     /// mode comes from the live session, which storage does not hold, so this
     /// cannot prove which mode was confirmed; it proves the recipe differs from
     /// the resume by nothing else.
-    pub(crate) fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
+    pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
         let mode = match recipe.arguments.as_slice() {
             [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
             _ => None,
@@ -281,7 +278,7 @@ impl Launch {
     }
 }
 
-pub(crate) fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
+pub fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
     if !matches!(
         mode,
         "default" | "manual" | "auto" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
@@ -565,15 +562,15 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 }
 
 /// Inline tool images are spooled to private files before entering a snapshot.
-pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
+pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
 /// Whether `path` names an inline image the host's transcript store decoded
 /// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
 /// Such a file lives only as long as that cache, so it is no path to hand to
 /// anyone else.
 #[cfg(any(feature = "ui", all(test, feature = "host")))]
-pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+pub fn is_cached_inline_image(path: &std::path::Path) -> bool {
     let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
         part.and_then(|part| part.to_str())
             .and_then(|part| part.strip_prefix(prefix))
@@ -1037,7 +1034,7 @@ impl Session {
 
     /// Runtime projections may learn provider identity/capability, but may
     /// never borrow it from another allocation, account or daemon epoch.
-    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+    pub fn learn_native_continuity_from(&mut self, observed: &Self) {
         if self.id == observed.id
             && self.proof == observed.proof
             && self.launch.provider == observed.launch.provider
@@ -1317,6 +1314,13 @@ pub struct Snapshot {
     pub capabilities: Capabilities,
     pub models: Vec<Model>,
     pub selected_model: Option<String>,
+    /// Provider-confirmed model status arrives independently of the frozen
+    /// snapshot wire layout, including when this chat is hidden.
+    #[serde(skip)]
+    pub active_model: Option<ActiveModel>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub active_model_revision: u64,
     pub reasoning: Option<String>,
     #[serde(default)]
     pub fast_mode: Option<FastMode>,
@@ -1553,12 +1557,35 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
         .collect()
 }
 
+/// What this conversation currently waits for in its direct delegated work.
+#[derive(Debug, Default)]
+pub struct SubagentActivity<'a> {
+    pub working: usize,
+    pub waiting: usize,
+    pub on_background_work: usize,
+    pub failed: Vec<&'a Subagent>,
+}
+
 impl Snapshot {
+    pub fn subagent_activity(&self) -> SubagentActivity<'_> {
+        let mut activity = SubagentActivity::default();
+        for agent in &self.subagents {
+            match agent.status {
+                ToolStatus::Running if agent.waiting => activity.waiting += 1,
+                ToolStatus::Running => activity.working += 1,
+                ToolStatus::Waiting => activity.on_background_work += 1,
+                ToolStatus::Failed => activity.failed.push(agent),
+                _ => {}
+            }
+        }
+        activity
+    }
+
     /// Drop renderable history while retaining provider continuity, controls,
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
     #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn evict_transcript(&mut self) {
+    pub fn evict_transcript(&mut self) {
         self.items = Vec::new();
         for child in &mut self.subagents {
             child.items = Vec::new();
@@ -1568,7 +1595,7 @@ impl Snapshot {
     /// Logical body bytes referenced by this owner, not unique heap bytes:
     /// immutable items can be Arc-shared with other snapshots and caches.
     #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn transcript_bytes(&self) -> usize {
+    pub fn transcript_bytes(&self) -> usize {
         self.items
             .iter()
             .chain(self.subagents.iter().flat_map(|child| &child.items))
@@ -1941,6 +1968,10 @@ pub enum ToolStatus {
     /// of life returns it to `Running`, and a Stop or the provider exiting
     /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
     Waiting,
+    /// An earlier or superseded run that has no current work to wait for.
+    /// Its transcript retains the outcome, when one was recorded. Unlike
+    /// `Stopped`, this does not claim someone cancelled the run.
+    Ended,
 }
 
 /// As derived, except that a client from before `Waiting` was added is sent
@@ -1955,6 +1986,11 @@ impl Serialize for ToolStatus {
             {
                 Self::Running
             }
+            Self::Ended
+                if crate::terminal_ipc::encoding_before(crate::terminal_ipc::ENDED_TOOL_STATUS) =>
+            {
+                Self::Stopped
+            }
             status => *status,
         };
         let name = match status {
@@ -1964,6 +2000,7 @@ impl Serialize for ToolStatus {
             Self::Denied => "Denied",
             Self::Stopped => "Stopped",
             Self::Waiting => "Waiting",
+            Self::Ended => "Ended",
         };
         serializer.serialize_unit_variant("ToolStatus", status as u32, name)
     }
@@ -2374,7 +2411,7 @@ impl Item {
     /// Bodies whose complete canonical bytes can be copied through the owned
     /// transcript source. Provider context uses the same field as ordinary
     /// prose; other deliveries retain their existing presentation copy rules.
-    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+    pub fn logical_copy_body(&self) -> Option<&str> {
         match &self.content {
             ItemContent::Text { text, .. } => Some(text),
             ItemContent::Delivery {
@@ -2426,6 +2463,17 @@ pub struct Request {
     /// Explicit provider decisions; no implicit approval or permissive default.
     pub actions: Vec<Choice>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveModel {
+    pub id: String,
+    pub label: String,
+    pub reasoning: Option<String>,
+    pub default_reasoning: Option<String>,
+    /// Provider-advertised aliases resolved to this concrete model ID.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -2447,6 +2495,44 @@ impl Model {
         })
     }
 
+    /// Name the model Claude's default menu choice resolves to while keeping
+    /// its alias and command ID recognizable in every catalog consumer.
+    pub fn resolve_claude_labels(models: &mut [Self], values: &[serde_json::Value]) {
+        for model in models.iter_mut().filter(|model| model.id == "default") {
+            let Some(resolved) = values.iter().find_map(|value| {
+                (value["value"].as_str() == Some(model.id.as_str()))
+                    .then(|| value["resolvedModel"].as_str())
+                    .flatten()
+            }) else {
+                continue;
+            };
+            let label = Self::claude_model_label(values, resolved);
+            model.label = format!("Default ({label})");
+        }
+    }
+
+    /// A concrete Claude model's canonical name, independent of whichever
+    /// menu alias selected it. Special aliases may resolve to another family.
+    pub fn claude_model_label(values: &[serde_json::Value], resolved: &str) -> String {
+        let family = resolved
+            .strip_prefix("claude-")
+            .and_then(|id| id.split('-').next());
+        values
+            .iter()
+            .find(|value| value["value"].as_str() == Some(resolved))
+            .or_else(|| {
+                family.and_then(|family| {
+                    values.iter().find(|value| {
+                        value["value"].as_str() == Some(family)
+                            && value["resolvedModel"].as_str() == Some(resolved)
+                    })
+                })
+            })
+            .and_then(|value| value["displayName"].as_str())
+            .unwrap_or(resolved)
+            .to_owned()
+    }
+
     /// One entry of the Codex app server's `model/list` page.
     ///
     /// An entry that does not describe its efforts, or does not name itself
@@ -2461,6 +2547,73 @@ impl Model {
                 effort["reasoningEffort"].as_str()
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use super::{ActiveModel, Model};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_active_model_json_defaults_to_no_reported_aliases() {
+        let model: ActiveModel = serde_json::from_value(json!({
+            "id":"claude-sonnet-5-5","label":"Sonnet 5.5",
+            "reasoning":"high","default_reasoning":null
+        }))
+        .unwrap();
+        assert!(model.aliases.is_empty());
+    }
+
+    #[test]
+    fn unresolved_custom_model_does_not_take_a_malformed_alias_label() {
+        let entries = json!([{"resolvedModel":"custom-model","displayName":"Unidentified alias"}]);
+        assert_eq!(
+            Model::claude_model_label(entries.as_array().unwrap(), "custom-model"),
+            "custom-model"
+        );
+    }
+
+    #[test]
+    fn default_alias_uses_a_resolved_peer_label_or_the_reported_id() {
+        for (entries, expected) in [
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},
+                    {"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5"}
+                ]),
+                "Default (Opus 5.5)",
+            ),
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-sonnet-5-5","displayName":"Default (recommended)"},
+                    {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+                    {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"}
+                ]),
+                "Default (Sonnet 5.5)",
+            ),
+            (
+                json!([
+                    {"value":"default","resolvedModel":"claude-unknown-6","displayName":"Default (recommended)"}
+                ]),
+                "Default (claude-unknown-6)",
+            ),
+            (
+                json!([
+                    {"value":"default","displayName":"Default (recommended)"}
+                ]),
+                "Default (recommended)",
+            ),
+        ] {
+            let entries = entries.as_array().unwrap();
+            let mut models = entries
+                .iter()
+                .filter_map(Model::from_claude)
+                .collect::<Vec<_>>();
+            Model::resolve_claude_labels(&mut models, entries);
+            assert_eq!(models[0].id, "default");
+            assert_eq!(models[0].label, expected);
+        }
     }
 }
 
@@ -2641,6 +2794,7 @@ pub enum Event {
         selected: Option<String>,
         reasoning: Option<String>,
     },
+    ActiveModel(Option<ActiveModel>),
     FastMode(FastMode),
     Commands(Vec<SlashCommand>),
     Skills(Vec<Skill>),
@@ -3729,7 +3883,7 @@ mod tests {
 
 /// Shared native launch policy for UI drafts and durable daemon executions.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn fresh_session(
+pub fn fresh_session(
     provider: Provider,
     id: crate::model::TerminalId,
     working_directory: std::path::PathBuf,
@@ -3796,7 +3950,7 @@ pub(crate) fn fresh_session(
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
+pub fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
     if crate::device::is_remote() {
         return None;
     }

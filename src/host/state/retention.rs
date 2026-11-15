@@ -140,6 +140,7 @@ impl HostState {
             // A failed startup still owns its original recovery slot. Keep the
             // record reachable until exact checked Close settles that custody.
             && !self.startup_custody.contains(&id)
+            && !self.publication_pending.contains_key(&id)
             && !self.terminal_retirements.contains_key(&id)
             && self.subscriptions.clients(id).is_empty()
             && !self.chats.contains_key(&id)

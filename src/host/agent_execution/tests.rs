@@ -18,10 +18,21 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
 pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
-    isolated_with_process_namespace(name, false)
+    isolated_child(name, false, false)
 }
 
 fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tempfile::TempDir> {
+    isolated_child(name, private_proc, false)
+}
+
+/// Also points the matched console CLI at `console/cagents` in the fixture
+/// root, which the test installs. Other fixtures keep the real lookup, which
+/// finds no CLI beside the test executable.
+fn isolated_with_console_cli(name: &str) -> Option<tempfile::TempDir> {
+    isolated_child(name, false, true)
+}
+
+fn isolated_child(name: &str, private_proc: bool, console_cli: bool) -> Option<tempfile::TempDir> {
     const OUTER_PID_NAMESPACE: &str = "CAGENTS_EXECUTION_OUTER_PID_NAMESPACE";
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
@@ -68,6 +79,7 @@ fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tem
         "tmp",
         "run",
         "project",
+        "console",
     ] {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
@@ -106,6 +118,9 @@ fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tem
             OUTER_PID_NAMESPACE,
             std::fs::read_link("/proc/self/ns/pid").unwrap(),
         );
+    }
+    if console_cli {
+        command.env("CAGENTS_TEST_CONSOLE_CLI", root.join("console/cagents"));
     }
     let result = command
         .args([
@@ -1800,13 +1815,6 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
             kind: crate::model::CardKind::Terminal(terminal),
             scope: None,
         };
-        store
-            .apply(&ModelEdit::SeedView {
-                scope: scope.clone(),
-                panes: vec![pane.clone()],
-                closed: vec![],
-            })
-            .unwrap();
         (agent, pane, scope)
     };
     let source = agent.session.as_ref().unwrap().id();
@@ -1847,6 +1855,28 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
         record.session.terminal = Some(descriptor.session);
         record.paired_terminal = Some(terminal.clone());
     }
+    // Seed the old store's projection only now. A current spawn publishes its
+    // live descriptor over a matching saved pane, which would replace the
+    // unprovable ended projection this test needs beside the live console.
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .pane_view(pane.id)
+            .unwrap()
+            .and_then(|view| view.panes.into_iter().find(|saved| saved.id == pane.id)),
+        Some(pane.clone()),
+        "the saved pane keeps the legacy ended projection while its console is live"
+    );
     assert!(!terminal.is_completed());
     assert_eq!(
         store
@@ -1961,6 +1991,115 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
     }
     terminal.shutdown().unwrap();
     close(&host, &Authority::default(), agent.id).unwrap();
+}
+
+/// An old store can hold the old UI's ended-console projection. Opening the
+/// agent's console publishes its live descriptor over that pane, so the pane
+/// shows the console the agent now owns, and closing the agent retires it.
+#[test]
+fn opening_a_console_repairs_a_legacy_ended_pane_and_close_retires_it() {
+    if isolated_with_console_cli(
+        "opening_a_console_repairs_a_legacy_ended_pane_and_close_retires_it",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let cli = path.parent().unwrap().join("console/cagents");
+    std::fs::write(&cli, "#!/bin/sh\nexec cat >/dev/null\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    assert!(agent.console.is_none());
+    let HostedSession::Chat(session) = agent.session.clone().unwrap() else {
+        unreachable!()
+    };
+    // The projection an old UI saved after this console's /quit or EOF: the
+    // exact recipe the console is opened with, ended, with no generation proof.
+    let ended = crate::model::TerminalSession {
+        id: session.id,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: crate::model::LaunchRecipe {
+            program: cli.to_str().unwrap().into(),
+            arguments: vec!["agent".into(), "console".into(), agent.id.to_string()],
+            working_directory: session.launch.recipe.working_directory.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        },
+    };
+    let pane = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: agent.placement.clone(),
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane,
+                title: "Legacy ended console".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: crate::model::CardKind::Terminal(ended.clone()),
+                scope: None,
+            }],
+            closed: vec![],
+        })
+        .unwrap();
+    let handle = host.lock().unwrap().chats[&session.id].handle.clone();
+    if let Err(error) = create_console(&host, &store, agent.id, &session, &handle) {
+        panic!("opening the console failed: {:?}", error.run_failure());
+    }
+
+    let console = store
+        .lock()
+        .unwrap()
+        .agent(agent.id)
+        .unwrap()
+        .console
+        .expect("the opened console is bound to its agent");
+    let saved = |store: &SharedRegistry| {
+        store
+            .lock()
+            .unwrap()
+            .pane_view(pane)
+            .unwrap()
+            .and_then(|view| view.panes.into_iter().find(|saved| saved.id == pane))
+            .map(|saved| saved.kind)
+    };
+    let crate::model::CardKind::Terminal(repaired) = saved(&store).unwrap() else {
+        panic!("the console pane stays a terminal")
+    };
+    assert!(
+        HostedSession::Terminal(repaired.clone()).same_process(&HostedSession::Terminal(console)),
+        "the pane shows the live console its agent owns: {repaired:?}"
+    );
+    let mut identity = repaired.clone();
+    identity.continuity = ended.continuity.clone();
+    assert_eq!(identity, ended, "only the ended state was replaced");
+    let terminal = host.lock().unwrap().terminals[&session.id].handle.clone();
+    assert!(!terminal.is_completed());
+
+    close(&host, &Authority::default(), agent.id).unwrap();
+    assert_eq!(
+        saved(&store),
+        None,
+        "closing the agent retires its console pane"
+    );
+    assert!(store.lock().unwrap().agent(agent.id).unwrap().closed);
 }
 
 #[test]
@@ -2473,7 +2612,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     let (host, mut request, path) = fixture();
     let root = path.parent().unwrap().to_owned();
     let program = root.join("bin/codex");
-    std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
+    std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let Destination::New(spec) = &mut request.destination else {
         unreachable!()
@@ -2656,7 +2795,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -6392,6 +6531,89 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
         assert!(
             error.contains("Resume it from its pane"),
             "{attempt}: {error}"
+        );
+    }
+}
+
+#[test]
+fn locked_mailbox_requests_are_retryable_without_accepting_or_consuming_mail() {
+    use crate::{
+        agent_execution::{
+            Lineage,
+            mailbox::{Inbox, Message, Outgoing, Party, Receipt, State as Delivery, To},
+        },
+        model::MessageId,
+        terminal::ipc::{ClientRequest, ProtocolErrorCode},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mailbox.sqlite3");
+    let host = crate::host::service::test_host();
+    host.lock()
+        .unwrap()
+        .install_model(Registry::at(&path).unwrap());
+    let store = registry(&host).unwrap();
+    let incoming = Message {
+        id: MessageId::new(),
+        from: Party {
+            lineage: Some(Lineage(TerminalId::new())),
+            session: None,
+            title: None,
+        },
+        to: Party::user(),
+        reply_to: None,
+        body: "fixture message".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms: now(),
+    };
+    store.lock().unwrap().post_message(&incoming).unwrap();
+    let outgoing = Outgoing {
+        to: To::Sender(incoming.id.to_string()),
+        body: "fixture reply".into(),
+        wait_ms: None,
+    };
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    let invoke = |operation| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority: Authority::default(),
+                operation,
+            },
+        )
+    };
+    for operation in [
+        Operation::SendMessage(outgoing.clone()),
+        Operation::Send(outgoing.clone()),
+        Operation::Deliver(outgoing),
+        Operation::Inbox(query.clone()),
+        Operation::AcknowledgeInbox(Receipt {
+            ids: vec![incoming.id],
+        }),
+    ] {
+        let mut rival = rusqlite::Connection::open(&path).unwrap();
+        let tx = rival
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let refusal = invoke(operation).unwrap_err();
+        tx.rollback().unwrap();
+        assert_eq!(refusal.code, ProtocolErrorCode::StoreBusy, "{refusal:?}");
+        assert!(refusal.retryable, "{refusal:?}");
+        assert_eq!(
+            store.lock().unwrap().peek_messages(None, &query).unwrap(),
+            vec![incoming.clone()]
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .peek_messages(incoming.from.lineage, &query)
+                .unwrap()
+                .is_empty()
         );
     }
 }

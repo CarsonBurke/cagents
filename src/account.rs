@@ -203,10 +203,7 @@ pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
 /// Expand only on the device that owns the account registry. An absolute
 /// remainder after ~/ would replace HOME during Path::join, so reject it first.
 #[cfg(any(feature = "ui", feature = "host", test))]
-pub(crate) fn expand_linked_home(
-    value: &str,
-    home: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, String> {
+pub fn expand_linked_home(value: &str, home: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
     validate_linked_home_operand(value)?;
     let path = if let Some(relative) = value.strip_prefix("~/") {
         PathBuf::from(home.ok_or("HOME is unavailable")?).join(relative)
@@ -232,7 +229,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
 /// stored login. Keep this list explicit: cloud credentials may still be needed
 /// by the agent's tools, and account-local configuration remains user-owned.
 /// See docs/user-guide.md, "Account credential isolation", for provider sources.
-pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str] {
+pub fn credential_overrides(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &[
             "ANTHROPIC_API_KEY",
@@ -979,7 +976,9 @@ pub struct Credits {
     pub unlimited: bool,
     pub used: Option<Money>,
     pub limit: Option<Money>,
-    /// A balance the provider reports as preformatted text.
+    /// Codex's credit balance, as the text it reports: a decimal count of
+    /// credits, such as `23292.7457325000`. [`Credits::summary`] writes it
+    /// as Codex does.
     pub balance: Option<String>,
     /// The fraction of a spending limit used, where there is one.
     pub used_fraction: Option<f32>,
@@ -997,13 +996,49 @@ impl Credits {
         match (&self.used, &self.limit, &self.balance) {
             (Some(used), Some(limit), _) => format!("{used} of {limit} used"),
             (Some(used), None, _) => format!("{used} used"),
-            (None, _, Some(balance)) => format!("{balance} left"),
+            (None, _, Some(balance)) => format!("{} left", credit_balance(balance)),
             (None, _, None) => match self.used_fraction {
                 Some(used) => format!("{:.0}% used", used * 100.0),
                 None => "On".into(),
             },
         }
     }
+}
+
+/// A reported credit balance as Codex's own status shows it: whole credits,
+/// here with thousands separated, so `23292.7457325000` is `23,293 credits`.
+/// A fraction of one is not rounded away to nothing, and a balance that is
+/// not a number is shown as it came.
+fn credit_balance(reported: &str) -> String {
+    let Some(credits) = reported
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|credits| credits.is_finite())
+    else {
+        return reported.to_owned();
+    };
+    if credits > 0.0 && credits < 0.5 {
+        return "Under 1 credit".into();
+    }
+    let whole = credits.round();
+    let digits = format!("{:.0}", whole.abs());
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if whole < 0.0 {
+        grouped.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    let unit = if whole.abs() == 1.0 {
+        "credit"
+    } else {
+        "credits"
+    };
+    format!("{grouped} {unit}")
 }
 
 /// How an account stands against its limits.
@@ -2138,6 +2173,31 @@ mod tests {
         assert_eq!(off.summary(), "Off");
     }
 
+    /// Codex reports its credit balance as a bare decimal count of credits.
+    #[test]
+    fn a_credit_balance_is_whole_credits() {
+        let left = |balance: &str| {
+            Credits {
+                enabled: true,
+                unlimited: false,
+                used: None,
+                limit: None,
+                balance: Some(balance.into()),
+                used_fraction: None,
+            }
+            .summary()
+        };
+        assert_eq!(left("23292.7457325000"), "23,293 credits left");
+        assert_eq!(left("1234567"), "1,234,567 credits left");
+        assert_eq!(left("999.4"), "999 credits left");
+        assert_eq!(left("12.50"), "13 credits left");
+        assert_eq!(left("1"), "1 credit left");
+        assert_eq!(left("0.2"), "Under 1 credit left");
+        assert_eq!(left("0"), "0 credits left");
+        assert_eq!(left("-3.6"), "-4 credits left");
+        assert_eq!(left("$12.34"), "$12.34 left");
+    }
+
     #[test]
     fn a_moment_is_named_relative_to_today() {
         let now = 1_790_119_800;
@@ -2334,7 +2394,7 @@ mod credential_guard {
             }
             // The Accounts install action opens this fixed documentation page
             // in a browser. It does not read credentials or call a service API.
-            if file.ends_with("src/app/account_ui.rs") {
+            if file.ends_with("crates/cagents-ui/src/app/account_ui.rs") {
                 let documentation = ["https://developers.open", "ai.com/codex/cli/"].concat();
                 text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
             }

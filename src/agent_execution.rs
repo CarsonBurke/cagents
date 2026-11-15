@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(feature = "host")]
 pub(crate) mod bundled;
 pub mod directory;
 pub mod mailbox;
@@ -29,6 +29,36 @@ pub const MAX_CHILDREN: usize = 64;
 pub const MAX_PARENT_RUNNING: usize = 8;
 pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
+
+/// The identity shown for a delegated agent, before or after its conversation
+/// loads. The accepted task supplies a stable preview, independent of provider
+/// titles; individual surfaces truncate this shared label to their own width.
+pub fn agent_label(name: &str, task: Option<&str>) -> String {
+    let (name, task) = agent_label_parts(name, task);
+    match task {
+        Some(task) => format!("{name} · {task}"),
+        None => name,
+    }
+}
+
+/// The name and first task line shared by pane titles and coordination rows.
+pub fn agent_label_parts(name: &str, task: Option<&str>) -> (String, Option<String>) {
+    fn preview(text: &str, limit: usize) -> Option<String> {
+        let text = crate::names::normalize_card_name(text)?;
+        let mut chars = text.chars();
+        let mut preview: String = chars.by_ref().take(limit).collect();
+        if chars.next().is_some() {
+            preview.push('…');
+        }
+        Some(preview)
+    }
+
+    let name = preview(name, 60).unwrap_or_else(|| "an agent".into());
+    let task = task
+        .and_then(|task| task.trim().lines().next())
+        .and_then(|task| preview(task, 160));
+    (name, task)
+}
 /// How the daemon begins refusing a follow-up run for an agent that a usage
 /// limit stops until a known reset; the CLI reports it as `agent_limited`.
 pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
@@ -89,10 +119,10 @@ impl Authority {
             Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
         })
     }
-    pub(crate) fn session(token: String) -> Self {
+    pub fn session(token: String) -> Self {
         Self(Some(token))
     }
-    pub(crate) fn token(&self) -> Option<&str> {
+    pub fn token(&self) -> Option<&str> {
         self.0.as_deref()
     }
 }
@@ -104,6 +134,8 @@ pub(crate) enum AcceptanceError {
     Invalid(String),
     #[error("{0}")]
     MailboxFull(String),
+    #[error("{0}")]
+    StoreBusy(String),
 }
 
 impl From<String> for AcceptanceError {
@@ -351,7 +383,7 @@ pub enum HostedSession {
 impl HostedSession {
     /// Equality alone also compares absent proofs. Explicit live activation
     /// requires a complete issued proof before comparing current descriptors.
-    pub(crate) fn has_complete_proof(&self) -> bool {
+    pub fn has_complete_proof(&self) -> bool {
         match self {
             Self::Chat(session) => session
                 .proof
@@ -366,7 +398,7 @@ impl HostedSession {
 
     /// Runtime ownership excludes mutable conversation/presentation metadata.
     /// A successor proof or different launch never identifies this process.
-    pub(crate) fn same_process(&self, other: &Self) -> bool {
+    pub fn same_process(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Chat(a), Self::Chat(b)) => same_chat_process(a, b),
             (Self::Terminal(a), Self::Terminal(b)) => same_terminal_process(a, b),
@@ -383,14 +415,14 @@ impl HostedSession {
 }
 
 /// Mutable thread and presentation metadata do not change runtime ownership.
-pub(crate) fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
+pub fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
     a.id == b.id
         && a.proof == b.proof
         && a.launch.provider == b.launch.provider
         && a.launch.recipe == b.launch.recipe
 }
 
-pub(crate) fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
+pub fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
     a.id == b.id
         && a.launch == b.launch
         && a.continuity.live_proof().is_some()
@@ -419,6 +451,53 @@ impl Agent {
         match &self.placement {
             Placement::Channel(id) => Some(*id),
             Placement::Worktree { .. } => None,
+        }
+    }
+
+    /// Whether this agent is a session `channel` still holds without showing
+    /// it: open, placed there, and its pane never closed there. A window
+    /// adopts such an agent into the channel, and one whose adoption has not
+    /// happened yet, or failed, is recovery evidence rather than emptiness.
+    /// A headless automation run is never adopted, but it is still live work
+    /// placed in the channel, which a reused run returns to.
+    /// `closed_panes` are the channel view's retired panes.
+    pub fn awaits_pane_in(
+        &self,
+        channel: ChannelId,
+        closed_panes: &[crate::model::CardId],
+    ) -> bool {
+        !self.closed
+            && self.channel() == Some(channel)
+            && !closed_panes.contains(&crate::model::CardId::from_uuid(self.id.as_uuid()))
+    }
+
+    /// An open user agent placed in `channel` that has not started a session.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_placed_in(channel: ChannelId) -> Self {
+        let placement = Placement::Channel(channel);
+        Self {
+            name: None,
+            id: AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: None,
+            console: None,
+            created_ms: 0,
+            closed: false,
         }
     }
 }
@@ -572,6 +651,12 @@ pub enum Operation {
     /// `Send` that also says how an agent recipient takes the message: as a
     /// run started now, or one waiting behind its current work.
     Deliver(mailbox::Outgoing),
+    /// Read sessions and the caller's durable channel fallback. Older
+    /// directory and session replies retain their positional wire layout.
+    Context {
+        scope: directory::Scope,
+        standing: bool,
+    },
 }
 
 /// What became of a prompt accepted for an existing agent.
@@ -656,6 +741,7 @@ pub enum Reply {
         start: Start,
     },
     Handed(mailbox::Handed),
+    Context(directory::Context),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
@@ -687,6 +773,29 @@ pub enum ProviderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_labels_share_a_bounded_first_line_without_formatting_controls() {
+        assert_eq!(
+            agent_label(
+                "reviewer",
+                Some("Review the one-row cards\nDetailed instructions")
+            ),
+            "reviewer · Review the one-row cards"
+        );
+        assert_eq!(
+            agent_label(
+                "\u{202e}reviewer",
+                Some(" \n Review\t the\u{7} cards \nMore")
+            ),
+            "reviewer · Review the cards"
+        );
+        assert_eq!(agent_label("reviewer", None), "reviewer");
+        assert_eq!(agent_label("", Some("\u{202e}")), "an agent");
+        let label = agent_label(&"界".repeat(100), Some(&"界".repeat(300)));
+        assert_eq!(label.chars().count(), 60 + 1 + 3 + 160 + 1);
+        assert!(!label.chars().any(char::is_control));
+    }
 
     #[test]
     fn waiting_is_observable_without_settling_the_run() {

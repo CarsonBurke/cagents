@@ -10,6 +10,7 @@ use crate::{
         protocol::{ExecutionContext, ProcessSpec, TransportSpec},
     },
     daemon::{
+        child_events::ChildEvents,
         holder_registry::{self as registry, Kind, Process, Record},
         owned_children::DetachedWork,
     },
@@ -185,6 +186,10 @@ pub(crate) struct Resident {
     /// that predates them reports none.
     #[serde(default)]
     pub agent_addresses: Vec<chat::AgentAddress>,
+    #[serde(default)]
+    pub active_model: Option<chat::ActiveModel>,
+    #[serde(default)]
+    pub active_model_revision: u64,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -485,6 +490,8 @@ impl RemoteActor {
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
+            active_model: None,
+            active_model_revision: 0,
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -602,6 +609,11 @@ impl RemoteActor {
         remote.proof = self.0.proof.clone();
         remote.source = self.0.source.clone();
         other
+    }
+    #[cfg(test)]
+    pub(in crate::chat::runtime) fn confirm_session_fixture(&self, session: String) {
+        let mut state = self.0.state.lock().unwrap();
+        Arc::make_mut(&mut state).confirmed_session = Some(session);
     }
     #[cfg(test)]
     pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
@@ -777,13 +789,17 @@ impl RemoteActor {
                 resident.idle = false;
                 resident.busy = false;
                 let (changed, generation) = (resident.changed, resident.generation);
+                let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
                 if !self.publish_resident_inner(resident, true) {
                     // Another refresh, such as the outcome broker's while a
                     // close drains the outbox, can publish a newer closed
                     // reply first. This older one is then only stale.
                     let current = self.state();
                     if !(current.completed
-                        && (current.changed > changed || current.generation > generation))
+                        && (current.changed > changed
+                            || current.generation > generation
+                            || (current.close.actor_id == active_model_clock.0
+                                && current.active_model_revision > active_model_clock.1)))
                     {
                         return Err("Closed actor metadata was superseded during refresh".into());
                     }
@@ -904,7 +920,7 @@ impl RemoteActor {
         {
             return Err("Retained actors require the Claude stream-json transport".into());
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let proof = source
             .proof
             .clone()
@@ -1367,6 +1383,10 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // A model update can precede its change callback while both
+                // general clocks still match an older in-flight sample.
+                || (resident.close.actor_id == state.close.actor_id
+                    && resident.active_model_revision < state.active_model_revision)
                 // Installation is acknowledged independently of observer
                 // revisions. A state RPC issued before commit can arrive
                 // after its ACK with equal changed/generation values.
@@ -1405,8 +1425,11 @@ impl RemoteActor {
             {
                 updates.push(Update::PromptAvailable);
             }
-            if (resident.outbox_latest > resident.outbox_ack
-                && resident.outbox_latest != state.outbox_latest)
+            // Conversation identity is durable daemon metadata even when no
+            // window subscribes and no semantic outcome accompanies it.
+            if identity_changed
+                || (resident.outbox_latest > resident.outbox_ack
+                    && resident.outbox_latest != state.outbox_latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -1424,6 +1447,12 @@ impl RemoteActor {
             );
             if resident.agent_addresses != state.agent_addresses {
                 updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
+            if resident.active_model_revision != state.active_model_revision {
+                updates.push(Update::ActiveModel {
+                    revision: resident.active_model_revision,
+                    model: resident.active_model.clone(),
+                });
             }
             *state = Arc::new(resident);
             updates
@@ -1453,6 +1482,12 @@ impl RemoteActor {
             if state.installed {
                 resident.installed = true;
                 resident.native_continuity = state.native_continuity.clone();
+            }
+            if resident.close.actor_id == state.close.actor_id
+                && resident.active_model_revision < state.active_model_revision
+            {
+                resident.active_model = state.active_model.clone();
+                resident.active_model_revision = state.active_model_revision;
             }
             *state = Arc::new(resident);
         }
@@ -2716,6 +2751,8 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
+        let active_model = state.active_model.clone();
+        let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
         let prompt_eligible =
@@ -2810,6 +2847,8 @@ impl Server {
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),
+            active_model,
+            active_model_revision,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -3641,7 +3680,8 @@ impl Server {
             resident: self.resident()?,
         })
     }
-    fn serve(&mut self, startup: UnixStream) -> Result<(), String> {
+    /// `children` wakes the loop to reap exited orphans; see [`OrphanSweep`].
+    fn serve(&mut self, startup: UnixStream, children: Option<ChildEvents>) -> Result<(), String> {
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
@@ -3651,9 +3691,10 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
         let connections = connections::Connections::new()?;
-        let mut orphans = OrphanSweep::new();
+        let mut orphans = OrphanSweep::new(children);
+        let mut child_exited = false;
         'serve: loop {
-            orphans.run_if_due();
+            orphans.run_if_due(std::mem::take(&mut child_exited));
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
@@ -3681,13 +3722,25 @@ impl Server {
                     revents: 0,
                 });
             }
+            let exits = orphans.wakeup().map(|fd| {
+                events.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                events.len() - 1
+            });
             // An admitted input's completion has no wakeup of its own, so
             // poll for it only while some are pending.
             let mut wait = orphans.until_due();
             if !self.pending.is_empty() {
-                wait = wait.min(INPUT_COMPLETION_POLL);
+                wait = Some(wait.map_or(INPUT_COMPLETION_POLL, |wait| {
+                    wait.min(INPUT_COMPLETION_POLL)
+                }));
             }
-            let millis = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            let millis = wait.map_or(-1, |wait| {
+                wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32
+            });
             // SAFETY: `events` stays live and initialized for this finite poll.
             if unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, millis) } < 0
             {
@@ -3697,6 +3750,7 @@ impl Server {
                 }
                 return Err(error.to_string());
             }
+            child_exited = exits.is_some_and(|index| events[index].revents != 0);
             while accepting && connections.has_capacity() {
                 match self.listener.accept() {
                     Ok((control, _)) => connections.admit(control),
@@ -3883,40 +3937,69 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 /// provider and scope requests spawn through `adopted_orphans`, which reserves
 /// their statuses for their owners. Nothing here signals a live child.
 ///
-/// The helper has no log sink, so a sweep failure is retried on the next tick
-/// rather than reported here. Its durable symptom is the per-holder zombie
-/// count that `cagents diagnostics` observes from outside the process.
+/// A sweep runs when a child exits, read from [`ChildEvents`], so an idle
+/// actor does not wake. Without that descriptor, as in a process whose other
+/// threads receive SIGCHLD, it runs every [`Self::INTERVAL`] instead.
+///
+/// The helper has no log sink, so a failed sweep is retried after
+/// [`Self::INTERVAL`] rather than reported here. Its durable symptom is the
+/// per-holder zombie count that `cagents diagnostics` observes from outside
+/// the process.
 struct OrphanSweep {
-    due: Instant,
+    children: Option<ChildEvents>,
+    /// When the next sweep is due without a child exit.
+    due: Option<Instant>,
 }
 impl OrphanSweep {
     const INTERVAL: Duration = Duration::from_millis(250);
     /// Bounds one pass so a large backlog cannot stall the serve loop.
     const LIMIT: usize = 4096;
 
-    fn new() -> Self {
+    fn new(children: Option<ChildEvents>) -> Self {
         Self {
-            due: Instant::now(),
+            children,
+            // Children may have exited before the descriptor existed.
+            due: Some(Instant::now()),
         }
     }
 
-    fn until_due(&self) -> Duration {
-        self.due.saturating_duration_since(Instant::now())
+    /// Readable when a child has exited.
+    fn wakeup(&self) -> Option<RawFd> {
+        self.children.as_ref().map(ChildEvents::fd)
     }
 
-    fn run_if_due(&mut self) {
-        if Instant::now() >= self.due {
+    /// How long the serve loop may wait before the next sweep, if it is
+    /// waiting on [`Self::wakeup`] instead.
+    fn until_due(&self) -> Option<Duration> {
+        self.due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+    }
+
+    fn run_if_due(&mut self, woken: bool) {
+        if woken
+            && let Some(children) = &self.children
+            && children.drain().is_err()
+        {
+            // An unreadable descriptor cannot be trusted to wake us again.
+            self.children = None;
+        }
+        if woken || self.due.is_some_and(|due| Instant::now() >= due) {
             self.run();
         }
     }
 
     fn run(&mut self) {
-        self.due = Instant::now() + Self::INTERVAL;
-        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
-            && sweep.truncated
-        {
-            // Continue the backlog on the next serve iteration.
-            self.due = Instant::now();
+        self.due = self
+            .children
+            .is_none()
+            .then(|| Instant::now() + Self::INTERVAL);
+        match crate::daemon::adopted_orphans::reap_exited(Self::LIMIT) {
+            // Continue the backlog on the next serve iteration: its exits
+            // were already read from the descriptor.
+            Ok(sweep) if sweep.truncated => self.due = Some(Instant::now()),
+            Ok(_) => {}
+            // No further exit may come to retry it.
+            Err(_) => self.due = Some(Instant::now() + Self::INTERVAL),
         }
     }
 }
@@ -4014,6 +4097,9 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
+        // Before any other thread starts, so all of them inherit the blocked
+        // SIGCHLD that wakes the sweep. Without it the sweep polls instead.
+        let children = ChildEvents::new().ok();
         let mut detached = DetachedWork::Stop;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
@@ -4022,7 +4108,10 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
                 &control,
                 crate::daemon::process_scope::enroll_holder,
             )?;
-            let served = server.serve(control.try_clone().map_err(|error| error.to_string())?);
+            let served = server.serve(
+                control.try_clone().map_err(|error| error.to_string())?,
+                children,
+            );
             detached = server.detached;
             served
         })();
@@ -4266,7 +4355,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             parent: Some(parent),
             worker: Some(thread::spawn(move || {
                 let mut server = server;
-                server.serve(control)
+                server.serve(control, None)
             })),
         };
         let attached: Result<Attached, String> =
@@ -4280,7 +4369,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
     }
 
     #[test]
-    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+    fn serving_actor_reaps_adopted_orphans_as_they_exit_and_sleeps_while_idle() {
         if crate::retained_fixture::run_isolated() {
             return;
         }
@@ -4288,7 +4377,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let test = thread::current().name().unwrap().to_owned();
-            let output = ChildCommand::new(std::env::current_exe().unwrap())
+            let mut command = ChildCommand::new(std::env::current_exe().unwrap());
+            // As in the helper, every thread blocks SIGCHLD before the sweep
+            // reads it, including libtest's own.
+            // SAFETY: the hook runs only async-signal-safe sigprocmask.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(
+                    &mut command,
+                    crate::daemon::child_events::block_sigchld_for_exec,
+                );
+            }
+            let output = command
                 .args(["--exact", &test, "--nocapture"])
                 .env(CHILD, "1")
                 .env("XDG_RUNTIME_DIR", root.path())
@@ -4387,10 +4486,16 @@ while IFS= read -r frame; do :; done
         let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
         let provider = server.identity.record.root.clone();
         let mut parent = Some(parent);
+        let (serving, serving_thread) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            serving.send(unsafe { libc::gettid() }).unwrap();
+            // Its owner's thread creates and drops it, as the helper's does.
+            let children = ChildEvents::new().expect("every fixture thread blocks SIGCHLD");
             let mut server = server;
-            server.serve(control)
+            server.serve(control, Some(children))
         });
+        let serving_thread = serving_thread.recv().unwrap();
         let attached: Result<Attached, String> =
             receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
         attached.unwrap();
@@ -4421,6 +4526,41 @@ while IFS= read -r frame; do :; done
         }
         assert!(provider.is_current(), "the provider must keep running");
         assert!(!worker.is_finished(), "the actor must keep serving");
+        // Idle, the actor sleeps until a child exits or a client calls: its
+        // serve loop and chat worker arm no timer.
+        let switches = || {
+            let mut total = 0;
+            for task in std::fs::read_dir("/proc/self/task").unwrap() {
+                let task = task.unwrap().path();
+                let name = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+                let tid: i32 = task.file_name().unwrap().to_str().unwrap().parse().unwrap();
+                if tid != serving_thread && name.trim() != "cagents-chat" {
+                    continue;
+                }
+                let status = std::fs::read_to_string(task.join("status")).unwrap();
+                total += status
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                    .map(|count| count.trim().parse::<u64>().unwrap())
+                    .sum::<u64>();
+            }
+            total
+        };
+        // Only the provider and the live daemon remain to exit.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while crate::daemon::owned_children::direct_children()
+            .unwrap()
+            .len()
+            > 2
+        {
+            assert!(Instant::now() < settle, "short-lived tools did not finish");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let before = switches();
+        thread::sleep(Duration::from_secs(2));
+        let woken = switches() - before;
+        // A 250 ms sweep timer alone woke the serve loop eight times here.
+        assert!(woken <= 1, "an idle actor woke {woken} times in 2 s");
         // The live adopted daemon is still this actor's unsignalled child.
         assert_eq!(state(live), Some('S'));
         assert!(
@@ -5788,17 +5928,22 @@ exec /bin/sleep 60
             let request: Invocation = receive(&control, TIMEOUT).unwrap();
             assert_eq!(request.method, "resolve_source");
             assert_eq!(request.epoch, Some(epoch));
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // Stall until the client has returned: a client that ignored its
+            // deadline would never return.
+            let _ = wait.recv();
         });
         let started = Instant::now();
-        let error = actor
-            .resolve_source_until(&source, started + Duration::from_millis(40))
-            .unwrap_err();
-        let elapsed = started.elapsed();
+        let (actor, error) = crate::test_timing::returns("source resolution", move || {
+            let error = actor
+                .resolve_source_until(&source, Instant::now() + Duration::from_millis(40))
+                .unwrap_err();
+            (actor, error)
+        });
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
-        assert!(elapsed < Duration::from_millis(250));
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(actor.0.epoch, epoch);
         assert!(actor.pending_inputs().is_empty());
     }
@@ -5913,25 +6058,27 @@ exec /bin/sleep 60
             assert_eq!(request.method, "inspect");
             assert!(request.epoch.is_none());
             // SO_PEERCRED has identified this exact Record.holder process, but
-            // its inspection response stalls. The client must still return.
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // its inspection response stalls until the client has returned.
+            let _ = wait.recv();
         });
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
+        let proof = fixture.server.proof.clone();
         let started = Instant::now();
-        let error = RemoteActor::inspect_at_until(
-            &record,
-            fixture.server.proof.clone(),
-            &socket,
-            started + Duration::from_millis(40),
-        )
-        .err()
-        .expect("stalled inspection must time out");
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("the stalled inspection", move || {
+            RemoteActor::inspect_at_until(
+                &record,
+                proof,
+                &socket,
+                Instant::now() + Duration::from_millis(40),
+            )
+            .err()
+            .expect("stalled inspection must time out")
+        });
         let _ = release.send(());
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());
@@ -6296,6 +6443,75 @@ exec /bin/sleep 60
         assert_eq!(actor.state().native_continuity, installed.native_continuity);
         assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
+    #[test]
+    fn retained_active_model_status_rejects_equal_clock_stale_revisions() {
+        let mut actor = RemoteActor::fixture();
+        let (published, publications) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            let _ = published.send(update);
+        });
+        let model = |name: &str| chat::ActiveModel {
+            id: name.into(),
+            label: name.into(),
+            reasoning: None,
+            default_reasoning: None,
+            aliases: Vec::new(),
+        };
+        let mut older = actor.state().as_ref().clone();
+        older.active_model_revision = 5;
+        older.active_model = Some(model("older"));
+        let mut newer = older.clone();
+        newer.active_model_revision = 6;
+        newer.active_model = Some(model("newer"));
+        assert_eq!(older.changed, newer.changed);
+        assert_eq!(older.generation, newer.generation);
+        assert!(actor.publish_resident(older.clone()));
+        assert!(actor.publish_resident(newer.clone()));
+        for revision in [5, 6] {
+            assert!(matches!(publications.recv_timeout(TIMEOUT).unwrap(),
+                Update::ActiveModel { revision: actual, .. } if actual == revision));
+        }
+        assert!(!actor.publish_resident(older.clone()));
+        assert!(publications.try_recv().is_err());
+        let attached = actor.state();
+        assert_eq!(attached.active_model_revision, 6);
+        assert_eq!(attached.active_model, newer.active_model);
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Snapshot::default()
+            },
+            Some(older),
+        );
+        let closed = actor.state();
+        assert!(closed.completed);
+        assert_eq!(closed.active_model_revision, 6);
+        assert_eq!(closed.active_model, newer.active_model);
+    }
+
+    #[test]
+    fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
+        let mut actor = RemoteActor::fixture();
+        let (sent, received) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            sent.send(update).unwrap();
+        });
+        let mut confirmed = actor.state().as_ref().clone();
+        confirmed.confirmed_session = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(confirmed.outbox_latest, confirmed.outbox_ack);
+        assert!(actor.publish_resident(confirmed.clone()));
+        assert!(
+            received
+                .try_iter()
+                .any(|update| matches!(update, Update::RetainedOutcomes))
+        );
+        assert!(actor.publish_resident(confirmed));
+        assert!(
+            received.try_iter().next().is_none(),
+            "unchanged metadata must not churn the broker"
+        );
+    }
+
     #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -6670,14 +6886,10 @@ exec /bin/sleep 60
             retransmit(&actor).is_none(),
             "an older helper is not asked again"
         );
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused without waiting"
         );
         // A receipt the helper reports on its own still lifts the fence.
         actor.apply_receipts(&[InputReceipt {
@@ -6837,14 +7049,10 @@ exec /bin/sleep 60
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
         assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused at once"
         );
         // A helper that returns still settles it, which lifts the fence.
         settle_now(&actor);

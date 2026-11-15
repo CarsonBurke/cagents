@@ -505,6 +505,13 @@ pub(super) fn index_activity(
                 } else {
                     ToolStatus::Succeeded
                 };
+                let status = if status == ToolStatus::Failed
+                    && history.latest_prompt.is_some_and(|prompt| offset < prompt)
+                {
+                    ToolStatus::Ended
+                } else {
+                    status
+                };
                 history.agent_status.insert(identity.clone(), status);
             }
         }
@@ -593,9 +600,15 @@ pub(super) fn index_activity(
                     ended.insert(identity.clone(), status);
                 }
                 if recorded || started || history.background_agent_tools.contains(&identity) {
-                    history
-                        .agent_status
-                        .insert(identity, status.unwrap_or(ToolStatus::Running));
+                    let status = status.unwrap_or(ToolStatus::Running);
+                    let status = if status == ToolStatus::Failed
+                        && history.latest_prompt.is_some_and(|prompt| offset < prompt)
+                    {
+                        ToolStatus::Ended
+                    } else {
+                        status
+                    };
+                    history.agent_status.insert(identity, status);
                 } else if status == Some(ToolStatus::Stopped) {
                     history.agent_status.insert(identity, ToolStatus::Stopped);
                 }

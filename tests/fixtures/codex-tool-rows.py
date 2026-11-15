@@ -11,19 +11,35 @@ Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT=1 to acknowledge interruptions
 without completing either the interrupted turn or its delayed successful script.
 Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE=1 to keep a WebSocket connection open
 after a close frame until its peer disconnects, without changing turn settlement.
+Set CAGENTS_TOOL_ROWS_HISTORY="COUNT BYTES" to open the thread's first turn
+with COUNT earlier messages of about BYTES each, a long-running conversation.
 
 Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
 runner as the isolated Codex executable. It models the app-server protocol
 only: no provider, credentials, network service or tool is contacted.
+
+With CODEX_HOME/fixture-web-rows present, each prompt instead plays one
+webSearch item with synthetic results. This isolates the native web-search
+row without collaboration activity or unrelated tool/event rows.
+CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
+short, synthetic original diagnostic for the native Details/Copy controls.
+An existing CODEX_HOME/fixture-turn-audit.json opts into a bounded record of
+accepted turn model/effort fields, without recording the prompt or other input.
+With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
+with one step done, one in progress and one pending, and finishes it before
+completing. The file may hold whole seconds for the turn to stay working,
+instead of the usual pause, so a slow capture still finds it running.
 """
 import copy
+import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -35,6 +51,18 @@ transport = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(transport)
 
 PAUSE = float(os.environ.get("CAGENTS_TOOL_ROWS_PAUSE", "6"))
+
+
+def long_history():
+    """The earlier messages CAGENTS_TOOL_ROWS_HISTORY asks for, if any."""
+    setting = os.environ.get("CAGENTS_TOOL_ROWS_HISTORY")
+    if not setting:
+        return []
+    count, size = map(int, setting.split())
+    phrase = "Reviewed the failing step, its logs and the last good run. "
+    text = (phrase * (size // len(phrase) + 1))[:size]
+    return [{"id": f"history-{at}", "type": "agentMessage", "text": f"Step {at}: {text}", "phase": None}
+            for at in range(count)]
 
 
 def items(child):
@@ -92,13 +120,31 @@ def items(child):
     ]
 
 
+def web_items():
+    """The dedicated app-server web-search item, with opaque result records."""
+    query = "temporary probe permission precedence and cleanup receipts with a deliberately long search query"
+    item = {"id": "fixture-web-search", "type": "webSearch", "query": query}
+    return [({**item, "results": []}, {**item, "results": [
+        {"title": "Fixture permission reference with a long descriptive title",
+         "url": "https://example.test/fixture/permissions/temporary-probe-cleanup-policy",
+         "snippet": "Recorded evidence: remove each temporary probe before final verification."},
+        {"title": "Fixture cleanup receipt schema",
+         "url": "https://example.test/fixture/receipts/schema",
+         "snippet": "Synthetic schema: the receipt records probe creation, removal and the final permission."},
+    ]})]
+
+
 class Scenario:
     def __init__(self):
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self.model = "fixture-mini"
+        self.reasoning = None
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
+        # Replayed once, by the thread's first turn.
+        self.history = long_history()
         self.interrupting = set()
         self._generation = 0
         self._generations = {}
@@ -116,6 +162,7 @@ class Scenario:
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
                                   "latest": self.latest, "child_latest": self.child_latest,
+                                  "model": self.model, "reasoning": self.reasoning,
                                   "interrupting": sorted(self.interrupting)})
 
     def restore(self, state):
@@ -127,6 +174,8 @@ class Scenario:
         self.thread, self.child = state["thread"], state["child"]
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
+        self.model = state.get("model", "fixture-mini")
+        self.reasoning = state.get("reasoning")
         self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
         for thread in (self.thread, self.child):
@@ -260,27 +309,52 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True):
+    def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False, plan=None):
+        starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
+        if diagnostics:
+            raw = ("Fixture diagnostic: the local synthetic receipt was rejected.\n"
+                   "request-id: fixture-original-diagnostic\n"
+                   "Original diagnostic detail: no provider or network was contacted.\n"
+                   "Recover by reviewing the recorded receipt; no files changed.")
+            return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                    {"_sleep": pause},
+                    notify("error", turnId=turn, error={"message": raw}, willRetry=False),
+                    notify("turn/completed", turn={"id": turn, "status": "failed", "items": [],
+                                                   "error": {"message": raw}})]
         started, completed = [], []
-        for begin, end in items(self.child):
+        pairs = web_items() if web_rows else items(self.child)
+        for begin, end in pairs:
             if begin is not None:
                 started.append(notify("item/started", turnId=turn, item=begin))
             completed.append(notify("item/completed", turnId=turn, item=end))
         diff = notify("turn/diff/updated", turnId=turn,
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
-        settled = [end for _, end in items(self.child)]
+        history, self.history = self.history, []
+        replayed = [notify("item/completed", turnId=turn, item=item) for item in history]
+        settled = [*history, *(end for _, end in pairs)]
         finished = {"id": turn, "status": "completed", "items": settled}
-        answer = {"id": "answer", "type": "agentMessage", "text": "Done.", "phase": None}
+        answer = {"id": "answer", "type": "agentMessage",
+                  "text": "Web references ready." if web_rows else "Done.", "phase": None}
         child_started = [notify("turn/started", threadId=self.child,
                                turn={"id": f"{turn}-child", "status": "inProgress", "items": []})] if starts_child else []
         child_completed = [notify("turn/completed", threadId=self.child,
                                  turn={"id": f"{turn}-child", "status": "completed", "items": []}),
                            notify("thread/status/changed", threadId=self.child, status={"type": "idle"})] if starts_child else []
+        def planned(*states):
+            steps = ("Read the recorded rows", "Check the running items", "Write the summary")
+            return notify("turn/plan/updated", turnId=turn, plan={
+                "explanation": "Fixture plan",
+                "plan": [{"step": step, "status": state} for step, state in zip(steps, states)]})
+        planning = [] if plan is None else [planned("completed", "in_progress", "pending")]
+        settling = [] if plan is None else [planned("completed", "completed", "completed")]
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                *planning,
+                *replayed,
                 *child_started,
-                *started, diff, {"_sleep": PAUSE}, *completed,
+                *started, *([] if web_rows else [diff]),
+                {"_sleep": pause if plan is None else plan}, *completed, *settling,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
@@ -305,16 +379,25 @@ class Scenario:
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self.latest if thread == self.thread else self.child_latest
-            result = {"thread": self.metadata(thread), "model": "fixture-mini",
+            if method == "thread/start":
+                catalog = self.models(codex_home)["data"]
+                default = next((model for model in catalog if model.get("isDefault")), catalog[0])
+                self.model = params.get("model") or default["model"]
+                self.reasoning = params.get("config", {}).get("model_reasoning_effort")
+            result = {"thread": self.metadata(thread), "model": self.model,
+                      "reasoningEffort": self.reasoning,
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
+            if (Path(codex_home) / "fixture-unconfirmed-model").is_file():
+                del result["model"]
         elif method == "thread/read":
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
-            result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
-                       "displayName": "Offline fixture"}], "nextCursor": None}
+            result = self.models(codex_home)
         elif method == "thread/list":
-            result = {"data": [self.metadata(self.child)], "nextCursor": None}
+            result = {"data": [] if any((Path(codex_home) / marker).is_file()
+                                       for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
+                      else [self.metadata(self.child)], "nextCursor": None}
         elif method == "thread/turns/list":
             latest = self.latest if params.get("threadId") == self.thread else self.child_latest
             result = {"data": [latest] if latest else [], "nextCursor": None}
@@ -329,6 +412,13 @@ class Scenario:
             result = {"data": [], "nextCursor": None}
         elif method == "account/read":
             result = {"account": {"type": "chatgpt", "email": "fixture@invalid", "planType": "free"}}
+        elif method == "account/rateLimits/read":
+            # Optional usage: CODEX_HOME/fixture-rate-limits.json holds the
+            # result, such as fixtures/accounts/codex-rate-limits-read.json's.
+            limits = Path(codex_home) / "fixture-rate-limits.json"
+            if not limits.is_file():
+                return [{"id": identifier, "error": {"code": -32601, "message": "The fixture reports no usage"}}]
+            result = json.loads(limits.read_text())
         elif method == "turn/start":
             if params.get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
@@ -336,15 +426,56 @@ class Scenario:
                     or self.child_latest and self.child_latest["status"] == "inProgress"
                     and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
+            pause = PAUSE
+            pause_file = Path(codex_home) / "fixture-turn-pause"
+            if pause_file.is_file():
+                try:
+                    pause = float(pause_file.read_text())
+                    if not 0 <= pause <= 300:
+                        raise ValueError()
+                except ValueError:
+                    raise ValueError("fixture-turn-pause must hold seconds between 0 and 300") from None
             turn = str(uuid.uuid4())
+            audit = Path(codex_home) / "fixture-turn-audit.json"
+            if audit.is_file():
+                with audit.with_suffix(".lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    records = json.loads(audit.read_text().strip() or "[]")
+                    if not isinstance(records, list):
+                        raise ValueError("fixture-turn-audit.json must hold an array")
+                    records = records[-15:] + [{"turnId": turn,
+                                               **{field: params[field] for field in ("model", "effort")
+                                                  if field in params}}]
+                    pending = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="w", dir=audit.parent,
+                                                         prefix=".fixture-turn-audit-", delete=False) as output:
+                            pending = Path(output.name)
+                            output.write(json.dumps(records) + "\n")
+                        pending.replace(audit)
+                    finally:
+                        if pending is not None:
+                            pending.unlink(missing_ok=True)
+            if params.get("model"):
+                self.model = params["model"]
+            if "effort" in params:
+                self.reasoning = params["effort"]
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
             self._advance(self.thread)
-            starts_child = not self.child_latest or self.child_latest["status"] != "inProgress"
+            web_rows = (Path(codex_home) / "fixture-web-rows").is_file()
+            diagnostics = (Path(codex_home) / "fixture-row-diagnostics").is_file()
+            starts_child = not (web_rows or diagnostics) and (not self.child_latest or self.child_latest["status"] != "inProgress")
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child)
+            plan = None
+            marker = Path(codex_home) / "fixture-plan"
+            if not (web_rows or diagnostics) and marker.is_file():
+                held = marker.read_text().strip()
+                plan = float(held) if held.isdigit() else PAUSE
+            after = self.notifications(turn, starts_child, pause=pause, web_rows=web_rows,
+                                       diagnostics=diagnostics, plan=plan)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
@@ -369,6 +500,20 @@ class Scenario:
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
         return [{"id": identifier, "result": result}, *after]
+
+    def models(self, codex_home):
+        """Optional recorded model/list result, private to this fixture's home."""
+        models = Path(codex_home) / "fixture-models.json"
+        if models.is_file():
+            catalog = json.loads(models.read_text())
+            if not isinstance(catalog.get("data"), list) or not catalog["data"]:
+                raise ValueError("fixture-models.json must hold a nonempty model/list result")
+            if any(not isinstance(model.get("model"), str) or not model["model"]
+                   for model in catalog["data"]):
+                raise ValueError("every fixture-models.json model must have a nonempty model ID")
+            return catalog
+        return {"data": [{"id": "fixture-mini", "model": "fixture-mini",
+                          "displayName": "Offline fixture"}], "nextCursor": None}
 
 
 def serve(connection, codex_home, scenario, request_lock):
@@ -428,8 +573,17 @@ def main():
     address = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--listen=")), None)
     if "--listen" in args:
         address = args[args.index("--listen") + 1]
+    if not address and "app-server" in args:
+        # The app's account check: one request per line on stdio, answered
+        # in turn, until the check closes its end.
+        scenario = Scenario()
+        for line in sys.stdin:
+            for response in scenario.request(json.loads(line), str(home)):
+                if "_sleep" not in response:
+                    print(json.dumps(response), flush=True)
+        return
     if not address or not address.startswith("unix://"):
-        raise SystemExit("fixture requires --listen unix://PATH")
+        raise SystemExit("fixture requires --listen unix://PATH or stdio app-server")
     path = Path(address[len("unix://"):])
     if not transport.private_listener(path.parent, runtime) or path.exists() or path.is_symlink():
         raise SystemExit("fixture requires a fresh socket beneath its private runtime")
