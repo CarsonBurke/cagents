@@ -244,7 +244,9 @@ use crate::{
 /// requests changed, so it reads them then rather than polling.
 /// Version 179 appends retryable `StoreBusy` errors for mailbox contention.
 /// Older clients cannot decode the new error code; replace the matched set.
-pub const PROTOCOL_VERSION: u16 = 179;
+/// Version 180 appends agent placement context and a narrow read of managed
+/// agents' accepted task labels, preserving the carried CLI directory layout.
+pub const PROTOCOL_VERSION: u16 = 180;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

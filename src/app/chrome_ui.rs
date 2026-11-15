@@ -27,6 +27,10 @@ pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    /// Accepted spawn labels, read without loading a provider conversation.
+    pub(super) agent_labels: HashMap<crate::model::AgentId, String>,
+    /// Only the exact managed process keeps its spawn label over provider titles.
+    pub(super) agent_title_sources: HashMap<CardId, crate::agent_execution::HostedSession>,
     pub(super) terminal_ordinals: HashMap<CardId, u32>,
     pub(super) terminal_next_ordinals: HashMap<PathBuf, u32>,
     /// Tab visibility follows pane focus even when a creation path already

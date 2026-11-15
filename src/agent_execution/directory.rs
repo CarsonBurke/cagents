@@ -93,6 +93,11 @@ pub struct Entry {
     /// The channel's owning repository, independent of this session's cwd.
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
+    /// Reported for the caller only: the channel its lineage last belonged
+    /// to, which an agent it starts joins when its own view is missing or
+    /// ambiguous.
+    #[serde(skip)]
+    pub lineage_channel: Option<ChannelHome>,
     pub state: ActivityState,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
@@ -104,6 +109,30 @@ pub struct Entry {
     pub relation: Relation,
     /// Stable across this session's relaunches and recoveries.
     pub lineage: super::Lineage,
+}
+
+/// A channel and the project that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHome {
+    pub id: crate::model::ChannelId,
+    pub repository: PathBuf,
+}
+
+/// Placement context uses a new reply so the directory entry remains readable
+/// by CLIs retained across an update. Postcard cannot default an added field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Context {
+    pub sessions: Sessions,
+    pub lineage_channel: Option<ChannelHome>,
+}
+
+impl Context {
+    pub fn into_sessions(mut self) -> Sessions {
+        if let Some(caller) = &mut self.sessions.caller {
+            caller.session.lineage_channel = self.lineage_channel;
+        }
+        self.sessions
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
