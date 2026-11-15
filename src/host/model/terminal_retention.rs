@@ -749,6 +749,7 @@ mod tests {
             before.remove(table).unwrap();
         }
         let scope_value: Scope = serde_json::from_str(&scope).unwrap();
+        let mut migrated_binding = None;
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             let previous = registry
@@ -806,6 +807,18 @@ mod tests {
             }
             let view = super::super::views::read(&registry.db, &scope_value).unwrap();
             assert_eq!((view.revision, view.panes), (7, vec![pane.clone()]));
+            // Schema 25 records each session's channel, backfilled from the
+            // saved view so the terminal keeps it after its pane goes.
+            let Scope::Channel(channel) = &scope_value else {
+                panic!("outbox19 saves a channel view")
+            };
+            assert_eq!(
+                after.remove("session_channels").unwrap(),
+                vec![vec![
+                    rusqlite::types::Value::Text(terminal(&pane).to_string()),
+                    rusqlite::types::Value::Text(channel.to_string())
+                ]]
+            );
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
                 vec![vec![
@@ -813,6 +826,29 @@ mod tests {
                     rusqlite::types::Value::Text(terminal(&pane).to_string())
                 ]]
             );
+            // Schema 26 binds each saved terminal pane to a durable generation.
+            // The backfill advances the registry watermark once so an older
+            // gesture cannot act on the newly initialized binding.
+            let prior_sequence = match before["metadata"][0][2] {
+                rusqlite::types::Value::Integer(sequence) => sequence,
+                ref value => panic!("unexpected metadata sequence: {value:?}"),
+            };
+            let bindings = after.remove("terminal_pane_bindings").unwrap();
+            if let Some(migrated_binding) = &migrated_binding {
+                assert_eq!(&bindings, migrated_binding);
+            } else {
+                let expected = vec![vec![
+                    rusqlite::types::Value::Text(pane.id.to_string()),
+                    rusqlite::types::Value::Integer(prior_sequence + 1),
+                    rusqlite::types::Value::Integer(view.revision as i64),
+                    rusqlite::types::Value::Text(serde_json::to_string(&pane.kind).unwrap()),
+                    rusqlite::types::Value::Null,
+                ]];
+                assert_eq!(bindings, expected);
+                before.get_mut("metadata").unwrap()[0][2] =
+                    rusqlite::types::Value::Integer(prior_sequence + 1);
+                migrated_binding = Some(bindings);
+            }
             assert_eq!(
                 after, before,
                 "every original table value, including audit/outbox/view receipts and placement allocator, must remain exact"

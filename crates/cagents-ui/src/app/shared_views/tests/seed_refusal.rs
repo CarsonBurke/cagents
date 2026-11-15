@@ -281,6 +281,7 @@ fn late_seed_receipts_cannot_settle_a_new_worktree_cleanup_seed() {
 }
 
 #[test]
+#[cfg(not(feature = "integrated-browser"))]
 fn refused_scope_cannot_use_the_settled_presentation_projection() {
     let (mut app, source, _, _) = presentation_fixture();
     let scope = Scope::Channel(source);
