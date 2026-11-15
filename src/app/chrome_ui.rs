@@ -1828,6 +1828,9 @@ impl Cagents {
                 if self.refused_terminal_recovery_target().is_some() {
                     ring.push(Cow::Borrowed("session-recovery.open"));
                 }
+                if self.can_retry_view_seeds() {
+                    ring.push(Cow::Borrowed(super::shared_views::seed_refusal::RETRY_ID));
+                }
                 ring
             }
         }
@@ -1888,24 +1891,29 @@ impl Cagents {
     }
 
     /// The sidebar row that shows the focused pane `card`, made visible:
-    /// the pane's own row while the Attention list draws it, otherwise the
-    /// row of the channel, checkout or folder the pane is in, revealed in
-    /// the unfiltered list, which draws no pane rows.
+    /// the pane's own row wherever the list draws one - the Attention list,
+    /// or a project whose checkouts are hidden - otherwise the row of the
+    /// channel, checkout or folder the pane is in, revealed in the unfiltered
+    /// list. A checkout whose row is hidden leaves its project's.
     pub(super) fn reveal_card_row(&mut self, card: CardId) -> Option<sidebar::SelectionRow> {
         // Unfold only the section that holds the row: a project or In
-        // progress folded for other reasons stays as the user left it.
-        if let Some(shown_on) = self.sidebar_state.attention_card_row(card) {
-            let row = sidebar::SelectionRow::Card(shown_on);
-            match sidebar::attention_place(
+        // progress folded for other reasons stays as the user left it. A list
+        // that draws no pane rows holds none.
+        let pane = self
+            .sidebar_state
+            .attention_card_row(card)
+            .map(sidebar::SelectionRow::Card);
+        if let Some(row) = pane {
+            match sidebar::pane_row_place(
                 &self.sidebar_model,
                 &self.sidebar_state,
                 self.projects_sidebar_mode() == SidebarMode::Compact,
                 row,
             ) {
-                Some(sidebar::AttentionPlace::Project(project)) => {
+                Some(sidebar::PaneRowPlace::Project(project)) => {
                     self.sidebar_state.expand_project(project);
                 }
-                Some(sidebar::AttentionPlace::InProgress) => {
+                Some(sidebar::PaneRowPlace::InProgress) => {
                     self.sidebar_state.unfold_in_progress();
                 }
                 None => {}
@@ -1935,7 +1943,22 @@ impl Cagents {
             Some((project.id, row))
         })?;
         self.sidebar_state.reveal_project(project);
-        Some(row)
+        if let Some(pane) = pane
+            && self.visible_sidebar_rows().contains(&pane)
+        {
+            return Some(pane);
+        }
+        Some(match row {
+            sidebar::SelectionRow::Worktree(..)
+                if !self
+                    .sidebar_state
+                    .worktree_display(project)
+                    .shows_checkouts() =>
+            {
+                sidebar::SelectionRow::Project(project)
+            }
+            row => row,
+        })
     }
 
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
@@ -2260,6 +2283,7 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
+            || self.has_refused_view_seeds()
             || self
                 .save_health
                 .as_ref()
@@ -2363,7 +2387,14 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let recorded_severity = self.notices.severity().max(health_severity);
+        let seed_severity = self
+            .has_refused_view_seeds()
+            .then_some(NoticeSeverity::Warning);
+        let recorded_severity = self
+            .notices
+            .severity()
+            .max(health_severity)
+            .max(seed_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2600,6 +2631,7 @@ impl Cagents {
                         self.session_recovery_action(),
                     ));
                 }
+                notices.extend(self.refused_view_seeds_notice());
                 let mut heading_children = vec![
                     design::heading("Application notices")
                         .width(Length::Fill)

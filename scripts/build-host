@@ -654,7 +654,7 @@ def under_test_limit(command):
     capped = os.path.join(HERE, "memory-capped")
     if not os.access(capped, os.X_OK):
         return command
-    return [sys.executable, "-I", capped, "--slice", TEST_SLICE, *command]
+    return [sys.executable, "-I", capped, "--slice", TEST_SLICE, "--stop-leftovers", *command]
 
 
 def runs_tests(arguments, index):
