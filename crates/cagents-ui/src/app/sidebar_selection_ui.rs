@@ -589,8 +589,11 @@ impl Cagents {
                     .ok_or("The selected channel's project is no longer open.")?;
                 let blocker = if self.channel_ui.is_deleting(id) {
                     Some("Channel deletion is already in progress.".into())
-                } else if !self.unsaved_channel_editors(&channel.cards).is_empty() {
-                    Some("Save or close this channel's unsaved editor buffers first.".into())
+                } else if let Some(editor) = self.unsaved_channel_editors(&channel.cards).first() {
+                    Some(format!(
+                        "Save or discard the unsaved changes in \"{}\" first.",
+                        self.unsaved_editor_name(*editor)
+                    ))
                 } else {
                     None
                 };
