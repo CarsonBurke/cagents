@@ -1,6 +1,5 @@
 use crate::container;
 
-use crate::core::event;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;

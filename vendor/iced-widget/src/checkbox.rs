@@ -537,7 +537,7 @@ where
         };
 
         let bounds = layout.bounds();
-        let is_hovered = cursor.is_over(bounds);
+        let _is_hovered = cursor.is_over(bounds);
         let Rectangle {
             x,
             y,

@@ -10,7 +10,6 @@ use crate::core::{
     self, Clipboard, Element, Length, Rectangle, Shell, Size, Vector, Widget,
 };
 
-use iced_renderer::core::widget::Operation;
 use ouroboros::self_referencing;
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -527,11 +526,11 @@ where
         renderer: &Renderer,
         dnd_rectangles: &mut core::clipboard::DndDestinationRectangles,
     ) {
-        let mut tree = tree
+        let tree = tree
             .state
             .downcast_ref::<Rc<RefCell<Option<Tree>>>>()
             .borrow_mut();
-        let mut tree = tree.as_ref().unwrap();
+        let tree = tree.as_ref().unwrap();
         self.with_element(|element| {
             element.as_widget().drag_destinations(
                 &tree.children[0],

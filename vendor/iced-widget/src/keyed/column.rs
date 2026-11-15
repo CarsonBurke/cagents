@@ -1,7 +1,6 @@
 //! Keyed columns distribute content vertically while keeping continuity.
 //! Distribute content vertically.
 
-use crate::core::event;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;

@@ -2,7 +2,6 @@
 
 use iced_renderer::core::mouse::Click;
 
-use crate::core::event;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;

@@ -37,7 +37,6 @@ use std::borrow::Cow;
 use iced_runtime::core::border::Radius;
 
 use crate::core::alignment;
-use crate::core::border;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::renderer;
@@ -510,7 +509,7 @@ where
 
         let space = style.handle_margin;
 
-        let toggler_background_bounds = Rectangle {
+        let _toggler_background_bounds = Rectangle {
             x: bounds.x,
             y: bounds.y,
             width: bounds.width,
@@ -530,7 +529,7 @@ where
             style.background,
         );
 
-        let padding = (style.padding_ratio * bounds.height).round();
+        let _padding = (style.padding_ratio * bounds.height).round();
         let toggler_foreground_bounds = Rectangle {
             x: bounds.x
                 + if self.is_toggled {
@@ -571,7 +570,7 @@ where
         };
 
         let bounds = layout.bounds();
-        let is_hovered = cursor.is_over(bounds);
+        let _is_hovered = cursor.is_over(bounds);
         let Rectangle {
             x,
             y,

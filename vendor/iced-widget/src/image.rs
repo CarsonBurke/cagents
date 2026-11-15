@@ -293,8 +293,8 @@ fn drawing_bounds<Renderer, Handle>(
     content_fit: ContentFit,
     rotation: Rotation,
     scale: f32,
-    opacity: f32,
-    border_radius: [f32; 4],
+    _opacity: f32,
+    _border_radius: [f32; 4],
 ) -> Rectangle
 where
     Renderer: image::Renderer<Handle = Handle>,

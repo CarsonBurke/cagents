@@ -6,7 +6,7 @@ use crate::core::renderer;
 use crate::core::widget::{self, Tree};
 use crate::core::{
     self, Clipboard, Element, Event, Layout, Point, Rectangle, Shell, Size,
-    Vector, event,
+    Vector,
 };
 use crate::pane_grid::{Draggable, TitleBar};
 
