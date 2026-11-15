@@ -38,6 +38,8 @@ pub(super) struct Title {
     /// The short target an unfamiliar tool's input names, shown under its
     /// name. Empty when the label already says what the call acted on.
     pub(super) target: String,
+    /// Whether the label is the path of the file the call acted on.
+    pub(super) path: bool,
 }
 
 impl Title {
@@ -407,12 +409,26 @@ impl Title {
                 Some(label) => Title {
                     verb: said,
                     label,
-                    target: String::new(),
+                    ..Title::default()
                 },
                 None => Title {
                     verb: said.strip_suffix(" for").unwrap_or(said),
                     ..Title::default()
                 },
+            }
+        };
+        // A call on one file, whose label is that file's path. A path is
+        // not held to the target limit: its row fades it at the start, so
+        // however long it is, its file name stays in view.
+        let file = |verb: Verb, path: &Option<Cow<'_, str>>| {
+            let path = path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && !path.contains(['\n', '\r']))
+                .map(str::to_owned);
+            Title {
+                path: path.is_some(),
+                ..named(verb, path)
             }
         };
         // Codex reports its own pauses by how long they last, as "Wait 5s".
@@ -514,22 +530,19 @@ impl Title {
                 verb("Reading a task", "Read a task", "Tried to read a task"),
                 None,
             ),
-            "NotebookEdit" => named(
+            "NotebookEdit" => file(
                 verb("Editing", "Edited", "Tried to edit"),
-                owned(&fields.notebook_path),
+                &fields.notebook_path,
             ),
-            "Edit" | "MultiEdit" => named(
+            "Edit" | "MultiEdit" => file(
                 verb("Editing", "Edited", "Tried to edit"),
-                owned(&fields.file_path),
+                &fields.file_path,
             ),
-            "Write" => named(
+            "Write" => file(
                 verb("Writing", "Wrote", "Tried to write"),
-                owned(&fields.file_path),
+                &fields.file_path,
             ),
-            "Read" => named(
-                verb("Reading", "Read", "Tried to read"),
-                owned(&fields.file_path),
-            ),
+            "Read" => file(verb("Reading", "Read", "Tried to read"), &fields.file_path),
             "Grep" => named(
                 verb("Searching for", "Searched for", "Tried to search for"),
                 owned(&fields.pattern),
@@ -623,6 +636,7 @@ impl Title {
                 } else {
                     plain(input)
                 },
+                path: false,
             },
         }
     }
@@ -824,6 +838,31 @@ mod tests {
             assert_eq!(shown, expected, "{name}");
             assert!(!shown.contains("Called"), "{name}");
         }
+    }
+
+    #[test]
+    fn a_call_on_one_file_keeps_its_whole_path() {
+        let deep = format!("/work/{}/main.rs", "nested/".repeat(30));
+        let title = Title::of(
+            "Edit",
+            &json!({"file_path": deep, "old_string": "a", "new_string": "b"}).to_string(),
+            ToolStatus::Succeeded,
+        );
+        assert!(title.path);
+        assert_eq!(title.label, deep);
+        let title = Title::of(
+            "Read",
+            &json!({"file_path": "  "}).to_string(),
+            ToolStatus::Succeeded,
+        );
+        assert!(!title.path);
+        assert_eq!(title.line(), "Read");
+        let title = Title::of(
+            "Grep",
+            &json!({"pattern": "a.rs"}).to_string(),
+            ToolStatus::Succeeded,
+        );
+        assert!(!title.path);
     }
 
     /// A refused or failed edit is shown as its call: it says what it tried,
