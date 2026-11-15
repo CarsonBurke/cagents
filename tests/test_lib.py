@@ -100,8 +100,10 @@ if phase == "prune":
     raise SystemExit(config.get("prune_exit", 0))
 
 if phase == "compiler":
-    artifact = dict(reason="compiler-artifact", manifest_path=str(root / "Cargo.toml"),
-                    target=dict(name="cagents", kind=["lib"]),
+    application = sys.argv[sys.argv.index("--package") + 1] == "cagents-ui"
+    manifest = root / "crates/cagents-ui/Cargo.toml" if application else root / "Cargo.toml"
+    artifact = dict(reason="compiler-artifact", manifest_path=str(manifest),
+                    target=dict(name="cagents_ui" if application else "cagents", kind=["lib"]),
                     profile=dict(test=True), executable=str(root / "libtest"))
     variant = config.get("artifact", "valid")
     if variant == "wrong-manifest":
@@ -289,7 +291,8 @@ class TestLib(unittest.TestCase):
         self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
-        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("ui", "test")):
+        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
+                              ("ui", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
@@ -297,11 +300,12 @@ class TestLib(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
                 compiler = self.events("compiler")[0]
+                package = "cagents-ui" if lane == "ui" else "cagents"
                 expected = ["test", "--locked", "--no-default-features", "--manifest-path",
-                            str(self.root / "Cargo.toml"), "--package", "cagents", "--lib",
+                            str(self.root / "Cargo.toml"), "--package", package, "--lib",
                             "--no-run", "--message-format=json-render-diagnostics"]
-                if lane != "cli":
-                    expected += ["--features", lane]
+                expected += {"host": ["--features", "host"],
+                             "shared-ui": ["--features", "ui"]}.get(lane, [])
                 self.assertEqual(compiler["arguments"], expected + extra)
                 self.assertTrue(compiler["held"], events)
                 metadata = self.events("metadata")[0]
@@ -434,7 +438,7 @@ class TestLib(unittest.TestCase):
 
     def test_interleaved_options_and_ignored_prefix_union_with_ordinary_exact(self):
         self.configure(available=["module::ignored", "other::three"])
-        result = self.invoke("ui", "--profile", "dev-runtime", "--prefix", "module::",
+        result = self.invoke("shared-ui", "--profile", "dev-runtime", "--prefix", "module::",
                              "other::three", "--test-threads", "3")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping ignored module::ignored", result.stderr)
@@ -448,6 +452,8 @@ class TestLib(unittest.TestCase):
             (("module::ignored",), {}, "explicit ignored tests"),
             (("--prefix", "absent::"), {}, "selects no tests"),
             (("--prefix", "module::"), {"available": ["module::ignored"]}, "no ordinary tests"),
+            (("--prefix", "module::"), {"available": [], "ignored": []},
+             "lane compiled no library tests"),
         ):
             with self.subTest(names=names):
                 self.clear()

@@ -531,18 +531,18 @@ class Evidence(unittest.TestCase):
         head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], check=True,
                               env=self.env, capture_output=True, text=True).stdout.strip()
         directory = builds / head
-        self.executables(directory)
+        self.executables(directory, checkout)
         if arguments is not None:
             (directory / "arguments").write_text(arguments)
         (builds / ".lock").touch()
         return directory
 
-    def executables(self, directory: Path) -> None:
-        """Executables as build would make them, and what it built them with."""
+    def executables(self, directory: Path, checkout: Path) -> None:
+        """Executables as build would make them of CHECKOUT, and what it built them with."""
         directory.mkdir(parents=True)
         for name in ("cagents", "cagentsd", "cagents-ui"):
             shutil.copy(self.bin / "fixture-cli", directory / name)
-        (directory / "arguments").write_text(self.run_tool("__build-arguments").stdout)
+        (directory / "arguments").write_text(self.run_tool("__build-arguments", cwd=checkout).stdout)
 
     def test_a_main_commit_the_sentinel_built_is_taken_without_compiling(self) -> None:
         checkout = self.checkout()
@@ -578,7 +578,7 @@ class Evidence(unittest.TestCase):
     def test_executables_built_elsewhere_are_moved_into_the_target(self) -> None:
         checkout = self.checkout()
         sent = self.root / "sent"
-        self.executables(sent)
+        self.executables(sent, checkout)
         result = self.run_tool("build", "after", str(checkout), "--executables", str(sent))
         self.assertIn(f"from {sent}", result.stdout)
         self.assertFalse((self.logs / "cargo").exists())
@@ -589,7 +589,7 @@ class Evidence(unittest.TestCase):
     def test_executables_built_otherwise_are_refused(self) -> None:
         checkout = self.checkout()
         sent = self.root / "sent"
-        self.executables(sent)
+        self.executables(sent, checkout)
         (sent / "arguments").write_text("--profile release\n")
         result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
         self.assertNotEqual(result.returncode, 0)
@@ -599,7 +599,7 @@ class Evidence(unittest.TestCase):
     def test_executables_missing_one_are_refused(self) -> None:
         checkout = self.checkout()
         sent = self.root / "sent"
-        self.executables(sent)
+        self.executables(sent, checkout)
         (sent / "cagentsd").unlink()
         result = self.run_tool("build", "after", str(checkout), "--executables", str(sent), check=False)
         self.assertNotEqual(result.returncode, 0)
@@ -805,6 +805,9 @@ class Evidence(unittest.TestCase):
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        # The runner builds the UI as its own package, as this repository lays it out.
+        (checkout / "crates" / "cagents-ui").mkdir(parents=True)
+        shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)
@@ -826,13 +829,16 @@ class Evidence(unittest.TestCase):
     def test_an_integrated_side_builds_and_runs_the_embedded_browser_lane(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        # The runner builds the UI as its own package, as this repository lays it out.
+        (checkout / "crates" / "cagents-ui").mkdir(parents=True)
+        shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)
         subprocess.run([*git, "commit", "-qm", "real runner"], check=True, env=self.env)
         self.run_tool("build", "after", str(checkout), "--integrated")
         built = (self.logs / "cargo").read_text()
-        self.assertIn("--features development,integrated-browser --bin cagents-ui", built)
+        self.assertIn("-p cagents-ui --features development,integrated-browser --bin cagents-ui", built)
         self.assertNotIn("development,ui --bin cagents-ui", built)
         self.assertIn("lane integrated", (self.task / "target-after" / "evidence-source").read_text())
         started = self.run_tool("start", "after", "--instance", "native-review", check=False)

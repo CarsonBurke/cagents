@@ -29,7 +29,7 @@ pub struct Violation {
 impl Violation {
     /// `check` must not contain `{` or `}` unless they mark where `message`
     /// holds a value, as in a format template.
-    pub(crate) fn new(check: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(check: &'static str, message: impl Into<String>) -> Self {
         Self {
             check,
             kind: None,
@@ -73,6 +73,7 @@ impl fmt::Display for Violation {
 /// The format string becomes the rule's check, which is why it has to be a
 /// literal: what it interpolates is the write's content, and the template
 /// alone is not.
+#[macro_export]
 macro_rules! invalid_state {
     ($check:literal $(,)?) => {
         $crate::persistence::StoreError::InvalidState($crate::persistence::Violation::new(

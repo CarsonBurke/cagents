@@ -64,7 +64,7 @@ cli=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents \
 /usr/bin/python3 "$root/scripts/build-ceditor-product" cagentsd \
     --locked --release --no-default-features --features development,host --bin cagentsd >/dev/null
 ui=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents-ui \
-    --locked --release --no-default-features --features development,latency-harness --bin cagents-ui)
+    --locked --release -p cagents-ui --features development,latency-harness --bin cagents-ui)
 sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
 # PATH without mise's shims, which re-execute forever under a moved HOME.
 no_shims=

@@ -94,7 +94,7 @@ fn mount_identity(_root: &Root) -> io::Result<u64> {
 /// placement this does not claim a private namespace, create anything, or
 /// authorize payloads. Sticky bootstrap callers must run this before mkdir,
 /// then acquire RecoveryPlacement on the actual fresh private sibling.
-pub(crate) fn validate_recovery_parent(
+pub fn validate_recovery_parent(
     parent: &Root,
     source: &Root,
     known_roots: &[Arc<Root>],

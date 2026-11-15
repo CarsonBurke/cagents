@@ -157,11 +157,7 @@ impl<'a> ManagedDisplayIndex<'a> {
     /// Shared alias reconciliation may retire an alias before canonical
     /// adoption. Fence replaced/ambiguous canonical evidence without blocking
     /// that existing migration path merely because an alias is present.
-    pub(crate) fn permits_projection(
-        &self,
-        agent: &crate::agent_execution::Agent,
-        pane: &Pane,
-    ) -> bool {
+    pub fn permits_projection(&self, agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
         let id = CardId::from_uuid(agent.id.as_uuid());
         let matches = |pane: &Pane| {
             managed_pane_matches(agent, pane)
