@@ -27386,7 +27386,7 @@ mod tests {
                 );
             }
             assert!(!app.channel_ui.was_deleted(channel));
-            assert!(app.channel_ui.retire_candidates.contains(&home));
+            assert!(app.channel_ui.retire_candidates.contains_key(&home));
             let mut before_ack = Vec::new();
             while let Ok(edit) = published.try_recv() {
                 before_ack.push(edit);

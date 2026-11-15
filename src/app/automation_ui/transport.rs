@@ -44,6 +44,14 @@ impl Connection {
     ) -> Result<Response, crate::control::ControlError> {
         self.client.automation(self.authority.clone(), request)
     }
+
+    /// Stable agent names, read on the same captured connection, so an
+    /// explicit Open names its agent before adoption.
+    pub(in crate::app) fn read_agent_labels(
+        &mut self,
+    ) -> Result<Vec<(crate::model::AgentId, String)>, crate::control::ControlError> {
+        self.client.read_agent_labels().map(|(_, labels)| labels)
+    }
 }
 
 impl Context {

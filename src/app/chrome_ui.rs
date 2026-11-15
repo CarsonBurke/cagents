@@ -2070,6 +2070,7 @@ impl Cagents {
                         self.publish_model_edit(
                             crate::workspace_model::ModelEdit::RetitleChannel { id, title },
                         );
+                        self.note_channel_named(id);
                         self.refresh_sidebar_channels();
                         self.persist();
                         return restore;

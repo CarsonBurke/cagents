@@ -7298,12 +7298,13 @@ mod tests {
         let channel = ChannelId::new();
         Arc::make_mut(&mut app.durable)
             .channels
-            .push(local(channel, project, "Empty", 0));
+            .push(local(channel, project, "", 0));
         app.workspace_model = WorkspaceModel::default();
         let requests = intercept_publishes(&mut app);
         app.allow_empty_channel_sweep();
         assert_eq!(app.channel_ui.sweep, super::super::channel_ui::Sweep::Ready);
-        let mut model = registry(vec![shared(channel, &repository, "Empty", 0)]);
+        // Untitled: a name the person gave would keep it.
+        let mut model = registry(vec![shared(channel, &repository, "", 0)]);
         model.views.push(View::empty(channel));
         let home = crate::channel_work::Home {
             registry: model.identity,
