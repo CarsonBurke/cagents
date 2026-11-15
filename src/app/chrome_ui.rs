@@ -2624,7 +2624,13 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                 ];
-                if !self.notices.is_empty() {
+                // Persistent save health resolves through saving, like the
+                // session writer's notice; Dismiss all applies to the log.
+                if self
+                    .notices
+                    .recent()
+                    .any(|entry| !matches!(entry.notice.key, Some(NoticeKey::TerminalSave(_, _))))
+                {
                     heading_children.push(
                         crate::ui_controls::button::quiet("Dismiss all")
                             .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
