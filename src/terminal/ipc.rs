@@ -246,7 +246,9 @@ use crate::{
 /// Older clients cannot decode the new error code; replace the matched set.
 /// Version 180 appends agent placement context and a narrow read of managed
 /// agents' accepted task labels, preserving the carried CLI directory layout.
-pub const PROTOCOL_VERSION: u16 = 180;
+/// Version 181 appends `RetryPendingTerminalSave` to persist an already
+/// running terminal without launching another worker.
+pub const PROTOCOL_VERSION: u16 = 181;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
