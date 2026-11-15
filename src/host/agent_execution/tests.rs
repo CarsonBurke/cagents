@@ -1800,13 +1800,6 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
             kind: crate::model::CardKind::Terminal(terminal),
             scope: None,
         };
-        store
-            .apply(&ModelEdit::SeedView {
-                scope: scope.clone(),
-                panes: vec![pane.clone()],
-                closed: vec![],
-            })
-            .unwrap();
         (agent, pane, scope)
     };
     let source = agent.session.as_ref().unwrap().id();
@@ -1847,6 +1840,28 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
         record.session.terminal = Some(descriptor.session);
         record.paired_terminal = Some(terminal.clone());
     }
+    // Seed the old store's projection only now. A current spawn publishes its
+    // live descriptor over a matching saved pane, which would replace the
+    // unprovable ended projection this test needs beside the live console.
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .pane_view(pane.id)
+            .unwrap()
+            .and_then(|view| view.panes.into_iter().find(|saved| saved.id == pane.id)),
+        Some(pane.clone()),
+        "the saved pane keeps the legacy ended projection while its console is live"
+    );
     assert!(!terminal.is_completed());
     assert_eq!(
         store
