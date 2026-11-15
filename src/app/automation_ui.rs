@@ -93,6 +93,7 @@ impl Cagents {
             self.refresh_automation_choices();
         }
         let was_draft_dialog = self.automation_ui.draft_dialog_open();
+        let opens_run = matches!(action, Action::OpenSession);
         match self.automation_ui.update(action) {
             None if !was_draft_dialog && self.automation_ui.draft_dialog_open() => {
                 iced::widget::operation::focus(crate::automation_ui::draft_dialog_focus_id())
@@ -125,14 +126,45 @@ impl Cagents {
             }
             Some(Effect::Request { sequence, request }) => {
                 let context = transport::Context::capture();
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || context.request(request))
-                        .await
-                        .unwrap_or_else(|error| Err(error.to_string()));
-                    Message::AutomationUi(Action::Received {
+                iced::Task::future(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let activity = super::request_failure::Activity::automation(&request);
+                        let scoped = context.is_scoped();
+                        let mut client = context.connect(activity)?;
+                        let response = client.request(request).map_err(|error| {
+                            super::request_failure::message(error, activity, scoped)
+                        })?;
+                        // An explicit Open must have its accepted title before
+                        // adoption, even if it overtook the workspace watcher.
+                        let labels = if opens_run {
+                            client
+                                .read_agent_labels()
+                                .map_err(crate::control::ControlError::reason)?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok::<_, String>((response, labels))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
+                })
+                .then(move |result| {
+                    let (result, labels) = match result {
+                        Ok((response, labels)) => (Ok(response), labels),
+                        Err(error) => (Err(error), Vec::new()),
+                    };
+                    let received = cosmic::task::message(Message::AutomationUi(Action::Received {
                         sequence,
                         result: Arc::new(result),
-                    })
+                    }));
+                    if labels.is_empty() {
+                        received
+                    } else {
+                        cosmic::task::message(Message::WorkspaceModelObserved(
+                            super::workspace_model_sync::ModelUpdate::AgentLabels(labels),
+                        ))
+                        .chain(received)
+                    }
                 })
             }
             Some(Effect::OpenRun(detail)) => {

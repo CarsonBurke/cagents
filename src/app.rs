@@ -8687,6 +8687,12 @@ impl Cagents {
     /// Storing it would blank the card header, the card's accessible name and
     /// the window title all at once, so the card keeps the name it already had.
     fn apply_reported_title(&mut self, id: CardId, title: String) -> bool {
+        if self
+            .card_state(id)
+            .is_some_and(|card| self.managed_agent_title(card).is_some())
+        {
+            return false;
+        }
         if self.chrome_ui.user_titles.contains_key(&id) {
             return false;
         }
@@ -9013,6 +9019,30 @@ impl Cagents {
         }
     }
 
+    /// Automatic spawn identity applies only while this card still presents
+    /// the exact managed process. A replacement conversation owns its title.
+    fn managed_agent_title<'a>(&'a self, card: &CardState) -> Option<&'a str> {
+        use crate::agent_execution::HostedSession;
+        let source = self.chrome_ui.agent_title_sources.get(&card.id)?;
+        let matches = match (source, &card.kind) {
+            (HostedSession::Chat(source), CardKind::Chat(current)) => {
+                crate::agent_execution::same_chat_process(source, current)
+            }
+            (HostedSession::Terminal(source), CardKind::Terminal(current)) => {
+                crate::agent_execution::same_terminal_process(source, current)
+            }
+            _ => false,
+        };
+        matches
+            .then(|| {
+                self.chrome_ui
+                    .agent_labels
+                    .get(&crate::model::AgentId::from_uuid(card.id.as_uuid()))
+                    .map(String::as_str)
+            })
+            .flatten()
+    }
+
     /// Provider activity belongs in the status icon, including restored titles.
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
         self.card_display_title_with_chat_title(card, || {
@@ -9075,7 +9105,8 @@ impl Cagents {
             return None;
         };
         let channel = channel?;
-        (card.title == chat_ui::chat_card_title(session.launch.provider)
+        ((card.title == chat_ui::chat_card_title(session.launch.provider)
+            && self.managed_agent_title(card).is_none())
             || (channel.title_source == crate::model::ChannelTitleSource::Manual
                 && self.channel_primary_chat(channel) == Some(card.id)))
         .then_some(channel.title.as_str())
@@ -9097,6 +9128,9 @@ impl Cagents {
         if matches!(card.kind, CardKind::Chat(_))
             && let Some(title) = chat_title()
         {
+            return title;
+        }
+        if let Some(title) = self.managed_agent_title(card) {
             return title;
         }
         let title = crate::agent::codex_title_without_status(&card.title);

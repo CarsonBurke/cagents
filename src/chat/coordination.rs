@@ -230,6 +230,9 @@ pub struct Run {
     pub effort: String,
     pub channel: Option<crate::model::ChannelId>,
     pub placement: Option<crate::agent_execution::Placement>,
+    /// The channel it went to, where the CLI said that is not the starting
+    /// conversation's own view.
+    pub placed_in: Option<crate::control::PlacedIn>,
     /// Where the command waited on it, how the run stood when it stopped.
     pub state: Option<crate::agent_execution::State>,
     pub timed_out: bool,
