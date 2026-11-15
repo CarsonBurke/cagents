@@ -104,6 +104,16 @@ fn fixture_with(unsent: bool) -> Fixture {
         Vec::new(),
     ));
     app.workspace_model.identity = home.registry;
+    // The registry lists every project its channels belong to; closing a
+    // shared pane checks its source against that.
+    app.workspace_model
+        .projects
+        .push(crate::workspace_model::ModelProject {
+            repository: path.clone(),
+            name: "project".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        });
     app.workspace_model.channels.push(ModelChannel {
         id: channel,
         repository: path,
