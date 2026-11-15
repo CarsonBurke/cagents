@@ -1333,7 +1333,15 @@ class Evidence(unittest.TestCase):
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
             runner_lines = (self.logs / "runner").read_text().splitlines()
             self.assertEqual(len(runner_lines), 2)
-            self.assertIn("--fresh-daemon", shlex.split(runner_lines[0]))
+            if scoped:
+                # The User CLI resets first; the scoped UI cannot restart it.
+                self.assertNotIn("--fresh-daemon", shlex.split(runner_lines[0]))
+                cli_lines = (self.logs / "cli").read_text().splitlines()
+                reset = "daemon stop-for-rebuild --including-subagents"
+                self.assertEqual(cli_lines.count(reset), 1)
+                self.assertLess(cli_lines.index(reset), cli_lines.index("daemon start"))
+            else:
+                self.assertIn("--fresh-daemon", shlex.split(runner_lines[0]))
             self.assertNotIn("--fresh-daemon", shlex.split(runner_lines[1]))
             if workspace_trace:
                 self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
