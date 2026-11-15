@@ -2730,7 +2730,11 @@ impl State {
                     content = content.push(crate::design::body(diagnostic));
                 }
                 if let Some(result) = run.run.as_ref().map(|run| &run.result) {
-                    content = content.push(crate::design::body(result.text.as_str()));
+                    // A run that never started has no result text; an empty
+                    // body would leave a blank row above the controls.
+                    if !result.text.is_empty() {
+                        content = content.push(crate::design::body(result.text.as_str()));
+                    }
                     if let Some(diagnostic) = &result.diagnostic
                         && run.firing.diagnostic.as_ref() != Some(diagnostic)
                     {
@@ -4667,6 +4671,23 @@ mod tests {
             ] {
                 outline.text(text);
             }
+        }
+    }
+
+    #[test]
+    fn run_details_without_result_text_render_no_blank_body() {
+        let diagnostic = "Cannot start claude: No such file or directory (os error 2)";
+        let state = State {
+            run: Some(diagnostic_run(Some(diagnostic), Some(diagnostic))),
+            ..Default::default()
+        };
+        for width in [360.0, 900.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            assert!(
+                outline.texts.iter().all(|(text, _)| !text.is_empty()),
+                "no empty result body at width {width}"
+            );
+            outline.text(diagnostic);
         }
     }
 
