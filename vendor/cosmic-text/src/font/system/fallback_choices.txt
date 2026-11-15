@@ -1,0 +1,288 @@
+SansSerif 100 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 100 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 100 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 100 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 100 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 100 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 300 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 300 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 300 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 300 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 300 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 300 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 400 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 400 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 400 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 400 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 400 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 400 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 500 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 500 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 500 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 500 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 500 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 500 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 700 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 700 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 700 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 700 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 700 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 700 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 900 Normal Hello 123: Noto Sans 400 Normal
+SansSerif 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 900 Normal שלום: Noto Sans Hebrew 400 Normal
+SansSerif 900 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+SansSerif 900 Italic Hello 123: Noto Sans 400 Normal
+SansSerif 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+SansSerif 900 Italic שלום: Noto Sans Hebrew 400 Normal
+SansSerif 900 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+Serif 100 Normal Hello 123: Inter 400 Normal
+Serif 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 100 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 100 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 100 Italic Hello 123: Inter 400 Normal
+Serif 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 100 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 100 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 300 Normal Hello 123: Inter 400 Normal
+Serif 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 300 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 300 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 300 Italic Hello 123: Inter 400 Normal
+Serif 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 300 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 300 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 400 Normal Hello 123: Inter 400 Normal
+Serif 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 400 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 400 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 400 Italic Hello 123: Inter 400 Normal
+Serif 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 400 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 400 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 500 Normal Hello 123: Inter 400 Normal
+Serif 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 500 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 500 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 500 Italic Hello 123: Inter 400 Normal
+Serif 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 500 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 500 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 700 Normal Hello 123: Inter 400 Normal
+Serif 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 700 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 700 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 700 Italic Hello 123: Inter 400 Normal
+Serif 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 700 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 700 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 900 Normal Hello 123: Inter 400 Normal
+Serif 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+Serif 900 Normal שלום: Noto Sans Hebrew 400 Normal
+Serif 900 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Serif 900 Italic Hello 123: Inter 400 Normal
+Serif 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+Serif 900 Italic שלום: Noto Sans Hebrew 400 Normal
+Serif 900 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Monospace 100 Normal Hello 123: Fira Mono 500 Normal
+Monospace 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 100 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 100 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 100 Italic Hello 123: Fira Mono 500 Normal
+Monospace 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 100 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 100 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 300 Normal Hello 123: Fira Mono 500 Normal
+Monospace 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 300 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 300 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 300 Italic Hello 123: Fira Mono 500 Normal
+Monospace 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 300 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 300 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 400 Normal Hello 123: Fira Mono 500 Normal
+Monospace 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 400 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 400 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 400 Italic Hello 123: Fira Mono 500 Normal
+Monospace 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 400 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 400 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 500 Normal Hello 123: Fira Mono 500 Normal
+Monospace 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 500 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 500 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 500 Italic Hello 123: Fira Mono 500 Normal
+Monospace 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 500 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 500 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 700 Normal Hello 123: Fira Mono 500 Normal
+Monospace 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 700 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 700 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 700 Italic Hello 123: Fira Mono 500 Normal
+Monospace 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 700 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 700 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 900 Normal Hello 123: Fira Mono 500 Normal
+Monospace 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+Monospace 900 Normal שלום: Noto Sans Hebrew 400 Normal
+Monospace 900 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Monospace 900 Italic Hello 123: Fira Mono 500 Normal
+Monospace 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+Monospace 900 Italic שלום: Noto Sans Hebrew 400 Normal
+Monospace 900 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Inter") 100 Normal Hello 123: Inter 400 Normal
+Name("Inter") 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 100 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 100 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 100 Italic Hello 123: Inter 400 Normal
+Name("Inter") 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 100 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 100 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 300 Normal Hello 123: Inter 400 Normal
+Name("Inter") 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 300 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 300 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 300 Italic Hello 123: Inter 400 Normal
+Name("Inter") 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 300 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 300 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 400 Normal Hello 123: Inter 400 Normal
+Name("Inter") 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 400 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 400 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 400 Italic Hello 123: Inter 400 Normal
+Name("Inter") 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 400 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 400 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 500 Normal Hello 123: Inter 400 Normal
+Name("Inter") 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 500 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 500 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 500 Italic Hello 123: Inter 400 Normal
+Name("Inter") 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 500 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 500 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 700 Normal Hello 123: Inter 400 Normal
+Name("Inter") 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 700 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 700 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 700 Italic Hello 123: Inter 400 Normal
+Name("Inter") 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 700 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 700 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 900 Normal Hello 123: Inter 400 Normal
+Name("Inter") 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 900 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 900 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter") 900 Italic Hello 123: Inter 400 Normal
+Name("Inter") 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter") 900 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter") 900 Italic Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Inter Variable") 100 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 100 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 100 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 100 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 100 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 100 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Inter Variable") 300 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 300 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 300 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 300 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 300 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 300 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Inter Variable") 400 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 400 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 400 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 400 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 400 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 400 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Inter Variable") 500 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 500 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 500 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 500 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 500 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 500 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Inter Variable") 700 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 700 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 700 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 700 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 700 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 700 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Inter Variable") 900 Normal Hello 123: Inter Variable 400 Normal
+Name("Inter Variable") 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 900 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 900 Normal Hi مرحبا שלום ok: Inter Variable 400 Normal, Noto Sans Hebrew 400 Normal, Inter Variable 400 Normal, Noto Sans Arabic 400 Normal, Inter Variable 400 Normal
+Name("Inter Variable") 900 Italic Hello 123: Inter Variable 400 Italic
+Name("Inter Variable") 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Inter Variable") 900 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Inter Variable") 900 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Missing") 100 Normal Hello 123: Inter 400 Normal
+Name("Missing") 100 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 100 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 100 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Missing") 100 Italic Hello 123: Inter Variable 400 Italic
+Name("Missing") 100 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 100 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 100 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Missing") 300 Normal Hello 123: Inter 400 Normal
+Name("Missing") 300 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 300 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 300 Normal Hi مرحبا שלום ok: Inter 400 Normal, Noto Sans Hebrew 400 Normal, Inter 400 Normal, Noto Sans Arabic 400 Normal, Inter 400 Normal
+Name("Missing") 300 Italic Hello 123: Inter Variable 400 Italic
+Name("Missing") 300 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 300 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 300 Italic Hi مرحبا שלום ok: Inter Variable 400 Italic, Noto Sans Hebrew 400 Normal, Inter Variable 400 Italic, Noto Sans Arabic 400 Normal, Inter Variable 400 Italic
+Name("Missing") 400 Normal Hello 123: Noto Sans 400 Normal
+Name("Missing") 400 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 400 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 400 Normal Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+Name("Missing") 400 Italic Hello 123: Noto Sans 400 Normal
+Name("Missing") 400 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 400 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 400 Italic Hi مرحبا שלום ok: Noto Sans 400 Normal, Noto Sans Hebrew 400 Normal, Noto Sans 400 Normal, Noto Sans Arabic 400 Normal, Noto Sans 400 Normal
+Name("Missing") 500 Normal Hello 123: Fira Mono 500 Normal
+Name("Missing") 500 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 500 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 500 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Missing") 500 Italic Hello 123: Fira Mono 500 Normal
+Name("Missing") 500 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 500 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 500 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Missing") 700 Normal Hello 123: Fira Mono 500 Normal
+Name("Missing") 700 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 700 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 700 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Missing") 700 Italic Hello 123: Fira Mono 500 Normal
+Name("Missing") 700 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 700 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 700 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Missing") 900 Normal Hello 123: Fira Mono 500 Normal
+Name("Missing") 900 Normal مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 900 Normal שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 900 Normal Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal
+Name("Missing") 900 Italic Hello 123: Fira Mono 500 Normal
+Name("Missing") 900 Italic مرحبا: Noto Sans Arabic 400 Normal
+Name("Missing") 900 Italic שלום: Noto Sans Hebrew 400 Normal
+Name("Missing") 900 Italic Hi مرحبا שלום ok: Fira Mono 500 Normal, Noto Sans Hebrew 400 Normal, Fira Mono 500 Normal, Noto Sans Arabic 400 Normal, Fira Mono 500 Normal

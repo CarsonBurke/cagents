@@ -269,6 +269,7 @@ fn announce(host: &SharedHost, home: Home, sequence: u64) {
             0,
             sequence,
             &crate::workspace_model::ModelEdit::ChannelWorkChanged { home },
+            &Default::default(),
         );
 }
 

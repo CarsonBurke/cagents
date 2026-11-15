@@ -317,8 +317,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn isolated_git_test(name: &str) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn isolated_git_test(name: &str) -> bool {
     use std::{
         io::Write,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -414,8 +415,9 @@ pub(crate) fn isolated_git_test(name: &str) -> bool {
     true
 }
 
-#[cfg(test)]
-pub(crate) fn retained_managed_fixture_directory() -> tempfile::TempDir {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn retained_managed_fixture_directory() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let parent = std::env::var_os("CAGENTS_MANAGED_DIRECTORY_ROOT")
         .expect("owning private managed-directory contract namespace");

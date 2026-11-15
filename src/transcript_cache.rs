@@ -12,10 +12,7 @@ use std::{
 #[cfg(feature = "host")]
 use std::{
     fs::{File, OpenOptions},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, OpenOptionsExt},
-    },
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
 };
 
 #[cfg(feature = "host")]
@@ -53,24 +50,18 @@ fn private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(feature = "host")]
-fn lock(file: &File, operation: i32) -> io::Result<()> {
-    // SAFETY: the descriptor remains live and flock accepts scalar flags.
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(feature = "host")]
-pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, File)> {
-    let gate = private_file(&root.join("transcript-cache.lock"))?;
-    lock(&gate, libc::LOCK_SH)?;
+pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, crate::instance::OwnedLock)> {
+    let _gate = crate::instance::owned_file_lock(
+        private_file(&root.join("transcript-cache.lock"))?,
+        libc::LOCK_SH,
+    )?;
     let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
     fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let result = (|| {
-        let lease = private_file(&directory.join(LEASE))?;
-        lock(&lease, libc::LOCK_EX | libc::LOCK_NB)?;
+        let lease = crate::instance::owned_file_lock(
+            private_file(&directory.join(LEASE))?,
+            libc::LOCK_EX | libc::LOCK_NB,
+        )?;
         Ok((directory.clone(), lease))
     })();
     if result.is_err() {
@@ -202,10 +193,24 @@ pub(crate) fn sweep(root: &Path) -> io::Result<Usage> {
     sweep_with_procfs(root, Path::new("/proc"))
 }
 
+/// How long a dead helper's undrained journal stays as evidence after its
+/// last write. Nothing reopens such a journal (each helper creates its own
+/// exclusively), so after this it only holds RAM in the runtime directory.
+#[cfg(feature = "host")]
+pub(crate) const ORPHANED_JOURNAL_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
 #[cfg(feature = "host")]
 fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
-    let gate = private_file(&root.join("transcript-cache.lock"))?;
-    lock(&gate, libc::LOCK_EX)?;
+    sweep_at(root, proc_root, std::time::SystemTime::now())
+}
+
+#[cfg(feature = "host")]
+fn sweep_at(root: &Path, proc_root: &Path, now: std::time::SystemTime) -> io::Result<Usage> {
+    let _gate = crate::instance::owned_file_lock(
+        private_file(&root.join("transcript-cache.lock"))?,
+        libc::LOCK_EX,
+    )?;
     let directories = cache_directories(root)?;
     let legacy_open = if directories.iter().any(|path| !path.join(LEASE).exists()) {
         // Failure is conservative: leave legacy caches for a later startup.
@@ -227,12 +232,15 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        match lock(&lease, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(()) => {}
+        let _lease = match crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lease) => lease,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error),
-        }
-        if !actor_journal::reclaimable(&directory)? {
+        };
+        // The lease is ours, so no helper or store owns this cache now.
+        if !actor_journal::reclaimable(&directory)?
+            && !actor_journal::orphan_expired(&directory, now, ORPHANED_JOURNAL_RETENTION)?
+        {
             continue;
         }
         let mut entries = match fs::read_dir(&directory) {
@@ -456,5 +464,34 @@ mod tests {
         assert_eq!(usage(root.path()).unwrap().count, 0);
         assert_eq!(sweep(root.path()).unwrap().count, 0);
         assert!(unrelated.path().join("keep").exists());
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_counts_cache_directories_and_their_direct_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("payload"), b"outside").unwrap();
+        let cache = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(1)));
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("transcript.sqlite"), b"abc").unwrap();
+        fs::create_dir(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested/file"), b"not direct").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("payload"), cache.join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            root.path()
+                .join(format!("chat-{}", uuid::Uuid::from_u128(2))),
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("chat-not-a-uuid")).unwrap();
+        let observed = usage(root.path()).unwrap();
+        assert_eq!((observed.count, observed.bytes), (1, 3));
     }
 }

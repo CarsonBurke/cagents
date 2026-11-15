@@ -54,6 +54,41 @@ pub struct Catalog {
     pub models: Vec<Model>,
     /// Unix milliseconds at which the provider listed them.
     pub observed_at: u64,
+    /// Last model explicitly advertised as the provider's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Advertised defaults, separate from a conversation's chosen override.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_defaults: BTreeMap<String, String>,
+}
+
+impl Catalog {
+    pub fn default_effort(&self, selected: Option<&str>) -> Option<&str> {
+        let model = selected.or(self.default_model.as_deref())?;
+        self.reasoning_defaults.get(model).map(String::as_str)
+    }
+
+    /// A live list can omit defaults that a probe already reported. Keep
+    /// those observations while their models and effort levels remain valid.
+    pub fn inherit_defaults(&mut self, previous: &Self) {
+        if self.default_model.is_none() {
+            self.default_model = previous
+                .default_model
+                .clone()
+                .filter(|id| self.models.iter().any(|model| &model.id == id));
+        }
+        for (id, effort) in &previous.reasoning_defaults {
+            if self
+                .models
+                .iter()
+                .any(|model| &model.id == id && model.reasoning.contains(effort))
+            {
+                self.reasoning_defaults
+                    .entry(id.clone())
+                    .or_insert_with(|| effort.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -64,6 +99,45 @@ struct Document {
     /// build that predates it reads the rest, and drops it when it writes.
     #[serde(default, deserialize_with = "readable_catalogs")]
     catalogs: BTreeMap<Provider, Catalog>,
+    /// Added after the first version, like `catalogs`: each account's
+    /// settled disagreement between two records of its login, by account
+    /// key. A build that predates it drops it when it writes, which only
+    /// shows a settled disagreement again until it is settled again. Each
+    /// is read on its own, so one this build cannot read costs only itself.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_settlements"
+    )]
+    settled: BTreeMap<String, Settled>,
+}
+
+/// How two records of one login's identity, which named different logins,
+/// were settled (see [`Identity::disputed_by`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Settled {
+    /// A sign-in that cagents ran for the account finished at `at`, in Unix
+    /// milliseconds: the record the CLI reads is the one that sign-in wrote,
+    /// so the disagreement the probe that follows it sees is settled in its
+    /// favour (see [`super::claude::SIGN_IN_SETTLES_FOR`]).
+    SignedIn { at: u64 },
+    /// The CLI's record, naming `reported`, was written by a sign-in after
+    /// the other record, naming `other`: the disagreement between exactly
+    /// these two is settled, and any other is shown again.
+    Reported { reported: String, other: String },
+}
+
+fn readable_settlements<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Settled>, D::Error> {
+    let serde_json::Value::Object(settled) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(settled
+        .into_iter()
+        .filter_map(|(key, settled)| Some((key, Settled::deserialize(settled).ok()?)))
+        .collect())
 }
 
 /// Each provider's list is read on its own, so one this build cannot read -
@@ -169,7 +243,7 @@ impl Cache {
 
     /// Remembers what `provider` listed, unless another window has written
     /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
-    pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
+    pub fn store_catalog(&self, provider: Provider, mut catalog: Catalog) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
@@ -184,8 +258,54 @@ impl Cache {
         {
             return Ok(());
         }
+        if let Some(previous) = document.catalogs.get(&provider) {
+            catalog.inherit_defaults(previous);
+        }
         document.catalogs.insert(provider, catalog);
         self.write(&document)
+    }
+
+    /// How the disagreement between two records of the login of the account
+    /// filed under `key` was last settled, if it was.
+    pub fn settled(&self, key: &str) -> Option<Settled> {
+        read_document(&self.path())?.settled.remove(key)
+    }
+
+    /// Records how the disagreement over `key`'s login is settled, or with
+    /// `None`, that nothing is.
+    pub fn settle(&self, key: &str, settled: Option<Settled>) -> io::Result<()> {
+        self.settle_with(key, |_, _| ((), Some(settled)))
+    }
+
+    /// Decides how the disagreement over `key`'s login is settled from the
+    /// settlement on record and the identity last cached for `key`, with no
+    /// other window settling it in between. `decide` returns its answer and
+    /// `None` to leave the settlement, or the settlement to record instead.
+    pub fn settle_with<T>(
+        &self,
+        key: &str,
+        decide: impl FnOnce(Option<&Settled>, Option<&Identity>) -> (T, Option<Option<Settled>>),
+    ) -> io::Result<T> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        let previous = document
+            .entries
+            .get(key)
+            .and_then(|entry| entry.identity.as_ref());
+        let (answer, settle) = decide(document.settled.get(key), previous);
+        let changed = match settle {
+            None => false,
+            Some(Some(settled)) => {
+                document.settled.insert(key.to_owned(), settled.clone()) != Some(settled)
+            }
+            Some(None) => document.settled.remove(key).is_some(),
+        };
+        if changed {
+            document.version = VERSION;
+            self.write(&document)?;
+        }
+        Ok(answer)
     }
 
     /// Forgets the entries no account in `keep` refers to that are older
@@ -200,6 +320,10 @@ impl Cache {
                 .entries
                 .iter()
                 .any(|(key, entry)| !keep.contains(key) && !current(entry, now))
+                || document
+                    .settled
+                    .keys()
+                    .any(|key| !keep.contains(key) && !document.entries.contains_key(key))
         };
         if !read_document(&path).is_some_and(|document| orphaned(&document)) {
             return Ok(());
@@ -211,6 +335,10 @@ impl Cache {
         document
             .entries
             .retain(|key, entry| keep.contains(key) || current(entry, now));
+        let entries = &document.entries;
+        document
+            .settled
+            .retain(|key, _| keep.contains(key) || entries.contains_key(key));
         self.write(&document)
     }
 
@@ -306,6 +434,7 @@ mod tests {
                 email: Some("user@example.com".into()),
                 organization: None,
                 plan: Some("max".into()),
+                disputed_by: None,
             }),
             snapshot,
         }
@@ -474,6 +603,78 @@ mod tests {
         assert!(!empty.path().join("nested").exists());
     }
 
+    #[test]
+    fn a_settled_disagreement_is_kept_beside_the_figures_until_its_account_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        assert_eq!(cache.settled("system"), None);
+        cache
+            .settle("system", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        cache.store("system", entry(1, "figures")).unwrap();
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 5 }));
+        let settled = Settled::Reported {
+            reported: "me@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        cache.settle("system", Some(settled.clone())).unwrap();
+        cache
+            .settle("gone", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        assert_eq!(cache.settled("system"), Some(settled.clone()));
+        assert_eq!(cache.load(10).len(), 1);
+        // An account no one refers to takes its settlement with it.
+        cache
+            .prune(&BTreeSet::from(["system".to_owned()]), 100 * ORPHAN_AFTER)
+            .unwrap();
+        assert_eq!(cache.settled("system"), Some(settled));
+        assert_eq!(cache.settled("gone"), None);
+        cache.settle("system", None).unwrap();
+        assert_eq!(cache.settled("system"), None);
+    }
+
+    /// A settlement a later build records in a way this one cannot read
+    /// costs only itself, never the figures beside it.
+    #[test]
+    fn an_unreadable_settlement_costs_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        cache
+            .settle("work", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        let path = cache.path();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["settled"]["system"] = serde_json::json!({"state": "from_a_later_build"});
+        std::fs::write(&path, document.to_string()).unwrap();
+        assert_eq!(cache.load(10).len(), 1);
+        assert_eq!(cache.settled("system"), None);
+        assert_eq!(cache.settled("work"), Some(Settled::SignedIn { at: 5 }));
+    }
+
+    /// The settlement and the identity last cached are read, and the new
+    /// settlement written, under one lock.
+    #[test]
+    fn a_settlement_is_decided_from_what_is_on_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        let seen = cache
+            .settle_with("system", |settled, identity| {
+                assert_eq!(settled, None);
+                let email = identity.and_then(|identity| identity.email.clone());
+                (email, Some(Some(Settled::SignedIn { at: 7 })))
+            })
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("user@example.com"));
+        let kept = cache
+            .settle_with("system", |settled, _| (settled.cloned(), None))
+            .unwrap();
+        assert_eq!(kept, Some(Settled::SignedIn { at: 7 }));
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 7 }));
+    }
+
     fn catalog(observed_at: u64, id: &str) -> Catalog {
         Catalog {
             models: vec![Model {
@@ -482,7 +683,61 @@ mod tests {
                 reasoning: vec!["high".into()],
             }],
             observed_at,
+            default_model: None,
+            reasoning_defaults: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn catalog_defaults_round_trip_and_survive_partial_live_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut known = catalog(1, "model");
+        known.models[0].reasoning = vec!["medium".into(), "high".into()];
+        known.default_model = Some("model".into());
+        known
+            .reasoning_defaults
+            .insert("model".into(), "medium".into());
+        cache.store_catalog(Provider::Codex, known.clone()).unwrap();
+        assert_eq!(cache.catalogs(u64::MAX)[&Provider::Codex], known);
+        let mut partial = known.clone();
+        partial.observed_at = 2;
+        partial.default_model = None;
+        partial.reasoning_defaults.clear();
+        cache.store_catalog(Provider::Codex, partial).unwrap();
+        let restored = cache.catalogs(u64::MAX).remove(&Provider::Codex).unwrap();
+        assert_eq!(restored.default_effort(None), Some("medium"));
+        assert_eq!(restored.default_effort(Some("model")), Some("medium"));
+        let mut changed = restored.clone();
+        changed
+            .reasoning_defaults
+            .insert("model".into(), "high".into());
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_effort(None),
+            Some("high"),
+            "new reports win"
+        );
+        changed.reasoning_defaults.clear();
+        changed.models[0].reasoning = vec!["high".into()];
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_effort(None),
+            None,
+            "removed efforts are not inherited"
+        );
+        changed.models.clear();
+        changed.default_model = None;
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_model, None,
+            "removed models are not inherited"
+        );
+        let legacy: Catalog = serde_json::from_value(serde_json::json!({
+            "models": [], "observed_at": 1
+        }))
+        .unwrap();
+        assert_eq!(legacy.default_effort(None), None);
     }
 
     /// Each provider's list is kept beside the figures, and the newer of two

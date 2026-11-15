@@ -328,7 +328,12 @@ fn reap() -> io::Result<bool> {
 pub fn actor_command(kind: &str, root: &Path) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", &std::env::var(TEST).unwrap(), "--test-threads=1"])
+        .args([
+            "--include-ignored",
+            "--exact",
+            &std::env::var(TEST).unwrap(),
+            "--test-threads=1",
+        ])
         .env(STAGE, kind)
         .env(ROOT, root)
         .stdin(Stdio::null())
@@ -446,7 +451,13 @@ fn isolated_with_rescue_control(
             let stderr = File::create(root.path().join("guardian.stderr")).unwrap();
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
-                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .args([
+                    "--include-ignored",
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .env(STAGE, "guardian")
                 .env(ROOT, root.path())
                 .env(TEST, name)
