@@ -611,6 +611,11 @@ impl RemoteActor {
         other
     }
     #[cfg(test)]
+    pub(in crate::chat::runtime) fn confirm_session_fixture(&self, session: String) {
+        let mut state = self.0.state.lock().unwrap();
+        Arc::make_mut(&mut state).confirmed_session = Some(session);
+    }
+    #[cfg(test)]
     pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
         let actor = Self::fixture();
         {
