@@ -136,7 +136,7 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
             focused: Some(card),
         });
     app.workspace_model.identity = uuid::Uuid::new_v4();
-    let (published, requests) = async_channel::unbounded();
+    let (published, requests) = test_model_channel();
     app.workspace_model_tx = published;
     let task = app.start_chat_draft(target);
     let candidate = app.chat_ui.draft_checkpoints[&card].candidate.clone();
@@ -1180,7 +1180,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         });
         let scope = Scope::Channel(channel);
         app.acknowledge_view_edit(scope.clone(), None);
-        let (sender, published) = async_channel::unbounded();
+        let (sender, published) = test_model_channel();
         app.workspace_model_tx = sender;
         let (writer, _) = crate::session::SessionRuntime::open(
             directory.path().join("state.sqlite3"),
