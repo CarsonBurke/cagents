@@ -213,6 +213,46 @@ pub(super) mod tests {
         (focused, captured)
     }
 
+    /// Tab and Shift+Tab within a dialog pass over a button that cannot act.
+    #[test]
+    fn dialog_tab_passes_over_disabled_buttons() {
+        let ids = ["first", "disabled", "last"].map(widget::Id::new);
+        let dialog = || {
+            confirmation_surface(
+                widget::row::with_children(
+                    ids.iter()
+                        .enumerate()
+                        .map(|(index, id)| {
+                            widget::button::text("Action")
+                                .id(id.clone())
+                                .on_press_maybe((index != 1).then(|| {
+                                    Message::UpdateUi(super::super::update_ui::Action::CopyDetails)
+                                }))
+                                .into()
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                400.0,
+            )
+        };
+        let tab = key_press(keyboard::key::Named::Tab);
+        assert_eq!(
+            focus_after_key(dialog(), ids[0].clone(), tab.clone()),
+            (Some(ids[2].clone()), true),
+            "Tab passes over the disabled button"
+        );
+        assert_eq!(
+            focus_after_key(dialog(), ids[2].clone(), shift_tab()),
+            (Some(ids[0].clone()), true),
+            "Shift+Tab passes over it too"
+        );
+        assert_eq!(
+            focus_after_key(dialog(), ids[1].clone(), tab),
+            (Some(ids[2].clone()), true),
+            "Tab moves on from a button disabled while focused"
+        );
+    }
+
     pub(in crate::app) fn space() -> keyboard::Event {
         let keyboard::Event::KeyPressed {
             physical_key,
