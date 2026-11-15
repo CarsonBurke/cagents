@@ -559,6 +559,7 @@ impl Cagents {
                 _ => Task::none(),
             };
         }
+        self.materialize_replica_snapshot();
         self.snapshot_workspace_scope();
         let left = self
             .durable
@@ -958,6 +959,7 @@ impl Cagents {
             }
         }
         drop(roots);
+        self.materialize_replica_snapshot();
         if was_channel {
             self.snapshot_workspace_scope();
         }

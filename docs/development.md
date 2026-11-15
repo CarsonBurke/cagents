@@ -1,5 +1,6 @@
 # Development
 
+- [Tasks](#tasks)
 - [Prerequisites](#prerequisites)
 - [Feature boundaries](#feature-boundaries)
 - [Development runner](#development-runner)
@@ -27,9 +28,62 @@ check Cargo's exit status before selecting an executable. The module is shipped
 beside the HOST test helper in gate installations and remote slots; isolated
 Python entry points explicitly import their own companion directory.
 
-[Issue #2780](https://github.com/CarsonBurke/cagents/issues/2780) tracks adopting
-mise tasks as the supported command interface while preserving the build and
-development contracts below.
+## Tasks
+
+[mise](https://mise.jdx.dev/) tasks are the supported way to set up, run, check,
+test and package cagents. `mise tasks` lists them, and `mise run TASK --help`
+shows a task's arguments. Tasks compose the scripts in `scripts/`, which keep the
+build admission, process and verification logic; Cargo still resolves
+dependencies and compiles. Run tasks from anywhere in the checkout.
+
+| Task | What it does |
+| --- | --- |
+| `setup` | Install the pinned Zig (`mise install`) and Rust (`rust-toolchain.toml`), then run `doctor` |
+| `doctor` | Report each missing prerequisite with its fix, and whether the build host answers |
+| `dev` | Run the browserless [development UI](#development-runner) |
+| `dev:browser` | Run the development UI with the embedded browser |
+| `check:cli`, `check:host`, `check:ui` | Type-check one [lane](#feature-boundaries), all targets by default |
+| `check:browser`, `check:editor` | Type-check the integrated-browser UI client or ceditor |
+| `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
+| `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
+| `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
+| `test` | The three lane test suites, one after another |
+| `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
+| `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
+| `fmt`, `fmt:check` | Format, or check the formatting of, Cargo roots and the Rust sources behind `include!` |
+| `ci` | What GitHub CI runs: `fmt:check`, `check:protocol` and `test:scripts`; none of it compiles Rust |
+| `install` | [Install your checkout](#installing-your-checkout) |
+| `package`, `package:smoke` | Build Linux packages; exercise package upgrades in a networkless root |
+| `release:build`, `release:verify` | [Build a release](releasing.md#building-a-release) from a tag; verify a bundle without publishing |
+
+Arguments for a task go after `--`. A lane task's arguments replace its default
+target selection, so naming a target narrows the lane rather than adding to it,
+and a later `--` reaches the test harness:
+
+```sh
+mise run check:host                                  # --all-targets
+mise run check:host -- --bin cagentsd                # just the daemon
+mise run test:host -- --lib terminal::
+mise run test:ui -- --test session_restore_contract -- --exact restores_tabs
+mise run dev -- --debug --log-file /tmp/cagents-ui.log
+mise run test:lib -- ui --profile dev-runtime --prefix app::chat_ui::
+mise run test:scripts tooling
+```
+
+Always write `mise run TASK`: `mise doctor` and `mise install` are mise's own
+commands. A task exits with its command's status. `check` runs its three lanes
+at once and `test` runs them in order, stopping at the first failure; the
+aggregates `check`, `test` and `ci` take no arguments, so narrow one lane
+instead. Every compiling task
+goes through `scripts/cargo-gate`, so the [build host](#building-on-another-host)
+and its admission apply exactly as they do to the commands below. No task
+combines the `host` and `ui` features, and none is cached by mise: Cargo decides
+what is stale, and a native run is never a build artifact.
+
+The scripts remain the lower-level entry points, documented in the sections
+below, for options a task does not forward, other build profiles, and callers
+that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
+build host's slots.
 
 ## Prerequisites
 
@@ -43,13 +97,32 @@ sudo apt-get install --yes --no-install-recommends \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
   libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
   libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
-rustup toolchain install 1.93.0 --profile minimal
-rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) (or with
-`mise install`, which reads `mise.toml`) and make sure `zig` is on `PATH`. The
-terminal host uses Ghostty's native library, so daemon builds require Zig.
+Install [rustup](https://rustup.rs/); `mise run setup` below installs the Rust
+toolchain `rust-toolchain.toml` pins, which rustup then selects in the checkout.
+
+The terminal host uses Ghostty's native library, so daemon builds require Zig.
+Install [mise](https://mise.jdx.dev/getting-started.html), trust the checkout's
+`mise.toml`, and let `setup` install the pinned Zig and Rust toolchains:
+
+```sh
+mise trust
+mise run setup
+```
+
+mise reads only configuration you have trusted, and every worktree has its own
+`mise.toml`. To trust the checkout and every worktree beneath it at once, run
+`mise settings add trusted_config_paths "$PWD"` from its root instead of
+`mise trust`. Without mise, install Zig 0.15.2 from
+[ziglang.org](https://ziglang.org/download/) and put it on `PATH`.
+
+`mise run doctor` checks the toolchains, Git and Python, and where Rust
+compiles. With a remote build host, the default, it checks that the host
+answers over SSH, and this computer needs no native build libraries. With
+`CAGENTS_BUILD_REMOTE=local` it checks the build tools and the libraries above.
+It also notes optional tools: a Wayland session for `dev`, `niri-harness` for
+[parallel instances](#parallel-instances) and Bubblewrap for release builds.
 
 Ordinary debug builds automatically use the isolated development instance;
 optimized builds are production unless the Cargo `development` feature is
@@ -62,20 +135,26 @@ Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --bin cagents
+mise run check:cli -- --bin cagents
 
 # Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd
+mise run check:host -- --bin cagentsd
 
 # Browserless UI client: libcosmic, no Ghostty or Servo graph.
-scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+mise run check:ui -- --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
-scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
+mise run check:browser
 
 # Standalone editor: separate package using the browserless UI graph.
-scripts/cargo-gate check --locked --package ceditor --bin ceditor
+mise run check:editor
 ```
+
+Without arguments, `check:cli`, `check:host` and `check:ui` check all targets,
+tests included, and `check` runs all three: what a change needs before review.
+Each task runs one `scripts/cargo-gate check --locked` command with its lane's
+features, `--no-default-features --features host` for the daemon for example;
+`mise.toml` defines the lanes once.
 
 Each of these commands waits in the build host's queue on its own, and on a
 busy host the wait is most of its time: on fw16 under a full queue, the CLI
@@ -136,13 +215,17 @@ process ownership, IPC and integrated browser portability remain separate work.
 
 ## Development runner
 
-Launch the native UI through `scripts/run-development`, not a direct
-`cargo run`:
+Launch the native UI with `mise run dev`, which runs `scripts/run-development`,
+not a direct `cargo run`:
 
 ```sh
-scripts/run-development --browserless   # no Servo; saved browser URLs open externally
-scripts/run-development                 # with the embedded browser
+mise run dev                            # no Servo; saved browser URLs open externally
+mise run dev:browser                    # with the embedded browser
+mise run dev -- --debug --fresh-daemon  # runner options after --
 ```
+
+The options below are the runner's; pass them after `--`, or run the script
+directly.
 
 | Option | Effect |
 | --- | --- |
@@ -163,9 +246,9 @@ scripts/run-development                 # with the embedded browser
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
-scripts/run-development --browserless --debug
-scripts/run-development --debug --fresh-daemon
-scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
+mise run dev -- --debug
+mise run dev:browser -- --debug --fresh-daemon
+mise run dev -- --debug --log-file /tmp/cagents-ui.log
 ```
 
 Use `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or
@@ -1306,9 +1389,10 @@ empty harnesses. The host-only terminal workload example is also skipped outside
 its lane. Cover the boundaries a change touches:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --all-targets
-scripts/cargo-gate test --locked --no-default-features --features host --all-targets
-scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
+mise run test:cli     # scripts/cargo-gate test --locked --no-default-features --all-targets
+mise run test:host    # ... --features host --all-targets
+mise run test:ui      # ... --features ui --all-targets
+mise run test         # all three, in order
 ```
 
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
@@ -1388,9 +1472,9 @@ left processes behind. Same-test reexecs that call `env_clear()` must pass
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --features host --lib terminal::
-scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
-scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
+mise run test:host -- --lib terminal::
+mise run test:host -- --test terminal_load_contract
+mise run test:ui -- --test session_restore_contract
 ```
 
 For focused root library tests, compile one isolated test harness and run the
@@ -1457,10 +1541,11 @@ into shards that partition its tests. The `Script contracts` check passes only
 when every job passed. Run the same steps locally:
 
 ```sh
-python3 -I -B scripts/script-contracts verify
-python3 -I -B scripts/script-contracts plan
-python3 -I -B scripts/script-contracts run tooling
-python3 -I -B scripts/script-contracts run "native evidence" 2/3
+mise run test:scripts                       # verify, then every job unsharded
+mise run test:scripts tooling
+mise run test:scripts "native evidence" 2/3
+mise run ci                                 # with formatting and the protocol checks
+python3 -I -B scripts/script-contracts plan # the CI matrix
 ```
 
 A new `tests/` file that imports `unittest` must be added to a job, or to
@@ -1471,10 +1556,14 @@ job's shard count rather than its timeout.
 The selected IPC source contract can be checked without compiling Rust:
 
 ```sh
-scripts/check-protocol-contract
+mise run check:protocol                 # against the merge base with origin/main
+mise run check:protocol --base REF
+scripts/check-protocol-contract         # the current snapshot only
 python3 -I -B tests/protocol_contract.py -v
-scripts/check-protocol-contract --base-ref origin/main
 ```
+
+`check:protocol` also runs `scripts/check-older-clients` and
+`scripts/check-update-sources`, as CI does.
 
 It covers `ClientRequest`, `ServerMessage` and `ServerResponse` in
 `src/terminal/ipc.rs`, `Provider` in `src/agent.rs`, and `Run`, `Summary` and
@@ -1547,7 +1636,8 @@ scripts/cargo-gate test --locked --no-default-features --features host --test re
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Run `mise run fmt:check` (`scripts/check-format`) after Rust edits, or
+`mise run fmt` to rewrite the same files. The check runs `cargo fmt --check` for
 Cargo roots and directly checks `src/modules.rs` and nested Rust-source
 `include!` fragments, which rustfmt does not discover through macro expansion.
 Both stages report their diagnostics and any failure makes the command fail;
@@ -1792,6 +1882,13 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **A second window.** Run `open-window window-2` in the background to open
+  that saved slot through the matched development runner in the same private
+  session. It replays only the builds already recorded, refuses a live slot,
+  and records readiness only after a new native window maps. Its trace goes
+  to `logs/ui-SIDE-window-2.log`, its native ID to
+  `session/window-window-2`, and the command stays until the window exits.
+  `stop` ends both windows and their fixture processes.
 - **UI-only restart.** To measure restored chats while their providers keep
   running, close the app window normally, then run `relaunch` in the same
   session. It reuses the recorded executables through the development runner
@@ -1802,7 +1899,10 @@ harness, it provides:
   under `logs/` on normal close; these measure synchronous work rather than
   compositor presentation. Add `--ui-trace` to `start` for a live log of
   UI-thread work by phase and message; see "UI thread trace" in
-  `docs/performance.md`. Recreate the same workload on each revision when comparing
+  `docs/performance.md`. Add `--workspace-trace` to record shared-model update
+  timing, scope projection choices and activity redraw intervals. Both trace
+  flags apply to the requested session and its relaunches; ordinary sessions
+  keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
@@ -1977,7 +2077,7 @@ data. It does not signal the host daemon or install anything on the host.
 `HEAD`:
 
 ```sh
-scripts/install-local --build-host fw16
+mise run install -- --build-host fw16
 ```
 
 It builds the three matched executables with the `local` Cargo profile,
@@ -2218,7 +2318,9 @@ elsewhere before cleanup. Run the pure checks with
 
 | Symptom | What to do |
 | --- | --- |
-| `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
+| `required command not found: zig` | Run `mise run setup`, or install Zig 0.15.2 and put it on `PATH`. |
+| `Config files in .../mise.toml are not trusted` | Run `mise trust` in that worktree, or trust the whole checkout with `mise settings add trusted_config_paths PATH`. |
+| Something else is missing | `mise run doctor` names each missing prerequisite and its fix. |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
 | `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
@@ -2239,7 +2341,8 @@ mise's trust prompt and waits for an answer whenever its stderr is a terminal, e
 stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
 `scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
 for you, because trusting a checkout's configuration is your decision. Run `mise trust`
-in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+in a new worktree, and in the checkout above it if that isn't trusted either, or
+trust them all once with `trusted_config_paths` (see [Prerequisites](#prerequisites)). Taking
 the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
 such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
 only that file pins can fail at once with `No version is set for shim`.
