@@ -1822,10 +1822,10 @@ impl Runtime {
     }
 
     /// The glyph and words of the line that closes a working transcript.
-    /// Where the newest row already shows the work with a spinner, a line
-    /// that only repeats what that row says keeps its place empty, and one
-    /// that says more, such as subagents working, a provider failure or the
-    /// provider's own detail, keeps its words without a second spinner.
+    /// Where the newest row already shows the work with a spinner, the line
+    /// drops the words that repeat that row and its spinner. What it says
+    /// beyond them, such as subagents working, a provider failure or the
+    /// provider's own detail, stays; with nothing left, its place stays empty.
     fn closing_line(
         &self,
         glyph: Icon,
@@ -1840,12 +1840,21 @@ impl Runtime {
             Some(agent) => items_activity(&agent.items),
             None => activity_label(&self.snapshot),
         };
-        if !failure && label == plain {
-            // A blank caption keeps the row's height.
-            (None, " ".to_owned())
+        let rest = if label == plain {
+            ""
         } else {
-            (None, label)
-        }
+            label
+                .strip_prefix(plain)
+                .and_then(|rest| rest.strip_prefix(" · "))
+                .unwrap_or(&label)
+        };
+        // A blank caption keeps the row's height.
+        let rest = if rest.is_empty() && !failure {
+            " "
+        } else {
+            rest
+        };
+        (None, rest.to_owned())
     }
 
     /// Whether a message is on its way to the provider. Other commands -
@@ -8061,10 +8070,7 @@ mod tests {
 
         // A closing line that says more than the row keeps its words.
         Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
-        assert_eq!(
-            closing(&runtime),
-            (None, "Thinking · 1 agent working".to_owned())
-        );
+        assert_eq!(closing(&runtime), (None, "1 agent working".to_owned()));
         Arc::make_mut(&mut runtime.snapshot).subagents.clear();
 
         // The command left running in the background while the agent goes
