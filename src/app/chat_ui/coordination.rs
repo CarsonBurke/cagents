@@ -820,8 +820,6 @@ struct Row {
     shown: String,
     /// The start of what was said, or the started agent's type.
     preview: String,
-    /// A separately placed agent's channel, ahead of the optional preview.
-    destination: Option<String>,
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
@@ -882,7 +880,6 @@ impl Row {
                 pressing.to_owned()
             },
             self.preview.clone(),
-            self.destination.clone().unwrap_or_default(),
         ]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
@@ -1207,7 +1204,6 @@ impl Runtime {
             label: recipient_whole.plain(),
             shown,
             preview,
-            destination: None,
             full: full.join("\n\n").trim().to_owned(),
             state,
             several: open.is_none() && listed.len() > 1,
@@ -1242,7 +1238,7 @@ impl Runtime {
             )
         });
         let (label, shown) = if let Some((label, _)) = &cli_label {
-            (label.clone(), Self::short_description(label, LABEL_CHARS))
+            (label.clone(), label.clone())
         } else {
             match listed {
                 Some(agent) => (
@@ -1256,18 +1252,18 @@ impl Runtime {
                 }
             }
         };
-        let destination = reading
+        let placed = reading
             .cli
             .then(|| reading.outcome.run.as_ref())
             .flatten()
-            .and_then(|run| run.placed_in.as_ref())
-            .map(|placed| {
-                placed.title.as_ref().map_or_else(
-                    || "in another channel".to_owned(),
-                    |title| format!("in channel “{title}”"),
-                )
-            });
-        let preview = if let Some((_, task)) = &cli_label {
+            .and_then(|run| run.placed_in.as_ref());
+        let destination = placed.map(|placed| {
+            placed.title.as_ref().map_or_else(
+                || "in another channel".to_owned(),
+                |title| format!("in channel “{title}”"),
+            )
+        });
+        let mut preview = if let Some((_, task)) = &cli_label {
             task.clone().unwrap_or_default()
         } else {
             match spawn.agents.as_slice() {
@@ -1285,6 +1281,25 @@ impl Runtime {
                     .join(", "),
             }
         };
+        if let Some(destination) = &destination {
+            let duplicate_task = placed
+                .and_then(|placed| placed.title.as_deref())
+                .is_some_and(|title| {
+                    spawn
+                        .agents
+                        .first()
+                        .and_then(|agent| agent.prompt.inline())
+                        .and_then(|task| task.trim().lines().next())
+                        .and_then(crate::names::normalize_card_name)
+                        .as_deref()
+                        == Some(title)
+                });
+            preview = if preview.is_empty() || duplicate_task {
+                destination.clone()
+            } else {
+                format!("{destination} · {preview}")
+            };
+        }
         let observed_model = listed
             .filter(|_| !reading.cli)
             .and_then(|agent| agent.model.as_deref());
@@ -1351,7 +1366,6 @@ impl Runtime {
             label,
             shown,
             preview,
-            destination,
             full: full.join("\n\n"),
             state,
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
@@ -1388,86 +1402,34 @@ impl Runtime {
         // The preview fades out where the pane runs short, as a step row's
         // summary does, on whatever the row is painted with; the agent keeps
         // its tab's words, cut as the tab cuts them.
-        let mut line: Vec<Element<'static, Message>> = if let Some(destination) = &row.destination {
-            // A destination keeps the room approved for narrow spawn rows.
-            // The identity/task preview and status fade where they run short;
-            // both remain whole in the row's tooltip and accessible name.
-            vec![
-                lead,
-                crate::ui_controls::fade_text(crate::agent_execution::agent_label(
-                    &row.label,
-                    Some(&row.preview),
-                ))
+        let mut line: Vec<Element<'static, Message>> = vec![
+            lead,
+            design::body(row.verb)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            chat_title(label)
                 .size(design::TEXT_BODY)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Semibold,
-                    ..cosmic::font::default()
-                })
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            crate::ui_controls::fade_text(row.preview.clone())
+                .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
-                crate::ui_controls::FadeText::caption(destination.clone())
-                    .width(Length::Fixed(180.0))
-                    .into(),
-            ]
-        } else {
-            vec![
-                lead,
-                design::body(row.verb)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-                chat_title(label)
-                    .size(design::TEXT_BODY)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-                crate::ui_controls::fade_text(row.preview.clone())
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .width(Length::Fill)
-                    .into(),
-            ]
-        };
-        let status_class = match row.state.tone {
-            Tone::Plain => cosmic::theme::Text::Custom(design::muted_text),
-            Tone::Warning => cosmic::theme::Text::Custom(design::warning_text),
-            Tone::Error => cosmic::theme::Text::Custom(design::destructive_text),
-        };
-        if row.destination.is_some() {
-            let mut trailing: Vec<Element<'static, Message>> = Vec::new();
-            if row.state.live {
-                trailing.push(crate::ui_controls::activity_spinner(
-                    f32::from(design::COMPACT_ICON_SIZE),
-                    design::muted_color,
-                ));
-            }
-            trailing.push(
-                crate::ui_controls::fade_text(row.state.text)
-                    .class(status_class)
-                    .into(),
-            );
-            line.push(
-                widget::container(
-                    widget::row::with_children(trailing)
-                        .spacing(step::GAP_S)
-                        .align_y(Alignment::Center),
-                )
-                .align_right(Length::Fill)
-                .clip(true)
-                .into(),
-            );
-        } else {
-            if row.state.live {
-                line.push(crate::ui_controls::activity_spinner(
-                    f32::from(design::COMPACT_ICON_SIZE),
-                    design::muted_color,
-                ));
-            }
-            line.push(
-                design::body(row.state.text)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .class(status_class)
-                    .into(),
-            );
+        ];
+        if row.state.live {
+            line.push(crate::ui_controls::activity_spinner(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::muted_color,
+            ));
         }
+        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status = match row.state.tone {
+            Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
+            Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
+            Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
+        };
+        line.push(status.into());
         let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -1804,6 +1766,94 @@ impl Runtime {
 mod identity_tests {
     use super::*;
 
+    #[test]
+    fn cli_spawn_preview_names_the_destination_without_repeating_the_task() {
+        let (runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let name = "cross-project-reviewer-with-a-distinctive-name";
+        let long_task = "Review the deployment carefully. ".repeat(8);
+        let long_destination = format!("in channel “{}”", long_task.trim());
+        for (placed, title, task, expected) in [
+            (
+                true,
+                Some("Release"),
+                "Review deployment",
+                "in channel “Release” · Review deployment",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "Review the cards",
+                "in channel “Review the cards”",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "Review  the cards",
+                "in channel “Review the cards”",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "\n Review the cards \nKeep the details",
+                "in channel “Review the cards”",
+            ),
+            (true, Some("Release"), "", "in channel “Release”"),
+            (
+                true,
+                None,
+                "Review deployment",
+                "in another channel · Review deployment",
+            ),
+            (false, None, "Review deployment", "Review deployment"),
+            (
+                true,
+                Some(long_task.trim()),
+                long_task.as_str(),
+                long_destination.as_str(),
+            ),
+        ] {
+            let spawn = Spawn {
+                agents: vec![crate::chat::coordination::Delegate {
+                    name: name.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    prompt: Text::Inline(task.into()),
+                }],
+                ..Default::default()
+            };
+            let reading = Coordinated::new(Coordination {
+                kind: Kind::Spawn(spawn.clone()),
+                outcome: crate::chat::coordination::Outcome {
+                    run: Some(Run {
+                        agent: "1a2b3c4d".into(),
+                        placed_in: placed.then(|| crate::control::PlacedIn {
+                            channel: crate::model::ChannelId::new(),
+                            title: title.map(str::to_owned),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                subagents: Vec::new(),
+                cli: true,
+            });
+            let row = runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
+            assert_eq!(row.verb, "Started");
+            assert_eq!(row.shown, name, "the name stays whole in either layout");
+            assert_eq!(row.preview, expected);
+            assert_eq!(row.state.text, "Launch accepted");
+            let (tip, accessible) = row.described();
+            assert!(accessible.contains(expected));
+            if placed {
+                let destination = title.map_or_else(
+                    || "in another channel".to_owned(),
+                    |title| format!("in channel “{title}”"),
+                );
+                assert!(tip.contains(&destination));
+            }
+        }
+    }
+
     fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
         let item = chat::Item {
             id: "toolu_step".into(),
@@ -2120,7 +2170,6 @@ mod identity_tests {
             verb: "Message to",
             label: label.to_owned(),
             shown: shown.to_owned(),
-            destination: None,
             preview: "The repo is now at /srv".to_owned(),
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
