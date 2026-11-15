@@ -3348,10 +3348,21 @@ pub(super) fn restore_orphaned_holders_preserving(
                 // reader before lineage/Registry restoration failed. Keep that
                 // exact live owner and forbid automatic execution; this does
                 // not claim its already-active prefix is still unparsed.
-                let message = format!(
+                let mut message = format!(
                     "Orphan terminal {} retained its original owner after restore failed: {error}",
                     record.terminal
                 );
+                // Restoration starts the view as client 0 and lineage adoption
+                // detaches it. A failed source publication returns before that
+                // adoption, so detach here too. If the worker refuses the
+                // visibility change, detach keeps client 0 attached.
+                if let Err(detach) = state.detach(0, record.terminal) {
+                    tracing::warn!(terminal = %record.terminal, error = %detach.message, "failed orphan restore could not release its client 0 attachment");
+                    message.push_str(&format!(
+                        "; restoration could not release its attachment: {}",
+                        detach.message
+                    ));
+                }
                 state.retain_startup_recovery(message.clone());
                 tracing::warn!(terminal = %record.terminal, %error, "orphan adoption retained original ownership; recovery-only startup required");
                 return Err(message);
