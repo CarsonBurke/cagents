@@ -1226,6 +1226,11 @@ impl Cagents {
     }
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
+        let trailing_clearance = if self.pane_inspector_layout(card).is_none() {
+            crate::app::pane_inspector::TOGGLE_CLEARANCE
+        } else {
+            0.0
+        };
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
@@ -1263,6 +1268,7 @@ impl Cagents {
                         .card(card)
                         .map_or(self.workspace.viewport_width(), |card| card.width())
                         .min(super::layout::READING_COLUMN),
+                    trailing_clearance,
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1285,7 +1291,7 @@ impl Cagents {
             ])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
-            .padding(step::GAP_M)
+            .padding(iced::Padding::new(step::GAP_M).right(step::GAP_M.max(trailing_clearance)))
             .into(),
         }
     }
@@ -2364,6 +2370,7 @@ impl Runtime {
         enter_sends: bool,
         shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
+        transcript_clearance: f32,
         place: Place,
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
@@ -2372,7 +2379,7 @@ impl Runtime {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
-            return self.pending_admission_view();
+            return self.pending_admission_view(transcript_clearance);
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
@@ -2812,22 +2819,22 @@ impl Runtime {
         }
         // The scroll viewport spans the pane, so its scrollbar follows the
         // pane edge, while the rows keep the reading column the composer
-        // shares. The symmetric inset already exceeds the scrollbar rail.
-        // Reserving the rail a second time would make transcript rows
-        // narrower than the composer in a pane no wider than the column.
-        // The viewport runs right up to whatever is pinned above and below
-        // it, the composer included, so a line scrolling past either edge
-        // meets that surface rather than a strip of pane laid over it. The
-        // gap the pane keeps between its blocks moves inside the viewport
-        // instead: it is the room the first and last rows rest at, and
-        // scrolled content passes through it.
+        // shares and its leading inset. The trailing side keeps extra
+        // clearance for the pane toggle, which also protects a row scrolled
+        // beneath that fixed control. The viewport runs right up to whatever
+        // is pinned above and below it, the composer included, so a line
+        // scrolling past either edge meets that surface rather than a strip
+        // of pane laid over it. The gap the pane keeps between its blocks
+        // moves inside the viewport instead: it is the room the first and
+        // last rows rest at, and scrolled content passes through it.
         let transcript_index = content.len();
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
                 .padding(
                     iced::Padding::new(step::GAP_M)
                         .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
-                        .bottom(step::GAP_M + step::GAP_S),
+                        .bottom(step::GAP_M + step::GAP_S)
+                        .right(step::GAP_M.max(transcript_clearance)),
                 )
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
@@ -3213,15 +3220,24 @@ impl Runtime {
                     child
                 } else {
                     widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
-                        } else if index == transcript_index + 1 {
-                            // Against the transcript's edge: its own
-                            // padding keeps the rows clear of this.
-                            0.0
-                        } else {
-                            space::S
-                        }))
+                        .padding({
+                            let padding =
+                                iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
+                                    step::GAP_M
+                                } else if index == transcript_index + 1 {
+                                    // Against the transcript's edge: its own
+                                    // padding keeps the rows clear of this.
+                                    0.0
+                                } else {
+                                    space::S
+                                });
+                            // The first block sits beside the pane toggle.
+                            if index == 0 {
+                                padding.right(step::GAP_M.max(transcript_clearance))
+                            } else {
+                                padding
+                            }
+                        })
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
@@ -6778,6 +6794,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "Fixture".into(),
                     channel: None,
@@ -7687,6 +7704,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
+                0.0,
                 Place {
                     channel: None,
                     name: "Spacing fixture".into(),
@@ -8621,6 +8639,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -8841,6 +8860,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -9059,6 +9079,7 @@ mod tests {
                 true,
                 shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -9735,6 +9756,7 @@ mod tests {
             true,
             &shortcuts,
             600.0,
+            0.0,
             Place {
                 name: "project".into(),
                 branch: None,
@@ -9834,6 +9856,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
+                0.0,
                 Place {
                     name: "restore-fixture".into(),
                     branch: None,
@@ -10034,6 +10057,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
+                    0.0,
                     Place {
                         name: "restore-fixture".into(),
                         branch: None,
@@ -10476,6 +10500,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 620.0,
+                0.0,
                 Place {
                     name: "restore-fixture".into(),
                     branch: None,
@@ -10983,6 +11008,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     620.0,
+                    0.0,
                     Place {
                         name: "restore-fixture".into(),
                         branch: None,
@@ -11290,6 +11316,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 360.0,
+                0.0,
                 Place {
                     name: "native-fixture".into(),
                     branch: None,
@@ -11313,7 +11340,6 @@ mod tests {
         };
         let (mut live, _handle) = frame_cost::live_runtime(&[thought]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
@@ -12219,6 +12245,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width.min(super::super::layout::READING_COLUMN),
+                0.0,
                 Place {
                     channel: None,
                     name: "Fixture".into(),
@@ -12284,6 +12311,7 @@ mod tests {
                 true,
                 &app.settings.keyboard_shortcuts,
                 450.0,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -12350,7 +12378,6 @@ mod tests {
 
         let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
@@ -12469,6 +12496,7 @@ mod tests {
             true,
             &shortcuts,
             width,
+            0.0,
             Place {
                 channel: Some("A long conversation name".into()),
                 name: "A long repository name".into(),
@@ -12762,6 +12790,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width,
+                    0.0,
                     Place {
                         channel: None,
                         name: "Fixture".into(),
@@ -12791,6 +12820,446 @@ mod tests {
                 assert_eq!(bounds.x, step::GAP_M);
                 assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
             }
+        }
+    }
+
+    fn inspector_chat_fixture(width: f32) -> (Cagents, CardId) {
+        let mut items = frame_cost::transcript(1);
+        items.truncate(1);
+        if let ItemContent::Text { text, .. } = &mut items[0].content {
+            *text = format!("{}restart safety.", "Review the retry change. ".repeat(12));
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        runtime.target.card = card;
+        runtime.composer = text_editor::Content::with_text("retained draft");
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(runtime.session.clone());
+        app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.workspace.resize_viewport(width));
+        app.sync_pane_inspectors();
+        (app, card)
+    }
+
+    #[test]
+    fn inspector_toggle_clearance_keeps_transcript_rows_out_of_its_footprint() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Bounds {
+            toggle: widget::Id,
+            row: Option<iced::Rectangle>,
+            composer_id: widget::Id,
+            composer: Option<iced::Rectangle>,
+            button: Option<iced::Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&scroll::item_id("0-prompt")) {
+                    self.row = Some(bounds);
+                }
+                if id == Some(&self.composer_id) {
+                    self.composer = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == Some(&self.toggle) {
+                    self.button = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [420.0, 720.0, 1440.0] {
+            let (app, card) = inspector_chat_fixture(width);
+            let mut element = app.card_view(card, true, false);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+            );
+            let mut bounds = Bounds {
+                toggle: card_control_id(card, "inspector.toggle"),
+                composer_id: card_control_id(card, "chat-composer-surface"),
+                row: None,
+                composer: None,
+                button: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let row = bounds.row.expect("rendered first user row");
+            let button = bounds.button.expect("floating toggle");
+            assert!(
+                row.x + row.width + step::GAP_S <= button.x + 0.1,
+                "{width}: {row:?} / {button:?}"
+            );
+            let composer = bounds.composer.expect("composer remains mounted");
+            let reading = width.min(super::super::layout::READING_COLUMN);
+            assert_eq!(composer.x, (width - reading) / 2.0 + step::GAP_M);
+            assert_eq!(composer.width, reading - 2.0 * step::GAP_M);
+        }
+    }
+
+    #[test]
+    fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        #[derive(Default)]
+        struct HeaderBounds {
+            panel: Option<iced::Rectangle>,
+            toggle: Option<iced::Rectangle>,
+            controls: Vec<iced::Rectangle>,
+            panel_id: Option<widget::Id>,
+            toggle_id: Option<widget::Id>,
+        }
+        impl Operation for HeaderBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == self.panel_id.as_ref() {
+                    self.panel = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == self.toggle_id.as_ref() {
+                    self.toggle = Some(bounds);
+                } else {
+                    self.controls.push(bounds);
+                }
+            }
+        }
+        let (mut app, card) = inspector_chat_fixture(1440.0);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        app.open_pane_inspector_now(card);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.card_view(card, true, false);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1440.0, 800.0)),
+        );
+        let mut bounds = HeaderBounds {
+            panel_id: Some(card_control_id(card, "inspector.panel")),
+            toggle_id: Some(card_control_id(card, "inspector.toggle")),
+            ..Default::default()
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let panel = bounds.panel.expect("mounted inspector");
+        let toggle = bounds.toggle.expect("header toggle");
+        let adjacent = bounds
+            .controls
+            .iter()
+            .filter(|control| {
+                control.x >= panel.x
+                    && control.x < toggle.x
+                    && control.y < toggle.y + toggle.height
+                    && control.y + control.height > toggle.y
+            })
+            .max_by(|a, b| (a.x + a.width).total_cmp(&(b.x + b.width)))
+            .expect("an actual adjacent header control, not just its short label");
+        assert!(
+            toggle.x - adjacent.x - adjacent.width >= step::GAP_S - 0.1,
+            "control {adjacent:?} stops a standard gap before toggle {toggle:?}"
+        );
+    }
+
+    #[test]
+    fn inspector_saved_admission_actions_clear_the_floating_toggle() {
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        for width in [300.0, 420.0, 720.0] {
+            let (mut app, card) = inspector_chat_fixture(width);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("fixture chat")
+            };
+            runtime.connection = Connection::AwaitingAdmission;
+            let mut renderer = crate::app::tests::headless_renderer();
+            let ui = UserInterface::build(
+                app.card_view(card, true, false),
+                iced::Size::new(width, 800.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let all = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .collect::<Vec<_>>();
+            let copy = all
+                .iter()
+                .find(|node| node.node().label() == Some("Copy saved draft"))
+                .and_then(|node| node.node().bounds())
+                .expect("copy saved draft control");
+            let toggle = all
+                .iter()
+                .find(|node| {
+                    node.node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Toggle inspector"))
+                })
+                .and_then(|node| node.node().bounds())
+                .expect("floating toggle");
+            assert!(copy.x1 + f64::from(step::GAP_S) <= toggle.x0 + 0.1);
+        }
+    }
+
+    #[test]
+    fn inspector_overlay_fills_its_pane_and_escape_restores_the_retained_toggle_focus() {
+        use iced::advanced::widget::{Operation, operation};
+        use iced::futures::StreamExt;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        struct Panel {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
+        impl Operation for Panel {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            width: f32,
+            cache: Cache,
+            task: Task<Message>,
+            renderer: &mut cosmic::Renderer,
+            event: Option<keyboard::Event>,
+        ) -> (
+            Cache,
+            Option<widget::Id>,
+            Option<iced::Rectangle>,
+            Vec<Message>,
+        ) {
+            let mut ui = UserInterface::build(
+                widget::row::with_children(
+                    app.workspace
+                        .order()
+                        .map(|id| app.card_view(id, true, false)),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
+                iced::Size::new(width, 800.0),
+                cache,
+                renderer,
+            );
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                while let Some(action) = executor.block_on(stream.next()) {
+                    if let iced::runtime::Action::Widget(mut op) = action {
+                        loop {
+                            ui.operate(renderer, &mut op);
+                            match op.finish() {
+                                operation::Outcome::Chain(next) => op = next,
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            let mut messages = Vec::new();
+            if let Some(event) = event {
+                let _ = ui.update(
+                    &[iced::Event::Keyboard(event)],
+                    iced::mouse::Cursor::Unavailable,
+                    renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut messages,
+                );
+            }
+            let focused = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let sink = focused.clone();
+            let mut find = operation::map(operation::focusable::find_focused(), move |id| {
+                *sink.lock().unwrap() = Some(id)
+            });
+            ui.operate(renderer, &mut find);
+            let _ = find.finish();
+            let mut panel = Panel {
+                id: card_control_id(card, "inspector.panel"),
+                bounds: None,
+            };
+            ui.operate(renderer, &mut panel);
+            let id = focused.lock().unwrap().clone();
+            (ui.into_cache(), id, panel.bounds, messages)
+        }
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [420.0, 600.0] {
+            let (mut app, card) = inspector_chat_fixture(width);
+            let (cache, _, _, _) = frame(
+                &app,
+                card,
+                width,
+                Cache::new(),
+                Task::none(),
+                &mut renderer,
+                None,
+            );
+            let opened = app.set_pane_inspector_open(card, true);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, bounds, _) = frame(
+                &app,
+                card,
+                width,
+                cache,
+                Task::batch([opened, finished]),
+                &mut renderer,
+                None,
+            );
+            assert_eq!(focused, Some(card_control_id(card, "inspector.toggle")));
+            let bounds = bounds.expect("actual overlay panel");
+            assert_eq!(
+                (bounds.x, bounds.width),
+                (0.0, width),
+                "overlay fills the pane"
+            );
+            let closed = app.update(Message::KeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                },
+                captured: false,
+            });
+            assert!(!app.pane_inspectors.is_open(card));
+            assert!(
+                app.pane_content_inputs_blocked(card),
+                "closing slide still covers content"
+            );
+            let (cache, _, _, _) = frame(&app, card, width, cache, closed, &mut renderer, None);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, panel, _) =
+                frame(&app, card, width, cache, finished, &mut renderer, None);
+            assert!(panel.is_none());
+            assert_eq!(
+                focused,
+                Some(card_control_id(card, "inspector.toggle")),
+                "Escape returns focus after the slide"
+            );
+            let (_, focused, _, _) =
+                frame(&app, card, width, cache, Task::none(), &mut renderer, None);
+            assert_eq!(
+                focused,
+                Some(card_control_id(card, "inspector.toggle")),
+                "focus survives the next retained frame"
+            );
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("retained chat")
+            };
+            assert_eq!(runtime.composer.text(), "retained draft");
+        }
+        // Native focus can enter the left inspector by Tab while workspace
+        // focus still names the right pane. Escape must follow native focus.
+        for move_focus_during_close in [false, true] {
+            let (mut app, left) = inspector_chat_fixture(840.0);
+            let right = super::super::tests::draft_chat_for_provider(&mut app, Provider::Claude);
+            for card in Arc::make_mut(&mut app.durable).cards.iter_mut() {
+                card.width_fraction = 0.5;
+            }
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            drop(app.workspace.resize_viewport(840.0));
+            assert_eq!(app.workspace.focused(), Some(right));
+            let opened = app.set_pane_inspector_open(left, true);
+            let completed =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (cache, focused, _, _) = frame(
+                &app,
+                left,
+                840.0,
+                Cache::new(),
+                Task::batch([opened, completed]),
+                &mut renderer,
+                None,
+            );
+            assert_eq!(focused, Some(card_control_id(left, "inspector.toggle")));
+            let escape = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            };
+            let (cache, _, _, messages) = frame(
+                &app,
+                left,
+                840.0,
+                cache,
+                Task::none(),
+                &mut renderer,
+                Some(escape),
+            );
+            let close = messages
+                .into_iter()
+                .find(
+                    |message| matches!(message, Message::ClosePaneInspector(card) if *card == left),
+                )
+                .expect("actual focused inspector consumes Escape and names its own pane");
+            let closed = app.update(close);
+            assert!(!app.pane_inspectors.is_open(left));
+            assert_eq!(app.workspace.focused(), Some(left));
+            let (cache, _, _, _) = frame(&app, left, 840.0, cache, closed, &mut renderer, None);
+            let expected = if move_focus_during_close {
+                card_control_id(right, "chat-composer")
+            } else {
+                card_control_id(left, "inspector.toggle")
+            };
+            let newer_focus = if move_focus_during_close {
+                iced::widget::operation::focus(expected.clone()).map(cosmic::Action::App)
+            } else {
+                Task::none()
+            };
+            let (cache, _, _, _) =
+                frame(&app, left, 840.0, cache, newer_focus, &mut renderer, None);
+            let finished =
+                app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+            let (_, focused, _, _) = frame(&app, left, 840.0, cache, finished, &mut renderer, None);
+            assert_eq!(
+                focused,
+                Some(expected),
+                "completion preserves a newer native focus choice"
+            );
+            drop(app.update(Message::ClosePaneInspector(left)));
+            assert!(
+                !app.pane_inspectors.is_open(left),
+                "repeated Escape cannot reopen it"
+            );
         }
     }
 
@@ -12876,6 +13345,7 @@ mod tests {
                     true,
                     &shortcuts,
                     width.min(super::super::layout::READING_COLUMN),
+                    0.0,
                     Place {
                         channel: None,
                         name: "Fixture".into(),
@@ -14399,6 +14869,7 @@ mod tests {
                 true,
                 &shortcuts,
                 600.0,
+                0.0,
                 Place {
                     name: "project".into(),
                     branch: None,
@@ -16190,6 +16661,7 @@ mod tests {
                 true,
                 &shortcuts,
                 width,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -16425,6 +16897,7 @@ mod tests {
                 true,
                 &shortcuts,
                 viewport.width,
+                0.0,
                 Place {
                     name: "fixture".into(),
                     branch: None,
@@ -16496,7 +16969,6 @@ mod tests {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut live, _handle) = frame_cost::live_runtime(&[]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         live.target.card = card;
         let target = live.target;
@@ -16527,6 +16999,7 @@ mod tests {
                     true,
                     &app.settings.keyboard_shortcuts,
                     width,
+                    0.0,
                     Place {
                         name: "fixture".into(),
                         branch: None,
@@ -16585,6 +17058,7 @@ mod tests {
                         true,
                         &shortcuts,
                         width,
+                        0.0,
                         Place {
                             name: "Fixture".into(),
                             channel: None,
@@ -16729,7 +17203,6 @@ mod prepared_disclosure_tests {
         };
         let (mut live, _handle) = frame_cost::live_runtime(&[item]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
