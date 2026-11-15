@@ -172,6 +172,14 @@ impl NativeActorOwnership {
     pub(in crate::host) fn scope(&self) -> Result<&LaunchAccountScope, &str> {
         self.scope.as_ref().map_err(String::as_str)
     }
+    /// The row an identity confirmation publishes: same phase, actor, owner
+    /// and account; only the descriptor gains its confirmed conversation.
+    pub(in crate::host) fn with_source(&self, source: &chat::Session) -> Self {
+        Self {
+            source: source.clone(),
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,8 +468,7 @@ impl Registry {
             source,
             NativeActorPhase::Installed,
         )?;
-        let mut next = expected.clone();
-        next.source = source.clone();
+        let next = expected.with_source(source);
         let encoded = serde_json::to_string(&next).map_err(|error| error.to_string())?;
         if encoded.len() > MAX_RECEIPT_BYTES {
             return Err("Retained actor census exceeds its metadata bound".into());

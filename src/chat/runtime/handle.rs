@@ -42,6 +42,14 @@ impl Handle {
     pub(crate) fn fixture_failed_remote() -> Self {
         Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
     }
+    /// Model the provider confirming its conversation after this attachment.
+    #[cfg(test)]
+    pub(crate) fn fixture_confirm_session(&self, session: String) {
+        match &self.0 {
+            Owner::Remote(remote) => remote.confirm_session_fixture(session),
+            Owner::Local(_) => panic!("session confirmation fixture requires a retained actor"),
+        }
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]
