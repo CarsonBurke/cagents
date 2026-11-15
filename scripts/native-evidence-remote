@@ -26,7 +26,7 @@ HOST may also come from CAGENTS_EVIDENCE_REMOTE, and DIR from
 CAGENTS_EVIDENCE_TASK. DIR's name, at most 18 letters, digits, dots, hyphens
 or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
 
-  pair --before SOURCE --after SOURCE --steps FILE [START OPTIONS]
+  pair --before SOURCE --after SOURCE --steps FILE [--integrated] [START OPTIONS]
                   The whole comparison in one command: build both sides, then
                   for each side start a session, run FILE, stop it, and bring
                   back its shots. FILE is a Bash script that runs on HOST with
@@ -36,7 +36,7 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   stopped. START OPTIONS, such as --width PX, --portal gtk or
                   --codex tool-rows, --ui-scoped-fixture or --codex-executable /host/path/codex,
                   go to each side's start. Executable paths name files on HOST.
-  build SIDE SOURCE
+  build SIDE SOURCE [--integrated]
                   Copy SOURCE to HOST and give HOST its executables. SOURCE is
                   a checkout directory, whose uncommitted and untracked files
                   are included, or a revision such as origin/main. A main
@@ -44,6 +44,8 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   checkout otherwise builds through its own gate, as
                   `mise run dev` does, reusing what that built, and the
                   executables go to HOST; a revision builds on HOST.
+                  --integrated builds the UI with the embedded browser, on
+                  HOST, as it does for both sides of a pair.
   shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
   fetch           Bring back every shot and the manifest.
   where           Print the task and checkouts on HOST.
@@ -397,9 +399,16 @@ record_source() {
 }
 
 cmd_build() {
-    local side=${1:-} source=${2:-} checkout
+    local side=${1:-} source=${2:-} checkout build_options=()
     case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
     [ -n "$source" ] || die 'build needs a checkout or revision' 2
+    shift 2
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --integrated) build_options+=("$1"); shift ;;
+            *) die "unknown build option: $1" 2 ;;
+        esac
+    done
     resolve_source "$source"
     tool_commit=$(snapshot "$tool_source")
     # Take the task's name on the host, or be refused, before anything is
@@ -433,7 +442,9 @@ $remote_prelude"'
     esac
     sync_tool
     local options=()
-    if [ -d "$source" ] && [ "$prebuilt" = false ]; then
+    # Built here and main's prebuilt executables are browserless; the
+    # integrated lane compiles on HOST.
+    if [ -d "$source" ] && [ "$prebuilt" = false ] && [ "${#build_options[@]}" -eq 0 ]; then
         build_in_checkout "$source_checkout" "$(git -C "$source_checkout" rev-parse "$source_commit^{tree}")"
         options=(--executables "$(send_executables "$side" "$built_executables")")
     fi
@@ -449,7 +460,7 @@ $remote_prelude"'
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
     local built=0
-    forward build "$side" "$checkout" "${options[@]}" || built=$?
+    forward build "$side" "$checkout" "${options[@]}" "${build_options[@]}" || built=$?
     if [ "$built" -ne 0 ]; then
         # What was sent for it is no use to the next build.
         [ "${#options[@]}" -eq 0 ] || on_host "$remote_prelude"'
@@ -482,7 +493,7 @@ cmd_clean() {
 }
 
 cmd_pair() {
-    local before='' after='' steps='' options=()
+    local before='' after='' steps='' options=() build_options=()
     while [ "$#" -gt 0 ]; do
         case $1 in
             --before) before=${2:-}; shift 2 || die '--before needs a source' 2 ;;
@@ -494,6 +505,7 @@ cmd_pair() {
                 shift 2
                 ;;
             --keep-state | --ui-trace | --workspace-trace | --ui-scoped-fixture) options+=("$1"); shift ;;
+            --integrated) build_options+=("$1"); shift ;;
             --codex-executable)
                 [ "$#" -ge 2 ] || die "$1 needs a value" 2
                 options+=("$1" "$2")
@@ -505,8 +517,8 @@ cmd_pair() {
     [ -n "$before" ] && [ -n "$after" ] && [ -n "$steps" ] ||
         die 'pair needs --before, --after and --steps' 2
     [ -f "$steps" ] || die "no steps file: $steps" 2
-    cmd_build before "$before"
-    cmd_build after "$after"
+    cmd_build before "$before" "${build_options[@]}"
+    cmd_build after "$after" "${build_options[@]}"
     local side status=0
     for side in before after; do
         printf 'running %s on %s\n' "$side" "$host"
