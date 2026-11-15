@@ -106,7 +106,7 @@ def prepare(cargo, arguments):
     metadata_args = [word for name, _, words in parsed if name in METADATA for word in words]
     described = subprocess.run([cargo, *toolchain, "metadata", "--format-version", "1",
                                 "--no-deps", *metadata_args], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, close_fds=False)
     if described.returncode:
         return None  # Cargo itself diagnoses an invalid original command.
     try:
@@ -123,7 +123,8 @@ def prepare(cargo, arguments):
                "--bin", "cagentsd", "--message-format=json-render-diagnostics"]
     print("cargo-gate: building the matched cagentsd helper for HOST tests", file=sys.stderr)
     artifacts = CargoArtifacts()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as child:
+    # Cargo keeps the jobserver descriptors MAKEFLAGS names.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, close_fds=False) as child:
         for line in child.stdout:
             artifacts.read(line, diagnostics=sys.stderr)
         status = child.wait()
@@ -134,18 +135,11 @@ def prepare(cargo, arguments):
 
 def main():
     arguments = sys.argv[1:]
-    run = bool(arguments and arguments[0] == "--run")
-    if run:
-        arguments.pop(0)
     if not arguments:
-        raise SystemExit("usage: cargo-host-test-helper.py [--run] CARGO COMMAND...")
+        raise SystemExit("usage: cargo-host-test-helper.py CARGO COMMAND...")
     cargo, arguments = arguments[0], arguments[1:]
     helper = prepare(cargo, arguments)
-    if run:
-        if helper:
-            os.environ[HELPER] = helper
-        os.execvp(cargo, [cargo, *arguments])
-    elif helper:
+    if helper:
         print(helper)
 
 

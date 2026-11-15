@@ -304,6 +304,18 @@ It includes finished empty reasoning, active empty reasoning and a live thought
 that gains a new last line. The Edit input maps to the app's Changes item;
 its patch is synthetic. None of the described commands or tools executes.
 
+`activity` opens its own named workspace and loads
+[`activity.jsonl`](../tests/fixtures/reasoning-row-scene/activity.jsonl): an
+empty thought, a command and a background command, then a second empty thought
+that stays live for 30 seconds while that command group is still running, then
+a newer command that runs for 25 seconds in a group of its own. It captures the
+working turn at both points, waits for the answer, and captures the finished
+turn.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
+```
+
 For a short comparison against main after the background-notice changes, run
 `refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
 each revision. Build both revisions before starting either session, use
@@ -451,7 +463,9 @@ cleans up its workers. Exercise a fresh native Close afterward as well.
 
 For a saved completed pane with no resident worker, use `prepare-completed`.
 The helper starts, finishes and releases its fixture shell before seeding its
-ended descriptor. Open **Shared Close race** and close **Original terminal**
+ended descriptor. Prepare it through `env` while the UI is stopped, then use
+`start SIDE --keep-state`: a running window can adopt the temporary worker
+before the helper places its saved pane. Open **Shared Close race** and close **Original terminal**
 once. Its pane should disappear without starting a replacement or needing a
 retained final screen. This exercises the completed-source absence proof;
 fixtures do not exercise live provider cleanup.
