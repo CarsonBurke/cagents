@@ -6,6 +6,7 @@ use crate::terminal::ipc::{
     ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
     read_frame, write_frame,
 };
+use crate::workspace_model::delta::EditEffects;
 use crate::workspace_model::{ModelEdit, ModelProject, WorkspaceModel};
 use cosmic::iced::futures::StreamExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,6 +15,32 @@ const CHILD: &str = "ADE_PROJECT_CLOSE_TEST_CHILD";
 const WAIT: Duration = Duration::from_secs(5);
 const CHILD_TIMEOUT: Duration = Duration::from_secs(40);
 const BASELINE: &str = "baseline\n";
+const FIXTURE_ORDINAL: u32 = 7;
+
+/// The project rows the daemon publishes with each edit this peer streams,
+/// as `public_effects` records them, so the window acts on real effects.
+fn canonical_effects(edit: &ModelEdit) -> EditEffects {
+    match edit {
+        ModelEdit::CloseProject { repository } => EditEffects {
+            removed_projects: vec![repository.clone()],
+            ..Default::default()
+        },
+        ModelEdit::ReopenProject {
+            repository,
+            name,
+            kind,
+        } => EditEffects {
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: name.clone(),
+                kind: *kind,
+                ordinal: FIXTURE_ORDINAL,
+            }],
+            ..Default::default()
+        },
+        edit => panic!("the close fixture streams no {edit:?}"),
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Case {
@@ -332,7 +359,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             repository: root.clone(),
             name: "Fixture folder".into(),
             kind: ProjectKind::Folder,
-            ordinal: 7,
+            ordinal: FIXTURE_ORDINAL,
         }],
         ..Default::default()
     };
@@ -355,8 +382,9 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         respond(
             &mut watcher,
             watch,
-            ServerResponse::WorkspaceModel {
+            ServerResponse::WorkspaceSnapshot {
                 model: served_model,
+                closed: Vec::new(),
             },
         );
         let watcher = std::thread::spawn(move || {
@@ -369,6 +397,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                         proof: proof(),
                         message: ServerMessage::WorkspaceModelEdited {
                             sequence: index as u64 + 2,
+                            effects: canonical_effects(&edit),
                             edit,
                         },
                     },
@@ -380,14 +409,22 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         for index in 0..if case.resumes() { 2 } else { 1 } {
             let (mut cleanup, _) = listener.accept().unwrap();
             handshake(&mut cleanup);
+            // Cleanup verifies ownership against the registry's projects as
+            // the close left them.
             let read: ClientEnvelope = read_frame(&mut cleanup).unwrap().unwrap();
-            assert!(matches!(&read.request, ClientRequest::ReadWorkspaceModel));
+            assert!(matches!(
+                &read.request,
+                ClientRequest::ReadWorkspaceMetadata {
+                    query: crate::workspace_model::metadata::Query::Projects,
+                }
+            ));
             respond(
                 &mut cleanup,
                 read,
-                ServerResponse::WorkspaceModel {
-                    model: closed_model.clone(),
-                },
+                ServerResponse::WorkspaceMetadata(crate::workspace_model::metadata::Reply::Projects {
+                    identity: closed_model.identity,
+                    projects: closed_model.projects.clone(),
+                }),
             );
             let chats: ClientEnvelope = read_frame(&mut cleanup).unwrap().unwrap();
             assert!(matches!(&chats.request, ClientRequest::ChatList));
@@ -419,7 +456,6 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
     });
 
     let mut app = super::super::tests::context_inspector_test_app(false);
-    app.context_inspector_open = false;
     app.settings.editor_auto_save = false;
     app.settings.language_servers.clear();
     app.lsp = LspManager::new(Vec::new());
@@ -462,8 +498,6 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         title: "notes.txt".into(),
         width_fraction: 1.0,
         existence: Existence::Open,
-        exposure: Exposure::Visible,
-        residency: Residency::Hot,
         kind: CardKind::Repository(descriptor),
     });
     durable.focused = Some(card);
@@ -486,7 +520,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         .unwrap();
     assert!(matches!(
         connected,
-        super::super::workspace_model_sync::ModelUpdate::Connected(_)
+        super::super::workspace_model_sync::ModelUpdate::ConnectedClosed { .. }
     ));
     drop(app.update(Message::WorkspaceModelObserved(connected)));
     edits.send(close).unwrap();
@@ -496,7 +530,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         .unwrap();
     assert!(matches!(
         &closed,
-        super::super::workspace_model_sync::ModelUpdate::Edited {
+        super::super::workspace_model_sync::ModelUpdate::Changed {
             edit: ModelEdit::CloseProject { .. },
             ..
         }
@@ -627,7 +661,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                 .unwrap();
             assert!(matches!(
                 &reopened,
-                super::super::workspace_model_sync::ModelUpdate::Edited {
+                super::super::workspace_model_sync::ModelUpdate::Changed {
                     edit: ModelEdit::ReopenProject { .. },
                     ..
                 }
