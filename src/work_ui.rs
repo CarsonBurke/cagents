@@ -641,13 +641,14 @@ impl State {
                 design::caption(empty_lane(column))
                     .class(cosmic::theme::Text::Custom(design::muted_text)),
             )
-            .padding(space::S)
+            .padding(Padding::new(space::S).top(space::S + space::XS))
             .width(Length::Fill)
             .into()
         } else {
-            // Cards scroll in the open lane below its heading, so a card
-            // crossing either edge fades into the lane rather than being
-            // sliced there.
+            // Cards scroll in the open lane right up to its heading, so a
+            // card crossing either edge fades into the lane rather than
+            // being sliced there. The gap below the heading scrolls with
+            // them.
             crate::interaction::overflow_fade_y(
                 crate::ui_controls::keep_in_place(
                     widget::scrollable(
@@ -659,7 +660,10 @@ impl State {
                             .estimate(CARD_ESTIMATE)
                             .keep_built(self.open_menu_key()),
                         )
-                        .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
+                        .padding(design::with_vertical_rail(Padding {
+                            top: space::XS,
+                            ..Padding::from([0.0, space::XS])
+                        })),
                     )
                     .direction(iced::widget::scrollable::Direction::Vertical(
                         design::scrollbar(),
@@ -670,10 +674,10 @@ impl State {
             )
         };
         widget::container(
-            widget::column::with_children(vec![header.into(), body])
-                .spacing(space::XS)
-                .height(Length::Fill),
+            widget::column::with_children(vec![header.into(), body]).height(Length::Fill),
         )
+        // The lane's own inset at the bottom keeps the fade there inside its
+        // rounded corners.
         .padding(Padding::from([space::XS, 0.0, space::XS, space::XS]))
         .width(width)
         .height(Length::Fill)

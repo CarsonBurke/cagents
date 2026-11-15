@@ -1346,24 +1346,30 @@ impl Runtime {
             // Full bytes are resolved only on expansion/copy. The collapsed
             // surface never clones or shapes a provider's request dump.
             if let Some((preview, omitted)) = self.failure_preview(&incident.key) {
+                // The preview scrolls between the disclosure's controls and
+                // its caption: what passes an edge fades into the surface.
                 rows.push(
-                    widget::container(
-                        widget::scrollable(selectable_prose::logical_text(
-                            vec![iced::widget::text::Span::new(preview.to_owned())].into(),
-                            design::TEXT_CAPTION.into(),
-                            iced::Font::MONOSPACE,
-                            target,
-                            None,
-                            selectable_prose::Logical {
-                                identity: diagnostic_preview_identity(&incident.key),
-                                start: 0,
-                            },
-                        ))
+                    widget::container(crate::interaction::overflow_fade_y(
+                        widget::scrollable(
+                            widget::container(selectable_prose::logical_text(
+                                vec![iced::widget::text::Span::new(preview.to_owned())].into(),
+                                design::TEXT_CAPTION.into(),
+                                iced::Font::MONOSPACE,
+                                target,
+                                None,
+                                selectable_prose::Logical {
+                                    identity: diagnostic_preview_identity(&incident.key),
+                                    start: 0,
+                                },
+                            ))
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
+                        surface,
+                    ))
                     .max_height(240)
                     .into(),
                 );

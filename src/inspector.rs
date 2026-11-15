@@ -578,10 +578,12 @@ pub fn locations_view(
     )
 }
 
+/// A section's rows, scrolling between its header and the rule below it.
+/// What passes either edge fades into the inspector.
 fn section_scroll(
     rows: Vec<Element<'static, InspectorAction>>,
 ) -> Element<'static, InspectorAction> {
-    widget::scrollable(
+    let scroll = widget::scrollable(
         widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
@@ -597,8 +599,8 @@ fn section_scroll(
     ))
     .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    .height(Length::Fill);
+    crate::interaction::overflow_fade_y(scroll, crate::design::base)
 }
 
 fn language_server_section(status: Option<&LspStatus>, notice: Option<&str>) -> Option<Section> {
