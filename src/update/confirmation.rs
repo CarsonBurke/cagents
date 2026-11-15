@@ -217,6 +217,23 @@ pub(super) fn check_cancelled(state: &Path, job: &UpdateJob) -> Result<(), Updat
     Ok(())
 }
 
+/// Within a review, its own Cancel closes it. Closing a review that named
+/// something to resolve by hand first records that refusal; cancelling the
+/// whole update, as Ctrl-C does, stays a cancellation.
+fn check_review_closed(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    if let Some(nonce) = cancellation_nonce(state, &job.id)? {
+        check_cancellation(state, &job.id, &nonce)?;
+    }
+    if let Some(confirmation) = &job.confirmation {
+        match check_cancellation(state, &job.id, &confirmation.nonce) {
+            // The preview it closed is the one the person was shown.
+            Err(UpdateError::Cancelled) => return Err(closed(&confirmation.preview)),
+            result => result?,
+        }
+    }
+    Ok(())
+}
+
 fn check_cancellation(state: &Path, job: &str, nonce: &str) -> Result<(), UpdateError> {
     let path = state.join(format!("{job}.{nonce}.cancel"));
     match read_private(&path, SMALL_ASSET_LIMIT) {
@@ -286,10 +303,20 @@ fn wait_with(
     state: &Path,
     job: &mut UpdateJob,
     reviewed: Option<impact::Preview>,
+    observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
+) -> Result<impact::Preview, UpdateError> {
+    wait_for(state, job, reviewed, CONFIRMATION_LIFETIME, observe)
+}
+
+fn wait_for(
+    state: &Path,
+    job: &mut UpdateJob,
+    reviewed: Option<impact::Preview>,
+    lifetime: Duration,
     mut observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    let deadline = Instant::now() + CONFIRMATION_LIFETIME;
-    let expires = now_ms().saturating_add(CONFIRMATION_LIFETIME.as_millis() as u64);
+    let deadline = Instant::now() + lifetime;
+    let expires = now_ms().saturating_add(lifetime.as_millis() as u64);
     let mut policy = reviewed
         .as_ref()
         .and_then(|preview| preview.daemon.as_ref())
@@ -302,15 +329,15 @@ fn wait_with(
     let mut nonce = uuid::Uuid::new_v4().to_string();
     loop {
         if Instant::now() >= deadline {
-            return Err(invalid(
-                "Update preview expired without installation; review the update again",
-            ));
+            return Err(refused(&preview, true).unwrap_or_else(|| {
+                invalid("Update preview expired without installation; review the update again")
+            }));
         }
         {
             // A cancellation acknowledged for the previous preview must win
             // before refreshing its nonce, including while observe was busy.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
-            check_cancelled(state, job)?;
+            check_review_closed(state, job)?;
             job.confirmation = Some(Confirmation {
                 stop: None,
                 nonce: nonce.clone(),
@@ -332,7 +359,7 @@ fn wait_with(
                 },
             )?;
         }
-        check_cancelled(state, job)?;
+        check_review_closed(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
         match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
@@ -344,7 +371,7 @@ fn wait_with(
                 }
                 fs::remove_file(&path)?;
                 match decision.choice {
-                    Choice::Cancel => return Err(UpdateError::Cancelled),
+                    Choice::Cancel => return Err(closed(&preview)),
                     Choice::Confirm => approved = true,
                     Choice::StopListed { .. } => (),
                     Choice::Policy(next) => {
@@ -384,11 +411,25 @@ fn wait_with(
         {
             // Preserve this exact nonce until the source accepts prepare, so
             // Ctrl-C still cancels while windows are saving and closing.
-            check_cancelled(state, job)?;
+            check_review_closed(state, job)?;
             return Ok(preview);
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Closing a review is a cancellation unless something it named had to be
+/// resolved by hand first; then that is why the update was not installed.
+fn closed(preview: &impact::Preview) -> UpdateError {
+    refused(preview, false).unwrap_or(UpdateError::Cancelled)
+}
+
+fn refused(preview: &impact::Preview, expired: bool) -> Option<UpdateError> {
+    let refusal = preview.refusal()?;
+    Some(UpdateError::Refused(Box::new(impact::Refusal {
+        expired,
+        ..refusal
+    })))
 }
 
 /// Choosing interruption advances a service-wide floor to its exact typed
@@ -464,9 +505,9 @@ pub(super) fn wait_stop(
 ) -> Result<(impact::Preview, floor_display::StopList), UpdateError> {
     let deadline = Instant::now() + CONFIRMATION_LIFETIME;
     let expires = now_ms().saturating_add(CONFIRMATION_LIFETIME.as_millis() as u64);
-    check_cancelled(state, job)?;
+    check_review_closed(state, job)?;
     let (mut preview, mut list) = observe()?;
-    check_cancelled(state, job)?;
+    check_review_closed(state, job)?;
     if !terminal {
         return Err(invalid(format!(
             "{} Details: {}",
@@ -485,7 +526,7 @@ pub(super) fn wait_stop(
             // A cancellation accepted for the old nonce must win before a
             // changed inventory can publish its replacement.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
-            check_cancelled(state, job)?;
+            check_review_closed(state, job)?;
             job.confirmation = Some(Confirmation {
                 nonce: nonce.clone(),
                 preview: preview.clone(),
@@ -503,7 +544,7 @@ pub(super) fn wait_stop(
                 ),
             )?;
         }
-        check_cancelled(state, job)?;
+        check_review_closed(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
         let decision = match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
@@ -518,10 +559,10 @@ pub(super) fn wait_stop(
             Err(error) => return Err(error),
         };
         if matches!(decision, Some(Choice::Cancel)) {
-            return Err(UpdateError::Cancelled);
+            return Err(closed(&preview));
         }
         let (current, current_list) = observe()?;
-        check_cancelled(state, job)?;
+        check_review_closed(state, job)?;
         let unchanged =
             preview.preserves_stop_consent(&current) && list.digest() == current_list.digest();
         if unchanged
@@ -553,6 +594,7 @@ mod tests {
             message: String::new(),
             log_path: directory.join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let request = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(
@@ -801,6 +843,7 @@ mod tests {
                 preview,
                 expires_at_unix_ms: u64::MAX,
             }),
+            refusal: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),
@@ -994,6 +1037,101 @@ mod tests {
             Err(UpdateError::Cancelled)
         ));
     }
+    /// Closing a blocked review is the person declining because of what it
+    /// named, so the job records those reasons rather than a cancellation.
+    /// Cancelling the whole update, as Ctrl-C does, stays a cancellation.
+    #[test]
+    fn closing_a_blocked_review_records_what_refused_the_update() {
+        for whole_update in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            let worker = thread::spawn(move || {
+                let mut job = job(&path);
+                initialize(&path, &job.id).unwrap();
+                wait(&path, &mut job, |_| Ok(impact::tests::blocked_preview()))
+            });
+            let current = published(directory.path(), None);
+            if whole_update {
+                assert!(cancel_at(directory.path(), &current.id).unwrap());
+            } else {
+                decide_at(
+                    directory.path(),
+                    &current.id,
+                    &current.confirmation.as_ref().unwrap().nonce,
+                    Choice::Cancel,
+                )
+                .unwrap();
+            }
+            match worker.join().unwrap() {
+                Err(UpdateError::Refused(refusal)) if !whole_update => {
+                    assert_eq!(Some(*refusal), impact::tests::blocked_preview().refusal());
+                }
+                Err(UpdateError::Cancelled) if whole_update => {}
+                other => panic!("whole update {whole_update}: {other:?}"),
+            }
+        }
+    }
+
+    /// Declining the stop list that a blocked review leads to is the same
+    /// refusal; one with nothing blocked is a plain cancellation.
+    #[test]
+    fn declining_a_blocked_stop_list_records_what_refused_the_update() {
+        for blocked in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            let worker = thread::spawn(move || {
+                let mut job = job(&path);
+                let reviewed = if blocked {
+                    impact::tests::blocked_preview()
+                } else {
+                    preview(false)
+                };
+                wait_stop(&path, &mut job, true, || {
+                    Ok((reviewed.clone(), stop_list()))
+                })
+            });
+            let current = published(directory.path(), None);
+            decide_at(
+                directory.path(),
+                &current.id,
+                &current.confirmation.as_ref().unwrap().nonce,
+                Choice::Cancel,
+            )
+            .unwrap();
+            match worker.join().unwrap() {
+                Err(UpdateError::Refused(_)) if blocked => {}
+                Err(UpdateError::Cancelled) if !blocked => {}
+                other => panic!("blocked {blocked}: {other:?}"),
+            }
+        }
+    }
+
+    /// A review left blocked until it expires was refused by the same
+    /// reasons, and says that it expired.
+    #[test]
+    fn a_blocked_review_that_expires_records_its_reasons() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        let result = wait_for(directory.path(), &mut job, None, Duration::ZERO, |_| {
+            Ok(impact::tests::blocked_preview())
+        });
+        let Err(UpdateError::Refused(refusal)) = result else {
+            panic!("a blocked review expired as something other than a refusal: {result:?}");
+        };
+        assert!(refusal.expired);
+        assert!(
+            refusal
+                .message()
+                .starts_with("Update not installed: the review expired while ")
+        );
+        let unblocked = wait_for(directory.path(), &mut job, None, Duration::ZERO, |_| {
+            Ok(preview(false))
+        });
+        assert!(
+            matches!(unblocked, Err(UpdateError::Invalid(message)) if message.contains("expired"))
+        );
+    }
+
     #[test]
     fn cancellation_overrides_pending_approval_and_remains_available_while_closing_windows() {
         let directory = tempfile::tempdir().unwrap();

@@ -113,6 +113,10 @@ pub enum UpdateError {
     TargetRecoveryRequired(#[from] recovery::TargetRecoveryRequired),
     #[error("Update cancelled")]
     Cancelled,
+    /// The review was closed, or expired, while something it named had to
+    /// be resolved by hand first. Unlike a cancellation, this says what.
+    #[error("{}", .0.message())]
+    Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
     #[error("{0}")]
@@ -186,6 +190,23 @@ pub struct UpdateJob {
     pub log_path: PathBuf,
     #[serde(default)]
     pub confirmation: Option<confirmation::Confirmation>,
+    /// What held a refused update back. A refused job ends `Failed` with this
+    /// set and `message` naming the same reasons, so a reader that predates
+    /// this field still shows them rather than a cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<impact::Refusal>,
+}
+
+impl UpdateError {
+    /// What a refused update's record keeps. A refusal is not a phase of its
+    /// own: windows and CLIs of other versions read the job, and an unknown
+    /// phase would hide it from them. They read `Failed` and the message.
+    fn refusal(&self) -> Option<impact::Refusal> {
+        match self {
+            Self::Refused(refusal) => Some((**refusal).clone()),
+            _ => None,
+        }
+    }
 }
 
 impl UpdateJob {
@@ -1107,6 +1128,7 @@ fn start_job(
         message: "Starting verified update".into(),
         log_path: state.join(format!("{id}.log")),
         confirmation: None,
+        refusal: None,
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
@@ -1454,6 +1476,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         UpdatePhase::Failed
     };
     job.confirmation = None;
+    job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
     job.message = match &result {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(_) if settled_failure => job.message.clone(),
@@ -2063,6 +2086,7 @@ fn record_primary_failure(
         UpdatePhase::Failed
     };
     job.confirmation = None;
+    job.refusal = error.refusal();
     job.message = error.to_string();
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(recovery_report);
@@ -3193,6 +3217,7 @@ mod tests {
             message: String::new(),
             log_path: directory.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
@@ -4554,6 +4579,7 @@ finally:
             message: "installed daemon startup failed".into(),
             log_path: root.join(".update/historical-failure.log"),
             confirmation: None,
+            refusal: None,
         };
         let superseded = |job: &UpdateJob, switched| {
             failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
@@ -4718,6 +4744,7 @@ finally:
             message: String::new(),
             log_path: root.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let result = Err(invalid("the original startup failure"));
         // A failed status write must leave the reservation intact.
@@ -4952,6 +4979,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             message: String::new(),
             log_path: root.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
         let census = if matches!(
@@ -5390,6 +5418,7 @@ sys.stdin.buffer.read(1)
             message: String::new(),
             log_path: state.join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         let monitor = thread::spawn(move || {
@@ -5415,6 +5444,7 @@ sys.stdin.buffer.read(1)
             message: String::new(),
             log_path: directory.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let report = concat!(
             "\nThe terminal service accepted the stop.\n",
@@ -5509,6 +5539,7 @@ sys.stdin.buffer.read(1)
             .into(),
             log_path: "/fake/update-worker.log".into(),
             confirmation: None,
+            refusal: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),
