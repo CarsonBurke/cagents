@@ -258,7 +258,6 @@ pub struct WorkspaceManifest {
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
-    pub workspace_visits: Vec<(WorkspaceDestination, u64)>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
@@ -2173,7 +2172,6 @@ impl StateStore {
             chat_waiting_messages: manifest.chat_waiting_messages,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
-            workspace_visits: manifest.workspace_visits,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
@@ -4292,11 +4290,12 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
         &to_json(&state.workspace_history)?,
     )?;
-    set_metadata(
-        transaction,
-        &format!("workspace:{workspace_id}:navigation:workspace_visits"),
-        &to_json(&state.workspace_visits)?,
-    )?;
+    // Written by one release only; nothing reads it any more.
+    transaction
+        .prepare_cached("DELETE FROM metadata WHERE key = ?1")?
+        .execute([format!(
+            "workspace:{workspace_id}:navigation:workspace_visits"
+        )])?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:agent_updates"),
@@ -5918,18 +5917,6 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace history", &value))
         .transpose()?
         .unwrap_or_default(),
-        // Only dates rows in the workspace switcher, so an unreadable value
-        // costs those dates rather than the workspace.
-        workspace_visits: metadata(
-            connection,
-            &format!("workspace:{id}:navigation:workspace_visits"),
-        )?
-        .and_then(|value| {
-            from_json("workspace visits", &value)
-                .inspect_err(|error| tracing::warn!(%error, "Skipping unreadable workspace visits"))
-                .ok()
-        })
-        .unwrap_or_default(),
         repository_navigation: metadata(
             connection,
             &format!("workspace:{id}:navigation:repository_navigation"),
@@ -6658,7 +6645,6 @@ mod tests {
             chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
-            workspace_visits: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),

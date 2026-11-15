@@ -188,7 +188,7 @@ mod tests {
         let mut times = Vec::new();
         for expanded in [None, Some(false), Some(true)] {
             let mut element = row(
-                "Thought for".into(),
+                "Thinking".into(),
                 "Reasoning".into(),
                 Icon::Agent,
                 None,

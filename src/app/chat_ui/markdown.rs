@@ -1291,6 +1291,27 @@ struct State {
     labels: Arc<pull_request_links::Labels>,
 }
 
+/// Whether `item` shows an image, itself or within its quotes, lists or
+/// table cells.
+pub(super) fn shows_image(item: &Item) -> bool {
+    match item {
+        Item::Image { .. } => true,
+        Item::Quote(items) => items.iter().any(shows_image),
+        Item::List { bullets, .. } => bullets
+            .iter()
+            .any(|bullet| bullet.items().iter().any(shows_image)),
+        Item::Table { columns, rows } => {
+            columns
+                .iter()
+                .any(|column| column.header.iter().any(shows_image))
+                || rows
+                    .iter()
+                    .any(|row| row.cells.iter().flatten().any(shows_image))
+        }
+        _ => false,
+    }
+}
+
 fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
     for item in items {
         match item {
