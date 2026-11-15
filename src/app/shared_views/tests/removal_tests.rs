@@ -251,7 +251,7 @@ fn shared_close_publication_contains_the_original_source_and_registry() {
     app.publish_view_changes();
     let changes = std::iter::from_fn(|| published.try_recv().ok())
         .filter_map(|edit| {
-            if let ModelEdit::ChangeView { scope, change, .. } = edit {
+            if let ModelEdit::ChangeView { scope, change, .. } = edit.edit {
                 Some((scope, change))
             } else {
                 None

@@ -25715,7 +25715,7 @@ mod tests {
         assert_eq!(app.workspace_model.views[0].panes[0], replacement);
         assert!(
             !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(
-                edit,
+                edit.edit,
                 ModelEdit::ChangeView {
                     change: Change::Remove { .. } | Change::RemoveSource { .. },
                     ..

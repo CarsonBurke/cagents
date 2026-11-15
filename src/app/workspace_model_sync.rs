@@ -4619,9 +4619,9 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (out, updates) = async_channel::unbounded();
-        let (input, requests) = async_channel::unbounded();
-        input.send_blocking(first).unwrap();
-        input.send_blocking(next.clone()).unwrap();
+        let (input, requests) = async_channel::unbounded::<ModelRequest>();
+        input.send_blocking(first.into()).unwrap();
+        input.send_blocking(next.clone().into()).unwrap();
         drop(input);
         let mut pending = None;
         assert!(publish_with_client(&out, &requests, &mut pending, &mut client).is_err());
