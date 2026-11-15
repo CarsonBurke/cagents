@@ -26,7 +26,7 @@ use std::{
 };
 use uuid::Uuid;
 
-pub(crate) const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_STORE_IMAGES: usize = 4096;
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
@@ -607,10 +607,10 @@ fn now_ms() -> Result<u64, String> {
     )
     .map_err(storage_error)
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static TEST_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
 fn store_path() -> Result<PathBuf, String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(path) = TEST_DIRECTORY.with(|path| path.borrow().clone()) {
         return Ok(path);
     }
@@ -693,7 +693,7 @@ pub fn is_stored_image_path(path: &Path) -> bool {
             })
 }
 #[cfg(feature = "ui")]
-pub(crate) fn stage_validated(
+pub fn stage_validated(
     bytes: &[u8],
     name: &str,
     extension: &str,
@@ -704,8 +704,12 @@ pub(crate) fn stage_validated(
 
 /// Thread-local, private real storage. Provider regressions exercise the same
 /// public APIs without changing XDG variables or another test's device.
-#[cfg(all(test, any(feature = "ui", feature = "host")))]
-pub(crate) fn with_test_image<T>(test: impl FnOnce(Attachment) -> T) -> T {
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(feature = "ui", feature = "host")
+))]
+#[doc(hidden)]
+pub fn with_test_image<T>(test: impl FnOnce(Attachment) -> T) -> T {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join(STORE_DIRECTORY);
     let store = Store::at(&path, true).unwrap();
@@ -723,8 +727,12 @@ pub(crate) fn with_test_image<T>(test: impl FnOnce(Attachment) -> T) -> T {
     test(attachment)
 }
 
-#[cfg(all(test, any(feature = "ui", feature = "host")))]
-pub(crate) fn test_image(name: &str) -> Attachment {
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(feature = "ui", feature = "host")
+))]
+#[doc(hidden)]
+pub fn test_image(name: &str) -> Attachment {
     let bytes = fixture_bytes(name);
     store(false)
         .unwrap()
@@ -732,7 +740,10 @@ pub(crate) fn test_image(name: &str) -> Attachment {
         .unwrap()
 }
 
-#[cfg(all(test, any(feature = "ui", feature = "host")))]
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(feature = "ui", feature = "host")
+))]
 fn fixture_bytes(name: &str) -> Vec<u8> {
     use image::ImageEncoder;
     let hash = Sha256::digest(name.as_bytes());

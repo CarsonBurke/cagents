@@ -16,8 +16,21 @@ set -eu
 
 # Installed as $FIXTURE/bin/codex: its own location is the root, since neither
 # the app nor the daemon promises to pass the fixture's variables on.
-fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 peers=$fixture/libexec/codex
+# Hold the real login terminal open for native busy-label recovery checks.
+# Status remains immediate; neither path contacts a provider.
+if [ "${1:-}" = login ]; then
+    fixture_codex_home=$(CDPATH='' cd -- "${CODEX_HOME:-$fixture/home/.codex}" && pwd -P) || exit 2
+    case "$fixture_codex_home/" in "$fixture/"*) ;; *) echo 'codex: fixture login home must be beneath its private root' >&2; exit 2 ;; esac
+    if [ "${2:-}" != status ] && [ -f "$fixture_codex_home/fixture-sign-in-seconds" ]; then
+        delay=$(head -n 1 "$fixture_codex_home/fixture-sign-in-seconds")
+        case $delay in ''|*[!0-9]*) echo 'codex: fixture-sign-in-seconds must hold whole seconds' >&2; exit 2 ;; esac
+        sleep "$delay"
+    fi
+    printf '%s\n' 'Successfully logged in'
+    exit 0
+fi
 peer=$(cat -- "$peers/peer" 2>/dev/null) || peer=
 case $peer in
     tool-rows) script=codex-tool-rows.py root=CAGENTS_TOOL_ROWS_FIXTURE_ROOT ;;

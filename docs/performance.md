@@ -2,12 +2,17 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Activity spinner cost](#activity-spinner-cost)
+- [Idle UI wakeups](#idle-ui-wakeups)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
+- [Workspace model edits](#workspace-model-edits)
 - [Native chat viewport](#native-chat-viewport)
+- [Idle retained actors](#idle-retained-actors)
+- [Work board polling](#work-board-polling)
+- [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -55,7 +60,7 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
 advance one focused step per frame. Measure the UI process with one busy agent
@@ -93,6 +98,56 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+## Idle UI wakeups
+
+A focused text cursor blinks for ten seconds after the last input, then rests
+visible and asks for no more frames, following GTK's
+`gtk-cursor-blink-timeout`. Every cursor shares that schedule:
+`iced_core::text::Blink` in `vendor/iced-core`, used by iced's text editor and
+text input (`vendor/iced-widget`), libcosmic's text input, the app's code editor
+and the terminal. Before, each focused cursor repainted the whole window every
+500 ms for as long as it held focus, and the chat composer holds focus after a
+chat opens or a message is sent.
+
+Where the desktop states its own blink through the settings portal
+(`org.gnome.desktop.interface` on GNOME, GTK and COSMIC), cursors use its
+interval and timeout instead, and follow changes while the app runs. With
+blinking turned off, every cursor is steady and asks for no frames, including a
+terminal whose program requested a blinking cursor.
+
+To measure it, seed a fixture with 30 settled chats, start a session with
+`scripts/native-evidence start SIDE --ui-trace`, spawn three agents whose
+first turn stays busy, then interrupt them. Leave the composer focused and the
+pointer still. Sample each UI thread's `voluntary_ctxt_switches` and
+`schedstat` CPU time from `/proc/PID/task/*` over 60 s, 30 s after spawning
+and 20 s after interrupting. The `ui-trace` summaries give the redraw count and
+time per five-second window.
+
+Local reference: fw16 (Ryzen 7 7840HS), `dev-runtime` build, headless nested
+session at 1500x900. Before is `374370965`; after is `2aec4b05c`. CPU is a
+percentage of one core:
+
+| State | Before | After |
+| --- | --- | --- |
+| Agents settled, composer focused: UI thread | 7.0 wakeups/s, 2.0% | 1.7 wakeups/s, 1.1% |
+| Agents settled, composer focused: redraws | 2.7/s | 0.8/s |
+| Agents settled, composer focused: clipboard thread | 6.2 wakeups/s | 2.2 wakeups/s |
+| Three agents working: UI thread | 26.4 wakeups/s, 6.1% | 23.5 wakeups/s, 5.5% |
+
+The after build also has the wgpu-core change below, which makes every frame
+cheaper, so the CPU columns credit both changes. The wakeups and redraws are
+the cursor's alone. With agents working, the spinners already ask for ten
+frames a second, so the cursor's frames made little difference there. Neither side logged a UI-thread
+call over 50 ms after startup. The remaining settled redraws follow the app's
+own updates.
+
+`dev-runtime` builds also turn off wgpu-core's debug assertions. With them,
+WGPU captured a backtrace whenever it took its snatch lock, on every frame, and
+the runner's `RUST_BACKTRACE=1` made that a real stack walk: about 16% of the
+UI thread's profile samples with three agents working. Release builds never
+paid it. The CPU difference in the working row is within the noise of the
+shared build host.
 
 ## UI thread trace
 
@@ -350,7 +405,7 @@ change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
 integrated build, browser progress ticks), now skip it. A wake whose only
 change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
-one publication to shared views, every three seconds. The unit tests in `src/app/terminal_output_tests.rs`
+one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
 
 The native workload has no script. In the browserless development runner,
@@ -383,13 +438,47 @@ resolution, layout, accessibility projection and allocation. After the change,
 the remaining title-churn time is mostly the same view, layout and render work
 that each title causes; `sync_chrome` is about 0.2% of samples.
 
+## Workspace model edits
+
+A pane edit in one window reaches every other window as a model edge. The
+window applies the edge's effects to its copy and, for a settled presentation
+change such as a pane title, projects only that scope. Two trace targets show
+where that work goes; with both disabled these paths read no clock and
+allocate nothing.
+
+- `cagents::workspace_pipeline=debug` records the inclusive wall time of each
+  shared-model update, including its projection tail, and of each replica
+  snapshot timer and capture.
+- `cagents::workspace_projection=trace` records whether each update projected
+  one scope or the whole workspace, with the reason when it fell back. A unit
+  fixture's eligibility does not show that a native workload qualifies, so
+  count selected and full projections in the native run.
+
+Measure edits on the generated large workspace with fixture agents streaming,
+one of them visible, and drive a fixed number of pane title edits at a fixed
+interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
+main-thread CPU and the UI thread trace's update and frame times over the edit
+interval on both sides.
+
+Start the native evidence session with `--ui-trace --workspace-trace` to
+record both inclusive update time and the selected/full projection decisions.
+`scripts/native-evidence open-window window-2` opens the peer through the
+development runner using the same recorded binaries, without compiling under
+the native lock. Its trace is `logs/ui-SIDE-window-2.log`; the primary trace
+is `logs/ui-SIDE.log`.
+
+The current-main comparison for the UI half of this work is tracked in
+[#2789](https://github.com/CarsonBurke/cagents/pull/2789). Its measurement table
+identifies the actual application revisions, workload, raw receipts and
+qualifications; historical #2573 results are not measurements of this branch.
+
 ## Native chat viewport
 
 Run the headless viewport contract with optimized application code, separately
 from native application measurements:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+CARGO_BUILD_JOBS=2 cargo test --locked -p cagents-ui \
   --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
   --config 'profile.dev-runtime.debug-assertions=false' --lib \
   chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
@@ -419,7 +508,7 @@ state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
 raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
 40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
 the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
-most recently hidden chats warm (`src/app/chat_ui/warm.rs`): at most 8, within
+most recently hidden chats warm (`crates/cagents-ui/src/app/chat_ui/warm.rs`): at most 8, within
 an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
 it hides. The estimate is calibrated against the heap cooling frees, measured
 by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a
@@ -581,6 +670,124 @@ pressure; commands of at most 2,048 bytes can be excluded using the
 recognizer's existing program-name predicate. Full rich coordination parts are
 still reparsed on changed publications; off-thread ownership does not make this
 cost incremental.
+
+## Idle retained actors
+
+Each retained Claude agent keeps a `cagents-native --cagents-native-actor`
+process alive between turns. An idle actor should not wake: its serve loop
+reaps adopted tool orphans when a child exits, read from a signalfd, and its
+`cagents-commands` cgroup sweeper backs off from 1 s to 8 s once a provider
+that reports its own activity has been quiet.
+
+`scripts/measure-idle-wakeups` counts context switches and on-CPU time per
+thread name from `/proc` alone, without signalling anything, so it is safe to
+run against the actors of a live session:
+
+```sh
+scripts/measure-idle-wakeups --seconds 60
+```
+
+`scripts/measure-idle-actors BIN_DIR [COUNT] [SECONDS]` builds a private
+fixture (HOME, XDG directories, runtime directory and project) from a matched
+`cagents` and `cagentsd`, spawns COUNT agents with the offline fixture provider
+one at a time, waits for each to settle, and then measures only the fixture's
+actors. It removes every process and directory it created on exit. Run it from
+a genuine user shell, such as `ssh fw16`; it refuses agent authority.
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 45 idle actors,
+60 s, `0b8b9aace` (before) against `6e62e851a` (after). The host was shared
+with other builds, so treat CPU as indicative; the wakeup counts are timer
+periods and barely depend on load.
+
+| Wakeups/s | Before | After |
+| --- | --- | --- |
+| `cagents-native` (serve loop) | 188.47 | 0 |
+| `cagents-command` (cgroup sweep) | 46.30 | 5.92 |
+| `cagents-chat` | 0 | 0 |
+| Total | 234.77 | 5.92 |
+| Per actor | 5.22 | 0.13 |
+
+CPU across all 45 actors fell from 3.32% to 0.08% of one core.
+
+`/proc` truncates the `cagents-commands` thread name to `cagents-command`.
+The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
+7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
+started without an announcement.
+
+## Work board polling
+
+The daemon's Work board keeps each open project's Git facts current. The Git
+watcher covers projects within a budget of 8192 directory watches, and each
+checkout's tracked directories count against it, so a repository with
+hundreds of worktrees is polled instead. Each worktree of a polled project
+comes due on its own. A worktree with an edit or agent session in the active
+window is read every 15 s, and any other every 120 s; reads due within the
+next 15 s share one scan. Previously one recent edit anywhere made the whole
+project re-read every worktree every 15 s.
+
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
+private fixture from a matched `cagents` and `cagentsd`: a project of
+WORKTREES worktrees (default 250) with 40 tracked directories each, which it
+checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
+worktrees. After the board has read every checkout once, it counts the
+`git status` reads the daemon starts and the CPU of its exited children over
+SECONDS (default 300). It removes everything it created on exit and refuses
+agent authority; run it from `ssh fw16`.
+
+Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
+300 s, `0ac78d249` (before) against `9b8523e9a` (after):
+
+| | Before | After |
+| --- | --- | --- |
+| `git status` per second | 15.79 | 2.47 |
+| Git CPU, % of one core | 7.22 | 1.71 |
+| Daemon CPU, % of one core | 1.83 | 0.45 |
+
+A fixture checkout holds 40 files. A real checkout costs more per read: on a
+347-worktree repository with 8 active worktrees, the scanner's Git processes
+took at least half a core before this change.
+
+## Git watcher during builds
+
+The daemon's Git watcher (`notify-rs inotify loop`, from the `notify` crate)
+covers each project's tracked directories and Git metadata. It asks the kernel
+for changes only: creations, removals, renames, content and metadata writes.
+An inotify watch that includes opens wakes the thread whenever `git status`, a
+compiler or an editor merely reads a watched file or lists a watched directory.
+Ignored output such as `target/` is never watched, because content watches come
+from the tracked-directory census.
+
+`scripts/measure-watch-wakeups BIN_DIR [SECONDS]` opens a shared clone of the
+checkout as the only project of a private daemon fixture. It then checks the
+clone's CLI through the build gate over and over, touching `src/main.rs` before
+each check, while `scripts/measure-idle-wakeups` counts the daemon's threads.
+Run it from a genuine user shell on the build host, with rustup's Cargo first
+on `PATH`:
+
+```sh
+scripts/measure-watch-wakeups ~/.local/state/cev/watch/target-after/dev-runtime 120
+```
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 120 s of
+builds, `7c7430da9` (before, notify 8.2) against `3611b064f` (after, notify 9
+with `EventKindMask::CORE`). Both sides used the same fixture from the after
+checkout; the host was shared with other builds.
+
+| Daemon, per second | Before | After |
+| --- | --- | --- |
+| `notify-rs inoti` wakeups | 937.08 | 0.47 |
+| `work-scan` wakeups | 3.05 | 5.75 |
+| All daemon threads, wakeups | 943.03 | 10.05 |
+| All daemon threads, CPU % of a core | 0.81 | 0.10 |
+| Checks completed | 26 | 49 |
+
+`work-scan` wakes to read a worktree's status after a real change. It followed
+the build rate on both sides, about 14 wakeups per check, so each touched source
+still reaches the Work board. The watcher's remaining 0.47 wakeups/s are about
+one per touch (0.41/s).
+
+A live daemon with 8,715 watches across several large projects showed the same
+pattern. A 60 s replica of its watch set saw 714 events/s, 701 of them opens.
 
 ## Reference results
 

@@ -6,6 +6,7 @@ mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
 mod console_relaunch;
+pub(super) use console_relaunch::matched_cli;
 #[cfg(test)]
 mod console_relaunch_tests;
 pub(super) mod floor_history;
@@ -601,6 +602,11 @@ fn changed_for_instance(
                 chat_id: id,
                 addresses: addresses.clone(),
             },
+            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+                chat_id: id,
+                revision: *revision,
+                model: model.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -665,6 +671,22 @@ pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<
     // published metadata, a local one from its own lock.
     let addresses = handle.agent_addresses();
     (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
+}
+
+pub(super) fn active_model(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    let (revision, model) = handle.active_model();
+    Some(ServerMessage::ChatActiveModel {
+        chat_id,
+        revision,
+        model,
+    })
 }
 
 fn current_session_snapshot(
@@ -1886,8 +1908,53 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state.native_closing.contains_key(&terminal)
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()))
         || state.chat_handoffs.contains_key(&terminal)
+}
+
+pub(super) fn shared_removal_in_transition(
+    state: &HostState,
+    before: &crate::workspace_model::views::Pane,
+) -> bool {
+    let crate::model::CardKind::Chat(source) = &before.kind else {
+        unreachable!("chat removal source")
+    };
+    let claims = |session: &crate::chat::Session| {
+        session.id == source.id
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == source.id)
+    };
+    let same = |session: &crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..before.clone()
+            },
+        )
+    };
+    state.chat_bindings.contains_key(&source.id)
+        || state.chat_handoffs.contains_key(&source.id)
+        || state
+            .chat_spawning
+            .values()
+            .filter(|session| claims(session))
+            .any(|session| {
+                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+            })
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
 fn start_with_execution(
@@ -2337,7 +2404,7 @@ fn start_with_execution(
     }
     // Provider-specific process fields derive from the prepared launch.
     // No environment overlay may follow constructor history/title reads.
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2558,7 +2625,7 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
         let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
@@ -4496,7 +4563,7 @@ pub(super) fn close_captured(
                 "The exact native attachment changed before close",
             ));
         }
-        capacity::Reservation::closing(host, &mut state, &source)?
+        capacity::Reservation::removing(host, &mut state, &source)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
@@ -4790,6 +4857,14 @@ fn prepare_native_process_launch(
 ) -> Result<chat::Launch, ProtocolError> {
     let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
     if let Some(daemon) = daemon {
+        // A client older than this daemon, started inside another agent's
+        // session, still sends that session along. Withhold it rather than
+        // refuse the conversation.
+        let selected = selected
+            .iter()
+            .filter(|(name, _)| !crate::agent::is_session_variable(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         if selected.iter().any(|(name, value)| {
             !crate::model::agent_recovery::fresh_environment_key(
                 launch.provider,
@@ -4802,7 +4877,7 @@ fn prepare_native_process_launch(
                 "Native execution environment contains an unrelated or private variable",
             ));
         }
-        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+        spec.environment = sourceless_environment(daemon, selected, spec.environment);
     }
     if let Some(source) = source {
         spec.environment = source.clone();
@@ -4842,7 +4917,7 @@ fn upgrade_environment(
     )
     .map_err(|error| error.message)?;
     let (mut spec, _) = chat::protocol::create(&process_launch)?;
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     Ok(spec.environment)
 }
 
@@ -5781,6 +5856,31 @@ IFS= read -r finish < finish
                 )
                 .is_err()
             );
+            // An older client started inside another agent's session still
+            // sends it; the conversation starts without it.
+            let prepared = prepare_native_process_launch(
+                &launch,
+                Some(BTreeMap::new()),
+                &[
+                    ("PATH".into(), "/selected/bin".into()),
+                    ("CLAUDECODE".into(), "1".into()),
+                    (
+                        "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                        "/run/parent.sock".into(),
+                    ),
+                ]
+                .into(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/selected/bin");
+            assert!(!prepared.recipe.environment.contains_key("CLAUDECODE"));
+            assert!(
+                !prepared
+                    .recipe
+                    .environment
+                    .contains_key("CLAUDE_CODE_MESSAGING_SOCKET")
+            );
         }
     }
 
@@ -6166,7 +6266,7 @@ IFS= read -r finish < finish
         let selected = BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".into(), "gui-fixture".into())]);
         let (mut spec, _) = chat::protocol::create(&launch).unwrap();
         spec.environment = sourceless_environment(daemon.clone(), selected, spec.environment);
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         assert_eq!(
             spec.environment
                 .get("CLAUDE_CONFIG_DIR")

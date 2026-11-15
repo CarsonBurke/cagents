@@ -54,6 +54,41 @@ pub struct Catalog {
     pub models: Vec<Model>,
     /// Unix milliseconds at which the provider listed them.
     pub observed_at: u64,
+    /// Last model explicitly advertised as the provider's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Advertised defaults, separate from a conversation's chosen override.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_defaults: BTreeMap<String, String>,
+}
+
+impl Catalog {
+    pub fn default_effort(&self, selected: Option<&str>) -> Option<&str> {
+        let model = selected.or(self.default_model.as_deref())?;
+        self.reasoning_defaults.get(model).map(String::as_str)
+    }
+
+    /// A live list can omit defaults that a probe already reported. Keep
+    /// those observations while their models and effort levels remain valid.
+    pub fn inherit_defaults(&mut self, previous: &Self) {
+        if self.default_model.is_none() {
+            self.default_model = previous
+                .default_model
+                .clone()
+                .filter(|id| self.models.iter().any(|model| &model.id == id));
+        }
+        for (id, effort) in &previous.reasoning_defaults {
+            if self
+                .models
+                .iter()
+                .any(|model| &model.id == id && model.reasoning.contains(effort))
+            {
+                self.reasoning_defaults
+                    .entry(id.clone())
+                    .or_insert_with(|| effort.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -208,7 +243,7 @@ impl Cache {
 
     /// Remembers what `provider` listed, unless another window has written
     /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
-    pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
+    pub fn store_catalog(&self, provider: Provider, mut catalog: Catalog) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
@@ -222,6 +257,9 @@ impl Cache {
             .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at, now))
         {
             return Ok(());
+        }
+        if let Some(previous) = document.catalogs.get(&provider) {
+            catalog.inherit_defaults(previous);
         }
         document.catalogs.insert(provider, catalog);
         self.write(&document)
@@ -645,7 +683,61 @@ mod tests {
                 reasoning: vec!["high".into()],
             }],
             observed_at,
+            default_model: None,
+            reasoning_defaults: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn catalog_defaults_round_trip_and_survive_partial_live_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut known = catalog(1, "model");
+        known.models[0].reasoning = vec!["medium".into(), "high".into()];
+        known.default_model = Some("model".into());
+        known
+            .reasoning_defaults
+            .insert("model".into(), "medium".into());
+        cache.store_catalog(Provider::Codex, known.clone()).unwrap();
+        assert_eq!(cache.catalogs(u64::MAX)[&Provider::Codex], known);
+        let mut partial = known.clone();
+        partial.observed_at = 2;
+        partial.default_model = None;
+        partial.reasoning_defaults.clear();
+        cache.store_catalog(Provider::Codex, partial).unwrap();
+        let restored = cache.catalogs(u64::MAX).remove(&Provider::Codex).unwrap();
+        assert_eq!(restored.default_effort(None), Some("medium"));
+        assert_eq!(restored.default_effort(Some("model")), Some("medium"));
+        let mut changed = restored.clone();
+        changed
+            .reasoning_defaults
+            .insert("model".into(), "high".into());
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_effort(None),
+            Some("high"),
+            "new reports win"
+        );
+        changed.reasoning_defaults.clear();
+        changed.models[0].reasoning = vec!["high".into()];
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_effort(None),
+            None,
+            "removed efforts are not inherited"
+        );
+        changed.models.clear();
+        changed.default_model = None;
+        changed.inherit_defaults(&restored);
+        assert_eq!(
+            changed.default_model, None,
+            "removed models are not inherited"
+        );
+        let legacy: Catalog = serde_json::from_value(serde_json::json!({
+            "models": [], "observed_at": 1
+        }))
+        .unwrap();
+        assert_eq!(legacy.default_effort(None), None);
     }
 
     /// Each provider's list is kept beside the figures, and the newer of two

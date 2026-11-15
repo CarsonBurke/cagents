@@ -8,10 +8,11 @@ publish = false
 
 [features]
 default = []
-development = ["cagents/development"]
+development = ["cagents/development", "cagents-ui/development"]
 
 [dependencies]
 cagents = { path = "../..", default-features = false, features = ["ui"] }
+cagents-ui = { path = "../cagents-ui" }
 clap = { version = "4.5", features = ["derive"] }
 directories = "6.0"
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["tokio", "wgpu", "winit", "xdg-portal"] }

@@ -1,3 +1,5 @@
+#[cfg(any(not(feature = "ui"), test))]
+use std::time::Instant;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -6,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -378,7 +380,7 @@ impl RetainedChatCopy {
 
     /// Keep a committed copy reachable in snapshots captured before its receipt.
     /// Only an explicit tombstone can remove it; omission cannot spend it.
-    pub(crate) fn project(&self, state: &mut WorkspaceState) -> Result<()> {
+    pub fn project(&self, state: &mut WorkspaceState) -> Result<()> {
         self.validate()?;
         if state.id != self.workspace {
             return Err(invalid_state!(
@@ -1156,7 +1158,7 @@ impl StateStore {
 
     /// Resolve restored recipe ownership and commit all canonical changes in
     /// the same ordered writer transaction as their navigation snapshot.
-    pub(crate) fn save_workspace_with_terminal_panes(
+    pub fn save_workspace_with_terminal_panes(
         &self,
         state: &WorkspaceState,
         base: SnapshotBase<'_>,
@@ -1539,7 +1541,7 @@ impl StateStore {
     /// Consume only the immutable witness minted by the authenticated client
     /// handshake. Two descriptor values cannot authorize a retained reset.
     #[cfg(feature = "ui")]
-    pub(crate) fn rebind_authenticated_chat_upgrade(
+    pub fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
         recovery: &crate::chat::client::UpgradeRecovery,
@@ -2579,8 +2581,9 @@ impl StateStore {
         Ok(live)
     }
 
-    #[cfg(test)]
-    pub(crate) fn audit_writer_holds_connection(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn audit_writer_holds_connection(&self) -> bool {
         matches!(
             self.inner.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
@@ -4290,6 +4293,12 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
         &to_json(&state.workspace_history)?,
     )?;
+    // Written by one release only; nothing reads it any more.
+    transaction
+        .prepare_cached("DELETE FROM metadata WHERE key = ?1")?
+        .execute([format!(
+            "workspace:{workspace_id}:navigation:workspace_visits"
+        )])?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:agent_updates"),
@@ -4940,7 +4949,7 @@ fn validate_chat_identity(
 /// `session` replaced it, which only an explicit replacement may do, as the
 /// [`Violation`] check an ordinary write of `session` breaks, with `{card}`
 /// standing for the card. `None` when an ordinary write can take `session`.
-pub(crate) fn chat_identity_change(
+pub fn chat_identity_change(
     stored: &crate::chat::Session,
     session: &crate::chat::Session,
 ) -> Option<&'static str> {
@@ -5579,7 +5588,7 @@ fn replace_terminal_identity_transaction(
 }
 
 /// What every workspace snapshot has to satisfy before any of it is written.
-pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
+pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {

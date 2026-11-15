@@ -467,6 +467,8 @@ pub struct Checks {
     pub passed: u32,
     pub failed: u32,
     pub pending: u32,
+    pub cancelled: u32,
+    pub skipped: u32,
 }
 
 impl Checks {
@@ -475,8 +477,12 @@ impl Checks {
             Some(CheckOutcome::Failing)
         } else if self.pending > 0 {
             Some(CheckOutcome::Pending)
+        } else if self.cancelled > 0 {
+            Some(CheckOutcome::Cancelled)
         } else if self.passed > 0 {
             Some(CheckOutcome::Passing)
+        } else if self.skipped > 0 {
+            Some(CheckOutcome::Skipped)
         } else {
             None
         }
@@ -489,6 +495,8 @@ pub enum CheckOutcome {
     Passing,
     Pending,
     Failing,
+    Cancelled,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,6 +922,26 @@ mod tests {
             title: None,
             state,
         }
+    }
+
+    #[test]
+    fn checks_keep_cancelled_and_skipped_distinct_in_outcomes_and_on_the_wire() {
+        let mut checks = Checks {
+            skipped: 1,
+            ..Default::default()
+        };
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Skipped));
+        checks.passed = 2;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Passing));
+        checks.cancelled = 3;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Cancelled));
+        checks.pending = 4;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Pending));
+        checks.failed = 5;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Failing));
+        let bytes = postcard::to_allocvec(&checks).unwrap();
+        assert_eq!(postcard::from_bytes::<Checks>(&bytes).unwrap(), checks);
+        assert_eq!(Checks::default().outcome(), None);
     }
 
     #[test]

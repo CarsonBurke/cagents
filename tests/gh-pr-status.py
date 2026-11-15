@@ -48,6 +48,7 @@ class Fixture(unittest.TestCase):
         self.addCleanup(self.patch.stop)
         self.script = self.repo / "scripts/gh-pr-status"
         self.script.write_bytes((ROOT / "scripts/gh-pr-status").read_bytes())
+        (self.script.parent / "cargo_artifacts.py").write_bytes((ROOT / "scripts/cargo_artifacts.py").read_bytes())
         self.script.chmod(0o755)
         self.install("bin/cagents", "#!/bin/sh\necho 'old installed cagents was invoked' >&2\nexit 77\n")
         self.install("bin/gh", '''#!/usr/bin/python3
@@ -87,7 +88,7 @@ while (r/'hold-build').exists() and not (r/'release-build').exists():
 if (r/'fail-build').exists(): sys.exit(8)
 p=Path('target/custom/cagents').absolute()
 p.parent.mkdir(parents=True,exist_ok=True)
-p.write_text("#!/usr/bin/python3\\nimport os,sys\\nfrom pathlib import Path\\nif '--help' in sys.argv: sys.exit(0)\\nr=Path(os.environ['FIXTURE_ROOT'])\\nwith (r/'cli-calls').open('a') as f: f.write('called\\\\n')\\nprint('cached-new-cli')\\nsys.exit(int(os.environ.get('FIXTURE_CLI_EXIT','0')))\\n")
+p.write_text("#!/usr/bin/python3\\nimport os,sys\\nfrom pathlib import Path\\nif '--help' in sys.argv: sys.exit(0)\\nr=Path(os.environ['FIXTURE_ROOT'])\\nwith (r/'cli-calls').open('a') as f: f.write(Path(sys.argv[0]).parent.name+'\\\\n')\\nprint('cached-new-cli')\\nsys.exit(int(os.environ.get('FIXTURE_CLI_EXIT','0')))\\n")
 p.chmod(0o700)
 print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind=['bin']),executable=str(p))))
 ''')
@@ -115,6 +116,14 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
     def lines(self, name):
         path = self.root / name
         return path.read_text().splitlines() if path.exists() else []
+
+    @staticmethod
+    def builder_idle(common):
+        try:
+            with status.locked(common / "gh-pr-status/build.lock"):
+                return True
+        except BlockingIOError:
+            return False
 
     def finish_builder(self):
         self.root.joinpath("release-build").touch()
@@ -196,6 +205,61 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
         self.git("commit", "-qm", "dispatch change")
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.assertNotEqual(status.build_context(self.repo, "origin/main")[2], before_dispatch)
+
+    def test_a_new_main_reads_ci_through_the_earlier_cli_until_its_own_is_built(self):
+        self.invoke()
+        self.finish_builder()
+        common, _, first = status.build_context(self.repo, "origin/main")
+        cache = common / "gh-pr-status"
+        # A branch is qualified with --source-ref HEAD part way through, then
+        # merged: its commits become ancestors of main, but its build is
+        # still no stand-in for main.
+        self.git("checkout", "-qb", "candidate")
+        (self.repo / "src/github_status.rs").write_text("candidate source")
+        self.git("commit", "-qam", "candidate")
+        self.assertEqual(subprocess.run([str(self.script), "7", "-R", "o/r", "--json",
+                                         "--source-ref", "HEAD"], env=self.env, capture_output=True,
+                                        text=True, timeout=5).returncode, 0)
+        candidate = status.build_context(self.repo, "HEAD")[2]
+        wait_for(lambda: (cache / candidate / "source.json").exists())
+        (self.repo / "src/github_status.rs").write_text("reviewed GitHub source")
+        self.git("commit", "-qam", "review fix")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "merge candidate", "candidate")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        second = status.build_context(self.repo, "origin/main")[2]
+        self.assertNotIn(second, {first, candidate})
+        wait_for(lambda: self.builder_idle(common))
+        os.utime(cache / candidate / "cagents")  # the newest build is the candidate's
+        # Main's new CLI takes a while to build. Reads meanwhile still go
+        # through a CLI, so they keep CI and review state.
+        self.root.joinpath("release-build").unlink(missing_ok=True)
+        self.root.joinpath("hold-build").touch()
+        for _ in range(3):
+            result = self.invoke()
+            self.assertEqual(result.stdout.strip(), "cached-new-cli", result.stderr)
+        self.assertEqual(self.lines("cli-calls")[-3:], [first] * 3)
+        wait_for(lambda: len(self.lines("builds")) == 3)
+        self.assertEqual(len(self.lines("requests")), 1, "only the cold start used REST")
+        self.finish_builder()
+        self.assertEqual(self.invoke().stdout.strip(), "cached-new-cli")
+        self.assertEqual(self.lines("cli-calls")[-1], second)
+        self.assertEqual(len(self.lines("builds")), 3)
+        # Main's own build removes the stand-in, but not the candidate's.
+        self.assertFalse((cache / first).exists())
+        self.assertTrue((cache / candidate / "cagents").exists())
+        # A failing build leaves the last main CLI answering.
+        self.root.joinpath("hold-build").unlink()
+        self.root.joinpath("fail-build").touch()
+        (self.repo / "src/github_status.rs").write_text("broken GitHub source")
+        self.git("commit", "-qam", "broken")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(self.invoke().stdout.strip(), "cached-new-cli")
+        wait_for(lambda: len(self.lines("builds")) == 4)
+        wait_for(lambda: self.builder_idle(common))
+        self.assertEqual(self.invoke().stdout.strip(), "cached-new-cli")
+        self.assertEqual(self.lines("cli-calls")[-2:], [second] * 2)
+        self.assertEqual(len(self.lines("requests")), 1)
 
     def test_failed_build_is_not_requeued_by_each_status_read(self):
         self.root.joinpath("fail-build").touch()
@@ -368,7 +432,8 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
 
         result = real()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["data"]["source"], "cache")
+        # Served from the cache, but labeled: the bridge's REST read has no CI.
+        self.assertEqual(json.loads(result.stdout)["data"]["source"], "rest-bootstrap")
         self.assertEqual(len(self.lines("requests")), 1, "Rust must read the bridge's actual wire cache")
         pr = dict(saved["snapshot"]["pull_request"])
         pr["commits"] = {"nodes": [{"commit": {"oid": pr["headRefOid"], "statusCheckRollup": {

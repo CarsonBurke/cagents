@@ -266,10 +266,13 @@ impl LaunchRecipe {
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
-    /// Apply explicit removals and the equivalent policy for legacy managed homes.
-    pub(crate) fn remove_unset_environment(&self, environment: &mut BTreeMap<String, String>) {
+    /// Remove what this launch must not pass on: its explicit removals, the
+    /// equivalent policy for legacy managed homes, and any provider session's
+    /// identity, which a recipe saved before it was withheld may still hold.
+    pub(crate) fn withhold_environment(&self, environment: &mut BTreeMap<String, String>) {
         let names = crate::account::launch_credential_overrides(self);
-        environment.retain(|name, _| !names.contains(name));
+        environment
+            .retain(|name, _| !names.contains(name) && !crate::agent::is_session_variable(name));
     }
 }
 
@@ -1385,11 +1388,11 @@ impl Cards {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Cards {
     /// How many of these are the very cards `other` holds at the same place,
     /// shared rather than copied.
-    pub(crate) fn shared_with(&self, other: &Self) -> usize {
+    pub fn shared_with(&self, other: &Self) -> usize {
         self.0
             .iter()
             .zip(&other.0)
@@ -1399,7 +1402,7 @@ impl Cards {
 
     /// The cards both lists hold that these hold a copy of rather than the
     /// very card `other` holds, wherever each sits.
-    pub(crate) fn copied_from(&self, other: &Self) -> Vec<CardId> {
+    pub fn copied_from(&self, other: &Self) -> Vec<CardId> {
         let theirs = other
             .0
             .iter()

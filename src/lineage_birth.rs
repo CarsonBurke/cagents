@@ -441,7 +441,7 @@ fn lineages(session: &crate::model::TerminalSession) -> Vec<TerminalId> {
 /// session saved with a different chain than it was launched with still
 /// finds the right records.
 pub(crate) fn instance_birth(session: &crate::model::TerminalSession) -> Option<LineageBirth> {
-    if cfg!(test) {
+    if cfg!(any(test, feature = "test-support")) {
         // Tests scan the real process table without launching through a ledger.
         return None;
     }

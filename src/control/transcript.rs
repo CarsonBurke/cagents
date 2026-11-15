@@ -163,6 +163,7 @@ fn render(entry: &Entry) -> String {
                 ToolStatus::Failed => " (failed)",
                 ToolStatus::Denied => " (denied)",
                 ToolStatus::Stopped => " (stopped)",
+                ToolStatus::Ended => " (ended)",
                 ToolStatus::Waiting => " (waiting on its own background work)",
             };
             let mut line = format!(
@@ -263,6 +264,7 @@ mod tests {
             channel: None,
             view_scope: None,
             channel_repository: None,
+            lineage_channel: None,
             state: crate::agent::ActivityState::Idle,
             directory: None,
             worktree: None,
