@@ -1608,8 +1608,17 @@ not. A failed build is retried on demand after ten minutes, rather than once
 per caller. Its `build.log` records failures. `--source-ref HEAD` qualifies a
 candidate deliberately; normal agent reads use the default `origin/main`.
 
-While the build is queued, failed or otherwise unavailable, the command makes
-at most one REST `GET /repos/OWNER/REPO/pulls/NUMBER`. It uses the same private
+When `origin/main` moves to a commit that needs a new CLI, reads keep going
+through the CLI built for the nearest earlier `origin/main` commit while the
+new one builds, or while its build keeps failing, so CI and review state stay
+known. Only builds made while their revision was `origin/main` count: a
+branch qualified with `--source-ref` and later merged never stands in for
+main. A successful main build removes the earlier main builds and leaves
+candidate builds alone.
+
+The command falls back to at most one REST `GET /repos/OWNER/REPO/pulls/NUMBER`
+when no CLI can answer: a cold cache with no earlier main build, a
+`--source-ref` candidate still building, or a cached CLI that cannot start. It uses the same private
 credential-scoped cache, per-PR flight and host cooldowns as the built CLI.
 The fallback reports PR/head/merge state; **CI and review decision are unknown**
 (`checks_state=null`, `checks_complete=false`, `reviewDecision=null`), with an
@@ -1634,8 +1643,10 @@ Exit zero confirms a readable snapshot; inspect `checks_state` to decide
 whether CI passed, failed or is pending.
 For GraphQL snapshots, the aggregate check state covers all contexts;
 `checks_complete=false` means the displayed context list stops at 100.
-REST bootstrap snapshots have no check aggregate. No reported checks means unknown,
-not passing. Enterprise repositories also accept `--hostname HOST`.
+REST bootstrap snapshots have no check aggregate. The CLI keeps serving one
+for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
+GitHub's REST answer has `mergeable: null` while it computes mergeability
+after a push, which the snapshot reports as `UNKNOWN`. No reported checks means unknown, not passing. Enterprise repositories also accept `--hostname HOST`.
 
 To clear bootstrap artifacts, first ensure no status command or builder is
 running. Remove only inactive `gh-pr-status-*` worktrees with `git worktree

@@ -90,13 +90,21 @@ fn human(report: &pr_status::Report) -> String {
         if pr.is_draft { " (draft)" } else { "" },
         pr.title,
         pr.head_ref_oid,
-        snapshot.checks_state.as_deref().unwrap_or("none reported"),
-        if snapshot.checks_complete {
+        if snapshot.is_rest_bootstrap() {
+            "unknown (REST bootstrap read)"
+        } else {
+            snapshot.checks_state.as_deref().unwrap_or("none reported")
+        },
+        if snapshot.checks_complete || snapshot.is_rest_bootstrap() {
             ""
         } else {
             " (first 100 contexts; aggregate includes all)"
         },
-        pr.review_decision.as_deref().unwrap_or("none reported"),
+        if snapshot.is_rest_bootstrap() {
+            "unknown"
+        } else {
+            pr.review_decision.as_deref().unwrap_or("none reported")
+        },
         pr.merge_state_status.as_deref().unwrap_or(&pr.mergeable),
         pr.url,
         report.source
