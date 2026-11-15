@@ -35,7 +35,7 @@ impl DirectoryNamespace {
 /// never a DirectoryNamespace or authority over an existing public entry.
 /// Root and noncooperating same-UID interference remain outside this contract.
 #[derive(Debug)]
-pub(crate) struct StickyParent {
+pub struct StickyParent {
     directory: Arc<Root>,
     stamp: RecoveryDirectoryStamp,
     uid: u32,
@@ -80,13 +80,28 @@ fn sticky_parent_effective_access(_directory: &Root) -> io::Result<()> {
     ))
 }
 impl StickyParent {
-    pub(crate) fn acquire(directory: Arc<Root>) -> io::Result<Arc<Self>> {
+    pub fn acquire(directory: Arc<Root>) -> io::Result<Arc<Self>> {
         let metadata = directory.metadata()?;
         let euid = unsafe { libc::geteuid() };
         if !metadata.is_dir()
             || (metadata.uid() != 0 && metadata.uid() != euid)
             || metadata.mode() & 0o1000 == 0
         {
+            #[cfg(test)]
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "retained-save diagnostic: stage=sticky-parent-acquire-guard; parent_is_dir={}; \
+                     parent_uid={}; effective_uid={euid}; parent_mode={:#o}; \
+                     parent_dev={}; parent_ino={}",
+                    metadata.is_dir(),
+                    metadata.uid(),
+                    metadata.mode() & 0o7777,
+                    metadata.dev(),
+                    metadata.ino()
+                );
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Private sibling creation requires a root- or user-owned sticky parent",
@@ -240,13 +255,13 @@ enum SiblingPreparationPolicy {
 /// without qualified proof. General sibling operations retain strict errors.
 #[derive(Debug)]
 #[must_use = "sibling directory durability must propagate to the final Save outcome"]
-pub(crate) enum SaveSiblingDurability {
+pub enum SaveSiblingDurability {
     Confirmed,
     Unconfirmed(io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PrivateSiblingCreateError {
+pub enum PrivateSiblingCreateError {
     #[error("Private sibling creation refused: {0}")]
     Rejected(#[source] io::Error),
     #[error("Private sibling preparation failed: {cause}; original cleanup custody retained")]
@@ -263,7 +278,7 @@ pub(crate) enum PrivateSiblingCreateError {
 /// cleanup errors retain this receipt and its pre-effect reservation.
 #[derive(Debug)]
 #[must_use = "retain the sibling through explicit cleanup and parent sync"]
-pub(crate) struct OwnedPrivateSibling {
+pub struct OwnedPrivateSibling {
     parent: Arc<StickyParent>,
     name: OsString,
     directory: Option<Arc<Root>>,

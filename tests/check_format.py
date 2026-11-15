@@ -21,6 +21,8 @@ CHECKER = ROOT / "scripts/check-format"
 CACHE_HELPER = ROOT / "scripts/check-format-cache.py"
 INCLUDED = (
     "src/modules.rs",
+    "crates/cagents-ui/src/modules.rs",
+    "crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs",
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
     "src/host/model/views/placement_tests.rs",
@@ -31,6 +33,11 @@ INCLUDED = (
 
 class FormatCheck(unittest.TestCase):
     def setUp(self):
+        # Keep inherited build-lane overrides out of temporary formatter fixtures.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("CARGO_TARGET_DIR", None)
         self.temporary = tempfile.TemporaryDirectory(prefix="cagents-format-check-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -101,6 +108,15 @@ sys.exit({status})
         self.addCleanup(directory_patch.stop)
         return helper, ["--edition", "2024", "--check", *INCLUDED]
 
+    def test_without_the_python_it_runs_rustfmt_still_checks(self):
+        # `python3` stays on PATH: the check is of the interpreter it would run.
+        self.script.write_text(self.script.read_text().replace("/usr/bin/python3", "/nonexistent/python3"))
+        log, env = self.mock_tools()
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tools = [json.loads(line)[1] for line in log.read_text().splitlines()]
+        self.assertEqual(tools, ["cargo", "rustfmt"])
+
     def test_checks_both_routes_and_preserves_failures_and_diagnostics(self):
         for cargo_status, rustfmt_status in ((0, 0), (0, 1), (7, 0), (7, 2)):
             with self.subTest(cargo=cargo_status, rustfmt=rustfmt_status):
@@ -111,12 +127,81 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "--check"],
+                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
                         [str(self.root), "rustfmt", "--edition", "2024", "--check", *INCLUDED],
                     ],
                 )
                 self.assertIn("cargo diagnostic", result.stderr)
                 self.assertIn("rustfmt diagnostic", result.stderr)
+
+    def test_write_formats_both_routes_in_place_without_the_cache(self):
+        # Python stays available, so only --write can explain the direct rustfmt call.
+        for cargo_status, rustfmt_status in ((0, 0), (0, 3), (5, 0)):
+            with self.subTest(cargo=cargo_status, rustfmt=rustfmt_status):
+                log, env = self.mock_tools(cargo_status, rustfmt_status)
+                log.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [str(self.script), "--write"], cwd=self.root.parent, env=env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, cargo_status or rustfmt_status)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [
+                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-ui"],
+                        [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
+                    ],
+                )
+        self.assertFalse((self.root / "target").exists())
+
+    def test_unknown_arguments_are_refused_before_formatting(self):
+        log, env = self.mock_tools()
+        for arguments in (["--check"], ["--write", "--write"], ["src/main.rs"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [str(self.script), *arguments], cwd=self.root.parent, env=env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(log.exists())
+
+    def test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = target.name
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_relative_cargo_target_uses_checker_checkout_directory(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = os.path.relpath(target.name, self.root)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_unusable_cargo_target_preserves_formatter_failure_without_local_cache(self):
+        occupied = self.root / "occupied-target"
+        occupied.write_text("preserve this file")
+        _, env = self.mock_tools(rustfmt_status=7)
+        env["CARGO_TARGET_DIR"] = str(occupied)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("rustfmt diagnostic", result.stderr)
+        self.assertEqual(occupied.read_text(), "preserve this file")
+        self.assertFalse((self.root / "target").exists())
+
+    def test_empty_cargo_target_retains_default_formatter_cache(self):
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = ""
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "target" / ".check-format-cache").is_dir())
 
     def test_missing_byte_environment_preserves_ordinary_formatter_status(self):
         helper, args = self.cache_fixture()
@@ -410,6 +495,82 @@ sys.exit({status})
                     with self.assertRaises(helper.Uncacheable):
                         helper.formatter_libraries(helper.InputHashes(), Path("/verified/rustfmt"))
 
+    def test_tool_digests_reuse_only_unchanged_files_within_one_check(self):
+        helper, _args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+        real_open = Path.open
+        reads = []
+
+        def tracked_open(path, *args, **kwargs):
+            source = real_open(path, *args, **kwargs)
+            if path == tool:
+                source.read = mock.Mock(wraps=source.read)
+                reads.append(source.read)
+            return source
+
+        def snapshot(memo):
+            hasher = helper.InputHashes(memo)
+            helper.tool_file(hasher, tool)
+            return hasher.hexdigest(), hasher.guard.hexdigest()
+
+        memo = {}
+        with mock.patch.object(Path, "open", tracked_open):
+            first = snapshot(memo)
+            self.assertEqual(snapshot(memo), first)
+            self.assertTrue(reads[0].called)
+            self.assertFalse(reads[1].called)
+
+            # Same size and restored mtime must not hide an in-place edit.
+            original = tool.stat()
+            tool.write_text("other formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            changed = snapshot(memo)
+            self.assertNotEqual(changed, first)
+            self.assertTrue(reads[-1].called)
+
+            # Replacing a file at the same path must also discard its digest.
+            tool.unlink()
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replaced = snapshot(memo)
+            self.assertEqual(replaced[0], first[0])
+            self.assertNotEqual(replaced[1], first[1])
+            self.assertTrue(reads[-1].called)
+
+            # A later check starts with no remembered bytes, even unchanged.
+            self.assertEqual(snapshot({}), replaced)
+            self.assertTrue(reads[-1].called)
+
+            # The second metadata observation is mandatory on a memo hit too.
+            before = tool.stat()
+            tool.write_text("other formatter")
+            after = tool.stat()
+            with mock.patch.object(helper.os, "fstat", side_effect=(before, after)):
+                with self.assertRaises(helper.Uncacheable):
+                    snapshot(memo)
+            self.assertFalse(reads[-1].called)
+
+    def test_tool_edit_and_restore_during_check_cannot_record_success(self):
+        helper, args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+
+        def formatter(hasher, _executable):
+            helper.tool_file(hasher, tool)
+
+        def mutate_and_restore(_command):
+            original = tool.stat()
+            tool.write_text("other formatter")
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            return 0
+
+        with mock.patch.object(helper, "rustfmt_binary", side_effect=formatter), \
+                mock.patch.object(helper, "run", side_effect=mutate_and_restore):
+            self.assertEqual(helper.main(args), 0)
+        self.assertFalse(any(helper.CACHE.iterdir()))
+
     def test_external_license_templates_and_missing_toml_parser_disable_cache(self):
         helper, args = self.cache_fixture()
         for key in ("license_template_path", '"license_\\u0074emplate_path"'):
@@ -464,12 +625,19 @@ sys.exit({status})
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]
+members = [".", "crates/cagents-ui"]
 [package]
-name = "format-fixture"
+name = "cagents"
+version = "0.0.0"
+edition = "2024"
+""")
+        self.write("crates/cagents-ui/Cargo.toml", """[package]
+name = "cagents-ui"
 version = "0.0.0"
 edition = "2024"
 """)
         self.write("src/lib.rs", 'include!("modules.rs");\n')
+        self.write("crates/cagents-ui/src/lib.rs", 'include!("modules.rs");\n')
         self.write("src/modules.rs", '#[cfg(feature = "ui")]\nmod gated;\n')
         for relative in INCLUDED[1:]:
             self.write(relative, "fn included_fragment() {}\n")
@@ -490,7 +658,8 @@ include!("../tests/support/repository_scale.rs");
                 path.write_text(original + "fn   malformed( ) { }\n")
                 before = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
                 cargo = subprocess.run(
-                    ["cargo", "fmt", "--check"], cwd=self.root, env=env,
+                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
+                    cwd=self.root, env=env,
                     capture_output=True, text=True, timeout=30,
                 )
                 self.assertEqual(cargo.returncode, 0, cargo.stdout + cargo.stderr)

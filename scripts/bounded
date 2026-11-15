@@ -1,0 +1,376 @@
+#!/usr/bin/python3 -I
+"""Run a workload that ends with the session that started it, or after a
+time limit, whichever comes first.
+
+A stress loop, a reproduction or a measurement started over SSH keeps running
+when the connection drops: sshd's session process exits, but nothing tells
+what it started. One such loop held a build host's CPUs for 36 hours and kept
+every build waiting. Run such work as
+
+    scripts/bounded --ttl 1800 --name w10-probe -- ./probe-loop
+
+and it stops when its owner ends (the SSH connection, the cagents agent that
+started it, or else the shell that ran this), when --ttl passes, or when this
+wrapper is stopped. Everything it started goes with it: its process group, and
+any process that left the group but still carries its CAGENTS_BOUNDED mark.
+
+    scripts/bounded --list     what runs bounded on this host, and whose
+    scripts/bounded --reap     stop workloads whose wrapper was killed
+"""
+
+import argparse
+import ctypes
+import errno
+import json
+import math
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                     "cagents-bounded")
+MARK = "CAGENTS_BOUNDED"
+# How often the owner and the time limit are checked, and how long a stopped
+# workload has between TERM and KILL.
+POLL = float(os.environ.get("CAGENTS_BOUNDED_POLL_SECONDS") or 2)
+GRACE = float(os.environ.get("CAGENTS_BOUNDED_GRACE_SECONDS") or 10)
+PR_SET_PDEATHSIG = 1
+
+
+def say(message):
+    # After an SSH connection drops, its terminal is gone too.
+    try:
+        print(f"bounded: {message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def stat(pid):
+    """(command name, state, parent, process group, start ticks) of a
+    process, or None. The name, in parentheses, may hold anything."""
+    try:
+        with open(f"/proc/{pid}/stat") as file:
+            text = file.read()
+    except OSError:
+        return None
+    name = text[text.index("(") + 1:text.rindex(")")]
+    fields = text[text.rindex(")") + 2:].split()
+    return name, fields[0], int(fields[1]), int(fields[2]), int(fields[19])
+
+
+def alive(pid, start):
+    """Whether the process that had this ID and start still runs: not a later
+    one given the same ID, and not one that has exited but not been reaped."""
+    found = stat(pid)
+    return found is not None and found[4] == start and found[1] not in "ZX"
+
+
+def describe(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as file:
+            words = [word.decode(errors="replace") for word in file.read().split(b"\0") if word]
+    except OSError:
+        words = []
+    text = " ".join(words) or (stat(pid) or ("?",))[0]
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def owner(chosen=None):
+    """Whose life this workload's is: the nearest SSH connection above this
+    process, else the process a cagents daemon runs for the session above it,
+    such as its agent's provider, else the shell that ran this."""
+    if chosen is not None:
+        found = stat(chosen)
+        if found is None or not alive(chosen, found[4]):
+            raise SystemExit(f"bounded: --owner {chosen} is not running")
+        return chosen, found[4], f"{describe(chosen)} (pid {chosen})"
+    chain, pid = [], os.getppid()
+    while pid > 1:
+        found = stat(pid)
+        if found is None:
+            break
+        chain.append((pid, found))
+        pid = found[2]
+    for pid, found in chain:
+        if found[0].startswith("sshd"):
+            return pid, found[4], f"the SSH connection (pid {pid})"
+    for (pid, found), (_, parent) in zip(chain, chain[1:]):
+        if parent[0].startswith("cagentsd"):
+            return pid, found[4], f"{found[0]} (pid {pid}), which the cagents session runs"
+    pid = os.getppid()
+    found = stat(pid)
+    return pid, found[4] if found else 0, f"{describe(pid)} (pid {pid})"
+
+
+def members(identity, leader=None):
+    """Every running process of the workload: those carrying its mark, which
+    a nested workload adds to rather than replaces, and those still in its
+    process group, whatever their environment. `leader` is the group's
+    (pid, start); its group counts only while that ID is the leader's or
+    nobody's, so a later process given the ID is never taken for it."""
+    group = None
+    if leader is not None:
+        found = stat(leader[0])
+        if found is None or found[4] == leader[1]:
+            group = leader[0]
+    mark = f"{MARK}=".encode()
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        process = stat(name)
+        if process is None or process[1] in "ZX":
+            continue
+        if group is not None and process[3] == group:
+            found.append(int(name))
+            continue
+        try:
+            with open(f"/proc/{name}/environ", "rb") as file:
+                environment = file.read().split(b"\0")
+        except OSError:
+            continue
+        for entry in environment:
+            if entry.startswith(mark):
+                if identity.encode() in entry[len(mark):].split(b":"):
+                    found.append(int(name))
+                break
+    return found
+
+
+def stop(identity, leader=None):
+    """TERM, then KILL after the grace period, to every member. True if
+    anything had to be killed."""
+    # Members this user may not signal, such as a setuid program, are left
+    # to end with the rest rather than waited for.
+    refused = set()
+
+    def remaining():
+        return [pid for pid in members(identity, leader) if pid not in refused]
+
+    def signal_all(number):
+        for pid in remaining():
+            try:
+                os.kill(pid, number)
+            except PermissionError:
+                refused.add(pid)
+            except OSError:
+                pass
+    signal_all(signal.SIGTERM)
+    deadline = time.monotonic() + GRACE
+    while time.monotonic() < deadline and remaining():
+        time.sleep(0.2)
+    killed = bool(remaining())
+    if killed:
+        signal_all(signal.SIGKILL)
+        # KILL takes effect on the way back from the kernel, not at once.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and remaining():
+            time.sleep(0.05)
+    return killed
+
+
+def record_path(identity):
+    return os.path.join(STATE, f"{identity}.json")
+
+
+def write_record(identity, record):
+    with open(record_path(identity) + ".new", "w") as file:
+        json.dump(record, file)
+    os.replace(record_path(identity) + ".new", record_path(identity))
+
+
+def run(arguments):
+    reason, status = None, 143
+    wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+
+    def stopped(number, _frame):
+        nonlocal reason
+        reason = reason or f"this wrapper got {signal.Signals(number).name}"
+
+    # Before anything that would need undoing, so a signal can't skip that.
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, stopped)
+    signal.set_wakeup_fd(wake_write)
+
+    os.makedirs(STATE, exist_ok=True)
+    me = stat(os.getpid())
+    identity = f"{os.getpid()}-{me[4]}"
+    owner_pid, owner_start, owner_name = owner(arguments.owner)
+    started, clock = time.time(), time.monotonic()
+    record = {"name": arguments.name or os.path.basename(arguments.command[0]),
+              "command": arguments.command, "cwd": os.getcwd(), "wrapper": os.getpid(),
+              "wrapper_start": me[4], "owner": owner_pid, "owner_start": owner_start,
+              "owner_name": owner_name, "started": started, "ttl": arguments.ttl}
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    parent = os.getpid()
+
+    def as_child():
+        # TERM if this wrapper is killed outright; then --reap stops the rest.
+        # A wrapper killed before this ran has already gone.
+        if prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0 or os.getppid() != parent:
+            os._exit(143)
+
+    inherited = os.environ.get(MARK)
+    marks = f"{inherited}:{identity}" if inherited else identity
+    leader = None
+    try:
+        write_record(identity, record)
+        if reason is not None:
+            say(f"did not start {record['name']}: {reason}")
+            return status
+        try:
+            child = subprocess.Popen(arguments.command, env=os.environ | {MARK: marks},
+                                     start_new_session=True, preexec_fn=as_child)
+        except OSError as error:
+            say(f"cannot run {arguments.command[0]}: {error.strerror}")
+            return 127 if error.errno == errno.ENOENT else 126
+        found = stat(child.pid)
+        leader = (child.pid, found[4] if found else 0)
+        record["leader"], record["leader_start"] = leader
+        write_record(identity, record)
+        # Its pidfd says when it exits, without reaping it: until it is
+        # reaped, its ID, and so its group's, cannot pass to another process.
+        exited = os.pidfd_open(child.pid)
+        while reason is None:
+            ready, _, _ = select.select([exited, wake_read], [], [], POLL)
+            if exited in ready:
+                # What it left running in the background goes too.
+                if members(identity, leader):
+                    stop(identity, leader)
+                code = child.wait()
+                return code if code >= 0 else 128 - code
+            if wake_read in ready:
+                try:
+                    os.read(wake_read, 64)
+                except BlockingIOError:
+                    pass
+                continue
+            if not alive(owner_pid, owner_start):
+                reason = f"its owner, {owner_name}, ended"
+            elif time.monotonic() - clock >= arguments.ttl:
+                reason, status = f"its --ttl of {arguments.ttl:g} seconds passed", 124
+        killed = stop(identity, leader)
+        child.wait()
+        say(f"stopped {record['name']} after {time.time() - started:.0f}s: {reason}"
+            + ("; it ignored TERM, so it was killed" if killed else ""))
+        return status
+    except BaseException:
+        # Whatever went wrong here, the workload must not outlive it.
+        if leader is not None:
+            stop(identity, leader)
+        raise
+    finally:
+        try:
+            os.unlink(record_path(identity))
+        except OSError:
+            pass
+        forget_finished()
+
+
+def records():
+    try:
+        names = sorted(os.listdir(STATE))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(STATE, name)) as file:
+                found.append((name[:-5], json.load(file)))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def leader_of(record):
+    return (record["leader"], record["leader_start"]) if "leader" in record else None
+
+
+def forget_finished():
+    """Drop the records of wrappers that were killed after all they ran had
+    ended, such as one inside a workload that was stopped as a whole."""
+    for identity, record in records():
+        if not alive(record["wrapper"], record["wrapper_start"]) and \
+                not members(identity, leader_of(record)):
+            try:
+                os.unlink(record_path(identity))
+            except OSError:
+                pass
+
+
+def list_records():
+    forget_finished()
+    found = records()
+    if not found:
+        print("Nothing runs bounded on this host.")
+    for identity, record in found:
+        age = time.time() - record["started"]
+        wrapper = alive(record["wrapper"], record["wrapper_start"])
+        owner_state = "running" if alive(record["owner"], record["owner_start"]) else "ended"
+        print(f"{record['name']}, wrapper pid {record['wrapper']}, running {age:.0f}s of its {record['ttl']:g}s")
+        print(f"  command: {' '.join(record['command'])}")
+        print(f"  owner:   {record['owner_name']}, {owner_state}")
+        if wrapper:
+            print(f"  stop:    kill {record['wrapper']}")
+        else:
+            print(f"  stop:    its wrapper was killed; scripts/bounded --reap stops the "
+                  f"{len(members(identity, leader_of(record)))} processes it left")
+    return 0
+
+
+def reap():
+    reaped = 0
+    for identity, record in records():
+        if alive(record["wrapper"], record["wrapper_start"]):
+            continue
+        left = members(identity, leader_of(record))
+        if left:
+            stop(identity, leader_of(record))
+            say(f"stopped {record['name']}: its wrapper had been killed, leaving {len(left)} processes")
+            reaped += 1
+        try:
+            os.unlink(record_path(identity))
+        except OSError:
+            pass
+    if not reaped:
+        say("no workload had lost its wrapper")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="scripts/bounded", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The command's exit status is this one's; 124 when --ttl stopped it, 143 "
+               "when its owner ended or this wrapper was stopped, and 127 or 126 when it "
+               "could not be run.")
+    parser.add_argument("--ttl", type=float, default=3600,
+                        help="stop it this many seconds after it starts (default 3600)")
+    parser.add_argument("--name", help="what --list and messages call it")
+    parser.add_argument("--owner", type=int, metavar="PID",
+                        help="end with this process instead of the session that started this")
+    parser.add_argument("--list", action="store_true", help="list bounded workloads")
+    parser.add_argument("--reap", action="store_true",
+                        help="stop workloads whose wrapper was killed")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args()
+    if arguments.list:
+        return list_records()
+    if arguments.reap:
+        return reap()
+    if arguments.command[:1] == ["--"]:
+        arguments.command = arguments.command[1:]
+    if not arguments.command:
+        parser.error("give the command after --")
+    if not (math.isfinite(arguments.ttl) and arguments.ttl > 0):
+        parser.error("--ttl must be a positive number of seconds")
+    return run(arguments)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

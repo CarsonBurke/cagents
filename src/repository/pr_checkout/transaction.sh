@@ -132,9 +132,29 @@ if [ "$1" = prepared ]; then
         if repo_git symbolic-ref --quiet "$CAGENTS_PR_REMOTE_REF"; then exit 1; else [ "$?" = 1 ]; fi
     fi
     if [ "$CAGENTS_PR_OLD" != "$CAGENTS_PR_NEW" ]; then
+        # Root enumeration uses the retained repository descriptors, after
+        # caller policy, just like the status and effect it protects.
         (
-            if read_git status --porcelain=v2 --untracked-files=all --ignore-submodules=none -z \
-                2> "$CAGENTS_PR_PRIVATE/status-errors"; then
+            if read_git ls-files --stage -z 2> "$CAGENTS_PR_PRIVATE/submodules-errors"; then
+                printf 0 > "$CAGENTS_PR_PRIVATE/submodules-exit"
+            else
+                printf 1 > "$CAGENTS_PR_PRIVATE/submodules-exit"
+            fi
+        ) | /usr/bin/head -c 16777217 > "$CAGENTS_PR_PRIVATE/submodules-index"
+        [ "$(/bin/cat "$CAGENTS_PR_PRIVATE/submodules-exit")" = 0 ]
+        [ ! -s "$CAGENTS_PR_PRIVATE/submodules-errors" ]
+        [ "$(/usr/bin/wc -c < "$CAGENTS_PR_PRIVATE/submodules-index")" -le 16777216 ]
+        if [ -s "$CAGENTS_PR_PRIVATE/submodules-index" ]; then
+            [ "$(/usr/bin/tail -c 1 "$CAGENTS_PR_PRIVATE/submodules-index" | /usr/bin/od -An -tu1 | /usr/bin/tr -d '[:space:]')" = 0 ]
+        fi
+        /usr/bin/xargs -0 -r -s 32768 /bin/sh "$CAGENTS_PR_PRIVATE/check-submodule-paths" \
+            "$CAGENTS_PR_WORKTREE_FD" < "$CAGENTS_PR_PRIVATE/submodules-index"
+        (
+            if {
+                read_git status --porcelain=v2 --untracked-files=all --ignore-submodules=none -z &&
+                read_git submodule foreach --quiet --recursive \
+                    '/bin/sh "$CAGENTS_PR_PRIVATE/submodule-status"'
+            } 2> "$CAGENTS_PR_PRIVATE/status-errors"; then
                 printf 0 > "$CAGENTS_PR_PRIVATE/status-exit"
             else
                 printf 1 > "$CAGENTS_PR_PRIVATE/status-exit"

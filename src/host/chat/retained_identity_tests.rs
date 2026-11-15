@@ -4,6 +4,9 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
 fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const MODE: &str = "CAGENTS_RETAINED_PREPARED_ID_TEST";
     if std::env::var_os(MODE).is_none() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -23,6 +26,7 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(MODE, "1")
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",

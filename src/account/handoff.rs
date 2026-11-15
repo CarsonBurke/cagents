@@ -4,11 +4,10 @@ use crate::{agent::Provider, chat::Session};
 use std::{
     fs,
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const MAX_TRANSCRIPT: u64 = 256 * 1024 * 1024;
-const ENTRY_BUDGET: usize = 262_144;
 
 pub fn prepare(source: &Session, replacement: &Session) -> Result<(), String> {
     transfer(source, replacement, true)
@@ -42,21 +41,8 @@ fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(),
         Provider::Claude => {
             crate::agent::claude_transcript(&original, &source.launch.recipe.working_directory, id)?
         }
-        Provider::Codex => {
-            let mut found = Vec::new();
-            let mut budget = ENTRY_BUDGET;
-            find(
-                &original.join("sessions"),
-                4,
-                &format!("-{id}.jsonl"),
-                &mut budget,
-                &mut found,
-            )?;
-            if found.len() != 1 {
-                return Err("The exact Codex transcript is missing or ambiguous; the conversation stays on its original account".into());
-            }
-            found.pop().unwrap()
-        }
+        Provider::Codex => crate::agent::codex_rollout(&original, id)
+            .map_err(|error| format!("{error}; the conversation stays on its original account"))?,
         Provider::Omp => return Err("Omp manages its own account rotation".into()),
     };
     let relative = path
@@ -65,33 +51,6 @@ fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(),
     copy_transcript(&path, &target.join(relative), commit).map_err(|error| {
         format!("The conversation history could not be prepared on the alternate account: {error}")
     })
-}
-
-fn find(
-    root: &Path,
-    depth: usize,
-    suffix: &str,
-    budget: &mut usize,
-    found: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    if depth == 0 {
-        return Ok(());
-    }
-    crate::secure_file::reject_symlink_components(root).map_err(|error| error.to_string())?;
-    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
-        if *budget == 0 {
-            return Err("The provider history exceeds the bounded account-switch scan".into());
-        }
-        *budget -= 1;
-        let entry = entry.map_err(|error| error.to_string())?;
-        let kind = entry.file_type().map_err(|error| error.to_string())?;
-        if kind.is_dir() {
-            find(&entry.path(), depth - 1, suffix, budget, found)?;
-        } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(suffix) {
-            found.push(entry.path());
-        }
-    }
-    Ok(())
 }
 
 fn open_transcript(path: &Path) -> io::Result<fs::File> {

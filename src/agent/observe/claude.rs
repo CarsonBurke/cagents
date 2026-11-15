@@ -71,7 +71,12 @@ fn listing(recipe: &LaunchRecipe) -> ProbeResult<Vec<Value>> {
     command
         .args(["agents", "--json"])
         .env_clear()
-        .envs(&recipe.environment)
+        .envs(
+            recipe
+                .environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .current_dir(&recipe.working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -166,6 +171,68 @@ pub(super) fn session<'a>(census: &'a ProcessCensus, pid: i32, cwd: &Path) -> Op
     (observed_cwd == cwd)
         .then_some(session.as_deref())
         .flatten()
+}
+
+/// A sessions directory with more entries than this is not compared; the
+/// census is then listed again on every check, as it would be without it.
+const MAX_SESSION_FILES: usize = 4096;
+
+/// The status files `claude agents --json` reads for an account: the CLI
+/// keeps one per interactive process under `<config>/sessions/<pid>.json`,
+/// and rewrites it whenever that process's status, name or session changes.
+/// While these are unchanged, so is every row the listing would report for a
+/// process that is still running, which is all the census is asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Inputs(BTreeMap<std::ffi::OsString, FileVersion>);
+
+/// Which version of a file this is: replacing it changes the inode, and
+/// writing it in place the change time, whatever the clock's resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl Inputs {
+    pub(super) fn read(home: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let mut files = BTreeMap::new();
+        for (index, entry) in std::fs::read_dir(home.join("sessions")).ok()?.enumerate() {
+            if index == MAX_SESSION_FILES {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            if !Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                continue;
+            }
+            // Not followed: a link's target can change without the link.
+            let metadata = entry.metadata().ok()?;
+            files.insert(
+                name,
+                FileVersion {
+                    inode: metadata.ino(),
+                    length: metadata.len(),
+                    modified: (metadata.mtime(), metadata.mtime_nsec()),
+                    changed: (metadata.ctime(), metadata.ctime_nsec()),
+                },
+            );
+        }
+        Some(Self(files))
+    }
+
+    /// Whether the CLI keeps a status file for `pid`. This is what shows the
+    /// installed CLI still reports through these files; one that does not
+    /// would leave them unchanged while its sessions change.
+    pub(super) fn tracks(&self, pid: i32) -> bool {
+        self.0
+            .contains_key(std::ffi::OsStr::new(&format!("{pid}.json")))
+    }
 }
 
 pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<ProcessCensus> {

@@ -146,7 +146,7 @@ impl Fixture {
     }
 
     fn settle_loss_with(&mut self, owner: &ExecutionOwner) -> Result<bool, String> {
-        require_execution_owner(&self.registry, Some(owner), true)?;
+        require_execution_owner(&self.registry, Some(owner), true, None)?;
         self.registry.commit_native_actor_loss(
             self.identity.instance,
             &self.identity.record,
@@ -201,7 +201,7 @@ fn missing_pending_and_revoked_owners_cannot_settle_an_accepted_run() {
         assert!(fixture.settle_loss().is_err(), "phase {phase}");
         fixture.assert_unsettled();
         // Cleanup attention and a zero-run loss still grant no run authority.
-        require_execution_owner(&fixture.registry, None, false).unwrap();
+        require_execution_owner(&fixture.registry, None, false, None).unwrap();
         fixture.assert_unsettled();
     }
 }
@@ -509,6 +509,81 @@ fn answer_watermark_shared_commit_does_not_ack_a_failed_durable_write() {
             .pending_retained_inputs()
             .is_empty()
     );
+}
+
+#[test]
+fn answer_keeps_its_owner_across_a_concurrent_identity_confirmation_only() {
+    // The provider confirms its conversation while an Answer is in flight and
+    // the semantic drain publishes that projection. Only the exact projection
+    // of the helper-confirmed conversation preserves the captured owner.
+    for published in ["confirmed", "other", "unconfirmed"] {
+        let (_root, host, synchronization, _run, _) = answer_sync_fixture();
+        let confirmed = uuid::Uuid::new_v4().to_string();
+        if published != "unconfirmed" {
+            synchronization
+                .target
+                .handle
+                .fixture_confirm_session(confirmed.clone());
+        }
+        let mut projected = synchronization.target.source.clone();
+        projected.launch.session_id = Some(match published {
+            "other" => uuid::Uuid::new_v4().to_string(),
+            _ => confirmed,
+        });
+        {
+            let mut registry = synchronization.registry.lock().unwrap();
+            let row = registry
+                .native_actor_ownership(synchronization.target.identity.instance)
+                .unwrap()
+                .unwrap();
+            registry
+                .confirm_native_actor_identity(&row, &projected)
+                .unwrap();
+        }
+        assert_eq!(
+            synchronization.require_current(&host).is_ok(),
+            published == "confirmed",
+            "{published}"
+        );
+    }
+}
+
+#[test]
+fn a_confirmed_identity_projects_the_resident_source_until_retirement() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    // The census predates the resident attachment's acknowledged alias.
+    let registered = fixture.source.clone();
+    fixture.source.proof.as_mut().unwrap().host_incarnation = "successor-attachment".into();
+    fixture.issued_sources.push(fixture.source.clone());
+    let captured = fixture.authenticate().unwrap();
+    let project = |source: &Session, confirmed: &str| {
+        let mut projected = source.clone();
+        projected.launch.session_id = Some(confirmed.into());
+        projected
+    };
+    let confirmed = uuid::Uuid::new_v4().to_string();
+    let resident = project(&fixture.source, &confirmed);
+    fixture
+        .registry
+        .confirm_native_actor_identity(&captured.0, &resident)
+        .unwrap();
+    let check = |fixture: &Fixture, projected: &Session| {
+        require_execution_owner(&fixture.registry, Some(&captured), true, Some(projected))
+    };
+    assert!(check(&fixture, &project(&registered, &confirmed)).is_err());
+    assert!(check(&fixture, &resident).is_ok());
+    fixture
+        .registry
+        .commit_native_actor_retirement(
+            fixture.identity.instance,
+            &fixture.identity.record,
+            &resident,
+            Ok(&fixture.scope),
+            Some(&confirmed),
+        )
+        .unwrap();
+    assert!(check(&fixture, &resident).is_err());
 }
 
 #[test]

@@ -6,6 +6,9 @@
 
 <p align="center">A native Linux workspace for coding agents.</p>
 
+> [!NOTE]
+> This product is in beta. Expect bugs.
+
 Run Claude Code, Codex, and OMP across repositories and Git worktrees. Keep
 conversations, terminals, files, diffs, and pull requests together, with a
 separate workspace for each worktree.
@@ -75,21 +78,26 @@ cagents --help
 
 ## Build from source
 
-You need Rust 1.93, Zig 0.15.2, and the
-[native build dependencies](docs/development.md#prerequisites).
+You need [mise](https://mise.jdx.dev/getting-started.html),
+[rustup](https://rustup.rs/), and the
+[native build dependencies](docs/development.md#prerequisites). `mise run setup`
+installs the pinned Zig 0.15.2 with mise and Rust 1.93 with rustup.
 
 ```sh
 git clone https://github.com/CarsonBurke/cagents.git
 cd cagents
-scripts/run-development --browserless
+mise trust
+mise run setup    # install the toolchains and report anything missing
+mise run dev      # build and run the browserless development UI
 ```
 
-The development runner builds the matched CLI, UI, and daemon separately and
-uses an isolated development instance that can run beside an installed copy.
-Omit `--browserless` to include the embedded Servo browser.
+`mise run dev` builds the matched CLI, UI, and daemon separately and uses an
+isolated development instance that can run beside an installed copy.
+`mise run dev:browser` includes the embedded Servo browser.
 
-See [development](docs/development.md) for build commands, tests, debugging,
-and runner options.
+`mise tasks` lists the checks, tests, formatting, and packaging tasks. See
+[development](docs/development.md#tasks) for what each does, and for runner
+options.
 
 ## Documentation
 
