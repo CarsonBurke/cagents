@@ -1617,19 +1617,28 @@ impl<Message> VirtualCard<'_, Message> {
         visible: &Rectangle,
     ) -> iced_accessibility::A11yTree {
         // `layout` carries no virtual offset, so every descendant reports its
-        // bounds in strip coordinates; they are clipped to the columns of
-        // the slot the camera shows and moved by the camera's `offset` once,
-        // here. Retained, overscan and travelling panes stay mounted, but
-        // expose no body before they enter view. Only the camera's axis is
-        // clipped: what a pane scrolls out of view vertically is its own
-        // scrollables' business, and stays reachable as it was.
+        // bounds in strip coordinates; they are clipped to the columns the
+        // camera shows and moved by the camera's `offset` once, here.
+        // Retained, overscan and travelling panes stay mounted, but expose no
+        // body before they enter view. Only the camera's axis is clipped:
+        // what a pane scrolls out of view vertically is its own scrollables'
+        // business, and stays reachable as it was.
         let bounds = layout.bounds();
         let left = bounds.x.max(visible.x);
         let right = (bounds.x + self.width).min(visible.x + visible.width);
         if right <= left {
             return iced_accessibility::A11yTree::default();
         }
-        let clip = crate::ui_controls::accessible_bounds::columns(left, right);
+        // A settled pane's body lies inside its slot, so the camera's columns
+        // hide what they always did. Its popups draw over the window, not the
+        // pane, and a menu reaching across a neighbour stays reachable where
+        // it is painted. Only an opening pane, laid out wider than its slot,
+        // keeps to the slot: past it lies its neighbour's body.
+        let clip = if self.content_width > self.width {
+            crate::ui_controls::accessible_bounds::columns(left, right)
+        } else {
+            crate::ui_controls::accessible_bounds::columns(visible.x, visible.x + visible.width)
+        };
         let mut accessible = self.content.as_widget().a11y_nodes(layout, state, cursor);
         crate::ui_controls::accessible_bounds::place(&mut accessible, offset, Some(clip));
         accessible
@@ -1699,7 +1708,13 @@ impl<'a, Message> VirtualStrip<'a, Message> {
     }
 
     /// Whether `target` is a shown node of some card's accessibility tree.
-    fn a11y_target_visible(&self, tree: &Tree, layout: Layout<'_>, target: &widget::Id) -> bool {
+    fn a11y_target_visible(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        target: &widget::Id,
+    ) -> bool {
         let visible = self.a11y_visible(layout);
         let target = iced_accessibility::A11yId::from(target.clone());
         self.cards
@@ -1711,7 +1726,9 @@ impl<'a, Message> VirtualStrip<'a, Message> {
                     state,
                     child_layout.with_virtual_offset(Vector::ZERO),
                     layout.virtual_offset(),
-                    mouse::Cursor::Unavailable,
+                    // The published tree is built with the real pointer;
+                    // hover-only nodes must resolve the same way here.
+                    cursor,
                     &visible,
                 );
                 accessible
@@ -1913,7 +1930,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         // goes where it always went, so a pane holding a modal popover still
         // sees, and captures, actions aimed at its neighbours.
         if let Event::A11y(target, _) = event
-            && !self.a11y_target_visible(tree, layout, target)
+            && !self.a11y_target_visible(tree, layout, cursor, target)
         {
             return;
         }
@@ -5415,6 +5432,94 @@ mod tests {
             (f64::from(painted.x), f64::from(painted.y))
         );
         assert!((260.0..580.0).contains(&bounds.x0));
+    }
+
+    #[test]
+    fn workspace_a11y_keeps_a_popup_reachable_where_it_spills_over_a_neighbour() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let item = widget::Id::unique();
+        let neighbour = CardId::new();
+        let owner = CardId::new();
+        // A popup far wider than its pane, opened from the right-hand pane,
+        // draws across the left-hand one, as menus near a pane's edge do.
+        let popover = cosmic::widget::popover(
+            cosmic::widget::button::text("Model")
+                .name("Model")
+                .on_press(1_u8),
+        )
+        .popup(
+            cosmic::widget::button::text("A long menu item")
+                .name("A long menu item")
+                .id(item.clone())
+                .width(300.0)
+                .on_press(2_u8),
+        )
+        .position(cosmic::widget::popover::Position::Bottom);
+        let card = |id, x, content: Element<'static, u8>| VirtualCard {
+            id,
+            x,
+            width: 160.0,
+            content_width: 160.0,
+            on_screen: true,
+            content: CardSurface::new(content).into(),
+        };
+        let strip = VirtualStrip {
+            total_width: 320.0,
+            viewport_width: 320.0,
+            retained: Arc::new(HashMap::from([(neighbour, 0), (owner, 1)])),
+            focused: Some(owner),
+            cards: vec![
+                card(neighbour, 0.0, cosmic::widget::text("Neighbour").into()),
+                card(owner, 160.0, popover.into()),
+            ],
+        };
+        let mut element: Element<'_, u8> = widget::scrollable(strip)
+            .direction(widget::scrollable::Direction::Horizontal(
+                widget::scrollable::Scrollbar::hidden(),
+            ))
+            .width(320.0)
+            .height(180.0)
+            .into();
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 180.0)),
+            )
+            .move_to(Point::new(260.0, 44.0));
+        let painted = {
+            let viewport = node.bounds();
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("the open popover draws its popup over the strip");
+            overlay
+                .as_overlay_mut()
+                .layout(&renderer, Size::new(1200.0, 750.0))
+                .children()[0]
+                .bounds()
+        };
+        let owner_left = 260.0 + 160.0;
+        assert!(
+            painted.x < owner_left,
+            "the fixture's popup must reach across the neighbouring pane: {painted:?}"
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let item = a11y_node(&accessible, &item).unwrap().node();
+        assert!(!item.is_hidden());
+        let bounds = item.bounds().unwrap();
+        assert_eq!(bounds.x0, f64::from(painted.x));
     }
 
     #[test]
