@@ -857,6 +857,9 @@ impl Row {
             (None, true) => OPENS_DETAIL_OF_SEVERAL,
         };
         let mut tip = Vec::new();
+        if matches!(&self.open, Some(Action::OpenAgent(_))) {
+            tip.push(format!("Open {}", self.label));
+        }
         if self.shown != self.label {
             tip.push(format!("{} {}", self.verb, self.label));
         }
@@ -871,7 +874,11 @@ impl Row {
             format!("{} {}", self.verb, self.label),
             self.state.text.to_owned(),
             self.state.detail.clone().unwrap_or_default(),
-            pressing.to_owned(),
+            if matches!(&self.open, Some(Action::OpenAgent(_))) {
+                format!("Open {}", self.label)
+            } else {
+                pressing.to_owned()
+            },
             self.preview.clone(),
         ]
         .into_iter()
@@ -1243,31 +1250,76 @@ impl Runtime {
         };
         // The agent is named as its tab names it: by its name, else its task,
         // else its type, which then follows it where the task would.
-        let (label, shown) = match listed {
-            Some(agent) => (
-                self.child_label(agent, usize::MAX).into_owned(),
-                self.row_agent_name(agent),
-            ),
-            None => {
-                let label = started(spawn);
-                let shown = Self::short_description(&label, LABEL_CHARS);
-                (label, shown)
+        let cli_label = reading.cli.then(|| {
+            let agent = spawn.agents.first();
+            crate::agent_execution::agent_label_parts(
+                agent.map_or("", |agent| agent.name.as_str()),
+                agent.and_then(|agent| agent.prompt.inline()),
+            )
+        });
+        let (label, shown) = if let Some((label, _)) = &cli_label {
+            (label.clone(), label.clone())
+        } else {
+            match listed {
+                Some(agent) => (
+                    self.child_label(agent, usize::MAX).into_owned(),
+                    self.row_agent_name(agent),
+                ),
+                None => {
+                    let label = started(spawn);
+                    let shown = Self::short_description(&label, LABEL_CHARS);
+                    (label, shown)
+                }
             }
         };
-        let preview = match spawn.agents.as_slice() {
-            [agent] if agent.kind.trim() != label => agent.kind.trim().to_owned(),
-            [_] => String::new(),
-            agents => agents
-                .iter()
-                .map(|agent| {
-                    started(&Spawn {
-                        agents: vec![agent.clone()],
-                        ..Spawn::default()
+        let placed = reading
+            .cli
+            .then(|| reading.outcome.run.as_ref())
+            .flatten()
+            .and_then(|run| run.placed_in.as_ref());
+        let destination = placed.map(|placed| {
+            placed.title.as_ref().map_or_else(
+                || "in another channel".to_owned(),
+                |title| format!("in channel “{title}”"),
+            )
+        });
+        let mut preview = if let Some((_, task)) = &cli_label {
+            task.clone().unwrap_or_default()
+        } else {
+            match spawn.agents.as_slice() {
+                [agent] if agent.kind.trim() != label => agent.kind.trim().to_owned(),
+                [_] => String::new(),
+                agents => agents
+                    .iter()
+                    .map(|agent| {
+                        started(&Spawn {
+                            agents: vec![agent.clone()],
+                            ..Spawn::default()
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
         };
+        if let Some(destination) = &destination {
+            let duplicate_task = placed
+                .and_then(|placed| placed.title.as_deref())
+                .is_some_and(|title| {
+                    spawn
+                        .agents
+                        .first()
+                        .and_then(|agent| agent.prompt.inline())
+                        .and_then(|task| task.trim().lines().next())
+                        .and_then(crate::names::normalize_card_name)
+                        .as_deref()
+                        == Some(title)
+                });
+            preview = if preview.is_empty() || duplicate_task {
+                destination.clone()
+            } else {
+                format!("{destination} · {preview}")
+            };
+        }
         let observed_model = listed
             .filter(|_| !reading.cli)
             .and_then(|agent| agent.model.as_deref());
@@ -1278,6 +1330,9 @@ impl Runtime {
             .filter(|prompt| !prompt.is_empty())
             .cloned()
             .collect();
+        if let Some(destination) = &destination {
+            full.insert(0, destination.clone());
+        }
         let details = spawn_details(reading, spawn, observed_model);
         if !details.is_empty() {
             full.push(details);
@@ -1316,7 +1371,12 @@ impl Runtime {
                 _ => run.map_or_else(|| RowStatus::plain("Finished"), run_status),
             },
         };
-        let open = listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())));
+        let open = if reading.cli {
+            run.filter(|run| !run.agent.is_empty())
+                .map(|run| Action::OpenAgent(run.agent.clone()))
+        } else {
+            listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())))
+        };
         // What it reported is in the open detail, and in the agent's
         // transcript; where the row cannot open one, the tooltip gives it too.
         if open.is_none() {
@@ -1385,14 +1445,12 @@ impl Runtime {
             line.push(live_dot());
         }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
-        line.push(
-            match row.state.tone {
-                Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
-                Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
-                Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
-            }
-            .into(),
-        );
+        let status = match row.state.tone {
+            Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
+            Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
+            Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
+        };
+        line.push(status.into());
         let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -1728,6 +1786,103 @@ impl Runtime {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn cli_spawn_preview_names_the_destination_without_repeating_the_task() {
+        let (runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let name = "cross-project-reviewer-with-a-distinctive-name";
+        // Longer than the task preview, within the channel title's limit.
+        let long_task = "Review the deployment carefully. ".repeat(7);
+        let long_destination = format!("in channel “{}”", long_task.trim());
+        let oversized_task = "x".repeat(TIP_CHARS + 100);
+        let oversized_preview = format!("in channel “Release” · {}…", "x".repeat(160));
+        for (placed, title, task, expected) in [
+            (
+                true,
+                Some("Release"),
+                "Review deployment",
+                "in channel “Release” · Review deployment",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "Review the cards",
+                "in channel “Review the cards”",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "Review  the cards",
+                "in channel “Review the cards”",
+            ),
+            (
+                true,
+                Some("Review the cards"),
+                "\n Review the cards \nKeep the details",
+                "in channel “Review the cards”",
+            ),
+            (true, Some("Release"), "", "in channel “Release”"),
+            (
+                true,
+                None,
+                "Review deployment",
+                "in another channel · Review deployment",
+            ),
+            (false, None, "Review deployment", "Review deployment"),
+            (
+                true,
+                Some(long_task.trim()),
+                long_task.as_str(),
+                long_destination.as_str(),
+            ),
+            (
+                true,
+                Some("Release"),
+                oversized_task.as_str(),
+                oversized_preview.as_str(),
+            ),
+        ] {
+            let spawn = Spawn {
+                agents: vec![crate::chat::coordination::Delegate {
+                    name: name.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    prompt: Text::Inline(task.into()),
+                }],
+                ..Default::default()
+            };
+            let reading = Coordinated::new(Coordination {
+                kind: Kind::Spawn(spawn.clone()),
+                outcome: crate::chat::coordination::Outcome {
+                    run: Some(Run {
+                        agent: "1a2b3c4d".into(),
+                        placed_in: placed.then(|| crate::control::PlacedIn {
+                            channel: crate::model::ChannelId::new(),
+                            title: title.map(str::to_owned),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                subagents: Vec::new(),
+                cli: true,
+            });
+            let row = runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
+            assert_eq!(row.verb, "Started");
+            assert_eq!(row.shown, name, "the name stays whole in either layout");
+            assert_eq!(row.preview, expected);
+            assert_eq!(row.state.text, "Launch accepted");
+            let (tip, accessible) = row.described();
+            assert!(accessible.contains(expected));
+            if placed {
+                let destination = title.map_or_else(
+                    || "in another channel".to_owned(),
+                    |title| format!("in channel “{title}”"),
+                );
+                assert!(tip.contains(&destination));
+            }
+        }
+    }
 
     fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
         let item = chat::Item {

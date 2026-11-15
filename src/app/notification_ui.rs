@@ -2400,7 +2400,39 @@ mod tests {
                 title_source: Default::default(),
                 ordinal: 0,
             });
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Scheduled agent · Review".into());
         (app, agent)
+    }
+
+    #[test]
+    fn scheduled_activation_retries_when_only_unloaded_label_metadata_arrives() {
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = activation_session(&agent).unwrap().id();
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        app.chrome_ui.agent_labels.clear();
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert_eq!(app.notification_ui.session_activation, Some(session));
+        assert!(app.card_state(card).is_none());
+        let sequence = app.workspace_model.sequence;
+        drop(app.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::AgentLabels(vec![(
+                agent.id,
+                "reviewer · Review the cards".into(),
+            )]),
+        ));
+        assert_eq!(
+            app.workspace_model.sequence, sequence,
+            "no unrelated model wake is needed"
+        );
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(app.notification_ui.session_activation.is_none());
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "reviewer · Review the cards"
+        );
     }
 
     #[test]

@@ -91,6 +91,7 @@ impl Cagents {
             self.refresh_automation_choices();
         }
         let was_draft_dialog = self.automation_ui.draft_dialog_open();
+        let opens_run = matches!(action, Action::OpenSession);
         match self.automation_ui.update(action) {
             None if !was_draft_dialog && self.automation_ui.draft_dialog_open() => {
                 iced::widget::operation::focus(crate::automation_ui::draft_dialog_focus_id())
@@ -121,22 +122,47 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Some(Effect::Request { sequence, request }) => cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
+            Some(Effect::Request { sequence, request }) => iced::Task::future(async move {
+                tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
                     let mut client = crate::control::ControlClient::connect(&socket)
                         .map_err(|error| error.to_string())?;
-                    client
+                    let response = client
                         .automation(crate::agent_execution::Authority::default(), request)
-                        .map_err(crate::control::ControlError::reason)
+                        .map_err(crate::control::ControlError::reason)?;
+                    // An explicit Open must have its accepted title before
+                    // adoption, even if it overtook the workspace watcher.
+                    let labels = if opens_run {
+                        client
+                            .read_agent_labels()
+                            .map_err(crate::control::ControlError::reason)?
+                            .1
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, String>((response, labels))
                 })
                 .await
-                .unwrap_or_else(|error| Err(error.to_string()));
-                Message::AutomationUi(Action::Received {
+                .unwrap_or_else(|error| Err(error.to_string()))
+            })
+            .then(move |result| {
+                let (result, labels) = match result {
+                    Ok((response, labels)) => (Ok(response), labels),
+                    Err(error) => (Err(error), Vec::new()),
+                };
+                let received = cosmic::task::message(Message::AutomationUi(Action::Received {
                     sequence,
                     result: Arc::new(result),
-                })
+                }));
+                if labels.is_empty() {
+                    received
+                } else {
+                    cosmic::task::message(Message::WorkspaceModelObserved(
+                        super::workspace_model_sync::ModelUpdate::AgentLabels(labels),
+                    ))
+                    .chain(received)
+                }
             }),
             Some(Effect::OpenRun(detail)) => {
                 let Some(agent) = detail.agent else {

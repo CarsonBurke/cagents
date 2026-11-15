@@ -33,7 +33,7 @@ mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 mod gh;
-pub use agents::AgentCommand;
+pub use agents::{AgentCommand, PlacedIn};
 pub use gh::GhCommand;
 mod automations;
 mod completions;
@@ -1054,6 +1054,20 @@ impl ControlClient {
                 crate::workspace_model::metadata::Reply::Agents { identity, agents },
             ) => Ok((identity, agents)),
             response => Err(unexpected_response("workspace agents", &response)),
+        }
+    }
+
+    /// Stable names for managed agents, without loading their conversations.
+    pub fn read_agent_labels(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<(crate::model::AgentId, String)>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::AgentLabels { identity, labels },
+            ) => Ok((identity, labels)),
+            response => Err(unexpected_response("agent labels", &response)),
         }
     }
 
