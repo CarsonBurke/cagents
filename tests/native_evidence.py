@@ -263,6 +263,8 @@ class Evidence(unittest.TestCase):
             # These fixtures exercise this host's queue; Rust never compiles.
             "CAGENTS_BUILD_REMOTE": "local",
             "CAGENTS_BUILD_INSTALLED_GATE": "",
+            # Build in place: no systemd scope or shared jobserver.
+            "CAGENTS_BUILD_SCOPE": "0",
             # The disk guard must not start the host's own pruner from a fixture.
             "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CAGENTS_EVIDENCE_TASK": str(self.task),
@@ -643,6 +645,8 @@ class Evidence(unittest.TestCase):
         lock = next(l.split("=", 1)[1] for l in env.splitlines() if l.startswith("CAGENTS_BUILD_LOCK="))
         self.assertTrue(lock.startswith(str(self.task)), lock)
         self.assertIn("CAGENTS_BUILD_SEED=0", env.splitlines())
+        # Nor the build host's slice and shared jobserver.
+        self.assertIn("CAGENTS_BUILD_SCOPE=0", env.splitlines())
         self.assertEqual((self.logs / "cargo").read_text(), before)
         # The stub runner execs this last, after its gated builds.
         for _ in range(100):
