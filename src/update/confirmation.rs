@@ -420,7 +420,7 @@ fn wait_for(
 
 /// Closing a review is a cancellation unless something it named had to be
 /// resolved by hand first; then that is why the update was not installed.
-fn closed(preview: &impact::Preview) -> UpdateError {
+pub(super) fn closed(preview: &impact::Preview) -> UpdateError {
     refused(preview, false).unwrap_or(UpdateError::Cancelled)
 }
 

@@ -874,7 +874,7 @@ fn drive_terminal_review_with(
                         continue;
                     }
                     if matches!(choice, UpdateChoice::Cancel) {
-                        return Err(UpdateError::Cancelled);
+                        return Err(confirmation::closed(&confirmation.preview));
                     }
                     submitted.insert(confirmation.nonce.clone());
                     continue;
@@ -924,7 +924,8 @@ fn drive_terminal_review_with(
                 match choice {
                     OrdinaryChoice::Cancel => {
                         terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
-                        return Err(UpdateError::Cancelled);
+                        // Says what the worker records for this review.
+                        return Err(confirmation::closed(&confirmation.preview));
                     }
                     OrdinaryChoice::InterruptNow => {
                         reviewed = Some(confirmation.preview.clone());
@@ -5476,6 +5477,87 @@ sys.stdin.buffer.read(1)
                 first_failure.message
             );
         }
+    }
+
+    /// Answering n at a blocked review tells the person what the worker
+    /// records: nothing was installed, and what held it back.
+    #[test]
+    fn declining_a_blocked_review_in_the_cli_reports_the_refusal() {
+        struct Terminal {
+            job: UpdateJob,
+            decided: Vec<UpdateChoice>,
+            output: Vec<u8>,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(
+                &mut self,
+                _: &str,
+                _: &str,
+                choice: UpdateChoice,
+            ) -> Result<(), UpdateError> {
+                self.decided.push(choice);
+                Ok(())
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("declining the review must not cancel the whole update");
+            }
+            fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+                answer.push_str("n\n");
+                Ok(answer.len())
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn worker_running(&mut self) -> Result<bool, UpdateError> {
+                Ok(true)
+            }
+            fn pause(&mut self) {}
+        }
+        let preview = impact::tests::blocked_preview();
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: preview.candidate.version.clone(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Review the update".into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: Some(confirmation::Confirmation {
+                nonce: "review".into(),
+                expires_at_unix_ms: u64::MAX,
+                preview,
+                stop: None,
+            }),
+            refusal: None,
+        };
+        let mut terminal = Terminal {
+            job: job.clone(),
+            decided: Vec::new(),
+            output: Vec::new(),
+        };
+        let error = drive_terminal_review_with(job, false, false, &mut terminal).unwrap_err();
+        assert!(matches!(terminal.decided[..], [UpdateChoice::Cancel]));
+        assert!(
+            matches!(&error, UpdateError::Refused(refusal) if !refusal.sessions.is_empty()),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().starts_with("Update not installed: "),
+            "{error}"
+        );
     }
 
     #[test]
