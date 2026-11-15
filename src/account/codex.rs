@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(usage.windows.len(), 1);
         assert_eq!(usage.windows[0].key, "codex:primary");
         assert_eq!(usage.status, UsageStatus::Limited);
-        assert_eq!(usage.credits.unwrap().summary(), "12.50 left");
+        assert_eq!(usage.credits.unwrap().summary(), "13 credits left");
     }
 
     #[test]
@@ -779,7 +779,10 @@ mod tests {
         let unknown = parse_rate_limits(&result, 1_000);
         assert_eq!(unknown.status, UsageStatus::Unavailable);
         assert_eq!(unknown.plan.as_deref(), Some("pro"));
-        assert_eq!(unknown.credits.as_ref().unwrap().summary(), "12.50 left");
+        assert_eq!(
+            unknown.credits.as_ref().unwrap().summary(),
+            "13 credits left"
+        );
         assert!(!super::super::routing::available(&unknown, 1_000));
         for (percent, status, available) in [
             (0, UsageStatus::Ok, true),

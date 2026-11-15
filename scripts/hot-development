@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifacts
+
 HOT_VERSION = "0.1.1"
 HOT_REVISION = "0d57d0664bf2e1c16ba30c34bcfe78cd3eed665f"
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,26 +69,16 @@ def build_product(name, features, target):
     command = ["cargo", "build", "--locked", "--profile", "dev-runtime",
                "--target", target, "--no-default-features", "--features", features, "--bin", name,
                "--message-format", "json-render-diagnostics"]
-    artifact = None
+    artifacts = CargoArtifacts()
     with subprocess.Popen(sandbox(command), stdout=subprocess.PIPE, text=True) as child:
         for line in child.stdout:
             if len(line) > 2 * 1024 * 1024:
                 child.terminate()
                 fail("Cargo output exceeds the per-message budget")
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                sys.stderr.write(line)
-                continue
-            if value.get("reason") == "compiler-message":
-                sys.stderr.write(value["message"].get("rendered") or "")
-            if (value.get("reason") == "compiler-artifact"
-                    and value.get("target", {}).get("name") == name
-                    and value.get("executable")):
-                artifact = Path(value["executable"])
-        if child.wait() or artifact is None:
+            artifacts.read(line, diagnostics=sys.stderr)
+        if child.wait():
             fail(f"Locked {name} build failed; development daemon was not stopped")
-    return artifact
+    return artifacts.executable(name)
 
 
 def stage_product(product, destination):
@@ -138,7 +131,8 @@ def main():
     # cargo-hot always selects host triple but puts its runnable bundle here,
     # independently of the ordinary artifact's optional triple subdirectory.
     metadata = subprocess.check_output(sandbox([
-        "cargo", "metadata", "--locked", "--no-default-features", "--features", ui_features,
+        "cargo", "metadata", "--locked", "--manifest-path", str(ROOT / "crates/cagents-ui/Cargo.toml"),
+        "--no-default-features", "--features", ui_features,
         "--filter-platform", native, "--format-version", "1"
     ]), text=True)
     target = Path(json.loads(metadata)["target_directory"])
@@ -155,7 +149,8 @@ def main():
         fail("Hot bundle has an unexpected cagents-ui entry; refusing replacement")
     else:
         alias.symlink_to("cagents-ui-hot")
-    command = sandbox([hot, "hot", "--profile", "dev-runtime", "--no-default-features",
+    # Only the UI package is patched; an edit to the shared library needs a cold restart.
+    command = sandbox([hot, "hot", "--profile", "dev-runtime", "-p", "cagents-ui", "--no-default-features",
                        "--features", ui_features, "--bin", "cagents-ui-hot", "--", *forwarded], offline=True)
     if args.fresh_daemon:
         position = command.index("--chdir")
@@ -163,7 +158,7 @@ def main():
     else:
         position = command.index("--chdir")
         command[position:position] = ["--unsetenv", "CAGENTS_HOT_FRESH_DAEMON"]
-    print("Experimental hot reload: body-only UI edits; type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
+    print("Experimental hot reload: body-only edits in crates/cagents-ui; shared-library, type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
     if args.log_file:
         with open(args.log_file, "w") as output:
             return subprocess.run(command, stdout=output, stderr=subprocess.STDOUT).returncode

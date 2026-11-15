@@ -39,7 +39,8 @@ def configure_peer(root):
         settings = json.load(stream)
     names = {"pause": "CAGENTS_TOOL_ROWS_PAUSE",
              "never_confirm_interrupt": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT",
-             "never_confirm_close": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE"}
+             "never_confirm_close": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE",
+             "history": "CAGENTS_TOOL_ROWS_HISTORY"}
     if not isinstance(settings, dict) or settings.keys() - names.keys():
         raise ValueError("unknown Codex fixture setting")
     for key, value in settings.items():
@@ -47,6 +48,11 @@ def configure_peer(root):
             if type(value) not in (int, float) or not 0 < value <= 300:
                 raise ValueError("Codex fixture pause must be between 0 and 300 seconds")
             os.environ[names[key]] = str(value)
+        elif key == "history":
+            if (type(value) is not list or len(value) != 2
+                    or any(type(part) is not int or part < 0 for part in value)):
+                raise ValueError("Codex fixture history must be [COUNT, BYTES]")
+            os.environ[names[key]] = f"{value[0]} {value[1]}"
         else:
             if type(value) is not bool:
                 raise ValueError("Codex fixture confirmation settings must be boolean")
@@ -105,9 +111,17 @@ def scenario_class(peer, storage, listener):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 state = json.load(stream)
-            if (not {"thread", "child", "latest"} <= set(state)
-                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting"}):
+            if (not isinstance(state, dict)
+                    or not {"thread", "child", "latest"} <= set(state)
+                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting",
+                                     "model", "reasoning"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
+            model = state.get("model", "fixture-mini")
+            reasoning = state.get("reasoning")
+            if not isinstance(model, str) or not model:
+                raise ValueError("invalid persisted rehearsal model")
+            if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
+                raise ValueError("invalid persisted rehearsal reasoning effort")
             thread_path(state["thread"])
             thread_path(state["child"])
             for turn in (state["latest"], state.get("child_latest")):

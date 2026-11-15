@@ -1235,13 +1235,14 @@ mod tests {
             .unwrap(),
             Response::Proposal(Box::new(proposals[0].clone()))
         );
-        assert_eq!(
-            without_wake(Request::Proposal {
-                id: Uuid::from_u128(4)
-            })
-            .unwrap_err(),
-            "The automation proposal is unavailable"
-        );
+        let error = without_wake(Request::Proposal {
+            id: Uuid::from_u128(4),
+        })
+        .unwrap_err();
+        let service::Error::Invalid(message) = error else {
+            panic!("a missing proposal must remain an invalid request: {error}");
+        };
+        assert_eq!(message, "The automation proposal is unavailable");
         {
             let registry = registry.lock().unwrap();
             assert_eq!(registry.model().unwrap(), before_model);
@@ -1256,6 +1257,36 @@ mod tests {
             }
             assert!(registry.automations(None, 100).unwrap().is_empty());
         }
+        // Windows watching notifications are told the project's pending
+        // requests changed, so they need not poll for them.
+        let (watching, unwatched) = {
+            let mut host = host.lock().unwrap();
+            let watching = host.register_client(1);
+            let unwatched = host.register_client(2);
+            host.watch_notifications(
+                1,
+                crate::notifications::Presence {
+                    window: "primary".into(),
+                    application: Default::default(),
+                    focused_target: None,
+                    sessions: Vec::new(),
+                    focused: None,
+                },
+            );
+            (watching, unwatched)
+        };
+        // Everything sent so far, without waiting for more.
+        let told = |delivery: &crate::host::delivery::DeliveryQueue| {
+            delivery.close_after_drain();
+            std::iter::from_fn(|| delivery.pop())
+                .filter_map(|envelope| match envelope.message {
+                    crate::terminal_ipc::ServerMessage::AutomationProposalsChanged {
+                        repository,
+                    } => Some(repository),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         let before = handle.0.wake.state.lock().unwrap().generation;
         let decision = Request::ResolveProposal {
             id: proposals[0].id,
@@ -1273,6 +1304,8 @@ mod tests {
             before.wrapping_add(1),
             "a newly committed decision must still wake scheduling"
         );
+        assert_eq!(told(&watching), [repository.clone()]);
+        assert!(told(&unwatched).is_empty());
         assert_eq!(
             registry
                 .lock()

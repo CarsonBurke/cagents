@@ -112,7 +112,7 @@ impl Stored {
     }
 }
 
-enum Reply {
+pub enum Reply {
     Page(Page),
     History(HistoryPage),
 }
@@ -416,36 +416,25 @@ fn poll_with(
     Ok(stored.result(completed))
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Census fixtures, including publisher processes, shared with the
+/// application's tests.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fixture {
     use super::*;
     use crate::github::review_requests::{Current, Entry, Viewer};
-    use std::{
-        fs::{self, OpenOptions},
-        io::Write,
-        process::{Command, Stdio},
-        sync::atomic::{AtomicUsize, Ordering},
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::{fs::OpenOptions, io::Write, process::Command, thread, time::Duration};
 
     /// A probe that can't answer, so every census reads as before probes.
-    pub(crate) fn unprobed(_: Option<&str>, _: Arc<File>) -> Result<Revalidation, GitHubError> {
+    pub fn unprobed(_: Option<&str>, _: Arc<File>) -> Result<Revalidation, GitHubError> {
         Err(GitHubError::Inspection("unprobed".into()))
     }
 
-    fn private_root() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        root
-    }
-
-    fn repository() -> GitHubRepoKey {
+    pub fn repository() -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, "owner", "repository").unwrap()
     }
 
-    fn page(viewer: &str, numbers: &[u64], next: Option<&str>) -> Reply {
+    pub fn page(viewer: &str, numbers: &[u64], next: Option<&str>) -> Reply {
         Reply::Page(Page {
             viewer: Viewer {
                 id: viewer.into(),
@@ -468,6 +457,120 @@ pub(crate) mod tests {
                 .collect(),
             next_cursor: next.map(str::to_owned),
         })
+    }
+
+    /// One publisher process. It does nothing unless [`published_fixture`]
+    /// started it, so the test that calls it passes in an ordinary run.
+    pub fn publisher_process() {
+        let Some(root) = std::env::var_os("CAGENTS_REVIEW_POLL_TEST_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let tick = std::env::var("CAGENTS_REVIEW_POLL_TEST_TICK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let count = std::env::var("CAGENTS_REVIEW_POLL_TEST_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let result = poll_with(
+            &root,
+            "account",
+            &repository(),
+            &CancellationToken::new(),
+            || tick,
+            |work, _| {
+                let mut calls = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("calls"))
+                    .unwrap();
+                writeln!(calls, "read").unwrap();
+                thread::sleep(Duration::from_millis(50));
+                Ok(if let Some(count) = count {
+                    let start = match work {
+                        Work::Page { cursor: None } => 1,
+                        Work::Page {
+                            cursor: Some(cursor),
+                        } => cursor
+                            .strip_prefix("page-")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
+                        _ => panic!("unexpected shared continuation"),
+                    };
+                    let end = (start + 49).min(count);
+                    let next = (end < count).then(|| format!("page-{}", end + 1));
+                    page(
+                        "viewer",
+                        &(start..=end).collect::<Vec<_>>(),
+                        next.as_deref(),
+                    )
+                } else {
+                    page("viewer", &[1], None)
+                })
+            },
+            || Ok(()),
+            unprobed,
+        )
+        .unwrap();
+        assert!(result.scan.requested.contains_key(&1));
+    }
+
+    /// A publisher with no notification consumer exits between pages. A later
+    /// follower must still see every validated page, not just the last one.
+    ///
+    /// `publisher` is the exact name of a test in the running test binary that
+    /// calls [`publisher_process`].
+    pub fn published_fixture(root: &Path, now: u64, count: u64, publisher: &str) -> PollResult {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pages = count.div_ceil(50);
+        for tick in (0..pages).map(|page| now + page * PACE) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", publisher])
+                .env("CAGENTS_REVIEW_POLL_TEST_ROOT", root)
+                .env("CAGENTS_REVIEW_POLL_TEST_TICK", tick.to_string())
+                .env("CAGENTS_REVIEW_POLL_TEST_COUNT", count.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        poll_with(
+            root,
+            "account",
+            &repository(),
+            &CancellationToken::new(),
+            || now + (pages - 1) * PACE + 1,
+            |_, _| panic!("the follower must read both published pages without a network request"),
+            || Ok(()),
+            unprobed,
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::fixture::{page, published_fixture, publisher_process, repository, unprobed};
+    use super::*;
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
     }
 
     #[test]
@@ -608,101 +711,18 @@ pub(crate) mod tests {
 
     #[test]
     fn process_worker() {
-        let Some(root) = std::env::var_os("CAGENTS_REVIEW_POLL_TEST_ROOT") else {
-            return;
-        };
-        let root = std::path::PathBuf::from(root);
-        let tick = std::env::var("CAGENTS_REVIEW_POLL_TEST_TICK")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1000);
-        let count = std::env::var("CAGENTS_REVIEW_POLL_TEST_COUNT")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-        let result = poll_with(
-            &root,
-            "account",
-            &repository(),
-            &CancellationToken::new(),
-            || tick,
-            |work, _| {
-                let mut calls = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(root.join("calls"))
-                    .unwrap();
-                writeln!(calls, "read").unwrap();
-                thread::sleep(Duration::from_millis(50));
-                Ok(if let Some(count) = count {
-                    let start = match work {
-                        Work::Page { cursor: None } => 1,
-                        Work::Page {
-                            cursor: Some(cursor),
-                        } => cursor
-                            .strip_prefix("page-")
-                            .unwrap()
-                            .parse::<u64>()
-                            .unwrap(),
-                        _ => panic!("unexpected shared continuation"),
-                    };
-                    let end = (start + 49).min(count);
-                    let next = (end < count).then(|| format!("page-{}", end + 1));
-                    page(
-                        "viewer",
-                        &(start..=end).collect::<Vec<_>>(),
-                        next.as_deref(),
-                    )
-                } else {
-                    page("viewer", &[1], None)
-                })
-            },
-            || Ok(()),
-            unprobed,
-        )
-        .unwrap();
-        assert!(result.scan.requested.contains_key(&1));
-    }
-
-    /// A publisher with no notification consumer exits between pages. A later
-    /// follower must still see every validated page, not just the last one.
-    pub(crate) fn published_fixture(root: &Path, now: u64, count: u64) -> PollResult {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let pages = count.div_ceil(50);
-        for tick in (0..pages).map(|page| now + page * PACE) {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "github::review_requests::shared::tests::process_worker",
-                ])
-                .env("CAGENTS_REVIEW_POLL_TEST_ROOT", root)
-                .env("CAGENTS_REVIEW_POLL_TEST_TICK", tick.to_string())
-                .env("CAGENTS_REVIEW_POLL_TEST_COUNT", count.to_string())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        poll_with(
-            root,
-            "account",
-            &repository(),
-            &CancellationToken::new(),
-            || now + (pages - 1) * PACE + 1,
-            |_, _| panic!("the follower must read both published pages without a network request"),
-            || Ok(()),
-            unprobed,
-        )
-        .unwrap()
+        publisher_process();
     }
 
     #[test]
     fn slow_follower_sees_every_page_published_by_other_processes() {
         let root = private_root();
-        let result = published_fixture(root.path(), 1000, 60);
+        let result = published_fixture(
+            root.path(),
+            1000,
+            60,
+            "github::review_requests::shared::tests::process_worker",
+        );
         assert_eq!(
             fs::read_to_string(root.path().join("calls")).unwrap(),
             "read\nread\n"

@@ -69,6 +69,20 @@ pub(super) fn publish_capability(lease: &mut File) -> io::Result<()> {
     lease.sync_all()
 }
 
+/// The pid a window recorded in its lease when it took the lease. It is only
+/// a candidate: the bytes can be stale, mid-publication or another user's
+/// claim, so the caller must still prove the lock is that process's.
+pub(super) fn recorded_owner(lease: &File) -> Option<u32> {
+    let length = lease.metadata().ok()?.len();
+    if length == 0 || length > MAX_CAPABILITY_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = vec![0; length as usize];
+    lease.read_exact_at(&mut bytes, 0).ok()?;
+    let capability: WindowCapability = serde_json::from_slice(&bytes).ok()?;
+    Some(capability.owner.pid)
+}
+
 fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file()
         || metadata.uid() != current_uid()
@@ -80,6 +94,7 @@ fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn compatible_window(window: &VerifiedWindow) -> io::Result<()> {
     if !window.still_owns_lease()? {
         return Err(io::Error::other(
@@ -165,6 +180,7 @@ fn declaration_path_in(runtime: &Path) -> PathBuf {
 
 /// How long an admission waits out starting windows' momentary probes of its
 /// declaration before it proceeds undeclared.
+#[cfg(any(feature = "host", test))]
 const DECLARATION_PATIENCE: Duration = Duration::from_millis(250);
 /// How often a starting window checks whether an admission has finished.
 const ADMISSION_POLL: Duration = Duration::from_millis(50);
@@ -182,6 +198,7 @@ const ADMISSION_WAIT_ALLOWANCE: Duration = Duration::from_secs(10);
 /// exclusively: if it can, no admission holds the fence, so the holder is an
 /// update; if it cannot, an admission does, and the window waits for it.
 /// Holders that predate the declaration still read as updates.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct AdmissionFence {
     // Fields drop in order: the fence is released before its declaration, so
     // a window can never find this admission's fence undeclared.
@@ -189,6 +206,7 @@ pub(crate) struct AdmissionFence {
     _declaration: Option<OwnedLock>,
 }
 
+#[cfg(any(feature = "host", test))]
 impl AdmissionFence {
     pub(crate) fn acquire() -> io::Result<Self> {
         Self::acquire_in(&runtime_directory()?)
@@ -211,6 +229,7 @@ impl AdmissionFence {
 /// after that, or cannot be opened at all, is not worth refusing the admission
 /// over: undeclared, it reads as an update, which is what every holder looked
 /// like before declarations existed.
+#[cfg(any(feature = "host", test))]
 fn declare_admission(runtime: &Path) -> Option<OwnedLock> {
     let deadline = Instant::now() + DECLARATION_PATIENCE;
     loop {
@@ -446,20 +465,23 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct DaemonAdmissionGuard {
     _launch: DaemonLaunch,
     _legacy: OwnedLock,
 }
 
+#[cfg(any(feature = "host", test))]
 enum DaemonLaunch {
     /// This daemon's own fence, declared as an admission while it is held.
-    Owned(AdmissionFence),
+    Owned { _fence: AdmissionFence },
     /// An installer's or recovery launcher's fence. It stays held after this
     /// daemon is ready, for that owner's own work, so it is never declared:
     /// a window opened meanwhile reports that owner's update.
-    Inherited(LaunchFence),
+    Inherited { _fence: LaunchFence },
 }
 
+#[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
     pub(crate) fn acquire() -> io::Result<Self> {
         let runtime = runtime_directory()?;
@@ -470,9 +492,13 @@ impl DaemonAdmissionGuard {
             unsafe {
                 libc::close(descriptor);
             }
-            DaemonLaunch::Inherited(LaunchFence::Inherited { file, descriptor })
+            DaemonLaunch::Inherited {
+                _fence: LaunchFence::Inherited { file, descriptor },
+            }
         } else {
-            DaemonLaunch::Owned(AdmissionFence::acquire_in(&runtime)?)
+            DaemonLaunch::Owned {
+                _fence: AdmissionFence::acquire_in(&runtime)?,
+            }
         };
         let legacy = admit_windows(&runtime)?;
         Ok(Self {
@@ -482,6 +508,7 @@ impl DaemonAdmissionGuard {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn upgrade_fence(file: &File) -> io::Result<()> {
     // An SH→EX conversion is NOT atomic. On failure Linux can drop the
     // parent's SH lock: return immediately, before any startup mutation.
@@ -494,6 +521,7 @@ fn upgrade_fence(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
     let legacy = owned_lock(
         &runtime.join(APPLICATION_LOCK_FILE),

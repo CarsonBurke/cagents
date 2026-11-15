@@ -1,3 +1,5 @@
+use crate::work::CheckState;
+
 use super::*;
 use crate::{
     model::WorktreeId,
@@ -47,6 +49,7 @@ fn worktree(path: &str, branch: &str) -> super::super::scan::Worktree {
         dirty: None,
         link: None,
         error: None,
+        status_read_at: None,
     }
 }
 

@@ -25,6 +25,8 @@ use super::{
 };
 
 #[cfg(test)]
+mod automation_authority_tests;
+#[cfg(test)]
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
@@ -182,6 +184,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadWorkspaceView { .. }
             | ClientRequest::ReadWorkspaceSnapshot
             | ClientRequest::ReadWorkspaceMetadata { .. }
+            | ClientRequest::ReadTerminalRemovalBasis { .. }
+            | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -369,6 +373,7 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         let _close_reply = if matches!(
             &request,
             ClientRequest::CloseTerminalChecked { .. }
+                | ClientRequest::CloseTerminalSource { .. }
                 | ClientRequest::ReleaseCompletedTerminal { .. }
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
@@ -511,6 +516,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::CloseTerminalSource { .. }
     ) {
         return Ok(());
     }
@@ -586,6 +592,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::CloseTerminalSource { .. }
             | ClientRequest::ChatCloseRetained { .. }
             | ClientRequest::ChatLostProcesses { .. }
     );
@@ -778,10 +785,11 @@ fn reserve_terminal_close(
     source: &crate::model::TerminalSession,
     paired: Option<&crate::chat::runtime::Handle>,
     generation: Result<Option<String>, String>,
+    capture: Option<&crate::workspace_model::views::CapturedTerminalSource>,
 ) -> Result<TerminalCloseRetirement, ProtocolError> {
     let gate = control_gate(host);
     let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
-    let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
+    let reserve = |current: Result<Option<String>, String>| -> Result<TerminalCloseRetirement, ProtocolError> {
     ensure_terminal_close_open(host)?;
     let unavailable =
         |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
@@ -820,6 +828,7 @@ fn reserve_terminal_close(
                     .is_some_and(|handle| handle.same_worker(expected))
                     && paired.is_none_or(|actor| !record.handle.same_attachment(actor))
             })
+            || (capture.is_some() && state.removal_in_transition(terminal))
             || super::chat::terminal_claim_pending(&state, terminal)
         {
             return Err(ProtocolError::new(
@@ -866,6 +875,69 @@ fn reserve_terminal_close(
     };
     reservation.previous = previous;
     Ok(reservation)
+    };
+    if let Some(capture) = capture {
+        with_source_close_fence(host, &gate, terminal, deadline, capture, reserve)
+    } else {
+        let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
+        reserve(current)
+    }
+}
+
+fn source_cleanup_conflict() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::InvalidRequest,
+        crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
+        false,
+    )
+}
+
+/// Acquire SQL before State, and never wait for the control writer while holding
+/// SQL. Readers queued on the registry can therefore finish before the retry.
+fn with_source_close_fence<T>(
+    host: &SharedHost,
+    gate: &RwLock<()>,
+    terminal: crate::model::TerminalId,
+    deadline: Instant,
+    capture: &crate::workspace_model::views::CapturedTerminalSource,
+    reserve: impl FnOnce(Result<Option<String>, String>) -> Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let writer = super::workspace::writer(host)?;
+    loop {
+        let registry = match writer.try_lock() {
+            Ok(registry) => Some(registry),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut registry) = registry {
+            let sql = registry
+                .source_admission()
+                .map_err(|error| ProtocolError::new(ProtocolErrorCode::Internal, error, true))?;
+            let current = sql.retention_pin_generation(terminal);
+            let admission = match gate.try_write() {
+                Ok(a) => Some(a),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(_admission) = admission {
+                sql.validate(capture)
+                    .map_err(|_| source_cleanup_conflict())?;
+                if !matches!(&capture.before.kind, crate::model::CardKind::Terminal(s) if s.id == terminal)
+                {
+                    return Err(source_cleanup_conflict());
+                }
+                return reserve(current);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Cagents is busy; retry closing this terminal",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Joining can transfer a still-live original holder to the reaper. Check the
@@ -1173,12 +1245,84 @@ fn process_wire_request(
     Ok((response.into(), extras, shutdown))
 }
 
+fn validate_cleanup_source(
+    state: &super::state::HostState,
+    expected: Option<&(
+        crate::model::TerminalSession,
+        crate::workspace_model::views::TerminalRemovalBasis,
+    )>,
+) -> Result<(), ProtocolError> {
+    if let Some((source, basis)) = expected {
+        if !state.terminals.contains_key(&source.id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalNotFound,
+                crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT,
+                false,
+            ));
+        }
+        let valid = match basis {
+            crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance } => {
+                owner == state.proof()
+                    && owner.is_complete()
+                    && !instance.is_nil()
+                    && state.terminals.get(&source.id).is_some_and(|record| {
+                        if record.handle.execution_instance() != *instance {
+                            return false;
+                        }
+                        state.descriptor(0, source.id).is_ok_and(|descriptor| {
+                            let mut current = descriptor.session;
+                            current.continuity = source.continuity.clone();
+                            current == *source
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn process_admitted_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
     _shared: Option<std::sync::RwLockReadGuard<'_, ()>>,
 ) -> Result<RequestOutcome, ProtocolError> {
+    // Adapt the additive request to the established close paths. Its original
+    // source is checked under the same lock that selects the resident handle;
+    // the existing close reservation then retains that exact handle.
+    let mut cleanup_capture = None;
+    let (request, cleanup_source) = match request {
+        ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+            capture,
+        } => {
+            cleanup_capture = capture;
+            let request = if completed_only {
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: session.clone(),
+                    allow_active,
+                }
+            } else {
+                ClientRequest::CloseTerminalChecked {
+                    terminal_id: session.id,
+                    allow_active,
+                }
+            };
+            (request, Some((session, basis)))
+        }
+        request => (request, None),
+    };
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -1323,9 +1467,7 @@ fn process_admitted_request(
         } => {
             let reply =
                 super::automations::service::process_under_control(host, authority, operation)
-                    .map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
+                    .map_err(super::automations::service::Error::into_protocol)?;
             Ok((ServerResponse::Automation(reply), Vec::new(), false))
         }
         ClientRequest::Agent {
@@ -1336,6 +1478,9 @@ fn process_admitted_request(
                 .map_err(|error| match error {
                     crate::agent_execution::AcceptanceError::Invalid(message) => {
                         ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    }
+                    crate::agent_execution::AcceptanceError::StoreBusy(message) => {
+                        ProtocolError::new(ProtocolErrorCode::StoreBusy, message, true)
                     }
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
@@ -1635,6 +1780,7 @@ fn process_admitted_request(
                 // so it is told those known already. They only accumulate, so
                 // this and a concurrent change may arrive in either order.
                 extras.extend(super::chat::agent_addresses(host, session.id));
+                extras.extend(super::chat::active_model(host, session.id));
             }
             Ok((response, extras, false))
         }
@@ -1667,6 +1813,46 @@ fn process_admitted_request(
         ClientRequest::ReadWorkspaceModel => {
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReadCapturedTerminalRemovalBasis { capture } => {
+            let writer = super::workspace::writer(host)?;
+            let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+            let admission = registry
+                .source_admission()
+                .map_err(|error| ProtocolError::new(ProtocolErrorCode::Internal, error, true))?;
+            admission
+                .validate(&capture)
+                .map_err(|_| source_cleanup_conflict())?;
+            let crate::model::CardKind::Terminal(source) = &capture.before.kind else {
+                return Err(source_cleanup_conflict());
+            };
+            let basis = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminal_removal_basis(source)
+                .map_err(|error| {
+                    if error.message == super::model::Registry::VIEW_REMOVAL_CONFLICT {
+                        source_cleanup_conflict()
+                    } else {
+                        error
+                    }
+                })?;
+            Ok((
+                ServerResponse::TerminalRemovalBasis(basis),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ReadTerminalRemovalBasis { source } => {
+            let basis = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminal_removal_basis(&source)?;
+            Ok((
+                ServerResponse::TerminalRemovalBasis(basis),
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::ReadWorkspaceMetadata { query } => {
             let metadata = super::workspace::metadata(host, query)?;
@@ -1727,6 +1913,10 @@ fn process_admitted_request(
             });
             Ok((ServerResponse::Spawned { terminal }, extras, false))
         }
+        ClientRequest::RetryPendingTerminalSave { pane, terminal_id } => {
+            super::state::retry_pending_terminal_save(host, pane, terminal_id)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::CompletePendingTerminal {
             pane,
             terminal_id,
@@ -1761,22 +1951,24 @@ fn process_admitted_request(
             after_generation,
             after_event_sequence,
         } => {
-            let (terminal, events) = {
+            let (terminal, events, worker) = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let terminal = state.attach(client_id, terminal_id)?;
                 state.resume_presentation(client_id, terminal_id, after_generation);
                 let events = state.replay_events(terminal_id, after_event_sequence)?;
-                (terminal, events)
+                let worker = state.worker_marker(terminal_id)?;
+                (terminal, events, worker)
             };
             let snapshot =
                 super::state::client_snapshot(host, client_id, terminal_id, after_generation)?;
-            let extras = replay_messages(
+            let mut extras = replay_messages(
                 terminal_id,
                 events,
                 snapshot,
                 terminal.generation,
                 terminal.event_sequence,
             );
+            extras.insert(0, worker);
             Ok((ServerResponse::Attached { terminal }, extras, false))
         }
         ClientRequest::Detach { terminal_id } => {
@@ -2045,8 +2237,15 @@ fn process_admitted_request(
             let paired = terminal_close_pair(host, terminal_id, &handle)?;
             let pin = retention_pin_generation(host, terminal_id);
             drop(_shared);
-            let close =
-                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
+            let close = reserve_terminal_close(
+                host,
+                terminal_id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                None,
+            )?;
             // Explicit shutdown permits active work, but still needs the same
             // inspected family cleanup proof as a checked close. A plain worker
             // hangup/join cannot certify release of its original holder.
@@ -2096,6 +2295,7 @@ fn process_admitted_request(
             }
             let (handle, paired, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_cleanup_source(&state, cleanup_source.as_ref())?;
                 state.ensure_retention_available(&[session.id])?;
                 let handle = match state.terminals.get(&session.id) {
                     None => {
@@ -2147,8 +2347,15 @@ fn process_admitted_request(
                 ));
             }
             drop(_shared);
-            let close =
-                reserve_terminal_close(host, session.id, &handle, &source, paired.as_ref(), pin)?;
+            let close = reserve_terminal_close(
+                host,
+                session.id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                cleanup_capture.as_ref(),
+            )?;
             if let Some(paired) = paired {
                 super::chat::close_terminal_actor(host, session.id, &paired)?;
             }
@@ -2172,6 +2379,7 @@ fn process_admitted_request(
         } => {
             let (handle, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_cleanup_source(&state, cleanup_source.as_ref())?;
                 state.ensure_retention_available(&[terminal_id])?;
                 (
                     state.history_handle(client_id, terminal_id)?,
@@ -2181,9 +2389,23 @@ fn process_admitted_request(
             let paired = terminal_close_pair(host, terminal_id, &handle)?;
             let pin = retention_pin_generation(host, terminal_id);
             drop(_shared);
-            let mut close =
-                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
-            let outcome = handle.close_checked(allow_active);
+            let mut close = reserve_terminal_close(
+                host,
+                terminal_id,
+                &handle,
+                &source,
+                paired.as_ref(),
+                pin,
+                cleanup_capture.as_ref(),
+            )?;
+            let outcome = if cleanup_source.is_some()
+                && !allow_active
+                && paired.as_ref().is_some_and(|actor| actor.owns_work())
+            {
+                crate::terminal_ipc::TerminalCloseResult::Active
+            } else {
+                handle.close_checked(allow_active)
+            };
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2221,6 +2443,7 @@ fn process_admitted_request(
                 false,
             ))
         }
+        ClientRequest::CloseTerminalSource { .. } => unreachable!("source close normalized above"),
         ClientRequest::Shutdown => {
             let outcome = host
                 .lock()
@@ -2293,7 +2516,7 @@ fn prepare_resume(
         if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
             continue;
         }
-        let (terminal, events) = {
+        let (terminal, events, worker) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
                 continue;
@@ -2302,17 +2525,19 @@ fn prepare_resume(
             let events = state
                 .replay_events(cursor.terminal_id, cursor.event_sequence)
                 .unwrap_or_default();
-            (terminal, events)
+            let worker = state.worker_marker(cursor.terminal_id)?;
+            (terminal, events, worker)
         };
         let snapshot =
             super::state::client_snapshot(host, client_id, cursor.terminal_id, cursor.generation)?;
-        let messages = replay_messages(
+        let mut messages = replay_messages(
             cursor.terminal_id,
             events,
             snapshot,
             terminal.generation,
             terminal.event_sequence,
         );
+        messages.insert(0, worker);
         let prepared = (terminal, messages);
         resumed.push(prepared.0);
         replay.extend(prepared.1);
@@ -2516,7 +2741,8 @@ pub(in crate::host) mod tests {
         generation: Result<Option<String>, String>,
     ) -> Result<(), ProtocolError> {
         let source = host.lock().unwrap().terminals[&terminal].session.clone();
-        let close = reserve_terminal_close(host, terminal, handle, &source, None, generation)?;
+        let close =
+            reserve_terminal_close(host, terminal, handle, &source, None, generation, None)?;
         finish_terminal_close(host, close)
     }
 
@@ -2879,6 +3105,7 @@ pub(in crate::host) mod tests {
                 let closing = matches!(
                     &request,
                     ClientRequest::CloseTerminalChecked { .. }
+                        | ClientRequest::CloseTerminalSource { .. }
                         | ClientRequest::ReleaseCompletedTerminal { .. }
                         | ClientRequest::ShutdownTerminal { .. }
                 );
@@ -3254,7 +3481,8 @@ pub(in crate::host) mod tests {
         drop(slow_request);
 
         let source = host.lock().unwrap().terminals[&id].session.clone();
-        let close = reserve_terminal_close(&host, id, &handle, &source, None, pin.clone()).unwrap();
+        let close =
+            reserve_terminal_close(&host, id, &handle, &source, None, pin.clone(), None).unwrap();
         super::super::agent_execution::registry(&host)
             .unwrap()
             .lock()
@@ -3352,7 +3580,8 @@ pub(in crate::host) mod tests {
                         &worker_handle,
                         &worker_source,
                         None,
-                        worker_generation
+                        worker_generation,
+                        None,
                     ))
                     .is_ok()
             );
@@ -3602,6 +3831,100 @@ pub(in crate::host) mod tests {
     }
 
     #[test]
+    fn source_checked_close_cannot_retarget_a_completed_replacement_after_basis_read() {
+        let (host, _directory, mut session, original) = retention_client_host("source-close-race");
+        let id = session.id;
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let basis = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        // B publishes after the metadata reply and before the destructive RPC.
+        let replacement =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !replacement.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let mut state = host.lock().unwrap();
+            drop(state.retire_terminal(id));
+        }
+        let absent = process_request(
+            &host,
+            1,
+            ClientRequest::CloseTerminalSource {
+                session: session.clone(),
+                basis: basis.clone(),
+                completed_only: true,
+                allow_active: false,
+                capture: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(absent.code, ProtocolErrorCode::TerminalNotFound);
+        assert_eq!(
+            absent.message,
+            crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT
+        );
+        {
+            let mut state = host.lock().unwrap();
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), replacement.clone(), false)
+                .unwrap();
+        }
+        for completed_only in [false, true] {
+            for allow_active in [false, true] {
+                let error = process_request(
+                    &host,
+                    1,
+                    ClientRequest::CloseTerminalSource {
+                        session: session.clone(),
+                        basis: basis.clone(),
+                        completed_only,
+                        allow_active,
+                        capture: None,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT
+                );
+                let state = host.lock().unwrap();
+                assert!(state.terminals[&id].handle.same_worker(&replacement));
+                assert!(!state.terminal_retirements.contains_key(&id));
+            }
+        }
+        let current = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        retry_retirement_close(&host, || ClientRequest::CloseTerminalSource {
+            session: session.clone(),
+            basis: current.clone(),
+            completed_only: true,
+            allow_active: false,
+            capture: None,
+        });
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        original.shutdown().unwrap();
+        replacement.shutdown().unwrap();
+    }
+
+    #[test]
     fn explicit_close_retains_registered_original_until_actual_holder_receipt() {
         use std::os::unix::{
             ffi::{OsStrExt, OsStringExt},
@@ -3792,6 +4115,7 @@ pub(in crate::host) mod tests {
             &current_source,
             None,
             pin.clone(),
+            None,
         )
         .unwrap();
         let mut refused_recipe = source.launch.clone();
@@ -4141,6 +4465,15 @@ pub(in crate::host) mod tests {
     }
 
     fn assert_completed_native_confirmation(provider: crate::agent::Provider) {
+        for completed_only in [true, false] {
+            assert_completed_native_confirmation_case(provider, completed_only);
+        }
+    }
+
+    fn assert_completed_native_confirmation_case(
+        provider: crate::agent::Provider,
+        completed_only: bool,
+    ) {
         use crate::{
             chat::{
                 self,
@@ -4250,9 +4583,17 @@ pub(in crate::host) mod tests {
                 },
             );
         }
-        let request = |allow_active| ClientRequest::ReleaseCompletedTerminal {
+        let basis = host
+            .lock()
+            .unwrap()
+            .terminal_removal_basis(&session)
+            .unwrap();
+        let request = |allow_active| ClientRequest::CloseTerminalSource {
             session: session.clone(),
+            basis: basis.clone(),
+            completed_only,
             allow_active,
+            capture: None,
         };
         assert!(matches!(
             process_request(&host, 1, request(false)).unwrap().0,
@@ -4661,6 +5002,23 @@ pub(in crate::host) mod tests {
         let started = directory.path().join("probe-started");
         wait_file(&started);
         let probe_pid: i32 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
+        // Upgrade and shutdown admission never waits for the provider listing.
+        let gate = host.lock().unwrap().control_gate.clone();
+        assert!(
+            gate.try_write().is_ok(),
+            "a provider listing in flight must not hold the control gate"
+        );
+        // ...but it holds the lease that account and worktree reservations
+        // wait for.
+        let probes = host.lock().unwrap().agent_probes.clone();
+        assert_eq!(
+            probes
+                .running()
+                .into_iter()
+                .map(|(_, probe)| probe.working_directory)
+                .collect::<Vec<_>>(),
+            [directory.path().to_path_buf()]
+        );
 
         // Compatibility refreshes read the cache immediately; none schedules a
         // probe or creates a per-connection worker. Input shares this socket.

@@ -1192,7 +1192,7 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// Keep historical diagnostics available to the CLI without showing a resolved
 /// installation failure as a warning in every subsequently installed window.
 #[cfg(feature = "ui")]
-pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
     #[cfg(feature = "development")]
     if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
         && let Some(job) = review_fixture::read(Path::new(&root))?
@@ -3341,36 +3341,35 @@ mod tests {
 
     #[test]
     fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
-        let cancellation = CancellationToken::new();
-        let started = Instant::now();
-        assert!(matches!(
+        // The children outlive the test's wait, so a command that waited for
+        // them instead of its timeout or cancellation never returns.
+        let result = crate::test_timing::returns("a timed-out command", || {
             bounded_command(
-                Command::new("/bin/sleep").arg("30"),
+                Command::new("/bin/sleep").arg("3600"),
                 "owned fixture",
                 10,
                 Duration::from_millis(20),
-                &cancellation
-            ),
-            Err(UpdateError::Timeout("owned fixture"))
-        ));
-        assert!(started.elapsed() < Duration::from_secs(2));
+                &CancellationToken::new(),
+            )
+        });
+        assert!(matches!(result, Err(UpdateError::Timeout("owned fixture"))));
         let cancellation = CancellationToken::new();
         let signal = cancellation.clone();
         let canceller = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             signal.cancel();
         });
-        let started = Instant::now();
-        let result = bounded_command(
-            Command::new("/bin/sleep").arg("30"),
-            "owned fixture",
-            10,
-            Duration::from_secs(2),
-            &cancellation,
-        );
+        let result = crate::test_timing::returns("a cancelled command", move || {
+            bounded_command(
+                Command::new("/bin/sleep").arg("3600"),
+                "owned fixture",
+                10,
+                Duration::from_secs(3600),
+                &cancellation,
+            )
+        });
         canceller.join().unwrap();
         assert!(matches!(result, Err(UpdateError::Cancelled)));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -3381,14 +3380,9 @@ mod tests {
             .spawn()
             .unwrap();
         let mut child = StreamingChild::new(child).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            if let Some(status) = child.observed_exit_status().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        };
+        let status = crate::test_timing::wait_for("the child's exit", || {
+            child.observed_exit_status().unwrap()
+        });
         assert_eq!(status.code(), Some(7));
         assert_eq!(
             child.observed_exit_status().unwrap().unwrap().code(),
@@ -3407,11 +3401,9 @@ mod tests {
     fn streaming_signal_error_reaps_exited_leader_and_refuses_live_wait() {
         let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
         let mut child = StreamingChild::new(child).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while child.observed_exit_status().unwrap().is_none() {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        }
+        crate::test_timing::eventually("the child's exit", || {
+            child.observed_exit_status().unwrap().is_some()
+        });
         assert_eq!(
             child
                 .finish_with(true, |_| Err(io::Error::from_raw_os_error(libc::EPERM)))
@@ -3424,12 +3416,13 @@ mod tests {
             Some(libc::ECHILD)
         );
 
+        // Outlives the test's wait: a finish that waited for it never returns.
         let child = Command::new("/bin/sleep")
-            .arg("30")
+            .arg("3600")
             .process_group(0)
             .spawn()
             .unwrap();
-        let mut child = StreamingChild::new(child).unwrap();
+        let child = StreamingChild::new(child).unwrap();
         struct OwnedCleanup(OwnedFd);
         impl Drop for OwnedCleanup {
             fn drop(&mut self) {
@@ -3452,15 +3445,14 @@ mod tests {
             }
         }
         let _cleanup = OwnedCleanup(child.identity.try_clone().unwrap());
-        let started = Instant::now();
-        assert_eq!(
-            child
+        let (child, error) = crate::test_timing::returns("a refused finish", move || {
+            let mut child = child;
+            let error = child
                 .finish_with(true, |_| Err(io::Error::from_raw_os_error(libc::EPERM)))
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EPERM)
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
+                .unwrap_err();
+            (child, error)
+        });
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         assert!(child.observed_exit_status().unwrap().is_none());
         // Own test-only cleanup uses the still-original capability, not a PGID.
         assert_eq!(

@@ -19,7 +19,7 @@ class RedrawArtifacts(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.calls = self.root / "calls.jsonl"
-        for name in ("run-redraw-latency", "build-ceditor-product"):
+        for name in ("run-redraw-latency", "build-ceditor-product", "cargo_artifacts.py"):
             self.write("scripts/" + name, (ROOT / "scripts" / name).read_text())
         self.write("fixtures/redraw-scheduling.schema.json", "{}\n")
         self.write(".cargo/config.toml", '[build]\ntarget = "x86_64-unknown-linux-gnu"\n')
@@ -49,7 +49,10 @@ message = {'reason': 'compiler-artifact', 'target': {'name': name, 'kind': ['bin
 if os.environ.get('MISSING_ARTIFACT') != name:
     print(json.dumps(message))
 if os.environ.get('AMBIGUOUS_ARTIFACT') == name:
-    print(json.dumps(message))
+    other = product.with_name('another-' + name)
+    other.write_bytes(product.read_bytes())
+    other.chmod(0o755)
+    print(json.dumps(dict(message, executable=str(other))))
 """)
         self.tool("git", """
 if sys.argv[1] == 'rev-parse': print('fixture-revision')
@@ -130,10 +133,11 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         result = self.run_runner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected = []
-        for name, features in (("cagents", "development"), ("cagentsd", "development,host"),
-                               ("cagents-ui", "development,latency-harness")):
-            expected.append(["build", "--locked", "--release", "--no-default-features",
-                             "--features", features, "--bin", name,
+        for name, selection in (
+                ("cagents", ["--no-default-features", "--features", "development"]),
+                ("cagentsd", ["--no-default-features", "--features", "development,host"]),
+                ("cagents-ui", ["-p", "cagents-ui", "--features", "development,latency-harness"])):
+            expected.append(["build", "--locked", "--release", *selection, "--bin", name,
                              "--message-format=json-render-diagnostics"])
         self.assertEqual(self.builds(), expected)
         calls = self.recorded()

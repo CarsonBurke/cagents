@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 /// Leave room for the response envelope without increasing the IPC frame cap.
-pub(crate) const MAX_DEVICE_IMAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
+pub const MAX_DEVICE_IMAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Home,
@@ -348,7 +348,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
 /// Read the producer's exact concrete filename on its owning device. Resolve
 /// relative names only against the verified conversation cwd; never search
 /// directories, expand patterns, or reinterpret a path on the UI computer.
-pub(crate) fn read_image_file(
+pub fn read_image_file(
     root: &std::path::Path,
     path: &std::path::Path,
     limit: usize,
@@ -1388,7 +1388,7 @@ mod tests {
         let path = directory.path().join("shared.txt");
         std::fs::write(&path, "before\n").unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let Some(group) = crate::fs_safety::tests::shared_group(&file) else {
+        let Some(group) = crate::fs_safety::acl_fixture::shared_group(&file) else {
             return;
         };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();

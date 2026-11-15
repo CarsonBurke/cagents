@@ -105,7 +105,7 @@ fn an_idle_tick_reads_past_another_connections_write_lock() {
 fn stopped_and_full_journals_keep_source_pending_and_retry_without_hot_enqueue() {
     for full in [false, true] {
         let (directory, registry, _) = fixture();
-        let (notifications, mut journal) =
+        let (notifications, journal) =
             JournalTestBridge::new(&directory.path().join("notices.sqlite3")).unwrap();
         let event = registry
             .lock()

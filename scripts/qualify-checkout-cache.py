@@ -12,8 +12,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifacts
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,7 +26,7 @@ ANCHOR = f'const _: Option<&str> = option_env!("{IDENTITY}");\n'
 OLD_TIME = 946684800
 VENDOR_BUILD_HOOKS = (
     "vendor/iced-core", "vendor/iced-runtime", "vendor/iced-winit",
-    "vendor/libcosmic", "vendor/libsqlite3-sys",
+    "vendor/libcosmic", "vendor/libsqlite3-sys", "vendor/iced-wgpu",
 )
 VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
@@ -83,20 +87,10 @@ def write(path, text):
 def build_workspace(checkout, env, names):
     output, log = run("cargo", "build", "--offline", "--workspace", "--verbose",
                       "--message-format=json-render-diagnostics", cwd=checkout, env=env)
-    messages = [json.loads(line) for line in output.splitlines()]
-    products = {}
-    for name in names:
-        matches = [Path(message["executable"]) for message in messages
-                   if message.get("reason") == "compiler-artifact"
-                   and message.get("target", {}).get("name") == name
-                   and "bin" in message.get("target", {}).get("kind", [])
-                   and message.get("executable")]
-        if len(matches) != 1:
-            raise RuntimeError(f"expected exactly one Cargo executable for {name}; got {matches}")
-        product = matches[0]
-        if not product.is_absolute() or not product.is_file() or not os.access(product, os.X_OK):
-            raise RuntimeError(f"Cargo executable is missing or not runnable: {product}")
-        products[name] = product
+    artifacts = CargoArtifacts()
+    messages = [message for line in output.splitlines()
+                if (message := artifacts.read(line)) is not None]
+    products = {name: artifacts.executable(name) for name in names}
     return products, messages, log
 
 
@@ -461,13 +455,14 @@ def main():
     args = parser.parse_args()
     config = tomllib.loads((ROOT / ".cargo/config.toml").read_text())
     assert config["env"][IDENTITY] == {"value": ".", "relative": True, "force": True}
-    # Both compilation roots share the unconditional anchor in modules.rs.
-    for source in ("src/lib.rs", "src/hot-ui.rs"):
+    # Each compilation root shares the unconditional anchor in its modules.rs.
+    for source in ("src/lib.rs", "crates/cagents-ui/src/lib.rs", "crates/cagents-ui/src/hot-ui.rs"):
         assert (ROOT / source).read_text().splitlines().count(
             'include!("modules.rs");'
         ) == 1, source
     for source in (
-        "build.rs", "src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+        "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
+        "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
     ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
