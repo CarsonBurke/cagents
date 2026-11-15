@@ -294,6 +294,11 @@ pub fn destructive_text(theme: &Theme) -> text::Style {
     ink(destructive_color(theme))
 }
 
+/// Text inked in the accent, such as the characters a search matched.
+pub fn accent_text(theme: &Theme) -> text::Style {
+    ink(accent_color(theme))
+}
+
 /// Text that reports something finished well, such as passing checks.
 pub fn success_text(theme: &Theme) -> text::Style {
     ink(success_color(theme))
