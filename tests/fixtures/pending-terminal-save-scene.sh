@@ -46,7 +46,7 @@ root=pathlib.Path(os.environ["CAGENTS_EVIDENCE_FIXTURE"])
 db=next(pathlib.Path(os.environ["XDG_DATA_HOME"]).rglob("workspace-model.sqlite3"))
 workers=[json.loads(x) for x in (root/"home/terminal-workers.jsonl").read_text().splitlines()]
 assert len(workers)==1, workers
-panes=sqlite3.connect(db).execute("select id,resource,pending_terminal_start from panes where kind=\"terminal\"").fetchall()
+panes=[list(row) for row in sqlite3.connect(db).execute("select id,resource,pending_terminal_start from panes where kind=\"terminal\"").fetchall()]
 assert len(panes)==1 and panes[0][2]==1, panes
 proof={"panes":panes,"workers":workers}
 (root/"home/terminal-save-before.json").write_text(json.dumps(proof))
@@ -63,7 +63,7 @@ evidence drive key Return
 sleep 1
 evidence shot "${SCENE_SHOT_PREFIX:-}completion-recovered"
 evidence env python3 -c '
-import os,pathlib,sqlite3,json
+import os,pathlib,sqlite3,json,sys
 root=pathlib.Path(os.environ["CAGENTS_EVIDENCE_FIXTURE"])
 db=next(pathlib.Path(os.environ["XDG_DATA_HOME"]).rglob("workspace-model.sqlite3"))
 workers=[json.loads(x) for x in (root/"home/terminal-workers.jsonl").read_text().splitlines()]
@@ -71,9 +71,9 @@ assert len(workers)==1, workers
 worker=workers[0]
 assert pathlib.Path("/proc/"+str(worker["pid"])+"/stat").read_text().split()[21]==worker["start"]
 before=json.loads((root/"home/terminal-save-before.json").read_text())
-panes=sqlite3.connect(db).execute("select id,resource,pending_terminal_start from panes where kind=\"terminal\"").fetchall()
+panes=[list(row) for row in sqlite3.connect(db).execute("select id,resource,pending_terminal_start from panes where kind=\"terminal\"").fetchall()]
 assert len(panes)==1 and panes[0][:2]==before["panes"][0][:2], panes
-assert panes[0][2]==(0 if __import__("sys").argv[1]=="after" else 1), panes
+assert panes[0][2]==(0 if sys.argv[1]=="after" else 1), panes
 assert workers==before["workers"], workers
 print(json.dumps({"panes":panes,"workers":workers,"original_worker_alive":True}))
 ' "$SIDE"
