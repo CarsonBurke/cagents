@@ -357,6 +357,12 @@ fn installed_version(text: &str) -> Result<Version, UpdateError> {
 /// Blocking, bounded network discovery. Run on an async runtime's blocking pool.
 /// No installation or updater files are created by this call.
 pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateError> {
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        && let Some(release) = review_fixture::release(Path::new(&root))?
+    {
+        return Ok(UpdateState::Available { release });
+    }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
         Err(error) => {
@@ -451,7 +457,23 @@ enum UpdateRequest {
     InstalledFromTerminal { root: PathBuf },
 }
 
+/// Whether this build asks for newer releases. A development build never
+/// does, apart from offering the native evidence fixture's release.
+pub fn discovers_releases() -> bool {
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        .is_some_and(|root| review_fixture::offers_release(Path::new(&root)))
+    {
+        return true;
+    }
+    crate::instance::NAME != "development"
+}
+
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
+        review_fixture::refuse_fixture_release(Path::new(&root), release)?;
+    }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {

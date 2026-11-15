@@ -683,7 +683,7 @@ impl Cagents {
     /// user asked for joins one already in flight rather than racing it, and
     /// is the only kind whose failure is reported.
     fn start_update_check(&mut self, manual: bool) -> Task<Message> {
-        if crate::instance::NAME == "development" || self.update_ui.updating() {
+        if !crate::update::discovers_releases() || self.update_ui.updating() {
             return Task::none();
         }
         if manual {
