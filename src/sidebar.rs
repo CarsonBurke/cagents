@@ -7838,7 +7838,7 @@ fn compact_project<'a>(
 /// even when nothing is open there. The glyph and the label follow the same
 /// rule, so a row reads as one strength rather than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowInk {
+pub(crate) enum RowInk {
     Full,
     Muted,
 }
@@ -7948,8 +7948,74 @@ fn channel_ink(channel: &SidebarChannel, listing: Listing) -> RowInk {
     )
 }
 
-fn channel_glyph_tone(channel: &SidebarChannel, listing: Listing) -> GlyphTone {
-    GlyphTone::Ink(channel_ink(channel, listing))
+/// The kind of workspace a row stands for, which decides the glyph it leads
+/// with wherever it is drawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WorkspaceGlyph<'a> {
+    Channel,
+    Worktree(&'a SidebarWorktree),
+}
+
+impl WorkspaceGlyph<'_> {
+    fn icon(self) -> widget::icon::Handle {
+        match self {
+            Self::Channel => Icon::Channel.handle(),
+            Self::Worktree(worktree) => worktree
+                .chrome
+                .pull_request
+                .as_ref()
+                .map_or_else(worktree_icon, pull_request_icon),
+        }
+    }
+
+    /// A channel's identity stays neutral, its activity shown beside it; a
+    /// worktree's pull request keeps its state's tone.
+    fn tone(self, ink: RowInk) -> GlyphTone {
+        match self {
+            Self::Channel => GlyphTone::Ink(ink),
+            Self::Worktree(worktree) => worktree_glyph_tone(
+                worktree.chrome.pull_request.as_ref().map(pull_request_tone),
+                ink,
+            ),
+        }
+    }
+}
+
+/// The glyph a channel or worktree row leads with, in the row's `ink`. The
+/// sidebar and the workspace switcher both draw their rows' glyphs with it, so
+/// a workspace looks the same in each.
+pub(crate) fn row_glyph<'a, Message: 'a>(
+    kind: WorkspaceGlyph<'_>,
+    ink: RowInk,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    toned_glyph(kind.icon(), kind.tone(ink), size)
+}
+
+/// Any other glyph that stands in a row's glyph column, in the row's `ink`.
+pub(crate) fn ink_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    ink: RowInk,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    toned_glyph(icon, GlyphTone::Ink(ink), size)
+}
+
+fn toned_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    tone: GlyphTone,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    widget::container(widget::icon(icon).size(size)).class(theme::Container::custom(move |theme| {
+        cosmic::iced::widget::container::Style {
+            // Resolved here, against the theme this frame is drawing with: this
+            // builder runs once per visible row, and reaching for
+            // `cosmic::theme::active()` locked the process-global theme and
+            // cloned it that many times per frame.
+            icon_color: Some(tone.color(theme)),
+            ..Default::default()
+        }
+    }))
 }
 
 /// A neutral pull request carries no news, so its glyph follows the row's ink
@@ -8125,7 +8191,16 @@ fn channel_view(
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
-    let glyph = child_glyph(Icon::Channel, channel_glyph_tone(channel, listing), compact);
+    let glyph: Element<'static, SidebarAction> = row_glyph(
+        WorkspaceGlyph::Channel,
+        channel_ink(channel, listing),
+        if compact {
+            rail::CHILD_GLYPH
+        } else {
+            CHILD_ROW_ICON_SIZE
+        },
+    )
+    .into();
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -8761,7 +8836,7 @@ fn worktree_view<'a>(
         let glyph = if deleting {
             worktree_glyph_muted(rail::CHILD_GLYPH)
         } else {
-            worktree_glyph(worktree, ink, rail::CHILD_GLYPH)
+            row_glyph(WorkspaceGlyph::Worktree(worktree), ink, rail::CHILD_GLYPH)
         };
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -9421,38 +9496,12 @@ fn worktree_glyph_muted(size: u16) -> widget::Container<'static, SidebarAction, 
     ))
 }
 
-/// A worktree's own glyph: its pull request's, in that request's tone, or the
-/// plain worktree glyph in the row's ink.
-fn worktree_glyph(
-    worktree: &SidebarWorktree,
-    ink: RowInk,
-    size: u16,
-) -> widget::Container<'static, SidebarAction, cosmic::Theme> {
-    let (handle, pull_request) = worktree
-        .chrome
-        .pull_request
-        .as_ref()
-        .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
-        .unwrap_or_else(|| (worktree_icon(), None));
-    let tone = worktree_glyph_tone(pull_request, ink);
-    widget::container(widget::icon(handle).size(size)).class(theme::Container::custom(
-        move |theme| cosmic::iced::widget::container::Style {
-            // Resolved here, against the theme this frame is drawing with: this
-            // builder runs once per visible worktree row, and reaching for
-            // `cosmic::theme::active()` locked the process-global theme and
-            // cloned it that many times per frame.
-            icon_color: Some(tone.color(theme)),
-            ..Default::default()
-        },
-    ))
-}
-
 fn worktree_status_icon(
     worktree: &SidebarWorktree,
     update: bool,
     ink: RowInk,
 ) -> Element<'static, SidebarAction> {
-    let glyph = worktree_glyph(worktree, ink, CHILD_ROW_ICON_SIZE);
+    let glyph = row_glyph(WorkspaceGlyph::Worktree(worktree), ink, CHILD_ROW_ICON_SIZE);
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
             cosmic::iced::widget::container::Style {
@@ -18399,16 +18448,19 @@ pub(crate) mod tests {
                 1,
             )
         };
+        let tone = |channel: &SidebarChannel, listing| {
+            WorkspaceGlyph::Channel.tone(channel_ink(channel, listing))
+        };
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, true), Listing::Live),
+            tone(&channel(None, false, true), Listing::Live),
             GlyphTone::Ink(RowInk::Full)
         );
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, false), Listing::Live),
+            tone(&channel(None, false, false), Listing::Live),
             GlyphTone::Ink(RowInk::Muted)
         );
         assert_eq!(
-            channel_glyph_tone(
+            tone(
                 &channel(Some(ActivityState::Waiting), false, true),
                 Listing::Live
             ),
@@ -18416,7 +18468,7 @@ pub(crate) mod tests {
             "waiting is shown by the indicator, not the glyph"
         );
         assert_eq!(
-            channel_glyph_tone(
+            tone(
                 &channel(Some(ActivityState::Working), false, true),
                 Listing::Live
             ),
@@ -18424,7 +18476,7 @@ pub(crate) mod tests {
             "working is shown by the indicator, not the glyph"
         );
         assert_eq!(
-            channel_glyph_tone(&channel(None, true, false), Listing::Live),
+            tone(&channel(None, true, false), Listing::Live),
             GlyphTone::Ink(RowInk::Full),
             "unread channels keep neutral identity glyphs"
         );
@@ -18440,7 +18492,7 @@ pub(crate) mod tests {
         );
 
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, true), Listing::Read),
+            tone(&channel(None, false, true), Listing::Read),
             GlyphTone::Ink(RowInk::Muted),
             "a channel read under Attention recedes though its panes are open"
         );
