@@ -528,94 +528,100 @@ pub fn draw_background<Renderer>(
 /// Produces a [`Task`] that queries the visible screen bounds of the
 /// [`Container`] with the given [`Id`].
 pub fn visible_bounds(id: Id) -> Task<Option<Rectangle>> {
-    struct VisibleBounds {
-        target: widget::Id,
-        depth: usize,
-        scrollables: Vec<(Vector, Rectangle, usize)>,
-        bounds: Option<Rectangle>,
+    task::widget(VisibleBounds::new(id))
+}
+
+/// Finds a container's bounds, clipped and translated by every scrollable
+/// that encloses it.
+struct VisibleBounds {
+    target: widget::Id,
+    depth: usize,
+    /// Each enclosing scrollable's accumulated translation, visible
+    /// viewport, and the depth its children are traversed from.
+    scrollables: Vec<(Vector, Rectangle, usize)>,
+    bounds: Option<Rectangle>,
+}
+
+impl VisibleBounds {
+    fn new(target: widget::Id) -> Self {
+        Self {
+            target,
+            depth: 0,
+            scrollables: Vec::new(),
+            bounds: None,
+        }
+    }
+}
+
+impl Operation<Option<Rectangle>> for VisibleBounds {
+    fn scrollable(
+        &mut self,
+        _id: Option<&widget::Id>,
+        bounds: Rectangle,
+        _content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn widget::operation::Scrollable,
+    ) {
+        match self.scrollables.last() {
+            Some((last_translation, last_viewport, _depth)) => {
+                let viewport = last_viewport
+                    .intersection(&(bounds - *last_translation))
+                    .unwrap_or(Rectangle::new(
+                        crate::core::Point::ORIGIN,
+                        Size::ZERO,
+                    ));
+
+                self.scrollables.push((
+                    translation + *last_translation,
+                    viewport,
+                    self.depth,
+                ));
+            }
+            None => {
+                self.scrollables.push((translation, bounds, self.depth));
+            }
+        }
     }
 
-    impl Operation<Option<Rectangle>> for VisibleBounds {
-        fn scrollable(
-            &mut self,
-            _id: Option<&widget::Id>,
-            bounds: Rectangle,
-            _content_bounds: Rectangle,
-            translation: Vector,
-            _state: &mut dyn widget::operation::Scrollable,
-        ) {
-            match self.scrollables.last() {
-                Some((last_translation, last_viewport, _depth)) => {
-                    let viewport = last_viewport
-                        .intersection(&(bounds - *last_translation))
-                        .unwrap_or(Rectangle::new(
-                            crate::core::Point::ORIGIN,
-                            Size::ZERO,
-                        ));
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if self.bounds.is_some() {
+            return;
+        }
 
-                    self.scrollables.push((
-                        translation + *last_translation,
-                        viewport,
-                        self.depth,
-                    ));
+        if id == Some(&self.target) {
+            match self.scrollables.last() {
+                Some((translation, viewport, _)) => {
+                    self.bounds =
+                        viewport.intersection(&(bounds - *translation));
                 }
                 None => {
-                    self.scrollables.push((translation, bounds, self.depth));
+                    self.bounds = Some(bounds);
                 }
             }
-        }
-
-        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-            if self.bounds.is_some() {
-                return;
-            }
-
-            if id == Some(&self.target) {
-                match self.scrollables.last() {
-                    Some((translation, viewport, _)) => {
-                        self.bounds =
-                            viewport.intersection(&(bounds - *translation));
-                    }
-                    None => {
-                        self.bounds = Some(bounds);
-                    }
-                }
-
-                return;
-            }
-
-            self.depth += 1;
-            // TODO do we need to traverse here??
-            self.depth -= 1;
-
-            match self.scrollables.last() {
-                Some((_, _, depth)) if self.depth == *depth => {
-                    let _ = self.scrollables.pop();
-                }
-                _ => {}
-            }
-        }
-
-        fn traverse(
-            &mut self,
-            operate: &mut dyn FnMut(&mut dyn Operation<Option<Rectangle>>),
-        ) {
-            self.depth += 1;
-            self.traverse(operate);
-            self.depth -= 1;
-        }
-
-        fn finish(&self) -> widget::operation::Outcome<Option<Rectangle>> {
-            widget::operation::Outcome::Some(self.bounds)
         }
     }
 
-    task::widget(VisibleBounds {
-        target: id,
-        depth: 0,
-        scrollables: Vec::new(),
-        bounds: None,
-    })
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn Operation<Option<Rectangle>>),
+    ) {
+        self.depth += 1;
+        operate(self);
+        self.depth -= 1;
+
+        // A scrollable reported at this depth has had all of its children
+        // traversed; its translation and viewport no longer apply.
+        match self.scrollables.last() {
+            Some((_, _, depth)) if self.depth == *depth => {
+                let _ = self.scrollables.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&self) -> widget::operation::Outcome<Option<Rectangle>> {
+        widget::operation::Outcome::Some(self.bounds)
+    }
 }
 
 /// The appearance of a container.
@@ -824,5 +830,87 @@ fn style(pair: theme::palette::Pair) -> Style {
         text_color: Some(pair.text),
         border: border::rounded(2),
         ..Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Point;
+    use crate::core::widget::operation::{Outcome, Scrollable};
+
+    struct Offset;
+
+    impl Scrollable for Offset {
+        fn snap_to(&mut self, _offset: widget::operation::scrollable::RelativeOffset<Option<f32>>) {}
+        fn scroll_to(&mut self, _offset: widget::operation::scrollable::AbsoluteOffset<Option<f32>>) {}
+        fn scroll_by(
+            &mut self,
+            _offset: widget::operation::scrollable::AbsoluteOffset,
+            _bounds: Rectangle,
+            _content_bounds: Rectangle,
+        ) {
+        }
+    }
+
+    fn rectangle(x: f32, y: f32, width: f32, height: f32) -> Rectangle {
+        Rectangle::new(Point::new(x, y), Size::new(width, height))
+    }
+
+    fn found(operation: VisibleBounds) -> Option<Rectangle> {
+        match operation.finish() {
+            Outcome::Some(bounds) => bounds,
+            _ => panic!("visible bounds always finishes with an answer"),
+        }
+    }
+
+    /// Reports a scrollable the way `Scrollable::operate` does, then
+    /// traverses its content.
+    fn scrollable(
+        operation: &mut dyn Operation<Option<Rectangle>>,
+        bounds: Rectangle,
+        translation: Vector,
+        content: &mut dyn FnMut(&mut dyn Operation<Option<Rectangle>>),
+    ) {
+        operation.scrollable(None, bounds, bounds, translation, &mut Offset);
+        operation.traverse(content);
+    }
+
+    #[test]
+    fn a_container_inside_a_scrollable_is_translated_and_clipped() {
+        let target = Id::new("target");
+        let mut operation = VisibleBounds::new(target.clone());
+        scrollable(
+            &mut operation,
+            rectangle(0.0, 0.0, 100.0, 100.0),
+            Vector::new(0.0, 50.0),
+            &mut |operation| {
+                operation.container(None, rectangle(0.0, 0.0, 100.0, 300.0));
+                operation.traverse(&mut |operation| {
+                    operation
+                        .container(Some(&target), rectangle(0.0, 130.0, 100.0, 40.0));
+                });
+            },
+        );
+        assert_eq!(found(operation), Some(rectangle(0.0, 80.0, 100.0, 20.0)));
+    }
+
+    #[test]
+    fn a_closed_scrollable_does_not_move_a_later_sibling() {
+        let target = Id::new("target");
+        let mut operation = VisibleBounds::new(target.clone());
+        operation.container(None, rectangle(0.0, 0.0, 200.0, 200.0));
+        operation.traverse(&mut |operation| {
+            scrollable(
+                operation,
+                rectangle(0.0, 0.0, 200.0, 100.0),
+                Vector::new(0.0, 500.0),
+                &mut |operation| {
+                    operation.container(None, rectangle(0.0, 0.0, 200.0, 900.0));
+                },
+            );
+            operation.container(Some(&target), rectangle(0.0, 120.0, 200.0, 40.0));
+        });
+        assert_eq!(found(operation), Some(rectangle(0.0, 120.0, 200.0, 40.0)));
     }
 }
