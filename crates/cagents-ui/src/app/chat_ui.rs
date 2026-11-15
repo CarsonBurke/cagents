@@ -9417,6 +9417,9 @@ impl Cagents {
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
         self.clear_close_refusal(card);
+        if let Some(closed) = self.close_fenced_card(card) {
+            return closed;
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -9786,6 +9789,14 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        // A fenced pane's saved session is unconfirmed: reconnecting or
+        // resuming it could act for an agent that is no longer this pane's.
+        if self.shared_views.quarantined.contains(&card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane can't reconnect because cagents can't confirm its saved session. Close it instead.",
+            ));
+            return Task::none();
+        }
         let initial_session = upgrade_admission
             .as_ref()
             .map_or(session.id, |canonical| canonical.id);

@@ -1342,7 +1342,7 @@ fn a_report_tells_held_panes_from_failed_ones() {
     assert!(app.startup_pane_held(cards[1]));
     assert!(!app.startup_pane_held(cards[0]));
 
-    let report = app.startup_incomplete(&cards, &[], None);
+    let report = app.startup_incomplete(&cards, &[], &[], None);
     assert!(
         report.contains(
             "1 saved pane could not reconnect: \u{201c}Failed\u{201d}. Open it to see why and retry."
@@ -1356,7 +1356,7 @@ fn a_report_tells_held_panes_from_failed_ones() {
         "{report}"
     );
 
-    let held = app.startup_incomplete(&cards[1..], &[], None);
+    let held = app.startup_incomplete(&cards[1..], &[], &[], None);
     assert!(!held.contains("retry"), "{held}");
 }
 
@@ -1404,7 +1404,7 @@ fn a_chat_awaiting_admission_is_held() {
     app.await_shared_chat_admission(chat, session);
     assert!(app.chat_awaiting_admission(chat));
     assert!(app.startup_pane_held(chat));
-    let report = app.startup_incomplete(&[chat], &[], None);
+    let report = app.startup_incomplete(&[chat], &[], &[], None);
     assert!(
         report.contains(
             "It reopens on its own once the workspace is ready; until then, opening it shows any unsent text."
@@ -1423,7 +1423,7 @@ fn the_longest_report_fits_what_the_launcher_accepts() {
         card_with_title(&mut app, *card, &"\u{1F980}".repeat(100));
     }
     let detail = "\u{1F980}".repeat(1000);
-    let report = app.startup_incomplete(&cards[..8], &cards[8..], Some(&detail));
+    let report = app.startup_incomplete(&cards[..8], &cards[8..], &[], Some(&detail));
     assert!(report.len() > 4096, "not its longest: {}", report.len());
     let bounded = bounded_report(report);
     assert!(bounded.len() <= MAX_REPORT_BYTES, "{}", bounded.len());
@@ -1467,7 +1467,7 @@ fn a_chat_with_the_store_unavailable_is_not_told_it_reopens_on_its_own() {
     app.await_shared_chat_admission(chat, session);
     app.shared_views.registry_unavailable = true;
     assert!(!app.startup_pane_held(chat));
-    let report = app.startup_incomplete(&[chat], &[], None);
+    let report = app.startup_incomplete(&[chat], &[], &[], None);
     assert!(
         report.contains("cannot reopen while the shared workspace is unavailable"),
         "{report}"

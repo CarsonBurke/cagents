@@ -119,6 +119,9 @@ struct Scan {
     panes: Vec<CardId>,
     failures: Vec<CardId>,
     out_of_step: Vec<CardId>,
+    /// Fenced panes, whose saved session is not the one their agent runs,
+    /// stay as saved: no wait settles them.
+    fenced: Vec<CardId>,
     reasons: Vec<String>,
     views_stalled: Option<&'static str>,
     registry_unavailable: bool,
@@ -243,10 +246,11 @@ impl Cagents {
                 panes: scan.panes,
             }));
         }
-        if !scan.out_of_step.is_empty() || !scan.failures.is_empty() {
+        if !scan.out_of_step.is_empty() || !scan.failures.is_empty() || !scan.fenced.is_empty() {
             return Err(self.startup_incomplete(
                 &scan.failures,
                 &scan.out_of_step,
+                &scan.fenced,
                 scan.reasons.first(),
             ));
         }
@@ -283,6 +287,7 @@ impl Cagents {
         let mut panes = Vec::new();
         let mut failures = Vec::new();
         let mut out_of_step = Vec::new();
+        let mut fenced = Vec::new();
         let mut reasons = Vec::new();
         for card in self
             .durable
@@ -290,6 +295,10 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
         {
+            if self.shared_views.quarantined.contains(&card.id) {
+                fenced.push(card.id);
+                continue;
+            }
             if let CardKind::Terminal(session) = &card.kind {
                 if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
@@ -392,6 +401,7 @@ impl Cagents {
             panes,
             failures,
             out_of_step,
+            fenced,
             reasons,
             views_stalled,
             registry_unavailable,
@@ -404,9 +414,10 @@ impl Cagents {
         &self,
         failures: &[CardId],
         out_of_step: &[CardId],
+        fenced: &[CardId],
         reason: Option<&String>,
     ) -> String {
-        let sentences = self.startup_unsettled_sentences(failures, out_of_step);
+        let sentences = self.startup_unsettled_sentences(failures, out_of_step, fenced);
         let detail = startup_details(reason);
         format!(
             "recovery-incomplete: {sentences} Nothing was closed or restarted, and this window remains available.{detail}"
@@ -416,7 +427,12 @@ impl Cagents {
     /// What is true of each kind of unsettled pane, since opening one does
     /// different things: a failed pane offers a retry, a held one says what it
     /// waits for, and an out-of-step one is already working.
-    fn startup_unsettled_sentences(&self, failures: &[CardId], out_of_step: &[CardId]) -> String {
+    fn startup_unsettled_sentences(
+        &self,
+        failures: &[CardId],
+        out_of_step: &[CardId],
+        fenced: &[CardId],
+    ) -> String {
         let (needs_registry, failed): (Vec<_>, Vec<_>) = failures
             .iter()
             .copied()
@@ -447,6 +463,17 @@ impl Cagents {
                 "{} reconnected and can be used in this window, but the shared workspace lists {them} under a different terminal service: {}.",
                 saved_panes(out_of_step.len()),
                 self.startup_pane_names(out_of_step),
+            ));
+        }
+        if !fenced.is_empty() {
+            let (they, them) = match fenced.len() {
+                1 => ("it stays", "it"),
+                _ => ("they stay", "them"),
+            };
+            sentences.push(format!(
+                "{} can't reconnect because cagents can't confirm that the saved session is the one the agent is running now, so {they} as saved: {}. Close {them} when you no longer need {them}; other panes work normally.",
+                saved_panes(fenced.len()),
+                self.startup_pane_names(fenced),
             ));
         }
         if self.shared_views.registry_unavailable {
@@ -554,12 +581,12 @@ impl Cagents {
     /// sentence following a report about the ones still waiting.
     fn startup_settled_alongside(&self) -> String {
         let scan = self.startup_scan();
-        if scan.failures.is_empty() && scan.out_of_step.is_empty() {
+        if scan.failures.is_empty() && scan.out_of_step.is_empty() && scan.fenced.is_empty() {
             return String::new();
         }
         format!(
             " {}",
-            self.startup_unsettled_sentences(&scan.failures, &scan.out_of_step)
+            self.startup_unsettled_sentences(&scan.failures, &scan.out_of_step, &scan.fenced)
         )
     }
 

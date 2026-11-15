@@ -30,6 +30,10 @@ impl Cagents {
     }
 
     pub(super) fn continue_chat_close(&mut self, card: CardId) -> Task<Message> {
+        // Closing a fenced pane stops nothing, so there is nothing to ask.
+        if let Some(closed) = self.close_fenced_card(card) {
+            return closed;
+        }
         if !self.prepare_shared_removal(card) {
             return Task::none();
         }
