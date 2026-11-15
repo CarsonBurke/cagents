@@ -4411,7 +4411,7 @@ impl Runtime {
             );
             sections.push(
                 widget::column::with_children(choices)
-                    .spacing(step::GAP_XS)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO))
                     .into(),
             );
         }
@@ -6311,10 +6311,11 @@ fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
         ));
     }
     if effort_changed {
-        choices.push(snapshot.reasoning.as_deref().map_or_else(
+        let label = snapshot.reasoning.as_deref().map_or_else(
             || "Default".to_owned(),
             |effort| effort_label(effort).into_owned(),
-        ));
+        );
+        choices.push(format!("{label} effort"));
     }
     (!choices.is_empty()).then(|| choices.join(" · "))
 }
@@ -6445,6 +6446,11 @@ fn picker_choice_row<'a>(
     selected: bool,
     message: Message,
 ) -> Element<'a, Message> {
+    let height = if detail.is_some() {
+        design::list::TWO_LINE_HEIGHT
+    } else {
+        design::DENSE_ROW_HEIGHT
+    };
     let mut label = vec![
         design::body(title)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -6474,14 +6480,15 @@ fn picker_choice_row<'a>(
                 .into(),
         ])
         .spacing(step::GAP_S)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::Center)
+        .height(Length::Fill),
     )
     .name(name)
     .id(id)
     .class(crate::ui_controls::control_style(selected, None))
     .selected(selected)
-    .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
-    .height(Length::Fixed(design::list::TWO_LINE_HEIGHT))
+    .padding([0.0, step::GAP_S])
+    .height(Length::Fixed(height))
     .width(Length::Fill)
     .on_press(message);
     if selected {
@@ -11875,16 +11882,75 @@ mod tests {
     }
 
     #[test]
+    fn footer_picker_rows_center_single_lines_and_subtitled_blocks() {
+        use iced::advanced::{layout, widget::Tree};
+
+        fn leaves(node: &layout::Node, origin: iced::Point, out: &mut Vec<iced::Rectangle>) {
+            let bounds = node.bounds() + iced::Vector::new(origin.x, origin.y);
+            if node.children().is_empty() {
+                out.push(bounds);
+            }
+            for child in node.children() {
+                leaves(child, bounds.position(), out);
+            }
+        }
+
+        let renderer = crate::app::tests::headless_renderer();
+        for (detail, height, text_lines) in [
+            (None, design::DENSE_ROW_HEIGHT, 1),
+            (Some("model-id"), design::list::TWO_LINE_HEIGHT, 2),
+        ] {
+            let mut row = picker_choice_row(
+                "High".into(),
+                detail,
+                "High".into(),
+                widget::Id::unique(),
+                true,
+                Message::RunCommand(crate::workspace_widget::GlobalShortcut::ChatModel),
+            );
+            let mut tree = Tree::new(row.as_widget());
+            let node = row.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 200.0)),
+            );
+            assert_eq!(node.size().height, height);
+            let mut parts = Vec::new();
+            leaves(&node, iced::Point::ORIGIN, &mut parts);
+            let icon = parts
+                .iter()
+                .find(|part| {
+                    part.width == f32::from(design::COMPACT_ICON_SIZE)
+                        && part.height == f32::from(design::COMPACT_ICON_SIZE)
+                })
+                .expect("selected check mark");
+            assert!((icon.center_y() - height / 2.0).abs() <= 0.5);
+            let text: Vec<_> = parts
+                .iter()
+                .filter(|part| part.x >= icon.x + icon.width)
+                .collect();
+            assert_eq!(text.len(), text_lines);
+            assert_eq!(text[0].x - (icon.x + icon.width), step::GAP_S);
+            let top = text.iter().map(|part| part.y).fold(f32::INFINITY, f32::min);
+            let bottom = text
+                .iter()
+                .map(|part| part.y + part.height)
+                .fold(0.0_f32, f32::max);
+            assert!(((top + bottom) / 2.0 - icon.center_y()).abs() <= 0.5);
+        }
+    }
+
+    #[test]
     fn footer_model_picker_bounds_reasoning_with_and_without_fast_mode() {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree, operation::Focusable},
         };
-        struct Efforts {
+        struct Choices {
             ids: Vec<widget::Id>,
-            bounds: Vec<iced::Rectangle>,
+            bounds: Vec<(widget::Id, iced::Rectangle)>,
         }
-        impl Operation for Efforts {
+        impl Operation for Choices {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
@@ -11894,8 +11960,8 @@ mod tests {
                 bounds: iced::Rectangle,
                 _: &mut dyn Focusable,
             ) {
-                if id.is_some_and(|id| self.ids.contains(id)) {
-                    self.bounds.push(bounds);
+                if let Some(id) = id.filter(|id| self.ids.contains(id)) {
+                    self.bounds.push((id.clone(), bounds));
                 }
             }
         }
@@ -11904,10 +11970,34 @@ mod tests {
             for width in [900.0, 1500.0] {
                 let (mut runtime, _handle) = furnished_runtime();
                 runtime.model_picker = Some(String::new());
-                Arc::make_mut(&mut runtime.snapshot).fast_mode = fast.then_some(chat::FastMode {
+                let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                snapshot.fast_mode = fast.then_some(chat::FastMode {
                     state: chat::FastModeState::Off,
                     disabled_reason: Some("preference".into()),
                 });
+                snapshot.models.push(model("Plain model", "Plain model"));
+                let efforts: Vec<_> = std::iter::once(card_control_id(
+                    runtime.target.card,
+                    "chat-reasoning-choice-default",
+                ))
+                .chain((0..3).map(|index| {
+                    card_control_id(
+                        runtime.target.card,
+                        &format!("chat-reasoning-choice-{index}"),
+                    )
+                }))
+                .collect();
+                let selected = card_control_id(
+                    runtime.target.card,
+                    &format!(
+                        "chat-model-choice-Claude-named-{}",
+                        runtime.snapshot.selected_model.as_deref().unwrap()
+                    ),
+                );
+                let plain = card_control_id(
+                    runtime.target.card,
+                    "chat-model-choice-Claude-named-Plain model",
+                );
                 let mut menu = runtime.model_search(Vec::new()).expect("open model picker");
                 let mut tree = Tree::new(menu.as_widget());
                 let node = menu.as_widget_mut().layout(
@@ -11915,29 +12005,12 @@ mod tests {
                     &renderer,
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 900.0)),
                 );
-                assert_eq!(
-                    node.size().width,
-                    design::MODEL_POPUP_WIDTH,
-                    "combined model and reasoning menu at window width {width}, fast {fast}"
-                );
-                let mut efforts = Efforts {
-                    ids: (0..3)
-                        .map(|index| {
-                            card_control_id(
-                                runtime.target.card,
-                                &format!("chat-reasoning-choice-{index}"),
-                            )
-                        })
-                        .chain([
-                            card_control_id(runtime.target.card, "chat-reasoning-choice-default"),
-                            card_control_id(
-                                runtime.target.card,
-                                &format!(
-                                    "chat-model-choice-Claude-named-{}",
-                                    runtime.snapshot.selected_model.as_deref().unwrap()
-                                ),
-                            ),
-                        ])
+                assert_eq!(node.size().width, design::MODEL_POPUP_WIDTH);
+                let mut choices = Choices {
+                    ids: efforts
+                        .iter()
+                        .cloned()
+                        .chain([selected.clone(), plain.clone()])
                         .collect(),
                     bounds: Vec::new(),
                 };
@@ -11945,22 +12018,47 @@ mod tests {
                     &mut tree,
                     Layout::new(&node),
                     &renderer,
-                    &mut efforts,
+                    &mut choices,
                 );
                 assert_eq!(
-                    efforts.bounds.len(),
-                    5,
-                    "Default, all advertised efforts, and the selected model remain mounted"
+                    choices.bounds.len(),
+                    6,
+                    "all advertised choices remain mounted"
                 );
-                for bounds in efforts.bounds {
+                let bounds = |id: &widget::Id| {
+                    choices
+                        .bounds
+                        .iter()
+                        .find(|(found, _)| found == id)
+                        .unwrap()
+                        .1
+                };
+                let model = bounds(&selected);
+                assert_eq!(model.height, design::list::TWO_LINE_HEIGHT);
+                assert_eq!(
+                    bounds(&plain).height,
+                    design::DENSE_ROW_HEIGHT,
+                    "models without subtitles are single-line rows"
+                );
+                for id in &efforts {
+                    let effort = bounds(id);
+                    assert_eq!(effort.height, design::DENSE_ROW_HEIGHT);
                     assert_eq!(
-                        bounds.height,
-                        design::list::TWO_LINE_HEIGHT,
-                        "model and effort rows use the same height"
+                        (effort.x, effort.width),
+                        (model.x, model.width),
+                        "check columns and trailing highlight edges align"
                     );
                     assert!(
-                        bounds.x >= 0.0 && bounds.x + bounds.width <= design::MODEL_POPUP_WIDTH,
-                        "effort stays inside the model menu at width {width}, fast {fast}: {bounds:?}"
+                        effort.x >= 0.0 && effort.x + effort.width <= design::MODEL_POPUP_WIDTH
+                    );
+                }
+                for pair in efforts.windows(2) {
+                    let previous = bounds(&pair[0]);
+                    let next = bounds(&pair[1]);
+                    assert_eq!(
+                        previous.y + previous.height,
+                        next.y,
+                        "effort rows have the model list's gapless spacing"
                     );
                 }
             }
@@ -15787,7 +15885,10 @@ mod tests {
             .push("default".into());
         snapshot.selected_model = Some("default".into());
         snapshot.reasoning = Some("high".into());
-        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("High"));
+        assert_eq!(
+            staged_model_choice(snapshot).as_deref(),
+            Some("High effort")
+        );
         assert_eq!(
             footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
             "Opus 5.5"
@@ -15795,11 +15896,14 @@ mod tests {
         snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
         assert_eq!(staged_model_choice(snapshot), None);
         snapshot.reasoning = None;
-        assert_eq!(staged_model_choice(snapshot).as_deref(), Some("Default"));
+        assert_eq!(
+            staged_model_choice(snapshot).as_deref(),
+            Some("Default effort")
+        );
         snapshot.selected_model = Some("next".into());
         assert_eq!(
             staged_model_choice(snapshot).as_deref(),
-            Some("Next model · Default")
+            Some("Next model · Default effort")
         );
         let catalog = crate::account::cache::Catalog {
             models: snapshot.models.clone(),
@@ -15815,7 +15919,7 @@ mod tests {
         snapshot.models[1].label = "Opus 5.5".into();
         assert_eq!(
             staged_model_choice(snapshot).as_deref(),
-            Some("Opus 5.5 · Default"),
+            Some("Opus 5.5 · Default effort"),
             "distinct concrete models can share a display name"
         );
         assert_eq!(
