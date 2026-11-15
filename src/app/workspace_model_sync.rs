@@ -31,7 +31,22 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const REPLAY_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// An edit taken from the window, and when it was first sent.
-type Unsent = (ModelEdit, std::time::SystemTime);
+type Unsent = (ModelRequest, std::time::SystemTime);
+
+/// Local publication identity never crosses the daemon protocol. A scope may
+/// be seeded again before an earlier receipt reaches the UI.
+#[derive(Debug, Clone)]
+pub(super) struct ModelRequest {
+    pub(super) edit: ModelEdit,
+    pub(super) seed_attempt: Option<uuid::Uuid>,
+}
+
+impl From<ModelEdit> for ModelRequest {
+    fn from(edit: ModelEdit) -> Self {
+        let seed_attempt = matches!(&edit, ModelEdit::SeedView { .. }).then(uuid::Uuid::new_v4);
+        Self { edit, seed_attempt }
+    }
+}
 
 /// Whether `edit`, first sent at `first`, may still be sent `now`. A clock
 /// that moved backwards past the first send proves nothing, so it may not.
@@ -45,6 +60,8 @@ fn may_resend(edit: &ModelEdit, first: std::time::SystemTime, now: std::time::Sy
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
+    /// Spawn metadata arrives before the model that first exposes its agent.
+    AgentLabels(Vec<(crate::model::AgentId, String)>),
     /// The registry as it stood when the watcher connected.
     ///
     /// This is the only update that means "a connection just began", which is
@@ -132,6 +149,24 @@ pub enum ModelUpdate {
     TitleDeferred(ModelEdit),
     PaneTransferFailed {
         operation: uuid::Uuid,
+        error: String,
+    },
+    /// A seed receipt follows the delta path only while this local offer owns
+    /// the scope. The attempt is never serialized to the daemon.
+    SeedCommitted {
+        attempt: uuid::Uuid,
+        receipt: EditReceipt,
+        edit: ModelEdit,
+        views: ViewChanges,
+    },
+    SeedApplied {
+        scope: crate::workspace_model::views::Scope,
+        attempt: uuid::Uuid,
+        model: WorkspaceModel,
+    },
+    SeedRefused {
+        scope: crate::workspace_model::views::Scope,
+        attempt: uuid::Uuid,
         error: String,
     },
     ViewRefused {
@@ -249,6 +284,8 @@ fn observe_with_client(
     };
     let mut mirror = Mirror::for_model(&model);
     let identity = model.identity;
+    let mut labelled = HashSet::new();
+    read_new_agent_labels(client, sender, identity, &model.agents, &mut labelled)?;
     sender
         .send_blocking(ModelUpdate::ConnectedClosed { model, closed })
         .map_err(|error| error.to_string())?;
@@ -260,6 +297,7 @@ fn observe_with_client(
         } = client
             .next_workspace_model_edit()
             .map_err(|error| error.to_string())?;
+        read_new_agent_labels(client, sender, identity, &effects.agents, &mut labelled)?;
         let applied = mirror.apply(&edit, &effects);
         let mut views = applied.changes;
         views.sequence = sequence;
@@ -287,10 +325,34 @@ fn observe_with_client(
     }
 }
 
+/// Labels are immutable acceptance metadata. Read them once per new inventory,
+/// off the UI thread, rather than loading a hidden transcript or polling it.
+fn read_new_agent_labels(
+    client: &mut ControlClient,
+    sender: &async_channel::Sender<ModelUpdate>,
+    registry: uuid::Uuid,
+    agents: &[crate::agent_execution::Agent],
+    labelled: &mut HashSet<crate::model::AgentId>,
+) -> Result<(), String> {
+    if agents.iter().all(|agent| labelled.contains(&agent.id)) {
+        return Ok(());
+    }
+    let (identity, labels) = client
+        .read_agent_labels()
+        .map_err(|error| error.to_string())?;
+    if identity != registry {
+        return Err("The workspace registry changed while reading agent labels".into());
+    }
+    labelled.extend(labels.iter().map(|(id, _)| *id));
+    sender
+        .send_blocking(ModelUpdate::AgentLabels(labels))
+        .map_err(|error| error.to_string())
+}
+
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelEdit>,
+    requests: async_channel::Receiver<ModelRequest>,
 ) {
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
@@ -314,7 +376,7 @@ pub(super) fn publish_workspace_model(
 
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<ModelRequest>,
     pending: &mut Option<Unsent>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
@@ -359,7 +421,7 @@ fn publish(
 #[cfg(test)]
 fn publish_with_client(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<ModelRequest>,
     pending: &mut Option<Unsent>,
     client: &mut ControlClient,
 ) -> Result<(), String> {
@@ -368,7 +430,7 @@ fn publish_with_client(
 
 fn publish_with_mirror(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<ModelRequest>,
     pending: &mut Option<Unsent>,
     client: &mut ControlClient,
     mirror: &mut Mirror,
@@ -376,13 +438,13 @@ fn publish_with_mirror(
     loop {
         let (request, first) = match pending.take() {
             Some((request, first)) => {
-                if !may_resend(&request, first, std::time::SystemTime::now()) {
+                if !may_resend(&request.edit, first, std::time::SystemTime::now()) {
                     tracing::warn!(
                         "a pane change waited too long for the daemon and was not resent"
                     );
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
-                    } = &request
+                    } = &request.edit
                     {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
@@ -405,7 +467,9 @@ fn publish_with_mirror(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some((request.clone(), first));
-        match send_with_mirror(client, request.clone(), updates, mirror) {
+        let seed_attempt = request.seed_attempt;
+        let request = request.edit;
+        match send_with_mirror(client, request.clone(), seed_attempt, updates, mirror) {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -462,6 +526,17 @@ fn publish_with_mirror(
                             });
                         }
                     }
+                    if let (
+                        ModelEdit::SeedView { scope, .. },
+                        ControlError::Remote { message, .. },
+                    ) = (&request, &error)
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::SeedRefused {
+                            scope: scope.clone(),
+                            attempt: seed_attempt.expect("a seed publication has an attempt"),
+                            error: message.clone(),
+                        });
+                    }
                     if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
                         let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
                             channel: home.channel,
@@ -489,14 +564,16 @@ fn publish_with_mirror(
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
+    seed_attempt: Option<uuid::Uuid>,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
-    send_with_mirror(client, edit, updates, &mut Mirror::default())
+    send_with_mirror(client, edit, seed_attempt, updates, &mut Mirror::default())
 }
 
 fn send_with_mirror(
     client: &mut ControlClient,
     edit: ModelEdit,
+    seed_attempt: Option<uuid::Uuid>,
     updates: &async_channel::Sender<ModelUpdate>,
     mirror: &mut Mirror,
 ) -> Result<(), ControlError> {
@@ -601,11 +678,21 @@ fn send_with_mirror(
         views.removed.extend(installed.removed);
         views.absent.extend(installed.absent);
     }
-    let _ = updates.send_blocking(ModelUpdate::Committed {
-        receipt,
-        edit: request,
-        views,
-    });
+    let update = if let Some(attempt) = seed_attempt {
+        ModelUpdate::SeedCommitted {
+            attempt,
+            receipt,
+            edit: request,
+            views,
+        }
+    } else {
+        ModelUpdate::Committed {
+            receipt,
+            edit: request,
+            views,
+        }
+    };
+    let _ = updates.send_blocking(update);
     Ok(())
 }
 
@@ -948,6 +1035,29 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, Projection) {
+        // A registry receipt can arrive after this scope began another seed.
+        // Fence it before installing rows or capturing any projection source.
+        let update = match update {
+            ModelUpdate::SeedCommitted {
+                attempt,
+                receipt,
+                edit,
+                views,
+            } => {
+                let ModelEdit::SeedView { scope, .. } = &edit else {
+                    return (Task::none(), Projection::Unchanged);
+                };
+                if self.shared_views.seed_attempts.get(scope) != Some(&attempt) {
+                    return (Task::none(), Projection::Unchanged);
+                }
+                ModelUpdate::Committed {
+                    receipt,
+                    edit,
+                    views,
+                }
+            }
+            update => update,
+        };
         let foreign = match &update {
             ModelUpdate::Committed { receipt, .. } => {
                 receipt.identity != self.workspace_model.identity
@@ -1252,6 +1362,18 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::AgentLabels(labels) => {
+                self.chrome_ui.agent_labels.extend(labels);
+                // An activation that waited on this metadata has a new basis
+                // even when the model sequence and local panes did not change.
+                self.notification_ui.scope_changed();
+                let reconcile = self.reconcile_workspace_model();
+                let activation = self.retry_notification_activation();
+                Task::batch([reconcile, activation, self.sync_chrome()])
+            }
+            ModelUpdate::SeedCommitted { .. } => {
+                unreachable!("seed receipts are fenced before projection")
+            }
             ModelUpdate::ConnectedClosed { model, closed } => {
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.shared_views.snapshot_sequence
@@ -1364,6 +1486,31 @@ impl Cagents {
             } => self.refuse_conflicting_view_update(scope, operation, change, model, error),
             ModelUpdate::PaneTransferFailed { operation, error } => {
                 self.reject_pane_transfer(operation, error);
+                self.reconcile_shared_views()
+            }
+            ModelUpdate::SeedApplied {
+                scope,
+                attempt,
+                model,
+            } => {
+                if self.shared_views.seed_attempts.get(&scope) != Some(&attempt) {
+                    return Task::none();
+                }
+                self.apply_workspace_model_update_inner(ModelUpdate::ViewApplied {
+                    scope,
+                    operation: None,
+                    model,
+                })
+            }
+            ModelUpdate::SeedRefused {
+                scope,
+                attempt,
+                error,
+            } => {
+                if !self.refuse_view_seed(scope.clone(), attempt, error.clone()) {
+                    return Task::none();
+                }
+                tracing::warn!(?scope, %error, "the registry refused a view seed");
                 self.reconcile_shared_views()
             }
             ModelUpdate::ViewRefused {
@@ -1964,6 +2111,7 @@ impl Cagents {
             return;
         }
         self.materialize_replica_snapshot();
+        let failed_seeds = std::mem::take(&mut self.shared_views.seed_failures);
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
@@ -1972,6 +2120,7 @@ impl Cagents {
             channel.shared = false;
         }
         self.persist();
+        self.shared_views.seed_failures = failed_seeds;
     }
 
     /// Mirrors the cached shared model into this window's own store.
@@ -2268,6 +2417,14 @@ impl Cagents {
             }
         };
         let card_id = CardId::from_uuid(agent.id.as_uuid());
+        // Canonical projection may install this proved successor after adoption
+        // sees the old local descriptor. Its label is ready when that happens;
+        // a replacement that matches neither source never inherits the label.
+        if self.chrome_ui.agent_labels.contains_key(&agent.id) {
+            self.chrome_ui
+                .agent_title_sources
+                .insert(card_id, session.clone());
+        }
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
         if let Some(existing) = self.durable.cards.iter().find(|card| card.id == card_id) {
@@ -2343,14 +2500,17 @@ impl Cagents {
                 CardKind::Terminal(session.clone())
             }
         };
+        let label = self.chrome_ui.agent_labels.get(&agent.id)?;
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
+            // Wait for accepted metadata rather than exposing a generic label
+            // that changes as soon as the conversation is first opened.
             title: display
                 .pane
                 .as_ref()
                 .map(|pane| pane.title.clone())
-                .unwrap_or_else(|| format!("{} agent", agent.spec.provider.label())),
+                .unwrap_or_else(|| label.clone()),
             width_fraction: if let Some(pane) = &display.pane {
                 pane.width_fraction
             } else if matches!(kind, CardKind::Chat(_)) {
@@ -2823,7 +2983,26 @@ impl Cagents {
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
-        if let Err(error) = self.workspace_model_tx.try_send(edit) {
+        let request = ModelRequest::from(edit);
+        let seed = match &request.edit {
+            ModelEdit::SeedView { scope, .. } => {
+                Some((scope.clone(), request.seed_attempt.unwrap()))
+            }
+            _ => None,
+        };
+        if let Some((scope, attempt)) = &seed {
+            self.shared_views
+                .seed_attempts
+                .insert(scope.clone(), *attempt);
+        }
+        if let Err(error) = self.workspace_model_tx.try_send(request) {
+            if let Some((scope, attempt)) = seed {
+                self.refuse_view_seed(
+                    scope,
+                    attempt,
+                    "The workspace connection is unavailable".into(),
+                );
+            }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
                 self.status = Some(TransientNotice::warning(
@@ -2832,6 +3011,25 @@ impl Cagents {
             }
         }
     }
+}
+
+/// Inspect model edits in fixtures without coupling their assertions to local
+/// publisher correlation metadata. The real request still enters the same queue.
+#[cfg(test)]
+pub(in crate::app) struct TestModelRequests(async_channel::Receiver<ModelRequest>);
+
+#[cfg(test)]
+impl TestModelRequests {
+    pub(in crate::app) fn try_recv(&self) -> Result<ModelEdit, async_channel::TryRecvError> {
+        self.0.try_recv().map(|request| request.edit)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::app) fn test_model_channel()
+-> (async_channel::Sender<ModelRequest>, TestModelRequests) {
+    let (sender, requests) = async_channel::unbounded();
+    (sender, TestModelRequests(requests))
 }
 
 #[cfg(test)]
@@ -2908,6 +3106,243 @@ mod tests {
     }
 
     #[test]
+    fn refused_seed_is_reported_to_the_window() {
+        let seed = ModelRequest::from(ModelEdit::SeedView {
+            scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
+            panes: vec![],
+            closed: vec![],
+        });
+        let attempt = seed.seed_attempt.unwrap();
+        let expected = seed.edit.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::ApplyWorkspaceEdit { edit: expected }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Fixture registry refused the saved panes",
+                    false,
+                )),
+            );
+        });
+        let (requests, receiver) = async_channel::unbounded();
+        requests.try_send(seed).unwrap();
+        let mut pending = None;
+        drop(requests);
+        let (updates, received) = async_channel::unbounded();
+        let _ = publish_with_client(&updates, &receiver, &mut pending, &mut client);
+        drop(client);
+        server.join().unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), ModelUpdate::SeedRefused { attempt: actual, error, .. }
+            if actual == attempt && error == "Fixture registry refused the saved panes")
+        );
+        assert!(
+            pending.is_none(),
+            "a definitive refusal must not be replayed"
+        );
+    }
+
+    #[test]
+    fn successful_seed_publishes_its_attempt_with_the_scoped_delta_receipt() {
+        use crate::workspace_model::{
+            delta::ViewRevision,
+            views::{Scope, View},
+        };
+        let scope = Scope::Channel(ChannelId::new());
+        let seed = ModelRequest::from(ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![],
+            closed: vec![],
+        });
+        let attempt = seed.seed_attempt.unwrap();
+        let edit = seed.edit.clone();
+        let expected_edit = edit.clone();
+        let mut view = View::empty(scope.clone());
+        view.revision = 1;
+        let expected_view = view.clone();
+        let identity = uuid::Uuid::new_v4();
+        let receipt = EditReceipt {
+            identity,
+            sequence: 2,
+            effects: EditEffects {
+                views: vec![ViewRevision {
+                    scope: scope.clone(),
+                    before: None,
+                    after: Some(1),
+                }],
+                ..Default::default()
+            },
+        };
+        let expected_receipt = receipt.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::ApplyWorkspaceEdit {
+                    edit: expected_edit
+                }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceEdit(receipt),
+                },
+            );
+            let read: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceView { scope });
+            publisher_reply(
+                peer,
+                proof,
+                read.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceView {
+                        view: Some(view),
+                        sequence: 2,
+                    },
+                },
+            );
+        });
+        let (queued, requests) = async_channel::unbounded();
+        queued.try_send(seed).unwrap();
+        drop(queued);
+        let (updates, received) = async_channel::unbounded();
+        let mut pending = None;
+        assert_eq!(
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err(),
+            "the window stopped publishing"
+        );
+        let ModelUpdate::SeedCommitted {
+            attempt: actual,
+            receipt,
+            edit: actual_edit,
+            views,
+        } = received.try_recv().unwrap()
+        else {
+            panic!("a seed must retain its local attempt on the delta receipt")
+        };
+        assert_eq!(actual, attempt);
+        assert_eq!(receipt, expected_receipt);
+        assert_eq!(actual_edit, edit);
+        assert_eq!(views.views, vec![expected_view]);
+        assert!(received.try_recv().is_err());
+        assert!(pending.is_none());
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn seed_delta_receipts_fence_stale_attempts_and_only_current_receipts_admit() {
+        use crate::workspace_model::{
+            delta::ViewRevision,
+            views::{Scope, View},
+        };
+        let (mut app, project, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let card = app.durable.cards[0].id;
+        let mut saved_channel = local(channel, project, "Release planning", 1);
+        saved_channel.cards.push(card);
+        saved_channel.focused = Some(card);
+        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace_model = registry(vec![shared(channel, &repository, "Release planning", 1)]);
+        Arc::make_mut(&mut app.durable).workspace_model_identity =
+            Some(app.workspace_model.identity);
+        let (queued, requests) = async_channel::unbounded();
+        app.workspace_model_tx = queued;
+        app.publish_view_changes();
+        let first = std::iter::from_fn(|| requests.try_recv().ok())
+            .find(|request| matches!(&request.edit, ModelEdit::SeedView { scope: owner, .. } if owner == &scope))
+            .unwrap();
+        let stale = first.seed_attempt.unwrap();
+        drop(app.apply_workspace_model_update(ModelUpdate::SeedRefused {
+            scope: scope.clone(),
+            attempt: stale,
+            error: "The panes were refused".into(),
+        }));
+        app.retry_view_seeds();
+        let current = app.shared_views.seed_attempts[&scope];
+        assert_ne!(current, stale);
+        assert!(app.has_refused_view_seeds());
+        assert!(!app.can_retry_view_seeds());
+        let mut view = View::empty(scope.clone());
+        view.revision = 2;
+        let ModelEdit::SeedView { panes, .. } = &first.edit else {
+            unreachable!()
+        };
+        view.panes = panes.clone();
+        let receipt = EditReceipt {
+            identity: app.workspace_model.identity,
+            sequence: 2,
+            effects: EditEffects {
+                views: vec![ViewRevision {
+                    scope: scope.clone(),
+                    before: None,
+                    after: Some(2),
+                }],
+                ..Default::default()
+            },
+        };
+        let edit = first.edit;
+        let views = ViewChanges {
+            sequence: 2,
+            views: vec![view.clone()],
+            ..Default::default()
+        };
+        let before_model = app.workspace_model.clone();
+        let before_attempts = app.shared_views.seed_attempts.clone();
+        let before_failures = app.shared_views.seed_failures.clone();
+        let (_, projection) =
+            app.apply_workspace_model_update_projection(ModelUpdate::SeedCommitted {
+                attempt: stale,
+                receipt: receipt.clone(),
+                edit: edit.clone(),
+                views: views.clone(),
+            });
+        assert!(matches!(projection, Projection::Unchanged));
+        assert_eq!(
+            app.workspace_model, before_model,
+            "a stale seed cannot install canonical rows"
+        );
+        assert_eq!(app.shared_views.seed_attempts, before_attempts);
+        assert_eq!(app.shared_views.seed_failures, before_failures);
+        // The observer can announce the same committed seed first, but only
+        // the matching publisher receipt settles this window's held offer.
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: receipt.sequence,
+            edit: edit.clone(),
+            changes: EdgeChanges {
+                identity: Some(receipt.identity),
+                effects: receipt.effects.clone(),
+                views: views.clone(),
+            },
+        }));
+        assert_eq!(app.shared_views.seed_attempts[&scope], current);
+        assert_eq!(app.shared_views.seed_failures, before_failures);
+        assert!(!app.can_retry_view_seeds());
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::SeedCommitted {
+                attempt: current,
+                receipt,
+                edit,
+                views,
+            }),
+        );
+        assert!(!app.shared_views.seed_attempts.contains_key(&scope));
+        assert!(!app.has_refused_view_seeds());
+        assert!(app.workspace_model.views.contains(&view));
+    }
+
+    #[test]
     fn invalid_receipt_reconnects_before_sending_later_edits() {
         let id = ChannelId::new();
         let title = ModelEdit::SuggestConversationTitle {
@@ -2962,8 +3397,8 @@ mod tests {
         });
         let (updates, _received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
-        queued.send_blocking(title).unwrap();
-        queued.send_blocking(next.clone()).unwrap();
+        queued.send_blocking(title.into()).unwrap();
+        queued.send_blocking(next.clone().into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -2972,7 +3407,9 @@ mod tests {
         server.join().unwrap();
         assert!(error.contains("does not match"), "{error}");
         assert!(
-            pending.as_ref().is_some_and(|(edit, _)| edit == &next),
+            pending
+                .as_ref()
+                .is_some_and(|(request, _)| request.edit == next),
             "only the edit with an unknown receipt may be retried"
         );
         assert!(requests.try_recv().is_err());
@@ -3017,13 +3454,16 @@ mod tests {
         let (updates, received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
         queued
-            .send_blocking(ModelEdit::SuggestChannelTitle {
-                id,
-                title: "First prompt".into(),
-                source: crate::model::ChannelTitleSource::Prompt,
-            })
+            .send_blocking(
+                ModelEdit::SuggestChannelTitle {
+                    id,
+                    title: "First prompt".into(),
+                    source: crate::model::ChannelTitleSource::Prompt,
+                }
+                .into(),
+            )
             .unwrap();
-        queued.send_blocking(next.clone()).unwrap();
+        queued.send_blocking(next.clone().into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -3031,7 +3471,10 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert_eq!(error, ControlError::ConnectionClosed.to_string());
-        assert_eq!(pending.as_ref().map(|(edit, _)| edit), Some(&next));
+        assert_eq!(
+            pending.as_ref().map(|(request, _)| &request.edit),
+            Some(&next)
+        );
         assert!(received.is_empty());
 
         let expected = next.clone();
@@ -3159,9 +3602,9 @@ mod tests {
         let (updates, received) = async_channel::unbounded();
         let (queued, requests) = async_channel::unbounded();
         for title in titles {
-            queued.send_blocking(title).unwrap();
+            queued.send_blocking(title.into()).unwrap();
         }
-        queued.send_blocking(next).unwrap();
+        queued.send_blocking(next.into()).unwrap();
         drop(queued);
         let mut pending = None;
         let error =
@@ -3322,6 +3765,30 @@ mod tests {
             let expected_created = created.clone();
             let expected_initial = initial.clone();
             let (mut client, server) = publisher_connection(move |peer, proof| {
+                let identity = uuid::Uuid::new_v4();
+                let labels = |peer: &mut std::os::unix::net::UnixStream| {
+                    let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::ReadWorkspaceMetadata {
+                            query: crate::workspace_model::metadata::Query::AgentLabels,
+                        },
+                        "only the new agent's accepted labels need a metadata read"
+                    );
+                    publisher_reply(
+                        peer,
+                        proof,
+                        request.request_id,
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceMetadata(
+                                crate::workspace_model::metadata::Reply::AgentLabels {
+                                    identity,
+                                    labels: vec![(agent_id, "reviewer · Review".into())],
+                                },
+                            ),
+                        },
+                    );
+                };
                 let watch: ClientEnvelope = read_frame(peer).unwrap().unwrap();
                 assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
                 publisher_reply(
@@ -3331,7 +3798,7 @@ mod tests {
                     ServerMessage::Response {
                         response: ServerResponse::WorkspaceSnapshot {
                             model: WorkspaceModel {
-                                identity: uuid::Uuid::new_v4(),
+                                identity,
                                 channels: vec![channel.clone()],
                                 agents: initial,
                                 ..Default::default()
@@ -3340,6 +3807,9 @@ mod tests {
                         },
                     },
                 );
+                if removed {
+                    labels(peer);
+                }
                 let edits = [
                     (
                         ModelEdit::RetitleChannel {
@@ -3348,6 +3818,13 @@ mod tests {
                         },
                         EditEffects {
                             channels: vec![titled],
+                            // Re-observing an existing agent does not read its
+                            // immutable labels a second time.
+                            agents: if removed {
+                                vec![agent.clone()]
+                            } else {
+                                Vec::new()
+                            },
                             ..Default::default()
                         },
                     ),
@@ -3387,6 +3864,9 @@ mod tests {
                         },
                     )
                     .unwrap();
+                    if sequence == 2 && !removed {
+                        labels(peer);
+                    }
                 }
                 write_frame(
                     peer,
@@ -3400,7 +3880,7 @@ mod tests {
                 .unwrap();
                 assert!(
                     read_frame::<ClientEnvelope>(peer).unwrap().is_none(),
-                    "metadata deltas must not request another model"
+                    "metadata deltas must not request another model or repeat known labels"
                 );
             });
             let (tx, rx) = async_channel::unbounded();
@@ -3408,6 +3888,26 @@ mod tests {
             drop(client);
             server.join().unwrap();
             let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(updates.len(), 5);
+            let label_index = if removed { 0 } else { 2 };
+            assert!(
+                matches!(&updates[label_index], ModelUpdate::AgentLabels(labels)
+                if labels == &vec![(agent_id, "reviewer · Review".into())])
+            );
+            assert!(
+                if removed {
+                    matches!(&updates[label_index + 1], ModelUpdate::ConnectedClosed { model, .. }
+                        if model.agents.iter().any(|agent| agent.id == agent_id))
+                } else {
+                    matches!(&updates[label_index + 1], ModelUpdate::Changed { changes, .. }
+                        if changes.effects.agents.iter().any(|agent| agent.id == agent_id))
+                },
+                "the label arrives before the initial inventory or delta that exposes its agent"
+            );
+            let updates: Vec<_> = updates
+                .into_iter()
+                .filter(|update| !matches!(update, ModelUpdate::AgentLabels(_)))
+                .collect();
             assert_eq!(updates.len(), 4);
             assert!(
                 matches!(&updates[0], ModelUpdate::ConnectedClosed { model, .. } if model.agents == expected_initial)
@@ -3716,7 +4216,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (sender, updates) = async_channel::unbounded();
-        send(&mut client, edit, &sender).unwrap();
+        send(&mut client, edit, None, &sender).unwrap();
         let ModelUpdate::Committed { receipt, views, .. } = updates.try_recv().unwrap() else {
             panic!("a successful create forwards its canonical receipt")
         };
@@ -3826,7 +4326,7 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client).unwrap();
         let (sender, updates) = async_channel::unbounded();
-        send(&mut client, title.clone(), &sender).unwrap();
+        send(&mut client, title.clone(), None, &sender).unwrap();
         assert!(matches!(
             updates.try_recv().unwrap(),
             ModelUpdate::RestoreCanonicalTitle
@@ -3834,7 +4334,7 @@ mod tests {
         assert!(
             matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title)
         );
-        send(&mut client, manual, &sender).unwrap();
+        send(&mut client, manual, None, &sender).unwrap();
         drop(client);
         server.join().unwrap();
     }
@@ -3989,7 +4489,7 @@ mod tests {
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         let (tx, rx) = async_channel::unbounded();
         let mut mirror = Mirror::default();
-        send_with_mirror(&mut client, first_edit, &tx, &mut mirror).unwrap();
+        send_with_mirror(&mut client, first_edit, None, &tx, &mut mirror).unwrap();
         assert!(
             matches!(rx.try_recv().unwrap(), ModelUpdate::ScopeConflicted {
             operation, change: actual, views, ..
@@ -3999,7 +4499,7 @@ mod tests {
             rx.try_recv().is_err(),
             "a refused source edit has no ViewApplied receipt"
         );
-        send_with_mirror(&mut client, next_edit, &tx, &mut mirror).unwrap();
+        send_with_mirror(&mut client, next_edit, None, &tx, &mut mirror).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::Committed {
             edit: ModelEdit::ChangeView { operation, .. }, ..
         } if operation == next));
@@ -4284,6 +4784,9 @@ mod tests {
         let card = CardId::from_uuid(agent.id.as_uuid());
         let channels = app.durable.channels.clone();
         let deletion = app.project_ui.begin_deleting(path.clone());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         drop(app.update(Message::ProjectUi(
             crate::app::project_ui::Action::Deleted {
@@ -4292,6 +4795,9 @@ mod tests {
                 result: Err("fixture deletion refused".into()),
             },
         )));
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_some());
         assert_eq!(app.durable.channels, channels);
         assert_eq!(app.workspace.focused(), focus);
@@ -4418,6 +4924,9 @@ mod tests {
             retired: vec![card],
         });
         assert!(app.workspace_model.views.is_empty());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Mailbox lead".into());
         app.workspace_model = model;
         drop(app.reconcile_workspace_model());
         assert!(
@@ -4605,6 +5114,9 @@ mod tests {
                 created_ms: 0,
                 closed: false,
             };
+            app.chrome_ui
+                .agent_labels
+                .insert(agent.id, "Agent task".into());
             let card = CardId::from_uuid(agent.id.as_uuid());
             let scope = Scope::Channel(target);
             let mut channels = vec![shared(active, &agent.spec.target.repository, "Active", 0)];
@@ -4653,11 +5165,14 @@ mod tests {
                         kind: CardKind::Chat(primary_session),
                         scope: Some(primary.spec.target.directory.clone()),
                     });
+                app.chrome_ui
+                    .agent_labels
+                    .insert(primary.id, "Existing primary".into());
                 model.agents.push(primary);
                 id
             });
             app.workspace_model = model.clone();
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = test_model_channel();
             app.workspace_model_tx = tx;
             // This view already exists and its real seed acknowledgement has
             // completed before the daemon announces the new live Agent.
@@ -5574,7 +6089,7 @@ mod tests {
                 view.panes.clear();
                 view.retired.clear();
             }
-            let (sent, requests) = async_channel::unbounded();
+            let (sent, requests) = test_model_channel();
             app.workspace_model_tx = sent;
             drop(
                 app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
@@ -6066,6 +6581,9 @@ mod tests {
                 .any(|candidate| candidate.id == card),
             "model refresh must not mount scheduled history or its live actor"
         );
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_some());
         assert!(
             app.chat_start_pending(card),
@@ -6090,6 +6608,9 @@ mod tests {
         assert!(
             matches!(&app.durable.cards.iter().find(|entry| entry.id == card).unwrap().kind, CardKind::Chat(actual) if actual == &session)
         );
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         Arc::make_mut(&mut app.durable)
             .cards
@@ -6103,6 +6624,9 @@ mod tests {
                 reason: Some("user closed".into()),
             },
         };
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         assert_eq!(
             app.durable
@@ -6198,7 +6722,256 @@ mod tests {
             },
         ];
         app.workspace_model.agents.push(agent.clone());
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, pane.title.clone());
         (app, agent, pane, destination)
+    }
+
+    fn unloaded_chat_label_fixture() -> (
+        Cagents,
+        crate::agent_execution::Agent,
+        crate::workspace_model::views::Pane,
+        ChannelId,
+    ) {
+        use crate::agent_execution::{HostedSession, Surface};
+        let (mut app, mut agent, mut pane, destination) = managed_display_fixture();
+        let CardKind::Terminal(console) = pane.kind else {
+            unreachable!()
+        };
+        let session = crate::chat::Session {
+            id: console.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: console.launch,
+                session_id: None,
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "labels-host".into(),
+                boot_id: "labels-boot".into(),
+                host_incarnation: "labels-owner".into(),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        agent.name = Some("reviewer".into());
+        agent.spec.surface = Surface::Chat;
+        agent.session = Some(HostedSession::Chat(session.clone()));
+        agent.console = None;
+        agent.placement = crate::agent_execution::Placement::Channel(destination);
+        for channel in &mut Arc::make_mut(&mut app.durable).channels {
+            if channel.id == destination {
+                channel.title_source = crate::model::ChannelTitleSource::Prompt;
+            }
+        }
+        for channel in &mut app.workspace_model.channels {
+            if channel.id == destination {
+                channel.title_source = crate::model::ChannelTitleSource::Prompt;
+            }
+        }
+        app.workspace_model.agents = vec![agent.clone()];
+        app.workspace_model.views.clear();
+        app.chrome_ui.agent_labels.clear();
+        pane.kind = CardKind::Chat(session);
+        (app, agent, pane, destination)
+    }
+
+    #[test]
+    fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
+        use crate::agent_execution::agent_label;
+        let (mut app, agent, pane, destination) = unloaded_chat_label_fixture();
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "unloaded agent waits for its accepted label"
+        );
+        assert!(app.card_state(pane.id).is_none());
+        let label = agent_label(
+            "reviewer",
+            Some("Review the one-row cards\nKeep details available"),
+        );
+        // A publisher receipt can overtake the observer's label read. It
+        // installs the canonical agent without exposing a provisional pane.
+        app.workspace_model.agents.clear();
+        let sequence = app.workspace_model.sequence + 1;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Committed {
+                receipt: EditReceipt {
+                    identity: app.workspace_model.identity,
+                    sequence,
+                    effects: EditEffects {
+                        agents: vec![agent.clone()],
+                        ..Default::default()
+                    },
+                },
+                edit: ModelEdit::AgentsChanged,
+                views: ViewChanges::default(),
+            })),
+        );
+        assert_eq!(app.workspace_model.sequence, sequence);
+        assert!(
+            app.workspace_model
+                .agents
+                .iter()
+                .any(|held| held.id == agent.id)
+        );
+        assert!(app.card_state(pane.id).is_none());
+        // Metadata alone retries adoption, even though the canonical edge is
+        // already installed and the model sequence does not advance again.
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::AgentLabels(
+                vec![(agent.id, label.clone())],
+            ))),
+        );
+        assert_eq!(app.workspace_model.sequence, sequence);
+        assert!(
+            app.chat_start_pending(pane.id),
+            "the conversation is still unloaded"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        // A restored source descriptor can still carry the old provider
+        // default. Accepted identity wins without loading the conversation.
+        app.card_state_mut(pane.id).unwrap().title =
+            chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.card_chrome[&pane.id].title, label,
+            "tabs and overflow use shared chrome"
+        );
+        drop(app.select_channel(destination));
+        drop(app.focus_workspace_card(pane.id));
+        drop(app.sync_window_title());
+        assert!(
+            app.core.window.header_title.contains(&label),
+            "window title follows the same label"
+        );
+        assert!(
+            !app.apply_reported_title(pane.id, "Review the one-row cards".into()),
+            "opening may not replace spawn identity"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            label
+        );
+        app.chrome_ui
+            .user_titles
+            .insert(pane.id, "My reviewer".into());
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            "My reviewer"
+        );
+        app.chrome_ui.user_titles.remove(&pane.id);
+        let CardKind::Chat(current) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            unreachable!()
+        };
+        current.id = TerminalId::new();
+        assert!(app.apply_reported_title(pane.id, "Replacement conversation".into()));
+        assert_eq!(
+            app.card_display_title(app.card_state(pane.id).unwrap()),
+            "Replacement conversation"
+        );
+    }
+
+    #[test]
+    fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
+        use crate::agent_execution::{Placement, agent_label};
+        let (mut app, mut agent, mut pane, _) = unloaded_chat_label_fixture();
+        let project = app.sidebar_model.projects[0].id;
+        let worktree = crate::model::WorktreeId::new();
+        let path = PathBuf::from("/repo");
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                worktree,
+                path.clone(),
+                Some("main".into()),
+            ),
+        );
+        let placement = Placement::Worktree {
+            repository: agent.spec.target.repository.clone(),
+            path: path.clone(),
+        };
+        agent.placement = placement.clone();
+        agent.spec.target.placement = Some(placement.clone());
+        pane.title = chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
+        pane.scope = Some(path.clone());
+        app.workspace_model.channels.clear();
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: placement,
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        Arc::make_mut(&mut app.durable).channels.clear();
+        let label = agent_label("reviewer", Some("Review the one-row cards"));
+        app.chrome_ui.agent_labels.insert(agent.id, label.clone());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(pane.id, path);
+        app.sidebar_state
+            .observe_agent_update(pane.id, project, worktree);
+        drop(
+            app.update(Message::Sidebar(crate::sidebar::SidebarAction::SetFilter(
+                crate::sidebar::SidebarFilter::Attention,
+            ))),
+        );
+        app.refresh_sidebar_channels();
+        let row_title = |app: &Cagents| {
+            app.sidebar_model
+                .projects
+                .iter()
+                .flat_map(|project| &project.panes)
+                .find(|row| row.id == pane.id)
+                .expect("the unloaded unchanneled agent has an attention row")
+                .title
+                .clone()
+        };
+        assert!(app.chat_start_pending(pane.id));
+        assert_eq!(row_title(&app), label);
+
+        // A restored pane may arrive before accepted metadata. Its row must
+        // refresh even when the label is the only new observation.
+        app.chrome_ui.agent_labels.remove(&agent.id);
+        app.card_state_mut(pane.id).unwrap().title = pane.title.clone();
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), pane.title);
+        let sequence = app.workspace_model.sequence;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::AgentLabels(
+                vec![(agent.id, label.clone())],
+            ))),
+        );
+        assert_eq!(app.workspace_model.sequence, sequence);
+        assert_eq!(row_title(&app), label);
+        assert!(app.chat_start_pending(pane.id));
+        assert!(!app.apply_reported_title(pane.id, "Review the one-row cards".into()));
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), label);
+
+        drop(app.update_chrome(super::super::chrome_ui::Action::Rename(pane.id)));
+        drop(
+            app.update_chrome(super::super::chrome_ui::Action::RenameChanged(
+                "My reviewer".into(),
+            )),
+        );
+        drop(app.update_chrome(super::super::chrome_ui::Action::RenameSubmit));
+        assert_eq!(row_title(&app), "My reviewer");
+        app.chrome_ui.user_titles.remove(&pane.id);
+        let CardKind::Chat(current) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            unreachable!()
+        };
+        current.id = TerminalId::new();
+        assert!(app.apply_reported_title(pane.id, "Replacement conversation".into()));
+        app.refresh_attention_card_rows();
+        assert_eq!(row_title(&app), "Replacement conversation");
     }
 
     #[test]
@@ -6219,6 +6992,9 @@ mod tests {
         app.workspace_model.agents = vec![agent.clone()];
         let original = app.durable.clone();
         let count = app.cards.len();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent(&agent).is_none());
         assert!(Arc::ptr_eq(&original, &app.durable));
         assert_eq!(app.cards.len(), count);
@@ -6291,6 +7067,9 @@ mod tests {
         original_only.views.clear();
         let display =
             crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         let runtime = app.cards.remove(&pane.id).unwrap();
         app.cards.insert(pane.id, runtime);
@@ -6328,6 +7107,9 @@ mod tests {
         original_only.views.clear();
         let display =
             crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         app.shared_views.initialize(
             crate::workspace_model::views::Scope::Channel(destination),
@@ -6678,12 +7460,13 @@ mod tests {
         let channel = ChannelId::new();
         Arc::make_mut(&mut app.durable)
             .channels
-            .push(local(channel, project, "Empty", 0));
+            .push(local(channel, project, "", 0));
         app.workspace_model = WorkspaceModel::default();
         let requests = intercept_publishes(&mut app);
         app.allow_empty_channel_sweep();
         assert_eq!(app.channel_ui.sweep, super::super::channel_ui::Sweep::Ready);
-        let mut model = registry(vec![shared(channel, &repository, "Empty", 0)]);
+        // Untitled: a name the person gave would keep it.
+        let mut model = registry(vec![shared(channel, &repository, "", 0)]);
         model.views.push(View::empty(channel));
         let home = crate::channel_work::Home {
             registry: model.identity,
@@ -6783,13 +7566,13 @@ mod tests {
 
     /// Replaces the publish queue with one the test can read, which is how the
     /// window's side of a publish is observed without a daemon.
-    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
-        let (tx, rx) = async_channel::unbounded();
+    fn intercept_publishes(app: &mut Cagents) -> TestModelRequests {
+        let (tx, rx) = test_model_channel();
         app.workspace_model_tx = tx;
         rx
     }
 
-    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+    fn drain(rx: &TestModelRequests) -> Vec<ModelEdit> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 

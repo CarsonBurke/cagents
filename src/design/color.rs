@@ -277,6 +277,18 @@ pub fn muted_text(theme: &Theme) -> text::Style {
     ink(muted_color(theme))
 }
 
+/// A step quieter than [`muted_text`], for a figure beside a muted label
+/// that it qualifies, such as a section header's count. Mixed toward the
+/// surface rather than faded, so it stays legible on every theme.
+pub fn faint_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.62)
+}
+
+pub fn faint_text(theme: &Theme) -> text::Style {
+    ink(faint_color(theme))
+}
+
 /// A qualifier beside a label, such as where a row's pane runs: inked like a
 /// muted glyph, so it plainly recedes behind the label it qualifies even when
 /// that label is itself muted. Never a whole row's ink; see [`muted_color`].
@@ -292,6 +304,11 @@ pub fn warning_text(theme: &Theme) -> text::Style {
 /// Text that reports an error the reader has to correct.
 pub fn destructive_text(theme: &Theme) -> text::Style {
     ink(destructive_color(theme))
+}
+
+/// Text inked in the accent, such as the characters a search matched.
+pub fn accent_text(theme: &Theme) -> text::Style {
+    ink(accent_color(theme))
 }
 
 /// Text that reports something finished well, such as passing checks.

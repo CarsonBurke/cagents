@@ -9481,67 +9481,6 @@
               ]
             ]
           }
-        ],
-        [
-          "ReadTerminalRemovalBasis",
-          {
-            "Struct": [
-              [
-                "source",
-                {
-                  "Container": "cagents::model::TerminalSession"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "CloseTerminalSource",
-          {
-            "Struct": [
-              [
-                "session",
-                {
-                  "Container": "cagents::model::TerminalSession"
-                }
-              ],
-              [
-                "basis",
-                {
-                  "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
-                }
-              ],
-              [
-                "completed_only",
-                "Bool"
-              ],
-              [
-                "allow_active",
-                "Bool"
-              ],
-              [
-                "capture",
-                {
-                  "Option": {
-                    "Container": "cagents::workspace_model::views::CapturedTerminalSource"
-                  }
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ReadCapturedTerminalRemovalBasis",
-          {
-            "Struct": [
-              [
-                "capture",
-                {
-                  "Container": "cagents::workspace_model::views::CapturedTerminalSource"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -10021,21 +9960,6 @@
               [
                 "repository",
                 "Str"
-              ]
-            ]
-          }
-        ],
-        [
-          "terminal_worker",
-          {
-            "Struct": [
-              [
-                "terminal_id",
-                "Bytes"
-              ],
-              [
-                "instance",
-                "Bytes"
               ]
             ]
           }
@@ -10645,14 +10569,6 @@
           {
             "Newtype": {
               "Container": "cagents::workspace_model::metadata::Reply"
-            }
-          }
-        ],
-        [
-          "terminal_removal_basis",
-          {
-            "Newtype": {
-              "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
             }
           }
         ]
@@ -13847,38 +13763,6 @@
         ]
       ]
     },
-    "cagents::workspace_model::views::CapturedTerminalSource": {
-      "Struct": [
-        [
-          "registry",
-          "Bytes"
-        ],
-        [
-          "repository",
-          "Str"
-        ],
-        [
-          "scope",
-          {
-            "Container": "cagents::workspace_model::views::Scope"
-          }
-        ],
-        [
-          "view_revision",
-          "U64"
-        ],
-        [
-          "model_sequence",
-          "U64"
-        ],
-        [
-          "before",
-          {
-            "Container": "cagents::workspace_model::views::Pane"
-          }
-        ]
-      ]
-    },
     "cagents::workspace_model::views::Change": {
       "Enum": [
         [
@@ -13982,68 +13866,6 @@
               ]
             ]
           }
-        ],
-        [
-          "RemoveSource",
-          {
-            "Struct": [
-              [
-                "registry",
-                "Bytes"
-              ],
-              [
-                "repository",
-                "Str"
-              ],
-              [
-                "before",
-                {
-                  "Container": "cagents::workspace_model::views::Pane"
-                }
-              ],
-              [
-                "terminal",
-                {
-                  "Option": {
-                    "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
-                  }
-                }
-              ],
-              [
-                "capture",
-                {
-                  "Option": {
-                    "Container": "cagents::workspace_model::views::CapturedTerminalSource"
-                  }
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "UpdateTerminalSource",
-          {
-            "Struct": [
-              [
-                "before",
-                {
-                  "Container": "cagents::workspace_model::views::Pane"
-                }
-              ],
-              [
-                "pane",
-                {
-                  "Container": "cagents::workspace_model::views::Pane"
-                }
-              ],
-              [
-                "worker",
-                {
-                  "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -14104,50 +13926,6 @@
               [
                 "path",
                 "Str"
-              ]
-            ]
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::views::TerminalRemovalBasis": {
-      "Enum": [
-        [
-          "Worker",
-          {
-            "Struct": [
-              [
-                "owner",
-                {
-                  "Container": "cagents::model::HostSessionProof"
-                }
-              ],
-              [
-                "instance",
-                "Bytes"
-              ]
-            ]
-          }
-        ],
-        [
-          "Absent",
-          {
-            "Struct": [
-              [
-                "owner",
-                {
-                  "Container": "cagents::model::HostSessionProof"
-                }
-              ],
-              [
-                "latest_worker",
-                {
-                  "Option": "Bytes"
-                }
-              ],
-              [
-                "history_epoch",
-                "U64"
               ]
             ]
           }

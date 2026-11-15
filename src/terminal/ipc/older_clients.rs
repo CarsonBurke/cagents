@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 179,
+    proven_at: 180,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -477,7 +477,8 @@ mod tests {
         };
         for (version, expected) in [
             (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::Internal),
-            (STORE_BUSY_ERROR - 1, ProtocolErrorCode::Internal),
+            (177, ProtocolErrorCode::Internal),
+            (178, ProtocolErrorCode::Internal),
             (STORE_BUSY_ERROR, ProtocolErrorCode::StoreBusy),
         ] {
             let message = ServerMessage::Error(error.clone());

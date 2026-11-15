@@ -684,11 +684,6 @@ impl Cagents {
         if let crate::workspace::FocusTarget::Card(next) = handoff.target {
             self.keyboard_owed = self.owes_chat_input(next).then_some(next);
         }
-        if !self.workspace_surfaces_visible() {
-            // The accepted close still commits, but its hidden pane cannot
-            // take native focus from Work or the contextual inspector.
-            return cosmic::task::message(Message::CommitClose(handoff.unmounting));
-        }
         workspace_widget::focus_handoff_then(
             handoff,
             widget::Id::new(TOOLBAR_FOCUS_ID),
@@ -816,8 +811,7 @@ impl Cagents {
             }
             _ => Task::none(),
         };
-        let focus = if self.workspace_surfaces_visible()
-            && !replacing
+        let focus = if !replacing
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
@@ -1403,8 +1397,8 @@ mod tests {
                 .is_empty(),
             "persist prunes closed membership after the original Home was captured"
         );
-        assert!(app.channel_ui.retire_candidates.contains(&home));
-        let (send, received) = async_channel::unbounded();
+        assert!(app.channel_ui.retire_candidates.contains_key(&home));
+        let (send, received) = test_model_channel();
         app.workspace_model_tx = send;
         app.retire_settled_empty_channels();
         assert!(

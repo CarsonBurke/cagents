@@ -46,7 +46,6 @@ impl CloneLspFixture {
 
     async fn app(&self, manager: LspManager, next_document: u64) -> (Cagents, CardId) {
         let mut app = context_inspector_test_app(true);
-        app.context_inspector_open = false;
         app.settings.editor_auto_save = false;
         app.settings.language_servers = manager.servers().to_vec();
         app.lsp = manager;

@@ -97,13 +97,10 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 /// the same three controls stay out of the group's drag region.
 const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
 
-/// The glyph for "a worktree on a branch", shared with the chat status line so
-/// the same idea is not drawn two ways.
+/// The glyph for "a worktree on a branch": [`Icon::Worktree`], wherever a
+/// worktree is shown, so the same idea is not drawn two ways.
 pub(crate) fn worktree_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1a4 4 0 0 1-4 4H4"/></g></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
+    Icon::Worktree.handle()
 }
 const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
 /// Height of one source-control panel row. Denser than the navigation rows
@@ -331,72 +328,77 @@ impl SidebarModel {
         })
     }
 
-    /// The projects whose [`SidebarProject::attention_cards`] no longer
-    /// match the state's last attention projection, or name a pane other
-    /// than `title` does now. A title report usually changes no row, so this
-    /// compares in place and allocates nothing per row; only the projects it
-    /// returns need [`Self::set_attention_cards`].
-    pub fn stale_attention_cards<'t>(
+    /// The projects whose [`SidebarProject::panes`] no longer match the
+    /// state's last attention projection, or name a pane other than `title`
+    /// does now. A title report usually changes no row, so this compares in
+    /// place and allocates nothing per row; only the projects it returns
+    /// need [`Self::set_panes`].
+    pub fn stale_panes<'t>(
         &self,
         state: &SidebarState,
         mut title: impl FnMut(CardId) -> Option<&'t str>,
     ) -> Vec<ProjectId> {
-        let mut matched: HashMap<ProjectId, usize> = self
+        // Each project's rows, and how many of them the projection matched.
+        let mut matched: HashMap<ProjectId, (&[SidebarCard], usize)> = self
             .projects
             .iter()
-            .map(|project| (project.id, 0))
+            .map(|project| (project.id, (project.panes.as_slice(), 0)))
             .collect();
         let mut stale = BTreeSet::new();
         for card in state.projected_cards() {
             let Some(title) = title(card.card) else {
                 continue;
             };
-            let Some(project) = self.project(card.project) else {
+            let Some((rows, index)) = matched.get_mut(&card.project) else {
                 continue;
             };
-            let Some(index) = matched.get_mut(&card.project) else {
-                continue;
-            };
-            if !project
-                .attention_cards
-                .get(*index)
-                .is_some_and(|row| row.shows(card, title))
-            {
+            if !rows.get(*index).is_some_and(|row| row.shows(card, title)) {
                 stale.insert(card.project);
             }
             *index += 1;
         }
-        for project in &self.projects {
-            if matched.get(&project.id) != Some(&project.attention_cards.len()) {
-                stale.insert(project.id);
-            }
-        }
+        stale.extend(
+            matched
+                .into_iter()
+                .filter(|(_, (rows, index))| rows.len() != *index)
+                .map(|(project, _)| project),
+        );
         stale.into_iter().collect()
     }
 
-    /// Rebuilds the [`SidebarProject::attention_cards`] of `projects` from
-    /// the state's last attention projection; see
-    /// [`Self::stale_attention_cards`]. `title` names a card as its pane
-    /// does; a card it cannot name gets no row. Unchanged rows are kept.
-    pub fn set_attention_cards(
+    /// Rebuilds the [`SidebarProject::panes`] of `projects` from the state's
+    /// last attention projection; see [`Self::stale_panes`]. `title` names a
+    /// card as its pane does; a card it cannot name gets no row. Unchanged
+    /// rows are kept.
+    pub fn set_panes(
         &mut self,
         state: &SidebarState,
         projects: &[ProjectId],
         mut title: impl FnMut(CardId) -> Option<String>,
     ) {
-        let projected = state.projected_cards();
+        // Every open pane has a row, so gather each project's once rather
+        // than scanning them all for every project.
+        let mut projected: HashMap<ProjectId, Vec<&ProjectedCard>> = HashMap::new();
+        for card in state
+            .projected_cards()
+            .iter()
+            .filter(|card| projects.contains(&card.project))
+        {
+            projected.entry(card.project).or_default().push(card);
+        }
         for project in self
             .projects
             .iter_mut()
             .filter(|project| projects.contains(&project.id))
         {
-            let mut previous: HashMap<_, _> = std::mem::take(&mut project.attention_cards)
+            let mut previous: HashMap<_, _> = std::mem::take(&mut project.panes)
                 .into_iter()
                 .map(|row| (row.id, row))
                 .collect();
-            project.attention_cards = projected
-                .iter()
-                .filter(|card| card.project == project.id)
+            project.panes = projected
+                .remove(&project.id)
+                .unwrap_or_default()
+                .into_iter()
                 .filter_map(|card| {
                     let title = title(card.card)?;
                     Some(match previous.remove(&card.card) {
@@ -488,10 +490,11 @@ pub struct SidebarProject {
     pub navigation_order: Vec<crate::workspace_model::NavigationItem>,
     pub worktrees: Vec<SidebarWorktree>,
     pub channels: Vec<SidebarChannel>,
-    /// The panes outside every channel with a row of their own in the
-    /// Attention list, in workspace order. The application fills these with
-    /// [`SidebarModel::set_attention_cards`] after each attention projection.
-    pub attention_cards: Vec<SidebarCard>,
+    /// The open panes outside every channel, one per conversation, in
+    /// workspace order: the rows the Attention list names, and the rows that
+    /// stand in for checkouts while they are hidden. The application fills
+    /// these with [`SidebarModel::set_panes`] after each attention projection.
+    pub panes: Vec<SidebarCard>,
     pub pull_requests: Vec<SidebarPullRequest>,
     pub github_status: String,
     pub github_ready: bool,
@@ -679,12 +682,12 @@ impl SidebarCard {
     /// How well the row matches a search: by its title, or by the checkout
     /// it runs in, as that checkout's own row would.
     fn search_rank(&self, project: &SidebarProject, query: &str) -> Option<usize> {
-        let checkout = self
-            .worktree
-            .and_then(|id| project.worktrees.iter().find(|row| row.id == id));
         search_score(&self.folded_title, query)
             .into_iter()
-            .chain(checkout.and_then(|row| row.search_rank(query)))
+            .chain(
+                self.checkout_row(project)
+                    .and_then(|checkout| checkout.search_rank(query)),
+            )
             .min()
     }
 
@@ -692,12 +695,12 @@ impl SidebarCard {
     /// Folder project's root is the project itself, whose header is the row
     /// above, so it adds nothing.
     fn checkout<'a>(&self, project: &'a SidebarProject) -> Option<&'a str> {
+        self.checkout_row(project).map(SidebarWorktree::label)
+    }
+
+    fn checkout_row<'a>(&self, project: &'a SidebarProject) -> Option<&'a SidebarWorktree> {
         let worktree = self.worktree?;
-        project
-            .worktrees
-            .iter()
-            .find(|row| row.id == worktree)
-            .map(SidebarWorktree::label)
+        project.worktrees.iter().find(|row| row.id == worktree)
     }
 }
 
@@ -727,7 +730,7 @@ impl SidebarProject {
             navigation_order: Vec::new(),
             worktrees,
             channels: Vec::new(),
-            attention_cards: Vec::new(),
+            panes: Vec::new(),
             pull_requests,
             github_status: "GitHub has not been refreshed.".into(),
             github_ready: false,
@@ -3000,8 +3003,9 @@ fn attention_roots(project: &SidebarProject) -> impl Iterator<Item = (WorktreeId
         )))
 }
 
-/// A pane the Attention list can name on its own row: the first open chat or
-/// terminal card of one conversation that no channel holds.
+/// A pane with a row of its own: the first open chat or terminal card of one
+/// conversation that no channel holds. The Attention list names those with
+/// something to show; hidden checkouts give way to every one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectedCard {
     card: CardId,
@@ -3104,6 +3108,12 @@ pub struct SidebarState {
     /// after its updates, never while drawing, so each row's read is one
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
+    /// The checkout row the workspace files each open pane outside every
+    /// channel under: its recorded scope, or else the checkout holding its
+    /// launch directory. Derived by the application after its updates, it
+    /// places a pane with nothing to show and no recorded scope, such as a
+    /// plain terminal, while checkouts are hidden.
+    pane_checkouts: BTreeMap<CardId, (ProjectId, WorktreeId)>,
     commit_draft: CommitDraft,
     parked_commit_drafts: BTreeMap<PathBuf, CommitDraft>,
     commit_generation: u64,
@@ -3155,11 +3165,60 @@ impl SidebarState {
         self.worktree_display_overrides = overrides;
     }
 
+    /// How `project` shows its checkouts. Hiding them by default hides them
+    /// in every project: the default is what the header's checkouts toggle
+    /// flips, and a project's own mode applies again once they show.
     pub fn worktree_display(&self, project: ProjectId) -> crate::settings::SidebarWorktrees {
+        if !self.sidebar_worktrees.shows_checkouts() {
+            return self.sidebar_worktrees;
+        }
         self.worktree_display_overrides
             .get(&project)
             .copied()
             .unwrap_or(self.sidebar_worktrees)
+    }
+
+    /// Whether the list draws a row for `card`, a pane of `project`: every
+    /// pane while the project's checkouts are hidden, and in the Attention
+    /// list one needing the user, kept there, or working under In progress.
+    fn draws_pane(&self, project: &SidebarProject, card: &SidebarCard) -> bool {
+        self.lists_panes(project)
+            || (self.filter == SidebarFilter::Attention
+                && (self.lists_card(card) || card.attention.only_working()))
+    }
+
+    /// Whether the list gives `project`'s open panes rows of their own in
+    /// place of its checkouts: the unfiltered list, with its checkouts hidden.
+    /// The Attention list names its panes in any case. A folder has no
+    /// checkouts to hide: its header is its root.
+    pub fn lists_panes(&self, project: &SidebarProject) -> bool {
+        self.filter == SidebarFilter::All
+            && project.kind == ProjectKind::Git
+            && !self.worktree_display(project.id).shows_checkouts()
+    }
+
+    /// Whether the checkout rows the filter asks for are drawn. The pull
+    /// request filter lists pull requests by their checkouts, so hiding
+    /// checkouts would empty it; it draws them whatever the display.
+    fn shows_checkouts(&self, project: ProjectId) -> bool {
+        self.filter == SidebarFilter::PullRequests
+            || self.worktree_display(project).shows_checkouts()
+    }
+
+    /// Whether any project's pane rows may be drawn, and so which of them
+    /// is current matters to the list.
+    fn draws_pane_rows(&self) -> bool {
+        match self.filter {
+            SidebarFilter::Attention => true,
+            SidebarFilter::PullRequests => false,
+            SidebarFilter::All => {
+                !self.sidebar_worktrees.shows_checkouts()
+                    || self
+                        .worktree_display_overrides
+                        .values()
+                        .any(|mode| !mode.shows_checkouts())
+            }
+        }
     }
 
     fn selected_worktree(&self, project: &SidebarProject) -> Option<WorktreeId> {
@@ -3179,14 +3238,19 @@ impl SidebarState {
         self.expanded_worktree_groups.contains(&project.id) || !self.query.trim().is_empty()
     }
 
+    /// Whether `worktree`'s row is drawn. Hidden checkouts stay hidden even
+    /// when selected: the row of the pane in focus, or else the project's,
+    /// says where the user is.
     fn shows_worktree(&self, project: &SidebarProject, worktree: &SidebarWorktree) -> bool {
-        is_primary_worktree(&project.repository, &worktree.path)
-            || self.selected_worktree(project) == Some(worktree.id)
-            || match self.worktree_display(project.id) {
-                crate::settings::SidebarWorktrees::Expanded => true,
-                crate::settings::SidebarWorktrees::Grouped => self.worktree_group_expanded(project),
-                crate::settings::SidebarWorktrees::Hidden => false,
+        match self.worktree_display(project.id) {
+            crate::settings::SidebarWorktrees::Hidden => self.shows_checkouts(project.id),
+            crate::settings::SidebarWorktrees::Expanded => true,
+            crate::settings::SidebarWorktrees::Grouped => {
+                is_primary_worktree(&project.repository, &worktree.path)
+                    || self.selected_worktree(project) == Some(worktree.id)
+                    || self.worktree_group_expanded(project)
             }
+        }
     }
 
     fn grouped_attention(&self, project: &SidebarProject) -> AttentionSummary {
@@ -3426,12 +3490,7 @@ impl SidebarState {
                     .channels
                     .iter()
                     .map(|channel| SelectionRow::Channel(channel.id))
-                    .chain(
-                        project
-                            .attention_cards
-                            .iter()
-                            .map(|card| SelectionRow::Card(card.id)),
-                    )
+                    .chain(project.panes.iter().map(|card| SelectionRow::Card(card.id)))
             })
             .collect();
         self.retained_attention.retain(|row, _| live.contains(row));
@@ -3577,6 +3636,18 @@ impl SidebarState {
     /// Replaces the worktrees that hold an open pane.
     pub fn set_worktrees_with_panes(&mut self, worktrees: BTreeSet<(ProjectId, WorktreeId)>) {
         self.worktrees_with_panes = worktrees;
+    }
+
+    /// Replace where open panes are filed. A change rebuilds the pane rows
+    /// at the next projection; an unchanged map costs one comparison.
+    pub fn set_pane_checkouts(&mut self, checkouts: BTreeMap<CardId, (ProjectId, WorktreeId)>) {
+        if self.pane_checkouts == checkouts {
+            return;
+        }
+        self.pane_checkouts = checkouts;
+        if let Some(projection) = &mut self.attention_projection {
+            projection.dirty = true;
+        }
     }
 
     pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {
@@ -3764,6 +3835,12 @@ impl SidebarState {
         }
     }
 
+    /// The current pane row, while the list may draw one: a list without
+    /// pane rows redraws nothing when focus moves between panes.
+    fn drawn_followed_card(&self) -> Option<CardId> {
+        self.followed_card.filter(|_| self.draws_pane_rows())
+    }
+
     /// Whether the list draws `card`'s row as the current one.
     fn follows_card(&self, card: &SidebarCard) -> bool {
         self.followed_card == Some(card.id)
@@ -3785,8 +3862,8 @@ impl SidebarState {
             .unwrap_or_default()
     }
 
-    /// The cards [`SidebarModel::set_attention_cards`] will ask to name.
-    pub fn attention_pane_cards(&self) -> impl Iterator<Item = CardId> + '_ {
+    /// The cards [`SidebarModel::set_panes`] will ask to name.
+    pub fn pane_cards(&self) -> impl Iterator<Item = CardId> + '_ {
         self.projected_cards().iter().map(|card| card.card)
     }
 
@@ -3970,16 +4047,24 @@ impl SidebarState {
         > = BTreeMap::new();
         let mut card_resources = BTreeMap::new();
         // Each conversation's first open chat or terminal card outside every
-        // channel, in workspace order, with whether any of its cards is in a
-        // channel: the channel's row speaks for those.
-        let mut panes: Vec<(_, CardId, bool)> = Vec::new();
+        // channel, by workspace position, with whether any of its cards is in
+        // a channel: the channel's row speaks for those.
+        let mut panes: Vec<(usize, _, CardId, bool)> = Vec::new();
         let mut seen = BTreeSet::new();
         let mut channeled = BTreeSet::new();
         // Cards with nothing to show, which still lead to their
         // conversation's row when it has one: focusing one draws that row
         // as current.
         let mut quiet = Vec::new();
-        for card in durable.cards.iter().filter(|card| card.existence.is_open()) {
+        // Conversations with news that no loaded project could own. A quiet
+        // card of one must not give it a row the news could not.
+        let mut unowned = BTreeSet::new();
+        for (position, card) in durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .enumerate()
+        {
             let resource = match &card.kind {
                 crate::model::CardKind::Chat(session) => (0, session.id.as_uuid()),
                 crate::model::CardKind::Terminal(session) => (0, session.id.as_uuid()),
@@ -3994,7 +4079,7 @@ impl SidebarState {
                     .retained_attention
                     .contains_key(&SelectionRow::Card(card.id))
             {
-                quiet.push((card.id, resource));
+                quiet.push((position, card, resource));
                 continue;
             }
             let owner = if let Some(channel) = channels.get(&card.id) {
@@ -4011,6 +4096,7 @@ impl SidebarState {
                     .or_else(|| kept.get(&card.id).map(|(project, _)| *project))
             };
             let Some(owner) = owner.filter(|owner| loaded.contains(owner)) else {
+                unowned.insert(resource);
                 continue;
             };
             // A channel's pane is opened, read and cleared from its channel
@@ -4038,6 +4124,7 @@ impl SidebarState {
                 && seen.insert(resource)
             {
                 panes.push((
+                    position,
                     resource,
                     card.id,
                     matches!(card.kind, crate::model::CardKind::Terminal(_)),
@@ -4059,14 +4146,66 @@ impl SidebarState {
                 })
                 .or_insert(Some((owner, worktree, summary)));
         }
+        // A conversation none of whose cards has anything to show still has
+        // a pane, which the list names while its checkout is hidden. Only
+        // the checkout its cards are open in can place it: the recorded
+        // scope, or else the one the workspace files the launch directory
+        // under, as for a plain terminal opened in a checkout.
+        let mut idle: BTreeMap<_, Option<(ProjectId, Option<WorktreeId>)>> = BTreeMap::new();
+        for &(position, card, resource) in &quiet {
+            if conversations.contains_key(&resource) || unowned.contains(&resource) {
+                continue;
+            }
+            if channels.contains_key(&card.id) {
+                channeled.insert(resource);
+                continue;
+            }
+            if !matches!(
+                card.kind,
+                crate::model::CardKind::Chat(_) | crate::model::CardKind::Terminal(_)
+            ) {
+                continue;
+            }
+            let placed = match durable.card_scopes.get(&card.id) {
+                Some(scope) => roots.get(scope.as_path()).copied().flatten(),
+                None => self.pane_checkouts.get(&card.id).copied(),
+            };
+            let Some((owner, worktree)) = placed.filter(|owner| loaded_worktrees.contains(owner))
+            else {
+                continue;
+            };
+            idle.entry(resource)
+                .and_modify(|old| {
+                    if let Some((project, current)) = old {
+                        if *project != owner {
+                            *old = None;
+                        } else if *current != Some(worktree) {
+                            *current = None;
+                        }
+                    }
+                })
+                .or_insert(Some((owner, Some(worktree))));
+            if seen.insert(resource) {
+                panes.push((
+                    position,
+                    resource,
+                    card.id,
+                    matches!(card.kind, crate::model::CardKind::Terminal(_)),
+                ));
+            }
+        }
+        panes.sort_by_key(|(position, ..)| *position);
         let mut cards = Vec::new();
         let mut rows = BTreeMap::new();
-        for (resource, card, terminal) in panes {
+        for (_, resource, card, terminal) in panes {
             if channeled.contains(&resource) {
                 continue;
             }
             let Some((project, worktree, summary)) =
-                conversations.get(&resource).copied().flatten()
+                conversations.get(&resource).copied().flatten().or_else(|| {
+                    let (project, worktree) = idle.get(&resource).copied().flatten()?;
+                    Some((project, worktree, AttentionSummary::default()))
+                })
             else {
                 continue;
             };
@@ -4082,7 +4221,7 @@ impl SidebarState {
         let card_rows = card_resources
             .iter()
             .map(|(card, resource)| (*card, *resource))
-            .chain(quiet)
+            .chain(quiet.iter().map(|(_, card, resource)| (card.id, *resource)))
             .filter_map(|(card, resource)| Some((card, *rows.get(&resource)?)))
             .collect();
         let owners = card_resources
@@ -4579,7 +4718,8 @@ impl SidebarState {
                 }
             }
             SidebarAction::CancelPublish | SidebarAction::Push { .. } => self.publish = None,
-            SidebarAction::OpenRepositoryPicker
+            SidebarAction::ToggleCheckouts
+            | SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::DismissWorktreeOperation(_)
             | SidebarAction::EditWorktreeOperation(_)
@@ -4731,6 +4871,10 @@ pub enum SidebarAction {
         project_id: ProjectId,
         mode: Option<crate::settings::SidebarWorktrees>,
     },
+    /// Shows or hides every project's checkouts: switches the default
+    /// checkout display between Hidden and the visible mode it last had. The
+    /// application owns that setting, so the state applies nothing.
+    ToggleCheckouts,
     OpenRepositoryPicker,
     NewChannel {
         project_id: ProjectId,
@@ -5098,7 +5242,7 @@ impl NavigationSnapshot {
             && self.worktree_display_overrides == state.worktree_display_overrides
             && self.expanded_worktree_groups == state.expanded_worktree_groups
             && self.in_progress_collapsed == state.in_progress_collapsed
-            && self.followed_card == state.followed_card
+            && self.followed_card == state.drawn_followed_card()
             && self.selection == state.selection
             && self.followed_worktree == state.followed_worktree
             && self.channel_selected == state.channel_selected
@@ -5126,7 +5270,7 @@ impl NavigationSnapshot {
             worktree_display_overrides: state.worktree_display_overrides.clone(),
             expanded_worktree_groups: state.expanded_worktree_groups.clone(),
             in_progress_collapsed: state.in_progress_collapsed,
-            followed_card: state.followed_card,
+            followed_card: state.drawn_followed_card(),
             selection: state.selection,
             followed_worktree: state.followed_worktree.clone(),
             channel_selected: state.channel_selected,
@@ -5727,37 +5871,44 @@ fn header<'a>(
     modal_open: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
-    let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
+    let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(5);
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
         actions.push(crate::interaction::tooltip(
-            centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-                .class(sidebar_button_style(attention))
-                .id(filter_id(SidebarFilter::Attention))
-                .name("Show projects needing attention")
-                .selected(attention)
-                .on_press_maybe(gated(
-                    SidebarAction::SetFilter(if attention {
-                        SidebarFilter::All
-                    } else {
-                        SidebarFilter::Attention
-                    }),
-                    modal_open,
-                )),
+            crate::interaction::pressed(
+                centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                    .class(sidebar_button_style(attention))
+                    .id(filter_id(SidebarFilter::Attention))
+                    .name("Show projects needing attention")
+                    .selected(attention)
+                    .on_press_maybe(gated(
+                        SidebarAction::SetFilter(if attention {
+                            SidebarFilter::All
+                        } else {
+                            SidebarFilter::Attention
+                        }),
+                        modal_open,
+                    )),
+                attention,
+            ),
             if attention {
                 "Show all projects"
             } else {
                 "Show projects needing attention"
             },
         ));
+        actions.push(checkouts_toggle(state, modal_open));
         let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
-            centered_icon_button(Icon::Search, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-                .class(sidebar_button_style(selected))
-                .id(search_toggle_focus_id())
-                .name("Search projects")
-                .selected(selected)
-                .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
+            crate::interaction::pressed(
+                centered_icon_button(Icon::Search, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                    .class(sidebar_button_style(selected))
+                    .id(search_toggle_focus_id())
+                    .name("Search projects")
+                    .selected(selected)
+                    .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
+                selected,
+            ),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.search_filters_active() {
                 "Close and clear search".to_owned()
@@ -5821,6 +5972,50 @@ fn header<'a>(
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
     window_gestures(header)
+}
+
+pub fn checkouts_toggle_focus_id() -> Id {
+    stable_id("sidebar.checkouts")
+}
+
+/// The checkouts toggle's accessible name, whatever its state.
+const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
+
+/// Shows or hides every project's checkouts. Like the filters beside it, it
+/// is lit while it narrows the list, so a list without checkouts never
+/// passes for the whole one. Its name stays fixed and its pressed state says
+/// whether checkouts are hidden, as the bell's does for its filter; the
+/// tooltip says what a press does. Hiding them by default overrides each
+/// project's own mode, which the hidden tooltip says.
+///
+/// Only the All view lists checkouts: Attention names panes instead and Pull
+/// requests always shows them. The setting persists, so the toggle stays
+/// live elsewhere and its tooltip names the view it changes.
+fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
+    let hidden = !state.sidebar_worktrees.shows_checkouts();
+    crate::interaction::tooltip(
+        crate::interaction::pressed(
+            centered_icon_handle_button(worktree_icon(), ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                .class(sidebar_button_style(hidden))
+                .id(checkouts_toggle_focus_id())
+                .name(CHECKOUTS_TOGGLE_NAME)
+                .selected(hidden)
+                .on_press_maybe(gated(SidebarAction::ToggleCheckouts, modal_open)),
+            hidden,
+        ),
+        checkouts_toggle_tooltip(state),
+    )
+}
+
+/// What pressing the checkouts toggle does, in the view it changes.
+fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
+    let hidden = !state.sidebar_worktrees.shows_checkouts();
+    match (hidden, state.filter == SidebarFilter::All) {
+        (false, true) => "Hide checkouts",
+        (true, true) => "Show checkouts (hidden in every project)",
+        (false, false) => "Hide checkouts in the All view",
+        (true, false) => "Show checkouts in the All view (hidden in every project)",
+    }
 }
 
 /// The search toggle is lit whenever the controls narrow the list, not only
@@ -7011,12 +7206,7 @@ fn member_rows(
         )
         // A pane row is a way to a pane, not a destination with a place in
         // the project's order.
-        .chain(
-            project
-                .attention_cards
-                .iter()
-                .map(|card| SelectionRow::Card(card.id)),
-        )
+        .chain(project.panes.iter().map(|card| SelectionRow::Card(card.id)))
         .collect();
     let content = widget::column::with_children(members.into_iter().map(|(_, element)| element))
         .width(Length::Fill);
@@ -7029,21 +7219,47 @@ fn member_rows(
     )
 }
 
-/// The selection a project header draws. A current channel or pane names
-/// the place more exactly than the header, so the header does not light up
-/// for it, whether or not the filter draws that channel's or pane's row.
+/// The selection a project header draws. A current channel names the place
+/// more exactly than the header, so the header does not light up for it,
+/// whether or not the filter draws that channel's row; nor for a current
+/// pane whose row the list draws. A checkout whose row is hidden names no
+/// place the list draws, so the project stands in for it.
 fn header_selection(
     project: &SidebarProject,
     state: &SidebarState,
     selection: Option<SidebarSelection>,
 ) -> Option<SidebarSelection> {
+    let lists_panes = state.lists_panes(project);
     let named_by_row = project.channels.iter().any(|channel| channel.selected)
-        || (state.filter == SidebarFilter::Attention
-            && project
-                .attention_cards
-                .iter()
-                .any(|card| state.follows_card(card)));
-    selection.filter(|_| !named_by_row)
+        || project
+            .panes
+            .iter()
+            .any(|card| state.follows_card(card) && state.draws_pane(project, card));
+    match selection.filter(|_| !named_by_row)? {
+        SidebarSelection::Worktree { project_id, .. } if lists_panes => {
+            Some(SidebarSelection::Project(project_id))
+        }
+        selection => Some(selection),
+    }
+}
+
+/// A project's news that none of the channel and pane rows drawn under it
+/// shows: news of a pane a search leaves out, or of no pane at all. While
+/// checkouts are hidden its header says this, or nobody would.
+fn undrawn_attention<'a>(
+    state: &SidebarState,
+    project: ProjectId,
+    channels: impl Iterator<Item = &'a SidebarChannel>,
+    cards: impl Iterator<Item = &'a SidebarCard>,
+) -> AttentionSummary {
+    let mut drawn = AttentionSummary::default();
+    for channel in channels {
+        drawn.add(channel.attention);
+    }
+    for card in cards {
+        drawn.add(card.attention);
+    }
+    state.project_attention(project).without(drawn)
 }
 
 fn project_view<'a>(
@@ -7080,17 +7296,24 @@ fn project_view<'a>(
     // to display their activity. Expanded roots show only that root's news;
     // collapsed headers keep the existing aggregate over all children. The
     // Attention list gives every pane and channel it counts a row of its own,
-    // so an expanded header there repeats none of it.
-    let header_attention = if !expanded
-        || (!attention_list
-            && project.state.worktree_display(project_id)
-                == crate::settings::SidebarWorktrees::Hidden)
-    {
+    // so an expanded header there repeats none of it. Hidden checkouts give
+    // their panes rows too, so the header says only what none of the rows
+    // drawn does: news of a pane a search leaves out, or of no pane at all.
+    let header_attention = if !expanded {
         project
             .state
             .shown_attention(project.state.project_attention(project_id))
     } else if attention_list {
         AttentionSummary::default()
+    } else if project.state.lists_panes(entity) {
+        undrawn_attention(
+            project.state,
+            project_id,
+            project.channels.iter().copied(),
+            project.cards.iter().copied(),
+        )
+    } else if !project.state.shows_checkouts(project_id) {
+        project.state.project_attention(project_id)
     } else {
         entity
             .folder_key()
@@ -7163,9 +7386,12 @@ fn project_view<'a>(
         identity = identity.push(indicator);
     }
     if !expanded {
-        identity = identity.push(design::caption(
-            (entity.channels.len() + entity.worktrees.len()).to_string(),
-        ));
+        let rows = if project.state.lists_panes(entity) {
+            entity.panes.len()
+        } else {
+            entity.worktrees.len()
+        };
+        identity = identity.push(design::caption((entity.channels.len() + rows).to_string()));
     }
     let header = project_header_row(
         identity.into(),
@@ -7363,7 +7589,7 @@ fn compact_project_identity(
     selected: bool,
     modal_open: bool,
     state: &SidebarState,
-    badged: bool,
+    badge: Option<AttentionSummary>,
 ) -> Element<'static, SidebarAction> {
     let (initials, color) = project_identity(&project.name);
     let chip = rail::project_chip(project.avatar.as_ref(), initials, color, false);
@@ -7423,11 +7649,9 @@ fn compact_project_identity(
         .control(
             grid.rail(
                 chip,
-                if badged {
-                    rail::Badges::attention(state.shown_attention(attention.summary))
-                } else {
-                    rail::Badges::default()
-                },
+                badge.map_or_else(rail::Badges::default, |summary| {
+                    rail::Badges::attention(state.shown_attention(summary))
+                }),
             ),
             selected,
         )
@@ -7465,11 +7689,13 @@ fn compact_project<'a>(
         column = column.push(row);
     }
     let mut members = Vec::new();
-    for channel in project
+    let drawn_channels: Vec<&SidebarChannel> = project
         .channels
         .iter()
+        .copied()
         .filter(|channel| expanded && compact_rail_shows_channel(project.state, channel))
-    {
+        .collect();
+    for channel in &drawn_channels {
         members.push((
             SelectionRow::Channel(channel.id),
             RowInteraction::selectable(
@@ -7534,21 +7760,25 @@ fn compact_project<'a>(
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
     let has_children = !members.is_empty() || !entity.operations.is_empty();
-    let header = context_controls_with_display(
-        compact_project_identity(
-            entity,
-            selected,
-            modal_open,
+    // Every row with news is drawn below the chip with its own badges (see
+    // `compact_rail_shows_channel`), so the chip speaks for the whole
+    // project only while none are: repeating them would count the same news
+    // twice. Hidden checkouts leave news to their panes' rows, and the chip
+    // keeps what no drawn row carries, as the expanded header does.
+    let badge = if members.is_empty() {
+        Some(project.state.project_attention(entity.id))
+    } else if project.state.lists_panes(entity) {
+        Some(undrawn_attention(
             project.state,
-            // Every row with news is drawn below the chip with its own badges
-            // (see `compact_rail_shows_channel`), so the chip speaks for the
-            // project only while none are: repeating them would count the
-            // same news twice.
-            members.is_empty()
-                || (project.state.filter != SidebarFilter::Attention
-                    && project.state.worktree_display(entity.id)
-                        == crate::settings::SidebarWorktrees::Hidden),
-        ),
+            entity.id,
+            drawn_channels.iter().copied(),
+            project.cards.iter().copied(),
+        ))
+    } else {
+        None
+    };
+    let header = context_controls_with_display(
+        compact_project_identity(entity, selected, modal_open, project.state, badge),
         entity.id,
         None,
         modal_open,
@@ -7605,7 +7835,7 @@ fn compact_project<'a>(
 /// even when nothing is open there. The glyph and the label follow the same
 /// rule, so a row reads as one strength rather than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowInk {
+pub(crate) enum RowInk {
     Full,
     Muted,
 }
@@ -7715,8 +7945,74 @@ fn channel_ink(channel: &SidebarChannel, listing: Listing) -> RowInk {
     )
 }
 
-fn channel_glyph_tone(channel: &SidebarChannel, listing: Listing) -> GlyphTone {
-    GlyphTone::Ink(channel_ink(channel, listing))
+/// The kind of workspace a row stands for, which decides the glyph it leads
+/// with wherever it is drawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WorkspaceGlyph<'a> {
+    Channel,
+    Worktree(&'a SidebarWorktree),
+}
+
+impl WorkspaceGlyph<'_> {
+    fn icon(self) -> widget::icon::Handle {
+        match self {
+            Self::Channel => Icon::Channel.handle(),
+            Self::Worktree(worktree) => worktree
+                .chrome
+                .pull_request
+                .as_ref()
+                .map_or_else(worktree_icon, pull_request_icon),
+        }
+    }
+
+    /// A channel's identity stays neutral, its activity shown beside it; a
+    /// worktree's pull request keeps its state's tone.
+    fn tone(self, ink: RowInk) -> GlyphTone {
+        match self {
+            Self::Channel => GlyphTone::Ink(ink),
+            Self::Worktree(worktree) => worktree_glyph_tone(
+                worktree.chrome.pull_request.as_ref().map(pull_request_tone),
+                ink,
+            ),
+        }
+    }
+}
+
+/// The glyph a channel or worktree row leads with, in the row's `ink`. The
+/// sidebar and the workspace switcher both draw their rows' glyphs with it, so
+/// a workspace looks the same in each.
+pub(crate) fn row_glyph<'a, Message: 'a>(
+    kind: WorkspaceGlyph<'_>,
+    ink: RowInk,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    toned_glyph(kind.icon(), kind.tone(ink), size)
+}
+
+/// Any other glyph that stands in a row's glyph column, in the row's `ink`.
+pub(crate) fn ink_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    ink: RowInk,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    toned_glyph(icon, GlyphTone::Ink(ink), size)
+}
+
+fn toned_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    tone: GlyphTone,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    widget::container(widget::icon(icon).size(size)).class(theme::Container::custom(move |theme| {
+        cosmic::iced::widget::container::Style {
+            // Resolved here, against the theme this frame is drawing with: this
+            // builder runs once per visible row, and reaching for
+            // `cosmic::theme::active()` locked the process-global theme and
+            // cloned it that many times per frame.
+            icon_color: Some(tone.color(theme)),
+            ..Default::default()
+        }
+    }))
 }
 
 /// A neutral pull request carries no news, so its glyph follows the row's ink
@@ -7892,7 +8188,16 @@ fn channel_view(
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
-    let glyph = child_glyph(Icon::Channel, channel_glyph_tone(channel, listing), compact);
+    let glyph: Element<'static, SidebarAction> = row_glyph(
+        WorkspaceGlyph::Channel,
+        channel_ink(channel, listing),
+        if compact {
+            rail::CHILD_GLYPH
+        } else {
+            CHILD_ROW_ICON_SIZE
+        },
+    )
+    .into();
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -8528,7 +8833,7 @@ fn worktree_view<'a>(
         let glyph = if deleting {
             worktree_glyph_muted(rail::CHILD_GLYPH)
         } else {
-            worktree_glyph(worktree, ink, rail::CHILD_GLYPH)
+            row_glyph(WorkspaceGlyph::Worktree(worktree), ink, rail::CHILD_GLYPH)
         };
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -8762,7 +9067,10 @@ pub enum ProjectCommand {
 enum ContextCommand<'a> {
     Project(ProjectId, Option<WorktreeId>, &'a ProjectCommand, bool),
     Display(ProjectId, Option<crate::settings::SidebarWorktrees>),
-    ShowWorktrees(ProjectId, crate::settings::SidebarWorktrees),
+    /// Shows the project's hidden checkouts: its own Hidden mode gives way
+    /// to the default, and a Hidden default is shown in every project, since
+    /// it overrides each project's own mode.
+    ShowCheckouts(ProjectId, crate::settings::SidebarWorktrees),
 }
 
 impl widget::menu::Action for ContextCommand<'_> {
@@ -8780,10 +9088,12 @@ impl widget::menu::Action for ContextCommand<'_> {
                 project_id: *project,
                 mode: *mode,
             },
-            Self::ShowWorktrees(project, global) => SidebarAction::SetWorktreeDisplay {
+            Self::ShowCheckouts(_, global) if !global.shows_checkouts() => {
+                SidebarAction::ToggleCheckouts
+            }
+            Self::ShowCheckouts(project, _) => SidebarAction::SetWorktreeDisplay {
                 project_id: *project,
-                mode: (*global == crate::settings::SidebarWorktrees::Hidden)
-                    .then_some(crate::settings::SidebarWorktrees::Grouped),
+                mode: None,
             },
         }
     }
@@ -8996,19 +9306,31 @@ fn context_controls_with_display<'a>(
             if let Some((global, override_mode)) = display.filter(|_| {
                 selection_count == Some(1) && git && *command == ProjectCommand::NewWorktree
             }) {
-                if override_mode.unwrap_or(global) == crate::settings::SidebarWorktrees::Hidden {
+                if !global.shows_checkouts() {
                     entries.push(Item::Button(
-                        "Show worktrees".into(),
-                        Some(Icon::Branch.handle()),
-                        ContextCommand::ShowWorktrees(project_id, global),
+                        "Show checkouts in every project".into(),
+                        Some(worktree_icon()),
+                        ContextCommand::ShowCheckouts(project_id, global),
+                    ));
+                } else if override_mode.is_some_and(|mode| !mode.shows_checkouts()) {
+                    entries.push(Item::Button(
+                        "Show checkouts".into(),
+                        Some(worktree_icon()),
+                        ContextCommand::ShowCheckouts(project_id, global),
                     ));
                 }
             }
         }
         if let Some((global, override_mode)) = display.filter(|_| selection_count == Some(1) && git)
         {
+            // A hidden default hides every project's checkouts, whatever
+            // mode the project has; that mode applies once they show.
             let mut choices = vec![Item::CheckBox(
-                format!("Use default ({})", global.label()),
+                if global.shows_checkouts() {
+                    format!("Use default ({})", global.label())
+                } else {
+                    "Use default (Hidden in every project)".to_owned()
+                },
                 None,
                 override_mode.is_none(),
                 ContextCommand::Display(project_id, None),
@@ -9026,7 +9348,7 @@ fn context_controls_with_display<'a>(
                     }),
             );
             entries.push(Item::Divider);
-            entries.push(Item::Folder("Worktrees in sidebar".into(), choices));
+            entries.push(Item::Folder("Checkouts in sidebar".into(), choices));
         }
         items(&std::collections::HashMap::new(), entries)
     })
@@ -9171,38 +9493,12 @@ fn worktree_glyph_muted(size: u16) -> widget::Container<'static, SidebarAction, 
     ))
 }
 
-/// A worktree's own glyph: its pull request's, in that request's tone, or the
-/// plain worktree glyph in the row's ink.
-fn worktree_glyph(
-    worktree: &SidebarWorktree,
-    ink: RowInk,
-    size: u16,
-) -> widget::Container<'static, SidebarAction, cosmic::Theme> {
-    let (handle, pull_request) = worktree
-        .chrome
-        .pull_request
-        .as_ref()
-        .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
-        .unwrap_or_else(|| (worktree_icon(), None));
-    let tone = worktree_glyph_tone(pull_request, ink);
-    widget::container(widget::icon(handle).size(size)).class(theme::Container::custom(
-        move |theme| cosmic::iced::widget::container::Style {
-            // Resolved here, against the theme this frame is drawing with: this
-            // builder runs once per visible worktree row, and reaching for
-            // `cosmic::theme::active()` locked the process-global theme and
-            // cloned it that many times per frame.
-            icon_color: Some(tone.color(theme)),
-            ..Default::default()
-        },
-    ))
-}
-
 fn worktree_status_icon(
     worktree: &SidebarWorktree,
     update: bool,
     ink: RowInk,
 ) -> Element<'static, SidebarAction> {
-    let glyph = worktree_glyph(worktree, ink, CHILD_ROW_ICON_SIZE);
+    let glyph = row_glyph(WorkspaceGlyph::Worktree(worktree), ink, CHILD_ROW_ICON_SIZE);
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
             cosmic::iced::widget::container::Style {
@@ -12060,8 +12356,16 @@ fn centered_icon_button<'a>(
     width: f32,
     height: f32,
 ) -> button::Button<'a, SidebarAction> {
+    centered_icon_handle_button(icon_name.handle(), width, height)
+}
+
+fn centered_icon_handle_button<'a>(
+    icon: widget::icon::Handle,
+    width: f32,
+    height: f32,
+) -> button::Button<'a, SidebarAction> {
     button::custom(
-        widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+        widget::container(widget::icon(icon).size(ROW_ICON_SIZE))
             .class(design::transparent())
             .center(Length::Fill),
     )
@@ -12248,7 +12552,8 @@ struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
     channels: Vec<&'a SidebarChannel>,
-    /// Pane rows, which only the Attention list draws.
+    /// Pane rows: the Attention list's, or every open pane's while the
+    /// project's checkouts are hidden.
     cards: Vec<&'a SidebarCard>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
@@ -12307,11 +12612,7 @@ fn navigation_item(
             .map(|worktree| NavigationItem::Worktree(worktree.path.clone())),
         // A pane row stands where its checkout does.
         SelectionRow::Card(id) => {
-            let worktree = project
-                .attention_cards
-                .iter()
-                .find(|card| card.id == id)?
-                .worktree?;
+            let worktree = project.panes.iter().find(|card| card.id == id)?.worktree?;
             project
                 .worktrees
                 .iter()
@@ -12343,7 +12644,7 @@ fn navigation_search_ranks(
                 worktree.search_rank(query).unwrap_or(usize::MAX),
             )
         }))
-        .chain(project.attention_cards.iter().map(|card| {
+        .chain(project.panes.iter().map(|card| {
             (
                 SelectionRow::Card(card.id),
                 card.search_rank(project, query).unwrap_or(usize::MAX),
@@ -12497,13 +12798,15 @@ fn filtered_projects<'a>(
                             SidebarFilter::PullRequests => false,
                         }
                 }));
-            // The Attention list names panes instead of their checkouts.
-            let mut cards = if state.filter == SidebarFilter::Attention {
+            // The Attention list names the panes needing the user instead of
+            // their checkouts; hidden checkouts give way to every open pane.
+            let lists_panes = state.lists_panes(project);
+            let mut cards = if state.filter == SidebarFilter::Attention || lists_panes {
                 cards_in_display_order(
                     project,
                     state.worktree_sort,
-                    project.attention_cards.iter().filter(|card| {
-                        state.lists_card(card)
+                    project.panes.iter().filter(|card| {
+                        (lists_panes || state.lists_card(card))
                             && (project_matches
                                 || card.search_rank(project, query.as_ref()).is_some())
                     }),
@@ -12511,12 +12814,14 @@ fn filtered_projects<'a>(
             } else {
                 Vec::new()
             };
+            let shows_checkouts = state.shows_checkouts(project.id);
             let mut worktrees = worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
                 project
                     .worktrees
                     .iter()
+                    .filter(|_| shows_checkouts)
                     .filter(|worktree| match state.filter {
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => {
@@ -12541,7 +12846,10 @@ fn filtered_projects<'a>(
             }
             let visible = match state.filter {
                 SidebarFilter::All => {
-                    project_matches || !worktrees.is_empty() || !channels.is_empty()
+                    project_matches
+                        || !worktrees.is_empty()
+                        || !channels.is_empty()
+                        || !cards.is_empty()
                 }
                 SidebarFilter::PullRequests => {
                     (project_matches && project.github_ready) || !worktrees.is_empty()
@@ -12740,27 +13048,25 @@ impl InProgressRow<'_> {
     }
 }
 
-/// Where the Attention list draws a row, folded or not.
+/// Where the list draws a row, folded or not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttentionPlace {
-    /// Under its project, in the main section.
+pub enum PaneRowPlace {
+    /// Under its project: in the Attention list's main section, or in a
+    /// project whose checkouts are hidden.
     Project(ProjectId),
-    /// In the In progress section.
+    /// In the Attention list's In progress section.
     InProgress,
 }
 
-/// Which section of the Attention list holds `row`, before any project or the
-/// In progress section is folded; `None` when the list does not hold it,
-/// under the current filter and search.
-pub fn attention_place(
+/// Which section of the list holds `row`, before any project or the In
+/// progress section is folded; `None` when the list does not draw it, under
+/// the current filter and search.
+pub fn pane_row_place(
     model: &SidebarModel,
     state: &SidebarState,
     compact: bool,
     row: SelectionRow,
-) -> Option<AttentionPlace> {
-    if state.filter != SidebarFilter::Attention {
-        return None;
-    }
+) -> Option<PaneRowPlace> {
     filtered_projects(model, state, compact)
         .iter()
         .find(|project| match row {
@@ -12768,12 +13074,12 @@ pub fn attention_place(
             SelectionRow::Channel(channel) => project.channels.iter().any(|row| row.id == channel),
             SelectionRow::Project(_) | SelectionRow::Worktree(..) => false,
         })
-        .map(|project| AttentionPlace::Project(project.project.id))
+        .map(|project| PaneRowPlace::Project(project.project.id))
         .or_else(|| {
             in_progress_rows(model, state, compact)
                 .into_iter()
                 .any(|candidate| candidate.row() == row)
-                .then_some(AttentionPlace::InProgress)
+                .then_some(PaneRowPlace::InProgress)
         })
 }
 
@@ -12819,7 +13125,7 @@ fn in_progress_rows<'a>(
             cards_in_display_order(
                 project,
                 state.worktree_sort,
-                project.attention_cards.iter().filter(|card| {
+                project.panes.iter().filter(|card| {
                     card.attention.only_working()
                         && !state.lists_card(card)
                         && (project_matches || card.search_rank(project, query.as_ref()).is_some())
@@ -14609,7 +14915,13 @@ pub(crate) mod tests {
         );
         let names = accessible_names(
             &headless_renderer(),
-            compact_project_identity(&project, false, false, &state, true),
+            compact_project_identity(
+                &project,
+                false,
+                false,
+                &state,
+                Some(state.project_attention(project.id)),
+            ),
         );
         assert!(
             names
@@ -14997,10 +15309,10 @@ pub(crate) mod tests {
                 .find(|card| card.id == id)
                 .map(|card| card.title.as_str())
         };
-        let stale = model.stale_attention_cards(state, title);
-        model.set_attention_cards(state, &stale, |id| title(id).map(str::to_owned));
+        let stale = model.stale_panes(state, title);
+        model.set_panes(state, &stale, |id| title(id).map(str::to_owned));
         assert!(
-            model.stale_attention_cards(state, title).is_empty(),
+            model.stale_panes(state, title).is_empty(),
             "rebuilt rows match the projection they were built from"
         );
     }
@@ -15038,7 +15350,7 @@ pub(crate) mod tests {
         refresh_attention(&mut state, &mut model, &durable);
         assert_eq!(state.retained_attention, expected.clone());
         assert_eq!(visible_selection_rows(&model, &state, false), listed);
-        let first = &model.projects[0].attention_cards[0];
+        let first = &model.projects[0].panes[0];
         assert_eq!(state.card_listing(first), Listing::Read);
 
         // A later answered wait keeps the stronger evidence that it was read.
@@ -15068,7 +15380,7 @@ pub(crate) mod tests {
             activity(ActivityState::Working),
         );
         refresh_attention(&mut state, &mut model, &durable);
-        let first = &model.projects[0].attention_cards[0];
+        let first = &model.projects[0].panes[0];
         assert_eq!(state.card_listing(first), Listing::Read);
         assert_eq!(state.retained_attention, expected.clone());
     }
@@ -15173,7 +15485,7 @@ pub(crate) mod tests {
             "the split conversation has no checkout, so it sorts last"
         );
         let split = model.projects[0]
-            .attention_cards
+            .panes
             .iter()
             .find(|card| card.id == cards[0])
             .unwrap();
@@ -15221,7 +15533,7 @@ pub(crate) mod tests {
         };
         let current = |model: &SidebarModel, state: &SidebarState| {
             model.projects[0]
-                .attention_cards
+                .panes
                 .iter()
                 .filter(|card| state.follows_card(card))
                 .map(|card| card.id)
@@ -15321,7 +15633,13 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let names = accessible_names(
             &renderer,
-            compact_project_identity(&project, true, false, &state, true),
+            compact_project_identity(
+                &project,
+                true,
+                false,
+                &state,
+                Some(state.project_attention(project.id)),
+            ),
         );
         assert!(
             names
@@ -15355,7 +15673,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     &SidebarState::default(),
-                    true,
+                    Some(AttentionSummary::default()),
                 );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(COMPACT_WIDTH, WORKTREE_ROW_HEIGHT));
@@ -15895,7 +16213,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn show_worktrees_follows_visible_global_defaults_and_pins_only_when_hidden() {
+    fn show_checkouts_clears_a_projects_hidden_mode_or_shows_them_everywhere() {
         use crate::settings::SidebarWorktrees::*;
         use widget::menu::Action as _;
         let project = project_id(1);
@@ -15906,20 +16224,20 @@ pub(crate) mod tests {
                 project_id: project,
                 mode: Some(Hidden),
             });
-            state.apply(&ContextCommand::ShowWorktrees(project, global).message());
-            assert_eq!(
-                state.worktree_display(project),
-                if global == Hidden { Grouped } else { global }
-            );
-            assert_eq!(
-                state.worktree_display_overrides.contains_key(&project),
-                global == Hidden
-            );
-            state.set_sidebar_worktrees(Expanded);
-            assert_eq!(
-                state.worktree_display(project),
-                if global == Hidden { Grouped } else { Expanded }
-            );
+            let message = ContextCommand::ShowCheckouts(project, global).message();
+            state.apply(&message);
+            if global == Hidden {
+                // A hidden default hides them everywhere, so only showing
+                // them everywhere shows this project's; its own mode stays.
+                assert_eq!(message, SidebarAction::ToggleCheckouts);
+                assert_eq!(
+                    state.worktree_display_overrides.get(&project),
+                    Some(&Hidden)
+                );
+            } else {
+                assert_eq!(state.worktree_display(project), global);
+                assert!(state.worktree_display_overrides.is_empty());
+            }
         }
     }
 
@@ -15996,7 +16314,8 @@ pub(crate) mod tests {
         state.set_sidebar_worktrees(Hidden);
         assert_eq!(
             visible_selection_rows(&model, &state, false),
-            vec![SelectionRow::Project(id), first, primary, second]
+            vec![SelectionRow::Project(id), first, second],
+            "hidden checkouts include the root"
         );
         assert_eq!(
             workspace_cycle(&model, &state).len(),
@@ -16059,7 +16378,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn worktree_display_keeps_operations_and_selected_worktree_visible() {
+    fn worktree_display_keeps_operations_and_a_selected_checkout_visible_unless_hidden() {
         use crate::settings::SidebarWorktrees::*;
         let renderer = headless_renderer();
         let mut entry = display_project();
@@ -16091,10 +16410,11 @@ pub(crate) mod tests {
                 worktree_id: worktree,
                 path: path.clone(),
             });
-            assert!(
+            assert_eq!(
                 visible_selection_rows(&model, &state, false)
                     .contains(&SelectionRow::Worktree(id, worktree)),
-                "{mode:?}"
+                mode != Hidden,
+                "{mode:?}: a hidden checkout stays hidden when selected"
             );
             if mode == Grouped {
                 assert!(state.worktree_group_expanded(&model.projects[0]));
@@ -16109,6 +16429,543 @@ pub(crate) mod tests {
             }
             model.projects[0].channels[0].selected = false;
             state.set_channel_selected(false);
+        }
+    }
+
+    /// What a list publishes, in tree order: its focusable ids and its texts.
+    #[derive(Default)]
+    struct Published {
+        focusable: Vec<Id>,
+        texts: Vec<String>,
+    }
+
+    impl cosmic::iced::advanced::widget::Operation for Published {
+        fn traverse(
+            &mut self,
+            visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+        ) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            _: Rectangle,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+        ) {
+            self.focusable.extend(id.cloned());
+        }
+        fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) {
+            self.texts.push(text.to_owned());
+        }
+    }
+
+    fn published(element: &mut Element<'_, SidebarAction>) -> Published {
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(320.0, 4_000.0)),
+        );
+        let mut published = Published::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut published);
+        published
+    }
+
+    /// The rows the list draws, in the order it draws them: every row the
+    /// model could give, found by the focusable control that opens it.
+    fn drawn_rows(model: &SidebarModel, state: &SidebarState, compact: bool) -> Vec<SelectionRow> {
+        let rows: std::collections::HashMap<Id, SelectionRow> = model
+            .projects
+            .iter()
+            .flat_map(|project| {
+                std::iter::once(SelectionRow::Project(project.id))
+                    .chain(
+                        project
+                            .channels
+                            .iter()
+                            .map(|channel| SelectionRow::Channel(channel.id)),
+                    )
+                    .chain(
+                        project
+                            .worktrees
+                            .iter()
+                            .map(|worktree| SelectionRow::Worktree(project.id, worktree.id)),
+                    )
+                    .chain(project.panes.iter().map(|card| SelectionRow::Card(card.id)))
+            })
+            .map(|row| (selection_row_focus_id(row), row))
+            .collect();
+        published(&mut project_list(model, state, compact, false))
+            .focusable
+            .into_iter()
+            .filter_map(|id| rows.get(&id).copied())
+            .collect()
+    }
+
+    /// A project with checkouts hidden: a pane idle in its root checkout,
+    /// and in its linked worktree one with unread news and one working.
+    /// The root's pane comes second in workspace order.
+    fn hidden_checkouts_scene() -> (SidebarModel, SidebarState, [CardId; 3]) {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let project = model.projects[0].id;
+        let root = &model.projects[0].worktrees[0];
+        let linked = &model.projects[0].worktrees[1];
+        assert!(is_primary_worktree(
+            &model.projects[0].repository,
+            &root.path
+        ));
+        let pane = |id: u128, title: &str| {
+            let mut card = compact_attention_terminal(CardId::from_uuid(Uuid::from_u128(id)));
+            card.title = title.into();
+            card
+        };
+        let unread = pane(71, "Review agent");
+        let idle = pane(72, "Shell");
+        let working = pane(73, "Build");
+        let ids = [idle.id, unread.id, working.id];
+        let durable = Arc::new(crate::model::WorkspaceState {
+            card_scopes: [
+                (unread.id, linked.path.clone()),
+                (idle.id, root.path.clone()),
+                (working.id, linked.path.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            cards: vec![unread, idle, working].into(),
+            ..Default::default()
+        });
+        let mut state = SidebarState::default();
+        state.set_sidebar_worktrees(crate::settings::SidebarWorktrees::Hidden);
+        state.observe_agent_update(ids[1], project, linked.id);
+        state.set_agent_activity(
+            ids[2],
+            project,
+            linked.id,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Working,
+            },
+        );
+        refresh_attention(&mut state, &mut model, &durable);
+        (model, state, ids)
+    }
+
+    #[test]
+    fn hidden_checkouts_give_every_open_pane_a_row_in_their_place() {
+        let (model, mut state, [idle, unread, working]) = hidden_checkouts_scene();
+        let entry = &model.projects[0];
+        let project = entry.id;
+        let root = entry.worktrees[0].label().to_owned();
+        let linked = entry.worktrees[1].label().to_owned();
+        let channels = [
+            SelectionRow::Channel(entry.channels[1].id),
+            SelectionRow::Channel(entry.channels[0].id),
+        ];
+        let panes = [
+            SelectionRow::Card(idle),
+            SelectionRow::Card(unread),
+            SelectionRow::Card(working),
+        ];
+        let rows = visible_selection_rows(&model, &state, false);
+        assert_eq!(
+            rows,
+            [&[SelectionRow::Project(project)][..], &channels, &panes].concat(),
+            "no checkout row, the root's included; panes follow the checkout order"
+        );
+        assert_eq!(
+            drawn_rows(&model, &state, false),
+            rows,
+            "keyboard order is drawn order"
+        );
+
+        let list = published(&mut project_list(&model, &state, false, false));
+        assert!(
+            list.texts.contains(&format!(" · {root}")),
+            "{:?}",
+            list.texts
+        );
+        assert!(
+            list.texts.contains(&format!(" · {linked}")),
+            "{:?}",
+            list.texts
+        );
+        let renderer = headless_renderer();
+        let names = accessible_names(&renderer, project_list(&model, &state, false, false));
+        assert!(
+            names.contains(&format!("Open pane Shell in {root}")),
+            "{names:?}"
+        );
+        for (title, news) in [("Review agent", "unread"), ("Build", "working")] {
+            let prefix = format!("Open pane {title} in {linked}, ");
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.starts_with(&prefix) && name.to_lowercase().contains(news)),
+                "{title} names its {news} state: {names:?}"
+            );
+        }
+
+        // The rail draws every pane too, and keyboard order agrees with it.
+        let rail = visible_selection_rows(&model, &state, true);
+        assert_eq!(drawn_rows(&model, &state, true), rail);
+        assert!(panes.iter().all(|pane| rail.contains(pane)), "{rail:?}");
+        assert!(
+            !rail
+                .iter()
+                .any(|row| matches!(row, SelectionRow::Worktree(..))),
+            "{rail:?}"
+        );
+
+        // A project with nothing open keeps its row.
+        let mut empty = model.clone();
+        empty.projects[0].panes.clear();
+        empty.projects[0].channels.clear();
+        assert_eq!(
+            visible_selection_rows(&empty, &state, false),
+            vec![SelectionRow::Project(project)]
+        );
+
+        // The Attention list is unchanged: the idle pane is not in it, and the
+        // working one waits under In progress.
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![
+                SelectionRow::Project(project),
+                SelectionRow::Card(unread),
+                SelectionRow::Card(working),
+            ]
+        );
+        assert_eq!(
+            in_progress_rows(&model, &state, false)
+                .into_iter()
+                .map(InProgressRow::row)
+                .collect::<Vec<_>>(),
+            vec![SelectionRow::Card(working)]
+        );
+    }
+
+    #[test]
+    fn hiding_checkouts_by_default_overrides_every_projects_own_mode() {
+        use crate::settings::SidebarWorktrees::*;
+        let (model, mut state, [idle, unread, working]) = hidden_checkouts_scene();
+        let entry = &model.projects[0];
+        let project = entry.id;
+        let checkouts = [
+            SelectionRow::Worktree(project, entry.worktrees[0].id),
+            SelectionRow::Worktree(project, entry.worktrees[1].id),
+        ];
+        let panes = [idle, unread, working].map(SelectionRow::Card);
+        state.apply(&SidebarAction::SetWorktreeDisplay {
+            project_id: project,
+            mode: Some(Expanded),
+        });
+        let cache = NavigationCache::default();
+        let hidden = cache.generation(&model, &state);
+        let rows = visible_selection_rows(&model, &state, false);
+        assert_eq!(state.worktree_display(project), Hidden);
+        assert!(checkouts.iter().all(|row| !rows.contains(row)), "{rows:?}");
+        assert!(panes.iter().all(|row| rows.contains(row)), "{rows:?}");
+        assert_eq!(
+            state.worktree_display_overrides.get(&project),
+            Some(&Expanded),
+            "the project's own mode is kept"
+        );
+
+        // Shown again, the project's own mode applies as before.
+        state.set_sidebar_worktrees(Grouped);
+        assert_ne!(hidden, cache.generation(&model, &state), "the list redraws");
+        let rows = visible_selection_rows(&model, &state, false);
+        assert_eq!(state.worktree_display(project), Expanded);
+        assert!(checkouts.iter().all(|row| rows.contains(row)), "{rows:?}");
+        assert!(panes.iter().all(|row| !rows.contains(row)), "{rows:?}");
+
+        // A project hiding its own checkouts lists its panes the same way.
+        state.apply(&SidebarAction::SetWorktreeDisplay {
+            project_id: project,
+            mode: Some(Hidden),
+        });
+        let rows = visible_selection_rows(&model, &state, false);
+        assert!(checkouts.iter().all(|row| !rows.contains(row)), "{rows:?}");
+        assert!(panes.iter().all(|row| rows.contains(row)), "{rows:?}");
+        assert_eq!(drawn_rows(&model, &state, false), rows);
+    }
+
+    #[test]
+    fn a_hidden_checkout_stays_hidden_when_current_and_its_pane_or_project_says_so() {
+        let (model, mut state, [_, unread, _]) = hidden_checkouts_scene();
+        let entry = &model.projects[0];
+        let project = entry.id;
+        let linked = &entry.worktrees[1];
+        state.apply(&SidebarAction::OpenWorktree {
+            project_id: project,
+            worktree_id: linked.id,
+            path: linked.path.clone(),
+        });
+        assert!(
+            !visible_selection_rows(&model, &state, false)
+                .contains(&SelectionRow::Worktree(project, linked.id))
+        );
+        // With no pane of it current, the project row marks the place.
+        assert_eq!(
+            header_selection(entry, &state, state.drawn_selection()),
+            Some(SidebarSelection::Project(project))
+        );
+        state.follow_card(Some(unread));
+        assert!(
+            entry
+                .panes
+                .iter()
+                .any(|card| card.id == unread && state.follows_card(card))
+        );
+        assert_eq!(
+            header_selection(entry, &state, state.drawn_selection()),
+            None,
+            "the current pane's row marks it instead"
+        );
+    }
+
+    #[test]
+    fn search_finds_pane_rows_by_title_or_checkout() {
+        let (model, mut state, [idle, unread, working]) = hidden_checkouts_scene();
+        let project = model.projects[0].id;
+        let linked = model.projects[0].worktrees[1].label().to_owned();
+        state.apply(&SidebarAction::SearchChanged(linked));
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![
+                SelectionRow::Project(project),
+                SelectionRow::Card(unread),
+                SelectionRow::Card(working),
+            ]
+        );
+        state.apply(&SidebarAction::SearchChanged("shell".into()));
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![SelectionRow::Project(project), SelectionRow::Card(idle)]
+        );
+    }
+
+    #[test]
+    fn hidden_checkouts_leave_pull_requests_folders_and_unowned_news_alone() {
+        let (mut model, mut state, [idle, unread, _]) = hidden_checkouts_scene();
+        let project = model.projects[0].id;
+        let linked = model.projects[0].worktrees[1].id;
+
+        // The pull request filter lists pull requests by their checkouts.
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
+        let rows = visible_selection_rows(&model, &state, false);
+        assert!(
+            rows.contains(&SelectionRow::Worktree(project, linked)),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| matches!(row, SelectionRow::Card(_))));
+        assert_eq!(drawn_rows(&model, &state, false), rows);
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+
+        // The unread news shows once: on its pane's row, or on the header
+        // while a search leaves that row out. An unread badge carries its
+        // count as text; the working badge beside Build has none.
+        let renderer = headless_renderer();
+        let unread_badges = |state: &SidebarState| {
+            let names = accessible_names(&renderer, project_list(&model, state, false, false));
+            let badges = names.iter().filter(|name| *name == "1").count();
+            (badges, names)
+        };
+        let (badges, names) = unread_badges(&state);
+        assert_eq!(badges, 1, "{names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent"))
+        );
+        state.apply(&SidebarAction::SearchChanged("build".into()));
+        let (badges, names) = unread_badges(&state);
+        assert_eq!(badges, 1, "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent"))
+        );
+        state.apply(&SidebarAction::SearchChanged(String::new()));
+
+        // A folder has no checkouts to hide, so it lists no pane rows.
+        model.projects[0].kind = ProjectKind::Folder;
+        assert!(!state.lists_panes(&model.projects[0]));
+        let rows = visible_selection_rows(&model, &state, false);
+        assert!(
+            ![idle, unread]
+                .iter()
+                .any(|card| rows.contains(&SelectionRow::Card(*card))),
+            "{rows:?}"
+        );
+    }
+
+    /// The rail's project chip leaves news to the pane rows drawn under it,
+    /// and still carries what none of them does, as the expanded header
+    /// does: a search that leaves out the unread pane's row must not take
+    /// its news off the rail while checkouts are hidden.
+    #[test]
+    fn hidden_checkouts_keep_news_no_drawn_row_carries_on_the_rail_chip() {
+        let (model, mut state, _) = hidden_checkouts_scene();
+        let renderer = headless_renderer();
+        // A rail badge draws an unread count, which its row's name carries
+        // instead, so count the drawn text.
+        let unread_badges = |state: &SidebarState| {
+            let badges = drawn_texts(project_list(&model, state, true, false), COMPACT_WIDTH)
+                .into_iter()
+                .filter(|(text, _)| text == "1")
+                .count();
+            let names = accessible_names(&renderer, project_list(&model, state, true, false));
+            (badges, names)
+        };
+        let (badges, names) = unread_badges(&state);
+        assert_eq!(badges, 1, "on the pane's row alone: {names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent"))
+        );
+
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("build".into()));
+        let (badges, names) = unread_badges(&state);
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("Open pane Review agent")),
+            "the search leaves the unread pane out: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.starts_with("Open pane Build")),
+            "the chip has a drawn row under it: {names:?}"
+        );
+        assert_eq!(badges, 1, "the chip carries the news: {names:?}");
+    }
+
+    #[test]
+    fn a_quiet_alias_cannot_give_unowned_news_a_row() {
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let linked = model.projects[0].worktrees[1].path.clone();
+        let canonical = compact_attention_terminal(CardId::new());
+        let mut alias = canonical.clone();
+        alias.id = CardId::new();
+        let durable = Arc::new(crate::model::WorkspaceState {
+            card_scopes: [(alias.id, linked)].into_iter().collect(),
+            cards: vec![canonical.clone(), alias].into(),
+            ..Default::default()
+        });
+        let mut state = SidebarState::default();
+        state.set_sidebar_worktrees(crate::settings::SidebarWorktrees::Hidden);
+        state.observe_card_update(canonical.id);
+        refresh_attention(&mut state, &mut model, &durable);
+        assert!(model.projects[0].panes.is_empty());
+    }
+
+    #[test]
+    fn the_checkouts_toggle_says_what_it_does_in_every_project() {
+        use iced_accessibility::accesskit::Toggled;
+        let renderer = headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let mut state = SidebarState::default();
+        for compact in [false, true] {
+            for (mode, pressed, tooltip) in [
+                (
+                    crate::settings::SidebarWorktrees::Grouped,
+                    Toggled::False,
+                    "Hide checkouts",
+                ),
+                (
+                    crate::settings::SidebarWorktrees::Expanded,
+                    Toggled::False,
+                    "Hide checkouts",
+                ),
+                (
+                    crate::settings::SidebarWorktrees::Hidden,
+                    Toggled::True,
+                    "Show checkouts (hidden in every project)",
+                ),
+            ] {
+                state.set_sidebar_worktrees(mode);
+                assert_eq!(checkouts_toggle_tooltip(&state), tooltip);
+                let mut element = header(&model, &state, compact, false, false, &shortcuts);
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(1280.0, 4_000.0)),
+                );
+                let nodes = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    cosmic::iced::advanced::mouse::Cursor::Unavailable,
+                );
+                let buttons: Vec<_> = nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .map(|node| node.node())
+                    .filter(|node| node.label().is_some())
+                    .collect();
+                let bell = buttons
+                    .iter()
+                    .position(|node| node.label() == Some("Show projects needing attention"))
+                    .expect("the bell");
+                assert_eq!(buttons[bell].toggled(), Some(Toggled::False));
+                let toggle = buttons.get(bell + 1).expect("beside the bell");
+                assert_eq!(
+                    (toggle.label(), toggle.toggled()),
+                    (Some(CHECKOUTS_TOGGLE_NAME), Some(pressed)),
+                    "{mode:?}, compact {compact}: the name stays and the pressed state says it"
+                );
+                assert!(
+                    !buttons.iter().any(|node| node
+                        .label()
+                        .is_some_and(|name| name.to_lowercase().contains("main"))),
+                    "{mode:?}, compact {compact}"
+                );
+                let focusable = published(&mut header(
+                    &model, &state, compact, false, false, &shortcuts,
+                ))
+                .focusable;
+                let toggle = focusable
+                    .iter()
+                    .position(|id| *id == checkouts_toggle_focus_id())
+                    .expect("the toggle takes keyboard focus");
+                assert_eq!(
+                    focusable.get(toggle.wrapping_sub(1)),
+                    Some(&filter_id(SidebarFilter::Attention)),
+                    "it follows the bell"
+                );
+            }
+        }
+    }
+
+    /// Only the All view lists checkouts. The setting persists, so the
+    /// toggle stays live in the other views and says which view it changes.
+    #[test]
+    fn the_checkouts_toggle_names_the_all_view_from_the_others() {
+        let mut state = SidebarState::default();
+        for filter in [SidebarFilter::Attention, SidebarFilter::PullRequests] {
+            state.filter = filter;
+            for (mode, tooltip) in [
+                (
+                    crate::settings::SidebarWorktrees::Grouped,
+                    "Hide checkouts in the All view",
+                ),
+                (
+                    crate::settings::SidebarWorktrees::Hidden,
+                    "Show checkouts in the All view (hidden in every project)",
+                ),
+            ] {
+                state.set_sidebar_worktrees(mode);
+                assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{filter:?}");
+            }
         }
     }
 
@@ -17588,16 +18445,19 @@ pub(crate) mod tests {
                 1,
             )
         };
+        let tone = |channel: &SidebarChannel, listing| {
+            WorkspaceGlyph::Channel.tone(channel_ink(channel, listing))
+        };
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, true), Listing::Live),
+            tone(&channel(None, false, true), Listing::Live),
             GlyphTone::Ink(RowInk::Full)
         );
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, false), Listing::Live),
+            tone(&channel(None, false, false), Listing::Live),
             GlyphTone::Ink(RowInk::Muted)
         );
         assert_eq!(
-            channel_glyph_tone(
+            tone(
                 &channel(Some(ActivityState::Waiting), false, true),
                 Listing::Live
             ),
@@ -17605,7 +18465,7 @@ pub(crate) mod tests {
             "waiting is shown by the indicator, not the glyph"
         );
         assert_eq!(
-            channel_glyph_tone(
+            tone(
                 &channel(Some(ActivityState::Working), false, true),
                 Listing::Live
             ),
@@ -17613,7 +18473,7 @@ pub(crate) mod tests {
             "working is shown by the indicator, not the glyph"
         );
         assert_eq!(
-            channel_glyph_tone(&channel(None, true, false), Listing::Live),
+            tone(&channel(None, true, false), Listing::Live),
             GlyphTone::Ink(RowInk::Full),
             "unread channels keep neutral identity glyphs"
         );
@@ -17629,7 +18489,7 @@ pub(crate) mod tests {
         );
 
         assert_eq!(
-            channel_glyph_tone(&channel(None, false, true), Listing::Read),
+            tone(&channel(None, false, true), Listing::Read),
             GlyphTone::Ink(RowInk::Muted),
             "a channel read under Attention recedes though its panes are open"
         );
@@ -18481,7 +19341,7 @@ pub(crate) mod tests {
                 let label = probe
                     .texts
                     .iter()
-                    .find(|(text, _)| text == "Worktrees in sidebar")
+                    .find(|(text, _)| text == "Checkouts in sidebar")
                     .unwrap_or_else(|| panic!("{case}: project menu missing: {:?}", probe.texts))
                     .1;
                 let folder = probe
@@ -20755,7 +21615,7 @@ pub(crate) mod tests {
                 .count()
         };
         let pane_listing = |model: &SidebarModel, state: &SidebarState| {
-            state.card_listing(&model.projects[0].attention_cards[0])
+            state.card_listing(&model.projects[0].panes[0])
         };
         for compact in [false, true] {
             assert_eq!(read_names(&model, &state, compact), 0);
@@ -20946,7 +21806,7 @@ pub(crate) mod tests {
         state.observe_agent_update(card, project, worktree);
         refresh_attention(&mut state, &mut model, &durable);
         assert_eq!(
-            state.card_listing(&model.projects[0].attention_cards[0]),
+            state.card_listing(&model.projects[0].panes[0]),
             Listing::Live
         );
     }
@@ -20968,7 +21828,7 @@ pub(crate) mod tests {
         };
         let waiting_listing = |model: &SidebarModel, state: &SidebarState| {
             let card = model.projects[0]
-                .attention_cards
+                .panes
                 .iter()
                 .find(|card| card.id == waiting)
                 .unwrap();
@@ -21069,7 +21929,7 @@ pub(crate) mod tests {
             state,
         };
         let listing = |model: &SidebarModel, state: &SidebarState| {
-            state.card_listing(&model.projects[0].attention_cards[0])
+            state.card_listing(&model.projects[0].panes[0])
         };
         let mut state = expanded_worktree_state();
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
@@ -21413,7 +22273,7 @@ pub(crate) mod tests {
         assert!(visible_selection_rows(&model, &state, false).contains(&SelectionRow::Card(busy)));
         assert!(draws_work_spinner(&card_view(
             &model.projects[0],
-            &model.projects[0].attention_cards[0],
+            &model.projects[0].panes[0],
             &state,
             false,
             false,
@@ -21752,6 +22612,7 @@ pub(crate) mod tests {
                 actions,
                 vec![
                     SidebarAction::SetFilter(SidebarFilter::Attention),
+                    SidebarAction::ToggleCheckouts,
                     SidebarAction::ToggleControls,
                     SidebarAction::OpenRepositoryPicker,
                 ]
@@ -23352,7 +24213,7 @@ pub(crate) mod tests {
             "a Folder root keeps its pane's row, never its header"
         );
         assert_eq!(
-            model.projects[0].attention_cards[0].checkout(&model.projects[0]),
+            model.projects[0].panes[0].checkout(&model.projects[0]),
             None
         );
         refresh_attention(&mut state, &mut model, &durable);
@@ -23391,7 +24252,7 @@ pub(crate) mod tests {
         state.prune_retained_attention(&model);
         assert_eq!(state.retained_attention.len(), 1);
         assert_eq!(
-            model.projects[0].attention_cards[0].checkout(&model.projects[0]),
+            model.projects[0].panes[0].checkout(&model.projects[0]),
             Some("main")
         );
         let rebuilt = state.attention_projection_rebuilds;

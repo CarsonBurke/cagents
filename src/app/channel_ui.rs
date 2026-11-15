@@ -292,6 +292,16 @@ impl Action {
     }
 }
 
+/// What made an empty channel a candidate for retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Retirement {
+    /// Its last card closed here, which was the person's own act.
+    Closed,
+    /// It was found empty: when the person left it, or by the startup
+    /// sweep. Nothing they did closed it, so a name they gave keeps it.
+    Unattended,
+}
+
 /// The pending deletion, held while its confirmation is on screen.
 #[derive(Debug, Default)]
 pub struct State {
@@ -330,11 +340,15 @@ pub struct State {
     /// reclaim it until it reports a name of its own, which one that fails
     /// to reconnect never does.
     names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
+    /// Channels the person renamed in this window. A name is never taken back
+    /// automatically, so this stays true once the registry has the rename.
+    named: HashSet<ChannelId>,
     reopening: HashMap<ChannelId, PendingReopen>,
     /// Emptied channels waiting for their view publication to settle, by the
-    /// incarnation the close saw. The registry checks that incarnation and
-    /// the settled view revision before it retires one.
-    pub(super) retire_candidates: HashSet<crate::channel_work::Home>,
+    /// incarnation the close saw, with what made each a candidate. The
+    /// registry checks that incarnation and the settled view revision before
+    /// it retires one.
+    pub(super) retire_candidates: HashMap<crate::channel_work::Home, Retirement>,
     /// Retirements sent to the registry, with the view revision each expects
     /// and when it was sent. The registry applies edits in order, so a pane
     /// published into one of these channels before the answer arrives would
@@ -970,7 +984,7 @@ impl Cagents {
             ClosedCardHome::Channel(id) => {
                 self.channel_ui
                     .retire_candidates
-                    .retain(|candidate| candidate.channel != id);
+                    .retain(|candidate, _| candidate.channel != id);
                 // No longer empty, so no longer a channel to revive, but one
                 // whose automatic name left with its conversation.
                 if let Some(index) = self
@@ -1162,7 +1176,7 @@ impl Cagents {
         if emptied.is_empty() {
             return Task::none();
         }
-        self.capture_retire_candidates(&emptied);
+        self.capture_retire_candidates(&emptied, Retirement::Closed);
         // The closing card is still open here; settle after its close lands.
         // A published pane is still in its view until the registry answers
         // the removal, which keeps the channel waiting for that answer.
@@ -1170,21 +1184,22 @@ impl Cagents {
     }
 
     /// Retires channel `left`, which this window just navigated away from,
-    /// when it holds nothing, as closing its last card would have. A channel
-    /// can reach that state without one of its cards closing here: a pane
-    /// moved out, a discarded composer, a peer's close, or a restore.
+    /// when it holds nothing and is not named, as closing its last card would
+    /// have. A channel can reach that state without one of its cards closing
+    /// here: a pane moved out, a discarded composer, a peer's close, or a
+    /// restore.
     pub(super) fn retire_left_channel(&mut self, left: Option<ChannelId>) {
         let Some(left) = left.filter(|&id| self.durable.active_channel != Some(id)) else {
             return;
         };
-        if self.channel_holds_nothing(left) {
-            self.capture_retire_candidates(&[left]);
+        if self.channel_retires_unattended(left) {
+            self.capture_retire_candidates(&[left], Retirement::Unattended);
             self.retire_settled_empty_channels();
         }
     }
 
     /// Asks once, after this window's restore settled and it joined the
-    /// registry, to retire every channel it is not showing that holds
+    /// registry, to retire every unnamed channel it is not showing that holds
     /// nothing. Startup, including the relaunch an update makes, is when
     /// channels emptied while no window watched them are found.
     pub(super) fn sweep_empty_channels(&mut self) {
@@ -1201,7 +1216,9 @@ impl Cagents {
             .channels
             .iter()
             .map(|channel| channel.id)
-            .filter(|&id| self.durable.active_channel != Some(id) && self.channel_holds_nothing(id))
+            .filter(|&id| {
+                self.durable.active_channel != Some(id) && self.channel_retires_unattended(id)
+            })
             .collect::<Vec<_>>();
         if empty.is_empty() {
             return;
@@ -1210,7 +1227,7 @@ impl Cagents {
             count = empty.len(),
             "retiring channels found empty at startup"
         );
-        self.capture_retire_candidates(&empty);
+        self.capture_retire_candidates(&empty, Retirement::Unattended);
         self.retire_settled_empty_channels();
     }
 
@@ -1222,6 +1239,35 @@ impl Cagents {
             self.channel_ui.sweep = Sweep::Ready;
         }
         self.sweep_empty_channels();
+    }
+
+    /// Whether `id` may retire without the person closing anything in it:
+    /// it holds nothing, and it is not named. A name is something they put
+    /// there, so leaving a named channel keeps it, even one they have not
+    /// used yet. An untitled channel has nothing of theirs to lose; the
+    /// registry clears a title its conversation suggested when that
+    /// conversation leaves.
+    fn channel_retires_unattended(&self, id: ChannelId) -> bool {
+        !self.channel_is_named(id) && self.channel_holds_nothing(id)
+    }
+
+    /// Whether `id` carries a name given to it rather than one suggested by
+    /// its conversation: by a rename, or when it was made with a title.
+    ///
+    /// A rename made here counts before the registry confirms it. Until
+    /// then, a model the registry sent before the rename shows the old title.
+    fn channel_is_named(&self, id: ChannelId) -> bool {
+        self.channel_ui.named.contains(&id)
+            || self.durable.channels.iter().any(|channel| {
+                channel.id == id
+                    && channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && !channel.title.is_empty()
+            })
+    }
+
+    /// Records that the person named channel `id` in this window.
+    pub(super) fn note_channel_named(&mut self, id: ChannelId) {
+        self.channel_ui.named.insert(id);
     }
 
     /// Whether `id` holds nothing a person could lose with it, as this window
@@ -1276,8 +1322,8 @@ impl Cagents {
 
     /// Records `ids` as retirement candidates under the incarnation the
     /// registry now holds, each with a snapshot that lets a card reopened from
-    /// it bring it back.
-    fn capture_retire_candidates(&mut self, ids: &[ChannelId]) {
+    /// it bring it back. A close here outweighs finding the channel empty.
+    fn capture_retire_candidates(&mut self, ids: &[ChannelId], retirement: Retirement) {
         for &id in ids {
             let Some(channel) = self
                 .durable
@@ -1304,7 +1350,16 @@ impl Cagents {
             };
             home.validate().ok().map(|_| home)
         });
-        self.channel_ui.retire_candidates.extend(captured);
+        for home in captured.collect::<Vec<_>>() {
+            let candidate = self
+                .channel_ui
+                .retire_candidates
+                .entry(home)
+                .or_insert(retirement);
+            if retirement == Retirement::Closed {
+                *candidate = Retirement::Closed;
+            }
+        }
     }
 
     /// View publication supplies the settled revision. The registry checks
@@ -1316,9 +1371,9 @@ impl Cagents {
             .channel_ui
             .retire_candidates
             .iter()
-            .copied()
+            .map(|(&home, &retirement)| (home, retirement))
             .collect::<Vec<_>>();
-        for captured in candidates {
+        for (captured, retirement) in candidates {
             let channel = captured.channel;
             let Some(metadata) = self.workspace_model.channel(channel) else {
                 self.channel_ui.retire_candidates.remove(&captured);
@@ -1344,8 +1399,10 @@ impl Cagents {
             // that pane later captures the channel again.
             // So can an agent's first adoption, which a failed restore can
             // leave undone; that session is not emptiness either.
+            // A name given since it was found empty keeps it too.
             if self.channel_holds_unpublished_work(channel)
                 || self.channel_awaits_session(channel, view)
+                || (retirement == Retirement::Unattended && self.channel_is_named(channel))
             {
                 self.channel_ui.retire_candidates.remove(&captured);
                 continue;
@@ -1354,7 +1411,7 @@ impl Cagents {
                 home: captured,
                 expected_view_revision: view.revision,
             };
-            if self.workspace_model_tx.try_send(edit).is_ok() {
+            if self.workspace_model_tx.try_send(edit.into()).is_ok() {
                 self.channel_ui.retire_candidates.remove(&captured);
                 self.channel_ui
                     .retiring
@@ -1714,6 +1771,7 @@ impl Cagents {
         else {
             return Task::none();
         };
+        self.forget_view_seed(&crate::workspace_model::views::Scope::Channel(id));
         let was_active = self.durable.active_channel == Some(id);
         let (project_id, successor) = self.channel_successor(index);
         let fallback = self.project_primary_worktree(project_id);
@@ -2139,8 +2197,8 @@ impl Cagents {
 }
 
 impl Cagents {
-    /// Folds attention into the rows the Attention list draws: counts first,
-    /// then the pane rows they give. Every projection goes through here, so
+    /// Folds attention into the rows the sidebar draws: counts first, then
+    /// the pane rows they give. Every projection goes through here, so
     /// no caller can leave the pane rows behind the counts.
     pub(super) fn refresh_attention_projection(&mut self) {
         self.sidebar_state
@@ -2148,30 +2206,28 @@ impl Cagents {
         self.refresh_attention_card_rows();
     }
 
-    /// The Attention list's pane rows, titled as their panes are. Every title
+    /// The sidebar's pane rows, titled as their panes are beside their
+    /// place: one per open conversation outside every channel. Every title
     /// report comes through here, and most change no row: those compare the
     /// rows in place and stop, and the rest rebuild only the projects whose
     /// rows changed.
     pub(super) fn refresh_attention_card_rows(&mut self) {
-        let stale = self
-            .sidebar_model
-            .stale_attention_cards(&self.sidebar_state, |id| {
-                self.card_state(id)
-                    .map(|card| self.card_display_title(card))
-            });
+        let stale = self.sidebar_model.stale_panes(&self.sidebar_state, |id| {
+            self.card_state(id).map(|card| self.pane_row_title(card))
+        });
         if stale.is_empty() {
             return;
         }
         let mut titles = self
             .sidebar_state
-            .attention_pane_cards()
+            .pane_cards()
             .filter_map(|id| {
                 let card = self.card_state(id)?;
-                Some((id, self.card_display_title(card).to_owned()))
+                Some((id, self.pane_row_title(card).to_owned()))
             })
             .collect::<HashMap<_, _>>();
         self.sidebar_model
-            .set_attention_cards(&self.sidebar_state, &stale, |id| titles.remove(&id));
+            .set_panes(&self.sidebar_state, &stale, |id| titles.remove(&id));
     }
 }
 
@@ -2295,17 +2351,19 @@ mod tests {
             original,
         ] {
             let mut app = super::super::tests::context_inspector_test_app(false);
-            let (send, received) = async_channel::unbounded();
+            let (send, received) = test_model_channel();
             app.workspace_model_tx = send;
             app.workspace_model = model_with_empty_channel(current);
-            app.channel_ui.retire_candidates.insert(original);
+            app.channel_ui
+                .retire_candidates
+                .insert(original, Retirement::Closed);
             app.retire_settled_empty_channels();
             if current == original {
                 assert_eq!(
                     received.try_recv().unwrap(),
                     ModelEdit::RetireEmptyChannel {
                         home: original,
-                        expected_view_revision: 7
+                        expected_view_revision: 7,
                     }
                 );
             } else {
@@ -2345,7 +2403,7 @@ mod tests {
                 });
             drop(app.close_emptied_channels(&[card]));
             assert_eq!(
-                app.channel_ui.retire_candidates.contains(&original),
+                app.channel_ui.retire_candidates.contains_key(&original),
                 ordinal != crate::workspace_model::PENDING_ORDINAL
             );
         }

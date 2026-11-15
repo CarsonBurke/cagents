@@ -864,7 +864,6 @@ fn nested_modal_popover_accessibility_owns_foreground_and_rejects_ancestor_actio
 
 fn live_app() -> (Cagents, CardId, TerminalId, HostSessionProof) {
     let mut app = tests::context_inspector_test_app(true);
-    app.context_inspector_open = false;
     let card = app.workspace.focused().unwrap();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new("host"),
@@ -1360,7 +1359,6 @@ fn a_refresh_confirming_the_same_repository_leaves_an_open_draft_submittable() {
 #[test]
 fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
     let mut app = tests::context_inspector_test_app(true);
-    app.context_inspector_open = false;
     let card = app.workspace.focused().unwrap();
     app.cards.insert(card, CardRuntime::Loading);
     app.begin_terminal_start(card);

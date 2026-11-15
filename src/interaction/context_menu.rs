@@ -429,7 +429,7 @@ mod tests {
                 entries.insert(
                     folder_index,
                     Item::Folder(
-                        "Worktrees in sidebar".to_owned(),
+                        "Checkouts in sidebar".to_owned(),
                         ["Use default (Grouped)", "Grouped", "Expanded", "Hidden"]
                             .into_iter()
                             .enumerate()
@@ -489,7 +489,7 @@ mod tests {
                 let label = texts
                     .0
                     .iter()
-                    .find(|(text, _)| text == "Worktrees in sidebar")
+                    .find(|(text, _)| text == "Checkouts in sidebar")
                     .expect("folder label is visible")
                     .1;
                 let folder = Layout::new(&measured)
