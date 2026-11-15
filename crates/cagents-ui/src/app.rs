@@ -19300,9 +19300,12 @@ impl Application for Cagents {
                 Some(CardRuntime::Repository(runtime)) => runtime,
                 _ => return None,
             };
-            let title = self
-                .card_state(card)
-                .map_or("Repository".into(), |state| state.title.clone());
+            // The file at stake, not the repository the pane is rooted at.
+            let title = runtime
+                .selected_path()
+                .map(|path| path.display().to_string())
+                .or_else(|| self.card_state(card).map(|state| state.title.clone()))
+                .unwrap_or_else(|| "Repository".into());
             let mut rows: Vec<Element<'_, Message>> = vec![
                 design::title(if runtime.has_durability_warning() {
                     format!("Confirm the save to {title} before closing")
