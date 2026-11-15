@@ -174,7 +174,7 @@ fn human(report: &Report) -> String {
             },
             if account.archived { " (archived)" } else { "" },
             if account.identity_conflict {
-                " — login identity changed"
+                " — login identity conflict"
             } else {
                 ""
             }

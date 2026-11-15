@@ -130,7 +130,7 @@ struct ConsumedInputs {
 /// One barrier per application window, shared across mounted cards and retained
 /// while cards unmount. A review key-up must not become input to a new focus.
 #[derive(Clone, Default)]
-pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
+pub struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
     pub fn owns_keyboard(&self, event: &Event) -> bool {
         let physical = match event {

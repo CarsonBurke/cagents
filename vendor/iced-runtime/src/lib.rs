@@ -28,7 +28,6 @@ pub use task::Task;
 pub use user_interface::UserInterface;
 pub use window::Window;
 
-use crate::core::Color;
 use crate::futures::futures::channel::oneshot;
 
 use std::borrow::Cow;

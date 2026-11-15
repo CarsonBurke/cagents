@@ -1,6 +1,7 @@
 use super::*;
 use crate::update::impact::{DaemonImpact, Disposition, Policy, SessionImpact, SessionKind};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 /// The caller holds the control gate. SQL and actor barriers deliberately run
 /// without HostState: both may need host events to finish admitted work.
@@ -186,7 +187,7 @@ impl HostState {
             } else {
                 (
                     Disposition::Blocked,
-                    "This terminal cannot preserve its live process through this update; finish it or close it before updating.",
+                    "This terminal cannot preserve its live process through this update; it can reopen stopped after confirmation.",
                 )
             };
             impact.sessions.push(SessionImpact {
@@ -212,6 +213,7 @@ impl HostState {
             }
             let (busy, ready) = record.handle.update_activity();
             let interrupted_subagents = record.handle.interrupt_subagents();
+            let hold = record.handle.work_hold();
             let confirmed = record.handle.confirmed_session_id();
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
@@ -241,34 +243,34 @@ impl HostState {
                 source.launch.session_id = confirmed.clone();
             }
             let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
-            let (disposition, reason) = if record.returning_terminal {
+            let (disposition, reason): (_, Cow<str>) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
-                    "Finish the pending return to terminal or close this conversation.",
+                    "Finish the pending return to terminal or close this conversation.".into(),
                 )
             } else if self.provider_ended(id, record) {
                 (
                     Disposition::Resumes,
-                    "Its provider already stopped. The saved conversation will reopen with a new provider process.",
+                    "Its provider already stopped. The saved conversation will reopen with a new provider process.".into(),
                 )
             } else if record.handle.is_completed() {
                 (
                     Disposition::Blocked,
-                    "Its provider stopped but may still hold unfinished work. Close this conversation to release it.",
+                    crate::update::impact::STOPPED_WITH_UNSETTLED_WORK.into(),
                 )
             } else if let Err(reason) = &migration {
-                (Disposition::Blocked, reason.as_str())
+                (Disposition::Blocked, reason.as_str().into())
             } else if let Err(reason) = &environment {
-                (Disposition::Blocked, reason.as_str())
+                (Disposition::Blocked, reason.as_str().into())
             } else if !ready {
                 (
                     Disposition::Blocked,
-                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
+                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.".into(),
                 )
             } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
                 (
                     Disposition::Blocked,
-                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",
+                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.".into(),
                 )
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {
@@ -278,38 +280,26 @@ impl HostState {
             {
                 (
                     Disposition::Blocked,
-                    "The paired console cannot preserve its live process through this update.",
+                    "The paired console cannot preserve its live process through this update."
+                        .into(),
                 )
             } else if durable {
                 (
                     Disposition::Continues,
-                    "The provider, active turn, and pending approvals stay alive while the application reconnects.",
+                    "The provider, active turn, and pending approvals stay alive while the application reconnects.".into(),
                 )
             } else if busy && policy == Policy::WhenIdle {
                 (
                     Disposition::WaitsForIdle,
-                    "The update will wait for this conversation to become idle, then resume it.",
+                    waits_for_idle_reason(&hold).into(),
                 )
             } else if busy {
-                (
-                    Disposition::Interrupted,
-                    "The active turn will be interrupted; the saved conversation will resume.",
-                )
+                (Disposition::Interrupted, interrupted_reason(&hold).into())
             } else {
                 (
                     Disposition::Resumes,
-                    "The saved conversation will reopen with a new provider process.",
+                    "The saved conversation will reopen with a new provider process.".into(),
                 )
-            };
-            let reason = if disposition == Disposition::Interrupted
-                && !interrupted_subagents.is_empty()
-            {
-                format!(
-                    "The active turn and {} running background subagent(s) will stop; background work will not resume automatically.",
-                    interrupted_subagents.len()
-                )
-            } else {
-                reason.into()
             };
             impact.sessions.push(SessionImpact {
                 id,
@@ -329,7 +319,7 @@ impl HostState {
                     record.handle.native_continuity(),
                 ))?,
                 disposition,
-                reason,
+                reason: reason.into_owned(),
                 interrupted_subagents: if disposition == Disposition::Interrupted {
                     interrupted_subagents
                 } else {
@@ -341,6 +331,43 @@ impl HostState {
             .sessions
             .sort_by_key(|session| (session.kind, session.id));
         Ok(impact)
+    }
+}
+
+/// Waiting for idle can last as long as a subagent's own background work,
+/// which may never end while the conversation looks finished, so the reason
+/// names any such subagent and how to update sooner.
+fn waits_for_idle_reason(hold: &crate::chat::WorkHold) -> String {
+    let wait = "The update will wait for this conversation to become idle, then resume it.";
+    let held = hold.beyond_turn();
+    if held.is_empty() {
+        return wait.into();
+    }
+    format!(
+        "{wait} {} To update sooner, stop {} in the conversation, or choose to interrupt instead.",
+        held.detail(),
+        held.where_to_stop()
+    )
+}
+
+/// What updating now stops. A turn is mentioned only while one is under way.
+fn interrupted_reason(hold: &crate::chat::WorkHold) -> String {
+    let held = hold.subagents();
+    match (hold.turn, held.is_empty()) {
+        (true, true) => {
+            "The active turn will be interrupted; the saved conversation will resume.".into()
+        }
+        (false, true) => {
+            "Work under way will be interrupted; the saved conversation will resume.".into()
+        }
+        (true, false) => format!(
+            "The update will interrupt the active turn and stop {}; background work will not resume automatically. The saved conversation will resume.",
+            held.counted()
+        ),
+        (false, false) => format!(
+            "The update will stop {}; background work will not resume automatically. The saved conversation will resume.",
+            held.counted()
+        ),
     }
 }
 
@@ -361,4 +388,62 @@ fn identity(value: &impl serde::Serialize) -> Result<String, ProtocolError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{interrupted_reason, waits_for_idle_reason};
+    use crate::chat::{HeldSubagent, WorkHold};
+
+    fn hold(turn: bool, agents: &[(&str, bool)]) -> WorkHold {
+        WorkHold {
+            turn,
+            subagents: agents
+                .iter()
+                .map(|&(name, waiting)| HeldSubagent {
+                    name: name.into(),
+                    waiting,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn waiting_for_idle_names_a_waiting_subagent_and_how_to_update_sooner() {
+        assert_eq!(
+            waits_for_idle_reason(&hold(false, &[("Run the dev server", true)])),
+            "The update will wait for this conversation to become idle, then resume it. Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. To update sooner, stop it from its tab in the conversation, or choose to interrupt instead."
+        );
+        // A turn's running subagents end with it; only a waiting one is news.
+        assert_eq!(
+            waits_for_idle_reason(&hold(true, &[("Audit the parser", false)])),
+            "The update will wait for this conversation to become idle, then resume it."
+        );
+        assert!(
+            waits_for_idle_reason(&hold(
+                true,
+                &[("Audit the parser", false), ("Run the dev server", true)]
+            ))
+            .contains("Background subagent \u{201c}Run the dev server\u{201d} is waiting")
+        );
+    }
+
+    #[test]
+    fn interrupting_mentions_a_turn_only_when_one_is_active_and_never_calls_waiting_running() {
+        assert_eq!(
+            interrupted_reason(&hold(false, &[("Run the dev server", true)])),
+            "The update will stop 1 waiting background subagent (\u{201c}Run the dev server\u{201d}); background work will not resume automatically. The saved conversation will resume."
+        );
+        assert_eq!(
+            interrupted_reason(&hold(
+                true,
+                &[("Audit the parser", false), ("Run the dev server", true)]
+            )),
+            "The update will interrupt the active turn and stop 1 running and 1 waiting background subagent (\u{201c}Audit the parser\u{201d} and \u{201c}Run the dev server\u{201d}); background work will not resume automatically. The saved conversation will resume."
+        );
+        assert_eq!(
+            interrupted_reason(&hold(true, &[])),
+            "The active turn will be interrupted; the saved conversation will resume."
+        );
+    }
 }
