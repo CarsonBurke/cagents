@@ -32,12 +32,6 @@ impl Connection {
             .map_err(|error| error.to_string())
     }
 
-    pub(in crate::app) fn read_agent_labels(
-        &mut self,
-    ) -> Result<Vec<(crate::model::AgentId, String)>, crate::control::ControlError> {
-        self.client.read_agent_labels().map(|(_, labels)| labels)
-    }
-
     pub(in crate::app) fn request(
         &mut self,
         request: Request,
