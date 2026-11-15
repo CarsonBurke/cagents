@@ -486,7 +486,7 @@ fn permissions_surface(
         space::XS + step::GAP_S,
     ))
     .id(card_control_id(card, "chat-permissions-surface"))
-    .width(width.clamp(1.0, 520.0))
+    .width(crate::ui_controls::scrolling_width(width.clamp(1.0, 520.0)))
     .into()
 }
 

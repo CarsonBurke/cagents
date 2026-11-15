@@ -94,6 +94,13 @@ pub fn popover_scroll<'a, Message: 'a>(
 /// rounded corners.
 pub const SCROLLING_FRAME: f32 = space::S;
 
+/// The width to give a [`scrolling_popover`]'s body so the popover is as
+/// wide as a [`popover`] around content `width` wide: its frame is wider by
+/// the difference in their side insets.
+pub fn scrolling_width(width: f32) -> f32 {
+    (width - 2.0 * (SCROLLING_FRAME - space::XS)).max(0.0)
+}
+
 fn framed<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     content: Option<Element<'a, Message>>,

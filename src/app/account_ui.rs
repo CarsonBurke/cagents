@@ -5228,7 +5228,7 @@ impl Cagents {
             height,
             crate::ui_controls::SCROLLING_FRAME,
         ))
-        .width(POPOVER_WIDTH)
+        .width(crate::ui_controls::scrolling_width(POPOVER_WIDTH))
         .into()
     }
 

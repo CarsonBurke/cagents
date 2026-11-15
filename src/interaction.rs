@@ -408,7 +408,7 @@ pub fn overflow_fade_x<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Horizontal,
         fill: Box::new(crate::design::base),
-        leading: true,
+        hold: None,
     })
 }
 
@@ -435,22 +435,38 @@ pub fn overflow_fade_y<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-        leading: true,
+        hold: None,
     })
 }
 
-/// As [`overflow_fade_y`], but at the bottom edge only: for a list whose
-/// top edge its own pinned headers hold, which a fade there would cover.
-pub fn overflow_fade_bottom<'a, Message: 'a>(
+/// As [`overflow_fade_y`], for a list whose own headers pin to its top
+/// edge: while one is pinned there, the header holds that edge, fading what
+/// passes under it, and a fade at the edge would cover the header itself.
+/// Pinned headers report themselves to `hold` as they draw; the top edge
+/// fades whenever none did.
+pub fn overflow_fade_y_under_headers<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
+    hold: TopEdgeHold,
 ) -> Element<'a, Message> {
     Element::new(OverflowFade {
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-        leading: false,
+        hold: Some(hold),
     })
+}
+
+/// Whether a pinned header holds a scrolling list's top edge in the frame
+/// being drawn. See [`overflow_fade_y_under_headers`].
+#[derive(Clone, Default)]
+pub(crate) struct TopEdgeHold(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl TopEdgeHold {
+    /// Called by a header drawing pinned to the list's top edge.
+    pub(crate) fn hold(&self) {
+        self.0.set(true);
+    }
 }
 
 /// Fades what passes under a pinned header, `area` being the stretch just
@@ -1489,8 +1505,8 @@ struct OverflowFade<'a, Message> {
     content: Element<'a, Message>,
     axis: Axis,
     fill: Box<dyn Fn(&Theme) -> Color + 'a>,
-    /// Whether the leading edge (top or left) fades too.
-    leading: bool,
+    /// Set for a list whose pinned headers may hold its leading edge.
+    hold: Option<TopEdgeHold>,
 }
 
 /// How far the fade reaches at the start and the end of the strip.
@@ -1676,6 +1692,9 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        if let Some(hold) = &self.hold {
+            hold.0.set(false);
+        }
         self.content.as_widget().draw(
             &tree.children[0],
             renderer,
@@ -1686,7 +1705,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             viewport,
         );
         let mut state = *tree.state.downcast_ref::<OverflowState>();
-        if !self.leading {
+        if self.hold.as_ref().is_some_and(|hold| hold.0.get()) {
             state.start = 0.0;
         }
         if state.start <= 0.0 && state.end <= 0.0 {

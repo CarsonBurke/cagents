@@ -45,7 +45,9 @@ pub use labelled::labelled;
 pub use list_row::{ListRow, list_row, row_label};
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
-pub use popover::{SCROLLING_FRAME, popover, popover_item, popover_scroll, scrolling_popover};
+pub use popover::{
+    SCROLLING_FRAME, popover, popover_item, popover_scroll, scrolling_popover, scrolling_width,
+};
 pub use pull_request_state::{
     ChecksSummary, WorktreePullRequestState, check_state_glyph, check_state_label,
     check_state_look, checks_glyph, pull_request_review_glyph, pull_request_state_glyph,

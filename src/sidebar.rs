@@ -6389,11 +6389,12 @@ fn project_scroll(
     filter: SidebarFilter,
     viewport: row_interaction::StickyViewport,
 ) -> Element<'_, SidebarAction> {
-    // Rows passing the list's bottom edge fade into the pane. Its top edge
-    // is a pinned project header's, which fades what passes under it. The
-    // fade wraps the filtered scroll, whose direct child must stay the
-    // scrollable: it swaps that child's state between filters.
-    crate::interaction::overflow_fade_bottom(
+    // Rows passing either edge fade into the pane, but while a project
+    // header is pinned the top edge is the header's, which fades what passes
+    // under it. The fade wraps the filtered scroll, whose direct child must
+    // stay the scrollable: it swaps that child's state between filters.
+    let hold = viewport.top_edge();
+    crate::interaction::overflow_fade_y_under_headers(
         RowInteraction::filtered_scroll(
             widget::scrollable(content)
                 .id(stable_id("projects.scroll"))
@@ -6406,6 +6407,7 @@ fn project_scroll(
             viewport,
         ),
         pane_fill,
+        hold,
     )
 }
 
@@ -13469,9 +13471,18 @@ mod row_interaction {
     /// One coordinate shared by the list and its groups, refreshed on each widget
     /// callback, including operations/accessibility before the next draw.
     #[derive(Clone, Default)]
-    pub(super) struct StickyViewport(Rc<Cell<f32>>, Rc<Cell<Option<f32>>>);
+    pub(super) struct StickyViewport(
+        Rc<Cell<f32>>,
+        Rc<Cell<Option<f32>>>,
+        crate::interaction::TopEdgeHold,
+    );
 
     impl StickyViewport {
+        /// Told when a group's header holds the list's top edge.
+        pub(super) fn top_edge(&self) -> crate::interaction::TopEdgeHold {
+            self.2.clone()
+        }
+
         fn content_top(&self, layout: Layout<'_>) -> f32 {
             self.1.get().unwrap_or(layout.bounds().y) + layout.virtual_offset().y
         }
@@ -14522,6 +14533,15 @@ mod row_interaction {
                 // How far the header has travelled from its place in the list:
                 // rows are passing under it while it is pinned.
                 let pinned = header.bounds().y - layout.bounds().y;
+                // A header at the list's top edge, pinned or merely resting
+                // there, holds it: the list's own fade there would cover it.
+                let top = header.bounds().y;
+                if let Kind::Group { viewport: sticky } = &self.kind
+                    && top <= viewport.y + 0.5
+                    && top + header.bounds().height > viewport.y
+                {
+                    sticky.2.hold();
+                }
                 if pinned > 0.0 {
                     // What passes under the header recedes into it rather
                     // than being cut at its edge. The fade grows over the
@@ -14539,7 +14559,7 @@ mod row_interaction {
                             crate::interaction::fade_below_header(
                                 renderer,
                                 area,
-                                super::pane_fill(theme),
+                                super::pinned_header_fill(theme),
                             );
                         });
                     }
@@ -20414,6 +20434,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_revealed_row_clears_the_fades_at_either_edge() {
+        let fade = crate::interaction::OVERFLOW_FADE;
+        // A 32 px row in a 180 px viewport over 1000 px of list, at 400.
+        // Already clear of both fades: it stays put.
+        assert_eq!(reveal_scroll(60.0..92.0, 0.0, 180.0, 1000.0, 400.0), 400.0);
+        // Under the bottom fade: it ends a fade's depth above the edge.
+        assert_eq!(
+            reveal_scroll(140.0..172.0, 0.0, 180.0, 1000.0, 400.0),
+            400.0 + 172.0 + fade - 180.0
+        );
+        // Under the top edge, or the fade below a pinned 32 px header: it
+        // starts a fade's depth below either.
+        assert_eq!(
+            reveal_scroll(10.0..42.0, 0.0, 180.0, 1000.0, 400.0),
+            400.0 + 10.0 - fade
+        );
+        assert_eq!(
+            reveal_scroll(40.0..72.0, 32.0, 180.0, 1000.0, 400.0),
+            400.0 + 40.0 - fade - 32.0
+        );
+        // At the list's ends nothing lies beyond and nothing fades: the
+        // first and last rows may sit flush.
+        assert_eq!(reveal_scroll(-4.0..28.0, 0.0, 180.0, 1000.0, 4.0), 0.0);
+        assert_eq!(
+            reveal_scroll(160.0..192.0, 0.0, 180.0, 1000.0, 812.0),
+            820.0
+        );
+        // A viewport too short for both margins shares what room it has,
+        // and a second reveal settles where the first left the row.
+        let first = reveal_scroll(100.0..132.0, 0.0, 40.0, 1000.0, 400.0);
+        assert_eq!(first, 400.0 + 100.0 - 4.0);
+        assert_eq!(reveal_scroll(4.0..36.0, 0.0, 40.0, 1000.0, first), first);
+    }
+
+    #[test]
     fn upward_reveal_keeps_the_channel_below_its_own_sticky_header_and_preserves_focus() {
         use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
         use cosmic::iced::{
@@ -20612,7 +20667,12 @@ pub(crate) mod tests {
             let raw_header = after.bounds[&selection_row_focus_id(SelectionRow::Project(owner))];
             assert!((row.y0 - f64::from(raw_row.y - after.offset)).abs() < 0.01);
             assert!((header.y0 - f64::from(raw_header.y - after.offset)).abs() < 0.01);
-            assert!((header.y0 - f64::from(after.viewport.y)).abs() < 0.01);
+            // The channel leads its group, so revealing it clear of the top
+            // edge's fade brings its header down off that edge with it.
+            assert!(
+                (header.y0 - f64::from(after.viewport.y + crate::interaction::OVERFLOW_FADE)).abs()
+                    < 0.01
+            );
             assert_eq!(after.row_insets[&target], raw_header.height);
             // Accessibility and operation were checked before any paint. Now
             // observe the real Group header draw, independent of either report.
@@ -27350,15 +27410,14 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
                 return;
             }
             let row = self.bounds - translation;
-            let top = bounds.y + self.top_inset.min((bounds.height - row.height).max(0.0));
-            let delta = if row.y < top {
-                row.y - top
-            } else if row.y + row.height > bounds.y + bounds.height {
-                row.y + row.height - bounds.y - bounds.height
-            } else {
-                0.0
-            };
-            if delta != 0.0 {
+            let delta = reveal_scroll(
+                row.y - bounds.y..row.y - bounds.y + row.height,
+                self.top_inset,
+                bounds.height,
+                content.height,
+                translation.y,
+            ) - translation.y;
+            if delta.abs() > 0.01 {
                 state.scroll_by(
                     operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
                     bounds,
@@ -27374,4 +27433,33 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
         insets: Vec::new(),
         top_inset: 0.0,
     })
+}
+
+/// The scroll offset that brings `row`, measured from the top of the
+/// project list's viewport, into view, with `inset` at the viewport's top
+/// held by a pinned header. Rows already in view stay where they are.
+///
+/// Both edges fade while rows lie beyond them: the top under a pinned header
+/// or at the viewport's own edge, the bottom into the pane. The row is
+/// revealed clear of either fade, sharing what room a short list has, and the
+/// clamp to the list's ends lets the first and last rows sit flush where
+/// nothing lies beyond and nothing fades.
+fn reveal_scroll(
+    row: std::ops::Range<f32>,
+    inset: f32,
+    viewport: f32,
+    content: f32,
+    offset: f32,
+) -> f32 {
+    let height = row.end - row.start;
+    let top = inset.min((viewport - height).max(0.0));
+    let margin = crate::interaction::OVERFLOW_FADE.min(((viewport - top - height) / 2.0).max(0.0));
+    let delta = if row.start - margin < top {
+        row.start - margin - top
+    } else if row.end + margin > viewport {
+        row.end + margin - viewport
+    } else {
+        0.0
+    };
+    (offset + delta).clamp(0.0, (content - viewport).max(0.0))
 }
