@@ -213,8 +213,8 @@ fn confirmed_projection(handle: &Handle, source: &Session) -> Option<Session> {
 /// Revocation, mutation or retirement after helper recognition cannot authorize
 /// a durable run transition or the helper ACK that follows it. The single
 /// accepted change is a concurrent identity confirmation: it keeps every
-/// authority field and publishes exactly `confirmed`, the helper-confirmed
-/// projection of the source this owner authenticated.
+/// authority field and publishes exactly `confirmed`, the attachment's
+/// resident source with the conversation its helper confirmed.
 fn require_execution_owner(
     registry: &super::super::model::Registry,
     captured: Option<&ExecutionOwner>,
@@ -469,13 +469,22 @@ fn persist_confirmed_identity(
         .collect::<Vec<_>>();
     let (changed, registered) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        // Publication replaces exactly the authenticated row, never a newer one.
-        require_execution_owner(&registry, Some(&owner), true, None)?;
+        // Publication replaces exactly the authenticated row. A concurrent
+        // drain or close may already have published this same projection.
+        require_execution_owner(&registry, Some(&owner), true, Some(&projected))?;
         let changed = registry.adopt_authenticated_agent_session(
             &aliases,
             &crate::agent_execution::HostedSession::Chat(projected.clone()),
         )?;
-        let registered = registry.confirm_native_actor_identity(&owner.0, &projected);
+        let published = owner.0.with_source(&projected);
+        let registered = if registry
+            .native_actor_ownership(owner.0.actor())?
+            .is_some_and(|current| current == published)
+        {
+            Ok(())
+        } else {
+            registry.confirm_native_actor_identity(&owner.0, &projected)
+        };
         (changed, registered)
     };
     // Adoption may have committed even if census publication needs retry.

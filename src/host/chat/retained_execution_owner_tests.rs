@@ -549,6 +549,44 @@ fn answer_keeps_its_owner_across_a_concurrent_identity_confirmation_only() {
 }
 
 #[test]
+fn a_confirmed_identity_projects_the_resident_source_until_retirement() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    // The census predates the resident attachment's acknowledged alias.
+    let registered = fixture.source.clone();
+    fixture.source.proof.as_mut().unwrap().host_incarnation = "successor-attachment".into();
+    fixture.issued_sources.push(fixture.source.clone());
+    let captured = fixture.authenticate().unwrap();
+    let project = |source: &Session, confirmed: &str| {
+        let mut projected = source.clone();
+        projected.launch.session_id = Some(confirmed.into());
+        projected
+    };
+    let confirmed = uuid::Uuid::new_v4().to_string();
+    let resident = project(&fixture.source, &confirmed);
+    fixture
+        .registry
+        .confirm_native_actor_identity(&captured.0, &resident)
+        .unwrap();
+    let check = |fixture: &Fixture, projected: &Session| {
+        require_execution_owner(&fixture.registry, Some(&captured), true, Some(projected))
+    };
+    assert!(check(&fixture, &project(&registered, &confirmed)).is_err());
+    assert!(check(&fixture, &resident).is_ok());
+    fixture
+        .registry
+        .commit_native_actor_retirement(
+            fixture.identity.instance,
+            &fixture.identity.record,
+            &resident,
+            Ok(&fixture.scope),
+            Some(&confirmed),
+        )
+        .unwrap();
+    assert!(check(&fixture, &resident).is_err());
+}
+
+#[test]
 fn answer_helper_ack_cannot_replace_a_missing_or_different_durable_cursor() {
     let (_root, _host, synchronization, run, _) = answer_sync_fixture();
     // Model an already-ACKed helper watermark. It is not accepted when the
