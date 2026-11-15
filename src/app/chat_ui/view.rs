@@ -116,6 +116,8 @@ pub(super) const NOTICE_CHARS: usize = 480;
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.
 const FOOTER_LABEL: usize = 32;
+/// The most of a channel's name the footer shows after its `# `.
+const CHANNEL_LABEL: usize = 26;
 /// The same, in a pane too narrow for the conversation's place.
 const NARROW_FOOTER_LABEL: usize = 20;
 /// The same where the model is named only on hover, for the text drawn in
@@ -889,13 +891,8 @@ fn menu_row<'a>(
             .into(),
     );
     cells.push(
-        design::caption(description)
-            .class(cosmic::theme::Text::Custom(design::muted_text))
+        crate::ui_controls::FadeText::caption(description)
             .width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
             .into(),
     );
     cells.extend(kind.map(|kind| {
@@ -3400,8 +3397,8 @@ impl Runtime {
             if let Some(channel) = &place.channel {
                 status.push(
                     crate::interaction::tooltip_above(
-                        design::caption(format!("# {}", Self::short_description(channel, 24)))
-                            .wrapping(iced::widget::text::Wrapping::None),
+                        crate::ui_controls::FadeText::caption(format!("# {channel}"))
+                            .limit(CHANNEL_LABEL),
                         format!("Channel: {channel}"),
                     )
                     .into(),
@@ -3409,8 +3406,8 @@ impl Runtime {
             }
             if !place.name.is_empty() {
                 status.push(bounded(
-                    design::caption(Self::short_description(&place.name, FOOTER_LABEL))
-                        .wrapping(iced::widget::text::Wrapping::None)
+                    crate::ui_controls::FadeText::caption(place.name.clone())
+                        .limit(FOOTER_LABEL)
                         .into(),
                     &place.name,
                     "Project",
@@ -3421,9 +3418,8 @@ impl Runtime {
                 status.push(bounded(
                     widget::row::with_children(vec![
                         crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                        design::caption(Self::short_description(branch, FOOTER_LABEL))
-                            .class(cosmic::theme::Text::Custom(design::muted_text))
-                            .wrapping(iced::widget::text::Wrapping::None)
+                        crate::ui_controls::FadeText::caption(branch.clone())
+                            .limit(FOOTER_LABEL)
                             .into(),
                     ])
                     .spacing(step::GAP_XS)
@@ -4076,7 +4072,9 @@ impl Runtime {
             };
             if transitioning {
                 controls.push(bounded(
-                    design::caption(Self::short_description(&label, fit.label_limit())).into(),
+                    crate::ui_controls::FadeText::caption(label.clone())
+                        .limit(fit.label_limit())
+                        .into(),
                     &label,
                     "Model",
                     fit.label_limit(),
@@ -4166,31 +4164,25 @@ impl Runtime {
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor =
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            // Cut rather than wrapped where a narrow footer
-                            // leaves the leading group little room.
-                            design::caption(selected.map_or("Permissions", |index| {
+                let anchor = widget::button::custom(
+                    // Faded rather than wrapped where a narrow footer leaves
+                    // the leading group little room; the chevron that says
+                    // this is a picker keeps its place either way.
+                    crate::ui_controls::trailing(
+                        crate::ui_controls::FadeText::caption(
+                            selected.map_or("Permissions", |index| {
                                 permission_mode_label(&modes[index])
-                            }))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .into(),
-                            widget::icon(Icon::PanDown.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .name("Choose permission mode")
-                    .id(card_control_id(target.card, "chat-permission-picker"))
-                    .class(crate::ui_controls::control_style(open, None))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                            }),
+                        ),
+                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        step::GAP_XS,
+                    ),
+                )
+                .name("Choose permission mode")
+                .id(card_control_id(target.card, "chat-permission-picker"))
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
                 context.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -4218,12 +4210,7 @@ impl Runtime {
         // and to assistive technology, so the controls beside it keep room.
         let named = fit == FooterFit::Wide;
         let label = || -> Element<'a, Message> {
-            design::caption(accounts.current.clone())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into()
+            crate::ui_controls::FadeText::caption(accounts.current.clone()).into()
         };
         let icon = Icon::Avatar.handle();
         if transitioning || !self.choosing() {
@@ -4312,14 +4299,8 @@ impl Runtime {
                                     .into(),
                             ),
                         }
-                        let mut text: Vec<Element<'a, Message>> = vec![
-                            design::body(choice.label.clone())
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .ellipsize(iced::widget::text::Ellipsize::End(
-                                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                ))
-                                .into(),
-                        ];
+                        let mut text: Vec<Element<'a, Message>> =
+                            vec![crate::ui_controls::fade_text(choice.label.clone()).into()];
                         if !choice.detail.is_empty() {
                             text.push(
                                 design::caption(choice.detail)
@@ -4425,7 +4406,6 @@ impl Runtime {
         } else {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
-        let label = Self::short_description(&label, limit);
         let anchor = widget::button::custom(
             widget::row::with_children(
                 std::iter::once(
@@ -4436,8 +4416,8 @@ impl Runtime {
                     .into(),
                 )
                 .chain(named.then(|| {
-                    design::caption(label)
-                        .wrapping(iced::widget::text::Wrapping::None)
+                    crate::ui_controls::FadeText::caption(label)
+                        .limit(limit)
                         .into()
                 }))
                 .chain(std::iter::once(
@@ -5515,7 +5495,7 @@ impl Runtime {
             if long {
                 widget::column::with_children(vec![
                     text,
-                    disclosure::row_on(
+                    disclosure::row(
                         if expanded { "Show less" } else { "Show more" }.into(),
                         if expanded { "Show less" } else { "Show more" }.into(),
                         Icon::Chat,
@@ -5523,7 +5503,6 @@ impl Runtime {
                         None,
                         Some(expanded),
                         Some(Action::Toggle(self.target, item.id.clone())),
-                        design::accent_wash,
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -5816,7 +5795,7 @@ impl Runtime {
                 "Thinking".to_owned()
             };
             let name = format!("Reasoning: {label}");
-            let header = disclosure::row_on(
+            let header = disclosure::row(
                 label,
                 name,
                 Icon::Agent,
@@ -5824,13 +5803,6 @@ impl Runtime {
                 elapsed,
                 has_text.then_some(expanded),
                 has_text.then(|| Action::Toggle(target, item.id.clone())),
-                move |theme| {
-                    if expanded {
-                        design::sunken(theme)
-                    } else {
-                        theme.current_container().base.into()
-                    }
-                },
             );
             let mut rows = vec![header];
             if expanded {

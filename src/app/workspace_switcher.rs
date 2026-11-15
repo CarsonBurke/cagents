@@ -51,6 +51,27 @@ pub(super) struct Row {
     pub(super) place: String,
 }
 
+impl Row {
+    /// Which end of the name gives way: a repository outside any project is
+    /// named by its path, which is told apart by its end.
+    fn name_edge(&self) -> crate::ui_controls::FadeEdge {
+        if self.project.is_none() {
+            self.place_edge()
+        } else {
+            crate::ui_controls::FadeEdge::End
+        }
+    }
+
+    /// Which end of the place gives way: a repository's place is its path.
+    fn place_edge(&self) -> crate::ui_controls::FadeEdge {
+        if matches!(self.action, SidebarAction::OpenRepository { .. }) {
+            crate::ui_controls::FadeEdge::Start
+        } else {
+            crate::ui_controls::FadeEdge::End
+        }
+    }
+}
+
 /// The pane of the highlighted workspace its preview shows, read when the
 /// selection moves.
 #[derive(Debug, Default)]
@@ -110,7 +131,7 @@ fn composite(under: iced::Color, over: iced::Color) -> iced::Color {
     }
 }
 
-/// The panel's background, which a row's text fades into.
+/// The panel's background, which the scrolled list and the footer fade into.
 fn panel_color(theme: &Theme) -> iced::Color {
     theme.current_container().component.base.into()
 }
@@ -963,16 +984,15 @@ impl Cagents {
             },
             sidebar::project_chip,
         );
-        let fade = move |theme: &Theme| row_color(theme, selected);
         let text = widget::column::with_children(vec![
-            crate::interaction::fade_overflow(
-                design::body(row.name.as_str()).wrapping(iced::widget::text::Wrapping::None),
-                fade,
-            ),
-            crate::interaction::fade_overflow(
-                design::caption(row.place.as_str()).wrapping(iced::widget::text::Wrapping::None),
-                fade,
-            ),
+            crate::ui_controls::fade_text(row.name.as_str())
+                .edge(row.name_edge())
+                .width(Length::Fill)
+                .into(),
+            crate::ui_controls::FadeText::caption(row.place.as_str())
+                .edge(row.place_edge())
+                .width(Length::Fill)
+                .into(),
         ])
         .spacing(space::XXS)
         .width(Length::Fill);
@@ -1116,10 +1136,9 @@ impl Cagents {
         };
         if let Some(caption) = caption {
             children.push(
-                widget::container(crate::interaction::fade_overflow(
-                    design::caption(caption).wrapping(iced::widget::text::Wrapping::None),
-                    panel_color,
-                ))
+                widget::container(
+                    crate::ui_controls::FadeText::caption(caption).width(Length::Fill),
+                )
                 .padding([space::XS, space::M])
                 .width(Length::Fill)
                 .into(),
