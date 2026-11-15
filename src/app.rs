@@ -31620,7 +31620,7 @@ mod tests {
     #[test]
     fn hidden_checkouts_reveal_and_open_a_pane_by_its_row() {
         let (mut app, card, channel) = attention_channel_test_app();
-        app.context_inspector_open = false;
+        app.pane_inspectors = pane_inspector::PaneInspectors::default();
         let card_row = sidebar::SelectionRow::Card(card);
         let (project, worktree) = add_attention_worktree(&mut app, card, channel);
         app.sidebar_state
