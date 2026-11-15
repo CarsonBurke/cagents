@@ -1291,7 +1291,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        rows.push(self.failure_diagnostics_on(incident, design::sunken));
+        rows.push(self.failure_diagnostics(incident));
         widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
@@ -1308,18 +1308,10 @@ impl Runtime {
         .into()
     }
     pub(super) fn failure_diagnostics(&self, incident: &Incident) -> Element<'static, Message> {
-        self.failure_diagnostics_on(incident, |theme| theme.current_container().base.into())
-    }
-
-    fn failure_diagnostics_on(
-        &self,
-        incident: &Incident,
-        surface: fn(&cosmic::Theme) -> iced::Color,
-    ) -> Element<'static, Message> {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut rows = Vec::new();
-        rows.push(disclosure::row_on(
+        rows.push(disclosure::row(
             if open { "Hide details" } else { "Details" }.to_owned(),
             format!(
                 "{} technical details for {}",
@@ -1331,7 +1323,6 @@ impl Runtime {
             None,
             Some(open),
             Some(Action::ToggleFailure(target, incident.key.clone())),
-            surface,
         ));
         rows.push(
             crate::ui_controls::button::quiet("Copy details")

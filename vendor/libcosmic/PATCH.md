@@ -34,3 +34,29 @@ own button does.
 The application regressions raise a tooltip and a popover from a control in an
 offset `button::custom` and check that each overlay is anchored to its control,
 with any ancestor translation applied once.
+
+# Text input cursors stop blinking
+
+`TextInput` blinks with `iced_core::text::Blink` (see `vendor/iced-core`). Ten
+seconds after its last input, the cursor rests visible and the input asks for
+no more redraws. Upstream it repainted the window every 500 ms for as long as it
+kept focus. Typing, a click, an input-method commit or returning to the window
+restarts the blink; the last is new, since upstream's blink never stopped.
+It reads the schedule through `Blink::current()`, so the desktop's blink
+interval and timeout apply, and a desktop that turns blinking off holds the
+cursor steady.
+
+# Disabled buttons are not focus stops
+
+`Button::operate` reported every button to focus operations as a stop, so Tab
+and Shift+Tab landed on buttons without `on_press` or `on_press_down`, which
+nothing can activate. A disabled button now reports its focus state through a
+wrapper whose `Focusable::is_focus_stop` is false (see
+`vendor/iced-core/README.cagents.md`), so traversal passes it over. It is still
+reported, because the app locates buttons such as a selected tab through focus
+operations. A button disabled while focused keeps its focus, as Refresh does
+while it runs, and Tab moves on from it.
+
+The application regression `disabled_buttons_are_not_focus_stops` in
+`src/ui_controls/button.rs` covers traversal in both directions, locating, and
+disabling a focused button.

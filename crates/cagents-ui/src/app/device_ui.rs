@@ -24,6 +24,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::SearchChanged(_)
             | SidebarAction::SetFilter(_)
             | SidebarAction::HideReadAttention
+            | SidebarAction::ToggleInProgress
             | SidebarAction::ToggleControls
             | SidebarAction::OpenFirstSearchResult
             | SidebarAction::FocusFirstSearchResult
@@ -32,6 +33,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::ScrollProjects(_)
             | SidebarAction::NavigateRow { .. }
             | SidebarAction::OpenChannel { .. }
+            | SidebarAction::OpenCard { .. }
             | SidebarAction::SelectRows { .. }
             | SidebarAction::ClearRowSelection
             | SidebarAction::OpenRepository { .. }
@@ -952,7 +954,7 @@ impl Cagents {
                     );
                 }
                 rows.push(
-                    widget::container(
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::column::with_children(choices)
                                 .padding(design::with_vertical_rail(Padding::ZERO)),
@@ -961,7 +963,9 @@ impl Cagents {
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
+                        // The chooser is a popover, on the elevated surface.
+                        design::component_base,
+                    ))
                     .max_height(280)
                     .into(),
                 );
@@ -1114,12 +1118,15 @@ impl Cagents {
             && !state.directory.as_os_str().is_empty()
         {
             rows.push(crate::interaction::tooltip(
-                design::caption(format!("Current: {}", state.directory.display()))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill),
+                widget::row::with_children(vec![
+                    design::caption("Current:").into(),
+                    crate::ui_controls::FadeText::caption(state.directory.display().to_string())
+                        .edge(crate::ui_controls::FadeEdge::Start)
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .width(Length::Fill),
                 format!(
                     "File and Git operations use {} until navigation succeeds",
                     state.directory.display()
@@ -1173,11 +1180,7 @@ impl Cagents {
                                 widget::icon(glyph.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
-                                design::body(&entry.name)
-                                    .wrapping(iced::widget::text::Wrapping::None)
-                                    .ellipsize(iced::widget::text::Ellipsize::End(
-                                        EllipsizeHeightLimit::Lines(1),
-                                    ))
+                                crate::ui_controls::fade_text(&entry.name)
                                     .width(Length::Fill)
                                     .into(),
                             ])
@@ -1873,6 +1876,7 @@ mod tests {
             SidebarAction::SearchChanged(String::new()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
             SidebarAction::HideReadAttention,
+            SidebarAction::ToggleInProgress,
             SidebarAction::ToggleControls,
             SidebarAction::FocusFirstSearchResult,
             SidebarAction::OpenFirstSearchResult,

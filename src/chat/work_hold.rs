@@ -26,8 +26,10 @@ pub struct WorkHold {
 /// A subagent as a person knows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldSubagent {
-    /// The first line of its task, else its name. Empty when whoever reported
-    /// it knew neither, as a retained helper from before names were reported.
+    /// What its tab calls it: its name, which a provider fills with its task
+    /// when it has none, else the first line of its task. Empty when whoever
+    /// reported it knew neither, as a retained helper from before names were
+    /// reported.
     pub name: String,
     /// It finished its own turn and waits on background work it started.
     pub waiting: bool,
@@ -35,7 +37,7 @@ pub struct HeldSubagent {
 
 impl HeldSubagent {
     pub fn of(agent: &Subagent) -> Self {
-        let name = [agent.description.as_str(), agent.kind.as_str()]
+        let name = [agent.kind.as_str(), agent.description.as_str()]
             .into_iter()
             .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
             .unwrap_or("Subagent");
@@ -297,12 +299,18 @@ mod tests {
         snapshot.subagents = vec![
             subagent(
                 "toolu_1",
-                "general-purpose",
+                "",
                 "\n Start the dev server\nThen wait",
                 ToolStatus::Waiting,
                 true,
             ),
-            subagent("toolu_2", "Explore", "", ToolStatus::Running, true),
+            subagent(
+                "toolu_2",
+                " Scout ",
+                "Map the parser",
+                ToolStatus::Running,
+                true,
+            ),
             subagent(
                 "toolu_3",
                 "Explore",
@@ -316,7 +324,7 @@ mod tests {
         assert!(!hold.turn);
         assert_eq!(
             hold.subagents,
-            [agent("Start the dev server", true), agent("Explore", false)]
+            [agent("Start the dev server", true), agent("Scout", false)]
         );
         assert_eq!(
             hold.beyond_turn().count(),

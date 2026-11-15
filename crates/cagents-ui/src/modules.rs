@@ -11,6 +11,7 @@ pub mod automation_ui;
 #[cfg(feature = "integrated-browser")]
 pub mod browser;
 pub mod capability;
+pub(crate) mod desktop_cursor_blink;
 pub mod diff_view;
 pub mod document_render;
 pub mod editor;

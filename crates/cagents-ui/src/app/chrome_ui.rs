@@ -1887,6 +1887,57 @@ impl Cagents {
         self.focus_popup_control(ring)
     }
 
+    /// The sidebar row that shows the focused pane `card`, made visible:
+    /// the pane's own row while the Attention list draws it, otherwise the
+    /// row of the channel, checkout or folder the pane is in, revealed in
+    /// the unfiltered list, which draws no pane rows.
+    pub(super) fn reveal_card_row(&mut self, card: CardId) -> Option<sidebar::SelectionRow> {
+        // Unfold only the section that holds the row: a project or In
+        // progress folded for other reasons stays as the user left it.
+        if let Some(shown_on) = self.sidebar_state.attention_card_row(card) {
+            let row = sidebar::SelectionRow::Card(shown_on);
+            match sidebar::attention_place(
+                &self.sidebar_model,
+                &self.sidebar_state,
+                self.projects_sidebar_mode() == SidebarMode::Compact,
+                row,
+            ) {
+                Some(sidebar::AttentionPlace::Project(project)) => {
+                    self.sidebar_state.expand_project(project);
+                }
+                Some(sidebar::AttentionPlace::InProgress) => {
+                    self.sidebar_state.unfold_in_progress();
+                }
+                None => {}
+            }
+            if self.visible_sidebar_rows().contains(&row) {
+                return Some(row);
+            }
+        }
+        let destination = self.active_workspace_destination()?;
+        let (project, row) = self.sidebar_model.projects.iter().find_map(|project| {
+            let row = match destination {
+                WorkspaceDestination::Channel(id)
+                    if project.channels.iter().any(|channel| channel.id == id) =>
+                {
+                    sidebar::SelectionRow::Channel(id)
+                }
+                WorkspaceDestination::Worktree(id)
+                    if project.worktrees.iter().any(|worktree| worktree.id == id) =>
+                {
+                    sidebar::SelectionRow::Worktree(project.id, id)
+                }
+                WorkspaceDestination::Folder(id) if project.id == id => {
+                    sidebar::SelectionRow::Project(id)
+                }
+                _ => return None,
+            };
+            Some((project.id, row))
+        })?;
+        self.sidebar_state.reveal_project(project);
+        Some(row)
+    }
+
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
         if self.modal_is_open() && !matches!(action, Action::Close) {
             return Task::none();
@@ -1984,6 +2035,7 @@ impl Cagents {
                     .map(|card| self.card_display_title(card).to_owned())
                     .unwrap_or(title);
                 let _ = self.workspace.rename_card(id, presentation);
+                self.refresh_attention_card_rows();
                 self.persist();
                 restore.chain(self.save_settings_task(false))
             }
@@ -2040,28 +2092,7 @@ impl Cagents {
                 }
                 let overlay = self.sync_context_overlay_state();
                 self.synchronize_sidebar_selection();
-                let destination = self.active_workspace_destination();
-                let target = self.sidebar_model.projects.iter().find_map(|project| {
-                    let row = match destination {
-                        Some(WorkspaceDestination::Channel(id))
-                            if project.channels.iter().any(|channel| channel.id == id) =>
-                        {
-                            sidebar::SelectionRow::Channel(id)
-                        }
-                        Some(WorkspaceDestination::Worktree(id))
-                            if project.worktrees.iter().any(|worktree| worktree.id == id) =>
-                        {
-                            sidebar::SelectionRow::Worktree(project.id, id)
-                        }
-                        Some(WorkspaceDestination::Folder(id)) if project.id == id => {
-                            sidebar::SelectionRow::Project(id)
-                        }
-                        _ => return None,
-                    };
-                    Some((project.id, row))
-                });
-                if let Some((project, row)) = target {
-                    self.sidebar_state.reveal_project(project);
+                if let Some(row) = self.reveal_card_row(id) {
                     self.persist();
                     let reveal = if self.context_inspector_is_overlay() {
                         Task::none()
@@ -2483,16 +2514,18 @@ impl Cagents {
                 widget::row::with_children(navigation)
                     .spacing(space::S)
                     .into(),
-                widget::scrollable(
-                    widget::column::with_children(entries)
-                        .spacing(space::XS)
-                        .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Shrink)
-                .into(),
+                crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(entries)
+                            .spacing(space::XS)
+                            .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .height(Length::Shrink),
+                    design::component_base,
+                ),
             ])
             .spacing(space::S),
         )
@@ -2595,21 +2628,23 @@ impl Cagents {
                         widget::container(heading)
                             .padding(iced::Padding::new(6.0).bottom(0.0))
                             .into(),
-                        widget::scrollable(
-                            widget::column::with_children(notices)
-                                .spacing(space::M)
-                                // Each notice ends in a Dismiss control on its
-                                // right edge, which the floating thumb would
-                                // otherwise cover.
-                                .padding(design::with_vertical_rail(
-                                    iced::Padding::new(6.0).top(0.0),
-                                )),
-                        )
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Shrink)
-                        .into(),
+                        crate::interaction::overflow_fade_y(
+                            widget::scrollable(
+                                widget::column::with_children(notices)
+                                    .spacing(space::M)
+                                    // Each notice ends in a Dismiss control on
+                                    // its right edge, which the floating thumb
+                                    // would otherwise cover.
+                                    .padding(design::with_vertical_rail(
+                                        iced::Padding::new(6.0).top(0.0),
+                                    )),
+                            )
+                            .direction(iced::widget::scrollable::Direction::Vertical(
+                                design::scrollbar(),
+                            ))
+                            .height(Length::Shrink),
+                            design::component_base,
+                        ),
                     ])
                     .spacing(space::S),
                 )
@@ -3031,11 +3066,7 @@ impl Cagents {
         };
         let mut title_children = vec![
             self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-            design::body(visible_title)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
+            crate::ui_controls::fade_text(visible_title)
                 .width(Length::Fill)
                 .into(),
         ];
