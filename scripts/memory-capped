@@ -4,6 +4,7 @@ early instead of filling the host's memory and swap. Without a working scope
 the command runs anyway, uncapped, with a note."""
 import ctypes
 import os
+import shlex
 import re
 import signal
 import subprocess
@@ -13,9 +14,15 @@ import time
 PROGRAM = "memory-capped"
 DEFAULT_MAX = "16G"
 DEFAULT_SWAP_MAX = "4G"
-USAGE = f"""usage: {PROGRAM} [--name NAME] COMMAND [ARGUMENT...]
+USAGE = f"""usage: {PROGRAM} [--name NAME] [--slice SLICE] [--stop-leftovers] COMMAND [ARGUMENT...]
 
 NAME is what to call COMMAND if it goes over the limit (default: its file name).
+SLICE is the systemd slice its scope goes in, such as app-cagents-test.slice
+(default: the user manager's).
+--stop-leftovers stops whatever COMMAND left running in its scope once it
+exits, such as a daemon a test started and never stopped, and names each
+process on stderr and in $XDG_STATE_HOME/cagents/leftover-processes.log, so
+the command that leaked it can be fixed.
 
 Environment:
   CAGENTS_MEMORY_MAX       Memory limit for COMMAND and its children, such as
@@ -31,6 +38,8 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 PR_SET_PDEATHSIG = 1
 UNIT_PREFIX = "cagents-capped-"
+# Seconds a process the command left gets to end by itself.
+LEFTOVER_GRACE = 1
 # A fixture or a nested session replaces these, which hides the user manager
 # from systemd's tools. The command gets them back inside its scope.
 MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
@@ -91,8 +100,10 @@ def run_as_is(command):
         return 127
 
 
-def scope_command(unit, limit, swap):
-    return ["systemd-run", "--user", "--scope", "--quiet", *unit,
+def scope_command(unit, limit, swap, slice_=None):
+    # systemd-run would otherwise expand $NAME and $$ in the command itself.
+    return ["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", *unit,
+            *([f"--slice={slice_}"] if slice_ else []),
             f"--property=MemoryMax={limit}", f"--property=MemorySwapMax={swap}",
             "--property=OOMPolicy=stop", "--property=TimeoutStopSec=5", "--"]
 
@@ -137,6 +148,68 @@ def went_over(unit, killed):
     return result.stdout.strip() == "oom-kill"
 
 
+def leftovers(unit):
+    """The processes still in the unit's scope, each with its age in seconds
+    and command line."""
+    try:
+        group = subprocess.run(["systemctl", "--user", "show", unit, "--property=ControlGroup", "--value"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                               env=manager_environment()).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not group:
+        return []  # The scope ended with its last process.
+    found = []
+    for directory, _, _ in os.walk(f"/sys/fs/cgroup{group}"):
+        try:
+            with open(os.path.join(directory, "cgroup.procs")) as file:
+                pids = [int(line) for line in file]
+        except OSError:
+            continue
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as file:
+                    arguments = [part.decode(errors="replace") for part in file.read().split(b"\0")[:-1]]
+                with open(f"/proc/{pid}/stat") as file:
+                    started = int(file.read().rsplit(")", 1)[1].split()[19])
+                with open("/proc/uptime") as file:
+                    uptime = float(file.read().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            found.append((pid, round(uptime - started / os.sysconf("SC_CLK_TCK")), arguments))
+    return found
+
+
+def stop_leftovers(unit, name):
+    """Stops what the command left in its scope, saying what that was. A
+    process already on its way out gets a moment to finish."""
+    deadline = time.monotonic() + LEFTOVER_GRACE
+    while (left := leftovers(unit)) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if not left:
+        return
+    lines = [f"pid {pid}, up {age}s: {shlex.join(arguments) or '?'}" for pid, age, arguments in left]
+    them = "them" if len(left) > 1 else "it"
+    print(f"{PROGRAM}: {name} left {len(left)} process{'es' if len(left) > 1 else ''} running "
+          f"after it exited; stopping {them}. Whatever started {them} should stop {them}:", file=sys.stderr)
+    for line in lines:
+        print(f"{PROGRAM}:   {line}", file=sys.stderr)
+    try:
+        state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        os.makedirs(os.path.join(state, "cagents"), exist_ok=True)
+        with open(os.path.join(state, "cagents", "leftover-processes.log"), "a") as log:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            log.write(f"{stamp} {unit} in {os.getcwd()}: {name}\n")
+            log.writelines(f"  {line}\n" for line in lines)
+    except OSError:
+        pass
+    try:
+        subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30, env=manager_environment())
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def amount(size):
     return f"{size // 2**30} GiB" if size % 2**30 == 0 else f"{size // 2**20} MiB"
 
@@ -164,12 +237,20 @@ def end_as(status):
 
 def main():
     command = sys.argv[1:]
-    name = None
-    if command[:1] == ["--name"]:
+    name = slice_ = None
+    stop_left = False
+    while command[:1] in (["--name"], ["--slice"], ["--stop-leftovers"]):
+        if command[0] == "--stop-leftovers":
+            stop_left, command = True, command[1:]
+            continue
         if len(command) < 3:
             print(USAGE, end="", file=sys.stderr)
             return 2
-        name, command = command[1], command[2:]
+        if command[0] == "--name":
+            name = command[1]
+        else:
+            slice_ = command[1]
+        command = command[2:]
     if not command or command[0] in ("-h", "--help"):
         print(USAGE, end="", file=sys.stdout if command else sys.stderr)
         return 0 if command else 2
@@ -184,7 +265,7 @@ def main():
     unit = f"{UNIT_PREFIX}{os.getpid()}-{time.monotonic_ns()}.scope"
     parent = os.getpid()
     # The command runs as this child: systemd-run execs it after making the scope.
-    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap),
+    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap, slice_),
                               *with_own_environment(command)],
                              env=manager_environment(), close_fds=False,
                              preexec_fn=lambda: follow_parent(parent))
@@ -207,6 +288,8 @@ def main():
     if went_over(unit, status == -signal.SIGKILL):
         print(over_limit_notice(name or os.path.basename(command[0]), limit, swap), file=sys.stderr)
         return 137
+    if stop_left and not interrupted:
+        stop_leftovers(unit, name or shlex.join(command))
     return end_as(status)
 
 
