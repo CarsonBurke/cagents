@@ -1501,6 +1501,33 @@ impl HostState {
         self.detach(0, source.id)
     }
 
+    /// Records what an installed worker inherits from the holder it adopted:
+    /// its lineage, whether the screen was lost, and the conversation's
+    /// resume hint. Runs whether or not its source publication succeeded, so
+    /// an original kept for recovery still resolves by every earlier source.
+    fn record_adopted_original(
+        &mut self,
+        recovery: &crate::terminal::holder::Recovery,
+        screen_lost: bool,
+        resume_hint: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        let record = self
+            .terminals
+            .get_mut(&recovery.source.id)
+            .ok_or_else(|| not_found(recovery.source.id))?;
+        record.screen_lost_after_crash = screen_lost;
+        // The worker learns a conversation's identity only from output it
+        // sees, which the previous daemon already saw.
+        if let Some(hint) = resume_hint {
+            record.session.resume_hint = Some(hint.to_owned());
+        }
+        self.adopt_upgrade_lineage(
+            &recovery.source,
+            &recovery.previous_sources,
+            &recovery.relaunches,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn finish_spawn(
         &mut self,
@@ -3303,17 +3330,17 @@ pub(super) fn restore_orphaned_holders_preserving(
             continue;
         }
         let socket = crate::terminal::holder::socket(&directory, record.terminal);
+        // What the adopted worker inherits, until it is recorded on it.
+        let mut unrecorded = None;
         let restored = (|| {
             let (recovery, screen_lost) =
                 crate::terminal::inspect_holder(&socket, &record, &proof)?;
-            let source = recovery.source.clone();
-            let previous_sources = recovery.previous_sources.clone();
-            let relaunches = recovery.relaunches.clone();
-            let mut session = source.clone();
+            let mut session = recovery.source.clone();
             session.continuity = TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
                 last_exit: None,
             };
+            unrecorded = Some((recovery.clone(), screen_lost));
             start_terminal_view(
                 host,
                 0,
@@ -3325,16 +3352,20 @@ pub(super) fn restore_orphaned_holders_preserving(
                 Some(recovery),
             )
             .map_err(|error| error.message)?;
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            state
-                .adopt_upgrade_lineage(&source, &previous_sources, &relaunches)
+            let (recovery, screen_lost) = unrecorded.take().expect("inherited before starting");
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_adopted_original(
+                    &recovery,
+                    screen_lost,
+                    recovery.source.resume_hint.as_deref(),
+                )
                 .map_err(|error| error.message)?;
-            if let Some(terminal) = state.terminals.get_mut(&record.terminal) {
-                terminal.screen_lost_after_crash = screen_lost;
-                terminal.session.resume_hint = source.resume_hint.clone();
-            }
-            drop(state);
-            restore_terminal_execution_authority(host, &source, &previous_sources)?;
+            restore_terminal_execution_authority(
+                host,
+                &recovery.source,
+                &recovery.previous_sources,
+            )?;
             Ok::<_, String>(())
         })();
         if let Err(error) = restored {
@@ -3352,11 +3383,22 @@ pub(super) fn restore_orphaned_holders_preserving(
                     "Orphan terminal {} retained its original owner after restore failed: {error}",
                     record.terminal
                 );
-                // Restoration starts the view as client 0 and lineage adoption
-                // detaches it. A failed source publication returns before that
-                // adoption, so detach here too. If the worker refuses the
-                // visibility change, detach keeps client 0 attached.
-                if let Err(detach) = state.detach(0, record.terminal) {
+                // A failed source publication returns before the inheritance is
+                // recorded. Record it now, so the original kept for recovery
+                // has the same lineage and recovery facts as one whose later
+                // restoration failed; recording it also releases client 0.
+                // Otherwise release client 0 directly: restoration starts the
+                // view attached. If the worker refuses the visibility change,
+                // detach keeps client 0 attached.
+                let released = match unrecorded.take() {
+                    Some((recovery, screen_lost)) => state.record_adopted_original(
+                        &recovery,
+                        screen_lost,
+                        recovery.source.resume_hint.as_deref(),
+                    ),
+                    None => state.detach(0, record.terminal),
+                };
+                if let Err(detach) = released {
                     tracing::warn!(terminal = %record.terminal, error = %detach.message, "failed orphan restore could not release its client 0 attachment");
                     message.push_str(&format!(
                         "; restoration could not release its attachment: {}",
@@ -3945,6 +3987,11 @@ fn adopt_carried_terminal(
                 recipe: session.launch.clone(),
                 last_exit: None,
             };
+            let hosted_before = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminals
+                .contains_key(&id);
             match start_terminal_view(
                 host,
                 0,
@@ -3957,23 +4004,10 @@ fn adopt_carried_terminal(
             ) {
                 Ok(_) => {
                     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(record) = state.terminals.get_mut(&id) {
-                        record.screen_lost_after_crash = screen_lost;
-                    }
-                    // The worker learns a conversation's identity only from
-                    // output it sees, which the previous daemon already saw.
-                    if let Some(record) = state.terminals.get_mut(&id)
-                        && terminal.source.resume_hint.is_some()
-                    {
-                        record
-                            .session
-                            .resume_hint
-                            .clone_from(&terminal.source.resume_hint);
-                    }
-                    if let Err(error) = state.adopt_upgrade_lineage(
-                        &previous.source,
-                        &previous.previous_sources,
-                        &previous.relaunches,
+                    if let Err(error) = state.record_adopted_original(
+                        &previous,
+                        screen_lost,
+                        terminal.source.resume_hint.as_deref(),
                     ) {
                         tracing::warn!(terminal = %id, error = %error.message,
                             "adopted a carried terminal but could not record its lineage");
@@ -3994,12 +4028,37 @@ fn adopt_carried_terminal(
                 }
                 Err(failure) => {
                     error = failure.message;
-                    if host
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .startup_recovery()
-                        .is_some()
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    if !hosted_before
+                        && state
+                            .terminals
+                            .get(&id)
+                            .is_some_and(|record| !record.handle.is_completed())
                     {
+                        // The holder committed to this worker before its source
+                        // publication failed. Keep this exact original for
+                        // inspection and explicit Close, with everything a
+                        // successful adoption records, and stop the restore
+                        // without restoring its execution authority.
+                        let mut message = format!(
+                            "Terminal {id} adoption retained its original owner but its source publication failed: {error}"
+                        );
+                        if let Err(lineage) = state.record_adopted_original(
+                            &previous,
+                            screen_lost,
+                            terminal.source.resume_hint.as_deref(),
+                        ) {
+                            message.push_str(&format!(
+                                "; its lineage could not be recorded: {}",
+                                lineage.message
+                            ));
+                        }
+                        tracing::warn!(terminal = %id, %error,
+                            "adopted a carried terminal whose source publication failed; recovery-only startup required");
+                        state.retain_startup_recovery(message);
+                        return true;
+                    }
+                    if state.startup_recovery().is_some() {
                         return false; // never re-adopt an ACK-ambiguous original
                     }
                 }
