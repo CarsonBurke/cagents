@@ -1310,7 +1310,9 @@ impl Runtime {
             .filter(|prompt| !prompt.is_empty())
             .cloned()
             .collect();
-        full.extend(destination.iter().cloned());
+        if let Some(destination) = &destination {
+            full.insert(0, destination.clone());
+        }
         let details = spawn_details(reading, spawn, observed_model);
         if !details.is_empty() {
             full.push(details);
@@ -1773,6 +1775,8 @@ mod identity_tests {
         // Longer than the task preview, within the channel title's limit.
         let long_task = "Review the deployment carefully. ".repeat(7);
         let long_destination = format!("in channel “{}”", long_task.trim());
+        let oversized_task = "x".repeat(TIP_CHARS + 100);
+        let oversized_preview = format!("in channel “Release” · {}…", "x".repeat(160));
         for (placed, title, task, expected) in [
             (
                 true,
@@ -1811,6 +1815,12 @@ mod identity_tests {
                 Some(long_task.trim()),
                 long_task.as_str(),
                 long_destination.as_str(),
+            ),
+            (
+                true,
+                Some("Release"),
+                oversized_task.as_str(),
+                oversized_preview.as_str(),
             ),
         ] {
             let spawn = Spawn {
