@@ -1420,8 +1420,11 @@ impl RemoteActor {
             {
                 updates.push(Update::PromptAvailable);
             }
-            if (resident.outbox_latest > resident.outbox_ack
-                && resident.outbox_latest != state.outbox_latest)
+            // Conversation identity is durable daemon metadata even when no
+            // window subscribes and no semantic outcome accompanies it.
+            if identity_changed
+                || (resident.outbox_latest > resident.outbox_ack
+                    && resident.outbox_latest != state.outbox_latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -6479,6 +6482,29 @@ exec /bin/sleep 60
         assert!(closed.completed);
         assert_eq!(closed.active_model_revision, 6);
         assert_eq!(closed.active_model, newer.active_model);
+    }
+
+    #[test]
+    fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
+        let mut actor = RemoteActor::fixture();
+        let (sent, received) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            sent.send(update).unwrap();
+        });
+        let mut confirmed = actor.state().as_ref().clone();
+        confirmed.confirmed_session = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(confirmed.outbox_latest, confirmed.outbox_ack);
+        assert!(actor.publish_resident(confirmed.clone()));
+        assert!(
+            received
+                .try_iter()
+                .any(|update| matches!(update, Update::RetainedOutcomes))
+        );
+        assert!(actor.publish_resident(confirmed));
+        assert!(
+            received.try_iter().next().is_none(),
+            "unchanged metadata must not churn the broker"
+        );
     }
 
     #[test]

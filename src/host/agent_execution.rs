@@ -1063,6 +1063,12 @@ fn dispatch(
             }
         }
         announce(host, &registry);
+        // Startup may capture its reply before identity publication finishes.
+        // Reconcile once more after binding, even if that confirmation's edge
+        // was already consumed while the launch was private.
+        if handle.actor_identity().is_some() {
+            super::chat::retained_actor::wake(host, session.id);
+        }
         (session, handle)
     };
     // A visible, bound startup may be closed or interrupted while a provider
