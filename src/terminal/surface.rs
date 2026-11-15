@@ -105,6 +105,17 @@ impl TerminalSurface {
         self.handle.events()
     }
 
+    /// The terminal worker's execution instance, once one is confirmed.
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.handle.set_worker_receipt_for_test(owner, worker);
+    }
+
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.handle.input(bytes)
     }

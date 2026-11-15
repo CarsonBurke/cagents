@@ -114,6 +114,19 @@ pub(super) fn pinned_terminals(
     Ok(pinned)
 }
 
+pub(super) fn read_generation(
+    db: &Connection,
+    terminal: TerminalId,
+) -> Result<Option<String>, String> {
+    db.query_row(
+        "SELECT generation FROM terminal_retention_pins WHERE terminal=?1",
+        [terminal.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 impl Registry {
     /// A pin only defers retiring a worker alive on this boot. A process crash
     /// keeps a committed WAL frame in the OS, and power loss ends the worker
@@ -169,14 +182,7 @@ impl Registry {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)
             .map_err(|error| error.to_string())?;
         schema::require_current(&tx)?;
-        let generation = tx
-            .query_row(
-                "SELECT generation FROM terminal_retention_pins WHERE terminal=?1",
-                [terminal.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
+        let generation = read_generation(&tx, terminal)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(generation)
     }

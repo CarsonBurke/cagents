@@ -4,6 +4,7 @@ use crate::workspace_model::{
     views::{Change, Scope, View},
 };
 
+pub(in crate::host::model) mod bindings;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, operation_seen, read};
 
@@ -187,7 +188,7 @@ fn write_terminal_source(
     Ok(())
 }
 
-fn update_terminal_source(
+pub(super) fn update_terminal_source(
     db: &Connection,
     id: crate::model::CardId,
     claimed_before: &crate::model::CardKind,
@@ -594,11 +595,22 @@ pub(super) fn apply_recorded(
         if matches!(
             edit,
             ModelEdit::ChangeView {
-                change: Change::Transfer { .. },
+                change: Change::Transfer { .. } | Change::RemoveSource { .. },
                 ..
             }
         ) {
-            return Err("The source view is no longer open".into());
+            return Err(if matches!(
+                edit,
+                ModelEdit::ChangeView {
+                    change: Change::RemoveSource { .. },
+                    ..
+                }
+            ) {
+                Registry::VIEW_REMOVAL_CONFLICT
+            } else {
+                "The source view is no longer open"
+            }
+            .into());
         }
         return Ok(false);
     }
@@ -641,11 +653,37 @@ pub(super) fn apply_recorded(
             change,
             ..
         } => {
+            if let Change::RemoveSource {
+                registry,
+                repository,
+                ..
+            } = change
+            {
+                let identity: String = transaction
+                    .query_row("SELECT identity FROM metadata WHERE key=0", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| error.to_string())?;
+                if *registry == crate::workspace_model::NO_REGISTRY
+                    || identity != registry.to_string()
+                    || project(transaction, scope)? != *repository
+                {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                }
+            }
             if operation_seen(transaction, *operation)? {
                 return Ok(false);
             }
             if view.revision != *expected_revision {
                 return Err(Registry::VIEW_REVISION_CONFLICT.into());
+            }
+            if let Change::UpdateTerminalSource { before, worker, .. } = change {
+                if bindings::read(transaction, before.id)?
+                    .and_then(|b| b.basis)
+                    .is_some_and(|original| &original != worker)
+                {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                }
             }
             changed = match change {
                 Change::Transfer {
@@ -699,7 +737,8 @@ pub(super) fn apply_recorded(
                     }
                     view.apply(change)?
                 }
-                Change::Update { before, pane } => {
+                Change::Update { before, pane }
+                | Change::UpdateTerminalSource { before, pane, .. } => {
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
                     // separately against the authoritative pane.
@@ -737,6 +776,29 @@ pub(super) fn apply_recorded(
                     }
                     changed
                 }
+                Change::RemoveSource {
+                    before, capture, ..
+                } => {
+                    if matches!(before.kind, crate::model::CardKind::Terminal(_))
+                        && capture.is_none()
+                    {
+                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    }
+                    if let Some(capture) = capture {
+                        if capture.scope != *scope || capture.before != *before {
+                            return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                        }
+                        bindings::captured(transaction, capture, None)?;
+                    }
+                    if owner(transaction, before.id)?.as_ref() != Some(scope) {
+                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    }
+                    let changed = view.apply(change)?;
+                    if changed {
+                        recorder.closed.push(before.id);
+                    }
+                    changed
+                }
                 _ => view.apply(change)?,
             };
             store::record_operation(transaction, *operation, scope_row)?;
@@ -753,6 +815,21 @@ pub(super) fn apply_recorded(
         // Remove/SeedView record closure intent while applying it. Transfers
         // retire their source placement without closing its identity.
         write_from(transaction, &stored, &view, recorder)?;
+        if let ModelEdit::ChangeView {
+            change: Change::UpdateTerminalSource { pane, worker, .. },
+            ..
+        } = edit
+        {
+            let binding =
+                bindings::read(transaction, pane.id)?.ok_or(Registry::VIEW_SOURCE_CONFLICT)?;
+            bindings::write(
+                transaction,
+                pane,
+                binding.birth_sequence,
+                binding.birth_revision,
+                Some(worker),
+            )?;
+        }
     }
     if let Some((before, target, existed)) = deferred_target {
         recorder.revised(
@@ -794,6 +871,8 @@ impl Registry {
     }
 
     pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
+    pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str =
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT;
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
@@ -858,7 +937,7 @@ fn resource_owner(
     store::resource_holder(db, pane)
 }
 
-fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
+pub(super) fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
     store::owner(db, id)
 }
 
@@ -959,6 +1038,7 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     // presentation, retirement and naming state outside the descriptor itself.
     terminal_retention::sync_view_pins(db, &view.panes)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
 }
 
@@ -1027,6 +1107,7 @@ pub(super) fn rebind_agent_pane(
     view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
 }
 
@@ -1082,7 +1163,7 @@ fn write(db: &Connection, view: &View, recorder: &mut Recorder) -> Result<(), St
 /// [`write`] from a `before` read earlier in the transaction, for a transfer:
 /// its pane row has already moved, but each view's derived state must still
 /// observe the transition from what the view held.
-fn write_from(
+pub(super) fn write_from(
     db: &Connection,
     before: &View,
     view: &View,
@@ -1132,6 +1213,7 @@ fn write_from(
     }
     // Pins hang off pane rows, so the rows come first.
     store::store(db, view)?;
+    bindings::sync(db, before, view)?;
     terminal_retention::sync_view_pins(db, &view.panes)
 }
 
@@ -1141,6 +1223,7 @@ mod tests {
     use crate::model::{BrowserId, BrowserSession, CardId, CardKind};
     use crate::workspace_model::views::Pane;
 
+    mod bindings;
     mod effects;
     fn setup() -> (Registry, tempfile::TempDir, ChannelId, ChannelId) {
         let dir = tempfile::tempdir().unwrap();
@@ -1202,6 +1285,168 @@ mod tests {
             change,
         }
     }
+    #[test]
+    fn delayed_shared_close_preserves_replacement_and_operation_receipt() {
+        let (mut registry, _, channel, _) = setup();
+        let original = pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let identity = registry.model().unwrap().identity;
+        let mut removal = edit(
+            &mut registry,
+            channel,
+            Change::RemoveSource {
+                registry: identity,
+                repository: "/repo".into(),
+                before: original.clone(),
+                terminal: None,
+                capture: None,
+            },
+        );
+        let mut replacement = original.clone();
+        replacement.kind = pane().kind;
+        let update = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: replacement.clone(),
+            },
+        );
+        registry.apply(&update).unwrap();
+        // The publisher retries a queued close against the latest revision.
+        let operation = match &mut removal {
+            ModelEdit::ChangeView {
+                expected_revision,
+                operation,
+                ..
+            } => {
+                *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+                *operation
+            }
+            _ => unreachable!(),
+        };
+        let before = registry.model().unwrap();
+        assert!(
+            registry.apply(&removal).is_err(),
+            "a delayed Close must refuse its replaced source"
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert!(!registry.view_operation_seen(operation).unwrap());
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![replacement]
+        );
+    }
+
+    #[test]
+    fn shared_close_context_scope_and_pending_start_are_atomic() {
+        for mutation in 0..4 {
+            let (mut registry, _, a, b) = setup();
+            let original = pane();
+            seed(&mut registry, a, vec![original.clone()]);
+            let identity = registry.model().unwrap().identity;
+            let mut change = Change::RemoveSource {
+                registry: identity,
+                repository: "/repo".into(),
+                before: original.clone(),
+                terminal: None,
+                capture: None,
+            };
+            match mutation {
+                0 => {
+                    if let Change::RemoveSource { registry, .. } = &mut change {
+                        *registry = Uuid::new_v4();
+                    }
+                }
+                1 => {
+                    if let Change::RemoveSource { repository, .. } = &mut change {
+                        *repository = "/other".into();
+                    }
+                }
+                2 => {
+                    let mut next = original.clone();
+                    next.pending_terminal_start = true;
+                    let update = edit(
+                        &mut registry,
+                        a,
+                        Change::Update {
+                            before: original.clone(),
+                            pane: next,
+                        },
+                    );
+                    registry.apply(&update).unwrap();
+                }
+                _ => {
+                    let transfer = edit(
+                        &mut registry,
+                        a,
+                        Change::Transfer {
+                            id: original.id,
+                            destination: Scope::Channel(b),
+                            before: None,
+                        },
+                    );
+                    registry.apply(&transfer).unwrap();
+                }
+            }
+            let removal = edit(&mut registry, a, change);
+            let before = registry.model().unwrap();
+            assert!(registry.apply(&removal).is_err(), "mutation {mutation}");
+            assert_eq!(registry.model().unwrap(), before);
+            let ModelEdit::ChangeView { operation, .. } = removal else {
+                unreachable!()
+            };
+            assert!(!registry.view_operation_seen(operation).unwrap());
+        }
+    }
+
+    #[test]
+    fn shared_close_rebases_presentation_and_replays_its_receipt() {
+        let (mut registry, _, channel, _) = setup();
+        let original = pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let change = Change::RemoveSource {
+            registry: registry.model().unwrap().identity,
+            repository: "/repo".into(),
+            before: original.clone(),
+            terminal: None,
+            capture: None,
+        };
+        let mut removal = edit(&mut registry, channel, change);
+        let mut titled = original.clone();
+        titled.title = "Peer's title".into();
+        titled.width_fraction = 0.75;
+        let update = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: titled,
+            },
+        );
+        registry.apply(&update).unwrap();
+        assert!(registry.apply(&removal).is_err());
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut removal
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+        }
+        registry.apply(&removal).unwrap();
+        let after = registry.model().unwrap();
+        registry.apply(&removal).unwrap();
+        assert_eq!(registry.model().unwrap(), after);
+        assert!(
+            after
+                .views
+                .iter()
+                .find(|view| view.scope == Scope::Channel(channel))
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+    }
+
     #[test]
     fn view_listings_read_each_view_whole_and_occupied_skips_emptied_views() {
         let (mut r, _, a, b) = setup();

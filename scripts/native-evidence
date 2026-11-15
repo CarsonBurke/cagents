@@ -514,54 +514,7 @@ seeded_home_identity() {
 }
 
 restore_seed_in_place() {
-    # Older rsync receivers cannot open an owned read-only file for an
-    # in-place update. Lend write permission only to regular files the seed
-    # needs to update; archive mode restores their exact saved permissions.
-    # Neither the walk nor chmod follows fixture symlinks.
-    /usr/bin/python3 - "$seed" "$fixture" <<'PY'
-import os
-import stat
-import subprocess
-import sys
-from pathlib import Path
-
-seed, fixture = map(Path, sys.argv[1:])
-lent = []
-restored = False
-try:
-    for directory, _, names in os.walk(fixture, followlinks=False):
-        for name in names:
-            path = Path(directory) / name
-            current = path.lstat()
-            if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
-                    or current.st_mode & stat.S_IWUSR):
-                continue
-            try:
-                saved = (seed / path.relative_to(fixture)).lstat()
-            except FileNotFoundError:
-                continue
-            if (stat.S_ISREG(saved.st_mode)
-                    and (current.st_size, current.st_mtime_ns) != (saved.st_size, saved.st_mtime_ns)):
-                path.chmod(stat.S_IMODE(current.st_mode) | stat.S_IWUSR, follow_symlinks=False)
-                lent.append((path, current))
-    result = subprocess.run([
-        "rsync", "-aH", "--inplace", "--delete", "--force", "--", f"{seed}/", f"{fixture}/",
-    ])
-    if result.returncode:
-        raise SystemExit(result.returncode)
-    restored = True
-finally:
-    if not restored:
-        # A failed restore must not leave its existing files writable. Avoid
-        # changing a file that rsync removed or replaced before it failed.
-        for path, original in lent:
-            try:
-                current = path.lstat()
-            except FileNotFoundError:
-                continue
-            if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
-                path.chmod(stat.S_IMODE(original.st_mode), follow_symlinks=False)
-PY
+    /usr/bin/python3 -I "$tool_root/scripts/native-evidence-seed.py" "$seed" "$fixture"
 }
 
 prepare_fixture() {
@@ -1098,15 +1051,36 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=() runner_instance=() window_arguments=() runner_lane=(--browserless)
+    local status=0 stage_environment=() runner_instance=() runner_lifecycle=() window_arguments=() runner_lane=(--browserless)
     [ "$lane" != integrated ] || runner_lane=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "$slot" ] || window_arguments=(-- --window "$slot")
+    # A new evidence session must use the matched daemon just built. Additional
+    # windows and UI-only relaunches deliberately retain that session's actors.
+    if [ -z "$slot" ] && [ ! -e "$state/replaying" ]; then
+        runner_lifecycle=(--fresh-daemon)
+    fi
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
         # Start the isolated daemon as User before adding the synthetic caller
         # to the UI runner. It must not inherit even this invalid capability.
+        if [ "${#runner_lifecycle[@]}" -gt 0 ]; then
+            if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon stop-for-rebuild --including-subagents; then
+                printf 'could not reset the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+                return 1
+            fi
+            local scoped_socket="$runtime/cagents-development${instance_name:+-$instance_name}/cagentsd.sock" remaining=100
+            while [ -e "$scoped_socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf 'the scoped fixture daemon did not stop within 5 seconds\n' >"$state/failed"
+                    return 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
+        fi
+        runner_lifecycle=()
         if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
             printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
             return 1
@@ -1118,7 +1092,7 @@ run_app() {
     )
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" \
+        scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" "${runner_lifecycle[@]}" \
             --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then

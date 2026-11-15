@@ -1696,6 +1696,96 @@ impl ControlClient {
         }
     }
 
+    pub fn terminal_removal_basis(
+        &mut self,
+        source: crate::model::TerminalSession,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadTerminalRemovalBasis { source })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("terminal removal basis", &response)),
+        }
+    }
+
+    pub fn captured_terminal_removal_basis(
+        &mut self,
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadCapturedTerminalRemovalBasis { capture })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("captured terminal source", &response)),
+        }
+    }
+
+    pub fn close_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        self.close_captured_terminal_source(session, basis, completed_only, allow_active, None)
+    }
+
+    pub fn close_captured_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let terminal_id = session.id;
+        if !completed_only {
+            if let Err(error) = self.attach_and_synchronize(terminal_id) {
+                // The cleanup request has not been sent. Keep disappearance
+                // distinct from an unconfirmed reply after cleanup admission.
+                return Err(match error {
+                    ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        retryable: false,
+                        ..
+                    } => ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                        retryable: false,
+                    },
+                    error => error,
+                });
+            }
+        }
+        let request = ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+            capture,
+        };
+        let result = (if completed_only {
+            self.request_with_deadline(request, Instant::now() + CHAT_CLOSE_TIMEOUT)
+        } else {
+            self.request_attached_with_deadline(
+                request,
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+        })
+        .and_then(|response| match response {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id: actual,
+                outcome,
+            } if actual == terminal_id => Ok(outcome),
+            response => Err(unexpected_response(
+                "a source-checked terminal close",
+                &response,
+            )),
+        });
+        if completed_only || matches!(result, Ok(terminal::ipc::TerminalCloseResult::Closed)) {
+            result
+        } else {
+            self.finish_attachment(terminal_id, result)
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,
@@ -2028,7 +2118,11 @@ impl ControlClient {
                 });
             }
             match envelope.message {
-                ServerMessage::Redraw {
+                ServerMessage::TerminalWorker {
+                    terminal_id: actual,
+                    ..
+                }
+                | ServerMessage::Redraw {
                     terminal_id: actual,
                     ..
                 }
@@ -2304,6 +2398,7 @@ impl ControlClient {
     /// request they interrupt.
     fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
         match message {
+            ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -2572,7 +2667,8 @@ fn response_from_message(message: ServerMessage) -> Result<ServerResponse, Contr
 
 fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
     match message {
-        ServerMessage::Redraw { terminal_id, .. }
+        ServerMessage::TerminalWorker { terminal_id, .. }
+        | ServerMessage::Redraw { terminal_id, .. }
         | ServerMessage::Snapshot { terminal_id, .. }
         | ServerMessage::TerminalObserved { terminal_id, .. }
         | ServerMessage::Event { terminal_id, .. } => *terminal_id == expected,
@@ -2599,6 +2695,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
 
 fn message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::TerminalWorker { .. } => "terminal_worker",
         ServerMessage::Response { .. } => "response",
         ServerMessage::Redraw { .. } => "redraw",
         ServerMessage::Snapshot { .. } => "snapshot",
@@ -2626,6 +2723,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::TerminalRemovalBasis(_) => "terminal_removal_basis",
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
@@ -8557,6 +8655,14 @@ mod tests {
         checked: bool,
         case: &str,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        public_terminal_close_exchange_source(checked, case, false)
+    }
+
+    fn public_terminal_close_exchange_source(
+        checked: bool,
+        case: &str,
+        source_checked: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
         fn reply(
             stream: &mut UnixStream,
@@ -8606,6 +8712,13 @@ mod tests {
             None,
         );
         let id = terminal.session.id;
+        let source = terminal.session.clone();
+        let basis = crate::workspace_model::views::TerminalRemovalBasis::Worker {
+            owner: pinned.clone(),
+            instance: uuid::Uuid::new_v4(),
+        };
+        let peer_source = source.clone();
+        let peer_basis = basis.clone();
         let case = case.to_owned();
         let peer_case = case.clone();
         let server = thread::spawn(move || {
@@ -8626,6 +8739,28 @@ mod tests {
                     after_event_sequence: 0,
                 } if terminal_id == id
             ));
+            if peer_case == "attach-missing" {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(2),
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalNotFound,
+                        "fixture terminal disappeared before Attach",
+                        false,
+                    )),
+                );
+                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(3),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed { terminals: vec![] },
+                    },
+                );
+                return;
+            }
             reply(
                 &mut server_stream,
                 &pinned,
@@ -8647,7 +8782,15 @@ mod tests {
             let close = request(&mut server_stream, &pinned, 3);
             assert_eq!(
                 close,
-                if checked {
+                if source_checked {
+                    ClientRequest::CloseTerminalSource {
+                        session: peer_source,
+                        basis: peer_basis,
+                        completed_only: false,
+                        allow_active: false,
+                        capture: None,
+                    }
+                } else if checked {
                     ClientRequest::CloseTerminalChecked {
                         terminal_id: id,
                         allow_active: false,
@@ -8698,6 +8841,17 @@ mod tests {
                 "wrong-request" => envelope.request_id = Some(999),
                 _ => {}
             }
+            if source_checked {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    None,
+                    ServerMessage::Redraw {
+                        terminal_id: id,
+                        generation: 1,
+                    },
+                );
+            }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
             if !matches!(peer_case.as_str(), "closed" | "late-closed") {
@@ -8742,7 +8896,9 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let result = if checked {
+        let result = if source_checked {
+            client.close_terminal_source(source, basis, false, false)
+        } else if checked {
             client.close_terminal_checked(id, false)
         } else {
             client
@@ -8754,6 +8910,19 @@ mod tests {
         }
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn source_checked_terminal_close_accepts_streaming_before_its_reply() {
+        for case in ["closed", "active", "unknown", "remote-error"] {
+            let result = public_terminal_close_exchange_source(true, case, true);
+            assert_eq!(result.is_ok(), case != "remote-error", "{case}: {result:?}");
+        }
+        assert!(
+            matches!(public_terminal_close_exchange_source(true, "attach-missing", true),
+            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, message, retryable: false })
+                if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT)
+        );
     }
 
     #[test]

@@ -379,7 +379,19 @@ impl From<&str> for KeptPane {
 pub(super) fn prove_not_hosted(
     session: &TerminalSession,
     leave: &[UnreadableProcess],
-) -> Result<(), KeptPane> {
+) -> Result<super::shared_views::TerminalRemovalReceipt, KeptPane> {
+    prove_not_hosted_for(
+        session,
+        leave,
+        &super::shared_views::TerminalCleanupAuthority::Local,
+    )
+}
+
+pub(super) fn prove_not_hosted_for(
+    session: &TerminalSession,
+    leave: &[UnreadableProcess],
+    authority: &super::shared_views::TerminalCleanupAuthority,
+) -> Result<super::shared_views::TerminalRemovalReceipt, KeptPane> {
     // A remote or agent-scoped window sees neither this daemon's lease nor the
     // processes behind it, so nothing it can read here would prove an absence.
     if crate::device::is_remote()
@@ -393,13 +405,27 @@ pub(super) fn prove_not_hosted(
         );
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|_| UNREACHABLE)?;
-    prove_not_hosted_at(
+    prove_not_hosted_with(
         session,
         &socket,
         Path::new("/proc"),
         registered_holder,
         leave,
+        |client| {
+            let basis = authority
+                .read_basis(client, session)
+                .map_err(|_| KeptPane::from(STILL_HOSTED))?;
+            match basis {
+                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+                    if authority.permits_resolved(&basis) =>
+                {
+                    Ok(basis)
+                }
+                _ => Err(STILL_HOSTED.into()),
+            }
+        },
     )
+    .map(|basis| authority.receipt(basis))
 }
 
 const UNREACHABLE: &str = "Cagents can't reach its daemon, so this terminal may still be running. The pane was kept. Close it again once the daemon is back.";
@@ -439,6 +465,7 @@ fn unadopted_refusal(pid: i32) -> String {
     )
 }
 
+#[cfg(test)]
 fn prove_not_hosted_at(
     session: &TerminalSession,
     socket: &Path,
@@ -446,11 +473,34 @@ fn prove_not_hosted_at(
     holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
     leave: &[UnreadableProcess],
 ) -> Result<(), KeptPane> {
-    session
-        .continuity
-        .live_proof()
-        .filter(HostSessionProof::is_complete)
-        .ok_or("This pane's saved identity is incomplete, so Cagents can't confirm its terminal has stopped. The pane was kept, and there's no way to close it yet.")?;
+    prove_not_hosted_with(session, socket, proc_root, holder, leave, |_| Ok(()))
+}
+
+fn prove_not_hosted_with<T>(
+    session: &TerminalSession,
+    socket: &Path,
+    proc_root: &Path,
+    holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
+    leave: &[UnreadableProcess],
+    capture: impl FnOnce(&mut ControlClient) -> Result<T, KeptPane>,
+) -> Result<T, KeptPane> {
+    let completed = matches!(
+        session.continuity,
+        crate::model::TerminalContinuity::Exited { .. }
+            | crate::model::TerminalContinuity::RelaunchAvailable {
+                last_exit: Some(_),
+                ..
+            }
+    );
+    if !completed
+        && session
+            .continuity
+            .live_proof()
+            .filter(HostSessionProof::is_complete)
+            .is_none()
+    {
+        return Err("This pane's saved identity is incomplete, so Cagents can't confirm its terminal has stopped. The pane was kept, and there's no way to close it yet.".into());
+    }
     // Retry holds this from discovery through attachment, so an absence read
     // here cannot be a replacement another window is starting.
     let _lease = crate::daemon::RecoveryLease::acquire(socket, LEASE_WAIT).map_err(|error| {
@@ -471,6 +521,7 @@ fn prove_not_hosted_at(
     // A daemon stuck in startup recovery still answers inventory reads, and that
     // inventory can be partial. This request is refused until it admits work.
     client.daemon_version().map_err(|_| UNREACHABLE)?;
+    let basis = capture(&mut client)?;
     let terminals = client.list().map_err(|_| UNREACHABLE)?;
     let chats = client.list_chats().map_err(|_| UNREACHABLE)?;
     let (_, agents) = client.read_workspace_agents().map_err(|_| UNREACHABLE)?;
@@ -565,7 +616,7 @@ fn prove_not_hosted_at(
             return Err(open_agent_refusal(agent, &chats, &current.boot_id).into());
         }
     }
-    Ok(())
+    Ok(basis)
 }
 
 const NOTHING_STARTED: &str = "so nothing was started";
@@ -2109,6 +2160,41 @@ mod tests {
             .map_err(|kept| kept.reason);
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn a_completed_source_can_prove_absence_but_still_checks_surviving_descendants() {
+        for survivor in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut saved = session(directory.path(), &proof("old"));
+            saved.continuity = crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+            if survivor {
+                process_with(
+                    directory.path(),
+                    format!("CAGENTS_TERMINAL_ID={}", saved.id),
+                );
+            }
+            let result = prove(
+                &saved,
+                proof("current"),
+                Inventory {
+                    owner_probes: if survivor { 1 } else { 2 },
+                    ..Default::default()
+                },
+                directory.path(),
+            );
+            if survivor {
+                assert!(result.unwrap_err().contains("4242"));
+            } else {
+                assert_eq!(result, Ok(()));
+            }
+        }
     }
 
     #[test]

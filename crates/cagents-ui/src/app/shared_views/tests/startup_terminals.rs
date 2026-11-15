@@ -41,7 +41,25 @@ fn descriptor(session: &TerminalSession) -> TerminalDescriptor {
 fn serve(mut stream: std::os::unix::net::UnixStream, hosted: Vec<TerminalSession>) {
     let proof = replacement_proof();
     std::thread::spawn(move || {
+        let workers: std::collections::HashMap<_, _> = hosted
+            .iter()
+            .map(|s| (s.id, uuid::Uuid::new_v4()))
+            .collect();
         while let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) {
+            if let ClientRequest::Attach { terminal_id, .. } = &request.request {
+                let marker = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message: ServerMessage::TerminalWorker {
+                        terminal_id: *terminal_id,
+                        instance: workers[terminal_id],
+                    },
+                };
+                if write_frame(&mut stream, &marker).is_err() {
+                    break;
+                }
+            }
             let response = match request.request {
                 ClientRequest::Connect { .. } => ServerResponse::Connected {
                     proof: proof.clone(),
@@ -1240,10 +1258,10 @@ fn attach_cached_publishing(
         if let ModelEdit::ChangeView {
             scope,
             operation,
-            change: change @ Change::Update { .. },
+            change: change @ (Change::Update { .. } | Change::UpdateTerminalSource { .. }),
             ..
         } = edit
-            && matches!(&change, Change::Update { pane, .. } if pane.id == window.cached.id)
+            && matches!(&change, Change::Update { pane, .. } | Change::UpdateTerminalSource { pane, .. } if pane.id == window.cached.id)
         {
             update = Some((scope, operation, change));
         }
@@ -1576,7 +1594,7 @@ fn acknowledge_seed(
     std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|edit| match edit {
             ModelEdit::ChangeView {
-                change: Change::Update { before, pane },
+                change: Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. },
                 ..
             } => Some((before, pane)),
             _ => None,

@@ -250,7 +250,16 @@ use crate::{
 /// running terminal without launching another worker.
 /// Version 182 appends provider-confirmed active model status independently of
 /// chat snapshots, whose inspector encoding stays frozen for update sources.
-pub const PROTOCOL_VERSION: u16 = 182;
+/// Version 183 fences shared Close on its original pane and terminal worker,
+/// with attachment metadata, captured-source reads and source-checked cleanup.
+/// Replace the matched daemon/window set.
+pub const PROTOCOL_VERSION: u16 = 183;
+/// A correlated refusal issued before source-checked cleanup has any effect.
+pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
+    "The terminal changed or still owns work; nothing was closed";
+/// No resident was selected; disappearance is not a successor publication.
+pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
+    "The captured terminal is no longer resident; nothing was closed";
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -660,6 +669,25 @@ pub enum ClientRequest {
         pane: crate::model::CardId,
         terminal_id: TerminalId,
     },
+    /// An exact source worker, or an absence stamp captured before Close's
+    /// process proof. This never closes, starts or attaches a terminal.
+    ReadTerminalRemovalBasis {
+        source: TerminalSession,
+    },
+    /// Close only the worker captured by the original pane gesture. Completed
+    /// release and checked live close share the same resident-generation fence.
+    CloseTerminalSource {
+        session: TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        #[serde(default)]
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    },
+    /// Resolve only the canonical generation from the original complete view.
+    ReadCapturedTerminalRemovalBasis {
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -944,10 +972,8 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         addresses: Vec<crate::chat::AgentAddress>,
     },
-    /// The project at `repository` gained a pending automation request, or one
-    /// was approved or declined. Delivered to every connection watching
-    /// notifications, which reads the project's pending requests again if it
-    /// offers them.
+    /// The project gained or resolved a pending automation request.
+    /// Notification subscribers read the pending requests again.
     AutomationProposalsChanged {
         repository: std::path::PathBuf,
     },
@@ -957,6 +983,12 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         revision: u64,
         model: Option<crate::chat::ActiveModel>,
+    },
+    /// Exact attachment metadata, separate from the frozen descriptor used by
+    /// historical update sources. This UUID never authorizes process cleanup.
+    TerminalWorker {
+        terminal_id: TerminalId,
+        instance: uuid::Uuid,
     },
 }
 
@@ -1096,6 +1128,7 @@ pub enum ServerResponse {
     },
     WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
     WorkspaceMetadata(crate::workspace_model::metadata::Reply),
+    TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
