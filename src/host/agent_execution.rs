@@ -52,12 +52,19 @@ pub(super) fn caller(
     host: &SharedHost,
     authority: &Authority,
 ) -> Result<(Origin, Option<TerminalId>), String> {
+    checked_caller(host, authority).map_err(|error| error.to_string())
+}
+
+pub(super) fn checked_caller(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<(Origin, Option<TerminalId>), super::model::AuthorityError> {
     let registry = registry(host)?;
     let (origin, source) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         (
             registry.execution_origin(authority)?,
-            registry.agent_authority_source(authority)?,
+            registry.checked_agent_authority_source(authority)?,
         )
     };
     let session = source.as_ref().map(HostedSession::id);
@@ -79,7 +86,9 @@ pub(super) fn caller(
             }
         };
         if !live {
-            return Err("The issuing agent session is no longer live or proved adopted".into());
+            return Err(super::model::AuthorityError::Denied(
+                "The issuing agent session is no longer live or proved adopted".into(),
+            ));
         }
     }
     Ok((origin, session))
@@ -1744,8 +1753,8 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
-/// Preserve typed mailbox backpressure at the service boundary. Existing
-/// operations retain their original validation and String-returning API.
+/// Preserve typed mailbox capacity and store contention at the service boundary.
+/// Other operations retain their original validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
     authority: Authority,
@@ -1760,6 +1769,16 @@ pub(super) fn process_request(
         }
         crate::agent_execution::Operation::Deliver(outgoing) => {
             mailbox::hand(host, &authority, outgoing).map(crate::agent_execution::Reply::Handed)
+        }
+        crate::agent_execution::Operation::Inbox(query) => {
+            mailbox::inbox(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::PeekInbox(query) => {
+            mailbox::peek(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::AcknowledgeInbox(receipt) => {
+            mailbox::acknowledge(host, &authority, receipt)
+                .map(|()| crate::agent_execution::Reply::InboxAcknowledged)
         }
         other => process(host, authority, other).map_err(Into::into),
     }
@@ -1810,6 +1829,9 @@ pub(super) fn process(
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
+        Operation::Context { scope, standing } => {
+            directory::context(host, &authority, scope, standing).map(Reply::Context)
+        }
         Operation::AccountInfo(query) => {
             account_info::read(host, &authority, query).map(Reply::AccountInfo)
         }
@@ -1824,11 +1846,15 @@ pub(super) fn process(
         Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
             .map(Reply::Sent)
             .map_err(|error| error.to_string()),
-        Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
-        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
-        Operation::AcknowledgeInbox(receipt) => {
-            mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
-        }
+        Operation::Inbox(query) => mailbox::inbox(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::AcknowledgeInbox(receipt) => mailbox::acknowledge(host, &authority, receipt)
+            .map(|()| Reply::InboxAcknowledged)
+            .map_err(|error| error.to_string()),
         Operation::Transcript(query) => {
             transcript::read(host, &authority, query).map(Reply::Transcript)
         }

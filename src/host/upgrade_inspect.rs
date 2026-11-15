@@ -2001,6 +2001,7 @@ mod tests {
         assert!(current::supports_protocol(175));
         assert!(current::supports_protocol(177));
         assert!(current::supports_protocol(178));
+        assert!(current::supports_protocol(179));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
             [
@@ -2009,6 +2010,7 @@ mod tests {
                 175,
                 177,
                 178,
+                179,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );

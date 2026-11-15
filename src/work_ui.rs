@@ -505,7 +505,7 @@ impl State {
             ];
             items.extend(projects.iter().map(|project| {
                 popover_item(
-                    Icon::Branch.handle(),
+                    Icon::Folder.handle(),
                     project.name.as_str(),
                     cards(count(Some(&project.repository))),
                     Action::Scope(Some(project.repository.clone())),
@@ -1243,6 +1243,8 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
         .into(),
         Leading::Waiting => glyph(Icon::AgentWaiting, design::warning_color),
         Leading::PullRequest(pull_request) => pull_request_glyph(pull_request),
+        // A checked-out branch is a worktree, drawn as the sidebar draws it.
+        Leading::Branch if item.worktree.is_some() => glyph(Icon::Worktree, design::muted_color),
         Leading::Branch => glyph(Icon::Branch, design::muted_color),
     }
 }
@@ -1573,6 +1575,40 @@ mod tests {
         )));
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::InProgress, false));
+        assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn a_refused_pin_preserves_the_confirmed_pin_and_derived_state() {
+        let mut state = State::default();
+        let mut pinned = item("feat/board", "cagents");
+        pinned.column = Column::Stale;
+        pinned.pinned = true;
+        watched(&mut state, 1, board(vec![pinned]));
+        let confirmed = state.confirmed.clone().unwrap();
+        let card = CardRef::of(&confirmed.items[0]);
+
+        state.update(Action::Pin(card.clone(), Some(Column::InReview)));
+        let shown = state.item(&card).unwrap();
+        assert_eq!(
+            (shown.column, shown.pinned, shown.derived),
+            (Column::InReview, true, Column::InProgress)
+        );
+        assert!(Arc::ptr_eq(state.confirmed.as_ref().unwrap(), &confirmed));
+        let original = &confirmed.items[0];
+        assert_eq!(
+            (original.column, original.pinned, original.derived),
+            (Column::Stale, true, Column::InProgress)
+        );
+
+        state.update(Action::Pinned(Err("Permission denied".into())));
+        let shown = state.item(&card).unwrap();
+        assert_eq!(
+            (shown.column, shown.pinned, shown.derived),
+            (Column::Stale, true, Column::InProgress)
+        );
+        assert!(Arc::ptr_eq(state.confirmed.as_ref().unwrap(), &confirmed));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &confirmed));
         assert!(state.error.is_some());
     }
 

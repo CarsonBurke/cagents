@@ -2565,6 +2565,43 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
     #[test]
+    fn find_opens_the_compact_cli_spawn_before_revealing_its_prompt() {
+        let item = Arc::new(chat::Item {
+            id: "spawn".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "cagents agent spawn --name reviewer 'Review NEEDLE carefully'".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: "Accepted agent 1a2b3c4d run 5e6f7a8b".into(),
+            },
+            at: None,
+            started_at: None,
+        });
+        let input = RawInput {
+            query: "NEEDLE".into(),
+            provider: Provider::Claude,
+            labels: Arc::default(),
+            metadata: metadata_capacity(),
+            groups: vec![(
+                "group".into(),
+                vec![RawItem {
+                    item,
+                    raw_disclosure: true,
+                    tools: Vec::new(),
+                }],
+            )],
+        };
+        let (groups, _, _, _) = raw_scan(&input, "NEEDLE", &|| true).unwrap();
+        assert!(groups[0].1[0].expand);
+        assert_eq!(groups[0].1[0].parts, vec!["spawn#prompt-0"]);
+    }
+
+    #[test]
     fn a_one_row_step_opens_on_a_match_in_what_it_said_or_its_tool_call() {
         let prompt = "say \"NEEDLE λ\"";
         let item = Arc::new(chat::Item {

@@ -59,6 +59,9 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         ClientRequest::ReadWorkspaceMetadata {
             query: crate::workspace_model::metadata::Query::Agents,
         },
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        },
         ClientRequest::ReadWorkspaceSnapshot,
         ClientRequest::ReadWorkspaceView {
             scope: scope.clone(),
@@ -94,6 +97,13 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         Reply::Agents {
             identity,
             agents: vec![],
+        },
+        Reply::AgentLabels {
+            identity,
+            labels: vec![(
+                crate::model::AgentId::new(),
+                "reviewer · Review the one-row cards".into(),
+            )],
         },
     ] {
         let mut frame = Vec::new();
@@ -818,10 +828,10 @@ fn agent_addresses_are_beyond_every_older_recording() {
 }
 
 /// Only a window watching notifications is told a project's automation
-/// requests changed, and no update source watches them, so no recorded older
-/// protocol has a message at its position.
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
 #[test]
-fn automation_request_changes_are_beyond_every_older_recording() {
+fn automation_request_changes_are_beyond_recordings_before_their_introduction() {
     let changed = ServerMessage::AutomationProposalsChanged {
         repository: "/fixture".into(),
     };

@@ -816,8 +816,7 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = current {
-            let on_screen = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-                && self.workspace_surfaces_visible();
+            let on_screen = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
             if !on_screen {
                 self.set_exposure(
                     card,
@@ -976,14 +975,41 @@ impl Cagents {
         let project = row
             .project
             .and_then(|project| self.sidebar_model.project(project));
-        let chip = project.map_or_else(
-            || {
-                widget::icon::from_name("folder-symbolic")
-                    .size(design::ROW_ICON_SIZE)
-                    .into()
-            },
-            sidebar::project_chip,
-        );
+        // What kind of workspace the row is, drawn as the sidebar draws it:
+        // a worktree's pull request or branch, a channel's chat. A folder of
+        // its own carries its project's chip, and the caption names the
+        // project for the rest. The list draws every row at full strength.
+        let slot = |glyph: widget::Container<'a, Message, Theme>| -> Element<'a, Message> {
+            glyph
+                .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
+                .into()
+        };
+        let ink = sidebar::RowInk::Full;
+        let size = design::ROW_ICON_SIZE;
+        let chip = match (row.destination, project) {
+            (WorkspaceDestination::Folder(_), Some(project)) => sidebar::project_chip(project),
+            (WorkspaceDestination::Folder(_), None) => slot(sidebar::ink_glyph(
+                widget::icon::from_name("folder-symbolic").handle(),
+                ink,
+                size,
+            )),
+            (WorkspaceDestination::Worktree(id), project) => slot(
+                match project
+                    .and_then(|project| project.worktrees.iter().find(|worktree| worktree.id == id))
+                {
+                    Some(worktree) => {
+                        sidebar::row_glyph(sidebar::WorkspaceGlyph::Worktree(worktree), ink, size)
+                    }
+                    // Gone from the model while the list is held.
+                    None => sidebar::ink_glyph(sidebar::worktree_icon(), ink, size),
+                },
+            ),
+            (WorkspaceDestination::Channel(_), _) => slot(sidebar::row_glyph(
+                sidebar::WorkspaceGlyph::Channel,
+                ink,
+                size,
+            )),
+        };
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())
                 .edge(row.name_edge())
@@ -1167,10 +1193,28 @@ impl Cagents {
     /// A pane that is not drawn live: its icon, name and what it is doing.
     fn workspace_switcher_pane_heading(&self, card: CardId) -> Element<'_, Message> {
         let state = self.card_state(card);
-        let title = self.card_chrome.get(&card).map_or_else(
+        let chrome = self.card_chrome.get(&card);
+        let title = chrome.map_or_else(
             || state.map_or("Pane", |state| self.card_display_title(state)),
             |chrome| chrome.title.as_str(),
         );
+        // Its destination's heading above names the checkout a shell is in.
+        // The tab's ordinal stays, telling a checkout's shells apart.
+        let title = match state {
+            Some(state) => {
+                let suffix = chrome
+                    .and_then(|chrome| chrome.terminal_ordinal_suffix.as_deref())
+                    .unwrap_or("");
+                let base = title.strip_suffix(suffix).unwrap_or(title);
+                let shown = self.titled_beside_place(state, base, self.card_worktree(state));
+                if shown.len() == base.len() {
+                    Cow::Borrowed(title)
+                } else {
+                    Cow::Owned(format!("{shown}{suffix}"))
+                }
+            }
+            None => Cow::Borrowed(title),
+        };
         let mut text = vec![design::body(title).into()];
         if let Some(doing) = self.workspace_switcher_pane_doing(card) {
             text.push(design::caption(doing).into());

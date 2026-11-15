@@ -403,6 +403,7 @@ mod tests {
             channel: None,
             view_scope: None,
             channel_repository: None,
+            lineage_channel: None,
             state: crate::agent::ActivityState::Idle,
             directory: None,
             worktree: None,

@@ -25,6 +25,8 @@ use super::{
 };
 
 #[cfg(test)]
+mod automation_authority_tests;
+#[cfg(test)]
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
@@ -1323,9 +1325,7 @@ fn process_admitted_request(
         } => {
             let reply =
                 super::automations::service::process_under_control(host, authority, operation)
-                    .map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
+                    .map_err(super::automations::service::Error::into_protocol)?;
             Ok((ServerResponse::Automation(reply), Vec::new(), false))
         }
         ClientRequest::Agent {
@@ -1336,6 +1336,9 @@ fn process_admitted_request(
                 .map_err(|error| match error {
                     crate::agent_execution::AcceptanceError::Invalid(message) => {
                         ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    }
+                    crate::agent_execution::AcceptanceError::StoreBusy(message) => {
+                        ProtocolError::new(ProtocolErrorCode::StoreBusy, message, true)
                     }
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)

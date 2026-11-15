@@ -40,7 +40,7 @@ pub(super) mod console_relaunch;
 mod execution;
 mod execution_deltas;
 pub(super) mod floor;
-pub(super) use execution::ResidentRelease;
+pub(super) use execution::{AuthorityError, ResidentRelease};
 mod lineage;
 mod mailbox;
 pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
@@ -61,11 +61,11 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
-/// A writer that loses a race waits rather than failing. Only the daemon writes
-/// this store, so contention is between its own client threads and is measured
-/// in microseconds; the timeout exists for the WAL checkpoint, not for a rival.
+/// Wait for another connection's writer rather than failing at admission.
+/// Read-then-write transactions must start immediate so SQLite can use this
+/// timeout before they take a snapshot that a rival commit could invalidate.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -76,6 +76,7 @@ const FILE_MODE: u32 = 0o600;
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Pause {
     SequenceRead,
+    MailboxRead,
     BeforeCommit,
     AfterCommit,
 }
@@ -239,6 +240,10 @@ impl Registry {
             Query::Agents => Reply::Agents {
                 identity,
                 agents: self.agents(None)?,
+            },
+            Query::AgentLabels => Reply::AgentLabels {
+                identity,
+                labels: self.agent_labels()?,
             },
         };
         snapshot.commit().map_err(|error| error.to_string())?;
@@ -995,6 +1000,10 @@ fn migrate_through(
         console_relaunch::migrate(tx)?;
         schema::migration_checkpoint(24)?;
     }
+    if version < 25 && target >= 25 {
+        lineage::migrate_channels(tx)?;
+        schema::migration_checkpoint(25)?;
+    }
     Ok(())
 }
 
@@ -1536,7 +1545,10 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE console_relaunches;
+                "DROP TRIGGER session_channel_insert;
+                 DROP TRIGGER session_channel_move;
+                 DROP TABLE session_channels;
+                 DROP TABLE console_relaunches;
                  DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;

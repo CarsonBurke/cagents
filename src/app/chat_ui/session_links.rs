@@ -26,6 +26,51 @@ fn unique_destination(
 }
 
 impl Cagents {
+    /// Brings forward the tab of the open agent whose ID starts with
+    /// `prefix`, wherever its channel is. An agent whose session has not
+    /// started yet has no tab to show, so its channel opens instead.
+    pub(super) fn open_agent_tab(&mut self, prefix: &str) -> Task<Message> {
+        let mut agents = self
+            .workspace_model
+            .agents
+            .iter()
+            .filter(|agent| !agent.closed && agent.id.to_string().starts_with(prefix));
+        let (agent, None) = (agents.next(), agents.next()) else {
+            self.status = Some(TransientNotice::warning(format!(
+                "More than one agent starts with {prefix}."
+            )));
+            return Task::none();
+        };
+        let Some(agent) = agent else {
+            self.status = Some(TransientNotice::warning(
+                "This agent is closed or not open on this device.",
+            ));
+            return Task::none();
+        };
+        let session = match agent.spec.surface {
+            crate::agent_execution::Surface::Terminal => {
+                agent.console.as_ref().map(|console| console.id)
+            }
+            crate::agent_execution::Surface::Chat => {
+                agent.session.as_ref().map(|session| session.id())
+            }
+        };
+        if let Some(session) = session {
+            return self.update_notifications(notification_ui::Action::Activated(
+                crate::notifications::Target::Session(session),
+            ));
+        }
+        match agent.channel() {
+            Some(channel) => self.select_channel(channel),
+            None => {
+                self.status = Some(TransientNotice::warning(
+                    "This agent has not started yet; open it once it has.",
+                ));
+                Task::none()
+            }
+        }
+    }
+
     pub(super) fn open_session_link(&mut self, prefix: String) -> Task<Message> {
         if let Ok(session) = prefix.parse::<TerminalId>()
             && self.durable.cards.iter().any(|card| {

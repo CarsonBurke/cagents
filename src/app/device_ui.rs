@@ -44,6 +44,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::ToggleProject(_)
             | SidebarAction::ToggleWorktrees(_)
             | SidebarAction::SetWorktreeDisplay { .. }
+            | SidebarAction::ToggleCheckouts
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
             | SidebarAction::WindowMenu
@@ -1060,7 +1061,7 @@ impl Cagents {
             [
                 (Panel::Files, Icon::Folder, "Browse files"),
                 (Panel::Changes, Icon::Diff, "Source control"),
-                (Panel::Worktrees, Icon::Branch, "Manage worktrees"),
+                (Panel::Worktrees, Icon::Worktree, "Manage worktrees"),
             ]
             .into_iter()
             .map(|(panel, glyph, label)| {
