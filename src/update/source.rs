@@ -657,6 +657,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (172, "superseded before update sources were pinned"),
     (174, "main served it under a day; never installed"),
     (176, "main served it under a day; never installed"),
+    (
+        180,
+        "intermediate #2783 protocol; superseded by 181 without a qualified installed update source",
+    ),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
@@ -923,7 +927,7 @@ mod admission_message_tests {
         for &(protocol, _) in RETIRED_SOURCES {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
         }
-        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176] {
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176, 180] {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
             let message = unsupported_source(protocol).to_string();
             assert!(message.contains(&format!("uses protocol {protocol}")));

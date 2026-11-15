@@ -252,20 +252,40 @@ impl Runtime {
     /// names them as its open row does, by what this conversation calls them,
     /// which grouping, formed only when the transcript's structure changes,
     /// cannot know.
+    #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
+        match self.strip_headline(turn) {
+            disclosure::Headline::Text(text) => text,
+            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
+        }
+    }
+
+    /// A collapsed strip's line as it is drawn. A lone step on one file
+    /// names it as its open row does, so the two never disagree.
+    fn strip_headline(&self, turn: &turn::Turn) -> disclosure::Headline {
         let [only] = turn.steps.as_slice() else {
-            return turn.summary.clone();
+            return disclosure::Headline::Text(turn.summary.clone());
         };
-        let Some(coordinated) = self
-            .step_items()
-            .get(only.index)
-            .and_then(|item| self.presentation_cache().get(&item.id))
-            .and_then(|cached| cached.coordination.as_deref())
-        else {
-            return turn.summary.clone();
+        let Some(item) = self.step_items().get(only.index) else {
+            return disclosure::Headline::Text(turn.summary.clone());
         };
-        let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
-        format!("{}{}", turn::headline(line), turn.state_suffix())
+        let cached = self.presentation_cache().get(&item.id);
+        if let Some(coordinated) = cached.and_then(|cached| cached.coordination.as_deref()) {
+            let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
+            return disclosure::Headline::Text(format!(
+                "{}{}",
+                turn::headline(line),
+                turn.state_suffix()
+            ));
+        }
+        let title = cached.and_then(|cached| cached.title_of(item));
+        match self.named_file(item, title) {
+            Some((verb, path)) => disclosure::Headline::Path {
+                verb: verb.to_owned(),
+                path: format!("{path}{}", turn.state_suffix()),
+            },
+            None => disclosure::Headline::Text(turn.summary.clone()),
+        }
     }
 
     /// One group's activity: a summary line and how long the work took,
@@ -299,8 +319,11 @@ impl Runtime {
         } else {
             turn.duration_label(0)
         };
-        let text = self.strip_summary(turn);
-        let name = text.clone();
+        let text = self.strip_headline(turn);
+        let name = match &text {
+            disclosure::Headline::Text(text) => text.clone(),
+            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
+        };
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()
@@ -400,6 +423,28 @@ impl Runtime {
         self.step_button(item, cached, open)
     }
 
+    /// The verb and file of a step on one file, the file named the way the
+    /// agent working in its directory names it, by the part that tells it
+    /// apart. A command names the directory it ran in; anything else ran in
+    /// the conversation's.
+    fn named_file(
+        &self,
+        item: &chat::Item,
+        title: Option<&tool_title::Title>,
+    ) -> Option<(&'static str, String)> {
+        if !turn::names_path(&item.content, title) {
+            return None;
+        }
+        let (verb, label) = turn::step_title(&item.content, title);
+        let directory = match &item.content {
+            ItemContent::Command {
+                working_directory, ..
+            } if !working_directory.is_empty() => std::path::Path::new(working_directory.as_str()),
+            _ => self.session.launch.recipe.working_directory.as_path(),
+        };
+        Some((verb, turn::shown_path(&label, directory).into_owned()))
+    }
+
     /// The summary line's toggle, without the actions placed beside it.
     fn step_button(
         &self,
@@ -411,40 +456,52 @@ impl Runtime {
         // A step that worked with another agent says what it did in the
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
-        let (verb, label) = match coordinated {
-            Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
-            None => {
-                let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
-                (verb.to_owned(), label.into_owned())
+        let (verb, label, path) = match coordinated {
+            Some(coordinated) => {
+                let (verb, label) = coordinated.line(&|id| self.listed_agent_name(id));
+                (verb, label, false)
             }
+            None => match self.named_file(item, cached.title_of(item)) {
+                Some((verb, path)) => (verb.to_owned(), path, true),
+                None => {
+                    let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
+                    (verb.to_owned(), label.into_owned(), false)
+                }
+            },
         };
         let glyph = coordinated
             .and_then(Coordinated::glyph)
             .unwrap_or_else(|| kind_glyph(&item.content));
-        let mut label = if verb.is_empty() {
-            label
-        } else {
-            format!("{verb} {label}")
-        };
+        let mut said = label;
         if let ItemContent::Command {
             exit_code: Some(code),
             ..
         } = item.content
             && code != 0
         {
-            label.push_str(&format!(" · exit {code}"));
+            said.push_str(&format!(" · exit {code}"));
         } else if let Some(word) = item.content.status().and_then(unsettled_word)
             && item.content.status() != Some(ToolStatus::Running)
         {
-            label.push_str(&format!(" · {word}"));
+            said.push_str(&format!(" · {word}"));
         }
+        let label = if verb.is_empty() {
+            said.clone()
+        } else {
+            format!("{verb} {said}")
+        };
         let elapsed = disclosure::item_duration(item, self.source_now_ms());
         let mut name = label.clone();
         if let Some(description) = turn::command_description(&item.content) {
             name.push_str(&format!(" · {description}"));
         }
+        let headline = if path {
+            disclosure::Headline::Path { verb, path: said }
+        } else {
+            disclosure::Headline::Text(turn::headline(label))
+        };
         disclosure::row(
-            turn::headline(label),
+            headline,
             name,
             glyph,
             self.step_status(item),

@@ -1291,7 +1291,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        rows.push(self.failure_diagnostics(incident));
+        rows.push(self.failure_diagnostics(incident, design::sunken));
         widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
@@ -1307,7 +1307,14 @@ impl Runtime {
         .max_width(design::READABLE_MEASURE)
         .into()
     }
-    pub(super) fn failure_diagnostics(&self, incident: &Incident) -> Element<'static, Message> {
+    /// An incident's disclosure, copy action and, when expanded, its
+    /// diagnostic preview. `surface` is the fill it is drawn on, which the
+    /// scrolling preview fades into.
+    pub(super) fn failure_diagnostics(
+        &self,
+        incident: &Incident,
+        surface: fn(&cosmic::Theme) -> iced::Color,
+    ) -> Element<'static, Message> {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut rows = Vec::new();
@@ -1337,24 +1344,30 @@ impl Runtime {
             // Full bytes are resolved only on expansion/copy. The collapsed
             // surface never clones or shapes a provider's request dump.
             if let Some((preview, omitted)) = self.failure_preview(&incident.key) {
+                // The preview scrolls between the disclosure's controls and
+                // its caption: what passes an edge fades into the surface.
                 rows.push(
-                    widget::container(
-                        widget::scrollable(selectable_prose::logical_text(
-                            vec![iced::widget::text::Span::new(preview.to_owned())].into(),
-                            design::TEXT_CAPTION.into(),
-                            iced::Font::MONOSPACE,
-                            target,
-                            None,
-                            selectable_prose::Logical {
-                                identity: diagnostic_preview_identity(&incident.key),
-                                start: 0,
-                            },
-                        ))
+                    widget::container(crate::interaction::overflow_fade_y(
+                        widget::scrollable(
+                            widget::container(selectable_prose::logical_text(
+                                vec![iced::widget::text::Span::new(preview.to_owned())].into(),
+                                design::TEXT_CAPTION.into(),
+                                iced::Font::MONOSPACE,
+                                target,
+                                None,
+                                selectable_prose::Logical {
+                                    identity: diagnostic_preview_identity(&incident.key),
+                                    start: 0,
+                                },
+                            ))
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
+                        surface,
+                    ))
                     .max_height(240)
                     .into(),
                 );
@@ -1561,14 +1574,18 @@ mod tests {
             active_recovery: false,
         };
         let renderer = crate::app::tests::headless_renderer();
-        let mut tree = Tree::new(runtime.failure_diagnostics(&incident).as_widget());
+        let mut tree = Tree::new(
+            runtime
+                .failure_diagnostics(&incident, design::sunken)
+                .as_widget(),
+        );
         for (index, open) in [false, true, false].into_iter().enumerate() {
             if open {
                 runtime.failure_ui.expanded.insert(incident.key.clone());
             } else {
                 runtime.failure_ui.expanded.remove(&incident.key);
             }
-            let mut element = runtime.failure_diagnostics(&incident);
+            let mut element = runtime.failure_diagnostics(&incident, design::sunken);
             tree.diff(element.as_widget_mut());
             let node = element.as_widget_mut().layout(
                 &mut tree,

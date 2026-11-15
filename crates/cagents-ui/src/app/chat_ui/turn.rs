@@ -612,6 +612,66 @@ pub(super) fn step_title<'a>(
     }
 }
 
+/// Whether a step's label is the path of the one file it acted on, which a
+/// row shows by its last components; see [`super::disclosure::Headline`].
+pub(super) fn names_path(content: &ItemContent, title: Option<&Title>) -> bool {
+    match content {
+        ItemContent::Changes { changes, .. } => changes.len() == 1,
+        // A read is labelled with the file it read, whether that is also
+        // the command (a built-in read), beside a shell command (Codex), or
+        // stored as "Read <file>"; one with no label shows its command.
+        ItemContent::Command {
+            action: chat::CommandAction::Read,
+            label,
+            ..
+        } => !label.is_empty(),
+        ItemContent::Tool { .. } => title.is_some_and(|title| title.path),
+        _ => false,
+    }
+}
+
+/// A path as a step row shows it: relative to the working directory when it
+/// is inside it, as the agent itself would name it, and otherwise from the
+/// home directory or the root, so it still reads as lying outside.
+///
+/// An absolute path is read as written, without resolving links, but with
+/// `.`, `..` and repeated separators taken out, so `/work/../etc/x` is not
+/// shown as though it lay in `/work`.
+pub(super) fn shown_path<'a>(path: &'a str, working_directory: &std::path::Path) -> Cow<'a, str> {
+    if !path.starts_with('/') {
+        return Cow::Borrowed(path);
+    }
+    let path = lexical(std::path::Path::new(path));
+    let root = lexical(working_directory);
+    // Relative to the root itself, every path would lose the slash that
+    // says where it lies.
+    let inside = root.parent().is_some() && working_directory.is_absolute();
+    match path.strip_prefix(&root) {
+        Ok(relative) if inside && !relative.as_os_str().is_empty() => {
+            Cow::Owned(relative.to_string_lossy().into_owned())
+        }
+        _ => Cow::Owned(crate::app::display_path(&path).into_owned()),
+    }
+}
+
+/// `path` with `.`, `..` and repeated separators taken out, as written.
+fn lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normal = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normal.pop() {
+                    normal.push(component);
+                }
+            }
+            component => normal.push(component),
+        }
+    }
+    normal
+}
+
 /// The verb a step is introduced with, kept separate from its target so the two
 /// can be typeset differently.
 pub(super) fn step_verb(content: &ItemContent) -> &'static str {
@@ -1778,5 +1838,94 @@ mod tests {
             format!("{} {}", step_verb(&edits), step_label(&edits)),
             "Edited 2 files"
         );
+    }
+
+    #[test]
+    fn a_step_on_one_file_names_it_from_the_working_directory() {
+        let edits = |paths: &[&str]| ItemContent::Changes {
+            changes: paths
+                .iter()
+                .map(|path| FileChange {
+                    path: (*path).into(),
+                    kind: ChangeKind::Updated,
+                    diff: String::new(),
+                })
+                .collect(),
+            status: ToolStatus::Succeeded,
+        };
+        let read = |label: &str, command: &str| ItemContent::Command {
+            label: label.into(),
+            command: command.into(),
+            working_directory: "/work".into(),
+            action: CommandAction::Read,
+            status: ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        };
+        assert!(names_path(&edits(&["/work/src/a.rs"]), None));
+        assert!(!names_path(&edits(&["a.rs", "b.rs"]), None));
+        assert!(!names_path(&edits(&[]), None));
+        assert!(names_path(&read("/work/a.rs", "/work/a.rs"), None));
+        // Codex labels a read with its file, beside the shell command.
+        assert!(names_path(&read("src/a.rs", "sed -n 1,80p src/a.rs"), None));
+        assert!(names_path(&read("Read a.rs", "cat a.rs"), None));
+        assert!(!names_path(&read("", "cat a.rs"), None));
+        let tool = ItemContent::Tool {
+            name: "Write".into(),
+            input: String::new(),
+            output: String::new(),
+            status: ToolStatus::Succeeded,
+        };
+        let written = Title::of(
+            "Write",
+            r#"{"file_path":"/work/a.rs"}"#,
+            ToolStatus::Succeeded,
+        );
+        assert!(names_path(&tool, Some(&written)));
+        let searched = Title::of("Grep", r#"{"pattern":"a.rs"}"#, ToolStatus::Succeeded);
+        assert!(!names_path(&tool, Some(&searched)));
+
+        let root = std::path::Path::new("/home/user/project");
+        assert_eq!(shown_path("/home/user/project/src/a.rs", root), "src/a.rs");
+        assert_eq!(
+            shown_path(
+                "/home/user/project/src/a.rs",
+                std::path::Path::new("/home/user/project/")
+            ),
+            "src/a.rs"
+        );
+        // A sibling that shares the directory's name as a prefix is outside it.
+        assert_eq!(
+            shown_path("/home/user/project-two/a.rs", root),
+            "/home/user/project-two/a.rs"
+        );
+        assert_eq!(shown_path("/home/user/project", root), "/home/user/project");
+        assert_eq!(shown_path("/etc/hosts", root), "/etc/hosts");
+        assert_eq!(shown_path("src/a.rs", root), "src/a.rs");
+        // Outside it, a file under the home directory is named from there.
+        if let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()) {
+            let settings = home.join(".claude/settings.json");
+            assert_eq!(
+                shown_path(settings.to_str().unwrap(), root),
+                "~/.claude/settings.json"
+            );
+        }
+        assert_eq!(
+            shown_path("/etc/hosts", std::path::Path::new("/")),
+            "/etc/hosts"
+        );
+        // Repeated separators, `.` and `..` are read as written.
+        assert_eq!(
+            shown_path("/home/user/project//src/./a.rs", root),
+            "src/a.rs"
+        );
+        assert_eq!(
+            shown_path("/home/user/project/../etc/x", root),
+            "/home/user/etc/x"
+        );
+        assert_eq!(shown_path("/home/user/project/src/../a.rs", root), "a.rs");
+        // A relative path is the agent's own, shown as it gave it.
+        assert_eq!(shown_path("../other/a.rs", root), "../other/a.rs");
     }
 }
