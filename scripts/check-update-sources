@@ -1,0 +1,90 @@
+#!/usr/bin/python3
+"""Check that every protocol main served is a live-update source or retired.
+
+Live updates start only from the installed builds pinned in RELEASED_SOURCES
+(src/update/source.rs) and the current matched release. When PROTOCOL_VERSION
+was relative, bumping it silently dropped the build users were running: 174
+dropped 173, and a 173 install could no longer be updated live. So each
+protocol main served since the oldest pinned source, which is each wire-format
+recording below PROTOCOL_VERSION, must be pinned, or retired in RETIRED_SOURCES
+with a reason. A protocol bump then cannot merge without deciding about the
+protocol it replaces. CI does not run the Rust tests that prove a pinned
+source, so this checks the decision, not the proof.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+IPC = Path("src/terminal/ipc.rs")
+SOURCES = Path("src/update/source.rs")
+RECORDINGS = Path("tests/fixtures/wire-formats")
+
+
+def block(text: str, name: str) -> str | None:
+    found = re.search(
+        rf"^pub\(crate\) const {name}: &\[[^\]]*\] =\s*&\[(.*?)^\];$",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    return None if found is None else found.group(1)
+
+
+def problems(root: Path) -> list[str]:
+    version = re.search(
+        r"^pub const PROTOCOL_VERSION: u16 = (\d+);$", (root / IPC).read_text(), re.MULTILINE
+    )
+    if version is None:
+        return [f"{IPC}: PROTOCOL_VERSION not found"]
+    protocol = int(version.group(1))
+    sources = root / SOURCES
+    if not sources.is_file():
+        # Moving the lists must move this check with them, not switch it off.
+        return [f"{SOURCES} not found: point this check at the update source lists"]
+    text = sources.read_text()
+    released_block = block(text, "RELEASED_SOURCES")
+    retired_block = block(text, "RETIRED_SOURCES")
+    if released_block is None or retired_block is None:
+        return [f"{SOURCES}: RELEASED_SOURCES or RETIRED_SOURCES not found"]
+    released = [int(value) for value in re.findall(r"\bprotocol: (\d+),", released_block)]
+    retired = [int(value) for value in re.findall(r"\(\s*(\d+),", retired_block)]
+    if not released:
+        return [f"{SOURCES}: RELEASED_SOURCES pins no protocol"]
+    recordings = {
+        int(path.stem) for path in (root / RECORDINGS).glob("*.json") if path.stem.isdigit()
+    }
+    found = []
+    for value in released:
+        if value >= protocol:
+            found.append(
+                f"{SOURCES}: pinned source protocol {value} is not older than "
+                f"PROTOCOL_VERSION {protocol}; the current release is always a source"
+            )
+        if value not in recordings:
+            found.append(f"{SOURCES}: pinned source protocol {value} has no {RECORDINGS}/{value}.json")
+        if value in retired:
+            found.append(f"{SOURCES}: protocol {value} is both pinned and retired")
+    for value in sorted(recordings):
+        if min(released) <= value < protocol and value not in released and value not in retired:
+            found.append(
+                f"{SOURCES}: main served protocol {value}, which is neither a live-update "
+                f"source nor retired. Pin it in RELEASED_SOURCES once an update from its "
+                f"install is rehearsed, or retire it in RETIRED_SOURCES with a reason."
+            )
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", type=Path, default=Path("."))
+    found = problems(parser.parse_args().root)
+    for problem in found:
+        print(problem, file=sys.stderr)
+    if not found:
+        print("Every protocol main served is a live-update source or retired")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -343,6 +343,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parse_status(&output.stdout), output)
     }
 
+    /// Lines the worktree's uncommitted changes to tracked files add and
+    /// remove against `HEAD`, staged and unstaged together. Binary files
+    /// count no lines. An unborn branch has nothing to compare against.
+    pub fn uncommitted_line_totals(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(u64, u64), RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "diff",
+                "HEAD",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--ignore-submodules=dirty",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        let records = invalid_output(parse_numstat(&output.stdout), output)?;
+        Ok(records.iter().fold((0, 0), |(added, removed), record| {
+            (
+                added + record.added.unwrap_or(0),
+                removed + record.removed.unwrap_or(0),
+            )
+        }))
+    }
+
     /// The committer time of each of `oids`, such as detached worktree heads,
     /// in one process. Commits that are not present locally fail the read.
     pub fn commit_times(
@@ -493,8 +524,24 @@ mod tests {
         std::fs::write(root.join("scratch/deep/b"), "b").unwrap();
         std::fs::write(root.join("README"), "three\n").unwrap();
 
+        std::fs::write(root.join("staged"), "a\nb\n").unwrap();
+        git(&["add", "staged"]);
+
         let service = RepositoryService::system("git");
         let cancellation = CancellationToken::new();
+        // Staged and unstaged lines count together; untracked files do not.
+        assert_eq!(
+            service
+                .uncommitted_line_totals(&root, &cancellation)
+                .unwrap(),
+            (3, 1)
+        );
+        assert_eq!(
+            service
+                .uncommitted_line_totals(&linked, &cancellation)
+                .unwrap(),
+            (0, 0)
+        );
         assert_eq!(
             service
                 .default_branch_ref(&root, &cancellation)
@@ -609,7 +656,11 @@ mod tests {
         // The untracked directory is one entry and the ignored tree is absent.
         assert_eq!(
             paths,
-            BTreeSet::from([PathBuf::from("README"), PathBuf::from("scratch/")])
+            BTreeSet::from([
+                PathBuf::from("README"),
+                PathBuf::from("scratch/"),
+                PathBuf::from("staged")
+            ])
         );
 
         // A fork compares with its parent, not with itself.

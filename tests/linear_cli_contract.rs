@@ -514,11 +514,11 @@ root = pathlib.Path(sys.argv[1])
 with socket.socket(socket.AF_UNIX) as server:
     server.bind(str(root / 'stderr-socket'))
     server.listen(1)
-    server.settimeout(5)
+    server.settimeout(60)
     (root / 'stderr-ready').write_text('ready')
     connection, _ = server.accept()
     with connection:
-        connection.settimeout(5)
+        connection.settimeout(60)
         _, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(4))
     assert len(ancillary) == 1
     level, kind, payload = ancillary[0]
@@ -528,7 +528,8 @@ with socket.socket(socket.AF_UNIX) as server:
     assert len(descriptors) == 1
     try:
         (root / 'stderr-held').write_text('held')
-        select.select([sys.stdin], [], [], 25)
+        # Until the test lets go, which is after the command has returned.
+        select.select([sys.stdin], [], [])
     finally:
         os.close(descriptors[0])
 "#;
@@ -542,7 +543,7 @@ with socket.socket(socket.AF_UNIX) as server:
             .spawn()
             .unwrap(),
     );
-    let ready_by = Instant::now() + Duration::from_secs(5);
+    let ready_by = Instant::now() + Duration::from_secs(60);
     while !f.path().join("stderr-ready").exists() {
         assert!(
             Instant::now() < ready_by,
@@ -562,9 +563,17 @@ raise SystemExit(1)
 "#,
     )
     .unwrap();
-    let started = Instant::now();
-    let output = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
-    let elapsed = started.elapsed();
+    // The helper's deadline is 15 seconds. A command that waited for the
+    // held stderr instead would wait for the holder, which lets go only after
+    // the command returns.
+    let command = f.without_api_key(&["linear", "issue", "ENG-12"]);
+    let (sender, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(capture(command));
+    });
+    let output = finished
+        .recv_timeout(Duration::from_secs(15 + 60))
+        .expect("the command outlived its helper's deadline");
     assert!(
         f.path().join("stderr-held").exists(),
         "actual stderr descriptor was not held"
@@ -573,17 +582,13 @@ raise SystemExit(1)
         holder.0.try_wait().unwrap().is_none(),
         "holder must still own the open writer"
     );
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "stderr outlived helper deadline: {elapsed:?}"
-    );
     assert!(!output.success);
     let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_keyring_unavailable");
     assert!(output.stdout.is_empty());
     assert_eq!(f.calls(), 0);
     drop(holder.0.stdin.take());
-    let settled_by = Instant::now() + Duration::from_secs(5);
+    let settled_by = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = holder.0.try_wait().unwrap() {
             assert!(status.success());

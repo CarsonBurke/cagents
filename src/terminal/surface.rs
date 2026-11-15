@@ -37,7 +37,7 @@ impl TerminalSurface {
     }
 
     /// Semantic surfaces must reset when a card attaches a replacement terminal.
-    pub(crate) fn terminal_id(&self) -> crate::model::TerminalId {
+    pub fn terminal_id(&self) -> crate::model::TerminalId {
         self.handle.terminal_id()
     }
 
@@ -58,13 +58,15 @@ impl TerminalSurface {
         self.handle.agent_activity()
     }
 
-    #[cfg(test)]
-    pub(crate) fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
         self.handle.visibility()
     }
 
-    #[cfg(test)]
-    pub(crate) fn stop_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stop_for_test(&self) {
         self.handle.stop_for_test();
     }
 
@@ -74,6 +76,17 @@ impl TerminalSurface {
 
     pub fn host_proof(&self) -> Option<HostSessionProof> {
         self.handle.proof()
+    }
+
+    /// See [`HostedTerminalHandle::current_attachment`].
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        self.handle.current_attachment()
+    }
+
+    /// See [`HostedTerminalHandle::attachment_failure`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.handle.attachment_failure()
     }
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
@@ -90,6 +103,17 @@ impl TerminalSurface {
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
         self.handle.events()
+    }
+
+    /// The terminal worker's execution instance, once one is confirmed.
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.handle.set_worker_receipt_for_test(owner, worker);
     }
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {

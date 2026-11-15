@@ -1,25 +1,54 @@
 #!/bin/sh
 # rustfmt does not expand include! macros. Check their Rust sources explicitly
 # as well as Cargo's crate roots; never rewrite files while checking them.
+# --write formats the same files in place instead of checking them.
 set -u
+
+check=--check
+case $# in
+0) ;;
+1)
+    case $1 in
+    --write) check= ;;
+    -h|--help)
+        printf '%s\n' 'Usage: scripts/check-format [--write]' \
+            'Check formatting of Cargo roots and Rust sources behind include!; --write formats them in place.'
+        exit 0
+        ;;
+    *) printf 'check-format: unknown argument %s\n' "$1" >&2; exit 2 ;;
+    esac
+    ;;
+*) printf '%s\n' 'Usage: scripts/check-format [--write]' >&2; exit 2 ;;
+esac
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit
 cd "$root" || exit
 
 cargo_status=0
-cargo fmt --check || cargo_status=$?
+cargo fmt ${check:+"$check"} -p cagents -p cagents-ui || cargo_status=$?
 
 # Keep this list in sync with Rust-source include! calls in src/, tests/ and
 # crates/. Ordinary mod declarations below modules.rs are traversed by rustfmt,
 # including feature-gated modules, without building any feature lane or vendor.
 included_status=0
-rustfmt --edition 2024 --check \
+set -- --edition 2024 ${check:+"$check"} \
     src/modules.rs \
+    crates/cagents-ui/src/modules.rs \
+    crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
     tests/support/iced_tree.rs \
-    tests/support/repository_scale.rs || included_status=$?
+    tests/support/repository_scale.rs
+if [ -n "$check" ] && [ "$cargo_status" -eq 0 ] && [ -x /usr/bin/python3 ]; then
+    # A successful check of identical source and formatter inputs can be reused.
+    # The helper falls back to rustfmt whenever it cannot prove that identity.
+    /usr/bin/python3 "$root/scripts/check-format-cache.py" "$@" || included_status=$?
+else
+    # Keep formatting available without Python, report both diagnostics when
+    # the Cargo-root check fails, and never reuse a check when writing.
+    rustfmt "$@" || included_status=$?
+fi
 
 # Report both sets of diagnostics even when Cargo's check fails.
 if [ "$cargo_status" -ne 0 ]; then
