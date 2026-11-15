@@ -68,9 +68,9 @@ pub(super) enum Action {
     CopyDetails(CardId, TerminalId),
 }
 
-/// A generic storage error is a partial success only after the same daemon
-/// proves it still hosts this exact launch and the accepted pane is unchanged.
-/// Source refusals never become an attachment through inventory.
+/// A storage or revision failure is a partial success only after the same
+/// daemon proves it still hosts this exact launch and the accepted pane is
+/// unchanged. Inventory never grants permission to save a changed source.
 pub(super) fn complete(
     client: &mut ControlClient,
     reservation: Reservation,
@@ -92,7 +92,7 @@ pub(super) fn complete(
                 if matches!(
                     &error,
                     ControlError::Remote {
-                        code: ProtocolErrorCode::Internal,
+                        code: ProtocolErrorCode::Internal | ProtocolErrorCode::ViewConflict,
                         ..
                     }
                 ) {
@@ -766,6 +766,7 @@ mod tests {
             "pending",
             "exited",
             "peer-saved",
+            "revision-conflict",
             "source-changed",
             "source-conflict",
             "wrong-worker",
@@ -784,7 +785,7 @@ mod tests {
                 view.panes[0].pending_terminal_start = false;
                 view.panes[0].kind = CardKind::Terminal(live.clone());
             }
-            if case == "source-changed" {
+            if matches!(case, "source-changed" | "source-conflict") {
                 view.panes[0].title = "Changed elsewhere".into();
             }
             let mut hosted =
@@ -817,7 +818,7 @@ mod tests {
                         ClientRequest::CompletePendingTerminal { .. } => {
                             requests.push("complete");
                             ServerMessage::Error(ProtocolError::new(
-                                if case == "source-conflict" {
+                                if matches!(case, "source-conflict" | "revision-conflict") {
                                     ProtocolErrorCode::ViewConflict
                                 } else {
                                     ProtocolErrorCode::Internal
@@ -865,7 +866,7 @@ mod tests {
                 TerminalConfig::default().into(),
             );
             match case {
-                "pending" | "exited" => {
+                "pending" | "exited" | "revision-conflict" => {
                     let (hosted, notice) = result.unwrap();
                     assert_eq!(hosted.session.id, terminal);
                     assert!(notice.is_some());
