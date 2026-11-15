@@ -2302,6 +2302,7 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
+            || self.has_terminal_save_notices()
             || self.has_refused_view_seeds()
             || self
                 .save_health
@@ -2387,6 +2388,17 @@ impl Cagents {
         Task::none()
     }
 
+    pub(super) fn refocus_after_terminal_save(&mut self, card: CardId) -> Task<Message> {
+        if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
+            self.chrome_ui.close();
+        }
+        if self.card_holds_keyboard(card) {
+            self.focus_pane_keyboard(card)
+        } else {
+            Task::none()
+        }
+    }
+
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
@@ -2423,7 +2435,11 @@ impl Cagents {
             .notices
             .severity()
             .max(health_severity)
-            .max(seed_severity);
+            .max(seed_severity)
+            .max(
+                self.has_terminal_save_notices()
+                    .then_some(NoticeSeverity::Error),
+            );
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2618,7 +2634,11 @@ impl Cagents {
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
+                notices.extend(self.terminal_save_notice_views());
                 for entry in self.notices.recent() {
+                    if matches!(entry.notice.key, Some(NoticeKey::TerminalSave(_, _))) {
+                        continue;
+                    }
                     let severity = entry.notice.severity;
                     let mut lines = vec![super::notice_body(&entry.notice.message)];
                     if let Some(details) = &entry.notice.details {
@@ -2666,7 +2686,13 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                 ];
-                if !self.notices.is_empty() {
+                // Persistent save health resolves through saving, like the
+                // session writer's notice; Dismiss all applies to the log.
+                if self
+                    .notices
+                    .recent()
+                    .any(|entry| !matches!(entry.notice.key, Some(NoticeKey::TerminalSave(_, _))))
+                {
                     heading_children.push(
                         crate::ui_controls::button::quiet("Dismiss all")
                             .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))

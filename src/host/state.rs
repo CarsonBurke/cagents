@@ -68,6 +68,8 @@ pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
+    /// Exact reservation and issued source, kept with this worker until saved.
+    pending_terminal_completion: Option<(super::workspace::PendingTerminal, TerminalSession)>,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     /// The actual validated worker command, independent of its issued pane.
     execution_recipe: Option<crate::model::LaunchRecipe>,
@@ -1500,6 +1502,7 @@ impl HostState {
                 screen_lost_after_crash: false,
                 session,
                 handle,
+                pending_terminal_completion: None,
                 options: TerminalSpawnOptions::default(),
                 execution_environment,
                 execution_recipe,
@@ -4065,6 +4068,98 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
+fn finish_pending_terminal(
+    shared: &SharedHost,
+    registry: &mut super::model::Registry,
+    terminal_id: TerminalId,
+    original: &TerminalHandle,
+) -> Result<(), ProtocolError> {
+    let completion = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .terminals
+            .get(&terminal_id)
+            .filter(|record| record.handle.same_worker(original))
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    super::model::Registry::VIEW_SOURCE_CONFLICT,
+                    true,
+                )
+            })?;
+        record.pending_terminal_completion.clone()
+    };
+    if let Some((reservation, session)) = completion {
+        super::workspace::complete_terminal(shared, registry, reservation, session)?;
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = state.terminals.get_mut(&terminal_id)
+            && record.handle.same_worker(original)
+        {
+            record.pending_terminal_completion = None;
+        }
+    }
+    Ok(())
+}
+
+fn read_pending_terminal(
+    shared: &SharedHost,
+    registry: &super::model::Registry,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+) -> Result<super::workspace::PendingTerminal, ProtocolError> {
+    super::workspace::pending_terminal(registry, pane, terminal_id).map_err(|error| {
+        // A missing pane after worker publication is a source refusal, not an
+        // attachment race that the UI may recover from through inventory.
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if error.code == ProtocolErrorCode::TerminalNotFound
+            && state
+                .terminals
+                .get(&terminal_id)
+                .is_some_and(|record| record.pending_terminal_completion.is_some())
+        {
+            ProtocolError::new(
+                ProtocolErrorCode::ViewConflict,
+                super::model::Registry::VIEW_SOURCE_CONFLICT,
+                true,
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// Persistence-only recovery never enters spawn admission. Retirement between
+/// observation and this request cannot reinterpret a saved recipe as a launch.
+pub(super) fn retry_pending_terminal_save(
+    shared: &SharedHost,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+) -> Result<(), ProtocolError> {
+    let writer = super::workspace::writer(shared)?;
+    let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    let reservation = read_pending_terminal(shared, &registry, pane, terminal_id)?;
+    let handle = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        state.ensure_retention_available(&[terminal_id])?;
+        let record = state.terminals.get(&terminal_id).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::TerminalNotFound,
+                "This terminal is no longer hosted. Its pending save was kept.",
+                false,
+            )
+        })?;
+        if reservation.pane_is_pending() && record.pending_terminal_completion.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ViewConflict,
+                super::model::Registry::VIEW_SOURCE_CONFLICT,
+                false,
+            ));
+        }
+        record.handle.clone()
+    };
+    finish_pending_terminal(shared, &mut registry, terminal_id, &handle)
+}
+
 pub(super) fn spawn_pending_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -4075,8 +4170,10 @@ pub(super) fn spawn_pending_terminal(
     let session = {
         let writer = super::workspace::writer(shared)?;
         let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-        super::workspace::pending_terminal(&registry, pane, terminal_id)?.session
+        read_pending_terminal(shared, &registry, pane, terminal_id)?.session
     };
+    #[cfg(test)]
+    super::workspace::pending_start_test_hook();
     start_terminal_view_owned(
         shared,
         client_id,
@@ -4407,28 +4504,52 @@ fn start_terminal_view_owned_reserved(
     let pending_writer = pending_pane
         .map(|_| super::workspace::writer(shared))
         .transpose()?;
-    let holder_recovery = {
-        let registry = pending_writer
+    let (holder_recovery, pending_reservation) = {
+        let mut registry = pending_writer
             .as_ref()
             .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
         let reservation = registry
             .as_deref()
             .zip(pending_pane)
-            .map(|(registry, pane)| super::workspace::pending_terminal(registry, pane, terminal_id))
+            .map(|(registry, pane)| read_pending_terminal(shared, registry, pane, terminal_id))
             .transpose()?;
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(reservation) = reservation {
+        if let Some(reservation) = &reservation {
             // Completion is idempotent across clients, but an actor alone is
             // insufficient: its authoritative pane must still name it.
             if state.terminals.contains_key(&terminal_id) {
+                if reservation.pane_is_pending()
+                    && state.terminals[&terminal_id]
+                        .pending_terminal_completion
+                        .is_none()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        super::model::Registry::VIEW_SOURCE_CONFLICT,
+                        true,
+                    ));
+                }
                 let descriptor = state.attach(client_id, terminal_id)?;
                 let handle = state.terminals[&terminal_id].handle.clone();
+                drop(state);
+                // Retry the original save before reporting this attachment as
+                // complete. Never spawn or adopt a different pane's intent.
+                finish_pending_terminal(
+                    shared,
+                    registry.as_deref_mut().expect("pending writer"),
+                    terminal_id,
+                    &handle,
+                )?;
                 return Ok((descriptor, handle));
             }
             if !reservation.accepts(&session) {
-                return Err(not_found(terminal_id));
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    super::model::Registry::VIEW_SOURCE_CONFLICT,
+                    true,
+                ));
             }
         }
         // A saved setup recipe is evidence, never automatic replay permission.
@@ -4461,7 +4582,7 @@ fn start_terminal_view_owned_reserved(
                 return Err(error);
             }
         }
-        state.recover_holders.then(|| {
+        let recovery = state.recover_holders.then(|| {
             let mut source = session.clone();
             source.continuity = TerminalContinuity::DetachedSameBoot {
                 host_session_id: state.proof.host_session_id.clone(),
@@ -4483,7 +4604,8 @@ fn start_terminal_view_owned_reserved(
                 execution_environment: retained_environment.clone(),
                 execution_recipe: execution_recipe.clone(),
             }
-        })
+        });
+        (recovery, reservation)
     };
     // Fresh holders receive this exact daemon-issued source. Retain it after
     // successful startup instead of the caller's proofless relaunch projection.
@@ -4702,21 +4824,12 @@ fn start_terminal_view_owned_reserved(
     let mut pending_registry = pending_writer
         .as_ref()
         .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
-    let reservation = pending_registry
-        .as_deref()
-        .zip(pending_pane)
-        .map(|(registry, pane)| {
-            super::workspace::pending_terminal(registry, pane, terminal_id).and_then(
-                |reservation| {
-                    if reservation.accepts(&session) {
-                        Ok(reservation)
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
-                },
-            )
-        });
-    let (descriptor, completion) = {
+    let reservation = pending_reservation.map(|reservation| {
+        reservation
+            .current_revision(pending_registry.as_deref().expect("pending writer"))
+            .map(|_| reservation)
+    });
+    let descriptor = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4801,15 +4914,14 @@ fn start_terminal_view_owned_reserved(
                 .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
-        let completion = reservation
-            .filter(|_| descriptor.is_ok())
-            .map(|reservation| (reservation, state.terminals[&terminal_id].session.clone()));
         if descriptor.is_ok() {
-            state
+            let record = state
                 .terminals
                 .get_mut(&terminal_id)
-                .expect("finished spawn")
-                .options = options.clone();
+                .expect("finished spawn");
+            record.pending_terminal_completion =
+                reservation.map(|reservation| (reservation, record.session.clone()));
+            record.options = options.clone();
             // Keep the independently installed parent through actual
             // descriptor publication, not merely the worker startup ACK.
             // Any earlier error leaves the exact original recoverable.
@@ -4822,14 +4934,8 @@ fn start_terminal_view_owned_reserved(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        (descriptor, completion)
+        descriptor
     };
-    if let (Some(registry), Some((reservation, session))) =
-        (pending_registry.as_deref_mut(), completion)
-    {
-        super::workspace::complete_terminal(shared, registry, reservation, session);
-    }
-    drop(pending_registry);
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
@@ -4868,6 +4974,12 @@ fn start_terminal_view_owned_reserved(
             broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
         }
     });
+    // A save failure leaves a fully observed resident worker and its exact
+    // completion intent available to the next request. Return the refusal so
+    // the UI can attach the worker and report its unresolved save separately.
+    if let Some(registry) = pending_registry.as_deref_mut() {
+        finish_pending_terminal(shared, registry, terminal_id, &redraw_handle)?;
+    }
     Ok((descriptor, redraw_handle))
 }
 
