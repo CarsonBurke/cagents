@@ -55,13 +55,14 @@ mod public_delta_tests;
 mod schema;
 mod terminal_owners;
 mod terminal_retention;
+pub(in crate::host) mod terminal_sources;
 #[cfg(test)]
 mod view_cost_bench;
 mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 25;
+const SCHEMA_VERSION: u32 = 26;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -354,26 +355,47 @@ impl Registry {
         })
     }
 
-    pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
-        // Native evidence can refuse this one save after the real worker is
-        // published, without changing the registry's admitted SQL schema.
+    pub(in crate::host) fn pending_terminal_save_fixture_error() -> Result<(), String> {
         #[cfg(feature = "development")]
+        if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
+            PathBuf::from(root)
+                .join("home/.config/fixture-pending-terminal-save-error")
+                .exists()
+        }) {
+            return Err("fixture refused the pending terminal completion save".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
         if matches!(edit, ModelEdit::ChangeView {
             change: crate::workspace_model::views::Change::Update { before, pane }, ..
         } if before.pending_terminal_start && !pane.pending_terminal_start)
-            && std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
-                PathBuf::from(root)
-                    .join("home/.config/fixture-pending-terminal-save-error")
-                    .exists()
-            })
         {
-            return Err("fixture refused the pending terminal completion save".into());
+            Self::pending_terminal_save_fixture_error()?;
         }
+        self.apply_delta_guarded(edit, |_, _| Ok(()))
+    }
+
+    /// Acquire SQL writer admission before retaining resident serialization.
+    /// The guard outlives commit, but never waits for BEGIN IMMEDIATE.
+    pub(crate) fn apply_delta_guarded<G>(
+        &mut self,
+        edit: &ModelEdit,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
+    ) -> Result<DeltaApplied, String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current(&transaction)?;
+        let seen = match edit {
+            ModelEdit::ChangeView { operation, .. } => {
+                views::operation_seen(&transaction, *operation)?
+            }
+            _ => false,
+        };
+        let resident_guard = guard(seen, &transaction)?;
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
@@ -629,6 +651,7 @@ impl Registry {
         #[cfg(test)]
         pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
+        drop(resident_guard);
         #[cfg(test)]
         pause(Pause::AfterCommit);
         Ok(DeltaApplied {
@@ -1017,6 +1040,10 @@ fn migrate_through(
     if version < 25 && target >= 25 {
         lineage::migrate_channels(tx)?;
         schema::migration_checkpoint(25)?;
+    }
+    if version < 26 && target >= 26 {
+        views::bindings::migrate(tx)?;
+        schema::migration_checkpoint(26)?;
     }
     Ok(())
 }
@@ -1559,7 +1586,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TRIGGER session_channel_insert;
+                "DROP TABLE terminal_pane_bindings;
+                 DROP TRIGGER session_channel_insert;
                  DROP TRIGGER session_channel_move;
                  DROP TABLE session_channels;
                  DROP TABLE console_relaunches;

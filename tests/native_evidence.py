@@ -343,6 +343,40 @@ class Evidence(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
 
+    def test_scoped_ui_waits_for_user_daemon_exit_before_restart(self) -> None:
+        self.built()
+        target = self.task / 'target-after/dev-runtime'
+        original = target / 'cagents-original'
+        original.write_bytes((target / 'cagents').read_bytes())
+        original.chmod(0o755)
+        write_executable(target / 'cagents', '''
+            #!/bin/bash
+            case "$*" in
+                'daemon stop-for-rebuild --including-subagents')
+                    [ -z "${CAGENTS_AGENT_AUTHORITY+x}" ] || exit 91
+                    socket="$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock"
+                    mkdir -p "${socket%/*}"
+                    : > "$socket"
+                    (sleep 0.3; rm -f "$socket") </dev/null >/dev/null 2>&1 &
+                    ;;
+                'daemon start')
+                    [ -z "${CAGENTS_AGENT_AUTHORITY+x}" ] || exit 92
+                    if [ -e "$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock" ]; then
+                        echo 'old daemon still listening' >&2
+                        exit 93
+                    fi
+                    printf 'started\\n' >> "$STUB_LOG/scoped-daemon"
+                    ;;
+                *) exec ORIGINAL "$@" ;;
+            esac
+            '''.replace('ORIGINAL', shlex.quote(str(original))), self.logs)
+        self.run_tool('start', 'after', '--ui-scoped-fixture')
+        self.assertEqual((self.logs / 'scoped-daemon').read_text(), 'started\n')
+        self.assertNotIn('--fresh-daemon', (self.logs / 'runner').read_text())
+        self.assertIn('CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session',
+                      (self.logs / 'ui-env').read_text())
+        self.run_tool('stop')
+
     def test_narrow_viewport_keeps_its_explicit_height(self):
         self.built("after")
         self.run_tool("start", "after", "--width", "900", "--height", "800")
@@ -757,6 +791,7 @@ class Evidence(unittest.TestCase):
         self.built()
         self.run_tool("start", "after", "--instance", "native-review")
         self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        self.assertIn("--fresh-daemon", shlex.split((self.logs / "runner").read_text().splitlines()[-1]))
         instance = self.run_tool("env", "sh", "-c", 'printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"')
         self.assertEqual(instance.stdout, "native-review")
         self.run_tool("stop")
@@ -1179,6 +1214,7 @@ class Evidence(unittest.TestCase):
             self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
             arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
             self.assertEqual(arguments[-3:], ["--", "--window", "window-2"])
+            self.assertNotIn("--fresh-daemon", arguments)
             self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
             if scoped:
                 self.assertIn("CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session\n",
@@ -1301,7 +1337,18 @@ class Evidence(unittest.TestCase):
             self.assertFalse(self.lock_is_free(self.native_lock))
             self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
-            self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
+            runner_lines = (self.logs / "runner").read_text().splitlines()
+            self.assertEqual(len(runner_lines), 2)
+            if scoped:
+                # The User CLI resets first; the scoped UI cannot restart it.
+                self.assertNotIn("--fresh-daemon", shlex.split(runner_lines[0]))
+                cli_lines = (self.logs / "cli").read_text().splitlines()
+                reset = "daemon stop-for-rebuild --including-subagents"
+                self.assertEqual(cli_lines.count(reset), 1)
+                self.assertLess(cli_lines.index(reset), cli_lines.index("daemon start"))
+            else:
+                self.assertIn("--fresh-daemon", shlex.split(runner_lines[0]))
+            self.assertNotIn("--fresh-daemon", shlex.split(runner_lines[1]))
             if workspace_trace:
                 self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
             if scoped:
@@ -2751,6 +2798,81 @@ class RemoteEvidence(unittest.TestCase):
         result = self.run_tool("status", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertFalse((self.logs / "ssh").exists())
+
+
+class SeedRestore(unittest.TestCase):
+    def test_read_only_files_restore_bytes_modes_and_inodes(self):
+        # Root bypasses read-only modes, so use an unprivileged child there.
+        # Ordinary CI users exercise the same filesystem behavior directly.
+        for changed, saved_mode in ((False, 0o444), (True, 0o444), (True, 0o640)):
+            with self.subTest(changed=changed, saved_mode=saved_mode), tempfile.TemporaryDirectory(
+                    prefix="native-seed-", dir="/var/tmp") as temporary:
+                root = Path(temporary)
+                seed, fixture = root / "seed", root / "fixture"
+                relatives = ("project/.git/objects/4b/object", "home/.claude/session.jsonl")
+                original = {}
+                for relative in relatives:
+                    for parent, content in ((seed, "saved"),
+                                            (fixture, "changed" if changed else "saved")):
+                        path = parent / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(content)
+                        path.chmod(saved_mode if parent == seed else 0o444)
+                    target = fixture / relative
+                    os.utime(target, (1, 1))
+                    original[relative] = target.stat().st_ino
+                provider = fixture / "home/.claude"
+                provider_identity = (provider.stat().st_dev, provider.stat().st_ino)
+                unrelated = root / "unrelated"
+                unrelated.write_text("outside the fixture")
+                unrelated.chmod(0o444)
+                for parent in (seed, fixture):
+                    (parent / "external").symlink_to(unrelated)
+                helper = root / "restore.py"
+                shutil.copyfile(REPOSITORY / "scripts/native-evidence-seed.py", helper)
+                credentials = {}
+                if os.geteuid() == 0:
+                    for directory, subdirs, files in os.walk(root):
+                        for path in [Path(directory), *(Path(directory) / name for name in files)]:
+                            os.chown(path, 65534, 65534, follow_symlinks=False)
+                    credentials = {"user": 65534, "group": 65534, "extra_groups": []}
+                result = subprocess.run(
+                    ["/usr/bin/python3", "-I", str(helper), str(seed), str(fixture)],
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(root)},
+                    capture_output=True, text=True, timeout=15, **credentials)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for relative in relatives:
+                    path = fixture / relative
+                    self.assertEqual(path.read_text(), "saved")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), saved_mode)
+                    self.assertEqual(path.stat().st_ino, original[relative])
+                self.assertEqual((provider.stat().st_dev, provider.stat().st_ino), provider_identity)
+                self.assertEqual(unrelated.read_text(), "outside the fixture")
+                self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o444)
+
+    def test_failed_restore_returns_the_original_file_permissions(self):
+        with tempfile.TemporaryDirectory(prefix="native-seed-failure-", dir="/var/tmp") as temporary:
+            root = Path(temporary)
+            seed, fixture, binaries = root / "seed", root / "fixture", root / "bin"
+            for directory in (seed, fixture, binaries):
+                directory.mkdir()
+            (seed / "file").write_text("saved")
+            target = fixture / "file"
+            target.write_text("changed")
+            target.chmod(0o444)
+            original_inode = target.stat().st_ino
+            rsync = binaries / "rsync"
+            rsync.write_text("#!/bin/sh\nexit 23\n")
+            rsync.chmod(0o755)
+            result = subprocess.run(
+                ["/usr/bin/python3", "-I", str(REPOSITORY / "scripts/native-evidence-seed.py"),
+                 str(seed), str(fixture)],
+                env={"PATH": str(binaries), "HOME": str(root)},
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual(target.read_text(), "changed")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)
+            self.assertEqual(target.stat().st_ino, original_inode)
 
 
 if __name__ == "__main__":

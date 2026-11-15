@@ -218,7 +218,7 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
             .handle
             .same_worker(&original)
     );
-    let issued = state.terminals[&fixture.session.id].session.clone();
+    let issued = state.descriptor(0, fixture.session.id).unwrap().session;
     drop(state);
     let saved = fixture.view();
     assert!(!saved.panes[0].pending_terminal_start);
@@ -234,6 +234,40 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
         thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(launches, "started\n");
+}
+
+#[test]
+fn persistence_only_retry_saves_the_original_worker_without_starting_another() {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(&fixture.path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+    assert_eq!(
+        fixture.complete().unwrap_err().code,
+        ProtocolErrorCode::Internal
+    );
+    let original = fixture.host.lock().unwrap().terminals[&fixture.session.id]
+        .handle
+        .clone();
+    db.execute_batch("DROP TRIGGER reject_pending").unwrap();
+    for _ in 0..2 {
+        crate::host::client::process_request(
+            &fixture.host,
+            1,
+            ClientRequest::RetryPendingTerminalSave {
+                pane: fixture.pane.id,
+                terminal_id: fixture.session.id,
+            },
+        )
+        .unwrap();
+    }
+    assert!(!fixture.view().panes[0].pending_terminal_start);
+    let state = fixture.host.lock().unwrap();
+    assert_eq!(state.terminals.len(), 1);
+    assert!(
+        state.terminals[&fixture.session.id]
+            .handle
+            .same_worker(&original)
+    );
 }
 
 #[test]

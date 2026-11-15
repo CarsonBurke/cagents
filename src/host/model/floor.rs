@@ -111,6 +111,7 @@ impl Registry {
             // a new canonical insertion, so issue its epoch in this same TX.
             super::channel_work::placement::observe_view_transition(&transaction, &before, &view)?;
             super::views::store::store(&transaction, &view)?;
+            super::views::bindings::sync(&transaction, &before, &view)?;
             super::terminal_retention::sync_view_pins(&transaction, &view.panes)?;
             // Update only the exact stopped presentation. Runs, launch authority,
             // actor journals and retirement receipts remain as the old close left them.

@@ -9335,6 +9335,18 @@ impl Cagents {
         // first. A surface attached to a terminal that had already ended
         // replays that report; recording it again would move the exit to now
         // and announce it a second time.
+        if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+            && let Some((instance, owner)) = handle.execution_instance().zip(handle.host_proof())
+            && let Some(CardKind::Terminal(source)) = self.card_state(card).map(|s| &s.kind)
+        {
+            self.shared_views.terminal_source_workers.insert(
+                card,
+                (
+                    source.id,
+                    crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance },
+                ),
+            );
+        }
         let already_ended = self.ended_terminal(card).is_some();
         if !already_ended
             && let Some(state) = self.card_state_mut(card)
@@ -10359,13 +10371,28 @@ impl Cagents {
         if self.chat_start_pending(card) {
             return (Task::none(), Projection::Unchanged);
         }
-        let (proof, collected) = {
+        let (proof, worker, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                 return (Task::none(), Projection::Unchanged);
             };
             let events = handle.events();
-            (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
+            (
+                handle.host_proof(),
+                handle.execution_instance(),
+                events.try_iter().collect::<Vec<_>>(),
+            )
         };
+        if let Some((instance, owner)) = worker.zip(proof.clone())
+            && let Some(CardKind::Terminal(source)) = self.card_state(card).map(|s| &s.kind)
+        {
+            self.shared_views.terminal_source_workers.insert(
+                card,
+                (
+                    source.id,
+                    crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, instance },
+                ),
+            );
+        }
         let mut durable_changed = false;
         let mut metadata_changed = false;
         // A reported title is durable, but only chrome reads it and its save

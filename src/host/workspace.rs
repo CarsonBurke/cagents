@@ -147,7 +147,39 @@ fn edit_then<T>(
             return Ok((receipt, then(&registry)?));
         }
     }
-    let applied = apply_delta(&mut registry, &edit)?;
+    let applied = if matches!(
+        &edit,
+        ModelEdit::ChangeView {
+            change: Change::RemoveSource { .. } | Change::UpdateTerminalSource { .. },
+            ..
+        }
+    ) {
+        apply_delta_guarded(&mut registry, &edit, |seen, sql| {
+            if seen {
+                return Ok(None);
+            }
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.validate_view_removal(&edit)?;
+            if Registry::unbound_terminal_update(sql, &edit)? {
+                let ModelEdit::ChangeView {
+                    change: Change::UpdateTerminalSource { before, worker, .. },
+                    ..
+                } = &edit
+                else {
+                    unreachable!()
+                };
+                let CardKind::Terminal(source) = &before.kind else {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                };
+                if !state.current_metadata_worker(source.id, worker) {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                }
+            }
+            Ok(Some(state))
+        })?
+    } else {
+        apply_delta(&mut registry, &edit)?
+    };
     if applied.changed {
         let waiting = Instant::now();
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -200,6 +232,14 @@ pub(super) fn apply_delta(
     registry: &mut Registry,
     edit: &ModelEdit,
 ) -> Result<DeltaApplied, ProtocolError> {
+    apply_delta_guarded(registry, edit, |_, _| Ok(()))
+}
+
+fn apply_delta_guarded<G>(
+    registry: &mut Registry,
+    edit: &ModelEdit,
+    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
+) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
         scope,
         expected_revision,
@@ -230,7 +270,10 @@ pub(super) fn apply_delta(
             }
         }
     }
-    registry.apply_delta(edit).map_err(|error| {
+    registry.apply_delta_guarded(edit, guard).map_err(|error| {
+        if error == Registry::VIEW_REMOVAL_CONFLICT {
+            return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
+        }
         if error == Registry::VIEW_SOURCE_CONFLICT || error == Registry::VIEW_REVISION_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
         }
@@ -254,11 +297,28 @@ pub(super) struct PendingTerminal {
     pub(super) session: TerminalSession,
     pane: Pane,
     scope: Scope,
+    #[cfg(test)]
     revision: u64,
+    #[cfg(test)]
     operation: uuid::Uuid,
 }
 
 impl PendingTerminal {
+    pub(super) fn validate(
+        &self,
+        admission: &super::model::terminal_sources::SourceAdmission<'_>,
+    ) -> Result<(), ProtocolError> {
+        admission
+            .validate_pending(&self.scope, &self.pane)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    Registry::VIEW_SOURCE_CONFLICT,
+                    true,
+                )
+            })
+    }
+
     pub(super) fn pane_is_pending(&self) -> bool {
         self.pane.pending_terminal_start
     }
@@ -269,6 +329,7 @@ impl PendingTerminal {
 
     /// Execution writes use another connection. Read the pane and its revision
     /// together; the next transaction fences any change after this snapshot.
+    #[cfg(test)]
     pub(super) fn current_revision(&self, registry: &Registry) -> Result<u64, ProtocolError> {
         let (view, _) = registry.view_snapshot(&self.scope).map_err(unavailable)?;
         if let Some(view) = view
@@ -301,7 +362,9 @@ pub(super) fn pending_terminal(
                     session: session.clone(),
                     pane: candidate,
                     scope: view.scope,
+                    #[cfg(test)]
                     revision: view.revision,
+                    #[cfg(test)]
                     operation: uuid::Uuid::new_v4(),
                 });
             }
@@ -316,6 +379,7 @@ pub(super) fn pending_terminal(
 
 /// Saves the published worker's source into its reserved pane. The caller
 /// holds writer admission from the reservation check; HostState is free.
+#[cfg(test)]
 pub(super) fn complete_terminal(
     host: &SharedHost,
     registry: &mut Registry,

@@ -239,6 +239,12 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            26 => {
+                // Source stamps own no process or recovery custody. The
+                // model watermark remains monotonic across cold conversion.
+                tx.execute_batch("DROP TABLE terminal_pane_bindings;")
+                    .map_err(|error| error.to_string())?;
+            }
             25 => {
                 tx.execute_batch("DROP TRIGGER session_channel_insert; DROP TRIGGER session_channel_move; DROP TABLE session_channels;")
                     .map_err(|error| error.to_string())?;
@@ -374,6 +380,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_FIVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_SIX: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -389,6 +396,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         23 => &TWENTY_THREE,
         24 => &TWENTY_FOUR,
         25 => &TWENTY_FIVE,
+        26 => &TWENTY_SIX,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -813,7 +821,8 @@ mod tests {
         require_current(&registry.db).unwrap();
         let model = registry.model().unwrap();
         assert_eq!(model.identity.to_string(), identity);
-        assert_eq!(model.sequence, 7);
+        // New source bindings advance the watermark once, fencing old gestures.
+        assert_eq!(model.sequence, 8);
         assert_eq!(model.channels[0].id, channel);
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
         assert_eq!(view.revision, 9);
@@ -883,6 +892,7 @@ mod tests {
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
             (24, "DROP TABLE console_relaunches;"),
             (25, "DROP TABLE session_channels;"),
+            (26, "DROP TABLE terminal_pane_bindings;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1320,7 +1330,7 @@ mod tests {
             );
             // This current opener also applies retention20, run-attention21,
             // history22, the empty console recovery ledger24 and session
-            // channel history25.
+            // channel history25 and source bindings26.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1334,6 +1344,7 @@ mod tests {
                 "automation_firing_successors",
                 "console_relaunches",
                 "session_channels",
+                "terminal_pane_bindings",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1350,6 +1361,7 @@ mod tests {
                 "automation_retired_manual_requests",
                 "console_relaunches",
                 "session_channels",
+                "terminal_pane_bindings",
             ] {
                 assert_eq!(
                     registry
@@ -1376,7 +1388,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects, the console ledger and the exact history column may be added"
+                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger and the exact history column may be added"
             );
             assert!(
                 registry
@@ -1703,7 +1715,8 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            26,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
