@@ -281,11 +281,12 @@ class TestLib(unittest.TestCase):
     def test_the_test_binary_runs_under_a_memory_limit(self):
         ran = self.root / "limited"
         limit = self.root / "scripts/memory-capped"
-        limit.write_text(f'#!/bin/sh\necho "$1" >"{ran}"\nexec "$@"\n')
+        limit.write_text(f'#!/bin/sh\necho "$1 $2" >"{ran}"\nshift\nexec "$@"\n')
         limit.chmod(0o755)
         result = self.invoke("cli", "module::one")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(ran.read_text().strip(), str(self.root / "libtest"))
+        # What a test leaves running is stopped with it.
+        self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("ui", "test")):

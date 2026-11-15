@@ -1367,7 +1367,7 @@ class TestsUnderAMemoryLimit(unittest.TestCase):
             import os, sys
             with open({str(self.ran)!r}, "a") as ran:
                 ran.write("limited " + " ".join(sys.argv[1:]) + "\\n")
-            os.execvp(sys.argv[3], sys.argv[3:])
+            os.execvp(sys.argv[4], sys.argv[4:])
         """))
         limit.chmod(0o755)
         cargo = self.root / "cargo"
@@ -1391,7 +1391,7 @@ class TestsUnderAMemoryLimit(unittest.TestCase):
                 self.ran.unlink(missing_ok=True)
                 limited = [line for line in self.gate_run(*route) if line.startswith("limited ")]
                 self.assertEqual(len(limited), 1)
-                self.assertIn("--slice app-cagents-test.slice cargo test --config target.'cfg(all())'.runner=",
+                self.assertIn("--slice app-cagents-test.slice --stop-leftovers cargo test --config target.'cfg(all())'.runner=",
                               limited[0])
 
     def test_tests_and_benchmarks_run_under_it_after_their_build_without_it(self):
@@ -1400,13 +1400,13 @@ class TestsUnderAMemoryLimit(unittest.TestCase):
                 self.ran.unlink(missing_ok=True)
                 self.assertEqual(self.gate_run(subcommand, "--lib", "filter"), [
                     f"cargo {subcommand} --no-run --lib filter",
-                    f"limited --slice app-cagents-test.slice cargo {subcommand} --lib filter",
+                    f"limited --slice app-cagents-test.slice --stop-leftovers cargo {subcommand} --lib filter",
                     f"cargo {subcommand} --lib filter",
                 ])
 
     def test_doctests_build_and_run_under_it_in_one(self):
         self.assertEqual(self.gate_run("test", "--doc"), [
-            "limited --slice app-cagents-test.slice cargo test --doc",
+            "limited --slice app-cagents-test.slice --stop-leftovers cargo test --doc",
             "cargo test --doc",
         ])
 
@@ -1421,7 +1421,7 @@ class TestsUnderAMemoryLimit(unittest.TestCase):
             with self.subTest(subcommand):
                 self.ran.unlink(missing_ok=True)
                 lines = self.gate_run("exec", str(self.gate), subcommand, "--lib")
-                self.assertIn(f"limited --slice app-cagents-test.slice cargo {subcommand} --lib", lines)
+                self.assertIn(f"limited --slice app-cagents-test.slice --stop-leftovers cargo {subcommand} --lib", lines)
                 self.assertIn(f"cargo {subcommand} --lib", lines)
 
     def test_an_updated_gate_brings_the_limit_and_build_host_with_it(self):
