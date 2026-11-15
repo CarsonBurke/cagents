@@ -4,10 +4,11 @@ set -eu
 
 evidence cli daemon protocol-version
 evidence cli project open '{fixture}/project'
+# Let the newly registered worktree settle, then activate its workspace.
+# The draft's empty state proves terminal creation will use the fixture scope.
+evidence drive click main --settle 2
 evidence drive click main
-if [ "${SCENE_HIDE_INSPECTOR:-0}" = 1 ]; then
-    evidence drive key ctrl+shift+i
-fi
+evidence drive wait appears --timeout 30
 evidence env python3 -c '
 import os,pathlib
 root=pathlib.Path(os.environ["CAGENTS_EVIDENCE_FIXTURE"])
@@ -18,7 +19,7 @@ parent=int(stat[3])
 if pathlib.Path(f"/proc/{parent}/comm").read_text().strip() != "cagents-holder":
  raise SystemExit(1)
 with (pathlib.Path.home()/"terminal-workers.jsonl").open("a") as f:
- f.write(json.dumps({"pid":pid,"start":stat[21]})+"\\n")
+ f.write(json.dumps({"pid":pid,"start":stat[21],"cwd":os.getcwd()})+"\\n")
 """)
 cfg=pathlib.Path(os.environ["XDG_CONFIG_HOME"])/"fish/config.fish"
 cfg.parent.mkdir(parents=True,exist_ok=True)
@@ -26,7 +27,7 @@ cfg.write_text("if status is-interactive\n if python3 \"$HOME/trace-shell.py\"\n
 (root/"home/.config/fixture-pending-terminal-save-error").touch()
 '
 evidence drive key ctrl+shift+t
-evidence drive wait "Completion fixture running" --timeout 30
+evidence drive wait running --timeout 30
 # The fault must not prevent typing into the retained worker.
 evidence drive click 410,240
 evidence drive type 'echo usable-before-save'
@@ -46,6 +47,7 @@ root=pathlib.Path(os.environ["CAGENTS_EVIDENCE_FIXTURE"])
 db=next(pathlib.Path(os.environ["XDG_DATA_HOME"]).rglob("workspace-model.sqlite3"))
 workers=[json.loads(x) for x in (root/"home/terminal-workers.jsonl").read_text().splitlines()]
 assert len(workers)==1, workers
+assert workers[0]["cwd"]==str(root/"project"), workers
 panes=[list(row) for row in sqlite3.connect(db).execute("select id,resource,pending_terminal_start from panes where kind=\"terminal\"").fetchall()]
 assert len(panes)==1 and panes[0][2]==1, panes
 proof={"panes":panes,"workers":workers}
