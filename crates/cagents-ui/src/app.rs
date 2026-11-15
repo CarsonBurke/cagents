@@ -19054,7 +19054,11 @@ impl Application for Cagents {
         self.sync_notification_presence();
         let keyboard = self.settle_owed_keyboard();
         let preview = self.settle_workspace_switcher_preview();
-        Task::batch([task, activation, visibility, keyboard, preview])
+        // Showing a cold chat can classify a current rejection synchronously,
+        // including disconnected metadata with no future client wake. Only
+        // mounted visible chats are inspected by this bounded handoff.
+        let limit_usage = self.refresh_chat_limit_accounts();
+        Task::batch([task, activation, visibility, keyboard, preview, limit_usage])
     }
 
     fn subscription(&self) -> Subscription<Message> {

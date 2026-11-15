@@ -79,6 +79,16 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
+    /// Spend one explicitly confirmed reset on a daemon-resolved account.
+    AccountReset {
+        request: crate::account::resets::ConsumeRequest,
+    },
+    /// A forced probe after a sign-in changed this home, which first discards
+    /// its cached profile metadata. Appended rather than added to
+    /// `AccountProbe`, whose fields a carried older CLI still encodes.
+    AccountProbeAfterLogin {
+        account: crate::account::Account,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -132,6 +142,7 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
+    AccountReset(#[serde(with = "wire_json")] serde_json::Value),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -189,6 +200,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::AccountReset { .. } => Err("Account resets require daemon admission".into()),
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
@@ -253,20 +265,8 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             registry,
         } => update_accounts(expected_revision, registry),
         Operation::AccountLogin { account } => account_login(account),
-        Operation::AccountProbe { account, force } => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            let outcome = runtime.block_on(crate::account::probe::run(
-                account,
-                crate::account::cache::Cache::installation(),
-                force,
-            ));
-            serde_json::to_value(outcome)
-                .map(Reply::AccountProbe)
-                .map_err(|error| error.to_string())
-        }
+        Operation::AccountProbe { account, force } => probe_account(account, force, false),
+        Operation::AccountProbeAfterLogin { account } => probe_account(account, true, true),
         Operation::Home => {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1856,6 +1856,33 @@ fn update_accounts(expected_revision: u64, proposal: serde_json::Value) -> Resul
         .map(Reply::AccountRegistry)
         .map_err(|error| error.to_string())
 }
+/// Probe a home's usage. After a sign-in, a Claude home's cached profile
+/// metadata belongs to the previous login and is discarded first.
+#[cfg(feature = "host")]
+fn probe_account(
+    account: crate::account::Account,
+    force: bool,
+    login_changed: bool,
+) -> Result<Reply, String> {
+    let cache = crate::account::cache::Cache::installation();
+    if login_changed
+        && account.provider == crate::agent::Provider::Claude
+        && let (Some(cache), Some(key)) = (&cache, account.cache_key())
+    {
+        cache
+            .invalidate_plan(&key)
+            .map_err(|error| error.to_string())?;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let outcome = runtime.block_on(crate::account::probe::run(account, cache, force));
+    serde_json::to_value(outcome)
+        .map(Reply::AccountProbe)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "host")]
 fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     use crate::account::{home::Homes, probe, registry::Store};
@@ -1911,6 +1938,16 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             .collect(),
     };
     account.bind_home(&mut recipe)?;
+    if account.provider == Provider::Claude
+        && let (Some(cache), Some(key)) = (
+            crate::account::cache::Cache::installation(),
+            account.cache_key(),
+        )
+    {
+        cache
+            .invalidate_plan(&key)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(Reply::Login(recipe))
 }
 
@@ -2054,9 +2091,10 @@ mod wire_tests {
                 account: account.clone(),
             });
             roundtrip(&Operation::AccountProbe {
-                account,
+                account: account.clone(),
                 force: true,
             });
+            roundtrip(&Operation::AccountProbeAfterLogin { account });
         }
         use crate::account::remote::Operation as Lifecycle;
         for operation in [

@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod account_info;
+pub(super) mod account_info;
 mod directory;
 pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;

@@ -21,34 +21,61 @@ pub fn badge<'a, Message: 'a>(
     label: impl Into<Cow<'a, str>> + 'a,
     tone: Tone,
 ) -> Element<'a, Message> {
-    widget::container(
-        caption(label)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .class(cosmic::theme::Text::Default),
-    )
-    .padding(iced::Padding {
-        top: 1.0,
-        right: space::XS + space::XXS,
-        bottom: 1.0,
-        left: space::XS + space::XXS,
-    })
-    .class(cosmic::theme::Container::custom(move |theme| {
-        let color = tone.resolve(theme);
-        let mut wash = color;
-        // Strong enough to read as a filled pill, weak enough that the label
-        // on top keeps its contrast at either theme polarity.
-        wash.a *= 0.18;
-        widget::container::Style {
-            background: Some(iced::Background::Color(wash)),
-            text_color: Some(color),
-            border: iced::Border {
-                radius: design::RADIUS_XS.into(),
+    badge_with_width(label.into(), tone, None)
+}
+
+/// A status pill constrained to its table cell. The caller supplies the full
+/// label through a tooltip or accessible name when the caption is shortened.
+pub fn bounded_badge<'a, Message: 'a>(
+    label: impl Into<Cow<'a, str>> + 'a,
+    tone: Tone,
+    width: f32,
+) -> Element<'a, Message> {
+    badge_with_width(label.into(), tone, Some(width.max(0.0)))
+}
+
+fn badge_with_width<'a, Message: 'a>(
+    label: Cow<'a, str>,
+    tone: Tone,
+    width: Option<f32>,
+) -> Element<'a, Message> {
+    let text = caption(label)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .class(cosmic::theme::Text::Default);
+    let text = if width.is_some() {
+        text.ellipsize(iced::widget::text::Ellipsize::End(
+            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+        ))
+    } else {
+        text
+    };
+    let pill = widget::container(text)
+        .padding(iced::Padding {
+            top: 1.0,
+            right: space::XS + space::XXS,
+            bottom: 1.0,
+            left: space::XS + space::XXS,
+        })
+        .class(cosmic::theme::Container::custom(move |theme| {
+            let color = tone.resolve(theme);
+            let mut wash = color;
+            // Strong enough to read as a filled pill, weak enough that the label
+            // on top keeps its contrast at either theme polarity.
+            wash.a *= 0.18;
+            widget::container::Style {
+                background: Some(iced::Background::Color(wash)),
+                text_color: Some(color),
+                border: iced::Border {
+                    radius: design::RADIUS_XS.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        }
-    }))
-    .into()
+            }
+        }));
+    match width {
+        Some(width) => pill.max_width(width).clip(true).into(),
+        None => pill.into(),
+    }
 }
 
 /// A `+12 −4` change count, with each side carrying its own semantic tone.
