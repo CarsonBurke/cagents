@@ -887,7 +887,7 @@ impl Row {
 struct RowStatus {
     text: &'static str,
     tone: Tone,
-    /// Still under way, which a spinner beside it says.
+    /// Still under way, which its caption says in the reader's ink.
     live: bool,
     detail: Option<String>,
 }
@@ -1009,7 +1009,7 @@ impl BackgroundState {
         }
     }
 
-    /// The row's status for this state: a spinner while the agent works,
+    /// The row's status for this state: a live caption while the agent works,
     /// and a warning while it waits on the person.
     fn status(self) -> RowStatus {
         match self {
@@ -1359,15 +1359,12 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        if row.state.live {
-            line.push(crate::ui_controls::activity_spinner(
-                f32::from(design::COMPACT_ICON_SIZE),
-                design::muted_color,
-            ));
-        }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         line.push(
             match row.state.tone {
+                // Work under way keeps the reader's ink; the transcript's one
+                // activity indicator says that something is happening.
+                Tone::Plain if row.state.live => status,
                 Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
                 Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
                 Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),

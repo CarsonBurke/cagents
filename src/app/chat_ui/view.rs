@@ -1325,14 +1325,6 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
             .is_some_and(|index| index + 1 < items.len())
 }
 
-/// Whether `item` shows, with a spinner of its own, work still under way: a
-/// running step or card, or a thought still streaming while its agent works.
-/// Callers pass the newest item, the only one whose thought can be live.
-fn row_live(item: &chat::Item, working: bool) -> bool {
-    item.content.status() == Some(chat::ToolStatus::Running)
-        || working && matches!(item.content, ItemContent::Text { thinking: true, .. })
-}
-
 /// The thought's own timestamps describe its work. Older providers without an
 /// end can use the next observation in this same stream, or its recorded end.
 fn reasoning_elapsed(
@@ -1773,14 +1765,15 @@ impl Runtime {
 
     /// Whether the newest row of the shown transcript shows, with a spinner
     /// of its own, the work under way: a thought still streaming, or a step
-    /// or card still running. The transcript shows one activity indicator,
-    /// and it belongs there; otherwise the closing line carries it.
+    /// still running. The transcript shows one activity indicator, and it
+    /// belongs there; otherwise the closing line carries it. A coordination
+    /// card states its own runs in words, so the closing line spins for it.
     fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
         match selected {
             Some(agent) => agent
                 .items
                 .last()
-                .is_some_and(|item| row_live(item, agent.status == chat::ToolStatus::Running)),
+                .is_some_and(|item| self.row_live(item, agent.status == chat::ToolStatus::Running)),
             None => {
                 let snapshot = &self.snapshot;
                 snapshot.busy
@@ -1789,16 +1782,38 @@ impl Runtime {
                     && snapshot
                         .items
                         .last()
-                        .is_some_and(|item| row_live(item, true))
+                        .is_some_and(|item| self.row_live(item, true))
             }
         }
+    }
+
+    /// Whether `item` shows, with a spinner of its own, work still under
+    /// way: a running step, or a thought still streaming while its agent
+    /// works. Callers pass the newest item, the only one whose thought can be
+    /// live.
+    fn row_live(&self, item: &chat::Item, working: bool) -> bool {
+        let card = self
+            .cache
+            .get(&item.id)
+            .and_then(|cached| cached.coordination.as_deref())
+            .is_some_and(Coordinated::is_card);
+        !card
+            && (item.content.status() == Some(chat::ToolStatus::Running)
+                || working && matches!(item.content, ItemContent::Text { thinking: true, .. }))
+    }
+
+    /// Whether the lead's closing line spins, as it does while subagents
+    /// work after the lead has finished, or while a message is sent.
+    fn closing_spins(&self) -> bool {
+        self.timeline_activity(false, None)
+            .is_some_and(|(glyph, _)| glyph == Icon::AgentWorking)
     }
 
     /// What a step strip draws for its status. While the lead works, a
     /// running strip carries the activity indicator only when it holds the
     /// newest row; otherwise a newer row or the closing line does. When the
-    /// lead is idle, only the group with the newest running step, such as a
-    /// background command, carries it. A strip that does not keeps its kind
+    /// lead is idle, the group with the newest running step, such as a
+    /// background command, carries it unless the closing line already spins. A strip that does not keeps its kind
     /// glyph, and its caption and counting time still say it is working.
     pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<chat::ToolStatus> {
         let status = turn.glyph();
@@ -1813,7 +1828,7 @@ impl Runtime {
                     .last()
                     .is_some_and(|step| step.index + 1 == snapshot.items.len())
         } else {
-            turn.newest_running
+            turn.newest_running && !self.closing_spins()
         };
         carries.then_some(chat::ToolStatus::Running)
     }
@@ -1852,6 +1867,27 @@ impl Runtime {
             rest
         };
         (None, rest.to_owned())
+    }
+
+    /// The line that closes a working transcript, as [`Self::closing_line`]
+    /// words it. Where it drops words, assistive technology still hears the
+    /// whole status; a row holding a failure control keeps the control's own
+    /// name instead.
+    fn closing_row<'a>(
+        &self,
+        glyph: Icon,
+        label: String,
+        failure: Option<Element<'a, Message>>,
+        selected: Option<&chat::Subagent>,
+    ) -> Element<'a, Message> {
+        let (shown, words) = self.closing_line(glyph, label.clone(), failure.is_some(), selected);
+        let named = failure.is_none() && words != label;
+        let row = activity_row(shown, words, failure);
+        if named {
+            crate::ui_controls::labelled(row, label)
+        } else {
+            row
+        }
     }
 
     /// Whether a message is on its way to the provider. Other commands -
@@ -2652,8 +2688,7 @@ impl Runtime {
             } else {
                 label
             };
-            let (glyph, label) = self.closing_line(glyph, label, failure.is_some(), selected);
-            transcript.push(activity_row(glyph, label, failure));
+            transcript.push(self.closing_row(glyph, label, failure, selected));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -3789,14 +3824,17 @@ impl Runtime {
                 .into(),
         ];
         rows.extend(plan.iter().map(|entry| -> Element<'_, Message> {
-            // The step in hand carries the same live indicator the rest of the
-            // shell uses for work in flight, so a reader can tell where the
-            // agent is without reading the plan at all.
+            // The step in hand is pointed at, still: the transcript's one
+            // activity indicator already says that the agent is working.
             let marker: Element<'_, Message> = match entry.status {
-                chat::PlanState::Active => crate::ui_controls::activity_spinner(
-                    f32::from(design::COMPACT_ICON_SIZE),
-                    design::accent_color,
-                ),
+                chat::PlanState::Active => widget::icon(Icon::ChevronRight.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
+                        cosmic::iced::widget::svg::Style {
+                            color: Some(design::accent_color(theme)),
+                        }
+                    })))
+                    .into(),
                 chat::PlanState::Done => widget::icon(Icon::Check.handle())
                     .size(design::COMPACT_ICON_SIZE)
                     .into(),
@@ -4692,8 +4730,7 @@ impl Runtime {
         // The preview is a picture of the chat, so it carries no failure
         // control to press.
         if let Some((glyph, label)) = self.timeline_activity(false, None) {
-            let (glyph, label) = self.closing_line(glyph, label, false, None);
-            transcript.push(activity_row(glyph, label, None));
+            transcript.push(self.closing_row(glyph, label, None, None));
         }
         Some(virtualized::column(transcript.children, Default::default()))
     }
@@ -8089,6 +8126,33 @@ mod tests {
             "a step inside a strip leaves the indicator to the strip"
         );
 
+        // The emptied closing line still tells assistive technology what
+        // the agent is doing.
+        {
+            use iced::advanced::Layout;
+            let renderer = crate::app::tests::headless_renderer();
+            let mut element =
+                runtime.closing_row(Icon::AgentWorking, "Thinking".into(), None, None);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node.node().label() == Some("Thinking"))
+            );
+        }
+
         // A closing line that says more than the row keeps its words.
         Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
         assert_eq!(closing(&runtime), (None, "1 agent working".to_owned()));
@@ -8137,6 +8201,48 @@ mod tests {
             runtime.strip_status(&runtime.turns[1]),
             Some(chat::ToolStatus::Succeeded)
         );
+
+        // Once subagents work after the lead has finished, the closing line
+        // spins for them and the background command's group keeps its glyph.
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
+        assert!(runtime.closing_spins());
+        assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+        Arc::make_mut(&mut runtime.snapshot).subagents.clear();
+
+        // A running coordination card states its run in words, so while the
+        // lead waits on it the closing line carries the indicator.
+        {
+            let spawn = item(
+                "spawn",
+                chat::Role::Assistant,
+                ItemContent::Tool {
+                    name: "Agent".into(),
+                    input: serde_json::json!({
+                        "subagent_type": "reviewer",
+                        "description": "Review the change",
+                        "prompt": "Review the change"
+                    })
+                    .to_string(),
+                    output: String::new(),
+                    status: chat::ToolStatus::Running,
+                },
+            );
+            let (mut waiting, _handle) = frame_cost::live_runtime(&[prompt.clone(), spawn]);
+            Arc::make_mut(&mut waiting.snapshot).busy = true;
+            regroup(&mut waiting);
+            assert!(
+                waiting.cache["spawn"]
+                    .coordination
+                    .as_deref()
+                    .is_some_and(Coordinated::is_card)
+            );
+            assert!(!waiting.work_shown(None));
+            let (glyph, label) = waiting.timeline_activity(false, None).unwrap();
+            assert_eq!(
+                waiting.closing_line(glyph, label, false, None).0,
+                Some(Icon::AgentWorking)
+            );
+        }
 
         // In a subagent's own transcript steps stand alone, and only the
         // newest one carries the indicator.
