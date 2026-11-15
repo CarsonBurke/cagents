@@ -607,9 +607,11 @@ mod tests {
             let (operation, proof) = retry(&mut app, card, terminal);
             let model = saved_model(&app, card);
             if watcher_first {
-                drop(app.apply_workspace_model_update(
-                    workspace_model_sync::ModelUpdate::Read(model.clone()),
-                ));
+                drop(
+                    app.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(
+                        model.clone(),
+                    )),
+                );
             }
             drop(app.update_terminal_save(Action::Finished {
                 card,
