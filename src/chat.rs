@@ -66,13 +66,13 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
 
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 
-pub(crate) fn sign_in_verification_detail(message: &str) -> Option<&str> {
+pub fn sign_in_verification_detail(message: &str) -> Option<&str> {
     message
         .split_once(SIGN_IN_VERIFICATION_MARKER)
         .map(|(_, detail)| detail)
 }
 
-pub(crate) fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
+pub fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
     let original = failure
         .split_once(SIGN_IN_VERIFICATION_MARKER)
         .map_or(failure, |(original, _)| original);
@@ -200,7 +200,7 @@ pub struct Launch {
 impl Launch {
     /// Claude's exact saved transcript remains readable after its working
     /// directory is removed, without starting a provider in another directory.
-    pub(crate) fn needs_read_only_history(&self) -> bool {
+    pub fn needs_read_only_history(&self) -> bool {
         self.provider == Provider::Claude
             && self
                 .session_id
@@ -219,10 +219,7 @@ impl Launch {
     /// Resume with the last provider-confirmed Claude policy. A permission
     /// change is session state, so an original CLI bypass must not restore it
     /// when the user returns from native chat.
-    pub(crate) fn terminal_recipe_with_permission_mode(
-        &self,
-        mode: Option<&str>,
-    ) -> Option<LaunchRecipe> {
+    pub fn terminal_recipe_with_permission_mode(&self, mode: Option<&str>) -> Option<LaunchRecipe> {
         let mut recipe = self.terminal_recipe()?;
         if self.provider == Provider::Claude
             && let Some(mode) = mode
@@ -237,7 +234,7 @@ impl Launch {
     /// mode comes from the live session, which storage does not hold, so this
     /// cannot prove which mode was confirmed; it proves the recipe differs from
     /// the resume by nothing else.
-    pub(crate) fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
+    pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
         let mode = match recipe.arguments.as_slice() {
             [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
             _ => None,
@@ -281,7 +278,7 @@ impl Launch {
     }
 }
 
-pub(crate) fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
+pub fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
     if !matches!(
         mode,
         "default" | "manual" | "auto" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
@@ -565,15 +562,15 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 }
 
 /// Inline tool images are spooled to private files before entering a snapshot.
-pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
+pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
 /// Whether `path` names an inline image the host's transcript store decoded
 /// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
 /// Such a file lives only as long as that cache, so it is no path to hand to
 /// anyone else.
 #[cfg(any(feature = "ui", all(test, feature = "host")))]
-pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+pub fn is_cached_inline_image(path: &std::path::Path) -> bool {
     let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
         part.and_then(|part| part.to_str())
             .and_then(|part| part.strip_prefix(prefix))
@@ -1037,7 +1034,7 @@ impl Session {
 
     /// Runtime projections may learn provider identity/capability, but may
     /// never borrow it from another allocation, account or daemon epoch.
-    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+    pub fn learn_native_continuity_from(&mut self, observed: &Self) {
         if self.id == observed.id
             && self.proof == observed.proof
             && self.launch.provider == observed.launch.provider
@@ -1581,7 +1578,7 @@ impl Snapshot {
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
     #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn evict_transcript(&mut self) {
+    pub fn evict_transcript(&mut self) {
         self.items = Vec::new();
         for child in &mut self.subagents {
             child.items = Vec::new();
@@ -1591,7 +1588,7 @@ impl Snapshot {
     /// Logical body bytes referenced by this owner, not unique heap bytes:
     /// immutable items can be Arc-shared with other snapshots and caches.
     #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn transcript_bytes(&self) -> usize {
+    pub fn transcript_bytes(&self) -> usize {
         self.items
             .iter()
             .chain(self.subagents.iter().flat_map(|child| &child.items))
@@ -2407,7 +2404,7 @@ impl Item {
     /// Bodies whose complete canonical bytes can be copied through the owned
     /// transcript source. Provider context uses the same field as ordinary
     /// prose; other deliveries retain their existing presentation copy rules.
-    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+    pub fn logical_copy_body(&self) -> Option<&str> {
         match &self.content {
             ItemContent::Text { text, .. } => Some(text),
             ItemContent::Delivery {
@@ -3762,7 +3759,7 @@ mod tests {
 
 /// Shared native launch policy for UI drafts and durable daemon executions.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn fresh_session(
+pub fn fresh_session(
     provider: Provider,
     id: crate::model::TerminalId,
     working_directory: std::path::PathBuf,
@@ -3829,7 +3826,7 @@ pub(crate) fn fresh_session(
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
+pub fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
     if crate::device::is_remote() {
         return None;
     }

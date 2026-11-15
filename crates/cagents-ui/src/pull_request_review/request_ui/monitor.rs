@@ -420,6 +420,12 @@ mod tests {
         }
     }
 
+    /// The publisher process `published_fixture` starts from this binary.
+    #[test]
+    fn review_request_publisher() {
+        shared::fixture::publisher_process();
+    }
+
     fn load(monitor: &mut Monitor, result: Result<shared::PollResult, String>) {
         monitor.make_due_for_test();
         drop(monitor.update(Action::Tick, [repository()]));
@@ -551,7 +557,12 @@ mod tests {
         // Separate publisher processes advance every page without an alert
         // consumer. The background follower arrives four minutes later, so
         // another 120-second subscription interval would lose the observations.
-        let mut result = shared::tests::published_fixture(root.path(), now - 240, 200);
+        let mut result = shared::fixture::published_fixture(
+            root.path(),
+            now - 240,
+            200,
+            "pull_request_review::request_ui::monitor::tests::review_request_publisher",
+        );
         result.due = now + 60;
         let mut task = monitor.update(
             Action::SharedLoaded {

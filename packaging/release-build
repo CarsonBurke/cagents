@@ -152,8 +152,10 @@ retained_actor_helper=$(python3 scripts/build-ceditor-product cagentsd \
 CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
     cargo test --locked --release --no-default-features --features host --all-targets
 cargo test --locked --release --no-default-features --features ui --all-targets
+cargo test --locked --release --package cagents-ui --all-targets
 cargo test --locked --release --package ceditor --all-targets
 cargo test --locked --release --features integrated-browser --all-targets
+cargo test --locked --release --package cagents-ui --features integrated-browser --all-targets
 ./scripts/package-linux.sh --variant full
 ./scripts/package-linux.sh --variant browserless
 ./scripts/package-ceditor-linux.sh

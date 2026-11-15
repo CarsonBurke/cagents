@@ -285,12 +285,12 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                               "--locked", "--profile", "release", "--target-dir", str(self.target),
                               "--target", NATIVE]
                     defaults = ["--no-default-features"] if variant == "browserless" else []
-                    ui = "ui" if variant == "browserless" else "integrated-browser"
+                    ui = [] if variant == "browserless" else ["--features", "integrated-browser"]
                     message = ["--message-format=json-render-diagnostics"]
                     self.assertEqual(self.builds(), [
                         common + defaults + ["--bin", "cagents"] + message,
                         common + defaults + ["--features", "host", "--bin", "cagentsd"] + message,
-                        common + defaults + ["--features", ui, "--bin", "cagents-ui"] + message,
+                        common + ["-p", "cagents-ui"] + ui + ["--bin", "cagents-ui"] + message,
                     ])
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)

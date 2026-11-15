@@ -21,7 +21,8 @@ CHECKER = ROOT / "scripts/check-format"
 CACHE_HELPER = ROOT / "scripts/check-format-cache.py"
 INCLUDED = (
     "src/modules.rs",
-    "src/app/repository_clone_lsp_ownership_tests.rs",
+    "crates/cagents-ui/src/modules.rs",
+    "crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs",
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
     "src/host/model/views/placement_tests.rs",
@@ -126,7 +127,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "--check"],
+                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
                         [str(self.root), "rustfmt", "--edition", "2024", "--check", *INCLUDED],
                     ],
                 )
@@ -593,12 +594,19 @@ sys.exit({status})
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]
+members = [".", "crates/cagents-ui"]
 [package]
-name = "format-fixture"
+name = "cagents"
+version = "0.0.0"
+edition = "2024"
+""")
+        self.write("crates/cagents-ui/Cargo.toml", """[package]
+name = "cagents-ui"
 version = "0.0.0"
 edition = "2024"
 """)
         self.write("src/lib.rs", 'include!("modules.rs");\n')
+        self.write("crates/cagents-ui/src/lib.rs", 'include!("modules.rs");\n')
         self.write("src/modules.rs", '#[cfg(feature = "ui")]\nmod gated;\n')
         for relative in INCLUDED[1:]:
             self.write(relative, "fn included_fragment() {}\n")
@@ -619,7 +627,8 @@ include!("../tests/support/repository_scale.rs");
                 path.write_text(original + "fn   malformed( ) { }\n")
                 before = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
                 cargo = subprocess.run(
-                    ["cargo", "fmt", "--check"], cwd=self.root, env=env,
+                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
+                    cwd=self.root, env=env,
                     capture_output=True, text=True, timeout=30,
                 )
                 self.assertEqual(cargo.returncode, 0, cargo.stdout + cargo.stderr)

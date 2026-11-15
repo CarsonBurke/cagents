@@ -9,128 +9,11 @@
 //! `/proc/PID/environ`. Removing a variable from a running process does not
 //! change its own `/proc` entry, so a child is the only honest witness.
 
-use std::{
-    collections::HashMap,
-    fs,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+#[path = "support/startup_environment.rs"]
+mod startup_environment;
 
-/// A parent session from each provider, as its shells export it.
-const PARENT_SESSION: [(&str, &str); 7] = [
-    ("CLAUDECODE", "1"),
-    ("CLAUDE_CODE_SESSION_ID", "parent-session"),
-    ("CLAUDE_CODE_MESSAGING_SOCKET", "/run/parent/messaging.sock"),
-    ("CLAUDE_CODE_MESSAGING_TOKEN", "parent-token"),
-    ("CODEX_THREAD_ID", "parent-thread"),
-    ("CODEX_ESCALATE_SOCKET", "/run/parent/escalate.sock"),
-    ("PI_TOOL_BRIDGE_SOCKET", "/run/parent/bridge.sock"),
-];
-/// The person's own provider configuration, which every child keeps.
-const USER_CONFIGURATION: (&str, &str) = ("CLAUDE_CODE_TMPDIR", "/var/tmp/claude-scratch");
-
-/// Private XDG roots, so no case reads or writes the person's own state.
-struct Home(tempfile::TempDir);
-
-impl Home {
-    fn new() -> Self {
-        let home = Self(tempfile::tempdir().unwrap());
-        for directory in ["home", "config", "data", "state", "cache", "runtime"] {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(home.path().join(directory))
-                .unwrap();
-        }
-        home
-    }
-
-    fn path(&self) -> &Path {
-        self.0.path()
-    }
-
-    /// Exactly the planted session, the person's configuration and the
-    /// private roots: nothing the test itself runs inside reaches the case.
-    fn command(&self, program: &Path) -> Command {
-        for (name, _) in PARENT_SESSION {
-            assert!(
-                cagents::agent::is_session_variable(name),
-                "{name} is no longer a provider session variable; plant a current one"
-            );
-        }
-        assert!(!cagents::agent::is_session_variable(USER_CONFIGURATION.0));
-        let mut command = Command::new(program);
-        command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", self.path().join("home"))
-            .env("XDG_CONFIG_HOME", self.path().join("config"))
-            .env("XDG_DATA_HOME", self.path().join("data"))
-            .env("XDG_STATE_HOME", self.path().join("state"))
-            .env("XDG_CACHE_HOME", self.path().join("cache"))
-            .env("XDG_RUNTIME_DIR", self.path().join("runtime"))
-            .envs(PARENT_SESSION)
-            .env(USER_CONFIGURATION.0, USER_CONFIGURATION.1)
-            .stdin(Stdio::null());
-        command
-    }
-}
-
-fn assert_detached(environ: &[u8]) {
-    let environment: HashMap<&str, &str> = environ
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| std::str::from_utf8(entry).unwrap().split_once('=').unwrap())
-        .collect();
-    for (name, _) in PARENT_SESSION {
-        assert!(
-            !environment.contains_key(name),
-            "a child was handed the parent session's {name}: {environment:?}"
-        );
-    }
-    assert_eq!(
-        environment.get(USER_CONFIGURATION.0),
-        Some(&USER_CONFIGURATION.1),
-        "the person's own configuration was lost"
-    );
-}
-
-/// A private installation beside the built executable: a hard link to it,
-/// which keeps `current_exe` there, and a stand-in companion that records the
-/// environment it was started with. A link stays on the build's filesystem
-/// rather than copying an executable into the RAM-backed temporary directory.
-struct Installation {
-    bin: tempfile::TempDir,
-    executable: PathBuf,
-}
-
-impl Installation {
-    fn new(built: &str, companion: &str, then: &str) -> Self {
-        let built = Path::new(built);
-        let bin = tempfile::Builder::new()
-            .prefix(".startup-environment-")
-            .tempdir_in(built.parent().unwrap())
-            .unwrap();
-        let executable = bin.path().join(built.file_name().unwrap());
-        fs::hard_link(built, &executable).unwrap();
-        let companion = bin.path().join(companion);
-        fs::write(
-            &companion,
-            format!(
-                "#!/bin/sh\n\
-                 cat /proc/$$/environ > \"$0.environ.next\" && mv \"$0.environ.next\" \"$0.environ\"\n\
-                 {then}\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&companion, fs::Permissions::from_mode(0o755)).unwrap();
-        Self { bin, executable }
-    }
-
-    fn recorded(&self, companion: &str) -> PathBuf {
-        self.bin.path().join(format!("{companion}.environ"))
-    }
-}
+use startup_environment::{Home, Installation, assert_detached};
+use std::fs;
 
 #[test]
 fn the_command_line_never_hands_a_parent_session_to_the_daemon() {
@@ -138,7 +21,7 @@ fn the_command_line_never_hands_a_parent_session_to_the_daemon() {
     // `daemon store-schema` runs its matched daemon directly and synchronously.
     let installation = Installation::new(env!("CARGO_BIN_EXE_cagents"), "cagentsd", "exit 0");
     let output = home
-        .command(&installation.executable)
+        .command(installation.executable())
         .args(["daemon", "store-schema"])
         .output()
         .unwrap();
@@ -150,70 +33,16 @@ fn the_command_line_never_hands_a_parent_session_to_the_daemon() {
     assert_detached(&fs::read(installation.recorded("cagentsd")).unwrap());
 }
 
-#[cfg(feature = "ui")]
-#[test]
-fn a_window_never_hands_a_parent_session_to_the_daemon_it_starts() {
-    use std::{
-        process::Child,
-        time::{Duration, Instant},
-    };
-    const DEADLINE: Duration = Duration::from_secs(30);
-    const POLL: Duration = Duration::from_millis(20);
-    fn wait_for(path: &Path, owner: &mut Child) -> Vec<u8> {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            if let Ok(bytes) = fs::read(path) {
-                return bytes;
-            }
-            if let Some(status) = owner.try_wait().unwrap() {
-                // A child can publish just as its owner exits.
-                if let Ok(bytes) = fs::read(path) {
-                    return bytes;
-                }
-                panic!("the executable exited with {status} before starting a child");
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the executable started no child within {DEADLINE:?}"
-            );
-            std::thread::sleep(POLL);
-        }
-    }
-    struct Window(Child);
-    impl Drop for Window {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let home = Home::new();
-    // The stand-in daemon stays until the record is collected, so the window
-    // keeps waiting for it instead of reporting a failed start.
-    let installation = Installation::new(
-        env!("CARGO_BIN_EXE_cagents-ui"),
-        "cagentsd",
-        "for _ in $(seq 600); do [ -e \"$0.environ\" ] || exit 0; sleep 0.05; done",
-    );
-    let mut window = Window(
-        home.command(&installation.executable)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let recorded = installation.recorded("cagentsd");
-    let environ = wait_for(&recorded, &mut window.0);
-    drop(window);
-    fs::remove_file(recorded).unwrap();
-    assert_detached(&environ);
-}
-
 #[cfg(feature = "host")]
 #[test]
 fn the_daemon_never_hands_a_parent_session_to_an_automation_precheck() {
-    use std::os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        process::CommandExt,
+    use std::{
+        os::unix::{
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        },
+        path::Path,
+        process::Stdio,
     };
     let home = Home::new();
     // The supervisor is `cagentsd` itself, past the same startup as a serving

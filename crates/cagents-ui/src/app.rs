@@ -159,7 +159,7 @@ use crate::{
     model::{BrowserId, BrowserRestoreFidelity, BrowserSession},
 };
 
-const APPLICATION_ICON_PNG: &[u8] = include_bytes!("../packaging/dev.cagents.Cagents.png");
+const APPLICATION_ICON_PNG: &[u8] = include_bytes!("../../../packaging/dev.cagents.Cagents.png");
 const APPLICATION_ICON_SIZE: u32 = 128;
 
 /// The name shown to a person, as opposed to `APP_ID`, which only matches the
@@ -5204,14 +5204,19 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
     }
 }
 
-impl WorkspaceDestination {
-    fn from_action(action: &SidebarAction) -> Option<Self> {
-        match action {
-            SidebarAction::OpenRepository { project_id, .. } => Some(Self::Folder(*project_id)),
-            SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
-            SidebarAction::OpenChannel { channel_id } => Some(Self::Channel(*channel_id)),
-            _ => None,
+/// The workspace a sidebar action opens, if it opens one.
+fn workspace_destination(action: &SidebarAction) -> Option<WorkspaceDestination> {
+    match action {
+        SidebarAction::OpenRepository { project_id, .. } => {
+            Some(WorkspaceDestination::Folder(*project_id))
         }
+        SidebarAction::OpenWorktree { worktree_id, .. } => {
+            Some(WorkspaceDestination::Worktree(*worktree_id))
+        }
+        SidebarAction::OpenChannel { channel_id } => {
+            Some(WorkspaceDestination::Channel(*channel_id))
+        }
+        _ => None,
     }
 }
 
@@ -14718,7 +14723,7 @@ impl Application for Cagents {
         // that takes the keyboard from the switcher ends it too: the release
         // that would have closed it may never be delivered.
         if self.chrome_ui.workspace_preview.is_some()
-            && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
+            && (matches!(&message, Message::Sidebar(action) if workspace_destination(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
                 || self.chat_ui.image_viewer.is_some())
@@ -26340,8 +26345,8 @@ mod tests {
         app.refresh_sidebar_channels();
 
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
-        let root = WorkspaceDestination::from_action(&destinations[1]).unwrap();
-        let feature = WorkspaceDestination::from_action(&destinations[2]).unwrap();
+        let root = workspace_destination(&destinations[1]).unwrap();
+        let feature = workspace_destination(&destinations[2]).unwrap();
         let channel = WorkspaceDestination::Channel(channel);
         // Sidebar order is channel, root, feature; visit order deliberately differs.
         for index in [1, 2, 0, 1] {
@@ -26377,7 +26382,7 @@ mod tests {
             app.chrome_ui
                 .workspace_preview
                 .as_ref()
-                .and_then(WorkspaceDestination::from_action)
+                .and_then(workspace_destination)
         };
         let alt = keyboard::Modifiers::ALT;
         drop(app.update(next(alt)));
@@ -26386,7 +26391,7 @@ mod tests {
             app.chrome_ui
                 .workspace_preview
                 .as_ref()
-                .and_then(WorkspaceDestination::from_action),
+                .and_then(workspace_destination),
             Some(channel)
         );
         drop(app.update(next(alt)));
@@ -26395,7 +26400,7 @@ mod tests {
             app.chrome_ui
                 .workspace_preview
                 .as_ref()
-                .and_then(WorkspaceDestination::from_action),
+                .and_then(workspace_destination),
             Some(feature)
         );
         drop(app.update(Message::KeyEvent {
@@ -26413,7 +26418,7 @@ mod tests {
             app.chrome_ui
                 .workspace_preview
                 .as_ref()
-                .and_then(WorkspaceDestination::from_action),
+                .and_then(workspace_destination),
             Some(root)
         );
         drop(app.update(next(alt)));
@@ -31569,7 +31574,7 @@ mod tests {
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
         let kinds: Vec<_> = destinations
             .iter()
-            .filter_map(WorkspaceDestination::from_action)
+            .filter_map(workspace_destination)
             .collect();
         assert_eq!(
             kinds,
@@ -31590,7 +31595,7 @@ mod tests {
             .next_workspace(crate::workspace::FocusDirection::Right)
             .unwrap();
         assert_eq!(
-            WorkspaceDestination::from_action(&previous),
+            workspace_destination(&previous),
             Some(WorkspaceDestination::Folder(folder))
         );
         app.active_workspace = Some("/folder".into());

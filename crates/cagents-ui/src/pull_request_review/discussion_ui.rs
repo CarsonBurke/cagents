@@ -60,13 +60,7 @@ pub enum Action {
     OpenLink(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Destination {
-    Line(Anchor),
-    File(String),
-    Reply(String),
-    Edit(String),
-}
+pub use cagents::review_cache::Destination;
 
 struct Composer {
     authority: Authority,

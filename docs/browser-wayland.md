@@ -13,9 +13,9 @@ Parent teardown joins all browser workers and reapers, retires the probe generat
 Run the isolated CLI, host, browserless UI, and integrated UI checks sequentially. The optional `browser-protocol-fixture` feature enables a real owned socket/registry test server; it is not a general development dependency and must not enter CLI/host dependency graphs:
 
 ```sh
-cargo test --locked --no-default-features --features ui --lib capability::wayland_requirement_tests
-cargo test --locked --no-default-features --features browser-protocol-fixture --lib browser::fallback::protocol_fixture
-cargo test --locked --features integrated-browser --lib app::browser_backend
+cargo test --locked -p cagents-ui --lib capability::wayland_requirement_tests
+cargo test --locked -p cagents-ui --features browser-protocol-fixture --lib browser::fallback::protocol_fixture
+cargo test --locked -p cagents-ui --features integrated-browser --lib app::browser_backend
 ```
 
 The controlled wire fixture covers a capable registry, each missing global, removal after an announcement, binding acknowledgment, pending-only polling with an unserviced server, and explicit release while a late factory reference survives. It owns the client reader to simulate the event loop's delivery; this does not prove Winit's integration or graphical browser behavior.

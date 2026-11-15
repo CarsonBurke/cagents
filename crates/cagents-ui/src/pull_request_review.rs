@@ -42,7 +42,7 @@ use crate::{
 
 type ActionTask = iced::Task<Action>;
 
-pub mod cache;
+pub use cagents::review_cache as cache;
 pub mod checkout;
 pub mod checkout_ui;
 pub mod discussion;
@@ -3926,7 +3926,7 @@ pub(crate) mod tests {
         // bypassing the temporary dependency patch also fails an app test.
         let mut db = fontdb::Database::new();
         db.load_font_data(
-            include_bytes!("../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+            include_bytes!("../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
         );
         let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
         let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
@@ -3989,20 +3989,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn pull_request(number: u64) -> PullRequest {
-        serde_json::from_value(serde_json::json!({
-            "id": "PR_1",
-            "number": number,
-            "title": format!("Change {number}"),
-            "body": "",
-            "state": "OPEN",
-            "isDraft": false,
-            "headRefName": "feature",
-            "headRefOid": "a".repeat(40),
-            "baseRefName": "main",
-            "updatedAt": "2026-01-01T00:00:00Z",
-            "url": format!("https://github.com/o/r/pull/{number}"),
-        }))
-        .unwrap()
+        crate::github::fixture_pull_request(number)
     }
 
     pub(crate) fn target(number: u64) -> ReviewTarget {

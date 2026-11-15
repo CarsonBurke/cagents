@@ -653,6 +653,9 @@ class Evidence(unittest.TestCase):
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        # The runner builds the UI as its own package, as this repository lays it out.
+        (checkout / "crates" / "cagents-ui").mkdir(parents=True)
+        shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)

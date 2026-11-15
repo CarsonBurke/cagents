@@ -1,9 +1,6 @@
-#![cfg(feature = "ui")]
-
 use std::collections::BTreeMap;
 
 use cagents::{
-    capability::{BrowserCapability, BrowserRestoreAction, browser_restore_action},
     location::SanitizedLocation,
     model::{
         BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState,
@@ -11,6 +8,7 @@ use cagents::{
     },
     persistence::{SnapshotBase, StateStore},
 };
+use cagents_ui::capability::{BrowserCapability, BrowserRestoreAction, browser_restore_action};
 use url::Url;
 
 fn persisted_browser() -> BrowserSession {

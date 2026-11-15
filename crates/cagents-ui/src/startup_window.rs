@@ -1,4 +1,4 @@
-use super::{Follow, Snapshot};
+use crate::update::startup::{Follow, Snapshot};
 use crate::{
     design::{self, space},
     instance,
@@ -117,7 +117,7 @@ impl Window {
         }
         self.polling = true;
         cosmic::task::future(async {
-            let snapshot = tokio::task::spawn_blocking(super::observe)
+            let snapshot = tokio::task::spawn_blocking(crate::update::startup::observe)
                 .await
                 .unwrap_or_else(|_| Snapshot::unavailable());
             Message::Observed(snapshot)
@@ -340,7 +340,7 @@ fn reopen(request: &Request) -> Result<(), &'static str> {
     // Fresh status is still not admission: normal startup reacquires every
     // original fence. Never start an updater or installer from here; the
     // ordinary UI entry point owns daemon readiness.
-    if !super::observe().can_open() {
+    if !crate::update::startup::observe().can_open() {
         return Err("The installation is still locked. Progress will keep updating here.");
     }
     if !request.new_window && request.focus().unwrap_or(false) {

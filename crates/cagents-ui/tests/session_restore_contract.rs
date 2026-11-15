@@ -1,5 +1,3 @@
-#![cfg(feature = "ui")]
-
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -16,8 +14,8 @@ use cagents::{
         TerminalSession, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::StateStore,
-    session::SessionRuntime,
 };
+use cagents_ui::session::SessionRuntime;
 use tempfile::tempdir;
 use url::Url;
 

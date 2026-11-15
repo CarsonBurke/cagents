@@ -133,10 +133,11 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         result = self.run_runner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected = []
-        for name, features in (("cagents", "development"), ("cagentsd", "development,host"),
-                               ("cagents-ui", "development,latency-harness")):
-            expected.append(["build", "--locked", "--release", "--no-default-features",
-                             "--features", features, "--bin", name,
+        for name, selection in (
+                ("cagents", ["--no-default-features", "--features", "development"]),
+                ("cagentsd", ["--no-default-features", "--features", "development,host"]),
+                ("cagents-ui", ["-p", "cagents-ui", "--features", "development,latency-harness"])):
+            expected.append(["build", "--locked", "--release", *selection, "--bin", name,
                              "--message-format=json-render-diagnostics"])
         self.assertEqual(self.builds(), expected)
         calls = self.recorded()

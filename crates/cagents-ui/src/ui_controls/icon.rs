@@ -220,7 +220,7 @@ pub fn passive_icon<'a, Message: 'a>(icon: impl Into<Handle>, size: u16) -> Elem
 pub fn ceditor_icon() -> Handle {
     static ICON: LazyLock<Handle> = LazyLock::new(|| {
         icon::from_svg_bytes(
-            include_bytes!("../../packaging/io.github.cagents.ceditor.svg").as_slice(),
+            include_bytes!("../../../../packaging/io.github.cagents.ceditor.svg").as_slice(),
         )
         .symbolic(false)
     });
@@ -230,7 +230,7 @@ pub fn ceditor_icon() -> Handle {
 /// Native editor window artwork, independent of the installed icon theme.
 pub fn ceditor_window_icon() -> cosmic::iced::window::Icon {
     let rgba = image::load_from_memory_with_format(
-        include_bytes!("../../packaging/io.github.cagents.ceditor.png"),
+        include_bytes!("../../../../packaging/io.github.cagents.ceditor.png"),
         image::ImageFormat::Png,
     )
     .expect("embedded editor icon must be a valid PNG")
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn editor_window_icon_preserves_its_distinct_transparent_artwork() {
         let image = image::load_from_memory_with_format(
-            include_bytes!("../../packaging/io.github.cagents.ceditor.png"),
+            include_bytes!("../../../../packaging/io.github.cagents.ceditor.png"),
             image::ImageFormat::Png,
         )
         .unwrap()

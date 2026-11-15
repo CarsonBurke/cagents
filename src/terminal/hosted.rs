@@ -1105,7 +1105,7 @@ impl HostedTerminalHandle {
     /// Why the daemon refused this terminal's attachment for good, if it did.
     /// Unlike a detached snapshot, which a hibernated view also holds, this
     /// is only set by the refusal itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn attachment_failure(&self) -> Option<String> {
         self.inner
             .published
@@ -1308,14 +1308,16 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn visibility(&self) -> TerminalVisibility {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn visibility(&self) -> TerminalVisibility {
         self.inner.published.desired_visibility()
     }
 
     /// Ends the connection for good, as giving up on a lost daemon does.
-    #[cfg(test)]
-    pub(crate) fn stop_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stop_for_test(&self) {
         self.inner.stop.request();
     }
 
@@ -1413,7 +1415,7 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
-pub(crate) fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+pub fn existing_daemon_socket_path() -> io::Result<PathBuf> {
     match crate::device::existing_socket_path()? {
         Some(socket) => Ok(socket),
         None => daemon_socket_path(),
@@ -1440,8 +1442,7 @@ pub fn ensure_daemon_ready_for(
 
 /// Provider activation requested by a person, after an attach-only recovery.
 /// Its transport is separate from the window's automatic read-only readers.
-pub(crate) fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError>
-{
+pub fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError> {
     if let Some(socket) = crate::device::socket_path_for_explicit_action()
         .map_err(HostedTerminalStartError::SocketPath)?
     {

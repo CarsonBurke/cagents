@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    github::{PullRequest, PullRequestKey, pull_request_number},
+    github::{PullRequest, PullRequestKey, ReviewDiffSide, pull_request_number},
     repository::{DiffEntry, PullRequestRange, RepoPath},
 };
 
@@ -73,13 +73,32 @@ impl WriteOrder {
         epoch == self.epoch && tick >= self.tick
     }
 
-    #[cfg(test)]
-    pub(crate) fn fixture(tick: u64) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture(tick: u64) -> Self {
         Self {
             epoch: "boottime-v1:fixture".into(),
             tick,
         }
     }
+}
+
+/// A review comment's place in the diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub path: String,
+    pub side: ReviewDiffSide,
+    pub start_line: u64,
+    pub line: u64,
+}
+
+/// Where a draft comment will be posted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Destination {
+    Line(Anchor),
+    File(String),
+    Reply(String),
+    Edit(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +114,7 @@ pub struct File {
 pub struct Draft {
     pub context: crate::github::ReviewContext,
     pub range: Option<PullRequestRange>,
-    pub destination: super::discussion_ui::Destination,
+    pub destination: Destination,
     pub body: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,15 +223,32 @@ pub trait Store: Send + Sync {
     fn save(&self, snapshot: &Snapshot, order: &WriteOrder) -> Result<(), String>;
 }
 
-#[cfg(test)]
-pub(crate) fn fixture() -> Snapshot {
-    use super::tests::{entry, loaded, pull_request, target};
-    let entry = entry("src/main.rs", crate::repository::ChangeKind::Modified);
+/// A valid one-file snapshot of pull request 1 in `github.com/o/r`.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture() -> Snapshot {
+    use crate::repository::{ChangeKind, Oid, ValidatedBranchName, ValidatedRefName};
+    let entry = DiffEntry {
+        path: RepoPath::parse("src/main.rs").unwrap(),
+        old_path: None,
+        kind: ChangeKind::Modified,
+        added_lines: Some(1),
+        removed_lines: None,
+    };
+    let repository = crate::github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
     Snapshot {
-        key: PullRequestKey::new(target(1).repository, 1).unwrap(),
+        key: PullRequestKey::new(repository, 1).unwrap(),
         viewer: "me".into(),
-        pull_request: pull_request(1),
-        range: loaded(Vec::new(), Vec::new()).range,
+        pull_request: crate::github::fixture_pull_request(1),
+        range: PullRequestRange {
+            number: 1,
+            base_branch: ValidatedBranchName::parse("main").unwrap(),
+            head_mirror: ValidatedRefName::parse("refs/cagents/pull/1/head").unwrap(),
+            base_mirror: ValidatedRefName::parse("refs/cagents/pull/1/base").unwrap(),
+            head: Oid::parse("a".repeat(40)).unwrap(),
+            base_tip: Oid::parse("b".repeat(40)).unwrap(),
+            merge_base: Oid::parse("c".repeat(40)).unwrap(),
+        },
         unknown_paths: BTreeSet::new(),
         drafts: None,
         drafts_changed: false,
@@ -273,7 +309,8 @@ mod tests {
         const ROLE: &str = "CAGENTS_REVIEW_CACHE_ORDER_ROLE";
         const DIRECTORY: &str = "CAGENTS_REVIEW_CACHE_ORDER_DIRECTORY";
         const LANE: &str = "CAGENTS_REVIEW_CACHE_ORDER_LANE";
-        const NAME: &str = "pull_request_review::cache::tests::crossprocess_cache_writes_keep_the_newer_capture_in_both_stores";
+        const NAME: &str =
+            "review_cache::tests::crossprocess_cache_writes_keep_the_newer_capture_in_both_stores";
         if let Some(role) = std::env::var_os(ROLE) {
             let directory = std::path::PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
             let store = store_for_lane(&directory, &std::env::var(LANE).unwrap());
@@ -415,7 +452,7 @@ mod tests {
             Some(saved.clone())
         );
         current.key.number = 2;
-        current.pull_request = super::super::tests::pull_request(2);
+        current.pull_request = crate::github::fixture_pull_request(2);
         current.range.number = 2;
         store.save(&current, &WriteOrder::fixture(1)).unwrap();
         assert_eq!(store.load(&current.key).unwrap(), Some(current));
@@ -662,7 +699,7 @@ impl Store for JsonStore {
 #[cfg(test)]
 mod draft_durability_tests {
     use super::*;
-    use crate::pull_request_review::cache;
+    use crate::review_cache as cache;
     #[test]
     fn json_recovery_text_has_order_conflict_and_eviction_protection() {
         let directory = tempfile::tempdir().unwrap();
@@ -759,7 +796,7 @@ pub(crate) fn assert_draft_protection(store: &dyn Store) {
         let mut snapshot = fixture();
         snapshot.key.number = number;
         snapshot.range.number = number;
-        snapshot.pull_request = super::tests::pull_request(number);
+        snapshot.pull_request = crate::github::fixture_pull_request(number);
         store
             .save(&snapshot, &WriteOrder::fixture(100 + number))
             .unwrap();
@@ -774,7 +811,7 @@ pub(crate) fn assert_draft_protection(store: &dyn Store) {
         let mut snapshot = fixture();
         snapshot.key.number = number;
         snapshot.range.number = number;
-        snapshot.pull_request = super::tests::pull_request(number);
+        snapshot.pull_request = crate::github::fixture_pull_request(number);
         local(
             &mut snapshot,
             "window-unit",
@@ -789,7 +826,7 @@ pub(crate) fn assert_draft_protection(store: &dyn Store) {
     let mut extra = fixture();
     extra.key.number = 99;
     extra.range.number = 99;
-    extra.pull_request = super::tests::pull_request(99);
+    extra.pull_request = crate::github::fixture_pull_request(99);
     local(&mut extra, "window-extra", "extra-v", None, "Not saved yet");
     assert!(store.save(&extra, &WriteOrder::fixture(400)).is_err());
     assert!(store.load(&extra.key).unwrap().is_none());

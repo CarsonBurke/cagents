@@ -14,11 +14,11 @@ fn window(free: bool) -> Window {
         request: Request::new(false, Some("window-2".into()), None, None, false).unwrap(),
         snapshot: Snapshot {
             installation_lock: if free {
-                super::super::LockState::Free
+                crate::update::startup::LockState::Free
             } else {
-                super::super::LockState::Held
+                crate::update::startup::LockState::Held
             },
-            helper_lock: super::super::LockState::Free,
+            helper_lock: crate::update::startup::LockState::Free,
             job: None,
         },
         follow: Follow::default(),
@@ -121,8 +121,8 @@ fn rendered(
 fn real_narrow_and_roomy_buttons_keep_details_progress_and_close_reachable() {
     for (width, height) in [(420.0, 340.0), (640.0, 440.0)] {
         let mut state = window(false);
-        state.snapshot.helper_lock = super::super::LockState::Held;
-        state.snapshot.job = Some(super::super::Job {
+        state.snapshot.helper_lock = crate::update::startup::LockState::Held;
+        state.snapshot.job = Some(crate::update::startup::Job {
             id: "rendered-operation".into(),
             version: Some(format!("1.2.4+{}", "longtarget".repeat(10))),
             phase: crate::update::UpdatePhase::WaitingForIdle,
@@ -161,13 +161,13 @@ fn actual_open_callback_still_refuses_held_lock_and_allows_only_one_inflight_req
     let mut state = window(true);
     let (_, mut messages) = rendered(&state, 420.0, 340.0, Some("Open cagents"));
     let action = messages.pop().unwrap();
-    state.snapshot.installation_lock = super::super::LockState::Held;
+    state.snapshot.installation_lock = crate::update::startup::LockState::Held;
     drop(state.update(action));
     assert!(!state.working, "queued click cannot bypass changed lock");
-    state.snapshot.installation_lock = super::super::LockState::Free;
+    state.snapshot.installation_lock = crate::update::startup::LockState::Free;
     let (_, mut messages) = rendered(&state, 420.0, 340.0, Some("Open cagents"));
     drop(state.update(messages.pop().unwrap()));
-    assert!(state.working && state.follow.auto_opened);
+    assert!(state.working && state.follow.auto_opened());
     drop(state.update(Message::Open));
     assert!(state.working);
     // First task deliberately unpolled: rendered callback/state proof, no launcher.
@@ -226,7 +226,7 @@ fn lost_original_device_context_never_falls_back_to_a_local_open_or_activation()
     state.context_ready = false;
     drop(state.update(Message::Open));
     drop(state.update(Message::Focus));
-    assert!(!state.working && !state.follow.auto_opened);
+    assert!(!state.working && !state.follow.auto_opened());
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn diagnostic_details_are_historical_fixed_categories_without_private_records() 
 }
 
 fn observed_operation(id: &str, complete: bool) -> Snapshot {
-    use super::super::{Job, LockState};
+    use crate::update::startup::{Job, LockState};
     Snapshot {
         installation_lock: if complete {
             LockState::Free
@@ -318,12 +318,12 @@ fn operation_change_observed_during_focus_or_diagnostics_still_requires_explicit
         }));
         drop(state.update(Message::Observed(observed_operation("original", true))));
         assert!(
-            !state.working && !state.follow.auto_opened,
+            !state.working && !state.follow.auto_opened(),
             "busy actions must not hide an observed replacement operation"
         );
         // The permanent automatic-return fence retains deliberate recovery.
         drop(state.update(Message::Open));
-        assert!(state.working && state.follow.auto_opened);
+        assert!(state.working && state.follow.auto_opened());
         // Tasks are deliberately unpolled: callback/state proof, no launcher.
     }
 }
@@ -339,19 +339,19 @@ fn first_leased_operation_observed_while_busy_returns_once_after_the_action_fini
         }));
         drop(state.update(Message::Observed(observed_operation("original", false))));
         drop(state.update(Message::Observed(observed_operation("original", true))));
-        assert!(state.working && !state.follow.auto_opened);
+        assert!(state.working && !state.follow.auto_opened());
         drop(state.update(if diagnostics {
             Message::Diagnosed("Historical startup evidence".into())
         } else {
             Message::Focused(Ok(false))
         }));
-        assert!(!state.working && !state.follow.auto_opened);
+        assert!(!state.working && !state.follow.auto_opened());
         drop(state.update(Message::Observed(observed_operation("original", true))));
-        assert!(state.working && state.follow.auto_opened);
+        assert!(state.working && state.follow.auto_opened());
         drop(state.update(Message::Opened(Err("Fixture launch failure"))));
         drop(state.update(Message::Observed(observed_operation("original", true))));
         assert!(
-            !state.working && state.follow.auto_opened,
+            !state.working && state.follow.auto_opened(),
             "a failed automatic launch must leave explicit retry, not a retry loop"
         );
         // Tasks are deliberately unpolled: callback/state proof, no launcher.

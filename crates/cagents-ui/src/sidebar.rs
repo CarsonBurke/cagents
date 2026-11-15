@@ -13521,6 +13521,65 @@ mod row_interaction {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
+        use crate::sidebar::{SidebarMode, effective_width};
+        use crate::{
+            layout_metrics::{
+                NAVIGATION_MAX_WIDTH as EXPANDED_WIDTH_MAX,
+                NAVIGATION_MIN_WIDTH as EXPANDED_WIDTH_MIN,
+            },
+            settings::{AppSettings, SettingsError},
+        };
+
+        let with_width = |sidebar_width| AppSettings {
+            sidebar_width,
+            ..AppSettings::default()
+        };
+
+        // A width outside the pane's bounds used to validate and then render
+        // clamped, so the file said 200 while the sidebar showed 240.
+        for width in [
+            EXPANDED_WIDTH_MIN - 40.0,
+            EXPANDED_WIDTH_MIN - 0.5,
+            EXPANDED_WIDTH_MAX + 0.5,
+            f32::NAN,
+        ] {
+            assert!(
+                matches!(
+                    with_width(width).validate(),
+                    Err(SettingsError::SidebarWidth { .. })
+                ),
+                "a width of {width} cannot be persisted: the pane will not render it"
+            );
+        }
+
+        for width in [
+            EXPANDED_WIDTH_MIN,
+            AppSettings::default().sidebar_width,
+            EXPANDED_WIDTH_MAX,
+        ] {
+            let accepted = with_width(width)
+                .validate()
+                .expect("a width the pane renders must validate");
+            assert_eq!(
+                effective_width(SidebarMode::Expanded, accepted.sidebar_width),
+                width
+            );
+        }
+
+        let message = SettingsError::SidebarWidth {
+            min: EXPANDED_WIDTH_MIN,
+            max: EXPANDED_WIDTH_MAX,
+        }
+        .to_string();
+        assert!(
+            message.contains(&EXPANDED_WIDTH_MIN.to_string())
+                && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
+            "the rejection must quote the bounds it enforces, not a copy of them: {message}"
+        );
+    }
+
+    #[test]
     fn project_and_worktree_menu_creation_labels_match_their_scope() {
         assert_eq!(super::project_channel_command_label(None), "New channel");
         assert_eq!(

@@ -39,7 +39,8 @@ class SentinelTests(unittest.TestCase):
         gate.write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
 from pathlib import Path
-lane = sys.argv[sys.argv.index('--features') + 1] if '--features' in sys.argv else 'cli'
+lane = (sys.argv[sys.argv.index('--features') + 1] if '--features' in sys.argv
+        else 'app' if '-p' in sys.argv else 'cli')
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with open(os.environ['SENTINEL_CALLS'], 'a') as out:
     out.write(json.dumps([sha, lane, sys.argv[1:], os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
@@ -48,6 +49,9 @@ if Path('broken-' + lane).exists():
     sys.exit(101)
 ''')
         gate.chmod(0o755)
+        application = self.origin / "crates/cagents-ui/Cargo.toml"
+        application.parent.mkdir(parents=True)
+        application.write_text('[package]\nname = "cagents-ui"\n')
         self.first = self.commit("baseline")
         self.command("git", "clone", "-q", str(self.origin), str(self.repo))
         gh = self.bin / "gh"
@@ -105,6 +109,15 @@ if sys.argv[1:3] == ['issue', 'create']:
             self.assertEqual(entry[2][:4], ['check', '--locked', '--no-default-features', '--all-targets'])
             self.assertEqual(entry[3], 'fw16')
 
+    def test_commit_before_the_application_package_skips_only_its_lane(self):
+        self.tick()
+        self.command("git", "-C", str(self.origin), "rm", "-q", "crates/cagents-ui/Cargo.toml")
+        earlier = self.commit("before the application package")
+        self.now += 120
+        self.tick()
+        self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
+                         ["cli", "host", "ui"])
+
     def test_failure_is_reported_and_closed_issue_reopened_then_recovery_reported(self):
         self.tick()
         broken = self.commit("incompatible merge", broken="host")
@@ -143,7 +156,7 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.now = 10000000000
         self.tick()
         builds = [entry for entry in self.recorded() if len(entry) == 4 and entry[1] in sentinel.LANES]
-        self.assertEqual(len(builds), 3)
+        self.assertEqual(len(builds), len(sentinel.LANES))
         self.assertNotIn("pending", json.loads((self.state / "state.json").read_text()))
 
     def test_notification_error_waits_before_retrying(self):
@@ -156,7 +169,7 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.assertEqual(self.recorded(), before)
         self.now += 120
         self.tick()
-        self.assertEqual(sum(entry[1] in sentinel.LANES for entry in self.recorded()), 3)
+        self.assertEqual(sum(entry[1] in sentinel.LANES for entry in self.recorded()), len(sentinel.LANES))
 
     def test_distinct_state_directories_cannot_rewrite_shared_checkout(self):
         worktrees = self.repo / ".worktrees"
@@ -169,14 +182,14 @@ if sys.argv[1:3] == ['issue', 'create']:
             self.tick()
             self.assertFalse(self.state.exists())
         self.tick()
-        self.assertEqual(len(self.recorded()), 3)
+        self.assertEqual(len(self.recorded()), len(sentinel.LANES))
 
     def test_rapid_invocations_do_not_fetch_or_build(self):
         self.tick()
         self.commit("next")
         with patch.object(sentinel, "git", side_effect=AssertionError("unexpected Git request")):
             self.tick()
-        self.assertEqual(len(self.recorded()), 3)
+        self.assertEqual(len(self.recorded()), len(sentinel.LANES))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 - Use `scripts/gh-observe run --real /usr/bin/gh -- bash` only when opting a repository agent shell into request measurement (see `docs/development.md`). Observation must fail open and add no admission waits or retries. Never install a global gh wrapper or enable live global cooldown state. Keep optional, reviewed content serialization separate from measurement. Honor the failed request's `Retry-After`; a primary reset applies to its account and API resource, so exhausted GraphQL must not block available REST quota. Do not query `gh api rate_limit` in a retry loop.
 - Do your work in PRs against `main`.
 - Merge as soon as CI is green and the change looks right to its reviewer. Merge with `--match-head-commit` so what lands is what was reviewed. Do not re-sync a branch with `main` or recompile it just before merging; update a branch only when it conflicts or its CI is stale against a change it depends on. Prefer many small merges over a queue of finished work. GitHub runs no CI on a pull request that conflicts with `main`, so after each push confirm the PR is mergeable; a conflicting PR waits forever with no checks.
-- GitHub CI compiles no Rust, so the author compiles every lane the change touches on their own head before asking for review (`scripts/cargo-gate check --locked --no-default-features --all-targets`, and again with `--features host` and `--features ui`). Two green PRs can still break `main` together: whoever notices a broken `main` fixes it forward at once, ahead of other work.
+- GitHub CI compiles no Rust, so the author compiles every lane the change touches on their own head before asking for review (`scripts/cargo-gate check --locked --no-default-features --all-targets`, again with `--features host` and `--features ui`, and `scripts/cargo-gate check --locked -p cagents-ui --all-targets`). Two green PRs can still break `main` together: whoever notices a broken `main` fixes it forward at once, ahead of other work.
 - The lead owns the user outcome through implementation, review and merge. Give parallel workers explicit boundaries and check the assembled experience. A subtask passing tests does not establish that the feature works well.
 - For a change people interact with, state the user's task and intended before/after behavior in the PR. Follow the latest approved design and corrections across the affected flow; preserve necessary controls and information when simplifying it.
 - For interaction changes, ask an independent reviewer to assess the user experience as well as correctness, with the intended flow and native evidence, not just a diff. A broken primary flow, lost essential controls or recurring stalls block the merge; everything else can merge with a linked follow-up. Match review effort to the size and risk of the change.
@@ -38,8 +38,9 @@ You are a senior app developer tasked with creating a great Agent Development En
 - Start with the isolated boundary that owns the change:
   - CLI: `scripts/cargo-gate check --locked --no-default-features --bin cagents`
   - daemon/terminal host: `scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd`
-  - browserless UI: `scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui`
-  - integrated UI: `scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui`
+  - browserless UI: `scripts/cargo-gate check --locked -p cagents-ui --bin cagents-ui`
+  - integrated UI: `scripts/cargo-gate check --locked -p cagents-ui --features integrated-browser --bin cagents-ui`
+- The application (`src/app` and the other UI-only modules) is the `cagents-ui` package in `crates/cagents-ui`; the root package is the shared library with the `cagents` and `cagentsd` binaries. Select the application with `-p cagents-ui`.
 - The default `full` feature selects production identity only. `ui`, `host`, and
   `integrated-browser` select implementation graphs; never reunify `ui` and
   `host` in one Cargo invocation just to shorten a command.
@@ -64,7 +65,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 ## Verify the changed surface
 
 - Run the narrow test target that covers the changed contract.
-- A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `scripts/cargo-gate test --locked --no-default-features --all-targets`, then the same with `--features host` and with `--features ui`, to cover the boundaries the change touches.
+- A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `scripts/cargo-gate test --locked --no-default-features --all-targets`, then the same with `--features host` and with `--features ui`, and `scripts/cargo-gate test --locked -p cagents-ui --all-targets` for the application, to cover the boundaries the change touches.
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
   - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
 - Fixtures, fake providers and the development runner are yours to maintain, like product code. When one is missing a state, is flaky, leaks processes or refuses a legitimate use, fix or extend it in your PR rather than working around it, and leave it easier for the next agent. Point fixture providers at their own config directory; never write fixture files into the real `~/.claude` or `~/.codex`.

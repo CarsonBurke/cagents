@@ -1,6 +1,4 @@
-#![cfg(feature = "ui")]
-
-use cagents::ui_controls::field;
+use cagents_ui::ui_controls::field;
 use cosmic::iced::advanced::{
     Layout, Shell, clipboard, layout, mouse, renderer::Headless, widget::Tree,
 };

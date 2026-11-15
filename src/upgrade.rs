@@ -1,5 +1,5 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
-pub(crate) mod floor;
+pub mod floor;
 pub(crate) mod recovery;
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
@@ -37,7 +37,7 @@ pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
 
 /// How a terminal comes back after its daemon is gone, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryKind {
+pub enum RecoveryKind {
     /// The exact saved conversation resumes.
     Exact,
     /// A recognised agent without an exact conversation reopens its provider's
@@ -49,7 +49,7 @@ pub(crate) enum RecoveryKind {
 
 #[cfg(any(feature = "host", feature = "ui"))]
 impl RecoveryKind {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Exact => "exact resume",
             Self::Picker => "resume picker",
@@ -68,9 +68,7 @@ pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe,
 /// An agent the terminal was known to run is never downgraded to the shell it
 /// ran in: a shell would leave its conversation findable only by someone who
 /// knows where the provider keeps it.
-pub(crate) fn recovery_plan(
-    session: &TerminalSession,
-) -> Result<(LaunchRecipe, RecoveryKind), String> {
+pub fn recovery_plan(session: &TerminalSession) -> Result<(LaunchRecipe, RecoveryKind), String> {
     use crate::model::agent_recovery;
     if let Some(recipe) = session.agent_resume_recipe() {
         return Ok((recipe, RecoveryKind::Exact));
@@ -141,9 +139,7 @@ pub(crate) fn checkpoint_recipe(
 /// Recipes passed here have already been normalized by agent_resume_recipe.
 /// Only the provider's resume selector identifies the writer, never UUID-shaped
 /// values of unrelated model, profile, or configuration flags.
-pub(crate) fn exact_conversation(
-    recipe: &LaunchRecipe,
-) -> Option<(crate::agent::Provider, uuid::Uuid)> {
+pub fn exact_conversation(recipe: &LaunchRecipe) -> Option<(crate::agent::Provider, uuid::Uuid)> {
     let provider = crate::agent::Provider::from_program(&recipe.program)?;
     let id = provider.resume_id(&recipe.arguments)?;
     Some((provider, uuid::Uuid::parse_str(id).ok()?))
@@ -153,7 +149,7 @@ pub(crate) fn exact_conversation(
 /// descendants can nevertheless survive SIGHUP, so inspect before recreating a
 /// shell or opening an exact conversation for writing. Unknown evidence blocks.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn ensure_no_surviving_process(
+pub fn ensure_no_surviving_process(
     session: &TerminalSession,
     owner: u32,
     proc_root: &Path,
@@ -168,11 +164,11 @@ pub(crate) fn ensure_no_surviving_process(
 /// A process that ties a saved terminal to something still running.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SurvivingProcess {
-    pub(crate) pid: u32,
+pub struct SurvivingProcess {
+    pub pid: u32,
     /// The kernel's short name for it, unless it exited during the scan.
-    pub(crate) name: Option<String>,
-    pub(crate) link: SurvivorLink,
+    pub name: Option<String>,
+    pub link: SurvivorLink,
     reason: String,
 }
 
@@ -180,7 +176,7 @@ pub(crate) struct SurvivingProcess {
 /// that stopping it is theirs to do.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SurvivorLink {
+pub enum SurvivorLink {
     Conversation,
     /// The saved launch named this unit. Another launch can reuse a unit name.
     Unit(String),
@@ -193,21 +189,22 @@ pub(crate) enum SurvivorLink {
 /// terminal; only the terminal's markers could, and they can't be read.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnreadableProcess {
-    pub(crate) pid: u32,
+pub struct UnreadableProcess {
+    pub pid: u32,
     /// Clock ticks after boot. With the PID it names one process, so leaving
     /// it running can't extend to a later process given the same PID.
     start: Option<u64>,
     /// The kernel's short name for it, unless it exited during the scan.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     /// Its unified-hierarchy cgroup, which anyone can read.
     cgroup: Option<String>,
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
 impl UnreadableProcess {
-    #[cfg(all(test, feature = "ui"))]
-    pub(crate) fn fixture(pid: u32, start: u64, name: &str) -> Self {
+    #[cfg(all(any(test, feature = "test-support"), feature = "ui"))]
+    #[doc(hidden)]
+    pub fn fixture(pid: u32, start: u64, name: &str) -> Self {
         Self {
             pid,
             start: Some(start),
@@ -238,7 +235,7 @@ impl UnreadableProcess {
 
     /// Whether it can be told apart from a later process given its PID.
     #[cfg(feature = "ui")]
-    pub(crate) fn identified(&self) -> bool {
+    pub fn identified(&self) -> bool {
         self.start.is_some()
     }
 
@@ -250,7 +247,7 @@ impl UnreadableProcess {
 /// Why a scan found no survivor but can't say there is none.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScanError {
+pub enum ScanError {
     /// Every other process was ruled out; these couldn't be, and nothing
     /// short of their exit or a person's decision will change that.
     Unreadable(Vec<UnreadableProcess>),
@@ -286,7 +283,7 @@ impl std::fmt::Display for ScanError {
 /// running. `leave` names unreadable processes a person chose to leave
 /// running; they are passed over, never signaled.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn surviving_process(
+pub fn surviving_process(
     session: &TerminalSession,
     owner: u32,
     proc_root: &Path,

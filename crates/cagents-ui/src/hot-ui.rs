@@ -1,17 +1,17 @@
 //! Development-only root: cargo-hot patches its selected binary, not library
 //! targets. Compile the same application modules here and watch their src root.
-//! The production target continues to use the ordinary library unchanged.
+//! The production target continues to use the ordinary library unchanged, and
+//! the shared `cagents` library is never patched.
 #[cfg(not(target_os = "linux"))]
 compile_error!("The experimental hot-reload runner supports Linux only");
 
-extern crate cagents as app_support;
-use app_support::runtime_state;
-extern crate self as cagents;
+// The entry point names the application modules through the UI library; here
+// they are this root's own.
+extern crate self as cagents_ui;
 include!("modules.rs");
 // The production entry point also states this executable's version.
 #[path = "bin/cagents-ui.rs"]
 mod ui_entry;
-mod version_stamp;
 
 const FRESH_ENV: &str = "CAGENTS_HOT_FRESH_DAEMON";
 

@@ -9,13 +9,7 @@ use crate::github::{
     ReviewDiffSide, ReviewEvent, ReviewThreadSubject, SubmitReviewRequest,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Anchor {
-    pub path: String,
-    pub side: ReviewDiffSide,
-    pub start_line: u64,
-    pub line: u64,
-}
+pub use cagents::review_cache::Anchor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {

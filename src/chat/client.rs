@@ -30,10 +30,7 @@ mod append;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
-pub(crate) fn restore_intent(
-    intent: Intent,
-    policy: crate::instance::WindowRestorePolicy,
-) -> Intent {
+pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
     if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
         Intent::RestoreExisting
     } else {
@@ -193,7 +190,7 @@ const TEXT_COPY_TIMEOUT: Duration = Duration::from_secs(40);
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SourceClock {
+pub struct SourceClock {
     sampled_at: u64,
     received_at: Instant,
 }
@@ -217,7 +214,7 @@ impl SourceClock {
         }
     }
 
-    pub(crate) fn now(self) -> u64 {
+    pub fn now(self) -> u64 {
         self.at(Instant::now())
     }
 
@@ -233,7 +230,7 @@ impl SourceClock {
 /// grant-bound attachment. This is deliberately neither serializable nor
 /// constructible from descriptors outside the handshake.
 #[derive(Clone, Debug)]
-pub(crate) struct UpgradeRecovery {
+pub struct UpgradeRecovery {
     sessions: (Session, Session),
     kind: UpgradeRecoveryKind,
 }
@@ -248,7 +245,7 @@ enum UpgradeRecoveryKind {
 impl UpgradeRecovery {
     /// Shape alone authorizes only an exact lineage query, never activation or
     /// persistence. Only the authenticated handshake can produce a witness.
-    pub(crate) fn is_candidate(source: &Session, replacement: &Session) -> bool {
+    pub fn is_candidate(source: &Session, replacement: &Session) -> bool {
         Self::candidate(source, replacement).is_some()
     }
 
@@ -298,14 +295,14 @@ impl UpgradeRecovery {
         })
     }
 
-    pub(crate) fn source(&self) -> &Session {
+    pub fn source(&self) -> &Session {
         &self.sessions.0
     }
-    pub(crate) fn replacement(&self) -> &Session {
+    pub fn replacement(&self) -> &Session {
         &self.sessions.1
     }
 
-    pub(crate) fn validate(&self) -> bool {
+    pub fn validate(&self) -> bool {
         matches!(
             (
                 self.kind,
@@ -343,7 +340,7 @@ struct PublicationPayload {
     // Ready before installation: hide performs no body/metadata derivation.
     // Metadata nodes have no pair and own no body or append authority.
     hidden: Option<Arc<Publication>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
 }
 
@@ -387,7 +384,7 @@ struct RetiredPublication {
 impl RetiredPublication {
     fn finish(self: Box<Self>) {
         debug_assert!(self.next.is_none());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let complete = self
             .payload
             .retirement_complete
@@ -397,7 +394,7 @@ impl RetiredPublication {
         // Snapshot/control vectors, weak lineage and ready metadata ownership
         // all belong to this same node, regardless of the last Arc's thread.
         drop(self);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(complete) = complete {
             let _ = complete.send(thread::current().id());
         }
@@ -425,7 +422,7 @@ impl Publication {
                     resident,
                     lineage,
                     hidden,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     retirement_complete: Mutex::new(None),
                 },
                 next: None,
@@ -627,7 +624,7 @@ struct InnerPayload {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
 
@@ -701,14 +698,14 @@ impl RetiredClient {
             let _ = worker.join();
         }
         let id = self.payload.id;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let completed = self.payload.retirement_complete.take();
         // Actual publication, codec scratch, pending replies, session metadata
         // and callback ownership all leave the event thread together.
         drop(self);
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
             released = true, resident_bytes = 0usize);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(completed) = completed {
             let _ = completed.send(std::thread::current().id());
         }
@@ -1535,8 +1532,9 @@ impl ClientHandle {
     ///
     /// The peer sockets are kept open for the process lifetime so dropping the
     /// handle does not look like a protocol failure to a test that only draws.
-    #[cfg(test)]
-    pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture(session: Session, snapshot: Snapshot) -> Self {
         let retirement = ClientRetirement::shared().expect("start fixture client retirement");
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
@@ -1601,8 +1599,9 @@ impl ClientHandle {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
@@ -1617,8 +1616,9 @@ impl ClientHandle {
     }
 
     /// A started resume successor of the stranded retained card `source`.
-    #[cfg(test)]
-    pub(crate) fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_retained_resume_commit(&source, &session));
         let proof = session.proof.clone().unwrap();
         let mut handle = Self::fixture(session, snapshot);
@@ -1629,13 +1629,14 @@ impl ClientHandle {
     }
 
     /// Drives the production connect/lineage/attach path for UI writer tests.
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade_handshake(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade_handshake(
         source: Session,
         session: Session,
         snapshot: Snapshot,
     ) -> Result<Self, StartFailure> {
-        tests::restore_with_lineage(source, Some(session), move |request| {
+        fixture::restore_with_lineage(source, Some(session), move |request| {
             let ClientRequest::ChatAttach { session } = request else {
                 panic!("expected exact upgrade attach");
             };
@@ -1647,8 +1648,9 @@ impl ClientHandle {
 
     /// Test-only access to the real start handshake and reader on a private
     /// socket. It never discovers a daemon or launches a provider.
-    #[cfg(test)]
-    pub(crate) fn fixture_start_on(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_start_on(
         stream: UnixStream,
         session: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
@@ -1668,16 +1670,18 @@ impl ClientHandle {
 
     /// Publishes `snapshot` as the reader thread would on a presentation
     /// frame, so a test can stream a transcript into a surface.
-    #[cfg(test)]
-    pub(crate) fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Apply a fixture publication through the production delta validator and
     /// append-lineage recorder. A full-snapshot fixture intentionally resets
     /// that lineage and cannot stand in for a streaming delta benchmark.
-    #[cfg(test)]
-    pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
         let (base, revision) = self.inner.publication.capture();
         let mut lineage = base.lineage.clone();
         let candidates = append::Lineage::candidates(&update, &base.snapshot);
@@ -1700,8 +1704,9 @@ impl ClientHandle {
     /// Build normal daemon-style deltas while retaining the production
     /// transaction validator and weak append authority. Full reset fixtures
     /// deliberately keep using publish_snapshot_for_test instead.
-    #[cfg(test)]
-    pub(crate) fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
         use super::presentation::{ChildUpdate, ItemChange, Presentation};
         let previous = self.snapshot();
         let changes = |old: &[Arc<super::Item>], items: &[Arc<super::Item>]| {
@@ -1750,8 +1755,9 @@ impl ClientHandle {
 
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
         self.inner
             .account_usage
             .lock()
@@ -1761,8 +1767,9 @@ impl ClientHandle {
 
     /// Records the subagent addresses the daemon sent as the reader thread
     /// would on their arrival.
-    #[cfg(test)]
-    pub(crate) fn learn_agent_addresses_for_test(&self, addresses: Vec<super::AgentAddress>) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn learn_agent_addresses_for_test(&self, addresses: Vec<super::AgentAddress>) {
         learn_addresses(
             &mut self
                 .inner
@@ -1775,8 +1782,9 @@ impl ClientHandle {
 
     /// Records the daemon's judgement of a usage limit as the reader thread
     /// would on its arrival.
-    #[cfg(test)]
-    pub(crate) fn judge_limit_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn judge_limit_for_test(
         &self,
         limit: Option<crate::agent_execution::directory::UsageLimit>,
     ) {
@@ -1785,8 +1793,9 @@ impl ClientHandle {
 
     /// Records an activity edge as the reader thread would, and says whether
     /// it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn observe_activity_for_test(&self, state: ActivityState) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_activity_for_test(&self, state: ActivityState) -> bool {
         let mut activity = self
             .inner
             .activity
@@ -1797,36 +1806,41 @@ impl ClientHandle {
     }
 
     /// Whether the handle has asked its daemon to keep the snapshot current.
-    #[cfg(test)]
-    pub(crate) fn is_visible_for_test(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn is_visible_for_test(&self) -> bool {
         self.inner.visible.load(Ordering::Acquire)
     }
 
     /// Marks the connection lost, as the reader thread does when its daemon
     /// goes away.
-    #[cfg(test)]
-    pub(crate) fn disconnect_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn disconnect_for_test(&self) {
         self.inner.alive.store(false, Ordering::Release);
     }
 
     /// Deliver a full snapshot the way the reader thread takes a daemon's
     /// `ChatSnapshot` reply, sharing unchanged items with a kept body.
-    #[cfg(test)]
-    pub(crate) fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
         self.inner
             .publication
             .replace(snapshot, &self.inner.body_requested, false, false);
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Observe disposal of this exact publication, independently of the UI's
     /// presentation reclaimer. The signal follows destruction of its payload.
-    #[cfg(test)]
-    pub(crate) fn observe_snapshot_retirement_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_snapshot_retirement_for_test(
         &self,
     ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
         let (completed, observed) = std::sync::mpsc::channel();
@@ -1988,7 +2002,7 @@ impl ClientHandle {
         Self::connect_upgrade_with_intent(source, expected, Intent::Restore, wake)
     }
 
-    pub(crate) fn connect_upgrade_with_intent(
+    pub fn connect_upgrade_with_intent(
         source: Session,
         expected: Session,
         intent: Intent,
@@ -2494,7 +2508,7 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 retirement_complete: None,
             },
             retirement,
@@ -2819,10 +2833,10 @@ impl ClientHandle {
     }
     /// The identity negotiated by ChatAttached, before snapshot projection.
     /// A read-only reader cannot move to another conversation after attachment.
-    pub(crate) fn attached_session_id(&self) -> Option<&str> {
+    pub fn attached_session_id(&self) -> Option<&str> {
         self.inner.session.launch.session_id.as_deref()
     }
-    pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+    pub fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner
             .upgrade_recovery
             .as_ref()
@@ -2830,13 +2844,13 @@ impl ClientHandle {
     }
     /// The saved card whose stranded retained owner this successor replaces,
     /// when the daemon proved that owner gone and prepared a resume.
-    pub(crate) fn resumed_from(&self) -> Option<&Session> {
+    pub fn resumed_from(&self) -> Option<&Session> {
         self.inner.resumed_from.as_ref()
     }
-    pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
+    pub fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
     }
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
     }
 
@@ -2850,9 +2864,7 @@ impl ClientHandle {
 
     /// Control metadata for a hidden runtime, without borrowing its body.
     /// A disconnected client's final publication must remain readable instead.
-    pub(crate) fn hidden_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn hidden_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let (mut snapshot, clock) = self.snapshot_with_clock();
         if !self.inner.alive.load(Ordering::Acquire) {
             return None;
@@ -2861,29 +2873,27 @@ impl ClientHandle {
         Some((snapshot, clock))
     }
 
-    pub(crate) fn has_observed_user_item(&self) -> bool {
+    pub fn has_observed_user_item(&self) -> bool {
         self.inner.user_item_seen.load(Ordering::Acquire)
     }
 
     /// A prompt receipt can precede its first transcript publication. Either
     /// authenticated observation forbids offering that prompt as an unsent draft.
-    pub(crate) fn has_accepted_user_input(&self) -> bool {
+    pub fn has_accepted_user_input(&self) -> bool {
         self.has_observed_user_item() || self.inner.prompt_accepted.load(Ordering::Acquire)
     }
 
     /// A renderable publication, absent until a hidden client's full history
     /// has been rehydrated. Metadata-only generations must never clear a
     /// runtime's scroll/disclosure state as if they were empty conversations.
-    pub(crate) fn resident_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn resident_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let state = self.inner.publication.current.load();
         state
             .resident
             .then(|| (state.snapshot.clone(), state.clock))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         self.inner.user_item_seen.fetch_or(
             update
@@ -3140,11 +3150,7 @@ impl ClientHandle {
             command,
         })
     }
-    pub(crate) fn known_append(
-        &self,
-        previous: &Arc<super::Item>,
-        current: &Arc<super::Item>,
-    ) -> bool {
+    pub fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {
         self.inner
             .publication
             .current
@@ -3159,7 +3165,7 @@ impl ClientHandle {
 
     /// Keep control notifications flowing for queued commands without keeping
     /// renderable history resident in an offscreen UI card.
-    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
+    pub fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
@@ -3365,8 +3371,111 @@ impl Drop for Inner {
     }
 }
 
+/// Daemon handshakes for chat-client tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+
+    pub fn host_proof(incarnation: &str) -> HostSessionProof {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    pub fn restore_with_lineage(
+        session: Session,
+        resolved: Option<Session>,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let proof = live.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                lineage.request_id,
+                resolved.map_or_else(
+                    || {
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "No durable upgrade replacement exists for this native chat",
+                            false,
+                        ))
+                    },
+                    |session| ServerMessage::Response {
+                        response: ServerResponse::UpgradeChatResolved { session },
+                    },
+                ),
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                start.request_id,
+                answer(start.request),
+            );
+        });
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        worker.join().unwrap();
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::{host_proof, restore_with_lineage};
     use super::*;
 
     /// The daemon tells a surface every address it knows, as it learns one
@@ -3998,15 +4107,6 @@ mod tests {
         assert!(!activity.observe(8, ActivityState::Idle));
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
-    }
-
-    fn host_proof(incarnation: &str) -> HostSessionProof {
-        use crate::model::{BootId, HostIncarnation, HostSessionId};
-        HostSessionProof {
-            host_session_id: HostSessionId::new("session"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new(incarnation),
-        }
     }
 
     /// The live installation's own card: a native OMP conversation whose
@@ -5224,92 +5324,6 @@ mod tests {
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         restore_with_lineage(session, None, answer)
-    }
-
-    pub(super) fn restore_with_lineage(
-        session: Session,
-        resolved: Option<Session>,
-        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
-    ) -> Result<ClientHandle, StartFailure> {
-        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = resolved
-            .as_ref()
-            .and_then(|session| session.proof.clone())
-            .unwrap_or_else(|| host_proof("live"));
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let proof = live.clone();
-        let worker = thread::spawn(move || {
-            server
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            server
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
-                codec
-                    .write(
-                        server,
-                        &ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: Some(id),
-                            proof: proof.clone(),
-                            message,
-                        },
-                    )
-                    .unwrap();
-            };
-            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                connect.request_id,
-                ServerMessage::Response {
-                    response: ServerResponse::Connected {
-                        proof: proof.clone(),
-                        resumed: Vec::new(),
-                    },
-                },
-            );
-            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                lineage.request_id,
-                resolved.map_or_else(
-                    || {
-                        ServerMessage::Error(ProtocolError::new(
-                            ProtocolErrorCode::TerminalUnavailable,
-                            "No durable upgrade replacement exists for this native chat",
-                            false,
-                        ))
-                    },
-                    |session| ServerMessage::Response {
-                        response: ServerResponse::UpgradeChatResolved { session },
-                    },
-                ),
-            );
-            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                start.request_id,
-                answer(start.request),
-            );
-        });
-        let result = ClientHandle::connect_on(
-            client,
-            session,
-            Intent::Restore,
-            None,
-            false,
-            None,
-            None,
-            None,
-            |_| {},
-        );
-        worker.join().unwrap();
-        result
     }
 
     #[test]

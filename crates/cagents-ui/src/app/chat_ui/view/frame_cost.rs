@@ -243,7 +243,7 @@ fn a_streaming_frame_of_a_full_window() {
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_streaming_frame_of_documentation() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
     let source = ["performance.md", "fixtures.md"]
         .iter()
         .map(|name| std::fs::read_to_string(root.join(name)).expect("documentation"))

@@ -89,10 +89,10 @@ impl Authority {
             Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
         })
     }
-    pub(crate) fn session(token: String) -> Self {
+    pub fn session(token: String) -> Self {
         Self(Some(token))
     }
-    pub(crate) fn token(&self) -> Option<&str> {
+    pub fn token(&self) -> Option<&str> {
         self.0.as_deref()
     }
 }
@@ -351,7 +351,7 @@ pub enum HostedSession {
 impl HostedSession {
     /// Equality alone also compares absent proofs. Explicit live activation
     /// requires a complete issued proof before comparing current descriptors.
-    pub(crate) fn has_complete_proof(&self) -> bool {
+    pub fn has_complete_proof(&self) -> bool {
         match self {
             Self::Chat(session) => session
                 .proof
@@ -366,7 +366,7 @@ impl HostedSession {
 
     /// Runtime ownership excludes mutable conversation/presentation metadata.
     /// A successor proof or different launch never identifies this process.
-    pub(crate) fn same_process(&self, other: &Self) -> bool {
+    pub fn same_process(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Chat(a), Self::Chat(b)) => same_chat_process(a, b),
             (Self::Terminal(a), Self::Terminal(b)) => same_terminal_process(a, b),
@@ -383,14 +383,14 @@ impl HostedSession {
 }
 
 /// Mutable thread and presentation metadata do not change runtime ownership.
-pub(crate) fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
+pub fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
     a.id == b.id
         && a.proof == b.proof
         && a.launch.provider == b.launch.provider
         && a.launch.recipe == b.launch.recipe
 }
 
-pub(crate) fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
+pub fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
     a.id == b.id
         && a.launch == b.launch
         && a.continuity.live_proof().is_some()
@@ -440,8 +440,9 @@ impl Agent {
     }
 
     /// An open user agent placed in `channel` that has not started a session.
-    #[cfg(test)]
-    pub(crate) fn fixture_placed_in(channel: ChannelId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_placed_in(channel: ChannelId) -> Self {
         let placement = Placement::Channel(channel);
         Self {
             name: None,

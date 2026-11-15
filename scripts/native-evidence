@@ -197,15 +197,20 @@ zig_executable() (
         -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'
 )
 
-# What `build` compiles, and all a session's cargo accepts. Keep these in step with
-# scripts/run-development's browserless builds, which cannot be asked to only build: the
-# before side may predate any option. A real-runner test fails if they drift.
+# What `build` compiles in CHECKOUT, and all a session's cargo accepts. Keep these in
+# step with scripts/run-development's browserless builds, which cannot be asked to only
+# build: the before side may predate any option. A real-runner test fails if they drift.
+# A checkout from before the UI became its own package builds it from the root package.
 build_arguments() {
-    local common='--locked --profile dev-runtime --no-default-features --features'
+    local checkout=$1 common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
-        "$common development,host --bin cagentsd" \
-        "$common development,ui --bin cagents-ui"
+        "$common development,host --bin cagentsd"
+    if [ -e "$checkout/crates/cagents-ui/Cargo.toml" ]; then
+        printf '%s\n' '--locked --profile dev-runtime -p cagents-ui --features development --bin cagents-ui'
+    else
+        printf '%s\n' "$common development,ui --bin cagents-ui"
+    fi
 }
 
 refuse_running_side() {
@@ -312,7 +317,7 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments)
+        done < <(build_arguments "$checkout")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
@@ -859,7 +864,7 @@ write_session_cargo() {
         printf '#!/bin/bash\n'
         printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
-        printf 'recorded=%q\n' "$(build_arguments)"
+        printf 'recorded=%q\n' "$(build_arguments "$checkout")"
         cat <<'CARGO'
 [ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {

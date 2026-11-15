@@ -609,8 +609,9 @@ impl Registry {
     ///
     /// Callers verify the login with the provider first; this records only
     /// what it reported, and never replaces or edits an existing row.
-    #[cfg(any(feature = "host", test))]
-    pub(crate) fn restore(
+    #[cfg(any(feature = "host", test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn restore(
         &mut self,
         managed: Registered,
         system: &[(Provider, Identity)],

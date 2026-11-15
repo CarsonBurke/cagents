@@ -222,7 +222,7 @@ impl Cagents {
         // terminal or conversation its default pane.
         let task = action
             .filter(|action| {
-                let destination = WorkspaceDestination::from_action(action);
+                let destination = workspace_destination(action);
                 destination != self.active_workspace_destination()
                     && sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state)
                         .iter()
@@ -351,7 +351,7 @@ impl Cagents {
         actions
             .into_iter()
             .filter_map(|action| {
-                let destination = WorkspaceDestination::from_action(&action)?;
+                let destination = workspace_destination(&action)?;
                 if !seen.insert(destination) {
                     return None;
                 }
@@ -477,7 +477,7 @@ impl Cagents {
         self.chrome_ui
             .workspace_preview
             .as_ref()
-            .and_then(WorkspaceDestination::from_action)
+            .and_then(workspace_destination)
     }
 
     /// Record only actual navigation at the workspace's save boundary.

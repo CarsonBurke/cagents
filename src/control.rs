@@ -115,7 +115,7 @@ const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// then flushes its session.
 const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
-pub(crate) const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
+pub const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Parser)]
@@ -800,7 +800,7 @@ impl ControlClient {
         result
     }
 
-    pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+    pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         let deadline = Instant::now() + Self::handshake_timeout();
         Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
     }

@@ -16,9 +16,11 @@ use crate::{
     },
     persistence::{
         SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
-        TranscriptRetention, invalid_state,
+        TranscriptRetention,
     },
 };
+// Exported at the shared library's root so its expansion names that crate.
+use cagents::invalid_state;
 
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 // A busy window must keep saving even when changes never leave a debounce gap.
@@ -443,7 +445,6 @@ enum ChatRecoveryKind {
     Account,
     Upgrade,
     Resume,
-    #[cfg(feature = "ui")]
     AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
 }
 
@@ -907,7 +908,6 @@ impl SessionRuntime {
 
     /// Queue a grant-bound attachment and await the same one-shot durable
     /// receipt as ordinary recovery. Descriptor arguments come only from it.
-    #[cfg(feature = "ui")]
     pub(crate) fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
@@ -1607,7 +1607,6 @@ trait SessionStore {
         ))
     }
 
-    #[cfg(feature = "ui")]
     fn rebind_authenticated_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1733,7 +1732,6 @@ impl SessionStore for StateStore {
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
     }
-    #[cfg(feature = "ui")]
     fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
@@ -1862,7 +1860,6 @@ impl SessionStore for Arc<StateStore> {
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
     }
-    #[cfg(feature = "ui")]
     fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
@@ -2360,7 +2357,6 @@ impl PendingWrites {
                             &recovery.source,
                             &recovery.replacement,
                         ),
-                        #[cfg(feature = "ui")]
                         ChatRecoveryKind::AuthenticatedUpgrade(witness) => {
                             if witness.source() != &recovery.source
                                 || witness.replacement() != &recovery.replacement

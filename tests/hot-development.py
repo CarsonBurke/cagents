@@ -107,7 +107,8 @@ class HotRunner(unittest.TestCase):
                 ui_features = "hot-reload" if browserless else "hot-reload,integrated-browser"
                 metadata = state.calls[2][1]
                 self.assertEqual(self.assert_locked_sandbox(metadata, state.root), [
-                    "cargo", "metadata", "--locked", "--no-default-features", "--features", ui_features,
+                    "cargo", "metadata", "--locked", "--manifest-path", str(state.root / "crates/cagents-ui/Cargo.toml"),
+                    "--no-default-features", "--features", ui_features,
                     "--filter-platform", "x86_64-unknown-linux-gnu", "--format-version", "1",
                 ])
                 self.assertNotIn("CARGO_NET_OFFLINE", metadata)
@@ -118,7 +119,7 @@ class HotRunner(unittest.TestCase):
                 executable, launch = state.execute.call_args.args
                 self.assertEqual(executable, "/tools/bin/bwrap")
                 self.assertEqual(self.assert_locked_sandbox(launch, state.root), [
-                    "/tools/bin/cargo-hot", "hot", "--profile", "dev-runtime", "--no-default-features",
+                    "/tools/bin/cargo-hot", "hot", "--profile", "dev-runtime", "-p", "cagents-ui", "--no-default-features",
                     "--features", ui_features, "--bin", "cagents-ui-hot", "--",
                 ])
                 self.assertIn(["--setenv", "CARGO_NET_OFFLINE", "true"], [launch[i:i + 3] for i in range(len(launch))])

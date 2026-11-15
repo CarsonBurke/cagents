@@ -1250,6 +1250,62 @@ fn io_error(error: io::Error) -> FileIoError {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[test]
+    fn editor_copy_preserves_access_acl_and_removes_unwanted_inheritance() {
+        use crate::fs_safety::acl_fixture::{
+            access_acl, restrictive_access_acl, set_default_acl, set_test_access_acl,
+        };
+        use std::{
+            fs::{self, File},
+            path::Path,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("restricted"), b"private contents").unwrap();
+        fs::write(directory.path().join("plain"), b"plain contents").unwrap();
+        let restricted = File::open(directory.path().join("restricted")).unwrap();
+        let acl = restrictive_access_acl();
+        if !set_test_access_acl(&restricted, &acl) {
+            return;
+        }
+        assert_eq!(
+            restricted.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::create_dir(directory.path().join("copies")).unwrap();
+        let parent = File::open(directory.path().join("copies")).unwrap();
+        set_default_acl(&parent, &acl);
+        let plain = File::open(directory.path().join("plain")).unwrap();
+        plain
+            .set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+
+        for name in ["restricted", "plain"] {
+            super::copy_file(
+                directory.path(),
+                Path::new(name),
+                &Path::new("copies").join(name),
+            )
+            .unwrap();
+        }
+        let restricted_copy = File::open(directory.path().join("copies/restricted")).unwrap();
+        let plain_copy = File::open(directory.path().join("copies/plain")).unwrap();
+        assert_eq!(access_acl(&restricted_copy), Some(acl));
+        assert_eq!(access_acl(&plain_copy), None);
+        assert_eq!(
+            plain_copy.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read(directory.path().join("restricted")).unwrap(),
+            b"private contents"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("copies/restricted")).unwrap(),
+            b"private contents"
+        );
+    }
+
     use tempfile::tempdir;
 
     use super::*;
@@ -1875,7 +1931,7 @@ mod tests {
         let path = root.path().join("shared.txt");
         fs::write(&path, "before\n").unwrap();
         let file = File::open(&path).unwrap();
-        let Some(group) = fs_safety::tests::shared_group(&file) else {
+        let Some(group) = fs_safety::acl_fixture::shared_group(&file) else {
             return;
         };
         fs::set_permissions(&path, Permissions::from_mode(0o660)).unwrap();

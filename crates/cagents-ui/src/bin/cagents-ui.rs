@@ -10,7 +10,7 @@ use cagents::instance::{
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
 // The hot-reload root compiles this file with the application's modules, tests
-// included, and its `cagents` is itself, so the refusal doesn't belong there.
+// included, so the refusal doesn't belong there.
 #[cfg(all(test, not(feature = "hot-reload")))]
 cagents::refuse_filtered_test_run!();
 
@@ -52,7 +52,7 @@ pub(crate) fn main_with_before_start(
     // putting a single line there would corrupt the page the reader is
     // waiting for. It is also the one mode that must stay cheap: it runs
     // once per page turn.
-    if let Some(code) = cagents::document_render::hook() {
+    if let Some(code) = cagents_ui::document_render::hook() {
         return code;
     }
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -109,7 +109,7 @@ pub(crate) fn main_with_before_start(
     }));
 
     #[cfg(feature = "integrated-browser")]
-    let _browser_cleanup = cagents::browser::ProcessShutdown;
+    let _browser_cleanup = cagents_ui::browser::ProcessShutdown;
     let result = run(options);
     // Whatever ended startup explains itself from here; the wait is over.
     cagents::instance::dismiss_startup_wait_notice();
@@ -120,7 +120,7 @@ pub(crate) fn main_with_before_start(
             if let Ok(Some(options)) = parse(&arguments)
                 && options.restore_policy != cagents::instance::WindowRestorePolicy::ExistingOnly
             {
-                let request = cagents::update::startup::Request::new(
+                let request = cagents_ui::startup_window::Request::new(
                     options.new_window,
                     options.slot.map(str::to_owned),
                     options.source.map(str::to_owned),
@@ -255,7 +255,9 @@ fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
     command.spawn()
 }
 
-fn spawn_startup_update_dialog(request: &cagents::update::startup::Request) -> std::io::Result<()> {
+fn spawn_startup_update_dialog(
+    request: &cagents_ui::startup_window::Request,
+) -> std::io::Result<()> {
     let payload = serde_json::to_string(request).map_err(std::io::Error::other)?;
     std::process::Command::new(std::env::current_exe()?)
         .args([STARTUP_UPDATE, &payload])
@@ -279,8 +281,8 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         if payload.len() > 4096 || arguments.next().is_some() {
             return Err("invalid startup update context".into());
         }
-        let request: cagents::update::startup::Request = serde_json::from_str(payload)?;
-        return cagents::update::startup::run(request);
+        let request: cagents_ui::startup_window::Request = serde_json::from_str(payload)?;
+        return cagents_ui::startup_window::run(request);
     }
     if arguments.peek() == Some(&STARTUP_WAIT) {
         arguments.next();
@@ -298,7 +300,7 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             return Err("invalid shutdown confirmation capability arguments".into());
         }
         let capability: cagents::terminal::ipc::ShutdownCapability = serde_json::from_str(payload)?;
-        return cagents::app::run_daemon_stop_confirmation(capability);
+        return cagents_ui::app::run_daemon_stop_confirmation(capability);
     }
     arguments.next();
     let message = arguments.next().ok_or("missing startup error message")?;
@@ -365,7 +367,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             cagents::device::window_slot(source)?
         };
-        cagents::session::SessionRuntime::initialize_window(
+        cagents_ui::session::SessionRuntime::initialize_window(
             device_source
                 .as_deref()
                 .unwrap_or(cagents::instance::PRIMARY_WINDOW),
@@ -382,7 +384,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 cagents::terminal::ensure_daemon_ready()?;
             }
         }
-        let restored = cagents::app::Cagents::load_startup()?;
+        let restored = cagents_ui::app::Cagents::load_startup()?;
         Ok((lease, (listener, activation_rx), restored))
     })();
     let (_application_lease, activation, restored) = startup?;
@@ -392,7 +394,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface
     // scaling changes the actual viewport, not only Core's preference.
-    type Shell = Cosmic<cagents::app::Cagents>;
+    type Shell = Cosmic<cagents_ui::app::Cagents>;
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     let settings = iced::Settings {
         id: Some(cagents::instance::APPLICATION_ID.to_owned()),
@@ -415,7 +417,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.
-                icon: Some(cagents::app::application_window_icon()),
+                icon: Some(cagents_ui::app::application_window_icon()),
                 ..iced::window::Settings::default()
             };
             window_settings.platform_specific.application_id =
@@ -426,7 +428,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             let startup = restored.borrow_mut().take().expect("UI initialized once");
             let (shell, initialize) = Shell::init((core, (activation_rx.clone(), startup)));
             let opened = open
-                .map(cagents::app::Message::StartupWindowOpened)
+                .map(cagents_ui::app::Message::StartupWindowOpened)
                 .map(cosmic::Action::App);
             (shell, iced::Task::batch([opened, initialize]))
         },
@@ -543,10 +545,10 @@ impl cosmic::Application for StartupError {
         }
         rows.push(
             cosmic::widget::row::with_children(vec![
-                cagents::ui_controls::button::primary("Retry")
+                cagents_ui::ui_controls::button::primary("Retry")
                     .on_press(StartupErrorMessage::Retry)
                     .into(),
-                cagents::ui_controls::button::secondary("Close")
+                cagents_ui::ui_controls::button::secondary("Close")
                     .on_press(StartupErrorMessage::Close)
                     .into(),
             ])
@@ -581,7 +583,7 @@ impl cosmic::Application for StartupWait {
 
     fn init(core: Core, _: ()) -> (Self, cosmic::app::Task<StartupWaitMessage>) {
         // The spinner is the only thing on screen; let it turn at full rate.
-        cagents::ui_controls::animate_activity(true);
+        cagents_ui::ui_controls::animate_activity(true);
         (Self { core }, cosmic::app::Task::none())
     }
 
@@ -605,7 +607,7 @@ impl cosmic::Application for StartupWait {
 
     fn view(&self) -> cosmic::Element<'_, StartupWaitMessage> {
         let heading = cosmic::widget::row::with_children(vec![
-            cagents::ui_controls::activity_spinner(20.0, cagents::design::accent_color),
+            cagents_ui::ui_controls::activity_spinner(20.0, cagents::design::accent_color),
             cagents::design::title("Starting cagents").into(),
         ])
         .spacing(space::M)
@@ -621,7 +623,7 @@ impl cosmic::Application for StartupWait {
                     "Starting can take longer while it restores your sessions. Hiding this message does not stop cagents from opening.",
                 )
                 .into(),
-                cagents::ui_controls::button::secondary("Hide")
+                cagents_ui::ui_controls::button::secondary("Hide")
                     .on_press(StartupWaitMessage::Hide)
                     .into(),
             ])
@@ -642,7 +644,7 @@ fn run_startup_wait_notice() -> Result<(), Box<dyn std::error::Error>> {
             let (window, open) = iced::window::open(iced::window::Settings {
                 size: iced::Size::new(620.0, 280.0),
                 exit_on_close_request: false,
-                icon: Some(cagents::app::application_window_icon()),
+                icon: Some(cagents_ui::app::application_window_icon()),
                 ..iced::window::Settings::default()
             });
             let mut core = Core::default();
@@ -709,7 +711,7 @@ fn run_startup_error_dialog(
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.
-                icon: Some(cagents::app::application_window_icon()),
+                icon: Some(cagents_ui::app::application_window_icon()),
                 ..iced::window::Settings::default()
             });
             let mut core = Core::default();
