@@ -6,6 +6,7 @@ mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
 mod console_relaunch;
+pub(super) use console_relaunch::matched_cli;
 #[cfg(test)]
 mod console_relaunch_tests;
 pub(super) mod floor_history;
