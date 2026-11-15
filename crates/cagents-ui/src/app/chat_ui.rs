@@ -537,9 +537,9 @@ pub enum Action {
         Result<Vec<crate::terminal::ipc::LostProcess>, String>,
     ),
     DismissCloseRefusal(Target),
-    /// Where the transcript's viewport has moved to, which is what asks for
-    /// another page of history.
-    Scrolled(Target, Option<String>, view::Scroll, bool),
+    /// Native viewport geometry and, for deliberate navigation, its direction.
+    /// A collapsed page can fit at both edges; geometry cannot choose its next page.
+    Scrolled(Target, Option<String>, view::Scroll, Option<view::Page>),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     PermissionPicker(Target, bool),
@@ -10716,9 +10716,7 @@ impl Cagents {
             }
             HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
-                if runtime.parent_scroll().at_bottom()
-                    && !runtime.parent_scroll().at_top()
-                    && runtime.snapshot.has_later =>
+                if runtime.parent_scroll().at_bottom() && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
             }
@@ -10726,9 +10724,7 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.parent_scroll().at_top()
-                    && !runtime.parent_scroll().at_bottom()
-                    && runtime.snapshot.has_earlier =>
+                if runtime.parent_scroll().at_top() && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -14743,14 +14739,14 @@ impl Cagents {
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
             }
-            Action::Scrolled(target, subagent, scroll, user_input) => {
+            Action::Scrolled(target, subagent, scroll, direction) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 if runtime.selected_subagent != subagent {
                     return Task::none();
                 }
-                if user_input {
+                if direction.is_some() {
                     runtime.find_navigation.cancel();
                 }
                 if let Some(id) = subagent {
@@ -14765,24 +14761,24 @@ impl Cagents {
                 // Leaving an end is what arms the page at it, so a reader who
                 // scrolls away and comes back asks again, while one who stays
                 // put asks once.
-                if !at_top {
+                if !at_top || direction == Some(view::Page::Newer) {
                     if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
                         runtime.deferred_page = None;
                     }
                     runtime.earlier_asked = None;
                 }
-                if !at_bottom {
+                if !at_bottom || direction == Some(view::Page::Earlier) {
                     if runtime.deferred_page == Some(HistoryNavigation::NewerEdge) {
                         runtime.deferred_page = None;
                     }
                     runtime.later_asked = None;
                 }
                 let height = Some(scroll.content());
-                // A short page has no scroll direction. Its explicit history
-                // controls choose the end without triggering a paging loop.
-                if user_input
+                // A byte-bounded page can contain only collapsed tool output.
+                // It fits at both edges, so the gesture chooses the next page;
+                // layout and provider updates never start another fetch.
+                if direction == Some(view::Page::Earlier)
                     && at_top
-                    && !at_bottom
                     && runtime.snapshot.has_earlier
                     && runtime.earlier_asked != height
                 {
@@ -14801,9 +14797,8 @@ impl Cagents {
                     }
                     return self.chat_send(target, Command::LoadEarlier, false);
                 }
-                if user_input
+                if direction == Some(view::Page::Newer)
                     && at_bottom
-                    && !at_top
                     && runtime.snapshot.has_later
                     && runtime.later_asked != height
                 {
@@ -17877,7 +17872,7 @@ mod tests {
             drop(app.handle_chat_ui(if explicit {
                 Action::Command(target, Command::LoadEarlier)
             } else {
-                Action::Scrolled(target, None, scroll, true)
+                Action::Scrolled(target, None, scroll, Some(view::Page::Earlier))
             }));
             assert_eq!(
                 chat_runtime(&app, card).deferred_page,
@@ -17912,13 +17907,13 @@ mod tests {
             target,
             None,
             view::Scroll::new(0.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Earlier),
         )));
         drop(app.handle_chat_ui(Action::Scrolled(
             target,
             None,
             view::Scroll::new(200.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Newer),
         )));
         assert_eq!(
             chat_runtime(&app, card).deferred_page,
@@ -17937,9 +17932,19 @@ mod tests {
         let (card, target, _) = history_fixture(&mut app);
         let scroll = view::Scroll::new(0.0, 1000.0, 400.0);
         app.chat_runtime_mut(target).unwrap().scroll = scroll;
-        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            scroll,
+            Some(view::Page::Earlier),
+        )));
         settle(&mut app, card, Err("temporary history failure".into()));
-        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            scroll,
+            Some(view::Page::Earlier),
+        )));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
             Some(view::Page::Earlier)
@@ -18012,7 +18017,12 @@ mod tests {
         let (card, target, handle) = history_fixture(&mut app);
         let scroll = view::Scroll::new(0.0, 1000.0, 400.0);
         app.chat_runtime_mut(target).unwrap().scroll = scroll;
-        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            scroll,
+            Some(view::Page::Earlier),
+        )));
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
         snapshot.history_loading = true;
@@ -18023,7 +18033,12 @@ mod tests {
         snapshot.error = Some("temporary provider error".into());
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
-        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            scroll,
+            Some(view::Page::Earlier),
+        )));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
             Some(view::Page::Earlier)
@@ -18040,7 +18055,7 @@ mod tests {
             view::Scroll::new(600.0, 1000.0, 400.0),
             view::Scroll::new(0.0, 100.0, 400.0),
         ] {
-            drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, false)));
+            drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, None)));
             assert!(chat_runtime(&app, card).pending.is_none());
         }
     }
@@ -18061,7 +18076,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(600.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Newer),
         )));
         assert_eq!(
             chat_runtime(&app, card).deferred_page,
@@ -18071,7 +18086,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(300.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Earlier),
         )));
         assert!(chat_runtime(&app, card).deferred_page.is_none());
         settle(&mut app, card, Ok(()));
@@ -18087,7 +18102,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(600.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Newer),
         )));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
@@ -18116,7 +18131,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(300.0, 1000.0, 400.0),
-            true,
+            Some(view::Page::Earlier),
         )));
         assert_eq!(
             chat_runtime(&app, card).deferred_page,
@@ -18140,7 +18155,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(600.0, 1000.0, 400.0),
-            false,
+            None,
         )));
         assert!(chat_runtime(&app, card).unseen_activity);
         Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = false;
@@ -18148,7 +18163,7 @@ mod tests {
             target,
             None,
             view::Scroll::new(600.0, 1000.0, 400.0),
-            false,
+            None,
         )));
         assert!(!chat_runtime(&app, card).unseen_activity);
     }
@@ -18242,12 +18257,17 @@ mod tests {
         runtime.scroll = parent;
         assert_eq!(runtime.active_scroll(), view::Scroll::default());
         let child = view::Scroll::new(0.0, 200.0, 400.0);
-        drop(app.handle_chat_ui(Action::Scrolled(target, Some("child".into()), child, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            Some("child".into()),
+            child,
+            Some(view::Page::Earlier),
+        )));
         drop(app.handle_chat_ui(Action::Scrolled(
             target,
             None,
             view::Scroll::new(0.0, 1000.0, 400.0),
-            false,
+            None,
         )));
         assert_eq!(
             chat_runtime(&app, card).scroll,
