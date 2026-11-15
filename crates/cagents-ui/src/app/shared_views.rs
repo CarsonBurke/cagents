@@ -7,6 +7,8 @@ use crate::workspace_model::{
     ModelEdit,
     views::{self, Change, Pane, Scope, View},
 };
+mod removal;
+pub(super) use removal::{TerminalCleanupAuthority, TerminalRemovalReceipt};
 
 /// One immutable projection for a publication pass. Scope discovery includes
 /// historical directories, but their cards never become open shared panes.
@@ -152,9 +154,17 @@ fn view_scope_hold<'a>(
 
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) removals: HashMap<CardId, Option<removal::RemovalSource>>,
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    pub(super) terminal_source_workers: HashMap<
+        CardId,
+        (
+            TerminalId,
+            crate::workspace_model::views::TerminalRemovalBasis,
+        ),
+    >,
     pub(super) scope_absences: HashMap<Scope, u64>,
     pub(super) view_sequences: HashMap<Scope, u64>,
     pub(super) metadata_revisions: HashMap<super::workspace_model_sync::MetadataKey, u64>,
@@ -206,6 +216,7 @@ pub(super) struct State {
     pub closed_chats: HashMap<CardId, crate::chat::Session>,
     /// Last actual canonical descriptors, before optimistic local edits.
     observed_chats: HashMap<CardId, crate::chat::Session>,
+    observed_terminals: HashMap<CardId, TerminalSession>,
     applying: bool,
     pub creating_default: bool,
     pub deferred_default: Option<PathBuf>,
@@ -245,7 +256,7 @@ impl State {
     pub(super) fn has_pending_update(&self, card: CardId) -> bool {
         self.pending
             .iter()
-            .any(|(_, _, change)| matches!(change, Change::Update { pane, .. } if pane.id == card))
+            .any(|(_, _, change)| matches!(change, Change::Update { pane, .. } | Change::UpdateTerminalSource { pane, .. } if pane.id == card))
     }
 
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
@@ -313,7 +324,7 @@ impl Cagents {
         let ModelEdit::ChangeView {
             scope,
             operation,
-            change: Change::Update { .. },
+            change: Change::Update { .. } | Change::UpdateTerminalSource { .. },
             ..
         } = edit
         else {
@@ -385,7 +396,7 @@ impl Cagents {
         // Another window can publish the same session update first, as when two
         // windows attached to one conversation both learn its provider session.
         // Only a session update qualifies: a refused name or width edit can be lost.
-        let session_already_applied = matches!(&change, Change::Update { before, pane } if {
+        let session_already_applied = matches!(&change, Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. } if {
             let same_source = |a: &Pane, b: &Pane| {
                 a.kind == b.kind
                     && a.pending_terminal_start == b.pending_terminal_start
@@ -402,7 +413,8 @@ impl Cagents {
                 && owners.next().is_none()
         });
         let mut retry = None;
-        if let Change::Update { before, pane } = &change
+        if let (Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }) =
+            &change
             && before.id == pane.id
             && self
                 .card_state(pane.id)
@@ -430,7 +442,7 @@ impl Cagents {
                 let later = &self.shared_views.pending[index + 1..];
                 let superseded = |field: fn(&Pane, &Pane) -> bool| {
                     later.iter().any(|(_, _, change)| {
-                        matches!(change, Change::Update { before, pane: after }
+                        matches!(change, Change::Update { before, pane: after } | Change::UpdateTerminalSource { before, pane: after, .. }
                         if after.id == pane.id && field(before, after))
                     })
                 };
@@ -465,7 +477,7 @@ impl Cagents {
         // did not change may have moved on since, as a suggested title does.
         let already_applied = session_already_applied
             && (retry.is_some()
-                || matches!(&change, Change::Update { before, pane }
+                || matches!(&change, Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }
                     if self
                         .workspace_model
                         .views
@@ -1897,6 +1909,43 @@ impl Cagents {
                     tracing::warn!(card = %id, ?scope, "not retiring a shared pane that is still open");
                     continue;
                 }
+                let change = if let Change::Remove { id } = &change {
+                    // Never turn a placement diff into source-free shared Close.
+                    let Some(change) = self.shared_removal_change(*id, &scope) else {
+                        continue;
+                    };
+                    change
+                } else {
+                    change
+                };
+                let change = match change {
+                    Change::Update { before, mut pane }
+                        if matches!((&before.kind, &pane.kind),
+                            (CardKind::Terminal(a), CardKind::Terminal(b)) if a.id == b.id && a.launch == b.launch)
+                            && before.kind != pane.kind =>
+                    {
+                        let worker = match self.cards.get(&pane.id) {
+                            Some(CardRuntime::Terminal(handle)) => handle.execution_instance().zip(handle.host_proof())
+                                .map(|(instance, owner)| views::TerminalRemovalBasis::Worker { owner, instance }),
+                            _ => self.shared_views.terminal_source_workers.get(&pane.id)
+                                .filter(|(id, _)| matches!(&pane.kind, CardKind::Terminal(s) if &s.id == id))
+                                .map(|(_, worker)| worker.clone()),
+                        };
+                        if let Some(worker) = worker {
+                            Change::UpdateTerminalSource {
+                                before,
+                                pane,
+                                worker,
+                            }
+                        } else {
+                            // A source without a surface receipt is saved locally,
+                            // but cannot overwrite another worker's canonical state.
+                            pane.kind = before.kind.clone();
+                            Change::Update { before, pane }
+                        }
+                    }
+                    change => change,
+                };
                 if let Change::Insert { pane, .. } = &change
                     && matches!(pane.kind, CardKind::Chat(_))
                 {
@@ -2032,7 +2081,9 @@ impl Cagents {
         let mut discarded = HashSet::new();
         let mut stale_actor = false;
         for (operation, scope, change) in &mut self.shared_views.pending {
-            let Change::Update { before, pane } = change else {
+            let (Change::Update { before, pane }
+            | Change::UpdateTerminalSource { before, pane, .. }) = change
+            else {
                 continue;
             };
             let card = pane.id;
@@ -2095,6 +2146,14 @@ impl Cagents {
                     .insert(*operation, source_basis);
             }
             *scope = owner.scope.clone();
+            if let Change::UpdateTerminalSource { before, pane, .. } = change
+                && !views::updates_source(before, pane)
+            {
+                *change = Change::Update {
+                    before: before.clone(),
+                    pane: pane.clone(),
+                };
+            }
             edits.push(ModelEdit::ChangeView {
                 scope: scope.clone(),
                 expected_revision: owner.revision,
@@ -2332,7 +2391,9 @@ impl Cagents {
             let id = match change {
                 Change::Insert { pane, .. }
                 | Change::Update { pane, .. }
+                | Change::UpdateTerminalSource { pane, .. }
                 | Change::InsertIfEmpty { pane } => pane.id,
+                Change::RemoveSource { before, .. } => before.id,
                 Change::Remove { id } | Change::Move { id, .. } | Change::Transfer { id, .. } => {
                     *id
                 }
@@ -3082,7 +3143,7 @@ impl Cagents {
             let existing = self.card_state(pane.id).cloned();
             // The exit this window saw, read before a readmission below can
             // mark the card unstarted.
-            let observed_exit = self.ended_terminal(pane.id).cloned();
+            let mut observed_exit = self.ended_terminal(pane.id).cloned();
             // A restored shared terminal may have waited for the registry
             // while lifecycle hydration was admitted. Once its authoritative
             // descriptor arrives, admit that exact identity again.
@@ -3094,10 +3155,36 @@ impl Cagents {
             let waiting = matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))
                 && existing.is_some()
                 && matches!(self.residency(pane.id), Residency::Hydrating { .. });
+            let canonical_was_ended = match &pane.kind {
+                CardKind::Terminal(source) => self
+                    .shared_views
+                    .observed_terminals
+                    .insert(pane.id, source.clone())
+                    .is_none_or(|previous| terminal_ended(&previous)),
+                _ => {
+                    self.shared_views.observed_terminals.remove(&pane.id);
+                    false
+                }
+            };
+            let completed_became_live = no_start
+                && canonical_was_ended
+                && observed_exit.is_some()
+                && matches!(self.cards.get(&pane.id), Some(CardRuntime::Completed))
+                && matches!(&pane.kind, CardKind::Terminal(s) if s.continuity.live_proof().is_some())
+                && !pane.pending_terminal_start;
+            if completed_became_live {
+                if let CardKind::Terminal(s) = &pane.kind {
+                    self.retained_outputs.remove(&s.id);
+                }
+                self.shared_views.terminal_source_workers.remove(&pane.id);
+                // The canonical live source attaches; saved exit state cannot
+                // turn its replacement back into the old Completed placeholder.
+                observed_exit = None;
+            }
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
             if matches!(pane.kind, CardKind::Terminal(_))
-                && ((no_start && (waiting || failed_pending))
+                && ((no_start && (waiting || failed_pending || completed_became_live))
                     || (leaves_saved
                         && matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))))
             {
@@ -3727,6 +3814,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 mod tests {
     mod history_start;
     mod published_card_edits;
+    mod removal_tests;
     #[cfg(not(feature = "integrated-browser"))]
     mod replica_capture;
     mod seed_refusal;
@@ -3802,6 +3890,22 @@ mod tests {
             });
         }
         app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: "/repo/.git".into(),
+            name: "Fixture".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = [a, b]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: "/repo/.git".into(),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
         app.shared_views
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);
@@ -3868,8 +3972,27 @@ mod tests {
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             panic!("terminal");
         };
+        let owner = session
+            .continuity
+            .live_proof()
+            .filter(HostSessionProof::is_complete)
+            .unwrap_or_else(|| HostSessionProof {
+                host_session_id: "observed-move-host".into(),
+                boot_id: "observed-move-boot".into(),
+                host_incarnation: "observed-move-instance".into(),
+            });
+        let observed = (
+            session.id,
+            views::TerminalRemovalBasis::Worker {
+                owner,
+                instance: uuid::Uuid::new_v4(),
+            },
+        );
         // This is the durable descriptor boundary written by ResumeHintChanged.
         session.resume_hint = Some("observed-provider-session-while-moving".into());
+        app.shared_views
+            .terminal_source_workers
+            .insert(card, observed);
         app.persist();
         let pane = app
             .local_view_panes(&Scope::Channel(source))
@@ -3924,22 +4047,12 @@ mod tests {
                 if let ModelEdit::ChangeView {
                     scope,
                     operation,
-                    change:
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
+                    change: change @ (Change::Update { .. } | Change::UpdateTerminalSource { .. }),
                     ..
                 } = edit
                 {
                     assert_eq!(scope, Scope::Channel(source));
-                    old.push((
-                        operation,
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
-                    ));
+                    old.push((operation, change));
                 }
             }
             assert!(
@@ -3989,23 +4102,13 @@ mod tests {
                     scope,
                     expected_revision,
                     operation,
-                    change:
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
+                    change: change @ (Change::Update { .. } | Change::UpdateTerminalSource { .. }),
                 } = edit
                 {
                     assert_eq!(scope, Scope::Channel(destination));
                     assert_eq!(expected_revision, 1);
                     assert!(!old.iter().any(|(previous, _)| *previous == operation));
-                    retried.push((
-                        operation,
-                        Change::Update {
-                            before,
-                            pane: after,
-                        },
-                    ));
+                    retried.push((operation, change));
                 }
             }
             assert_eq!(

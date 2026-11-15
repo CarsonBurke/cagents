@@ -884,3 +884,74 @@ fn active_models_are_beyond_every_older_recording() {
         );
     }
 }
+
+#[test]
+fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
+    let marker = ServerMessage::TerminalWorker {
+        terminal_id: crate::model::TerminalId::new(),
+        instance: uuid::Uuid::new_v4(),
+    };
+    let index = super::variant_index(&marker).unwrap();
+    assert_eq!(index + 1, variant_count(&recorded(183), "ServerMessage"));
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "terminal_worker",
+        183
+    )));
+    for client in OLDER_CLIENTS {
+        assert!(!client.admits_message(&marker));
+    }
+    for protocol in
+        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 183)
+    {
+        assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
+    }
+}
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
+#[test]
+fn actual_main_178_receives_the_frozen_internal_error_for_store_contention() {
+    use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode, ServerEnvelopeRef, write_frame};
+    let frozen = recorded(178);
+    let Some(Container::Enum(variants)) = frozen
+        .containers
+        .get("cagents::terminal::ipc::ProtocolErrorCode")
+    else {
+        panic!("missing frozen error codes")
+    };
+    assert!(!variants.iter().any(|(name, _)| name == "store_busy"));
+    let internal = variants
+        .iter()
+        .position(|(name, _)| name == "internal")
+        .unwrap();
+    assert_eq!(
+        super::variant_index(&ProtocolErrorCode::Internal),
+        Some(internal as u32)
+    );
+    let proof = crate::model::HostSessionProof {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-daemon".into(),
+    };
+    let encode = |code| {
+        let message = ServerMessage::Error(ProtocolError::new(code, "database is locked", true));
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &ServerEnvelopeRef {
+                version: 178,
+                request_id: Some(17),
+                proof: &proof,
+                message: &message,
+            },
+        )
+        .unwrap();
+        bytes
+    };
+    assert_eq!(
+        encode(ProtocolErrorCode::StoreBusy),
+        encode(ProtocolErrorCode::Internal)
+    );
+}

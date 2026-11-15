@@ -47,11 +47,15 @@ impl CloseIntent {
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
+    ClosedWithBasis(super::shared_views::TerminalRemovalReceipt),
     Active,
     Stale,
+    /// The owner correlated a refusal before any cleanup could take effect.
+    SourceChanged,
     /// The owning daemon answered and the terminal is proven gone. Nothing was
     /// stopped: there is nothing left to stop.
     NotHosted,
+    NotHostedWithBasis(super::shared_views::TerminalRemovalReceipt),
     /// Not proven gone, for the reason given. Nothing was sent to the terminal.
     Kept(KeptPane),
     Unreachable(String),
@@ -60,13 +64,16 @@ pub enum CloseOutcome {
 #[derive(Debug, Clone)]
 pub enum CompletedCloseOutcome {
     Closed,
+    ClosedWithBasis(super::shared_views::TerminalRemovalReceipt),
     Active(HostSessionProof),
+    SourceChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct QueuedCardClose {
     card: CardId,
     unasked: bool,
+    preserve_source: bool,
 }
 
 #[cfg(test)]
@@ -125,6 +132,7 @@ impl Cagents {
 
     /// Gives up removing `card`, which stays open and can be closed again.
     pub(super) fn abandon_removal(&mut self, card: CardId) {
+        self.shared_views.removals.remove(&card);
         if self
             .workspace
             .pending_close()
@@ -192,15 +200,20 @@ impl Cagents {
     }
 
     pub(super) fn queue_card_close(&mut self, card: CardId, unasked: bool) {
+        let preserve_source = self.shared_views.removals.contains_key(&card);
         if let Some(queued) = self
             .queued_card_closes
             .iter_mut()
             .find(|queued| queued.card == card)
         {
             queued.unasked |= unasked;
+            queued.preserve_source |= preserve_source;
         } else {
-            self.queued_card_closes
-                .push_back(QueuedCardClose { card, unasked });
+            self.queued_card_closes.push_back(QueuedCardClose {
+                card,
+                unasked,
+                preserve_source,
+            });
         }
     }
 
@@ -214,7 +227,11 @@ impl Cagents {
         let mut tasks = Vec::new();
         let mut kept = 0;
         while !self.close_queue_held() {
-            let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front()
+            let Some(QueuedCardClose {
+                card,
+                unasked,
+                preserve_source,
+            }) = self.queued_card_closes.pop_front()
             else {
                 break;
             };
@@ -231,11 +248,25 @@ impl Cagents {
             // Acquire the next close's ownership before returning a task.
             // A delayed CardId-only message would leave Retry free to
             // replace its terminal between dequeue and dispatch.
-            tasks.push(self.update(if unasked {
-                Message::CloseCardUnasked(card)
+            tasks.push(if preserve_source {
+                if unasked {
+                    self.continue_card_close(card, true)
+                } else if self
+                    .card_state(card)
+                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+                    || self.chat_has_parked_runtime(card)
+                {
+                    self.continue_chat_close(card)
+                } else {
+                    self.continue_card_close(card, unasked)
+                }
             } else {
-                Message::CloseCard(card)
-            }));
+                self.update(if unasked {
+                    Message::CloseCardUnasked(card)
+                } else {
+                    Message::CloseCard(card)
+                })
+            });
             if self.status.is_none() {
                 self.status = earlier_notice;
             }
@@ -314,13 +345,25 @@ impl Cagents {
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
+        self.reset_shared_removal_for_new_close(card);
         self.close_card_as(card, !self.asks(QUESTION), false)
+    }
+
+    pub(super) fn reset_shared_removal_for_new_close(&mut self, card: CardId) {
+        if !self.pane_close_owned(card) {
+            self.shared_views.removals.remove(&card);
+        }
+    }
+
+    pub(super) fn continue_card_close(&mut self, card: CardId, unasked: bool) -> Task<Message> {
+        self.close_card_as(card, unasked || !self.asks(QUESTION), unasked)
     }
 
     /// Closes `card` without asking whether to stop what its terminal is
     /// running, for a close the reader already asked for in so many words -
     /// cancelling a sign-in, say. The daemon's identity checks still apply.
     pub(super) fn close_card_unasked(&mut self, card: CardId) -> Task<Message> {
+        self.reset_shared_removal_for_new_close(card);
         self.close_card_as(card, true, true)
     }
 
@@ -334,6 +377,9 @@ impl Cagents {
                 .card_state(card)
                 .is_none_or(|state| !state.existence.is_open())
         {
+            return Task::none();
+        }
+        if !self.prepare_shared_removal(card) {
             return Task::none();
         }
         // Read before anything persists the scope, which prunes the closed
@@ -391,7 +437,11 @@ impl Cagents {
         {
             return Task::none();
         }
+        if !self.prepare_shared_removal(card) {
+            return Task::none();
+        }
         if let Some(session) = self.ended_terminal(card).cloned() {
+            let authority = self.terminal_cleanup_authority(card);
             self.completed_release = Some(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
@@ -400,11 +450,48 @@ impl Cagents {
                         .map_err(|error| error.to_string())?;
                     let mut client =
                         ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                    match client
-                        .release_completed_terminal(source, allow_active)
-                        .map_err(|error| error.to_string())?
-                    {
-                        TerminalCloseResult::Closed => Ok(CompletedCloseOutcome::Closed),
+                    let basis = match authority.read_basis(&mut client, &source) {
+                        Err(error) if is_source_close_refusal(&error) => {
+                            return Ok(CompletedCloseOutcome::SourceChanged);
+                        }
+                        result => result.map_err(|error| error.to_string())?,
+                    };
+                    if matches!(
+                        basis,
+                        crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+                    ) {
+                        return super::daemon_recovery::prove_not_hosted_for(
+                            &source,
+                            &[],
+                            &authority,
+                        )
+                        .map(CompletedCloseOutcome::ClosedWithBasis)
+                        .map_err(|kept| kept.reason);
+                    }
+                    if !authority.permits_resolved(&basis) {
+                        return Ok(CompletedCloseOutcome::SourceChanged);
+                    }
+                    let outcome = if authority.capture().is_some() || authority.worker().is_some() {
+                        client.close_captured_terminal_source(
+                            source,
+                            basis.clone(),
+                            true,
+                            allow_active,
+                            authority.capture().cloned(),
+                        )
+                    } else {
+                        client.release_completed_terminal(source, allow_active)
+                    };
+                    let outcome = match outcome {
+                        Err(error) if is_source_close_refusal(&error) => {
+                            return Ok(CompletedCloseOutcome::SourceChanged);
+                        }
+                        result => result.map_err(|error| error.to_string())?,
+                    };
+                    match outcome {
+                        TerminalCloseResult::Closed => Ok(CompletedCloseOutcome::ClosedWithBasis(
+                            authority.receipt(basis),
+                        )),
                         TerminalCloseResult::Active => {
                             Ok(CompletedCloseOutcome::Active(client.proof().clone()))
                         }
@@ -437,7 +524,8 @@ impl Cagents {
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
             let uncertain = self.uncertain_terminal_proofs.contains_key(&card);
-            let probe_only = uncertain && session.continuity.live_proof().is_some();
+            let probe_only = (uncertain && session.continuity.live_proof().is_some())
+                || self.shared_terminal_removal_needs_receipt(card);
             self.terminal_close = Some(CloseIntent {
                 card,
                 terminal: session.id,
@@ -481,9 +569,35 @@ impl Cagents {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
         }) {
+            if matches!(&result, Ok(CompletedCloseOutcome::SourceChanged)) {
+                return Task::batch([
+                    self.readmit_shared_terminal_after_source_refusal(card),
+                    self.next_queued_card_close(),
+                ]);
+            }
             return self.next_queued_card_close();
         }
+        let result = result.and_then(|outcome| match outcome {
+            CompletedCloseOutcome::ClosedWithBasis(basis) => {
+                if self.shared_removal_terminal_receipt(card, basis) {
+                    Ok(CompletedCloseOutcome::Closed)
+                } else {
+                    Err("The pane changed while Close was pending".into())
+                }
+            }
+            outcome => Ok(outcome),
+        });
         match result {
+            Ok(CompletedCloseOutcome::ClosedWithBasis(_)) => unreachable!(),
+            Ok(CompletedCloseOutcome::SourceChanged) => {
+                self.status = Some(TransientNotice::warning(
+                    "This terminal changed before it could close, so the pane was kept. Try closing it again.",
+                ));
+                Task::batch([
+                    self.readmit_shared_terminal_after_source_refusal(card),
+                    self.next_queued_card_close(),
+                ])
+            }
             Ok(CompletedCloseOutcome::Closed) => {
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
@@ -525,6 +639,17 @@ impl Cagents {
     }
 
     pub(super) fn request_card_removal(&mut self, card: CardId) -> Task<Message> {
+        if self
+            .card_state(card)
+            .is_some_and(|state| !state.existence.is_open())
+        {
+            self.abandon_removal(card);
+            return self.next_queued_card_close();
+        }
+        if !self.prepare_shared_removal(card) || !self.shared_removal_ready(card) {
+            self.abandon_removal(card);
+            return self.next_queued_card_close();
+        }
         let reservation = match self.workspace.pending_close() {
             Some(handoff) if handoff.unmounting == card => Ok(handoff),
             _ => self.workspace.request_close(card),
@@ -592,6 +717,10 @@ impl Cagents {
         }
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
+        if !replacing && (!self.prepare_shared_removal(id) || !self.shared_removal_ready(id)) {
+            self.abandon_removal(id);
+            return None;
+        }
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
         let update = match self.workspace.commit_close(id) {
             Ok(update) => update,
@@ -717,10 +846,8 @@ impl Cagents {
         // exists so one intent cannot submit two concurrent requests and so
         // no automatic path retries a request whose fate is unknown; it is
         // not a permanent refusal to ever close this terminal again. A
-        // terminal id is a fresh UUID and the request carries the owner's
-        // session proof, so a later explicit close cannot reach a different
-        // terminal, and an owner that no longer knows this one answers
-        // `Stale` rather than killing something else.
+        // later explicit close captures its source again. Shared closes carry
+        // that source's worker receipt when a terminal ID is reused.
         if intent.detail.is_some() {
             self.terminal_close_attempts.remove(&intent.terminal);
         }
@@ -808,17 +935,19 @@ impl Cagents {
         intent.pending = true;
         intent.generation = self.terminal_close_generation;
         let intent = intent.clone();
+        let authority = self.terminal_cleanup_authority(intent.card);
         cosmic::task::future(async move {
             let card = intent.card;
             let terminal = intent.terminal;
             let proof = intent.proof.clone();
             let generation = intent.generation;
-            let outcome =
-                tokio::task::spawn_blocking(move || revalidate_and_close(&intent, allow_active))
-                    .await
-                    .unwrap_or_else(|error| {
-                        CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
-                    });
+            let outcome = tokio::task::spawn_blocking(move || {
+                revalidate_and_close(&intent, allow_active, &authority)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
+            });
             Message::TerminalCloseFinished {
                 card,
                 terminal,
@@ -848,11 +977,30 @@ impl Cagents {
         {
             return Task::none();
         }
+        let outcome = match outcome {
+            CloseOutcome::ClosedWithBasis(basis) => {
+                if self.shared_removal_terminal_receipt(card, basis) {
+                    CloseOutcome::Closed
+                } else {
+                    CloseOutcome::Stale
+                }
+            }
+            CloseOutcome::NotHostedWithBasis(basis) => {
+                if self.shared_removal_terminal_receipt(card, basis) {
+                    CloseOutcome::NotHosted
+                } else {
+                    CloseOutcome::Stale
+                }
+            }
+            outcome => outcome,
+        };
+        let intent = self.terminal_close.as_ref().unwrap();
         let identity_matches = target_matches(intent, self.card_state(card))
             || exited_target_matches(intent, self.card_state(card));
         let still_saved = intent
             .saved_source
             .as_ref()
+            .or(intent.completed_source.as_ref())
             .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
         let starting = self.terminal_start_in_flight(card);
         match outcome {
@@ -891,6 +1039,7 @@ impl Cagents {
                 self.open_confirmation(QUESTION, cancel_id(), confirm_id())
             }
             outcome => {
+                let source_changed = matches!(&outcome, CloseOutcome::SourceChanged);
                 // `Stale` and a mismatched identity both mean the request was
                 // never applied to the card's terminal, so nothing is left
                 // outstanding for the fence to hold.
@@ -910,8 +1059,11 @@ impl Cagents {
                         "This terminal is starting, so the pane was kept. Close it again when it finishes.".into()
                     }
                     CloseOutcome::Closed
+                    | CloseOutcome::ClosedWithBasis(_)
+                    | CloseOutcome::NotHostedWithBasis(_)
                     | CloseOutcome::Active
                     | CloseOutcome::Stale
+                    | CloseOutcome::SourceChanged
                     | CloseOutcome::NotHosted => {
                         "This terminal changed before it could close, so the pane was kept. Try closing it again.".into()
                     }
@@ -922,7 +1074,14 @@ impl Cagents {
                     }
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus()
+                Task::batch([
+                    close_focus(),
+                    if source_changed {
+                        self.readmit_shared_terminal_after_source_refusal(card)
+                    } else {
+                        Task::none()
+                    },
+                ])
             }
         }
     }
@@ -1158,6 +1317,14 @@ mod tests {
         let project = ProjectId::new();
         app.active_workspace = Some("/tmp".into());
         app.workspace_model.identity = home.registry;
+        app.workspace_model
+            .projects
+            .push(crate::workspace_model::ModelProject {
+                repository: "/tmp".into(),
+                name: "Fixture".into(),
+                kind: Default::default(),
+                ordinal: 1,
+            });
         app.workspace_model.channels.push(ModelChannel {
             id: home.channel,
             repository: "/tmp".into(),
@@ -1183,6 +1350,23 @@ mod tests {
             cards: vec![card],
             focused: Some(card),
         });
+        // This reducer fixture has no resident worker. Supply its simulated
+        // positive-absence receipt before testing canonical Home retirement.
+        assert!(app.capture_shared_removal(card));
+        assert!(app.shared_removal_terminal_receipt(
+            card,
+            app.terminal_cleanup_authority(card).receipt(
+                crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                    owner: HostSessionProof {
+                        host_session_id: "fixture".into(),
+                        boot_id: "boot".into(),
+                        host_incarnation: "incarnation".into()
+                    },
+                    latest_worker: None,
+                    history_epoch: 0,
+                }
+            )
+        ));
         (app, card, home)
     }
 
@@ -1266,6 +1450,77 @@ mod tests {
         (app, card)
     }
 
+    #[test]
+    fn source_refusal_is_definitive_but_unknown_cleanup_remains_uncertain() {
+        use crate::control::ControlError;
+        let refusal = |retryable| ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT.into(),
+            retryable,
+        };
+        assert!(matches!(
+            source_close_outcome(Err(refusal(false))),
+            CloseOutcome::SourceChanged
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(refusal(true))),
+            CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(ControlError::ConnectionClosed)),
+            CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            source_close_outcome(Err(ControlError::Remote {
+                code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
+                message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                retryable: false,
+            })),
+            CloseOutcome::Stale
+        ));
+        assert!(matches!(
+            source_close_outcome(Ok(TerminalCloseResult::Unknown("retained".into()))),
+            CloseOutcome::Unreachable(_)
+        ));
+    }
+
+    #[test]
+    fn dismissing_a_source_refusal_allows_fresh_close_of_the_replacement() {
+        for definitive in [false, true] {
+            let (mut app, card) = retry_close_fixture();
+            drop(app.begin_card_close(card));
+            let intent = app.terminal_close.as_ref().unwrap().clone();
+            assert!(app.terminal_close_attempts.contains(&intent.terminal));
+            let outcome = if definitive {
+                CloseOutcome::SourceChanged
+            } else {
+                CloseOutcome::Unreachable("reply lost".into())
+            };
+            drop(app.terminal_close_finished(
+                card,
+                intent.terminal,
+                intent.proof,
+                intent.generation,
+                outcome,
+            ));
+            assert_eq!(
+                app.terminal_close_attempts.contains(&intent.terminal),
+                !definitive
+            );
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            drop(app.cancel_terminal_close());
+            let CardKind::Terminal(source) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            source.launch.arguments.push("replacement".into());
+            let replacement = source.clone();
+            drop(app.begin_card_close(card));
+            let fresh = app.terminal_close.as_ref().unwrap();
+            assert!(fresh.pending);
+            assert_eq!(fresh.saved_source.as_ref(), Some(&replacement));
+        }
+    }
+
     fn terminal_source(app: &Cagents, card: CardId) -> TerminalSession {
         let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
             unreachable!();
@@ -1296,10 +1551,12 @@ mod tests {
             QueuedCardClose {
                 card: moving,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: next,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1325,10 +1582,12 @@ mod tests {
             QueuedCardClose {
                 card: turn,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: behind,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1355,10 +1614,12 @@ mod tests {
             QueuedCardClose {
                 card: turn,
                 unasked: true,
+                preserve_source: false,
             },
             QueuedCardClose {
                 card: behind,
                 unasked: true,
+                preserve_source: false,
             },
         ]);
         drop(app.next_queued_card_close());
@@ -1497,6 +1758,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: behind,
             unasked: false,
+            preserve_source: false,
         });
         app.device_ui.open = true;
         drop(app.next_queued_card_close());
@@ -1625,6 +1887,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: behind,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.update(Message::CloseCard(first)));
         assert!(app.dirty_repository_close.is_some());
@@ -1653,6 +1916,7 @@ mod tests {
             app.queued_card_closes.push_back(QueuedCardClose {
                 card,
                 unasked: true,
+                preserve_source: false,
             });
         }
         drop(app.next_queued_card_close());
@@ -1683,11 +1947,13 @@ mod tests {
             app.queued_card_closes.push_back(QueuedCardClose {
                 card,
                 unasked: true,
+                preserve_source: false,
             });
         }
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.next_queued_card_close());
         assert!(app.pane_close_owned(next));
@@ -1716,6 +1982,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.next_queued_card_close());
         assert_eq!(app.queued_card_closes.len(), 1);
@@ -1734,6 +2001,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.request_card_removal(unknown));
         assert!(!app.closed_terminal_cards.contains(&unknown));
@@ -1749,6 +2017,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.completed_terminal_closed(
             first,
@@ -1765,6 +2034,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         drop(app.completed_terminal_closed(first, current, Err("daemon went away".into())));
         assert!(app.card_state(first).unwrap().existence.is_open());
@@ -1781,6 +2051,7 @@ mod tests {
         app.queued_card_closes.push_back(QueuedCardClose {
             card: next,
             unasked: true,
+            preserve_source: false,
         });
         // Nothing reserved this removal, so the workspace turns it down.
         drop(app.update(Message::CommitClose(first)));
@@ -1853,6 +2124,7 @@ mod tests {
         let queued_intent = QueuedCardClose {
             card: queued,
             unasked: true,
+            preserve_source: false,
         };
         assert_eq!(app.queued_card_closes.front(), Some(&queued_intent));
         // Both clicks were taken, and neither pane has a dialog to say so.
@@ -2054,57 +2326,71 @@ mod tests {
 
     #[test]
     fn completed_terminal_with_live_conversation_uses_fenced_close_confirmation() {
-        let mut app = super::super::tests::context_inspector_test_app(true);
-        let card = app.workspace.focused().unwrap();
-        app.set_residency(card, Residency::Hot);
-        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
-            unreachable!()
-        };
-        session.continuity = TerminalContinuity::Exited {
-            last_exit: crate::model::TerminalExit {
-                code: Some(0),
-                signal: None,
-                occurred_at_unix_ms: 1,
-            },
-        };
-        let source = session.clone();
-        let proof = HostSessionProof {
-            host_session_id: HostSessionId::new("paired"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        };
-        let _ = app.begin_card_close(card);
-        let opening = app.update(Message::CompletedTerminalClosed {
-            card,
-            session: source.clone(),
-            result: Ok(CompletedCloseOutcome::Active(proof.clone())),
-        });
-        // A routine question opens on its answer, so Enter closes the pane.
-        assert_eq!(
-            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
-            Some(confirm_id())
-        );
-        assert!(matches!(
-            super::super::dialog_ui::tests::enter_control(
-                app.terminal_close_dialog().unwrap(),
-                confirm_id()
-            ),
-            Message::ConfirmTerminalClose
-        ));
-        assert!(app.card_state(card).unwrap().existence.is_open());
-        let _ = app.update(Message::ConfirmTerminalClose);
-        let intent = app.terminal_close.as_ref().unwrap().clone();
-        assert!(intent.pending);
-        assert_eq!(intent.completed_source, Some(source));
-        assert_eq!(intent.proof, proof);
-        let _ = app.update(Message::TerminalCloseFinished {
-            card,
-            terminal: intent.terminal,
-            proof: intent.proof,
-            generation: intent.generation,
-            outcome: CloseOutcome::Closed,
-        });
-        assert!(app.closed_terminal_cards.contains(&card));
+        for proven_gone in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let card = app.workspace.focused().unwrap();
+            app.set_residency(card, Residency::Hot);
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+            let source = session.clone();
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("paired"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            };
+            let _ = app.begin_card_close(card);
+            let opening = app.update(Message::CompletedTerminalClosed {
+                card,
+                session: source.clone(),
+                result: Ok(CompletedCloseOutcome::Active(proof.clone())),
+            });
+            // A routine question opens on its answer, so Enter closes the pane.
+            assert_eq!(
+                super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
+                Some(confirm_id())
+            );
+            assert!(matches!(
+                super::super::dialog_ui::tests::enter_control(
+                    app.terminal_close_dialog().unwrap(),
+                    confirm_id()
+                ),
+                Message::ConfirmTerminalClose
+            ));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            let _ = app.update(Message::ConfirmTerminalClose);
+            let intent = app.terminal_close.as_ref().unwrap().clone();
+            assert!(intent.pending);
+            assert_eq!(intent.completed_source, Some(source));
+            assert_eq!(intent.proof, proof);
+            let outcome = if proven_gone {
+                CloseOutcome::NotHostedWithBasis(app.terminal_cleanup_authority(card).receipt(
+                    crate::workspace_model::views::TerminalRemovalBasis::Absent {
+                        owner: proof,
+                        latest_worker: None,
+                        history_epoch: 0,
+                    },
+                ))
+            } else {
+                CloseOutcome::Closed
+            };
+            let _ = app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            });
+            assert!(app.closed_terminal_cards.contains(&card));
+            assert_eq!(app.proven_gone_cards.contains(&card), proven_gone);
+        }
     }
 
     #[test]
@@ -2281,6 +2567,7 @@ mod tests {
             Some(QueuedCardClose {
                 card: login,
                 unasked: true,
+                preserve_source: false,
             }),
             "a later explicit cancellation upgrades a queued ordinary close"
         );
@@ -2301,7 +2588,33 @@ mod tests {
     }
 }
 
-fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
+fn is_source_close_refusal(error: &crate::control::ControlError) -> bool {
+    matches!(error, crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+        message, retryable: false } if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT)
+}
+
+fn source_close_outcome(
+    result: Result<TerminalCloseResult, crate::control::ControlError>,
+) -> CloseOutcome {
+    match result {
+        Ok(TerminalCloseResult::Closed) => CloseOutcome::Closed,
+        Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
+        Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
+        Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
+        Err(crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
+            message,
+            retryable: false,
+        }) if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT => CloseOutcome::Stale,
+        Err(error) => CloseOutcome::Unreachable(error.to_string()),
+    }
+}
+
+fn revalidate_and_close(
+    intent: &CloseIntent,
+    allow_active: bool,
+    authority: &super::shared_views::TerminalCleanupAuthority,
+) -> CloseOutcome {
     if let Some(source) = &intent.completed_source {
         let run = || -> Result<CloseOutcome, String> {
             let path =
@@ -2310,22 +2623,75 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
             if client.proof() != &intent.proof || !intent.proof.is_complete() {
                 return Ok(CloseOutcome::Stale);
             }
-            client
-                .release_completed_terminal(source.clone(), allow_active)
-                .map_err(|error| error.to_string())
-                .map(|outcome| match outcome {
-                    TerminalCloseResult::Closed => CloseOutcome::Closed,
-                    TerminalCloseResult::Active => CloseOutcome::Active,
-                    TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
-                })
+            let basis = match authority.read_basis(&mut client, source) {
+                Err(error) if is_source_close_refusal(&error) => {
+                    return Ok(CloseOutcome::SourceChanged);
+                }
+                result => result.map_err(|error| error.to_string())?,
+            };
+            if matches!(
+                basis,
+                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+            ) {
+                return Ok(
+                    match super::daemon_recovery::prove_not_hosted_for(
+                        source,
+                        &intent.leave,
+                        authority,
+                    ) {
+                        Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
+                        Err(kept) => CloseOutcome::Kept(kept),
+                    },
+                );
+            }
+            if !authority.permits_resolved(&basis) {
+                return Ok(CloseOutcome::SourceChanged);
+            }
+            let result = if authority.capture().is_some() || authority.worker().is_some() {
+                client.close_captured_terminal_source(
+                    source.clone(),
+                    basis.clone(),
+                    true,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
+            } else {
+                client.release_completed_terminal(source.clone(), allow_active)
+            };
+            Ok(match source_close_outcome(result) {
+                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(authority.receipt(basis)),
+                outcome => outcome,
+            })
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
-    close_or_prove_gone(
+    let mut basis = None;
+    let outcome = close_or_prove_gone(
         intent,
-        || close_hosted_terminal(intent.terminal, &intent.proof, allow_active),
-        super::daemon_recovery::prove_not_hosted,
-    )
+        || {
+            if let (Some(source), Some(basis)) = (intent.saved_source.as_ref(), authority.worker())
+            {
+                close_hosted_terminal_source(
+                    source,
+                    basis,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
+            } else {
+                close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+            }
+        },
+        |source, leave| {
+            basis = Some(super::daemon_recovery::prove_not_hosted_for(
+                source, leave, authority,
+            )?);
+            Ok(())
+        },
+    );
+    match (outcome, basis) {
+        (CloseOutcome::NotHosted, Some(basis)) => CloseOutcome::NotHostedWithBasis(basis),
+        (outcome, _) => outcome,
+    }
 }
 
 /// `close` is the only route that can stop anything, so a card whose connection
@@ -2350,6 +2716,33 @@ fn close_or_prove_gone(
         Ok(()) => CloseOutcome::NotHosted,
         Err(kept) => CloseOutcome::Kept(kept),
     }
+}
+
+fn close_hosted_terminal_source(
+    source: &TerminalSession,
+    basis: &crate::workspace_model::views::TerminalRemovalBasis,
+    allow_active: bool,
+    capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+) -> CloseOutcome {
+    let run = || -> Result<CloseOutcome, String> {
+        let crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, .. } = basis
+        else {
+            return Ok(CloseOutcome::Stale);
+        };
+        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+        if client.proof() != owner || !owner.is_complete() {
+            return Ok(CloseOutcome::Stale);
+        }
+        Ok(source_close_outcome(client.close_captured_terminal_source(
+            source.clone(),
+            basis.clone(),
+            false,
+            allow_active,
+            capture,
+        )))
+    };
+    run().unwrap_or_else(CloseOutcome::Unreachable)
 }
 
 /// Asks the daemon to close `terminal`, provided the daemon is still the one

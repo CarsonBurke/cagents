@@ -1809,12 +1809,19 @@ harness, it provides:
   and won't reopen once that directory is replaced, and a transcript's
   location records its file's. So `start` restores the seed into the existing
   fixture in place, with `rsync --inplace --delete`, instead of recreating it,
-  and a chat saved in the seed reopens on both sides. `start` needs rsync
+  and a chat saved in the seed reopens on both sides. Existing read-only files
+  are writable only during restoration, then recover the seed's permissions;
+  a failed restoration returns their previous permissions. `start` needs rsync
   whenever there is a seed and a fixture. `save-seed` records the provider
   home's identity; while the fixture's differs, as it does once the fixture
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **Matched daemon.** The first window uses the development runner's
+  `--fresh-daemon` so daemon and protocol changes cannot reuse an older actor.
+  Additional windows and UI-only relaunches retain that session's daemon.
+  A named private session permits this daemon-only restart with `--in-session`;
+  the runner retains its compositor and rejects session lifetime controls.
 - **A second window.** Run `open-window window-2` in the background to open
   that saved slot through the matched development runner in the same private
   session. It replays only the builds already recorded, refuses a live slot,

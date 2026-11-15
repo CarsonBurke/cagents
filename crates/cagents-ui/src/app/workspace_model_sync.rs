@@ -499,11 +499,32 @@ fn publish_with_mirror(
                         scope, operation, ..
                     } = &request
                     {
-                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
-                            scope: scope.clone(),
-                            operation: *operation,
-                            error: error.to_string(),
-                        });
+                        if let ModelEdit::ChangeView { change, .. } = &request
+                            && matches!(
+                                change,
+                                crate::workspace_model::views::Change::RemoveSource { .. }
+                                    | crate::workspace_model::views::Change::UpdateTerminalSource { .. }
+                            )
+                        {
+                            let (view, sequence) = client
+                                .read_workspace_view(scope.clone())
+                                .map_err(|error| error.to_string())?;
+                            let views = mirror.install_at(scope.clone(), view, sequence);
+                            let _ = updates.send_blocking(ModelUpdate::ScopeConflicted {
+                                identity: mirror.identity(),
+                                scope: scope.clone(),
+                                operation: *operation,
+                                change: change.clone(),
+                                views,
+                                error: error.to_string(),
+                            });
+                        } else {
+                            let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                                scope: scope.clone(),
+                                operation: *operation,
+                                error: error.to_string(),
+                            });
+                        }
                     }
                     if let (
                         ModelEdit::SeedView { scope, .. },
@@ -603,7 +624,16 @@ fn send_with_mirror(
                     views: view.clone().into_iter().collect(),
                     ..Default::default()
                 };
-                if source_update_conflicts(&scoped, scope, change) {
+                let removal_changed = match change {
+                    Change::RemoveSource { before, .. } => !view.as_ref().is_some_and(|view| {
+                        let mut sources = view.panes.iter().filter(|pane| pane.id == before.id);
+                        sources.next().is_some_and(|pane| {
+                            crate::workspace_model::views::same_removal_source(before, pane)
+                        }) && sources.next().is_none()
+                    }),
+                    _ => false,
+                };
+                if removal_changed || source_update_conflicts(&scoped, scope, change) {
                     let views = mirror.install_at(scope.clone(), view, read_sequence);
                     let _ = updates.send_blocking(ModelUpdate::ScopeConflicted {
                         identity: mirror.identity(),
@@ -672,7 +702,9 @@ pub(in crate::app) fn source_update_conflicts(
     change: &crate::workspace_model::views::Change,
 ) -> bool {
     use crate::workspace_model::views::{Change, updates_source};
-    let Change::Update { before, pane } = change else {
+    let (Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. }) =
+        change
+    else {
         return false;
     };
     match model.views.iter().find(|view| &view.scope == scope) {
@@ -4471,6 +4503,136 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::Committed {
             edit: ModelEdit::ChangeView { operation, .. }, ..
         } if operation == next));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_definitive_worker_refusal_does_not_replay_or_block_the_next_edit() {
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
+        use crate::workspace_model::views::{Change, Pane, Scope, TerminalRemovalBasis, View};
+        use std::os::unix::net::UnixStream;
+        let app = super::super::tests::context_inspector_test_app(true);
+        let mut before = Pane::from_card(&app.durable.cards[0], None).unwrap();
+        before.kind = CardKind::Terminal(fresh_terminal_session(
+            LaunchRecipe::shell("/fixture".into()).unwrap(),
+        ));
+        let proof = HostSessionProof {
+            host_session_id: "fixture".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "host".into(),
+        };
+        let scope = Scope::Channel(ChannelId::new());
+        let change = Change::UpdateTerminalSource {
+            before: before.clone(),
+            pane: before.clone(),
+            worker: TerminalRemovalBasis::Worker {
+                owner: proof.clone(),
+                instance: uuid::Uuid::new_v4(),
+            },
+        };
+        let first = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 1,
+            operation: uuid::Uuid::new_v4(),
+            change: change.clone(),
+        };
+        let next = ModelEdit::OpenProject {
+            repository: "/fixture/next".into(),
+            name: "Next".into(),
+            kind: Default::default(),
+        };
+        let identity = uuid::Uuid::new_v4();
+        let view = View {
+            scope: scope.clone(),
+            revision: 2,
+            panes: vec![before],
+            retired: vec![],
+        };
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let expected_first = first.clone();
+        let expected_next = next.clone();
+        let server = std::thread::spawn(move || {
+            for step in 0..4 {
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                let message = match step {
+                    0 => {
+                        assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                        ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: vec![],
+                            },
+                        }
+                    }
+                    1 => {
+                        assert!(
+                            matches!(request.request, ClientRequest::ApplyWorkspaceEdit { edit } if edit == expected_first)
+                        );
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
+                            false,
+                        ))
+                    }
+                    2 => {
+                        assert!(matches!(
+                            request.request,
+                            ClientRequest::ReadWorkspaceView { .. }
+                        ));
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceView {
+                                view: Some(view.clone()),
+                                sequence: 2,
+                            },
+                        }
+                    }
+                    _ => {
+                        assert!(
+                            matches!(request.request, ClientRequest::ApplyWorkspaceEdit { edit } if edit == expected_next)
+                        );
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceEdit(EditReceipt {
+                                identity,
+                                sequence: 3,
+                                effects: Default::default(),
+                            }),
+                        }
+                    }
+                };
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+            assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none());
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (out, updates) = async_channel::unbounded();
+        let (input, requests) = async_channel::unbounded::<ModelRequest>();
+        input.send_blocking(first.into()).unwrap();
+        input.send_blocking(next.clone().into()).unwrap();
+        drop(input);
+        let mut pending = None;
+        assert!(publish_with_client(&out, &requests, &mut pending, &mut client).is_err());
+        assert!(pending.is_none(), "neither request remains to replay");
+        assert!(
+            matches!(updates.try_recv().unwrap(), ModelUpdate::ScopeConflicted { change: denied, .. } if denied == change)
+        );
+        assert!(
+            matches!(updates.try_recv().unwrap(), ModelUpdate::Committed { edit, .. } if edit == next)
+        );
+        assert!(updates.try_recv().is_err());
         drop(client);
         server.join().unwrap();
     }
