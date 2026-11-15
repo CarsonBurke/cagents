@@ -7946,8 +7946,12 @@ impl Cagents {
         }
         #[cfg(test)]
         terminal_output_tests::record_persist();
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        phase.mark("save_prepare");
         self.snapshot_workspace_scope();
+        phase.mark("save_scope_snapshot");
         publish(self);
+        phase.mark("save_publish");
         // Ordered identity work needs its exact complete snapshot now. Scope
         // projection alone is not authority to coalesce these checkpoints.
         tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",

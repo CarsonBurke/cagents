@@ -1088,6 +1088,7 @@ impl Cagents {
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
+        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
         let cards = self
             .durable
             .cards
@@ -1098,6 +1099,7 @@ impl Cagents {
             mut scopes,
             worktree_cards,
         } = self.discover_view_scopes();
+        phase.mark("local_discover");
         if let Some(selected) = selected {
             scopes.retain(|scope| selected.contains(scope));
         }
@@ -1121,6 +1123,7 @@ impl Cagents {
             .filter(|pane| pane.pending_terminal_start)
             .map(|pane| pane.id)
             .collect::<HashSet<_>>();
+        phase.mark("local_members");
         let mut panes = HashMap::new();
         for scope in &scopes {
             if let Scope::Worktree { path, .. } = scope {
@@ -1154,6 +1157,7 @@ impl Cagents {
                 .collect();
             panes.insert(scope.clone(), projected);
         }
+        phase.mark("local_panes");
         LocalViews {
             scopes,
             cards: members,
@@ -1746,6 +1750,7 @@ impl Cagents {
         {
             return;
         }
+        let mut phase = WorkspaceProjectionTiming::new(matches!(projection, ViewProjection::All));
         let LocalViews {
             scopes,
             cards,
@@ -1759,6 +1764,7 @@ impl Cagents {
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        phase.mark("publish_owners");
         let needed = match projection {
             ViewProjection::All => None,
             ViewProjection::Structural(_) | ViewProjection::Selected(_) => {
@@ -1819,6 +1825,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_indices");
         // A quarantined pane keeps its canonical descriptor and placement:
         // this client neither seeds, moves nor rewrites it. Closing it is the
         // one change it publishes, so it leaves the view like any closed pane.
@@ -1871,6 +1878,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_transfers");
         // A fenced pane the reader closed leaves the view that holds it,
         // wherever this window showed it. Its saved source is unconfirmed, so
         // the close names the pane rather than a source the registry would
@@ -2090,6 +2098,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("publish_scopes");
     }
 
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
