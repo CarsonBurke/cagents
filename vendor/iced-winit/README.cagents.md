@@ -12,7 +12,7 @@ use the existing widget focus operation. Snapshot work runs only while assistive
 technology has activated that window.
 
 The app also uses an accessibility-preserving copy of Iced Responsive in
-src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
+crates/cagents-ui/src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
 these backports when the pinned dependency provides equivalent behavior.
 
 The hot-patch callback also wakes the native event loop after queuing its existing

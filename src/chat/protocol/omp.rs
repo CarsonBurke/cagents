@@ -137,6 +137,7 @@ struct Omp {
     branch_draft: Option<String>,
     branch_request: Option<String>,
     configured_reasoning: Option<String>,
+    active_model: Option<chat::ActiveModel>,
 }
 struct Execution {
     run: crate::model::RunId,
@@ -1196,6 +1197,18 @@ impl Adapter for Omp {
                             branch: true,
                             ..chat::Capabilities::default()
                         }));
+                        self.active_model = model_id(&data["model"]).map(|id| chat::ActiveModel {
+                            label: data["model"]["name"].as_str().unwrap_or(&id).to_owned(),
+                            id,
+                            reasoning: self
+                                .configured_reasoning
+                                .clone()
+                                .or_else(|| data["thinkingLevel"].as_str().map(str::to_owned)),
+                            default_reasoning: None,
+                            aliases: Vec::new(),
+                        });
+                        step.events
+                            .push(Event::ActiveModel(self.active_model.clone()));
                         step.events.push(Event::Models {
                             models: Vec::new(),
                             selected: model_id(&data["model"]),
@@ -1495,6 +1508,11 @@ impl Adapter for Omp {
                     selected: None,
                     reasoning: self.configured_reasoning.clone(),
                 });
+                if let Some(model) = self.active_model.as_mut() {
+                    model.reasoning = self.configured_reasoning.clone();
+                    step.events
+                        .push(Event::ActiveModel(self.active_model.clone()));
+                }
             }
             "agent_start" | "auto_compaction_start" => {
                 if text(&frame, "type") == "agent_start" {

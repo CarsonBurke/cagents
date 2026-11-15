@@ -203,10 +203,7 @@ pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
 /// Expand only on the device that owns the account registry. An absolute
 /// remainder after ~/ would replace HOME during Path::join, so reject it first.
 #[cfg(any(feature = "ui", feature = "host", test))]
-pub(crate) fn expand_linked_home(
-    value: &str,
-    home: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, String> {
+pub fn expand_linked_home(value: &str, home: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
     validate_linked_home_operand(value)?;
     let path = if let Some(relative) = value.strip_prefix("~/") {
         PathBuf::from(home.ok_or("HOME is unavailable")?).join(relative)
@@ -232,7 +229,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
 /// stored login. Keep this list explicit: cloud credentials may still be needed
 /// by the agent's tools, and account-local configuration remains user-owned.
 /// See docs/user-guide.md, "Account credential isolation", for provider sources.
-pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str] {
+pub fn credential_overrides(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &[
             "ANTHROPIC_API_KEY",
@@ -2397,7 +2394,7 @@ mod credential_guard {
             }
             // The Accounts install action opens this fixed documentation page
             // in a browser. It does not read credentials or call a service API.
-            if file.ends_with("src/app/account_ui.rs") {
+            if file.ends_with("crates/cagents-ui/src/app/account_ui.rs") {
                 let documentation = ["https://developers.open", "ai.com/codex/cli/"].concat();
                 text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
             }

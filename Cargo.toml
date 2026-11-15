@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/ceditor", "crates/browser-import", "crates/iced-contracts"]
+members = [".", "crates/cagents-ui", "crates/ceditor", "crates/browser-import", "crates/iced-contracts"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
@@ -15,15 +15,14 @@ publish = false
 [features]
 default = ["full"]
 development = []
-# Experimental Linux-only UI iteration; never selected by production defaults.
-hot-reload = ["development", "ui", "dep:iced_hot", "iced_hot/hot"]
 # Opt-in local redraw-scheduling fixture; ordinary builds use a zero-state recorder.
 latency-harness = ["ui"]
-# Controlled registry tests only; never a CLI/host or ordinary UI dev-dependency.
-browser-protocol-fixture = ["integrated-browser", "dep:wayland-server", "wayland-protocols/server"]
 # Product identity only. Keep this separate from the embedded-browser
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
+# Test fixtures that the UI crate's tests share with this library's. Only a
+# dev-dependency selects it.
+test-support = []
 host = [
     "dep:yaml-rust",
     "dep:diesel",
@@ -50,10 +49,7 @@ ui = [
     "dep:base64",
     "dep:ashpd",
     "dep:async-channel",
-    "dep:async-lsp",
-    "dep:blake3",
     "dep:croner",
-    "dep:hayro",
     "dep:iced_accessibility",
     "dep:image",
     "image/jpeg",
@@ -64,58 +60,23 @@ ui = [
     "image/tiff",
     "dep:jiff",
     "dep:libcosmic",
-    "dep:lsp-types",
-    "dep:memchr",
-    "dep:mermaid-rs-renderer",
-    "dep:unicase",
     "dep:notify",
-    "dep:resvg",
-    "dep:regex",
-    "dep:roxmltree",
     "dep:rusqlite",
     "dep:tokio",
-    "dep:tokio-util",
     "dep:tracing-subscriber",
-    "dep:two-face",
-    "dep:unicode-linebreak",
     "dep:unicode-casefold",
     "dep:yaml-rust",
     "dep:unicode-segmentation",
 ]
-integrated-browser = [
-    "full",
-    "ui",
-    "dep:cagents-browser-import",
-    "dep:cookie",
-    "dep:net_traits",
-    "dep:dpi",
-    "dep:euclid",
-    "dep:keyboard-types",
-    "dep:raw-window-handle",
-    "dep:servo",
-    "dep:wayland-client",
-    "dep:wayland-protocols",
-]
+# The UI crate adds the embedded browser itself; this selects the product
+# identity and browser-only paths in the shared code.
+integrated-browser = ["full", "ui"]
 
 [[bin]]
 name = "cagents"
 path = "src/main.rs"
 test = false
 bench = false
-
-[[bin]]
-name = "cagents-ui"
-path = "src/bin/cagents-ui.rs"
-test = false
-bench = false
-required-features = ["ui"]
-
-[[bin]]
-name = "cagents-ui-hot"
-path = "src/hot-ui.rs"
-test = false
-bench = false
-required-features = ["hot-reload"]
 
 [[bin]]
 name = "cagentsd"
@@ -175,79 +136,39 @@ name = "upgrade_inspection_contract"
 required-features = ["host"]
 
 [[test]]
-name = "browser_capability_contract"
-required-features = ["ui"]
-
-[[test]]
 name = "iced_tree_reconciliation"
-required-features = ["ui"]
-
-[[test]]
-name = "native_accessibility_button_routing"
 required-features = ["ui"]
 
 [[test]]
 name = "repository_git_contract"
 required-features = ["ui"]
 
-[[test]]
-name = "session_restore_contract"
-required-features = ["ui"]
-
-[[test]]
-name = "ui_process_identity_contract"
-required-features = ["ui"]
-
 [dependencies]
-cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
-cookie = { version = "0.18", optional = true }
-net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = "0.2.2"
-regex = { version = "1.13", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
-unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio"], optional = true }
-async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"], optional = true }
 base64 = { version = "0.22", optional = true }
 bitflags = { version = "2.9", features = ["serde"] }
-blake3 = { version = "1.8", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "=4.5.61"
 crossbeam-channel = "0.5"
-dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
-euclid = { version = "=0.22.14", optional = true }
 futures-util = { version = "0.3", optional = true }
 glob = "0.3.4"
-# Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
-# an SVG, by rasterizing to RGBA off the UI thread, so a document in a
-# worktree opens in place instead of handing the reader to an external viewer.
-# Only the `ui` lane resolves it; the CLI and the daemon never parse a PDF.
-hayro = { version = "0.7.1", optional = true }
 # Seals the messages the daemon delivers between sessions, so a conversation
 # can tell them apart from text that merely looks like one. Daemon only.
 hmac = { version = "0.12", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
-# Exact same package/source as libcosmic's iced; only its hot feature is added.
-iced_hot = { package = "iced", git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, optional = true }
-keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
-# `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
-# default set and the editor is the only consumer.
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"], optional = true }
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"], optional = true }
 imara-diff = "0.2.0"
 ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
-# Finds records worth parsing in large provider transcripts for the resume
-# picker; already in the resolved graph through regex.
-memchr = { version = "2.7", optional = true }
-# Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
-lsp-types = { version = "0.95", optional = true }
 notify = { version = "=9.0.0-rc.8", optional = true }
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
@@ -258,15 +179,10 @@ portable-pty = { version = "0.9", features = ["serde_support"], optional = true 
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Shared bounded notification excerpts use the same CommonMark parser as the UI.
 pulldown-cmark = { version = "0.12.2", default-features = false }
-mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
-unicase = { version = "2.9", optional = true }
-resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
-roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 diesel = { version = "2.3.13", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"], optional = true }
 croner = { version = "4.0", default-features = false, features = ["jiff"], optional = true }
 jiff = { version = "0.2.35", optional = true }
-raw-window-handle = { version = "=0.6.2", optional = true }
 serde = { version = "1.0", features = ["derive", "rc"] }
 semver = { version = "1.0", features = ["serde"] }
 serde_bytes = "0.11"
@@ -274,20 +190,16 @@ serde_ignored = "0.1"
 serde_json = "1.0"
 serde_path_to_error = "0.1"
 sha2 = "0.10"
-servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "js_jit"], optional = true }
 thiserror = "2.0"
 # Atomic settings writes are shared by CLI, daemon, and UI.
 tempfile = "3.21"
 tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
-tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 toml = { version = "1.1.4", features = ["preserve_order"] }
 tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
-two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"], optional = true }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
-wayland-server = { version = "=0.31.14", optional = true }
 # Platform backends are explicit rather than inherited from iced/winit defaults.
 # Match the common package identities so Cargo unifies widget/runtime features.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -297,9 +209,6 @@ accesskit_unix = { version = "0.18.0", git = "https://github.com/wash2/accesskit
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"], optional = true }
 # Only Linux enables the portal's Wayland handle integration.
 ashpd = { version = "0.12.3", default-features = false, features = ["wayland"], optional = true }
-# These system-backed protocols belong only to the integrated Linux browser.
-wayland-client = { version = "=0.31.15", features = ["system"], optional = true }
-wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["test-util"] }

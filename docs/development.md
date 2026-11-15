@@ -131,6 +131,11 @@ enabled. See [Daemon and upgrades](daemon.md#development-instance).
 ## Feature boundaries
 
 The CLI, UI client, and terminal host have separate Cargo feature boundaries.
+The root `cagents` package is the shared library with the `cagents` and
+`cagentsd` binaries. The application (`src/app` and the other UI-only modules)
+and the `cagents-ui` binary are the `cagents-ui` package in `crates/cagents-ui`,
+which depends on the shared library's `ui` feature. Editing the application
+recompiles only that package; editing the shared library recompiles both.
 Start with the boundary that owns your change:
 
 ```sh
@@ -154,7 +159,9 @@ Without arguments, `check:cli`, `check:host` and `check:ui` check all targets,
 tests included, and `check` runs all three: what a change needs before review.
 Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
-`mise.toml` defines the lanes once.
+`mise.toml` defines the lanes once. The `ui` lane selects both packages,
+`--package cagents --package cagents-ui --features cagents/ui`, and `browser`
+selects `--package cagents-ui --features integrated-browser`.
 
 Each of these commands waits in the build host's queue on its own, and on a
 busy host the wait is most of its time: on fw16 under a full queue, the CLI
@@ -166,9 +173,10 @@ its check.
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
-`default-members = ["."]` selects only cagents: root UI checks and root
-`--all-targets` tests do not compile the downstream ceditor binary. Run the
-ceditor check separately from the CLI, host, and UI checks.
+`default-members = ["."]` selects only cagents: a command without `-p` builds
+neither the application nor the downstream ceditor binary. Select the
+application with `-p cagents-ui`, and run the ceditor check separately from the
+CLI, host, and UI checks.
 
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
@@ -179,7 +187,7 @@ targets:
 ```sh
 scripts/cargo-gate build --locked --release --no-default-features --bin cagents
 scripts/cargo-gate build --locked --release --no-default-features --features host --bin cagentsd
-scripts/cargo-gate build --locked --release --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate build --locked --release -p cagents-ui --bin cagents-ui
 ```
 
 `cagents`, `cagents-ui`, and `cagentsd` are a matched set and must stay
@@ -490,13 +498,15 @@ the system browser instead of compiling Servo.
 
 The opt-in lane uses the same application modules and startup entry in a separate
 `cagents-ui-hot` binary. This matters because cargo-hot patches its selected
-binary only: the normal UI's views live in the separate `cagents` library. Its
-source watcher covers `src/`, including those actual views, without maintaining
-another module list: both roots include `src/modules.rs`. Normal and release
-defaults do not enable `hot-reload`.
+binary only: the normal UI's views live in the `cagents_ui` library. Its source
+watcher covers `crates/cagents-ui/src/`, including those actual views, without
+maintaining another module list: both roots include
+`crates/cagents-ui/src/modules.rs`. The shared `cagents` library is an ordinary
+dependency that is never patched. Normal and release defaults do not enable
+`hot-reload`.
 
 Thread-local storage for panic recovery, the inspector Markdown cache and browser
-engine ownership stays in the ordinary library's `src/runtime_state.rs`. Concrete,
+engine ownership stays in the shared library's `src/runtime_state.rs`. Concrete,
 non-inlined accessors keep executable TLS relocations out of shared hot patches,
 while retaining one storage identity across patches. Application types stay in
 their selected root; the cache crosses only dependency-owned Markdown item types.
@@ -564,7 +574,7 @@ several agents build on one host, run Cargo through the build gate rather than
 a single global lock:
 
 ```sh
-mise run check:ui -- --bin cagents-ui  # scripts/cargo-gate check --locked ... --features ui
+mise run check:ui -- --bin cagents-ui  # scripts/cargo-gate check --locked ... -p cagents-ui
 mise run test:host                     # scripts/cargo-gate test --locked ... --features host
 ```
 
@@ -676,9 +686,9 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
 at most once every two minutes and checks every new first-parent commit in
-order. Its first run checks the current tip. Each commit gets three separate
+order. Its first run checks the current tip. Each commit gets four separate
 `scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
-CLI, `--features host`, and `--features ui`. These use the ordinary shared queue
+CLI, `--features host`, `--features ui`, and `-p cagents-ui`. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 
@@ -1093,7 +1103,7 @@ identifying `libsqlite3-sys` as the affected package in a browserless UI check:
 ```sh
 # Explicit maintenance operation: only after evidence identifies this package.
 cargo clean --package libsqlite3-sys
-CARGO_BUILD_JOBS=2 scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+CARGO_BUILD_JOBS=2 scripts/cargo-gate check --locked -p cagents-ui --bin cagents-ui
 ```
 
 Use `name@version` if the package name is ambiguous. Preserve the clean output,
@@ -1122,7 +1132,8 @@ filter limits execution, not compilation of the selected feature graph, so
 start with the narrow feature lane and `--lib` or `--test NAME` rather than
 `--all-features`.
 
-Product tests live in the library, so select them with `--lib`, not `--bin`.
+Product tests live in the libraries, so select them with `--lib`, not `--bin`:
+the application's are in `-p cagents-ui --lib`.
 `--bin cagents` and `--bin cagents-ui` have no tests and refuse a filter rather
 than pass by running none, except that `--bin cagents-ui` does not refuse with the
 `hot-reload` feature. `--bin cagentsd` has only a few of its own and does
@@ -1297,9 +1308,14 @@ its lane. Cover the boundaries a change touches:
 ```sh
 mise run test:cli     # scripts/cargo-gate test --locked --no-default-features --all-targets
 mise run test:host    # ... --features host --all-targets
-mise run test:ui      # ... --features ui --all-targets
+mise run test:ui      # ... --features cagents/ui, with both packages, --all-targets
 mise run test         # all three, in order
 ```
+
+`test:ui` tests the shared library compiled for the UI and the application
+together. The lane already names both packages, so arguments narrow targets,
+not packages; for the application's tests alone, run
+`scripts/cargo-gate test --locked -p cagents-ui --all-targets`.
 
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
@@ -1383,7 +1399,7 @@ mise run test:host -- --test terminal_load_contract
 mise run test:ui -- --test session_restore_contract
 ```
 
-For focused root library tests, compile one isolated test harness and run the
+For focused library tests, compile one isolated test harness and run the
 Cargo-reported executable directly, after its build admission has ended.
 
 `--no-run` only compiles tests. A later direct harness launch, including
@@ -1406,11 +1422,13 @@ Use the same profile option in both commands when overriding it. The gate
 translates a supplied helper path inside the checkout or target to its build-host
 copy; a path outside both is refused. A matching version alone does not prove
 that binaries from two dirty source trees match. CLI and UI focused runs need no
-helper:
+helper. The `ui` lane runs the application's tests (`-p cagents-ui`);
+`shared-ui` runs the shared library's tests under `--features ui`:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
+scripts/test-lib shared-ui --prefix settings::
 ```
 
 Use actual full test names, or repeat `--prefix MODULE::` for literal module

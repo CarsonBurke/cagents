@@ -47,7 +47,7 @@ fn main() -> std::process::ExitCode {
     // the helper's stdout carries a binary page frame that any log line would
     // corrupt. As in cagents-ui, the mode stays out of the usage text: it is
     // a calling convention between two copies of one binary, not a feature.
-    if let Some(code) = cagents::document_render::hook() {
+    if let Some(code) = cagents_ui::document_render::hook() {
         return code;
     }
     let arguments = Arguments::parse();
@@ -107,7 +107,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     iced::daemon(
         move || {
             let mut window_settings = iced::window::Settings {
-                icon: Some(cagents::ui_controls::ceditor_window_icon()),
+                icon: Some(cagents_ui::ui_controls::ceditor_window_icon()),
                 size: iced::Size::new(1280.0, 860.0),
                 min_size: Some(iced::Size::new(720.0, 480.0)),
                 decorations: false,

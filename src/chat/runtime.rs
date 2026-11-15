@@ -187,6 +187,10 @@ pub(crate) enum Update {
     /// subagents. Every address known so far, which only accumulate; the
     /// snapshot, whose layout older peers share, holds none.
     AgentAddresses(Vec<AgentAddress>),
+    ActiveModel {
+        revision: u64,
+        model: Option<super::ActiveModel>,
+    },
 }
 
 #[derive(Clone)]
@@ -1465,6 +1469,11 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .work_hold()
+    }
+    /// Provider-confirmed model status without hydrating the transcript.
+    pub(crate) fn active_model(&self) -> (u64, Option<super::ActiveModel>) {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.active_model_revision, state.active_model.clone())
     }
     /// How the provider addresses this conversation's subagents, where that
     /// is not by the IDs its snapshot lists them under.
@@ -3284,6 +3293,22 @@ impl Actor {
                 });
                 continue;
             }
+            if let Event::ActiveModel(model) = event {
+                let changed = {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.active_model != model {
+                        state.active_model = model.clone();
+                        state.active_model_revision = state.active_model_revision.saturating_add(1);
+                        Some(state.active_model_revision)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(revision) = changed {
+                    (self.notify)(Update::ActiveModel { revision, model });
+                }
+                continue;
+            }
             if let Event::AgentAddress(address) = event {
                 if self.agent_addresses.learn(address) {
                     (self.notify)(Update::AgentAddresses(self.agent_addresses.list()));
@@ -3899,6 +3924,7 @@ fn apply_projected_event(
                 state.reasoning = reasoning;
             }
         }
+        Event::ActiveModel(model) => state.active_model = model,
         Event::FastMode(value) => state.fast_mode = Some(value),
         Event::Commands(value) => state.commands = value,
         Event::Skills(value) => state.skills = value,
@@ -8306,6 +8332,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::AgentAddresses(_)
+                | Update::ActiveModel { .. }
                 | Update::Attention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready

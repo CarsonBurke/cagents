@@ -156,11 +156,11 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     if [ "$VARIANT" = browserless ]; then
         CLI_BINARY=$(build_target cagents --no-default-features --bin cagents)
         HOST_BINARY=$(build_target cagentsd --no-default-features --features host --bin cagentsd)
-        UI_BINARY=$(build_target cagents-ui --no-default-features --features ui --bin cagents-ui)
+        UI_BINARY=$(build_target cagents-ui -p cagents-ui --bin cagents-ui)
     else
         CLI_BINARY=$(build_target cagents --bin cagents)
         HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
-        UI_BINARY=$(build_target cagents-ui --features integrated-browser --bin cagents-ui)
+        UI_BINARY=$(build_target cagents-ui -p cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
@@ -180,16 +180,18 @@ if [ "$ARCHIVE_ONLY" = 0 ]; then
     if [ "$VARIANT" = browserless ]; then
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                --no-default-features --features ui,host --edges normal --prefix none |
-                sed 's/ (\*)$//' |
+                -p cagents -p cagents-ui --no-default-features --features cagents/host \
+                --edges normal --prefix none |
+                sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
                 wc -l
         )
     else
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                --features host,integrated-browser --edges normal --prefix none |
-                sed 's/ (\*)$//' |
+                -p cagents -p cagents-ui --features cagents/host,cagents-ui/integrated-browser \
+                --edges normal --prefix none |
+                sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
                 wc -l
         )

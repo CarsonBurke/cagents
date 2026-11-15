@@ -25,7 +25,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit
 cd "$root" || exit
 
 cargo_status=0
-cargo fmt ${check:+"$check"} || cargo_status=$?
+cargo fmt ${check:+"$check"} -p cagents -p cagents-ui || cargo_status=$?
 
 # Keep this list in sync with Rust-source include! calls in src/, tests/ and
 # crates/. Ordinary mod declarations below modules.rs are traversed by rustfmt,
@@ -33,7 +33,8 @@ cargo fmt ${check:+"$check"} || cargo_status=$?
 included_status=0
 set -- --edition 2024 ${check:+"$check"} \
     src/modules.rs \
-    src/app/repository_clone_lsp_ownership_tests.rs \
+    crates/cagents-ui/src/modules.rs \
+    crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \

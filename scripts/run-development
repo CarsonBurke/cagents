@@ -978,11 +978,12 @@ fi
 # without `full`, which selects the shipped product's application ID, peer
 # package and self-update, none of which a development build uses, so both
 # lanes share one build of each.
+# The UI is its own package, whose default is the browserless UI.
 if [ "$browserless" = true ]; then
-    ui_features='--no-default-features --features development,ui'
+    ui_features='-p cagents-ui --features development'
     ui_feature=ui
 else
-    ui_features='--features development,integrated-browser'
+    ui_features='-p cagents-ui --features development,integrated-browser'
     ui_feature=integrated-browser
 fi
 

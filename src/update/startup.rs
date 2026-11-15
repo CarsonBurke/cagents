@@ -1,8 +1,5 @@
 //! Read-only, capability-free projection for a window waiting on an update.
 //! Status is evidence, not admission: every reopen still uses normal UI fences.
-mod window;
-pub use window::{Request, run};
-
 use super::{UpdateJob, UpdatePhase, impact::Disposition};
 use std::{
     fs,
@@ -28,20 +25,22 @@ impl From<io::Result<bool>> for LockState {
 }
 
 #[derive(Clone, Debug)]
-struct Job {
-    id: String,
-    version: Option<String>,
-    phase: UpdatePhase,
-    waiting: usize,
-    blocked: usize,
-    daemon_timeout: bool,
+#[doc(hidden)]
+pub struct Job {
+    pub id: String,
+    pub version: Option<String>,
+    pub phase: UpdatePhase,
+    pub waiting: usize,
+    pub blocked: usize,
+    pub daemon_timeout: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub installation_lock: LockState,
     pub helper_lock: LockState,
-    job: Option<Job>,
+    #[doc(hidden)]
+    pub job: Option<Job>,
 }
 
 impl Snapshot {
@@ -175,13 +174,17 @@ pub struct Follow {
     auto_opened: bool,
 }
 impl Follow {
-    fn mark_opened(&mut self) {
+    pub fn mark_opened(&mut self) {
         self.auto_opened = true;
+    }
+    /// Whether this follow already opened its finished operation.
+    pub fn auto_opened(&self) -> bool {
+        self.auto_opened
     }
     pub fn observe(&mut self, snapshot: &Snapshot) -> bool {
         self.observe_when_ready(snapshot, true)
     }
-    fn observe_when_ready(&mut self, snapshot: &Snapshot, ready: bool) -> bool {
+    pub fn observe_when_ready(&mut self, snapshot: &Snapshot, ready: bool) -> bool {
         // Focus and diagnostics may defer reopening, but cannot hide an
         // observed operation change or the first leased operation.
         if self.operation_changed {

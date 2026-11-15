@@ -8,12 +8,14 @@
 zig = "0.15.2"
 
 # Each implementation graph is its own Cargo invocation. Cargo features are
-# package-wide, so no task combines `host` with `ui`.
+# package-wide, so no task combines `host` with `ui`. The UI lanes select the
+# cagents-ui package, which holds the application; `ui` also selects the shared
+# library, so one invocation covers both packages' targets in that graph.
 [vars]
 cli = "--locked --no-default-features"
 host = "--locked --no-default-features --features host"
-ui = "--locked --no-default-features --features ui"
-browser = "--locked --features integrated-browser"
+ui = "--locked --no-default-features --package cagents --package cagents-ui --features cagents/ui"
+browser = "--locked --package cagents-ui --features integrated-browser"
 editor = "--locked --package ceditor"
 # Cargo arguments a lane task forwards. Naming any replaces the default target
 # selection, so `-- --lib terminal::` narrows a lane instead of adding to it.

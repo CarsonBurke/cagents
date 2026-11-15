@@ -1091,9 +1091,9 @@ exit 1
         ])
         self.assertEqual(integrated[:2], browserless[:2])
         self.assertEqual(browserless[2:], [
-            f"{common} --no-default-features --features development,ui --bin cagents-ui"])
+            f"{common} -p cagents-ui --features development --bin cagents-ui"])
         self.assertEqual(integrated[2:], [
-            f"{common} --features development,integrated-browser --bin cagents-ui"])
+            f"{common} -p cagents-ui --features development,integrated-browser --bin cagents-ui"])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")
