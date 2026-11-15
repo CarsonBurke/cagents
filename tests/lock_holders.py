@@ -377,7 +377,9 @@ class LockHolders(unittest.TestCase):
             )
         self.processes.append(bystander)
         self.pids.append(bystander.pid)
-        self.wait_for(lambda: Path(f"/proc/{bystander.pid}/wchan").read_text() == "locks_lock_inode_wait", "block")
+        # Newer kernels name this wait flock_lock_inode_wait.
+        self.wait_for(lambda: Path(f"/proc/{bystander.pid}/wchan").read_text()
+                      in ("locks_lock_inode_wait", "flock_lock_inode_wait"), "block")
         self.assertNotIn(str(bystander.pid), self.report())
         del holder, taken
 
