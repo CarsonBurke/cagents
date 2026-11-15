@@ -6372,7 +6372,7 @@ mod tests {
             app.sidebar_model
                 .projects
                 .iter()
-                .flat_map(|project| &project.attention_cards)
+                .flat_map(|project| &project.panes)
                 .find(|row| row.id == pane.id)
                 .expect("the unloaded unchanneled agent has an attention row")
                 .title

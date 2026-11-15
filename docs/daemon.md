@@ -41,6 +41,9 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.
+An admitted CLI from before protocol 179 receives store contention as a
+retryable `Internal` error so it can decode the reply. It keeps the response
+timeouts of its original executable.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused, withheld or restated. It checks
@@ -207,7 +210,8 @@ accepted provider commands, so a queued prompt cannot masquerade as idle.
 The candidate drives qualified source daemons through a frozen lifecycle subset:
 the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
 protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
-(`c73002744`), 177 (`374370965`) and 178 (`3b1e81a4d`), and the
+(`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
+`f016f047b`) and 179 (`43f253ef8`), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
 Other source protocols, including 160, 165, 174 and 176, are refused before preparation,

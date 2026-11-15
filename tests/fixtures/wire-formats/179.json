@@ -1255,23 +1255,6 @@
               "Container": "cagents::agent_execution::mailbox::Outgoing"
             }
           }
-        ],
-        [
-          "Context",
-          {
-            "Struct": [
-              [
-                "scope",
-                {
-                  "Container": "cagents::agent_execution::directory::Scope"
-                }
-              ],
-              [
-                "standing",
-                "Bool"
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -1466,14 +1449,6 @@
           {
             "Newtype": {
               "Container": "cagents::agent_execution::mailbox::Handed"
-            }
-          }
-        ],
-        [
-          "Context",
-          {
-            "Newtype": {
-              "Container": "cagents::agent_execution::directory::Context"
             }
           }
         ]
@@ -1732,36 +1707,6 @@
           {
             "Option": {
               "Container": "cagents::workspace_model::views::Scope"
-            }
-          }
-        ]
-      ]
-    },
-    "cagents::agent_execution::directory::ChannelHome": {
-      "Struct": [
-        [
-          "id",
-          "Bytes"
-        ],
-        [
-          "repository",
-          "Str"
-        ]
-      ]
-    },
-    "cagents::agent_execution::directory::Context": {
-      "Struct": [
-        [
-          "sessions",
-          {
-            "Container": "cagents::agent_execution::directory::Sessions"
-          }
-        ],
-        [
-          "lineage_channel",
-          {
-            "Option": {
-              "Container": "cagents::agent_execution::directory::ChannelHome"
             }
           }
         ]
@@ -9648,6 +9593,10 @@
         [
           "chat_capacity",
           "Unit"
+        ],
+        [
+          "store_busy",
+          "Unit"
         ]
       ]
     },
@@ -13763,10 +13712,6 @@
         [
           "Agents",
           "Unit"
-        ],
-        [
-          "AgentLabels",
-          "Unit"
         ]
       ]
     },
@@ -13810,28 +13755,6 @@
                 {
                   "Seq": {
                     "Container": "cagents::agent_execution::Agent"
-                  }
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "AgentLabels",
-          {
-            "Struct": [
-              [
-                "identity",
-                "Bytes"
-              ],
-              [
-                "labels",
-                {
-                  "Seq": {
-                    "Tuple": [
-                      "Bytes",
-                      "Str"
-                    ]
                   }
                 }
               ]
