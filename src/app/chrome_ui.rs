@@ -2435,7 +2435,10 @@ impl Cagents {
             .severity()
             .max(health_severity)
             .max(seed_severity)
-            .max(self.has_terminal_save_notices().then_some(NoticeSeverity::Error));
+            .max(
+                self.has_terminal_save_notices()
+                    .then_some(NoticeSeverity::Error),
+            );
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
