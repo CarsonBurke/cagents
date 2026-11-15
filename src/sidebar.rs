@@ -11925,6 +11925,15 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
     row_button_style::<true>(selected)
 }
 
+/// A navigation row outside the sidebar, such as the workspace switcher's,
+/// selected as the sidebar's rows are. It takes no hover fill of its own.
+pub fn navigation_row_style(selected: bool) -> theme::Button {
+    row_button_style::<false>(selected)
+}
+
+/// How strongly a selected navigation row is tinted with the text color.
+pub const SELECTED_ROW_ALPHA: f32 = 0.10;
+
 /// Inset navigation fills use the theme radius; project labels remain plain on hover.
 fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
     fn appearance(
@@ -11952,7 +11961,9 @@ fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
             surface.a = if disabled {
                 0.04
             } else {
-                (if selected { 0.10 } else { 0.0 }) + alpha + if focused { 0.06 } else { 0.0 }
+                (if selected { SELECTED_ROW_ALPHA } else { 0.0 })
+                    + alpha
+                    + if focused { 0.06 } else { 0.0 }
             };
             style.background = Some(cosmic::iced::Background::Color(surface));
         }
