@@ -103,9 +103,9 @@ impl Cagents {
     /// The registry's pane for `card` once this window's own unanswered edits
     /// to it land, which is what the window shows. The publisher sends them in
     /// order ahead of any Close, so a Close started meanwhile refers to their
-    /// result. `Err` when the card has more than one owner, or when one of
-    /// those edits is based on a source the registry no longer holds: the
-    /// registry will refuse it, so the window's pane is not the one listed.
+    /// result; one based on a source the registry no longer holds will be
+    /// refused, so it is not assumed. `Err` when the card has more than one
+    /// owner, or an edit is one this projection does not follow.
     ///
     /// A terminal's source is bound to a host worker at the view revision that
     /// published it, so a terminal Close keeps to the source the registry holds.
@@ -160,9 +160,11 @@ impl Cagents {
             }
             match change {
                 Change::Insert { pane, .. } if !terminal(pane) => {}
+                // The registry will refuse an update based on a source it no
+                // longer holds; the window's pane is then compared with its own.
                 Change::Update { before, pane } if !terminal(before) && !terminal(pane) => {
                     if view.source_update_conflicts(before, pane) {
-                        return Err(());
+                        continue;
                     }
                 }
                 Change::Move { .. } => continue,

@@ -483,3 +483,24 @@ fn close_captured_during_own_update_refuses_once_that_update_is_refused() {
     assert!(!app.prepare_shared_removal(original.id));
     assert!(app.card_state(original.id).unwrap().existence.is_open());
 }
+
+#[test]
+fn a_refused_own_update_leaves_close_to_the_registrys_pane() {
+    let (mut app, channel, _, original) = channel_move_fixture();
+    with_own_source_update_pending(&mut app, &original);
+    // Another window's replacement reached this window's pane first; this
+    // window's earlier update will be refused, and Close refers to what it shows.
+    let mut replacement = original.clone();
+    if let CardKind::Browser(browser) = &mut replacement.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes[0] = replacement.clone();
+    app.workspace_model.views[0].revision += 1;
+    app.card_state_mut(original.id).unwrap().kind = replacement.kind.clone();
+
+    assert!(app.capture_shared_removal(original.id));
+    assert!(matches!(
+        app.shared_removal_change(original.id, &Scope::Channel(channel)),
+        Some(Change::RemoveSource { before, .. }) if before == replacement
+    ));
+}

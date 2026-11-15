@@ -2388,17 +2388,7 @@ impl Cagents {
             }
         }
         for (_, scope, change) in &self.shared_views.pending {
-            let id = match change {
-                Change::Insert { pane, .. }
-                | Change::Update { pane, .. }
-                | Change::UpdateTerminalSource { pane, .. }
-                | Change::InsertIfEmpty { pane } => pane.id,
-                Change::RemoveSource { before, .. } => before.id,
-                Change::Remove { id } | Change::Move { id, .. } | Change::Transfer { id, .. } => {
-                    *id
-                }
-            };
-            let entries = owners.entry(id).or_default();
+            let entries = owners.entry(change.pane_id()).or_default();
             entries.insert(scope.clone());
             if let Change::Transfer { destination, .. } = change {
                 entries.insert(destination.clone());
