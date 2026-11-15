@@ -408,7 +408,7 @@ pub fn overflow_fade_x<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Horizontal,
         fill: Box::new(crate::design::base),
-        hold: None,
+        headers: false,
     })
 }
 
@@ -435,38 +435,65 @@ pub fn overflow_fade_y<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-        hold: None,
+        headers: false,
     })
 }
 
 /// As [`overflow_fade_y`], for a list whose own headers pin to its top
 /// edge: while one is pinned there, the header holds that edge, fading what
 /// passes under it, and a fade at the edge would cover the header itself.
-/// Pinned headers report themselves to `hold` as they draw; the top edge
-/// fades whenever none did.
+///
+/// The top fade is never deeper than the distance from the edge to the
+/// nearest of the list's groups, so it recedes as a header comes up to the
+/// edge and grows back as a group's end leaves it, rather than switching at
+/// full depth. The list marks itself and each of its groups with
+/// [`PinnedHeaders`] when operated on.
 pub fn overflow_fade_y_under_headers<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
-    hold: TopEdgeHold,
 ) -> Element<'a, Message> {
     Element::new(OverflowFade {
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
-        hold: Some(hold),
+        headers: true,
     })
 }
 
-/// Whether a pinned header holds a scrolling list's top edge in the frame
-/// being drawn. See [`overflow_fade_y_under_headers`].
-#[derive(Clone, Default)]
-pub(crate) struct TopEdgeHold(std::rc::Rc<std::cell::Cell<bool>>);
+/// Marks, through [`Operation::custom`], a list whose groups' headers pin to
+/// the top edge of the scrollable around it, and then each of those groups
+/// with its whole extent. See [`overflow_fade_y_under_headers`].
+pub(crate) enum PinnedHeaders {
+    List,
+    Group,
+}
 
-impl TopEdgeHold {
-    /// Called by a header drawing pinned to the list's top edge.
-    pub(crate) fn hold(&self) {
-        self.0.set(true);
+/// How deep below its scrollable a [`PinnedHeaders::List`] is looked for,
+/// and below the list each [`PinnedHeaders::Group`]. Both sit near the top of
+/// what wraps them; looking no deeper keeps the rows beside them from being
+/// walked on every event, and counting each from its own start keeps a
+/// wrapper around the list from hiding its groups.
+const PINNED_LIST_DEPTH: usize = 8;
+const PINNED_GROUP_DEPTH: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    static TOP_FADES: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
+}
+
+/// The depth of every top fade drawn under pinned headers while `draw` runs.
+#[cfg(test)]
+pub(crate) fn capture_top_fades(draw: impl FnOnce()) -> Vec<f32> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TOP_FADES.with(|fades| fades.replace(None));
+        }
     }
+    TOP_FADES.with(|fades| assert!(fades.replace(Some(Vec::new())).is_none()));
+    let _reset = Reset;
+    draw();
+    TOP_FADES.with(|fades| fades.take().unwrap())
 }
 
 /// Fades what passes under a pinned header, `area` being the stretch just
@@ -1537,8 +1564,8 @@ struct OverflowFade<'a, Message> {
     content: Element<'a, Message>,
     axis: Axis,
     fill: Box<dyn Fn(&Theme) -> Color + 'a>,
-    /// Set for a list whose pinned headers may hold its leading edge.
-    hold: Option<TopEdgeHold>,
+    /// Whether the content is a list whose headers pin to its leading edge.
+    headers: bool,
 }
 
 /// How far the fade reaches at the start and the end of the strip.
@@ -1546,12 +1573,50 @@ struct OverflowFade<'a, Message> {
 struct OverflowState {
     start: f32,
     end: f32,
+    /// How far the start's edge lies from the nearest group of a list whose
+    /// headers pin there, when it has any: none while one spans the edge.
+    header_room: Option<f32>,
 }
 
 struct OverflowProbe {
     axis: Axis,
     state: OverflowState,
     found: bool,
+    /// Whether to look inside the scrollable for [`PinnedHeaders`].
+    headers: bool,
+    /// The strip's start, where the scrollable lays its content out.
+    edge: f32,
+    /// How far below the scrollable, or once inside the list below it, the
+    /// walk has come.
+    depth: usize,
+    seek: Seek,
+}
+
+/// How far a probe has come through a list whose headers pin.
+#[derive(Clone, Copy, PartialEq)]
+enum Seek {
+    Looking,
+    /// The list was marked; its own children are its groups.
+    Entering,
+    /// Inside the list, looking for its groups.
+    Groups,
+    /// A group was marked; its own children are its rows.
+    Group,
+    Done,
+}
+
+impl OverflowProbe {
+    fn new(axis: Axis, headers: bool) -> Self {
+        Self {
+            axis,
+            state: OverflowState::default(),
+            found: false,
+            headers,
+            edge: 0.0,
+            depth: 0,
+            seek: Seek::Looking,
+        }
+    }
 }
 
 impl<T> Operation<T> for OverflowProbe {
@@ -1560,6 +1625,50 @@ impl<T> Operation<T> for OverflowProbe {
         // otherwise be walked on each event and layout for nothing.
         if !self.found {
             operate(self);
+            return;
+        }
+        if !self.headers {
+            return;
+        }
+        let mut descend = |probe: &mut Self, limit: usize| {
+            if probe.depth < limit {
+                probe.depth += 1;
+                operate(probe);
+                probe.depth -= 1;
+            }
+        };
+        match self.seek {
+            Seek::Looking => descend(self, PINNED_LIST_DEPTH),
+            Seek::Entering => {
+                self.seek = Seek::Groups;
+                let outside = std::mem::take(&mut self.depth);
+                descend(self, PINNED_GROUP_DEPTH);
+                self.depth = outside;
+                self.seek = Seek::Done;
+            }
+            // A group's own rows say nothing more.
+            Seek::Group => self.seek = Seek::Groups,
+            Seek::Groups => descend(self, PINNED_GROUP_DEPTH),
+            Seek::Done => {}
+        }
+    }
+
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if !self.found {
+            return;
+        }
+        match (self.seek, state.downcast_ref::<PinnedHeaders>()) {
+            (Seek::Looking, Some(PinnedHeaders::List)) => self.seek = Seek::Entering,
+            (Seek::Groups, Some(PinnedHeaders::Group)) => {
+                self.seek = Seek::Group;
+                let (top, bottom) = (bounds.y - self.edge, bounds.y + bounds.height - self.edge);
+                // Above the edge, the room is how far the group's end has
+                // gone past it; below, how far its header is from reaching
+                // it; spanning it, its header is pinned there.
+                let room = if bottom <= 0.0 { -bottom } else { top.max(0.0) };
+                self.state.header_room = Some(self.state.header_room.map_or(room, |r| r.min(room)));
+            }
+            _ => {}
         }
     }
 
@@ -1578,26 +1687,30 @@ impl<T> Operation<T> for OverflowProbe {
             return;
         }
         self.found = true;
+        // The content is laid out from the viewport's start and drawn
+        // shifted back by the scroll.
+        self.edge = bounds.y + translation.y;
         let (start, end) = match self.axis {
             Axis::Horizontal => overflow_fades(translation.x, bounds.width, content_bounds.width),
             Axis::Vertical => overflow_fades(translation.y, bounds.height, content_bounds.height),
         };
-        self.state = OverflowState { start, end };
+        self.state = OverflowState {
+            start,
+            end,
+            header_room: None,
+        };
     }
 }
 
 fn read_overflow<Message>(
     axis: Axis,
+    headers: bool,
     content: &mut Element<'_, Message>,
     tree: &mut Tree,
     layout: Layout<'_>,
     renderer: &Renderer,
 ) -> OverflowState {
-    let mut probe = OverflowProbe {
-        axis,
-        state: OverflowState::default(),
-        found: false,
-    };
+    let mut probe = OverflowProbe::new(axis, headers);
     content
         .as_widget_mut()
         .operate(tree, layout, renderer, &mut probe);
@@ -1641,6 +1754,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             .layout(&mut tree.children[0], renderer, limits);
         let overflow = read_overflow(
             self.axis,
+            self.headers,
             &mut self.content,
             &mut tree.children[0],
             Layout::new(&node),
@@ -1687,6 +1801,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
         );
         let overflow = read_overflow(
             self.axis,
+            self.headers,
             &mut self.content,
             &mut tree.children[0],
             child_layout,
@@ -1724,9 +1839,6 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if let Some(hold) = &self.hold {
-            hold.0.set(false);
-        }
         self.content.as_widget().draw(
             &tree.children[0],
             renderer,
@@ -1737,8 +1849,16 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             viewport,
         );
         let mut state = *tree.state.downcast_ref::<OverflowState>();
-        if self.hold.as_ref().is_some_and(|hold| hold.0.get()) {
-            state.start = 0.0;
+        if self.headers {
+            if let Some(room) = state.header_room {
+                state.start = state.start.min(room);
+            }
+            #[cfg(test)]
+            TOP_FADES.with(|fades| {
+                if let Some(fades) = fades.borrow_mut().as_mut() {
+                    fades.push(state.start);
+                }
+            });
         }
         if state.start <= 0.0 && state.end <= 0.0 {
             return;
@@ -3976,6 +4096,7 @@ mod tests {
                 == OverflowState {
                     start: 0.0,
                     end: OVERFLOW_FADE,
+                    header_room: None,
                 }
         );
         let bounds = node.bounds();
@@ -3998,8 +4119,137 @@ mod tests {
                 == OverflowState {
                     start: OVERFLOW_FADE,
                     end: OVERFLOW_FADE,
+                    header_room: None,
                 }
         );
+    }
+
+    /// Under pinned headers, the top fade's room is the distance from the
+    /// edge to the nearest group: none while one spans the edge, and growing
+    /// from none as a header comes down from it or a group's end leaves it,
+    /// including the last group's, past which nothing else would say so.
+    #[test]
+    fn the_room_under_pinned_headers_follows_the_nearest_group() {
+        use cosmic::iced::advanced::clipboard;
+        struct Marked(fn() -> PinnedHeaders, Element<'static, ()>);
+        impl Widget<(), Theme, Renderer> for Marked {
+            fn children(&self) -> Vec<Tree> {
+                vec![Tree::new(&self.1)]
+            }
+            fn diff(&mut self, tree: &mut Tree) {
+                tree.diff_children(std::slice::from_mut(&mut self.1));
+            }
+            fn size(&self) -> Size<Length> {
+                self.1.as_widget().size()
+            }
+            fn layout(
+                &mut self,
+                tree: &mut Tree,
+                renderer: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                let child = self
+                    .1
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, limits);
+                layout::Node::with_children(child.size(), vec![child])
+            }
+            fn operate(
+                &mut self,
+                tree: &mut Tree,
+                layout: Layout<'_>,
+                renderer: &Renderer,
+                operation: &mut dyn Operation,
+            ) {
+                operation.custom(None, layout.bounds(), &mut (self.0)());
+                operation.container(None, layout.bounds());
+                operation.traverse(&mut |operation| {
+                    self.1.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout.children().next().unwrap(),
+                        renderer,
+                        operation,
+                    );
+                });
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+        }
+        let group = || -> Element<'static, ()> {
+            Element::new(Marked(
+                || PinnedHeaders::Group,
+                widget::Space::new().width(300).height(100).into(),
+            ))
+        };
+        // Wrapped as deep as the sidebar wraps its list and groups, plus
+        // room to spare: the compact rail puts each group in a container, and
+        // the Attention filter adds sections after the list.
+        let wrap = |content: Element<'static, ()>, times: usize| {
+            (0..times).fold(content, |content, _| widget::container(content).into())
+        };
+        let list = Element::new(Marked(
+            || PinnedHeaders::List,
+            widget::column::with_children(vec![wrap(group(), 2), wrap(group(), 2)])
+                .spacing(8)
+                .into(),
+        ));
+        let mut list: Element<'static, ()> = overflow_fade_y_under_headers(
+            widget::scrollable(wrap(
+                widget::column::with_children(vec![
+                    wrap(list, 4),
+                    widget::Space::new().width(300).height(300).into(),
+                ])
+                .into(),
+                2,
+            ))
+            .height(Length::Fill),
+            crate::design::base,
+        );
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 200.0)),
+        );
+        let bounds = node.bounds();
+        // Groups span 0..100 and 108..208 of the content.
+        let expected = |offset: f32| {
+            let room = |top: f32, bottom: f32| {
+                if bottom <= offset {
+                    offset - bottom
+                } else {
+                    (top - offset).max(0.0)
+                }
+            };
+            room(0.0, 100.0).min(room(108.0, 208.0))
+        };
+        for offset in 1..=300 {
+            let mut messages = Vec::new();
+            list.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -1.0 },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(bounds.center()),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            let room = tree.state.downcast_ref::<OverflowState>().header_room;
+            assert_eq!(room, Some(expected(offset as f32)), "at {offset}");
+        }
     }
 
     /// The fade recedes with the content still hidden past an edge, so the
