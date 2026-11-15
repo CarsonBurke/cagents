@@ -101,17 +101,19 @@ if [[ -n $daemon_cli ]]; then
     fi
     "$daemon_cli" --json daemon stop-for-rebuild --including-subagents > /tmp/stop
     jq -e '.ok == true and .command == "daemon.stop_for_rebuild" and .data.stopped == true' /tmp/stop >/dev/null
+    # Stop acknowledges SIGTERM before exit. Wait for this exact process before
+    # asking its closing socket for status; keep all later IPC errors strict.
+    for attempt in {1..100}; do
+        if ! same_daemon; then break; fi
+        sleep 0.05
+    done
+    if same_daemon; then fail 'daemon process did not exit'; fi
     for attempt in {1..100}; do
         "$daemon_cli" --json daemon status > /tmp/status
         if jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null; then break; fi
         sleep 0.05
     done
     jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null
-    for attempt in {1..100}; do
-        if ! same_daemon; then break; fi
-        sleep 0.05
-    done
-    if same_daemon; then fail 'daemon process did not exit'; fi
     daemon_cli=
 fi
 case $artifact in

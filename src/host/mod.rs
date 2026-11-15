@@ -1,12 +1,18 @@
 mod account_lifecycle;
+#[cfg(test)]
+mod account_restore_tests;
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
+mod channel_work;
 mod chat;
 mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
+#[cfg(all(test, target_os = "linux"))]
+mod exit_drain_tests;
+mod lifecycle;
 mod lock;
 mod model;
 mod notifications;
@@ -16,7 +22,9 @@ mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
 mod state;
+mod update_recovery;
 mod work;
+mod workspace;
 mod worktree_removal;
 
 use std::{
@@ -197,6 +205,8 @@ pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
 /// Holds launch exclusion until the daemon listener is ready.
 pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
+    lease: Option<std::fs::File>,
+    retirement_owned_by_updater: bool,
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -206,15 +216,135 @@ pub struct DaemonAdmission {
 /// markers so later terminal children cannot inherit a consumed descriptor.
 pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     let admission = crate::instance::DaemonAdmissionGuard::acquire()?;
+    // The authenticated inherited launch fence belongs to the updater until
+    // it has reopened and verified every saved window. A plain cold start owns
+    // its own post-Ready completion instead.
+    let retirement_owned_by_updater = std::env::var_os(crate::instance::INSTALL_GUARD_ENV)
+        .is_some()
+        || crate::upgrade::recovery::has_inherited_receipt()?;
     // SAFETY: the caller guarantees that no other thread accesses environment.
     unsafe {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
     }
-    Ok(DaemonAdmission { _guard: admission })
+    // SAFETY: this is still the single-threaded entry point.
+    let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
+    Ok(DaemonAdmission {
+        _guard: admission,
+        lease,
+        retirement_owned_by_updater,
+    })
 }
 
-pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
+/// How often the daemon reclaims runtime-directory space that its chats no
+/// longer need. The directory is RAM-backed, so leaving this to the next
+/// daemon start lets a long-running daemon hold it for days.
+const RUNTIME_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Reclaims transcript caches whose owners have ended and the transcripts that
+/// retired actors' final receipts no longer need: now, then every interval,
+/// until the daemon is gone. The startup sweep has already run.
+fn collect_runtime_directory(
+    host: std::sync::Weak<state::HostLock>,
+    root: std::path::PathBuf,
+    model: Option<model::Registry>,
+) {
+    let mut first = true;
+    loop {
+        if !first {
+            std::thread::sleep(RUNTIME_COLLECT_INTERVAL);
+        }
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        if !first {
+            match crate::transcript_cache::sweep(&root) {
+                Ok(usage) if usage.count > 0 => tracing::info!(
+                    caches = usage.count,
+                    bytes = usage.bytes,
+                    "reclaimed transcript caches"
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved")
+                }
+            }
+        }
+        first = false;
+        match chat::retained_actor::compact_retired_receipts(&host) {
+            Ok(0) => {}
+            Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
+            Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
+        }
+        drop(host);
+        // Its own connection, so a batch never waits on or holds the host lock.
+        if let Some(model) = &model {
+            match model.collect_view_operations() {
+                Ok(0) => {}
+                Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
+                Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
+            }
+        }
+    }
+}
+
+/// Reserve and configure the serving socket before restore can take ownership
+/// of an original holder. The caller still holds HostLease and admission, and
+/// does not accept clients or publish readiness until restoration finishes.
+fn listener_before_restore(
+    paths: &RuntimePaths,
+    restore: impl FnOnce() -> Result<(), HostError>,
+) -> Result<UnixListener, HostError> {
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    restore()?;
+    Ok(listener)
+}
+
+/// Runs `work` on this installation's shared-model store while holding the
+/// daemon lease, so no daemon can open or convert the store meanwhile.
+fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
+    let inherited =
+        daemon::lease_handoff::clone_inherited_lease().map_err(|error| error.to_string())?;
+    let _lease =
+        HostLease::acquire_for_store_maintenance(&paths, inherited).map_err(
+            |error| match error {
+                PlatformError::AlreadyRunning { .. } => {
+                    "a cagents daemon is running; stop it before reading or converting its store"
+                        .to_owned()
+                }
+                error => error.to_string(),
+            },
+        )?;
+    work()
+}
+
+/// The schema of this installation's shared-model store, or `None` if there is
+/// no store yet. The installer records it before a replacement daemon starts,
+/// since that daemon may convert the store forward, so that a rollback can
+/// convert it back without running the previous release.
+pub fn stored_schema() -> Result<Option<u32>, String> {
+    with_store_stopped(model::Registry::stored_schema)
+}
+
+/// Converts this installation's shared-model store back to schema `target`, so
+/// a daemon that predates the current schema can open it after a rollback.
+/// Refuses while a daemon runs. Returns the schema it converted from, or
+/// `None` if there was nothing to do.
+pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
+    with_store_stopped(|| model::Registry::downgrade(target))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) {
+    exit_drain_tests::observe_startup(phase, error);
+}
+
+pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     let proof = HostSessionProof {
@@ -223,8 +353,29 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
-    let _lease = HostLease::acquire(&paths, &proof)?;
+    let retirement_owned_by_updater = admission.retirement_owned_by_updater;
+    // The lock outlives every daemon but not the runtime directory, which a
+    // reboot removes: without it no daemon of this instance ran this boot.
+    let first_this_boot = fs::symlink_metadata(&paths.lock)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let _lease = match admission.lease.take() {
+        Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
+        None => HostLease::acquire(&paths, &proof)?,
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("daemon lease acquired", None);
+    // Before anything is launched, so the epoch precedes every launch.
+    crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
+    // Before anything is launched or adopted: sessions launched through this
+    // entry by an earlier daemon now run the CLI that speaks this protocol.
+    if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
+        tracing::warn!(
+            %error,
+            "sessions will name this version's CLI directory, which a later update does not follow"
+        );
+    }
     let mut initial = HostState::new(proof);
+    initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
@@ -234,6 +385,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
     // and donating its state over and over.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
         Ok(registry) => host
             .lock()
@@ -244,6 +397,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
         &std::env::current_exe()?,
         std::env::args_os()
@@ -263,30 +418,89 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-    let retained_runs = chat::retained_actor::retained_runs(&host);
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(&host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )
-            .map_err(io::Error::other)?;
+    // An empty session scope stays loaded in the user manager until it
+    // exits. Enrollment withdraws its own, but a manager too slow to answer
+    // can outlast that, and earlier versions left them too. Collecting them
+    // waits on the manager, so it runs beside the daemon.
+    if let Err(error) = std::thread::Builder::new()
+        .name("cagents-scope-collect".into())
+        .spawn(|| {
+            loop {
+                match crate::daemon::process_scope::collect_empty_scopes() {
+                    Ok(0) => {}
+                    Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
+                    Err(error) => {
+                        tracing::warn!(%error, "empty session scopes were not collected")
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            }
+        })
+    {
+        tracing::warn!(%error, "empty session scopes were not collected");
     }
+    // This mandatory thread service must be available before any adoption
+    // can discard the holder's replay copy. It observes no process until the
+    // same HostState publishes one; it initiates no execution.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting activity monitor", None);
     let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("activity monitor started", None);
+    let mut recovered_prepared = false;
+    let listener = listener_before_restore(&paths, || {
+        #[cfg(all(test, target_os = "linux"))]
+        observe_fixture_startup("restore inherited recovery", None);
+        let restored = (|| -> io::Result<()> {
+            if update_recovery::restore(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
+            }
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore settled Prepared", None);
+            if update_recovery::restore_settled(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
+            }
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore ordinary", None);
+            update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                #[cfg(all(test, target_os = "linux"))]
+                observe_fixture_startup("restore error before cleanup", Some(&error.to_string()));
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state
+                    .terminals
+                    .values()
+                    .any(|record| !record.handle.is_completed())
+                    || state.chats.values().any(|record| record.handle.owns_work())
+                {
+                    // Keep the real listener, lease and original owners. A
+                    // failed restore is not permission to destroy accepted
+                    // replay or start an empty replacement daemon.
+                    state.retain_startup_recovery(error.to_string());
+                    tracing::error!(%error, "startup retained original ownership; recovery-only listener remains available");
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    })?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("restore complete; release admission", None);
     drop(admission);
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    // After restore, so the first pass covers every conversation it carried.
+    if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
+        tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
+    }
     let tally_host = Arc::downgrade(&host);
     let _tray = crate::tray::start(move || {
         let host = tally_host.upgrade()?;
@@ -294,34 +508,90 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let automation_broker = match automations::start(&host) {
-        Ok(broker) => Some(broker),
-        Err(error) => {
-            tracing::warn!(%error, "scheduled automations are unavailable");
-            None
+    let recovery_only = recovered_prepared
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .startup_recovery()
+            .is_some();
+    if !recovery_only {
+        let restore_host = Arc::downgrade(&host);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-account-restore".into())
+            .spawn(move || account_lifecycle::restore_unregistered_homes(restore_host))
+        {
+            tracing::warn!(%error, "lost accounts will not be restored automatically");
+        }
+    }
+    if !recovery_only {
+        let collect_host = Arc::downgrade(&host);
+        let runtime_root = paths.directory.clone();
+        let collect_model = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .independent_model()
+            .and_then(|connection| match connection {
+                Ok(connection) => Some(connection),
+                Err(error) => {
+                    tracing::warn!(%error, "applied pane changes will not be collected");
+                    None
+                }
+            });
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-runtime-collect".into())
+            .spawn(move || collect_runtime_directory(collect_host, runtime_root, collect_model))
+        {
+            tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
+        }
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting automation broker", None);
+    let mut automation_broker = if recovery_only {
+        None
+    } else {
+        match automations::start(&host) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::warn!(%error, "scheduled automations are unavailable");
+                None
+            }
         }
     };
-    let work_board = match work::Service::start(&host) {
-        Ok(service) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
-            Some(service)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "the Work board is unavailable");
-            None
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting Work board", None);
+    let mut work_board = if recovery_only {
+        None
+    } else {
+        match work::Service::start(&host) {
+            Ok(service) => {
+                host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+                Some(service)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Work board is unavailable");
+                None
+            }
         }
     };
-    let courier = match agent_execution::mailbox::Courier::start(&host) {
-        Ok(courier) => Some(courier),
-        Err(error) => {
-            tracing::warn!(%error, "messages between sessions are unavailable");
-            None
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting mailbox courier", None);
+    let mut courier = if recovery_only {
+        None
+    } else {
+        match agent_execution::mailbox::Courier::start(&host) {
+            Ok(courier) => Some(courier),
+            Err(error) => {
+                tracing::warn!(%error, "messages between sessions are unavailable");
+                None
+            }
         }
     };
 
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("startup services started", None);
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
-    let stall_watch = match host.watch(lock::STALL_LIMIT) {
+    let mut stall_watch = match host.watch(lock::STALL_LIMIT) {
         Ok(watch) => Some(watch),
         Err(error) => {
             tracing::warn!(%error, "a wedged host mutex will not be detected");
@@ -333,12 +603,35 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
     let mut runtime_error = None;
+    let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
+    let mut ordinary_cleanup_started = false;
+    let mut sealed_deliveries = None;
+    let mut lifecycle = lifecycle::Lifecycle::new();
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
         "cagents daemon is ready"
     );
 
+    #[cfg(all(test, target_os = "linux"))]
+    exit_drain_tests::observe_ready(&host);
+    if !retirement_owned_by_updater {
+        // This thread must use the actual socket after startup, never a
+        // synchronous self-query in listener_before_restore. Its connection
+        // is served by the accept loop immediately below.
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-recovery-complete".into())
+            .spawn(|| {
+                if let Err(error) = crate::update::recovery::refresh_completed_service() {
+                    // Durable completion is separate from current daemon
+                    // readiness. Keep the serving owners and listener usable.
+                    tracing::warn!(%error, "recovery completion proof is unavailable; serving owners were kept");
+                }
+            })
+        {
+            tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
+        }
+    }
     loop {
         reap_finished(&mut clients);
         if daemon::termination_requested() {
@@ -346,14 +639,66 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
         }
-        if host
+        // Read the epoch BEFORE checking absence. A final ticket release
+        // between this check and a fatal-listener wait must not be lost.
+        let progress_epoch = ordinary_exit_drain
+            .as_ref()
+            .map(|drain| drain.progress_epoch());
+        if let Some(drain) = &ordinary_exit_drain {
+            if !ordinary_cleanup_started {
+                ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+            }
+            // Restored originals can lack a local reaper credit. Their
+            // independent parent/startup proof must settle before either
+            // ordinary teardown or the terminal-child absence seal authorizes
+            // returning from the daemon.
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if ordinary_cleanup_started
+                && !state.ordinary_exit_cleanup_blocked()
+                && drain.try_seal_absence()
+            {
+                // The startup/reply guard, core seal and registration/reply
+                // acquisition fence share this one HostMutex transaction.
+                sealed_deliveries = Some(state.close_ordinary_exit_registration());
+                break;
+            }
+        } else if host
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
             .is_shutting_down()
         {
-            break;
+            let Some(drain) = begin_ordinary_exit(&host) else {
+                break; // saved committed-successor decision, before teardown
+            };
+            ordinary_exit_drain = Some(drain);
+
+            // Stop autonomous producers once, then use the original ordinary
+            // cleanup paths. No producer/reaper waits while holding control.
+            drop(stall_watch.take());
+            drop(automation_broker.take());
+            drop(courier.take());
+            host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+            drop(work_board.take());
+            ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+            tracing::info!(pending = %ordinary_exit_drain.as_ref().unwrap().pending_description(),
+                "ordinary daemon exit retains its listener and lease until exact child absence is sealed");
+            continue;
         }
 
+        let deadline =
+            lifecycle.maintain(&host, client_capacity.active.load(Ordering::Acquire) != 0);
+        if ordinary_exit_drain.is_none()
+            && host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_shutting_down()
+        {
+            #[cfg(all(test, target_os = "linux"))]
+            exit_drain_tests::lifecycle_retention_tests::observe_lifecycle_idle_shutdown();
+            // Lifecycle idle uses the same begin/seal path as requested exit.
+            // A pending drain must keep accepting inspection and checked Close.
+            continue;
+        }
         let fatal = match listener.accept() {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
@@ -391,61 +736,61 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 None
             }
             // Nothing is pending. Park until a peer connects, a client thread
-            // exits, or a signal arrives; an idle daemon blocks here indefinitely
-            // instead of waking on a timer.
+            // exits, a holder exits, a signal arrives, or a real retention/development
+            // idle deadline expires. There is no periodic polling timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                daemon::wait_for_activity(&listener).err()
+                daemon::wait_for_activity_until(&listener, deadline, lifecycle.waiting_holders())
+                    .err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,
             Err(error) => Some(error),
         };
         if let Some(error) = fatal {
+            if host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ordinary_exit_cleanup_blocked()
+            {
+                // Preserve 1204's same-listener recovery on a broken socket.
+                // A restored owner may have no reaper epoch to wait for.
+                tracing::error!(%error, "recovery listener failed while original ownership remains retained");
+                runtime_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            if let Some(drain) = &ordinary_exit_drain {
+                tracing::error!(%error, pending = %drain.pending_description(),
+                    "listener unavailable while original child custody remains; retaining daemon and lease");
+                runtime_error = Some(error);
+                drain.wait_for_progress(progress_epoch.expect("active ordinary exit epoch"));
+                continue;
+            }
             host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
             runtime_error = Some(error);
-            break;
+            // Arm ordinary absence before any return/drop; a committed
+            // successor transfer still takes the saved bypass above.
+            continue;
         }
     }
 
     tracing::info!("cagents daemon is shutting down");
-    // Shutdown waits on providers and holders by design.
-    drop(stall_watch);
-    // Stop deadline acceptance before snapshotting/tearing down provider
-    // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
-    drop(automation_broker);
-    drop(courier);
-    host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
-    drop(work_board);
-    let proof = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .proof()
-        .clone();
-    let (handles, deliveries) = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .graceful_shutdown();
-    if let Err(error) = finish_chat_shutdown(&host) {
-        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
-        runtime_error = Some(io::Error::other(error));
-    }
-    for delivery in &deliveries {
-        let _ = delivery.push(ServerEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id: None,
-            proof: proof.clone(),
-            message: ServerMessage::HostShuttingDown,
-        });
-        delivery.close_after_drain();
-    }
-    for result in finish_terminal_shutdown(&handles) {
-        if let Err(error) = result {
-            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
-            runtime_error = Some(io::Error::other(format!(
-                "terminal shutdown left unconfirmed ownership: {error}"
-            )));
-        }
+    if ordinary_exit_drain.is_some() {
+        // Already fenced atomically with the final startup/core absence check.
+        // Late accepted threads receive an already-closed queue, while the
+        // original writer drains every correlated checked-Close reply first.
+        let deliveries = sealed_deliveries.expect("ordinary exit sealed its delivery fence");
+        close_shutdown_deliveries(&host, &deliveries);
+    } else {
+        // The committed-successor path keeps its existing intentional transfer
+        // behavior and never seals absence or closes reaper admission.
+        drop(stall_watch);
+        drop(automation_broker);
+        drop(courier);
+        host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+        drop(work_board);
+        finish_shutdown_owners(&host, &mut runtime_error, true);
     }
     for client in clients {
         let _ = client.join();
@@ -460,6 +805,77 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+/// The ordinary exit caller owns the permit. Keep reservation closure and
+/// public quiescence under the existing writer, then release both locks before
+/// invoking any producer Drop, provider cleanup, child wait or client work.
+fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
+    let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
+    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    // Save intentional successor transfer BEFORE finish_upgrade takes its
+    // state. Such a handoff is not a claim of original-child absence.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_committed_upgrade()
+    {
+        return None;
+    }
+    let drain = crate::daemon::child_reaper::begin_exit_drain();
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_ordinary_exit_cleanup();
+    Some(drain)
+}
+
+fn close_shutdown_deliveries(host: &SharedHost, deliveries: &[Arc<delivery::DeliveryQueue>]) {
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    for delivery in deliveries {
+        let _ = delivery.push(ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof: proof.clone(),
+            message: ServerMessage::HostShuttingDown,
+        });
+        delivery.close_after_drain();
+    }
+}
+
+/// Ordinary cleanup runs exactly once before waiting for original tickets.
+/// Successor cleanup preserves the original notification-before-terminal order.
+fn finish_shutdown_owners(
+    host: &SharedHost,
+    runtime_error: &mut Option<io::Error>,
+    close_deliveries: bool,
+) -> bool {
+    let (handles, deliveries) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !close_deliveries && state.ordinary_exit_cleanup_blocked() {
+            return false;
+        }
+        state.graceful_shutdown()
+    };
+    if let Err(error) = finish_chat_shutdown(host) {
+        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
+        *runtime_error = Some(io::Error::other(error));
+    }
+    if close_deliveries {
+        close_shutdown_deliveries(host, &deliveries);
+    }
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
+            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
+            *runtime_error = Some(io::Error::other(format!(
+                "terminal shutdown left unconfirmed ownership: {error}"
+            )));
+        }
+    }
+    true
 }
 
 fn finish_terminal_shutdown(
@@ -498,13 +914,16 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
+            chat.decide_detached_work(agent_execution::detached_work_on_close(host, session.id));
             chat.close().and_then(|()| {
                 if !upgrading {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.
                     // Preserve that ownership on failure, before retiring the
-                    // delegated session record below.
-                    chat::retained_actor::finish_close(host, &chat, &session)
+                    // delegated session record below. A paired CLI view closes
+                    // first, with the proof its resume requires.
+                    chat::retained_actor::close_paired_view(host, session.id)
+                        .and_then(|()| chat::retained_actor::finish_close(host, &chat, &session))
                 } else {
                     Ok(())
                 }
@@ -512,11 +931,12 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
-                // Ordinary shutdown proved this exact provider stopped. Retire
-                // its delegated record before a new daemon can resume the UI
-                // descriptor with another proof; absence alone cannot do this.
-                if let Err(error) = agent_execution::retired(host, &session) {
-                    tracing::warn!(%error, "delegated provider retirement was not saved");
+                // Ordinary shutdown proved this exact provider stopped. End its
+                // delegated authority and runs before a new daemon can resume
+                // the UI descriptor with another proof; absence alone cannot do
+                // this. The agent, pane and channel stay so it resumes in place.
+                if let Err(error) = agent_execution::stopped(host, &session) {
+                    tracing::warn!(%error, "delegated provider stop was not saved");
                     if result.is_ok() {
                         result = Err(error);
                     }

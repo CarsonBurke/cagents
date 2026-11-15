@@ -5,16 +5,25 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
 fn pending_publication_failure_closed_agent_cold_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     cleanup_after_publication(false, false);
 }
 
 #[test]
 fn installed_closed_agent_cold_explicit_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     cleanup_after_publication(true, false);
 }
 
 #[test]
 fn installed_helper_without_census_refuses_adoption_before_epoch_change() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     cleanup_after_publication(false, true);
 }
 
@@ -38,6 +47,7 @@ fn cleanup_after_publication(installed: bool, unknown_installed: bool) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(CHILD, "1")
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -273,6 +283,7 @@ fn cleanup_after_publication(installed: bool, unknown_installed: bool) {
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),
+            failed_close: None,
         },
     );
     drop(lease);

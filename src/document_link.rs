@@ -91,10 +91,9 @@ mod tests {
     }
     #[test]
     fn heading_fragments_preserve_duplicate_and_explicit_suffix_collisions() {
-        let items: Vec<_> = markdown::parse(
-            "# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n",
-        )
-        .collect();
+        let items: Vec<_> =
+            markdown::parse("# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n")
+                .collect();
         for (fragment, index) in [
             ("repeated", 0),
             ("repeated-1", 1),
@@ -154,7 +153,7 @@ use cosmic::iced::{
 };
 use cosmic::widget::markdown;
 
-pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
+pub fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
     let mut used = std::collections::HashSet::new();
     // Each base slug resumes after its last suffix, instead of retrying every
     // preceding duplicate when a generated document repeats a heading.
@@ -200,11 +199,11 @@ pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<
     None
 }
 
-pub(crate) fn heading_id(card: crate::model::CardId, index: usize) -> Id {
+pub fn heading_id(card: crate::model::CardId, index: usize) -> Id {
     Id::new(format!("document-heading-{card}-{index}"))
 }
 
-pub(crate) fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
+pub fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
     scroll_to_heading_anchored(scroll, target, false)
 }
 
@@ -272,7 +271,7 @@ pub(crate) fn scroll_to_heading_anchored<T: Send + 'static>(
     })
 }
 
-pub(crate) struct PreviewViewer;
+pub struct PreviewViewer;
 impl<'a> markdown::Viewer<'a, markdown::Uri, cosmic::Theme, cosmic::Renderer> for PreviewViewer {
     fn on_link_click(uri: markdown::Uri) -> markdown::Uri {
         uri

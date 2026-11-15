@@ -18,7 +18,14 @@ const LEGACY_NAME: &str = "cagents-agents";
 /// unedited, so it is upgraded in place; anything else is user content and is
 /// never replaced. Append only: when `SKILL.md` changes, a test fails until its
 /// new hash is appended, which keeps every earlier revision upgradable.
-const BUNDLED: &[&str] = &["246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4"];
+const BUNDLED: &[&str] = &[
+    "246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4",
+    "91ef5d665ff6c64fef61cb960a70b6432f3e5aeec91de41ea20b5fc9f81add53",
+    "da0498ddc44bae2ae3ea33e0dc7f8965c4289cb555accfce353461c3f221b75a",
+    "4f034514d3e8d56b99dfc9a9055edd046ef0977affdcb891c6eb539c0e545019",
+    "34dcff6191a4c79016d79a045c2e00f3bdbc2ab6b97be1447860f03eb1022329",
+    "f79a1c86a098d3429fbbebe252f767106f4f93b7fc5bf9600d0e6fe6f947a748",
+];
 
 /// Recognized copies of the retired cagents-agents skill, used only for cleanup.
 const LEGACY_BUNDLED: &[&str] = &[
@@ -184,8 +191,12 @@ fn retire_bundle(root: &Path, name: &str, hashes: &[&str]) -> io::Result<()> {
     let destination = skill.join("SKILL.md");
     let (content, metadata) = match read_regular(&destination, libc::O_NOFOLLOW) {
         Ok(value) => value,
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP)
-            || error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error)
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || error.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     if metadata.nlink() != 1 || !hashes.contains(&sha256(&content).as_str()) {
@@ -201,8 +212,23 @@ fn retire_bundle(root: &Path, name: &str, hashes: &[&str]) -> io::Result<()> {
             != (directory_metadata.dev(), directory_metadata.ino())
         || !current.is_file()
         || current.nlink() != 1
-        || (current.dev(), current.ino(), current.len(), current.mtime(), current.mtime_nsec(), current.ctime(), current.ctime_nsec())
-            != (metadata.dev(), metadata.ino(), metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
+        || (
+            current.dev(),
+            current.ino(),
+            current.len(),
+            current.mtime(),
+            current.mtime_nsec(),
+            current.ctime(),
+            current.ctime_nsec(),
+        ) != (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
     {
         return Err(preserved("changed during retirement"));
     }
@@ -352,17 +378,83 @@ fn directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Use the CLI paired with this daemon, without persisting the installation
-/// path into user-authored recipes or replacing the rest of their PATH.
-pub(crate) fn matched_path(current: Option<&str>) -> Option<String> {
+/// The runtime directory entry naming the directory of the CLI paired with
+/// the daemon that holds that directory's lease.
+///
+/// A launched session's `PATH` names this entry rather than the daemon's
+/// version directory. Its provider process can outlive the daemon, carried
+/// across an update, and must then run the CLI of the daemon that serves it.
+const SERVING_CLI: &str = "bin";
+
+/// The directory of this executable, when it holds the paired CLI.
+fn paired_directory() -> Option<std::path::PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
-    if !directory.join("cagents").is_file() {
-        return None;
+    directory
+        .join("cagents")
+        .is_file()
+        .then(|| directory.to_owned())
+}
+
+/// Points the runtime directory's [`SERVING_CLI`] entry at this daemon's
+/// paired CLI. Only the daemon holding the runtime lease calls this, before it
+/// launches anything. Without a paired CLI the entry is removed, so a carried
+/// session finds its CLI on the rest of its `PATH` rather than an older one.
+pub(crate) fn publish_serving_cli(runtime: &Path) -> io::Result<()> {
+    publish_serving_cli_at(runtime, paired_directory().as_deref())
+}
+
+fn publish_serving_cli_at(runtime: &Path, paired: Option<&Path>) -> io::Result<()> {
+    let entry = runtime.join(SERVING_CLI);
+    let Some(paired) = paired else {
+        return match fs::symlink_metadata(&entry) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&entry),
+            _ => Ok(()),
+        };
+    };
+    let staged = runtime.join(format!(".{SERVING_CLI}.{}", std::process::id()));
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    let mut paths = vec![directory.to_owned()];
+    std::os::unix::fs::symlink(paired, &staged)?;
+    // Renaming replaces an earlier daemon's link, or a stray file, in one
+    // step; a directory in its place is refused.
+    fs::rename(&staged, &entry).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })
+}
+
+/// Use the CLI paired with the serving daemon, without persisting the
+/// installation path into user-authored recipes or replacing the rest of
+/// their PATH.
+pub(crate) fn matched_path(current: Option<&str>) -> Option<String> {
+    let paired = paired_directory()?;
+    let serving = crate::daemon::RuntimePaths::discover()
+        .ok()
+        .map(|paths| paths.directory.join(SERVING_CLI));
+    matched_path_with(&paired, serving.as_deref(), current)
+}
+
+fn matched_path_with(
+    paired: &Path,
+    serving: Option<&Path>,
+    current: Option<&str>,
+) -> Option<String> {
+    // The entry is used only while it names this daemon's own CLI; a link
+    // this daemon did not publish says nothing about what serves its socket.
+    let serving = serving.filter(|entry| {
+        fs::canonicalize(entry)
+            .ok()
+            .zip(fs::canonicalize(paired).ok())
+            .is_some_and(|(entry, paired)| entry == paired)
+    });
+    let first = serving.unwrap_or(paired);
+    let mut paths = vec![first.to_owned()];
     paths.extend(
-        std::env::split_paths(current.unwrap_or_default()).filter(|path| path != directory),
+        std::env::split_paths(current.unwrap_or_default())
+            .filter(|path| path != paired && Some(path.as_path()) != serving),
     );
     std::env::join_paths(paths).ok()?.into_string().ok()
 }
@@ -370,6 +462,65 @@ pub(crate) fn matched_path(current: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launched_path_follows_the_daemon_that_serves_the_runtime_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        let older = directory.path().join("versions/older/bin");
+        let newer = directory.path().join("versions/newer/bin");
+        for path in [&runtime, &older, &newer] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let entry = runtime.join(SERVING_CLI);
+        let user = "/usr/local/bin:/usr/bin";
+
+        // Before any daemon published the entry, the daemon's own directory leads.
+        let path = matched_path_with(&older, Some(&entry), Some(user)).unwrap();
+        assert_eq!(path, format!("{}:{user}", older.display()));
+
+        publish_serving_cli_at(&runtime, Some(&older)).unwrap();
+        let launched = matched_path_with(&older, Some(&entry), Some(user)).unwrap();
+        assert_eq!(launched, format!("{}:{user}", entry.display()));
+        assert_eq!(
+            fs::canonicalize(&entry).unwrap(),
+            fs::canonicalize(&older).unwrap()
+        );
+
+        // The next daemon replaces the entry, and the session launched above
+        // now resolves its CLI to that daemon's.
+        publish_serving_cli_at(&runtime, Some(&newer)).unwrap();
+        assert_eq!(
+            fs::canonicalize(&entry).unwrap(),
+            fs::canonicalize(&newer).unwrap()
+        );
+        assert!(
+            fs::read_dir(&runtime).unwrap().count() == 1,
+            "the staged link is renamed into place"
+        );
+        // A relaunch keeps a single leading entry rather than accumulating them.
+        let relaunched = matched_path_with(&newer, Some(&entry), Some(&launched)).unwrap();
+        assert_eq!(relaunched, format!("{}:{user}", entry.display()));
+        // A daemon that did not publish the entry does not trust it.
+        let path = matched_path_with(&older, Some(&entry), Some(&launched)).unwrap();
+        assert_eq!(
+            path,
+            format!("{}:{}:{user}", older.display(), entry.display())
+        );
+
+        // A daemon without a paired CLI withdraws the entry, so a carried
+        // session falls through to the rest of its PATH.
+        publish_serving_cli_at(&runtime, None).unwrap();
+        assert!(fs::symlink_metadata(&entry).is_err());
+        publish_serving_cli_at(&runtime, None).unwrap();
+
+        // Something other than a link in its place is never replaced.
+        fs::create_dir(&entry).unwrap();
+        assert!(publish_serving_cli_at(&runtime, Some(&newer)).is_err());
+        publish_serving_cli_at(&runtime, None).unwrap();
+        assert!(entry.is_dir());
+        assert_eq!(fs::read_dir(&runtime).unwrap().count(), 1);
+    }
 
     #[cfg(feature = "ui")]
     #[test]
@@ -482,20 +633,32 @@ mod tests {
             share_managed_skills(&root, &system).unwrap();
             assert!(!root.join("skills").exists());
             match previous {
-                "missing" => {},
+                "missing" => {}
                 "empty" => fs::create_dir(root.join("skills")).unwrap(),
-                "legacy" => { legacy(&root); },
+                "legacy" => {
+                    legacy(&root);
+                }
                 "current" => install_at(&root, false).unwrap(),
-                "both" => { install_at(&root, false).unwrap(); legacy(&root); },
+                "both" => {
+                    install_at(&root, false).unwrap();
+                    legacy(&root);
+                }
                 _ => unreachable!(),
             }
             let personal = system.join("skills/cagents/SKILL.md");
             fs::create_dir_all(personal.parent().unwrap()).unwrap();
             fs::write(&personal, b"personal revision one").unwrap();
             share_managed_skills(&root, &system).unwrap();
-            assert_eq!(fs::read_link(root.join("skills")).unwrap(), system.join("skills"), "{previous}");
+            assert_eq!(
+                fs::read_link(root.join("skills")).unwrap(),
+                system.join("skills"),
+                "{previous}"
+            );
             fs::write(&personal, b"personal revision two").unwrap();
-            assert_eq!(fs::read(installed(&root)).unwrap(), b"personal revision two");
+            assert_eq!(
+                fs::read(installed(&root)).unwrap(),
+                b"personal revision two"
+            );
             share_managed_skills(&root, &system).unwrap();
         }
     }
@@ -509,12 +672,22 @@ mod tests {
         fs::create_dir_all(system.join("skills")).unwrap();
         share_managed_skills(&root, &system).unwrap();
         assert!(fs::read_link(root.join("skills")).unwrap().is_absolute());
-        assert_eq!(root.join("skills").canonicalize().unwrap(), system.join("skills").canonicalize().unwrap());
+        assert_eq!(
+            root.join("skills").canonicalize().unwrap(),
+            system.join("skills").canonicalize().unwrap()
+        );
     }
 
     #[test]
     fn managed_skill_sharing_preserves_current_edits_resources_and_existing_links() {
-        for case in ["edited", "resources", "hard-link", "skill-link", "skills-link", "dangling-link"] {
+        for case in [
+            "edited",
+            "resources",
+            "hard-link",
+            "skill-link",
+            "skills-link",
+            "dangling-link",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("account");
             let system = directory.path().join("system");
@@ -523,13 +696,17 @@ mod tests {
             let path = installed(&root);
             let outside = directory.path().join("outside");
             if case == "skills-link" || case == "dangling-link" {
-                if case == "skills-link" { fs::create_dir(&outside).unwrap(); }
+                if case == "skills-link" {
+                    fs::create_dir(&outside).unwrap();
+                }
                 std::os::unix::fs::symlink(&outside, root.join("skills")).unwrap();
             } else {
                 install_at(&root, false).unwrap();
                 match case {
                     "edited" => fs::write(&path, b"account edit").unwrap(),
-                    "resources" => fs::write(path.parent().unwrap().join("notes.md"), b"keep").unwrap(),
+                    "resources" => {
+                        fs::write(path.parent().unwrap().join("notes.md"), b"keep").unwrap()
+                    }
                     "hard-link" => fs::hard_link(&path, &outside).unwrap(),
                     "skill-link" => {
                         fs::rename(&path, &outside).unwrap();
@@ -542,8 +719,15 @@ mod tests {
             if case == "skills-link" || case == "dangling-link" {
                 assert_eq!(fs::read_link(root.join("skills")).unwrap(), outside);
             } else {
-                assert!(fs::symlink_metadata(root.join("skills")).unwrap().is_dir(), "{case}");
-                let expected = if case == "edited" { b"account edit".as_slice() } else { CONTENT.as_bytes() };
+                assert!(
+                    fs::symlink_metadata(root.join("skills")).unwrap().is_dir(),
+                    "{case}"
+                );
+                let expected = if case == "edited" {
+                    b"account edit".as_slice()
+                } else {
+                    CONTENT.as_bytes()
+                };
                 assert_eq!(fs::read(&path).unwrap(), expected, "{case}");
             }
         }
@@ -558,10 +742,17 @@ mod tests {
         share_managed_skills(&root, &system).unwrap();
         assert!(!root.exists());
         fs::create_dir_all(root.join("skills/custom")).unwrap();
-        fs::write(root.join("skills/custom/SKILL.md"), b"personal account skill").unwrap();
+        fs::write(
+            root.join("skills/custom/SKILL.md"),
+            b"personal account skill",
+        )
+        .unwrap();
         share_managed_skills(&root, &system).unwrap();
         assert!(fs::symlink_metadata(root.join("skills")).unwrap().is_dir());
-        assert_eq!(fs::read(root.join("skills/custom/SKILL.md")).unwrap(), b"personal account skill");
+        assert_eq!(
+            fs::read(root.join("skills/custom/SKILL.md")).unwrap(),
+            b"personal account skill"
+        );
     }
 
     #[test]
@@ -570,7 +761,10 @@ mod tests {
         let path = legacy(directory.path());
         install_at(directory.path(), false).unwrap();
         assert!(!path.parent().unwrap().exists());
-        assert_eq!(fs::read(installed(directory.path())).unwrap(), CONTENT.as_bytes());
+        assert_eq!(
+            fs::read(installed(directory.path())).unwrap(),
+            CONTENT.as_bytes()
+        );
         install_at(directory.path(), false).unwrap();
     }
 
@@ -588,7 +782,14 @@ mod tests {
 
     #[test]
     fn legacy_edits_links_and_extra_resources_are_preserved() {
-        for case in ["edited", "file-link", "directory-link", "hard-link", "resources", "fifo"] {
+        for case in [
+            "edited",
+            "file-link",
+            "directory-link",
+            "hard-link",
+            "resources",
+            "fifo",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = legacy(directory.path());
             let outside = directory.path().join("outside");
@@ -616,7 +817,11 @@ mod tests {
             install_at(directory.path(), false).unwrap();
             assert!(fs::symlink_metadata(&path).is_ok(), "{case}");
             if case != "fifo" {
-                let expected = if case == "edited" { b"personal legacy skill".as_slice() } else { LEGACY };
+                let expected = if case == "edited" {
+                    b"personal legacy skill".as_slice()
+                } else {
+                    LEGACY
+                };
                 assert_eq!(fs::read(&path).unwrap(), expected, "{case}");
             }
         }

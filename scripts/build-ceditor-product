@@ -1,0 +1,32 @@
+#!/usr/bin/python3
+"""Build one ceditor product lane and print its Cargo-reported executable path."""
+from pathlib import Path
+import subprocess
+import sys
+
+# Also work under python -I, importing only this tool's own companion module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifactError, CargoArtifacts
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: build-ceditor-product NAME CARGO_BUILD_ARGUMENTS...")
+    name = sys.argv[1]
+    artifacts = CargoArtifacts()
+    command = ["cargo", "build", *sys.argv[2:], "--message-format=json-render-diagnostics"]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, encoding="utf-8") as child:
+        for line in child.stdout:
+            artifacts.read(line, diagnostics=sys.stderr)
+        status = child.wait()
+    if status:
+        return status if status > 0 else 128 - status
+    print(artifacts.executable(name))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, CargoArtifactError) as error:
+        sys.exit(f"Could not build ceditor product: {error}")

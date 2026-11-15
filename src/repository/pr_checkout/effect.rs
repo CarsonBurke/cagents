@@ -318,20 +318,6 @@ fn repair_tracking<E: ProcessExecutor>(
     })
 }
 
-fn executable(program: &Path) -> Result<PathBuf, String> {
-    if program.is_absolute() || program.components().count() > 1 {
-        return fs::canonicalize(program).map_err(|error| error.to_string());
-    }
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|directory| directory.join(program))
-        .find(|path| {
-            fs::metadata(path)
-                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
-        })
-        .ok_or_else(|| "Git executable could not be resolved before reconciliation".into())
-        .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
-}
-
 fn transaction<E: ProcessExecutor>(
     service: &RepositoryService<E>,
     plan: &ExistingPrCheckoutPlan,
@@ -358,6 +344,16 @@ fn transaction<E: ProcessExecutor>(
         fs::write(&hook, include_bytes!("transaction.sh")).map_err(|error| error.to_string())?;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
+        fs::write(
+            private.join("submodule-status"),
+            include_bytes!("submodule_status.sh"),
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            private.join("check-submodule-paths"),
+            include_bytes!("submodule_paths.sh"),
+        )
+        .map_err(|error| error.to_string())?;
         fs::write(
             private.join("check-new-paths"),
             include_bytes!("check_new_paths.sh"),
@@ -412,8 +408,12 @@ fn transaction<E: ProcessExecutor>(
             "--stdin".into(),
         ])
         .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("CAGENTS_PR_GIT", executable(&service.git)?)
+        .env(
+            "CAGENTS_PR_GIT",
+            complete_inventory::resolved_git_executable(&service.git)?,
+        )
         .env("CAGENTS_PR_PRIVATE", private)
+        .env("CAGENTS_PR_SUBMODULE_HELPERS", private)
         .env("CAGENTS_PR_MODE", if probe { "probe" } else { "effect" })
         .env("CAGENTS_PR_WORKTREE", &plan.worktree.path)
         .env("CAGENTS_PR_GITDIR", &plan.git_dir.path)
@@ -483,17 +483,22 @@ fn transaction<E: ProcessExecutor>(
     Ok(())
 }
 
-/// Keep accepted-operation ownership until every child has closed the original
+/// Keep accepted-operation ownership until every holder has closed the original
 /// flock description. Cancellation requests do not mean detached children exited.
-fn settle_descendants(observer: &fs::File) -> bool {
-    let mut observed_descendant = false;
+/// A flock cannot attribute the holder: an unrelated fork can inherit this
+/// CLOEXEC descriptor until exec. Unknown holders still require a refusal.
+fn settle_lease(observer: &fs::File) -> bool {
+    let mut observed_holder = false;
     loop {
         // SAFETY: observer is an independent, owned open description of the
         // original lease inode, retained before any subprocess can replace it.
         if unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return observed_descendant;
+            return observed_holder;
         }
-        observed_descendant = true;
+        if !observed_holder {
+            test_phase("retained_lease_observed");
+            observed_holder = true;
+        }
         // A noncooperating policy child deliberately leaves this operation
         // unsettled. Do not clear UI busy/close guards or directory protection.
         std::thread::sleep(Duration::from_millis(100));
@@ -843,9 +848,9 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         .join(private_name);
     drop(lease);
     test_phase("before_lease_observation");
-    let observed_descendant = settle_descendants(&lease_observer);
-    let descendant = if observed_descendant {
-        Err("A policy or Git descendant outlived its command; it has now released the operation lease. Refresh and inspect the checkout before continuing".to_owned())
+    let observed_holder = settle_lease(&lease_observer);
+    let lease_settlement = if observed_holder {
+        Err("The operation lease remained held after its command and has now been released. Its holder could not be identified; a policy or Git descendant, or an unrelated child before exec, may have inherited it. Refresh and inspect the checkout before continuing".to_owned())
     } else {
         Ok(())
     };
@@ -863,7 +868,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     let effects = changed
         || private.path().join("checkout-started").exists()
         || private.path().join("ref-committed").exists();
-    if let Err(detail) = attempt.and(descendant) {
+    if let Err(detail) = attempt.and(lease_settlement) {
         let current = state();
         let detail = format!(
             "{detail}. {current}. Operation evidence: {}",
@@ -871,7 +876,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         );
         let _retained_path = private.keep();
         return Err(PrCheckoutFailure {
-            kind: if effects || observed_descendant {
+            kind: if effects || observed_holder {
                 PrCheckoutFailureKind::PartialOrUnknown
             } else {
                 PrCheckoutFailureKind::Refused

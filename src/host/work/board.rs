@@ -10,8 +10,9 @@ use crate::{
     agent::{ActivityState, Provider},
     model::TerminalId,
     work::{
-        Activity, ActivitySource, Board, Checks, Column, Forge, Head, Item, ItemKey, LinearTicket,
-        Project, PullRequest, PullRequestState, Review, Session, TicketSource, Worktree,
+        Activity, ActivitySource, Board, CheckState, Checks, Column, Forge, Head, Item, ItemKey,
+        LinearTicket, Project, PullRequest, PullRequestState, Review, Session, TicketSource,
+        Worktree,
     },
 };
 
@@ -48,7 +49,12 @@ pub(super) fn assemble(projects: &[ProjectView<'_>], context: &Context<'_>) -> B
     let worktrees = projects
         .iter()
         .filter_map(|project| project.local)
-        .flat_map(|local| local.worktrees.iter().map(|worktree| worktree.path.as_path()))
+        .flat_map(|local| {
+            local
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+        })
         .collect::<Vec<_>>();
     let sessions = sessions_by_worktree(context.sessions, &worktrees);
     let mut items = projects
@@ -93,7 +99,10 @@ fn sessions_by_worktree<'a>(
             .filter(|worktree| session.directory.starts_with(worktree))
             .max_by_key(|worktree| worktree.components().count())
         {
-            placed.entry(worktree.to_path_buf()).or_default().push(session);
+            placed
+                .entry(worktree.to_path_buf())
+                .or_default()
+                .push(session);
         }
     }
     placed
@@ -298,7 +307,10 @@ fn pull_request_for(
     Some(convert(pull_request, contains))
 }
 
-fn convert(pull_request: &crate::github::PullRequest, contains_local_head: bool) -> PullRequest {
+pub(super) fn convert(
+    pull_request: &crate::github::PullRequest,
+    contains_local_head: bool,
+) -> PullRequest {
     let state = match pull_request.state.0.as_str() {
         "OPEN" => PullRequestState::Open,
         "MERGED" => PullRequestState::Merged,
@@ -309,24 +321,27 @@ fn convert(pull_request: &crate::github::PullRequest, contains_local_head: bool)
     let checks = pull_request.status_check_rollup.as_ref().map(|_| {
         let mut checks = Checks::default();
         for check in pull_request.check_summaries() {
-            match check.bucket.0.as_str() {
-                "pass" => checks.passed += 1,
-                "fail" => checks.failed += 1,
-                "pending" => checks.pending += 1,
-                _ => {}
+            match check.work_state() {
+                Some(CheckState::Passed) => checks.passed += 1,
+                Some(CheckState::Failed) => checks.failed += 1,
+                Some(CheckState::Pending) => checks.pending += 1,
+                Some(CheckState::Cancelled) => checks.cancelled += 1,
+                Some(CheckState::Skipped) => checks.skipped += 1,
+                None => {}
             }
         }
         checks
     });
-    let review = pull_request
-        .review_decision
-        .as_ref()
-        .and_then(|decision| match decision.0.as_str() {
-            "APPROVED" => Some(Review::Approved),
-            "CHANGES_REQUESTED" => Some(Review::ChangesRequested),
-            "REVIEW_REQUIRED" => Some(Review::Required),
-            _ => None,
-        });
+    let review =
+        pull_request
+            .review_decision
+            .as_ref()
+            .and_then(|decision| match decision.0.as_str() {
+                "APPROVED" => Some(Review::Approved),
+                "CHANGES_REQUESTED" => Some(Review::ChangesRequested),
+                "REVIEW_REQUIRED" => Some(Review::Required),
+                _ => None,
+            });
     PullRequest {
         number: pull_request.number,
         title: pull_request.title.clone(),
@@ -431,10 +446,16 @@ mod tests {
             dirty: Some(crate::work::Dirty::default()),
             link: None,
             error: None,
+            status_read_at: None,
         }
     }
 
-    fn pull_request(branch: &str, oid: &str, state: &str, draft: bool) -> crate::github::PullRequest {
+    fn pull_request(
+        branch: &str,
+        oid: &str,
+        state: &str,
+        draft: bool,
+    ) -> crate::github::PullRequest {
         serde_json::from_value(serde_json::json!({
             "number": 7,
             "title": "Seven",
@@ -543,9 +564,16 @@ mod tests {
                 }),
             },
         );
-        local.branch_names = ["main", "feature", "landed", "draft", "merged-plain", "unshared"]
-            .map(str::to_owned)
-            .into();
+        local.branch_names = [
+            "main",
+            "feature",
+            "landed",
+            "draft",
+            "merged-plain",
+            "unshared",
+        ]
+        .map(str::to_owned)
+        .into();
         let mut merged = pull_request("landed", "landed-oid", "MERGED", false);
         merged.number = 8;
         let mut merged_plain = pull_request("merged-plain", "merged-plain-oid", "MERGED", false);
@@ -583,8 +611,16 @@ mod tests {
         assert_eq!(column(&board, "draft"), Some(Column::InProgress));
         assert_eq!(column(&board, "remote-only"), Some(Column::Stale));
         assert_eq!(column(&board, "main"), None, "an idle primary checkout");
-        assert_eq!(column(&board, "merged-plain"), None, "a merged plain branch");
-        assert_eq!(column(&board, "unshared"), None, "no worktree and no pull request");
+        assert_eq!(
+            column(&board, "merged-plain"),
+            None,
+            "a merged plain branch"
+        );
+        assert_eq!(
+            column(&board, "unshared"),
+            None,
+            "no worktree and no pull request"
+        );
         assert_eq!(board.projects[0].name, "repo");
     }
 
@@ -678,6 +714,76 @@ mod tests {
             board.items[0].last_activity.unwrap().source,
             ActivitySource::Session
         );
+    }
+
+    #[test]
+    fn rollup_counts_actual_states_including_cancellation_and_skips() {
+        let states = [
+            ("SUCCESS", "COMPLETED"),
+            ("NEUTRAL", "COMPLETED"),
+            ("SKIPPED", "COMPLETED"),
+            ("CANCELLED", "COMPLETED"),
+            ("FAILURE", "COMPLETED"),
+            ("TIMED_OUT", "COMPLETED"),
+            ("ACTION_REQUIRED", "COMPLETED"),
+            ("STARTUP_FAILURE", "COMPLETED"),
+            ("STALE", "COMPLETED"),
+            ("SUCCESS", "IN_PROGRESS"),
+            ("", "QUEUED"),
+            ("", "UNKNOWN"),
+        ];
+        let mut pr = pull_request("feature", "oid", "OPEN", false);
+        pr.status_check_rollup = Some(
+            states
+                .into_iter()
+                .map(|(conclusion, status)| {
+                    serde_json::from_value(serde_json::json!({
+                        "__typename": "CheckRun", "name": conclusion,
+                        "status": status, "conclusion": conclusion,
+                    }))
+                    .unwrap()
+                })
+                .chain([serde_json::from_value(serde_json::json!({
+                    "__typename": "StatusContext", "context": "legacy", "state": "ERROR",
+                }))
+                .unwrap()])
+                .collect(),
+        );
+        assert_eq!(
+            convert(&pr, true).checks,
+            Some(Checks {
+                passed: 2,
+                failed: 6,
+                pending: 2,
+                cancelled: 1,
+                skipped: 1,
+            })
+        );
+        for (conclusion, expected) in [
+            (
+                "CANCELLED",
+                Checks {
+                    cancelled: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "SKIPPED",
+                Checks {
+                    skipped: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            pr.status_check_rollup = Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                    "conclusion": conclusion,
+                }))
+                .unwrap(),
+            ]);
+            assert_eq!(convert(&pr, true).checks, Some(expected));
+        }
     }
 
     #[test]

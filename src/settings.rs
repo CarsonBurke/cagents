@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
@@ -22,7 +22,8 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
+const MAX_LEGACY_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -156,6 +157,37 @@ pub enum TerminalCursorStyle {
     #[default]
     Beam,
     Underline,
+}
+
+/// Whether account allowance labels and gauges describe what remains or was used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountUsageDisplay {
+    #[default]
+    Left,
+    Used,
+}
+
+impl AccountUsageDisplay {
+    pub const ALL: [Self; 2] = [Self::Left, Self::Used];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Used => "used",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Used => "Used",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|display| display.key() == key)
+    }
 }
 
 const fn default_ui_scale() -> f32 {
@@ -379,6 +411,51 @@ impl KeyboardShortcuts {
         ]
     }
 
+    /// Replaces one registered action's chords; call the full validator before saving.
+    pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
+        match index {
+            0 => self.new_terminal = chords,
+            1 => self.new_channel = chords,
+            2 => self.clone_pane = chords,
+            3 => self.close_focused_column = chords,
+            4 => self.search_projects = chords,
+            5 => self.find_in_pane = chords,
+            6 => self.previous_column = chords,
+            7 => self.next_column = chords,
+            8 => self.cycle_pane_width = chords,
+            9 => self.previous_workspace = chords,
+            10 => self.next_workspace = chords,
+            11 => self.review_toggle_viewed = chords,
+            12 => self.review_next_file = chords,
+            13 => self.review_previous_file = chords,
+            14 => self.review_next_unviewed = chords,
+            15 => self.review_next_change = chords,
+            16 => self.review_previous_change = chords,
+            17 => self.command_palette = chords,
+            18 => self.new_native_thread = chords,
+            19 => self.chat_permissions = chords,
+            20 => self.chat_model = chords,
+            21 => self.chat_account = chords,
+            22 => self.toggle_inspector = chords,
+            23 => self.open_settings = chords,
+            24 => self.move_pane_left = chords,
+            25 => self.move_pane_right = chords,
+            26 => self.reopen_pane = chords,
+            27 => self.focus_pane_1 = chords,
+            28 => self.focus_pane_2 = chords,
+            29 => self.focus_pane_3 = chords,
+            30 => self.focus_pane_4 = chords,
+            31 => self.focus_pane_5 = chords,
+            32 => self.focus_pane_6 = chords,
+            33 => self.focus_pane_7 = chords,
+            34 => self.focus_pane_8 = chords,
+            35 => self.focus_pane_9 = chords,
+            36 => self.toggle_projects = chords,
+            37 => self.rename_pane = chords,
+            _ => panic!("unknown shortcut action"),
+        }
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         self.fault().map_or(Ok(()), |fault| Err(fault.error))
     }
@@ -407,7 +484,7 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = withheld_from_the_card(binding) {
+                if let Some(message) = shortcut_chord_refusal(binding) {
                     return fault(message, None);
                 }
                 if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
@@ -468,6 +545,98 @@ pub struct ShortcutFault {
     pub action: usize,
     pub conflicts_with: Option<usize>,
     pub error: SettingsError,
+}
+
+/// A chord handled directly by a native surface rather than the action table.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedShortcut {
+    pub label: &'static str,
+    pub chords: &'static [&'static str],
+    pub scope: &'static str,
+    pub refusal: &'static str,
+    /// Native font zoom also accepts logical keypad keys. Its filter uses the
+    /// same handler instead of the configurable number-row binding policy.
+    pub font_zoom_delta: Option<i8>,
+}
+
+pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+        font_zoom_delta: Some(1),
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Ctrl+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+        font_zoom_delta: Some(-1),
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Ctrl+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+        font_zoom_delta: Some(0),
+    },
+    FixedShortcut {
+        label: "Save file",
+        chords: &["Ctrl+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Save file",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Stage / unstage selected lines",
+        chords: &["Ctrl+Shift+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Stage / unstage selected lines",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Ctrl+Shift+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Ctrl+Shift+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+        font_zoom_delta: None,
+    },
+];
+
+/// The same refusal is used by the recorder, typed edits and file validation.
+pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> {
+    if let Some(reason) = withheld_from_the_card(binding) {
+        return Some(reason);
+    }
+    FIXED_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
+}
+
+/// Legacy actions that must retain a route back to the workspace.
+pub fn shortcut_required(index: usize) -> bool {
+    !INTRODUCED_SHORTCUT_ACTIONS.contains(&SHORTCUT_ACTIONS[index])
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -627,8 +796,60 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Canonical keys for searching bindings accepted with aliases, whitespace or
+/// reordered modifiers. Display text remains exactly as the user entered it.
+pub fn shortcut_search_keywords(value: &str) -> String {
+    parse_chords(value)
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .map(|binding| {
+            let mut parts = Vec::new();
+            if binding.control {
+                parts.push("Ctrl".to_owned());
+            }
+            if binding.alt {
+                parts.push("Alt".to_owned());
+            }
+            if binding.logo {
+                parts.push("Super".to_owned());
+            }
+            if binding.shift {
+                parts.push("Shift".to_owned());
+            }
+            parts.push(match binding.key {
+                ShortcutKey::Character(',') => "Comma".into(),
+                ShortcutKey::Character('+') => "Plus".into(),
+                ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+                ShortcutKey::ArrowLeft => "Left".into(),
+                ShortcutKey::ArrowRight => "Right".into(),
+                ShortcutKey::ArrowUp => "Up".into(),
+                ShortcutKey::ArrowDown => "Down".into(),
+                ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::PageUp => "PageUp".into(),
+                ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::Function(number) => format!("F{number}"),
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Approximate the old line preference at 1 KiB per requested line, rounded
+/// up to MiB. Its former direct use as bytes retained almost no history.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    if lines > MAX_LEGACY_TERMINAL_SCROLLBACK_LINES {
+        return MAX_TERMINAL_SCROLLBACK_MIB + 1;
+    }
+    lines.div_ceil(1024)
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -647,7 +868,7 @@ fn default_managed_worktree_directory() -> String {
 }
 
 const fn default_focus_follows_mouse() -> bool {
-    false
+    true
 }
 
 const fn default_editor_auto_save() -> bool {
@@ -697,6 +918,10 @@ const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
 }
 
+const fn default_preference_defaults_revision() -> u32 {
+    PREFERENCE_DEFAULTS_REVISION
+}
+
 /// Main stays first; imported worktrees without creation evidence sort by path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -705,6 +930,46 @@ pub enum WorktreeSort {
     Newest,
     Oldest,
     Alphabetical,
+}
+
+/// How a project's checkouts appear beside its channels: the repository's
+/// root checkout and its linked worktrees. Hidden draws none of them; each
+/// pane open in one gets a row of its own instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarWorktrees {
+    #[default]
+    Grouped,
+    Expanded,
+    Hidden,
+}
+
+impl SidebarWorktrees {
+    pub const ALL: [Self; 3] = [Self::Grouped, Self::Expanded, Self::Hidden];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "Grouped",
+            Self::Expanded => "Expanded",
+            Self::Hidden => "Hidden",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Expanded => "expanded",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+
+    pub const fn shows_checkouts(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
 }
 
 /// Syntax colors for native editors and diffs. `Auto` follows the app theme.
@@ -760,6 +1025,33 @@ impl EditorSyntaxTheme {
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|theme| theme.key() == key)
+    }
+}
+
+/// A routine question the person may choose not to be asked again: its
+/// action is common and what it ends can be reopened. Questions about
+/// something that can't be undone are not listed, so they always ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Confirmation {
+    /// Closing a chat that may still be working; its conversation stays in
+    /// history.
+    StopWorkingChat,
+    /// Closing a terminal whose processes are still running.
+    CloseActiveTerminal,
+}
+
+impl Confirmation {
+    pub const ALL: [Self; 2] = [Self::StopWorkingChat, Self::CloseActiveTerminal];
+
+    /// The question's stable name: its key under `[confirmations]`, and in
+    /// widget ids. The terminal question is stored in the older top-level
+    /// `confirm_terminal_close` instead, which builds before this table
+    /// still read, so `close_active_terminal` never appears in the file.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::StopWorkingChat => "stop_working_chat",
+            Self::CloseActiveTerminal => "close_active_terminal",
+        }
     }
 }
 
@@ -836,8 +1128,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -847,11 +1139,20 @@ pub struct AppSettings {
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
-    /// Automatic cleanup is opt-in and never discards changes or stops work.
+    /// Opt-in merged-worktree notices retain files until explicit deletion.
+    /// The legacy storage key remains compatible with existing settings.
     #[serde(default)]
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
+    #[serde(default)]
+    pub sidebar_worktrees: SidebarWorktrees,
+    #[serde(default)]
+    pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
+    /// The visible mode [`Self::sidebar_worktrees`] last had, which showing
+    /// checkouts again from the sidebar returns to. Never Hidden.
+    #[serde(default)]
+    pub sidebar_worktrees_when_shown: SidebarWorktrees,
     #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
@@ -891,11 +1192,14 @@ pub struct AppSettings {
     #[serde(default = "default_native_fraction")]
     pub default_native_pane_fraction: f32,
     /// Whether the window keeps a status bar along its bottom edge, which
-    /// reports how much of each signed-in provider account's usage limits
-    /// is left. Hiding it also stops the account probes that feed it while
+    /// reports each signed-in provider account's usage limits.
+    /// Hiding it also stops the account probes that feed it while
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// What account allowance labels and gauges show throughout the app.
+    #[serde(default)]
+    pub account_usage_display: AccountUsageDisplay,
     /// Preview rows by provider: `window:<provider key>` or `credits`.
     /// An absent provider retains its automatic headline; an empty list
     /// deliberately shows only the provider control.
@@ -905,6 +1209,11 @@ pub struct AppSettings {
     /// source-control data and agent activity indicators intact.
     #[serde(default = "default_show_worktree_changes_icons")]
     pub show_worktree_changes_icons: bool,
+    /// Whether the inspector lists the pull requests a channel only
+    /// mentioned, below those it worked on. Off, because a mention says
+    /// little about what the channel did.
+    #[serde(default)]
+    pub show_mentioned_pull_requests: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -927,6 +1236,21 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// The revision of the built-in preference defaults this file has been
+    /// brought up to; see [`PREFERENCE_DEFAULTS_REVISION`]. Like
+    /// `shortcut_defaults_revision`, it lets a changed default reach a file
+    /// that wrote the old one out without a choice behind it, and keeps a
+    /// value chosen afterwards.
+    #[serde(default = "default_preference_defaults_revision")]
+    pub preference_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -938,16 +1262,28 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
     pub notifications: crate::notifications::Preferences,
+    /// Routine questions the person chose not to be asked again, by
+    /// [`Confirmation::key`]; an absent key asks. Read through
+    /// [`AppSettings::asks`]. A table rather than a list, so windows that
+    /// each skip a different question merge by key instead of the last save
+    /// replacing the others, and a newer build's keys survive an older one.
+    /// Always written, even empty, so turning the last question back on
+    /// removes only its own key from what another window saved.
+    #[serde(default)]
+    pub confirmations: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             notifications: crate::notifications::Preferences::default(),
+            confirmations: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -967,13 +1303,16 @@ impl Default for AppSettings {
             sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            sidebar_worktrees: SidebarWorktrees::default(),
+            sidebar_worktree_overrides: BTreeMap::new(),
+            sidebar_worktrees_when_shown: SidebarWorktrees::default(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -990,16 +1329,39 @@ impl Default for AppSettings {
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
+            account_usage_display: AccountUsageDisplay::default(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
+            show_mentioned_pull_requests: false,
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            preference_defaults_revision: PREFERENCE_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1022,6 +1384,9 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    /// Sent in initialize before the server begins loading its workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1034,6 +1399,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
         root_markers: &[&str],
     ) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: languages
                 .iter()
@@ -1142,7 +1508,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -1162,6 +1528,25 @@ pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
+
+/// The revision of the built-in preference defaults this build writes.
+///
+/// Every save used to write each preference out, so a file holding an old
+/// default cannot say whether anyone chose it. A file records the revision
+/// its preferences were last brought up to as `preference_defaults_revision`;
+/// one without it is at revision 1. Loading a file at an older revision
+/// replaces each preference still holding a default that a later revision
+/// changed with this build's default.
+///
+/// Revision 2 turned on `focus_follows_mouse`.
+pub const PREFERENCE_DEFAULTS_REVISION: u32 = 2;
+
+/// The revision a file without `preference_defaults_revision` is at.
+const FIRST_PREFERENCE_DEFAULTS_REVISION: u32 = 1;
+
+/// A preference default that a later revision changed: the key, the first
+/// revision with the new default, and the default it replaced.
+const RETIRED_PREFERENCE_DEFAULTS: &[(&str, u32, bool)] = &[("focus_follows_mouse", 2, false)];
 
 /// A built-in default that a later revision replaced.
 struct RetiredShortcutDefault {
@@ -1566,7 +1951,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -1588,6 +1973,55 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    /// Whether to ask before the routine action `confirmation` guards.
+    pub fn asks(&self, confirmation: Confirmation) -> bool {
+        match confirmation {
+            // Older builds read this field, which predates the table, so it
+            // stays the one place this answer is kept.
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close,
+            _ => self
+                .confirmations
+                .get(confirmation.key())
+                .copied()
+                .unwrap_or(true),
+        }
+    }
+
+    pub fn set_asks(&mut self, confirmation: Confirmation, ask: bool) {
+        match confirmation {
+            Confirmation::CloseActiveTerminal => self.confirm_terminal_close = ask,
+            _ if ask => {
+                self.confirmations.remove(confirmation.key());
+            }
+            _ => {
+                self.confirmations
+                    .insert(confirmation.key().to_owned(), false);
+            }
+        }
+    }
+
+    /// Sets how every project shows its checkouts. Hiding them remembers the
+    /// visible mode they had, which [`Self::toggled_sidebar_worktrees`]
+    /// returns to.
+    pub fn set_sidebar_worktrees(&mut self, mode: SidebarWorktrees) {
+        if !mode.shows_checkouts() && self.sidebar_worktrees.shows_checkouts() {
+            self.sidebar_worktrees_when_shown = self.sidebar_worktrees;
+        }
+        self.sidebar_worktrees = mode;
+    }
+
+    /// The mode the sidebar's checkouts toggle switches the default to:
+    /// Hidden while checkouts show, otherwise the visible mode they had.
+    pub fn toggled_sidebar_worktrees(&self) -> SidebarWorktrees {
+        if self.sidebar_worktrees.shows_checkouts() {
+            SidebarWorktrees::Hidden
+        } else if self.sidebar_worktrees_when_shown.shows_checkouts() {
+            self.sidebar_worktrees_when_shown
+        } else {
+            SidebarWorktrees::default()
+        }
+    }
+
     pub fn editor_font_size(&self) -> f32 {
         self.editor_font_size.unwrap_or(self.terminal_font_size)
     }
@@ -1613,6 +2047,7 @@ impl AppSettings {
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
         self.palette_recents.truncate(24);
+        adopt_current_preview_rows(&mut self.usage_preview_rows);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1730,9 +2165,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -1745,6 +2180,16 @@ impl AppSettings {
                 "managed_worktree_directory must be a nonempty path without control characters",
             ));
         }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
+            ));
+        }
         self.keyboard_shortcuts.validate()?;
         validate_language_servers(&self.language_servers)?;
         Ok(self)
@@ -1754,11 +2199,37 @@ impl AppSettings {
 /// Validates the flattened language-server mapping. An empty list is valid and
 /// disables LSP. Nothing here touches the filesystem, resolves an executable,
 /// or invokes a shell.
+/// Renames the status-bar rows a selection saved against a window key that
+/// Claude has since renamed, so the bar keeps showing the window chosen.
+/// Two names for the same window become one row, in the place of its first.
+fn adopt_current_preview_rows(rows: &mut HashMap<String, Vec<String>>) {
+    let Some(rows) = rows.get_mut(crate::agent::Provider::Claude.executable()) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    *rows = std::mem::take(rows)
+        .into_iter()
+        .map(|row| match row.strip_prefix("window:") {
+            Some(key) => format!("window:{}", crate::account::claude::stable_window_key(key)),
+            None => row,
+        })
+        .filter(|row| seen.insert(row.clone()))
+        .collect();
+}
+
 fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), SettingsError> {
     let mut identifiers: HashSet<&str> = HashSet::new();
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
 
     for server in servers {
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} initialization_options exceed 1 MiB",
+                server.id
+            )));
+        }
         let id = server.id.as_str();
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -1886,8 +2357,7 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
     instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
 }
 
-fn settings_lock(path: &Path) -> Result<File, SettingsError> {
-    use std::os::fd::AsRawFd;
+fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let lock_path = path.with_extension("toml.lock");
@@ -1900,11 +2370,9 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
     validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
-    // SAFETY: the returned file owns the locked descriptor until dropped.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(lock)
+    // The returned lock unlocks as its scope ends, even if a concurrent fork
+    // copied the descriptor before exec; closing the file alone would not.
+    Ok(crate::instance::owned_file_lock(lock, libc::LOCK_EX)?)
 }
 
 /// Applies only fields this window changed since its last successful save.
@@ -2041,6 +2509,23 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if let Some(legacy) = table.remove("terminal_scrollback_lines") {
+        // An explicit current value wins, even when it is unreadable. Retain
+        // invalid legacy input under the current key so normal per-setting
+        // diagnostics/preservation apply rather than silently dropping it.
+        table
+            .entry("terminal_scrollback_mib")
+            .or_insert_with(|| match legacy {
+                toml::Value::Integer(lines)
+                    if (0..=MAX_LEGACY_TERMINAL_SCROLLBACK_LINES as i64).contains(&lines) =>
+                {
+                    usize::try_from(lines).map_or(toml::Value::Integer(lines), |lines| {
+                        toml::Value::Integer(legacy_scrollback_mib(lines) as i64)
+                    })
+                }
+                value => value,
+            });
+    }
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -2063,6 +2548,7 @@ fn normalize_current(table: &mut toml::Table) {
             i64::from(SHORTCUT_DEFAULTS_REVISION).into(),
         );
     }
+    adopt_preference_defaults(table);
     if !table.contains_key("terminal_scroll_size")
         && matches!(
             table.get("terminal_scroll_speed"),
@@ -2076,6 +2562,36 @@ fn normalize_current(table: &mut toml::Table) {
         };
         table.insert("terminal_scroll_size".to_owned(), value);
     }
+}
+
+/// Brings preferences written against older defaults up to this build's; see
+/// [`PREFERENCE_DEFAULTS_REVISION`]. A preference still holding a retired
+/// default is removed, so decoding fills in the current one and saving keeps
+/// it out of the file. A newer build's revision is left as it is.
+fn adopt_preference_defaults(table: &mut toml::Table) {
+    let revision = match table.get("preference_defaults_revision") {
+        None => FIRST_PREFERENCE_DEFAULTS_REVISION,
+        Some(value) => match value
+            .as_integer()
+            .and_then(|revision| u32::try_from(revision).ok())
+        {
+            Some(revision) => revision,
+            // Unreadable: decoding sets it aside like any other value.
+            None => return,
+        },
+    };
+    if revision >= PREFERENCE_DEFAULTS_REVISION {
+        return;
+    }
+    for (key, changed_at, retired) in RETIRED_PREFERENCE_DEFAULTS {
+        if revision < *changed_at && table.get(*key) == Some(&toml::Value::Boolean(*retired)) {
+            table.remove(*key);
+        }
+    }
+    table.insert(
+        "preference_defaults_revision".to_owned(),
+        i64::from(PREFERENCE_DEFAULTS_REVISION).into(),
+    );
 }
 
 fn load_current_toml(document: &str) -> Result<Loaded, SettingsError> {
@@ -2842,6 +3358,105 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn language_server_initialization_options_round_trip_and_are_bounded() {
+        let mut settings = AppSettings::default();
+        let options = serde_json::json!({
+            "checkOnSave": false,
+            "cargo": {"extraArgs": ["--locked", "--offline"]}
+        });
+        settings.language_servers[0].initialization_options = Some(options.clone());
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            decoded.language_servers[0].initialization_options,
+            Some(options)
+        );
+        assert!(decoded.validate().is_ok());
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"oversized": "x".repeat(1024 * 1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
+    fn account_usage_display_defaults_to_left_and_round_trips_both_choices() {
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.account_usage_display, AccountUsageDisplay::Left);
+        let mut legacy = toml::Value::try_from(&defaults).unwrap();
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("account_usage_display");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.account_usage_display, AccountUsageDisplay::Left);
+
+        for display in AccountUsageDisplay::ALL {
+            let settings = AppSettings {
+                account_usage_display: display,
+                ..defaults.clone()
+            };
+            let encoded = toml::to_string(&settings).unwrap();
+            assert!(encoded.contains(&format!("account_usage_display = {:?}", display.key())));
+            let restored: AppSettings = toml::from_str(&encoded).unwrap();
+            assert_eq!(restored.account_usage_display, display);
+        }
+    }
+
+    #[test]
+    fn account_usage_display_survives_another_windows_unrelated_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let mut first = base.clone();
+        first.account_usage_display = AccountUsageDisplay::Used;
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = base.clone();
+        second.terminal_font_size = 18.0;
+        save_merged(&path, &base, &second).unwrap();
+        save_merged(&path, &base, &base).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.account_usage_display, AccountUsageDisplay::Used);
+        assert_eq!(restored.terminal_font_size, 18.0);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -2864,6 +3479,52 @@ mod tests {
             .insert("codex".into(), Vec::new());
         let decoded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.usage_preview_rows, settings.usage_preview_rows);
+    }
+
+    /// Settings saved before Claude's live Fable window was renamed hold
+    /// its retired key; loading them keeps that window in the status bar.
+    #[test]
+    fn loading_renames_retired_claude_preview_rows() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Value::try_from(AppSettings::default()).unwrap();
+        document.as_table_mut().unwrap().insert(
+            "usage_preview_rows".into(),
+            toml::toml! {
+                claude = [
+                    "window:weekly_overage",
+                    "window:session",
+                    "window:weekly_scoped:Fable 5.1",
+                    "credits",
+                ]
+                codex = ["window:weekly_overage"]
+            }
+            .into(),
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&path)
+            .unwrap()
+            .write_all(toml::to_string(&document).unwrap().as_bytes())
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.usage_preview_rows["claude"],
+            ["window:weekly_scoped:Fable", "window:session", "credits"]
+        );
+        // Another provider's keys are its own.
+        assert_eq!(
+            loaded.usage_preview_rows["codex"],
+            ["window:weekly_overage"]
+        );
+        save(&path, &loaded).unwrap();
+        assert_eq!(
+            load(&path).unwrap().usage_preview_rows,
+            loaded.usage_preview_rows
+        );
     }
 
     #[test]
@@ -3043,6 +3704,33 @@ mod tests {
     }
 
     #[test]
+    fn settings_lock_releases_despite_a_copied_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let lock_path = path.with_extension("toml.lock");
+        let probe = || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
+        };
+        let lock = settings_lock(&path).unwrap();
+        // A fork that has not reached exec yet holds a copy of this
+        // description; closing the owner's file alone would leave the lock
+        // held by that copy until the child execs or exits.
+        let copied = lock.try_clone().unwrap();
+        assert!(probe().is_err(), "the held lock must refuse a probe");
+        drop(lock);
+        assert!(
+            probe().is_ok(),
+            "ending the scope must release the lock despite the copied descriptor"
+        );
+        drop(copied);
+    }
+
+    #[test]
     fn palette_recents_survive_save_and_old_settings_default_to_empty() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3170,6 +3858,55 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_worktree_preferences_round_trip_default_and_merge_per_project() {
+        use SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let first = crate::model::ProjectId::new();
+        let second = crate::model::ProjectId::new();
+        let base = AppSettings::default();
+        let mut legacy = toml::Value::try_from(&base).unwrap();
+        legacy.as_table_mut().unwrap().remove("sidebar_worktrees");
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("sidebar_worktree_overrides");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.sidebar_worktrees, Grouped);
+        assert!(legacy.sidebar_worktree_overrides.is_empty());
+        save(&path, &base).unwrap();
+        let mut one = base.clone();
+        one.sidebar_worktrees = Hidden;
+        one.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &base, &one).unwrap();
+        let mut two = base.clone();
+        two.sidebar_worktree_overrides.insert(second, Grouped);
+        save_merged(&path, &base, &two).unwrap();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&first),
+            Some(&Expanded)
+        );
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        one.sidebar_worktree_overrides.remove(&first);
+        let mut one_base = base.clone();
+        one_base.sidebar_worktrees = Hidden;
+        one_base.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &one_base, &one).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&first));
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+    }
+
+    #[test]
     fn absent_settings_use_defaults_without_creating_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3226,7 +3963,7 @@ mod tests {
         table.remove("relaunch_agents_on_upgrade");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
-        assert!(!decoded.focus_follows_mouse);
+        assert!(decoded.focus_follows_mouse);
         assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
     }
@@ -3400,7 +4137,7 @@ mod tests {
             assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
             assert_eq!(loaded.sidebar_width, expected_width);
             assert_eq!(loaded.default_column_fraction, 0.72);
-            assert!(!loaded.focus_follows_mouse);
+            assert!(loaded.focus_follows_mouse);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
     }
@@ -3436,7 +4173,7 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.sidebar_width, 376.0);
         assert_eq!(migrated.terminal_font_size, 15.0);
         assert_eq!(migrated.default_column_fraction, 0.72);
-        assert!(!migrated.focus_follows_mouse);
+        assert!(migrated.focus_follows_mouse);
         // Every shortcut the file held was a default then, so each takes
         // today's default.
         assert_eq!(migrated.keyboard_shortcuts, KeyboardShortcuts::default());
@@ -3858,6 +4595,73 @@ new_thread = "Alt+Shift+G"
         );
     }
 
+    /// A file written before revision 2 of the preference defaults, as every
+    /// save wrote it: each preference out, `focus_follows_mouse` among them.
+    fn revision_one_preferences(path: &Path, focus_follows_mouse: bool) {
+        let mut document = written(&AppSettings::default()).unwrap();
+        let table = document.as_table_mut().unwrap();
+        table.remove("preference_defaults_revision");
+        table.insert("focus_follows_mouse".into(), focus_follows_mouse.into());
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hover_activation_reaches_files_that_wrote_the_old_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, false);
+        let loaded = load(&path).unwrap();
+        assert!(loaded.focus_follows_mouse);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION
+        );
+        save(&path, &loaded).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["preference_defaults_revision"],
+            i64::from(PREFERENCE_DEFAULTS_REVISION).into()
+        );
+        // The default this build filled in stays out of the file.
+        assert!(!file.contains_key("focus_follows_mouse"));
+
+        // Choosing click activation afterwards is a choice, and is kept.
+        let chosen = AppSettings {
+            focus_follows_mouse: false,
+            ..loaded
+        };
+        save(&path, &chosen).unwrap();
+        assert_eq!(saved(&path)["focus_follows_mouse"], false.into());
+        assert!(!load(&path).unwrap().focus_follows_mouse);
+    }
+
+    #[test]
+    fn an_old_file_that_turned_hover_activation_on_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, true);
+        assert!(load(&path).unwrap().focus_follows_mouse);
+    }
+
+    #[test]
+    fn a_newer_preference_defaults_revision_is_left_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, false);
+        let mut document = saved(&path);
+        document.insert(
+            "preference_defaults_revision".into(),
+            i64::from(PREFERENCE_DEFAULTS_REVISION + 1).into(),
+        );
+        fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.focus_follows_mouse);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION + 1
+        );
+    }
+
     #[test]
     fn every_retired_default_names_an_action_and_parses() {
         for retired in RETIRED_SHORTCUT_DEFAULTS {
@@ -4116,10 +4920,27 @@ new_thread = "Alt+Shift+G"
         // The gesture only reaches the child as a control character when Ctrl
         // is alone: the shifted and Alt forms send something else, or nothing,
         // and stay bindable.
-        for chord in ["Ctrl+Shift+C", "Ctrl+Alt+D", "Super+Z"] {
+        for chord in ["Ctrl+Shift+X", "Ctrl+Alt+D", "Super+Z"] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
             assert!(settings.validate().is_ok(), "{chord} was refused");
+        }
+    }
+
+    #[test]
+    fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        for (chord, label) in [
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+Shift+C", "Copy terminal selection"),
+            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            assert!(
+                matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
+                "{chord}"
+            );
         }
     }
 
@@ -4135,14 +4956,104 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
-    fn terminal_scrollback_is_bounded() {
+    fn legacy_scrollback_lines_migrate_and_save_only_the_explicit_byte_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {lines}\nfuture_history = 'keep'\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, mib);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(
+                saved["terminal_scrollback_mib"].as_integer(),
+                Some(mib as i64)
+            );
+            assert_eq!(saved["future_history"].as_str(), Some("keep"));
+            assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib);
+        }
+        assert_eq!(AppSettings::default().terminal_scrollback_mib, 16);
+        assert_eq!(
+            load_current_toml("schema_version = 3")
+                .unwrap()
+                .settings
+                .terminal_scrollback_mib,
+            16
+        );
+    }
+
+    #[test]
+    fn explicit_scrollback_mib_wins_and_invalid_legacy_input_is_not_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for legacy in ["10000", "-1", "1000001", "'unreadable'"] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {legacy}\nterminal_scrollback_mib = 32\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 32);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(saved["terminal_scrollback_mib"].as_integer(), Some(32));
+        }
+        for invalid in ["-1", "1000001", "9223372036854775807", "'unreadable'"] {
+            fs::write(
+                &path,
+                format!("schema_version = 3\nterminal_scrollback_lines = {invalid}\n"),
+            )
+            .unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 16);
+            assert_eq!(loaded.set_aside().count(), 1, "{invalid}");
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let original: toml::Table = toml::from_str(&format!("value = {invalid}")).unwrap();
+            assert_eq!(saved["terminal_scrollback_mib"], original["value"]);
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+        }
+        let invalid_current = load_current_toml(
+            "schema_version = 3\nterminal_scrollback_lines = 10000\nterminal_scrollback_mib = -1\n",
+        )
+        .unwrap();
+        assert_eq!(invalid_current.settings.terminal_scrollback_mib, 16);
+        assert_eq!(invalid_current.set_aside().count(), 1);
+    }
+
+    #[test]
+    fn version_two_scrollback_migration_keeps_legacy_bounds_and_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, expected) in [
+            (0, Some(0)),
+            (10_000, Some(10)),
+            (1_000_000, Some(977)),
+            (1_000_001, None),
+        ] {
+            fs::write(&path, format!(
+                "schema_version = 2\nmax_hot_cards = 8\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 260.0\ndefault_column_fraction = 0.5\nterminal_scrollback_lines = {lines}\n"
+            )).unwrap();
+            match expected {
+                Some(mib) => assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib),
+                None => assert!(matches!(load(&path), Err(SettingsError::Invalid(_)))),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scrollback_mib_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(
@@ -4235,59 +5146,6 @@ new_thread = "Alt+Shift+G"
         assert_eq!(loaded.terminal_scroll_speed, 2.5);
         fs::write(&path, current.replace("terminal_scroll_size = 2\n", "")).unwrap();
         assert_eq!(load(&path).unwrap().terminal_scroll_speed, 2.5);
-    }
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
-        use crate::sidebar::{SidebarMode, effective_width};
-
-        let with_width = |sidebar_width| AppSettings {
-            sidebar_width,
-            ..AppSettings::default()
-        };
-
-        // A width outside the pane's bounds used to validate and then render
-        // clamped, so the file said 200 while the sidebar showed 240.
-        for width in [
-            EXPANDED_WIDTH_MIN - 40.0,
-            EXPANDED_WIDTH_MIN - 0.5,
-            EXPANDED_WIDTH_MAX + 0.5,
-            f32::NAN,
-        ] {
-            assert!(
-                matches!(
-                    with_width(width).validate(),
-                    Err(SettingsError::SidebarWidth { .. })
-                ),
-                "a width of {width} cannot be persisted: the pane will not render it"
-            );
-        }
-
-        for width in [
-            EXPANDED_WIDTH_MIN,
-            AppSettings::default().sidebar_width,
-            EXPANDED_WIDTH_MAX,
-        ] {
-            let accepted = with_width(width)
-                .validate()
-                .expect("a width the pane renders must validate");
-            assert_eq!(
-                effective_width(SidebarMode::Expanded, accepted.sidebar_width),
-                width
-            );
-        }
-
-        let message = SettingsError::SidebarWidth {
-            min: EXPANDED_WIDTH_MIN,
-            max: EXPANDED_WIDTH_MAX,
-        }
-        .to_string();
-        assert!(
-            message.contains(&EXPANDED_WIDTH_MIN.to_string())
-                && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
-            "the rejection must quote the bounds it enforces, not a copy of them: {message}"
-        );
     }
 
     #[test]
@@ -5056,5 +5914,40 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn skipped_confirmations_merge_per_key_and_keep_unknown_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut base = AppSettings::default();
+        assert!(Confirmation::ALL.into_iter().all(|kind| base.asks(kind)));
+        // A newer build's question survives this build's saves.
+        base.confirmations.insert("future_question".into(), false);
+        save(&path, &base).unwrap();
+
+        // Two windows each skip a different question from the same base.
+        let mut chat = base.clone();
+        chat.set_asks(Confirmation::StopWorkingChat, false);
+        save_merged(&path, &base, &chat).unwrap();
+        let mut terminal = base.clone();
+        terminal.set_asks(Confirmation::CloseActiveTerminal, false);
+        save_merged(&path, &base, &terminal).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        // The terminal question stays where older builds read it.
+        assert!(!saved.confirm_terminal_close);
+        assert!(!saved.confirmations.contains_key("close_active_terminal"));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
+
+        // Asking again removes only that question's key.
+        let mut again = chat.clone();
+        again.set_asks(Confirmation::StopWorkingChat, true);
+        save_merged(&path, &chat, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.asks(Confirmation::StopWorkingChat));
+        assert!(!saved.asks(Confirmation::CloseActiveTerminal));
+        assert_eq!(saved.confirmations.get("future_question"), Some(&false));
     }
 }

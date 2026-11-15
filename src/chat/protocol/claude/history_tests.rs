@@ -157,3 +157,77 @@ fn legacy_history_without_record_session_ids_remains_readable() {
         |event| matches!(event, Event::History { items, has_earlier: false } if items.len() == 30)
     ));
 }
+
+#[test]
+fn trailing_record_recovers_after_more_than_256_false_openers() {
+    let mut line = b"cut record ".to_vec();
+    line.extend(std::iter::repeat_n(b'{', 300));
+    let offset = line.len();
+    line.extend_from_slice(br#"{"type":"user","uuid":"recovered","message":{"content":"kept"}}"#);
+    let (found, record) =
+        trailing_record(&line).expect("the complete trailing record is recoverable");
+    assert_eq!(found, offset);
+    assert_eq!(record["uuid"], "recovered");
+}
+
+#[test]
+fn trailing_record_respects_quoted_braces_escapes_and_arbitrary_damaged_prefixes() {
+    let tail = serde_json::to_vec(&json!({"type":"user","uuid":"tail","message":{"content":"braces {} and quote \\\" and \\\\"}})).unwrap();
+    let alphabet = b"{}[]\\\" abcdef:012,";
+    let mut seed = 37_u64;
+    for length in 0..512 {
+        let mut line = "damaged λ ".as_bytes().to_vec();
+        for _ in 0..length % 97 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            line.push(alphabet[seed as usize % alphabet.len()]);
+        }
+        let offset = line.len();
+        line.extend_from_slice(&tail);
+        line.extend_from_slice(b" \r\n");
+        let (found, record) = trailing_record(&line).expect("valid trailing record");
+        assert_eq!(found, offset);
+        assert_eq!(record["uuid"], "tail");
+    }
+}
+
+#[test]
+#[ignore = "30 MiB damaged-line workload; run explicitly on fw16 for before/after measurements"]
+fn measure_trailing_record_damaged_line_recovery() {
+    use std::time::Instant;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    for valid_tail in [false, true] {
+        let mut line = b"cut ".to_vec();
+        for _ in 0..100 {
+            line.extend_from_slice(br#"{"payload":"#);
+        }
+        line.push(b'"');
+        line.extend(std::iter::repeat_n(b'x', MAX_PAYLOAD - 2048));
+        if valid_tail {
+            line.extend_from_slice(
+                br#"{"type":"user","uuid":"tail","message":{"content":"kept"}}"#,
+            );
+        } else {
+            line.push(b'}');
+        }
+        assert!(line.len() <= MAX_PAYLOAD);
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let recovered = trailing_record(std::hint::black_box(&line));
+            samples.push(start.elapsed().as_micros());
+            assert_eq!(recovered.is_some(), valid_tail);
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        eprintln!(
+            "recovery-measure host={} bytes={} nested_prefixes=100 valid_tail={} samples_us={:?} median_us={}",
+            host.trim(),
+            line.len(),
+            valid_tail,
+            samples,
+            sorted[1]
+        );
+    }
+}
