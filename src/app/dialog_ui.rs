@@ -16,6 +16,53 @@ pub(crate) fn surface<'a, M: 'a>(
     .into()
 }
 
+/// A [`surface`] whose whole body scrolls when the window is too short for
+/// it. `height` is the dialog's own: `Shrink` to fit its content, or `Fill`
+/// to take `max_height` whatever it holds.
+///
+/// The viewport runs to the dialog's border, so content leaves through the
+/// dialog's edge and fades into it, rather than being cut off a padding's
+/// width short of it: the vertical padding scrolls with the content. The
+/// sides keep theirs, which holds the fade and the scrollbar's thumb clear
+/// of the rounded corners.
+pub(crate) fn scrolling_surface<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    max_width: f32,
+    max_height: f32,
+    height: Length,
+) -> Element<'a, M> {
+    let edge = space::L - design::BORDER_WIDTH;
+    crate::interaction::opaque(
+        widget::container(crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::container(content).padding(design::with_vertical_rail(Padding {
+                    top: edge,
+                    bottom: edge,
+                    ..Padding::ZERO
+                })),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .height(height),
+            design::dialog_base,
+        ))
+        .class(cosmic::theme::Container::Dialog(false))
+        .padding(Padding {
+            top: design::BORDER_WIDTH,
+            bottom: design::BORDER_WIDTH,
+            left: space::L,
+            right: space::L,
+        })
+        .width(Length::Fill)
+        .height(height)
+        .max_width(max_width)
+        .max_height(max_height),
+    )
+    .into()
+}
+
 /// What a confirmation's committing action costs, which decides where the
 /// keyboard starts and whether the person may stop being asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,5 +403,86 @@ pub(super) mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focused);
         (messages, captured, focused.0)
+    }
+
+    /// The scroll region's viewport within a laid-out dialog, and its
+    /// content's height.
+    fn scroll_geometry(
+        mut element: Element<'_, Message>,
+        window: iced::Size,
+    ) -> (iced::Rectangle, iced::Rectangle, f32) {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Viewport(iced::Rectangle, f32);
+        impl Operation for Viewport {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                content: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::scrollable::Scrollable,
+            ) {
+                self.0 = bounds;
+                self.1 = content.height;
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, window),
+        );
+        let mut viewport = Viewport::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut viewport);
+        (node.bounds(), viewport.0, viewport.1)
+    }
+
+    #[test]
+    fn a_scrolling_dialog_scrolls_its_padding_and_runs_its_viewport_to_the_border() {
+        let window = iced::Size::new(800.0, 800.0);
+        // Taller than the dialog may be: the viewport takes the dialog's whole
+        // height inside its border, and the padding scrolls with the content.
+        let (dialog, viewport, content) = scroll_geometry(
+            scrolling_surface(
+                widget::Space::new().height(1000.0),
+                600.0,
+                300.0,
+                Length::Shrink,
+            ),
+            window,
+        );
+        assert_eq!(dialog.height, 300.0);
+        assert_eq!(viewport.y, dialog.y + design::BORDER_WIDTH);
+        assert_eq!(viewport.height, dialog.height - 2.0 * design::BORDER_WIDTH);
+        assert_eq!(content, 1000.0 + 2.0 * (space::L - design::BORDER_WIDTH));
+        // The sides keep the dialog's inset, which keeps the scrollbar's
+        // thumb clear of the rounded corners.
+        assert_eq!(viewport.x, dialog.x + space::L);
+        assert_eq!(
+            dialog.x + dialog.width - (viewport.x + viewport.width),
+            space::L
+        );
+        // Short content: the dialog fits it, with the same padding as an
+        // ordinary dialog.
+        let (dialog, _, _) = scroll_geometry(
+            scrolling_surface(
+                widget::Space::new().height(100.0),
+                600.0,
+                300.0,
+                Length::Shrink,
+            ),
+            window,
+        );
+        assert_eq!(dialog.height, 100.0 + 2.0 * space::L);
     }
 }

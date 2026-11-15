@@ -5210,7 +5210,7 @@ impl Cagents {
         ))));
         let anchor =
             crate::interaction::tooltip(crate::interaction::hover(button), summary.tooltip);
-        Some(crate::ui_controls::popover(
+        Some(crate::ui_controls::scrolling_popover(
             anchor,
             open.then(|| {
                 let shown = popover_account.unwrap_or(lead);
@@ -5235,20 +5235,13 @@ impl Cagents {
         // The complete surface scrolls, so warnings and every account remain
         // reachable even when their labels span several lines.
         let height = (self.window_height - CHIP_HEIGHT - 2.0 * space::XS).max(0.0);
-        widget::container(
-            widget::scrollable(widget::column::with_children(sections).spacing(space::S))
-                .id(widget::Id::new(format!(
-                    "account-popover-{}",
-                    provider.executable()
-                )))
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Shrink),
-        )
-        .max_height(height)
-        .width(POPOVER_WIDTH)
-        .padding(space::XS)
+        widget::container(crate::ui_controls::popover_scroll(
+            widget::column::with_children(sections).spacing(space::S),
+            widget::Id::new(format!("account-popover-{}", provider.executable())),
+            height,
+            crate::ui_controls::SCROLLING_FRAME,
+        ))
+        .width(crate::ui_controls::scrolling_width(POPOVER_WIDTH))
         .into()
     }
 

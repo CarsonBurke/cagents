@@ -195,7 +195,7 @@ pub(super) fn view<'a>(
         .filter(|incident| incident.active_recovery)
     {
         rows.push(
-            widget::container(runtime.failure_diagnostics(incident))
+            widget::container(runtime.failure_diagnostics(incident, design::base))
                 .id(runtime.find_anchor(&format!("failure:{}", incident.key)))
                 .into(),
         );
