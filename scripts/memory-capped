@@ -13,9 +13,11 @@ import time
 PROGRAM = "memory-capped"
 DEFAULT_MAX = "16G"
 DEFAULT_SWAP_MAX = "4G"
-USAGE = f"""usage: {PROGRAM} [--name NAME] COMMAND [ARGUMENT...]
+USAGE = f"""usage: {PROGRAM} [--name NAME] [--slice SLICE] COMMAND [ARGUMENT...]
 
 NAME is what to call COMMAND if it goes over the limit (default: its file name).
+SLICE is the systemd slice its scope goes in, such as app-cagents-test.slice
+(default: the user manager's).
 
 Environment:
   CAGENTS_MEMORY_MAX       Memory limit for COMMAND and its children, such as
@@ -91,8 +93,9 @@ def run_as_is(command):
         return 127
 
 
-def scope_command(unit, limit, swap):
+def scope_command(unit, limit, swap, slice_=None):
     return ["systemd-run", "--user", "--scope", "--quiet", *unit,
+            *([f"--slice={slice_}"] if slice_ else []),
             f"--property=MemoryMax={limit}", f"--property=MemorySwapMax={swap}",
             "--property=OOMPolicy=stop", "--property=TimeoutStopSec=5", "--"]
 
@@ -164,12 +167,16 @@ def end_as(status):
 
 def main():
     command = sys.argv[1:]
-    name = None
-    if command[:1] == ["--name"]:
+    name = slice_ = None
+    while command[:1] in (["--name"], ["--slice"]):
         if len(command) < 3:
             print(USAGE, end="", file=sys.stderr)
             return 2
-        name, command = command[1], command[2:]
+        if command[0] == "--name":
+            name = command[1]
+        else:
+            slice_ = command[1]
+        command = command[2:]
     if not command or command[0] in ("-h", "--help"):
         print(USAGE, end="", file=sys.stdout if command else sys.stderr)
         return 0 if command else 2
@@ -184,7 +191,7 @@ def main():
     unit = f"{UNIT_PREFIX}{os.getpid()}-{time.monotonic_ns()}.scope"
     parent = os.getpid()
     # The command runs as this child: systemd-run execs it after making the scope.
-    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap),
+    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap, slice_),
                               *with_own_environment(command)],
                              env=manager_environment(), close_fds=False,
                              preexec_fn=lambda: follow_parent(parent))

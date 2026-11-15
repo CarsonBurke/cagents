@@ -9,9 +9,9 @@ import time
 # and whatever they start vary too much to list, so another holder is not thereby a
 # leftover. Names only say what a process looks like.
 LEGITIMATE = {"cargo", "cargo-gate", "flock", "kwin_wayland", "native-evidence", "niri", "rustc"}
-# Run as `sh PATH`, or longer than a kernel process name.
+# Run as `sh PATH` or `python3 -I PATH`, or longer than a kernel process name.
 SCRIPTS = {
-    "build-disk-guard", "cagents-cargo-gate", "cargo-gate", "cargo-gate-command.py",
+    "build-disk-guard", "build-host", "cagents-cargo-gate", "cargo-gate", "cargo-gate-command.py",
     "native-evidence", "prune-build-dirs",
 }
 SAMPLE_SECONDS = 1.0
@@ -22,7 +22,8 @@ def default_locks():
     found = set(glob.glob("/var/tmp/cagents-*.lock*"))
     if named:
         found.update(glob.glob(glob.escape(named) + "*"))
-    # A gate records each slot's expected cost beside it; nothing locks that file.
+    # Older gates recorded each slot's expected cost beside it, and the file may
+    # remain; nothing locks it.
     return sorted(path for path in found if not path.endswith(".cost"))
 
 
@@ -165,7 +166,9 @@ def looks_legitimate(pid):
         return False
     if fields[0] in LEGITIMATE:
         return True
-    arguments = (read(f"/proc/{pid}/cmdline") or "").split("\0")[:2]
+    # A script run as `python3 -I -B PATH`, as an offloaded build-host is,
+    # has its path fourth.
+    arguments = (read(f"/proc/{pid}/cmdline") or "").split("\0")[:4]
     return any(os.path.basename(argument) in SCRIPTS for argument in arguments)
 
 

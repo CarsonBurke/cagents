@@ -1,0 +1,765 @@
+#!/usr/bin/python3 -I
+"""Runs builds on the build host.
+
+Each build waits for its share of the memory set aside for builds, then runs
+in a systemd scope in background-cagents.slice. That slice sits in the user
+manager's background.slice, whose CPU weight is below interactive work and
+tests, and its memory is capped as a whole, so the kernel throttles builds
+before they push everything else into swap. Every build draws from one pool of
+GNU make jobserver tokens, which bounds how many compiler jobs run on the host
+at once: a lone build uses every CPU, and several share them, without waiting
+for each other to start. Tests run after their build has
+given its share back, in app-cagents-test.slice under memory-capped.
+
+Without a systemd user manager, or with CAGENTS_BUILD_SCOPE=0, builds still
+wait for their shares but run in place, each with its own Cargo jobs. A build
+that another build-host started runs in place too, in that build's scope and
+with its jobserver, unless something between closed that jobserver's
+descriptors, when it joins the jobserver for itself.
+"""
+import array
+import contextlib
+import fcntl
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+
+PROGRAM = "cargo-gate"
+USAGE = """usage: build-host cargo [OPTIONS] -- CARGO SUBCOMMAND [ARGUMENT...]
+       build-host build [OPTIONS] -- COMMAND [ARGUMENT...]
+       build-host count
+
+`cargo` runs a Cargo command: its build holds the shares, and for `test`,
+`bench` and `run` the tests or program then run without them, tests in
+app-cagents-test.slice under memory-capped. `build` holds the shares for all of
+COMMAND, such as a script of builds. `count` prints how many shares the host
+has.
+
+Options:
+  --shares N         Memory shares the build needs (default 1); 0 within
+                     the shares of a build that started it
+  --deadline NS      Give up waiting for shares at this CLOCK_MONOTONIC
+                     time, in nanoseconds, exiting 124
+  --wait-seconds S   The same, S seconds from now
+  --runner CONFIG    For `cargo`, Cargo's --config setting of the runner that
+                     the tests or program of `run`, `test` or `bench` start
+                     under
+  --remove PATH      Remove the directory PATH when this ends, such as the
+                     `cargo` shim of the gate's `exec`
+
+Environment:
+  CAGENTS_BUILD_LOCK   First share's lock file; the others add .1, .2, ...
+                       (default /var/tmp/cagents-cargo.lock)
+  CAGENTS_BUILD_SLOTS  Shares on this host (default: three quarters of its
+                       memory, in shares of 4 GiB, and at least 2)
+  CAGENTS_BUILD_SCOPE=0
+                       Run builds in place, without a scope or the jobserver
+  CAGENTS_BUILD_JOBSERVER
+                       The jobserver's directory, for tests
+                       (default /run/user/UID/cagents-jobserver)
+"""
+HERE = os.path.dirname(os.path.realpath(__file__))
+SHARE = 4 * 2**30
+# Builds go in systemd's background.slice, whose CPUWeight of 30 is below the
+# 100 of app.slice, where agent sessions, the desktop's applications and tests
+# run.
+BUILD_SLICE = "background-cagents.slice"
+TEST_SLICE = "app-cagents-test.slice"
+# How often build-host restocks its build's tokens from the pool, and how
+# often it counts the builds sharing it.
+TOKEN_TICK = 0.02
+SWEEP_SECONDS = 0.25
+# Where a build's jobserver descriptors start.
+HIGH_DESCRIPTOR = 200
+# Cargo's short names for what this splits.
+ALIASES = {"t": "test", "r": "run"}
+# Marks a command run by a build that holds shares, for the gates it starts.
+HELD_MARK = "CAGENTS_BUILD_SLOT_HELD"
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+def say(message):
+    print(f"{PROGRAM}: {message}", file=sys.stderr, flush=True)
+
+
+def memory_total():
+    with open("/proc/meminfo") as file:
+        for line in file:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    raise OSError("cannot read MemTotal from /proc/meminfo")
+
+
+def budget():
+    """The memory set aside for builds: three quarters of the host's."""
+    return memory_total() * 3 // 4
+
+
+def share_count():
+    configured = os.environ.get("CAGENTS_BUILD_SLOTS")
+    if configured:
+        if not configured.isdecimal() or int(configured) <= 0:
+            say("CAGENTS_BUILD_SLOTS must be a positive integer")
+            raise SystemExit(2)
+        return int(configured)
+    return max(2, budget() // SHARE)
+
+
+def share_paths(lock, count):
+    return [lock] + [f"{lock}.{index}" for index in range(1, count)]
+
+
+class Expired(Exception):
+    pass
+
+
+def flock_until(file, deadline):
+    """Takes the lock on `file`, blocking in the kernel's queue of waiters,
+    which keeps their order, until the CLOCK_MONOTONIC `deadline`."""
+    if deadline is None:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        return
+    def expire(_number, _frame):
+        raise Expired
+    previous = signal.signal(signal.SIGALRM, expire)
+    try:
+        left = (deadline - time.monotonic_ns()) / 1e9
+        if left <= 0:
+            raise Expired
+        signal.setitimer(signal.ITIMER_REAL, left)
+        fcntl.flock(file, fcntl.LOCK_EX)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@contextlib.contextmanager
+def shares(needed, deadline):
+    """Holds `needed` of the host's shares until the block ends. Waiters line
+    up on a queue lock, and the one at its head takes shares as they free, so
+    a build needing two is not passed over by builds needing one. A command
+    run under `flock /var/tmp/cagents-cargo.lock` holds the first."""
+    lock = os.environ.get("CAGENTS_BUILD_LOCK") or "/var/tmp/cagents-cargo.lock"
+    total = share_count()
+    needed = max(1, min(needed, total))
+    held = []
+    with open(f"{lock}.queue", "a") as queue:
+        announced = False
+        def wait(take):
+            nonlocal announced
+            while not take():
+                if deadline is not None and time.monotonic_ns() >= deadline:
+                    raise Expired
+                if not announced:
+                    announced = True
+                    say(f"waiting for {needed} of the {total} build memory shares on "
+                        f"{os.uname().nodename}; the others are in use")
+                time.sleep(0.25)
+        try:
+            fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say(f"waiting for {needed} of the {total} build memory shares on "
+                f"{os.uname().nodename}; the others are in use")
+            announced = True
+            flock_until(queue, deadline)
+        def take():
+            for path in share_paths(lock, total):
+                if len(held) == needed:
+                    break
+                if any(name == path for name, _ in held):
+                    continue
+                share = open(path, "a")
+                try:
+                    fcntl.flock(share, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    share.close()
+                    continue
+                held.append((path, share))
+            return len(held) == needed
+        try:
+            wait(take)
+        except BaseException:
+            for _, share in held:
+                share.close()
+            raise
+    try:
+        yield
+    finally:
+        for _, share in held:
+            share.close()
+
+
+def systemctl(*arguments):
+    return subprocess.run(["systemctl", "--user", *arguments], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=30, env=manager_environment())
+
+
+def manager_environment_only():
+    return {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+
+
+def manager_environment():
+    """This environment, finding the user manager: a fixture or nested session
+    that moved XDG_RUNTIME_DIR would hide it."""
+    return {key: value for key, value in os.environ.items()
+            if key not in MANAGER_VARIABLES} | manager_environment_only()
+
+
+def prepare_slice():
+    """Whether builds can run in scopes here, capping the build slice's
+    memory first when its cap differs."""
+    if os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
+        return False
+    wanted = f"MemoryHigh={budget() // 4096 * 4096}"
+    try:
+        shown = systemctl("show", BUILD_SLICE, "--property=MemoryHigh")
+        if shown.returncode != 0:
+            return False
+        if shown.stdout.strip() != wanted:
+            return systemctl("set-property", "--runtime", BUILD_SLICE, wanted).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def jobserver_directory():
+    return os.environ.get("CAGENTS_BUILD_JOBSERVER") or f"/run/user/{os.getuid()}/cagents-jobserver"
+
+
+def pending(descriptor):
+    """How many tokens wait in the pipe `descriptor`."""
+    count = array.array("i", [0])
+    fcntl.ioctl(descriptor, termios.FIONREAD, count)
+    return count[0]
+
+
+def drain(descriptor):
+    while True:
+        try:
+            if not os.read(descriptor, 4096):
+                return
+        except BlockingIOError:
+            return
+
+
+class Jobserver:
+    """A build's place in the host's jobserver.
+
+    The host's tokens wait in a pool, a named pipe holding one for each CPU.
+    A build does not use the pool itself. Its Cargo and compilers take tokens
+    from a pipe this keeps stocked from the pool, and give them back into
+    another, whose tokens this passes straight on to the pool. So every
+    token a build takes comes through here: while other builds want tokens,
+    none gets more than its fair share of the CPUs, and once the build ends,
+    however it ends, every token taken for it goes back, including any its
+    processes held when they were killed.
+
+    Only build-host processes hold the pool open, each with a shared lock on
+    its users file and an exclusive one on its record in `builds`, which
+    says how many tokens it took. A build-host killed outright cannot give
+    them back, so another gives back what its record says once its lock is
+    free. A pipe's contents go with the last process holding it open, so a
+    build that finds no other using the pool fills it afresh."""
+
+    def __init__(self, directory, tokens):
+        self.tokens = tokens
+        self.taken = 0
+        self.users = self.pool = self.record = None
+        self.own = []
+        try:
+            self.mutex = os.path.join(directory, "join")
+            self.records = os.path.join(directory, "builds")
+            os.makedirs(self.records, mode=0o700, exist_ok=True)
+            with self.serialized():
+                self.users = os.open(os.path.join(directory, "users"), os.O_RDONLY | os.O_CREAT, 0o600)
+                path = os.path.join(directory, "pool")
+                with contextlib.suppress(FileExistsError):
+                    os.mkfifo(path, 0o600)
+                self.pool = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+                if not stat.S_ISFIFO(os.fstat(self.pool).st_mode):
+                    raise OSError(f"{path} is not a named pipe")
+                try:
+                    fcntl.flock(self.users, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    # No build-host is running: what the pool and records
+                    # held went with them.
+                    drain(self.pool)
+                    for name in os.listdir(self.records):
+                        os.unlink(os.path.join(self.records, name))
+                    os.write(self.pool, b"+" * tokens)
+                fcntl.flock(self.users, fcntl.LOCK_SH)
+                self.record_path = os.path.join(self.records, f"{os.getpid()}-{time.monotonic_ns()}")
+                self.record = os.open(self.record_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                fcntl.flock(self.record, fcntl.LOCK_EX)
+            # Two pipes of the build's own. This end of each never blocks;
+            # the build's, which jobserver clients expect to, do.
+            with tempfile.TemporaryDirectory(dir=directory) as private:
+                ends = {}
+                for name in ("give", "back"):
+                    fifo = os.path.join(private, name)
+                    os.mkfifo(fifo, 0o600)
+                    ends[name] = (os.open(fifo, os.O_RDWR | os.O_NONBLOCK), os.open(fifo, os.O_RDWR))
+                    self.own += ends[name]
+            (self.give, reader), (self.back, writer) = ends["give"], ends["back"]
+            # Numbered high, clear of the low descriptors that scripts
+            # redirect, as with `exec 9>lock`.
+            reader, writer = (fcntl.fcntl(end, fcntl.F_DUPFD, HIGH_DESCRIPTOR) for end in (reader, writer))
+            self.own += [reader, writer]
+            for descriptor in (reader, writer):
+                os.set_inheritable(descriptor, True)
+            self.auth = f"{reader},{writer}"
+        except BaseException:
+            self.close_descriptors()
+            raise
+        self.hungry = False
+        self.reserve = 1
+        self.stopping = threading.Event()
+        self.stocker = threading.Thread(target=self.stock, daemon=True)
+        # Signals go to the main thread, which a signal while giving tokens
+        # back would otherwise not reach in time.
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.stocker.start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
+
+    @contextlib.contextmanager
+    def serialized(self):
+        """One build-host at a time joins or reads the records."""
+        with open(self.mutex, "a") as mutex:
+            fcntl.flock(mutex, fcntl.LOCK_EX)
+            yield
+
+    def note(self):
+        """Records how many tokens the build has, and whether it wants more."""
+        os.pwrite(self.record, f"{self.taken:<20}{int(self.hungry)}".encode(), 0)
+
+    def move(self, source, target, count):
+        """Moves up to `count` tokens between pipes, returning how many."""
+        if count <= 0:
+            return 0
+        try:
+            tokens = os.read(source, count)
+        except BlockingIOError:
+            return 0
+        os.write(target, tokens)
+        return len(tokens)
+
+    def sweep(self):
+        """Gives back what build-hosts killed outright took, and counts the
+        other builds that want more tokens than they have."""
+        hungry = 0
+        with self.serialized():
+            for name in os.listdir(self.records):
+                path = os.path.join(self.records, name)
+                try:
+                    record = os.open(path, os.O_RDWR)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        hungry += path != self.record_path and os.pread(record, 21, 0)[20:] == b"1"
+                        continue
+                    owed = os.pread(record, 20, 0).strip()
+                    if owed.isdigit() and int(owed):
+                        os.write(self.pool, b"+" * int(owed))
+                    os.unlink(path)
+                finally:
+                    os.close(record)
+        return hungry
+
+    def stock(self):
+        """Passes returned tokens to the pool as they come, and keeps up to
+        `reserve` in the build's pipe: twice as many after the build took them
+        all, and half as many after it left some. A build that took them all
+        wants more, and while others do too, each gets an equal share of the
+        tokens; one alone may have every token the others leave."""
+        poller = select.poll()
+        poller.register(self.back, select.POLLIN)
+        swept = 0.0
+        others = 0
+        while not self.stopping.is_set():
+            poller.poll(TOKEN_TICK * 1000)
+            now = time.monotonic()
+            before = self.taken, self.hungry
+            self.taken -= self.move(self.back, self.pool, self.tokens)
+            if now - swept >= SWEEP_SECONDS:
+                others, swept = self.sweep(), now
+            level = pending(self.give)
+            self.hungry = level == 0
+            share = -(-self.tokens // (others + 1))
+            self.reserve = min(2 * self.reserve, self.tokens) if level == 0 else max(1, self.reserve // 2)
+            wanted = max(0, min(self.reserve, share - (self.taken - level)))
+            if level > wanted:
+                self.taken -= self.move(self.give, self.pool, level - wanted)
+            else:
+                self.taken += self.move(self.pool, self.give, wanted - level)
+            if (self.taken, self.hungry) != before:
+                self.note()
+
+    def close(self):
+        """Gives back every token taken for the build, which has ended."""
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.stopping.set()
+            self.stocker.join()
+            # A build joining or sweeping meanwhile would find the pool
+            # emptied by its last holder, or repay this build again.
+            with self.serialized():
+                if self.taken > 0:
+                    os.write(self.pool, b"+" * self.taken)
+                self.taken = 0
+                self.close_descriptors()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
+
+    def close_descriptors(self):
+        if self.record is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.record_path)
+        for descriptor in (*self.own, self.record, self.users, self.pool):
+            if descriptor is not None:
+                os.close(descriptor)
+        self.users = self.pool = self.record = None
+        self.own = []
+
+
+def build_environment(environment, auth):
+    """What a build runs with: the jobserver, given as its read and write
+    descriptors, when it has one, and otherwise Cargo jobs of its own. A
+    caller's own CARGO_BUILD_JOBS stays."""
+    environment = dict(environment)
+    cpus = os.cpu_count() or 1
+    if auth:
+        flags = f"-j --jobserver-auth={auth}"
+        environment["MAKEFLAGS"] = environment["CARGO_MAKEFLAGS"] = flags
+        environment.pop("MFLAGS", None)
+        # The jobserver bounds the jobs; this only overrides the
+        # repository's default for hosts that have none.
+        environment.setdefault("CARGO_BUILD_JOBS", str(cpus))
+    else:
+        environment.setdefault("CARGO_BUILD_JOBS", str(max(2, min(8, cpus // 2))))
+    environment[HELD_MARK] = str(os.getpid())
+    return environment
+
+
+def follow_parent(parent):
+    """A killed build-host takes its command with it."""
+    import ctypes
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent:
+        os._exit(143)
+
+
+MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+class Interrupted(Exception):
+    def __init__(self, number):
+        super().__init__(number)
+        self.number = number
+
+
+def run(command, environment, scoped, group=True, capture=False):
+    """Runs `command` to its end, in a scope of the build slice when
+    `scoped`, and returns its status, with its standard output when
+    `capture`. A signal to this process interrupts it: first as a Ctrl-C
+    would, then, if it is still running five seconds later, by stopping its
+    whole scope. Unscoped, the command's own process group stands in for the
+    scope, unless `group` is false, as for a command within another build,
+    whose scope or group ends it."""
+    unit = f"cagents-build-{os.getpid()}-{time.monotonic_ns()}.scope"
+    if scoped:
+        # The command runs as this child: systemd-run execs it after making
+        # the scope, which the manager's environment finds, with the build's.
+        settings = [f"{name}={environment[name]}" if name in environment else f"--unset={name}"
+                    for name in MANAGER_VARIABLES]
+        command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                   f"--slice={BUILD_SLICE}", f"--unit={unit}", "--property=TimeoutStopSec=5", "--",
+                   "env", *sorted(settings, key=lambda setting: not setting.startswith("--")),
+                   *command]
+        environment = {key: value for key, value in environment.items()
+                       if key not in MANAGER_VARIABLES} | manager_environment_only()
+    parent = os.getpid()
+    try:
+        group = group and not scoped
+        child = subprocess.Popen(command, env=environment, close_fds=False,
+                                 stdout=subprocess.PIPE if capture else None,
+                                 process_group=0 if group else None,
+                                 preexec_fn=lambda: follow_parent(parent))
+    except OSError as error:
+        say(f"build-host: {command[0]}: {error.strerror}")
+        status = 127 if isinstance(error, FileNotFoundError) else 126
+        return (status, b"") if capture else status
+    output = []
+    if capture:
+        reader = threading.Thread(target=lambda: output.append(child.stdout.read()), daemon=True)
+        reader.start()
+    interrupted = []
+
+    def signal_command(number):
+        with contextlib.suppress(ProcessLookupError):
+            if group:
+                os.killpg(child.pid, number)
+            else:
+                child.send_signal(number)
+
+    def forward(number, _frame):
+        if not interrupted:
+            signal_command(signal.SIGINT)
+            interrupted.append((number, time.monotonic()))
+
+    previous = {number: signal.signal(number, forward) for number in SIGNALS}
+    try:
+        stopped = False
+        while True:
+            try:
+                status = child.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if interrupted and not stopped and time.monotonic() - interrupted[0][1] >= 5:
+                stopped = True
+                if scoped:
+                    systemctl("stop", unit)
+                else:
+                    signal_command(signal.SIGKILL)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    if interrupted:
+        # What the command left behind, such as a background job, which
+        # ignores Ctrl-C, ends with it.
+        if scoped:
+            systemctl("stop", unit)
+        else:
+            signal_command(signal.SIGKILL)
+        raise Interrupted(interrupted[0][0])
+    if capture:
+        reader.join()
+        return status, output[0] if output else b""
+    return status
+
+
+def status_of(status):
+    return status if status >= 0 else 128 - status
+
+
+def within_build():
+    """Whether a build-host that is still running started this."""
+    holder = os.environ.get(HELD_MARK, "")
+    if not holder.isdecimal():
+        return False
+    try:
+        with open(f"/proc/{holder}/cmdline", "rb") as file:
+            arguments = file.read().split(b"\0")[:4]
+    except OSError:
+        return False
+    return any(os.path.basename(argument) == b"build-host" for argument in arguments)
+
+
+def lost_jobserver():
+    """Whether this inherited a jobserver whose descriptors a process
+    between, such as Python's subprocess by default, did not pass on."""
+    found = re.search(r"--jobserver-auth=(\d+),(\d+)", os.environ.get("MAKEFLAGS", ""))
+    if not found or os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
+        return False
+    try:
+        return not all(stat.S_ISFIFO(os.fstat(int(end)).st_mode) for end in found.groups())
+    except OSError:
+        return True
+
+
+class Build:
+    """One build's slot in the host: its shares, scope and jobserver."""
+
+    def __init__(self, shares, deadline, runner=None):
+        self.shares, self.deadline, self.runner = shares, deadline, runner
+
+    @contextlib.contextmanager
+    def admitted(self):
+        started = time.monotonic()
+        try:
+            # None for a command within the shares of a build that started it.
+            with shares(self.shares, self.deadline) if self.shares else contextlib.nullcontext():
+                waited = time.monotonic() - started
+                if waited >= 2:
+                    say(f"admitted after {waited:.0f}s")
+                # A build that another build-host started, such as Cargo
+                # under `cargo-gate exec`, runs in its scope, with its
+                # jobserver, which its environment names.
+                self.nested = within_build()
+                self.scoped = not self.nested and prepare_slice()
+                self.jobserver = None
+                if self.scoped or self.nested and lost_jobserver():
+                    try:
+                        self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
+                    except OSError as error:
+                        say(f"building without the shared jobserver: {error}")
+                try:
+                    yield self
+                finally:
+                    if self.jobserver:
+                        self.jobserver.close()
+        except Expired:
+            say("build admission timed out")
+            raise SystemExit(124)
+
+    def run(self, command, capture=False):
+        auth = self.jobserver.auth if self.jobserver else None
+        return run(command, build_environment(os.environ, auth), self.scoped,
+                   group=not self.nested, capture=capture)
+
+
+def separate(arguments):
+    """For `test`, `bench` or `run` that runs something after building it:
+    the subcommand's index. Cargo cannot build doctests without running
+    them, so `--doc` builds and runs in one, as does anything `--no-run`."""
+    index = 1 if arguments[:1] and arguments[0].startswith("+") else 0
+    if len(arguments) <= index or arguments[index] not in ("test", "bench", "run"):
+        return None
+    for argument in arguments[index + 1:]:
+        if argument == "--":
+            break
+        if argument in ("--doc", "--no-run"):
+            return None
+    return index
+
+
+def build_phase(cargo, arguments, index):
+    """The build half of `test`, `bench` or `run`. Arguments after `--`
+    belong to the tests or program, not Cargo."""
+    rest = arguments[index + 1:]
+    rest = rest[:rest.index("--")] if "--" in rest else rest
+    if arguments[index] == "run":
+        return [cargo, *arguments[:index], "build", *rest]
+    return [cargo, *arguments[:index], arguments[index], "--no-run", *rest]
+
+
+def under_test_limit(command):
+    """COMMAND under the memory limit tests run with, in app-cagents-test.slice."""
+    capped = os.path.join(HERE, "memory-capped")
+    if not os.access(capped, os.X_OK):
+        return command
+    return [sys.executable, "-I", capped, "--slice", TEST_SLICE, *command]
+
+
+def runs_tests(arguments, index):
+    """Whether the Cargo command runs tests or benchmarks, as `--doc` does
+    while it builds them."""
+    rest = arguments[index + 1:]
+    rest = rest[:rest.index("--")] if "--" in rest else rest
+    return arguments[index:index + 1] in (["test"], ["bench"]) and "--no-run" not in rest
+
+
+def cargo_command(build, cargo, arguments):
+    index = 1 if arguments[:1] and arguments[0].startswith("+") else 0
+    if arguments[index:index + 1] and arguments[index] in ALIASES:
+        arguments = [*arguments[:index], ALIASES[arguments[index]], *arguments[index + 1:]]
+    tests = runs_tests(arguments, index)
+    if build.runner and arguments[index:index + 1] in (["run"], ["test"], ["bench"]):
+        arguments = [*arguments[:index + 1], "--config", build.runner, *arguments[index + 1:]]
+    index = separate(arguments)
+    with build.admitted():
+        if index is not None and arguments[index] == "test":
+            # Library tests cannot use Cargo's integration-only CARGO_BIN_EXE_*
+            # variables, so the matched daemon builds here, with the shares.
+            helper = os.path.join(HERE, "cargo-host-test-helper.py")
+            if os.path.isfile(helper) and not os.environ.get("CAGENTS_TEST_RETAINED_ACTOR_HELPER"):
+                status, output = build.run([sys.executable, "-I", "-B", helper, cargo, *arguments],
+                                           capture=True)
+                if status:
+                    return status_of(status)
+                if output.strip():
+                    os.environ["CAGENTS_TEST_RETAINED_ACTOR_HELPER"] = output.strip().decode()
+        if index is None:
+            # Doctests build and run in one, within the shares.
+            command = [cargo, *arguments]
+            return status_of(build.run(under_test_limit(command) if tests else command))
+        status = build.run(build_phase(cargo, arguments, index))
+        if status:
+            return status_of(status)
+    # The shares are back: what remains runs the tests or program.
+    command = [cargo, *arguments]
+    if tests:
+        command = under_test_limit(command)
+    os.execvp(command[0], command)
+
+
+def options(arguments):
+    shares, deadline, runner, remove = 1, None, None, []
+    while arguments and arguments[0] != "--":
+        option, value = arguments[0], arguments[1] if len(arguments) > 1 else ""
+        if option == "--runner":
+            runner = value
+        elif option == "--remove":
+            remove.append(value)
+        elif option not in ("--shares", "--deadline", "--wait-seconds"):
+            print(USAGE, end="", file=sys.stderr)
+            raise SystemExit(2)
+        elif not value.isdecimal():
+            say(f"build-host: {option} needs a whole number")
+            raise SystemExit(2)
+        elif option == "--shares":
+            shares = int(value)
+        elif option == "--deadline":
+            deadline = int(value)
+        else:
+            deadline = time.monotonic_ns() + int(value) * 10**9
+        arguments = arguments[2:]
+    if not arguments[1:]:
+        print(USAGE, end="", file=sys.stderr)
+        raise SystemExit(2)
+    return Build(shares, deadline, runner), remove, arguments[1:]
+
+
+def main(arguments):
+    if arguments == ["count"]:
+        print(share_count())
+        return 0
+    if arguments[:1] not in (["cargo"], ["build"]):
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    build, remove, command = options(arguments[1:])
+
+    def stop(number, _frame):
+        raise Interrupted(number)
+
+    # Until a command runs, which takes signals over, a signal ends the wait.
+    for number in SIGNALS:
+        signal.signal(number, stop)
+    try:
+        if arguments[0] == "cargo":
+            return cargo_command(build, command[0], command[1:])
+        with build.admitted():
+            return status_of(build.run(command))
+    except Interrupted as interruption:
+        for path in remove:
+            shutil.rmtree(path, ignore_errors=True)
+        # Ends as the signal it was sent, as the command would have, without
+        # the core dump SIGQUIT's default action would write.
+        import ctypes
+        ctypes.CDLL(None).prctl(4, 0)  # PR_SET_DUMPABLE
+        signal.signal(interruption.number, signal.SIG_DFL)
+        os.kill(os.getpid(), interruption.number)
+        return 128 + interruption.number
+    finally:
+        for path in remove:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
