@@ -283,7 +283,8 @@ fi
 
 # One turn's activity while it works and after it finishes. An empty thought
 # opens the turn; a background command keeps the command group running while
-# a second empty thought is live, then the receipt arrives and the turn ends.
+# a second empty thought is live, and then while a newer command runs in a
+# group of its own. The receipt arrives and the turn ends.
 if [ "$scene" = activity ]; then
     cp "$here/reasoning-row-scene/activity.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
@@ -299,6 +300,15 @@ if [ "$scene" = activity ]; then
     sleep 4
     scroll_top
     shot activity-working
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"activity-check-1-call"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the second command did not start' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot activity-working-next
     finished=false
     for _ in $(seq 60); do
         if rg -q '"uuid":"activity-answer-1"' "$config/projects"; then finished=true; break; fi
@@ -308,7 +318,7 @@ if [ "$scene" = activity ]; then
     sleep 3
     scroll_top
     shot activity-finished
-    printf '%s\n' 'Captured a working turn and the same turn finished.'
+    printf '%s\n' 'Captured a working turn at two points and the same turn finished.'
     exit 0
 fi
 

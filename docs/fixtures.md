@@ -307,9 +307,10 @@ its patch is synthetic. None of the described commands or tools executes.
 `activity` opens its own named workspace and loads
 [`activity.jsonl`](../tests/fixtures/reasoning-row-scene/activity.jsonl): an
 empty thought, a command and a background command, then a second empty thought
-that stays live for 40 seconds while the command group is still running. It
-captures that working turn, waits for the receipt and the answer, and captures
-the finished turn.
+that stays live for 20 seconds while that command group is still running, then
+a newer command that runs for 15 seconds in a group of its own. It captures the
+working turn at both points, waits for the answer, and captures the finished
+turn.
 
 ```sh
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
