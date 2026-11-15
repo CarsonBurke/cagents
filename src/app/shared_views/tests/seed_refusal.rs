@@ -279,3 +279,29 @@ fn late_seed_receipts_cannot_settle_a_new_worktree_cleanup_seed() {
     assert!(app.shared_views.seeding.contains(&scope));
     assert!(!app.has_refused_view_seeds());
 }
+
+#[test]
+fn refused_scope_cannot_use_the_settled_presentation_projection() {
+    let (mut app, source, _, _) = presentation_fixture();
+    let scope = Scope::Channel(source);
+    let before = app
+        .workspace_model
+        .views
+        .iter()
+        .find(|view| view.scope == scope)
+        .unwrap()
+        .clone();
+    let mut after = before.clone();
+    after.revision += 1;
+    assert_eq!(
+        app.presentation_projection_ready(&before, &after, None),
+        Ok(())
+    );
+    app.shared_views
+        .seed_failures
+        .insert(scope, "The registry refused these panes".into());
+    assert_eq!(
+        app.presentation_projection_ready(&before, &after, None),
+        Err("scope admission is unsettled")
+    );
+}

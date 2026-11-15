@@ -2022,7 +2022,7 @@ impl Focus {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.is_window_focused && Blink::DEFAULT.visible(self.now - self.updated_at)
+        self.is_window_focused && Blink::current().visible(self.now - self.updated_at)
     }
 }
 
@@ -2512,7 +2512,7 @@ where
                 {
                     focus.now = *now;
 
-                    if let Some(next) = Blink::DEFAULT.next_frame(focus.now - focus.updated_at) {
+                    if let Some(next) = Blink::current().next_frame(focus.now - focus.updated_at) {
                         shell.request_redraw_at(focus.now + next);
                     }
                 }

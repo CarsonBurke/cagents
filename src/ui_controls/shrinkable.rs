@@ -13,7 +13,8 @@ use cosmic::{Element, Renderer, Theme};
 /// A row lays its shrinking children out in order, so a long label early in
 /// the row takes the width a later one needs. This child is measured after
 /// them instead: it reports a fill width, so its row also fills, then keeps
-/// its natural width when that fits. Text inside it should ellipsize.
+/// its natural width when that fits. Text inside it should be a
+/// [`FadeText`](super::FadeText), which fades where it is cut.
 ///
 /// Several shrinkables in one row split what is left by fill factor, evenly,
 /// not by need: a short one leaves its unused share empty while a long one
@@ -191,12 +192,7 @@ mod tests {
     use cosmic::widget;
 
     fn label(text: &str) -> Element<'_, ()> {
-        crate::design::body(text)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
-            .into()
+        super::super::fade_text(text).into()
     }
 
     /// Each child's bounds in a row `width` wide.

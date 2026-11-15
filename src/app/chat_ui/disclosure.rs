@@ -1,7 +1,7 @@
 //! One scan line for transcript activity and content disclosures.
 
 use super::*;
-use std::{cell::Cell, rc::Rc};
+use std::rc::Rc;
 
 pub(super) fn duration(millis: u64) -> String {
     let seconds = millis / 1_000;
@@ -44,6 +44,8 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     }
 }
 
+/// One disclosure row. Its accessible name carries the trailing metadata,
+/// which is drawn in a cell of its own.
 pub(super) fn row(
     label: String,
     name: String,
@@ -53,33 +55,11 @@ pub(super) fn row(
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
-    row_on(
-        label,
-        name,
-        icon,
-        status,
-        trailing,
-        expanded,
-        toggle,
-        |theme| theme.current_container().base.into(),
-    )
-}
-
-pub(super) fn row_on(
-    label: String,
-    name: String,
-    icon: Icon,
-    status: Option<chat::ToolStatus>,
-    trailing: Option<String>,
-    expanded: Option<bool>,
-    toggle: Option<Action>,
-    base: impl Fn(&cosmic::Theme) -> iced::Color + 'static,
-) -> Element<'static, Message> {
     let name = match &trailing {
         Some(trailing) => format!("{name} · {trailing}"),
         None => name,
     };
-    row_painted(label, name, icon, status, trailing, expanded, toggle, base)
+    row_named(label, name, icon, status, trailing, expanded, toggle)
 }
 
 /// A row whose accessible name already includes its trailing metadata.
@@ -94,48 +74,12 @@ pub(super) fn row_named(
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
-    row_painted(
-        label,
-        name,
-        icon,
-        status,
-        trailing,
-        expanded,
-        toggle,
-        |theme| theme.current_container().base.into(),
-    )
-}
-
-fn row_painted(
-    label: String,
-    name: String,
-    icon: Icon,
-    status: Option<chat::ToolStatus>,
-    trailing: Option<String>,
-    expanded: Option<bool>,
-    toggle: Option<Action>,
-    base: impl Fn(&cosmic::Theme) -> iced::Color + 'static,
-) -> Element<'static, Message> {
-    // Cosmic resolves a button's style before drawing its children. Share that
-    // resolved paint with the fade rather than guessing hover/focus from the
-    // text's smaller bounds. This also keeps keyboard feedback intact.
-    let surface = Rc::new(Cell::new(None));
-    let faded_surface = surface.clone();
-    let base = Rc::new(base);
-    let faded_base = base.clone();
-    let text = crate::interaction::parent_wheel(crate::interaction::overflow_fade_x_on(
-        widget::scrollable(
-            design::body(label)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .direction(iced::widget::scrollable::Direction::Horizontal(
-            iced::widget::scrollable::Scrollbar::hidden(),
-        ))
+    // The fade is in the glyphs themselves, so it is right on the row's
+    // resting, hovered, pressed and focused paint alike.
+    let text = crate::ui_controls::fade_text(label)
+        .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill)
-        .height(design::LINE_BODY),
-        move |theme| faded_surface.get().unwrap_or_else(|| faded_base(theme)),
-    ));
+        .into();
     let indicator = match status {
         Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -181,27 +125,6 @@ fn row_painted(
         .spacing(step::GAP_S)
         .align_y(Alignment::Center);
     if let Some(toggle) = toggle {
-        let cosmic::theme::Button::Custom {
-            active,
-            disabled,
-            hovered,
-            pressed,
-        } = crate::ui_controls::control_style(false, None)
-        else {
-            unreachable!("control_style draws a custom button");
-        };
-        let paint = move |style: widget::button::Style, theme: &cosmic::Theme| {
-            let backdrop = base(theme);
-            let color = match style.background {
-                Some(iced::Background::Color(color)) => over(color, backdrop),
-                _ => backdrop,
-            };
-            surface.set(Some(color));
-            style
-        };
-        let active_paint = paint.clone();
-        let hovered_paint = paint.clone();
-        let pressed_paint = paint.clone();
         crate::interaction::a11y_target(
             widget::button::custom(line)
                 .name(name)
@@ -210,18 +133,7 @@ fn row_painted(
                 } else {
                     "Expand details"
                 })
-                .class(cosmic::theme::Button::Custom {
-                    active: Box::new(move |focused, theme| {
-                        active_paint(active(focused, theme), theme)
-                    }),
-                    disabled: Box::new(move |theme| paint(disabled(theme), theme)),
-                    hovered: Box::new(move |focused, theme| {
-                        hovered_paint(hovered(focused, theme), theme)
-                    }),
-                    pressed: Box::new(move |focused, theme| {
-                        pressed_paint(pressed(focused, theme), theme)
-                    }),
-                })
+                .class(crate::ui_controls::control_style(false, None))
                 .width(Length::Fill)
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(toggle)),
@@ -234,15 +146,6 @@ fn row_painted(
     }
 }
 
-fn over(foreground: iced::Color, background: iced::Color) -> iced::Color {
-    iced::Color {
-        r: foreground.r * foreground.a + background.r * (1.0 - foreground.a),
-        g: foreground.g * foreground.a + background.g * (1.0 - foreground.a),
-        b: foreground.b * foreground.a + background.b * (1.0 - foreground.a),
-        a: 1.0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,17 +155,6 @@ mod tests {
         for (ms, expected) in [(0, "0s"), (999, "0s"), (12_999, "12s"), (65_000, "1m 5s")] {
             assert_eq!(duration(ms), expected);
         }
-    }
-
-    #[test]
-    fn translucent_control_paint_blends_into_its_actual_surface() {
-        assert_eq!(
-            over(
-                iced::Color::from_rgba(1.0, 1.0, 1.0, 0.25),
-                iced::Color::BLACK
-            ),
-            iced::Color::from_rgb(0.25, 0.25, 0.25)
-        );
     }
 
     #[test]
