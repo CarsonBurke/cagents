@@ -99,6 +99,9 @@ struct Highlighted {
 #[derive(Default)]
 struct State {
     spans: Vec<Span<'static, (), Font>>,
+    /// The font system's version the paragraph was shaped against: a font
+    /// loaded since may shape it differently.
+    fonts: Option<cosmic::iced::advanced::graphics::text::Version>,
     paragraph: Paragraph,
     /// Where the highlighted spans lie across the line, from its start.
     marks: Vec<Range<f32>>,
@@ -115,7 +118,7 @@ impl Highlighted {
             // natural width whatever room the line is given.
             bounds: Size::new(f32::INFINITY, f32::INFINITY),
             size: Pixels(design::TEXT_BODY),
-            line_height: LineHeight::default(),
+            line_height: LineHeight::Absolute(Pixels(design::LINE_BODY)),
             font: self.font,
             align_x: core_text::Alignment::Default,
             align_y: alignment::Vertical::Top,
@@ -146,15 +149,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Highlighted {
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
-        if state.spans != self.spans {
+        let fonts = cosmic::iced::advanced::graphics::text::font_system()
+            .read()
+            .map_or(None, |fonts| Some(fonts.version()));
+        if state.spans != self.spans || state.fonts != fonts {
             state.paragraph = Paragraph::with_spans(self.text(&self.spans));
+            // Set right to left, matches lie across the line in the
+            // opposite order to the text's; drawing walks them left to right.
             state.marks = self
                 .highlighted
                 .iter()
                 .flat_map(|index| state.paragraph.span_bounds(*index))
                 .map(|bounds| bounds.x..bounds.x + bounds.width)
                 .collect();
+            state.marks.sort_by(|a, b| a.start.total_cmp(&b.start));
             state.spans = self.spans.clone();
+            state.fonts = fonts;
         }
         layout::Node::new(limits.resolve(
             Length::Shrink,
@@ -178,12 +188,27 @@ impl<Message> Widget<Message, Theme, Renderer> for Highlighted {
         let base = style.text_color;
         let accent = theme.style(&self.highlight).color.unwrap_or(base);
         let natural = state.paragraph.min_bounds().width;
-        // Text that fits is drawn whole; up and down the viewport decides.
+        // Across, only the fade and the cuts between colours clip: ink that
+        // overhangs the line's ends, such as a bold glyph's, is drawn as
+        // plain text draws it. Up and down the viewport decides.
+        let open = |region: Rectangle, end: bool| {
+            let start = viewport.x.min(region.x);
+            let right = if end {
+                viewport.x + viewport.width
+            } else {
+                region.x + region.width
+            };
+            Rectangle {
+                x: start,
+                width: (right - start).max(0.0),
+                ..region
+            }
+        };
         let regions: Vec<(Rectangle, f32)> = if natural <= bounds.width + 0.5 {
-            vec![(bounds, 1.0)]
+            vec![(open(bounds, true), 1.0)]
         } else {
             let (solid, fade) = split(bounds, FadeEdge::End);
-            std::iter::once((solid, 1.0))
+            std::iter::once((open(solid, false), 1.0))
                 .chain(steps(fade, FadeEdge::End))
                 .collect()
         };
@@ -325,5 +350,31 @@ mod tests {
         assert_eq!(marks.len(), 2);
         assert!(marks[0].start > 0.0 && marks[0].end < marks[1].start);
         assert!(marks[1].end <= marked + 0.5);
+    }
+
+    #[test]
+    fn matches_set_right_to_left_are_marked_left_to_right() {
+        // Two matches in a Hebrew title: the first lies to the right.
+        let title = "שלום עולם ושלום";
+        let first = 0..title.find(' ').unwrap();
+        let last = title.rfind(' ').unwrap() + 1..title.len();
+        let mut line: Element<'_, ()> =
+            fade_highlighted(title, &[first, last], cosmic::theme::Text::Accent);
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(line.as_widget());
+        line.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+        );
+        let marks = &tree.state.downcast_ref::<State>().marks;
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        assert!(marks[0].end <= marks[1].start + 0.5, "{marks:?}");
+        // Both matches are drawn in the highlight across a clip of the line.
+        let highlighted = pieces(0.0..400.0, 0.0, marks)
+            .into_iter()
+            .filter(|(_, highlighted)| *highlighted)
+            .count();
+        assert_eq!(highlighted, 2);
     }
 }
