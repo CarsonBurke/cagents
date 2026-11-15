@@ -562,7 +562,11 @@ fn an_empty_channel_is_not_retired_under_a_conversation_it_has_not_published() {
             accepted_first_send(&mut world);
         }
         while world.published.try_recv().is_ok() {}
-        world.app.channel_ui.retire_candidates.insert(home);
+        world
+            .app
+            .channel_ui
+            .retire_candidates
+            .insert(home, crate::app::channel_ui::Retirement::Closed);
         world.app.retire_settled_empty_channels();
         let retired = std::iter::from_fn(|| world.published.try_recv().ok())
             .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. }));
