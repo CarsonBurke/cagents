@@ -419,6 +419,7 @@ pub fn overflow_fade_x<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Horizontal,
         fill: Box::new(crate::design::base),
+        leading: true,
     })
 }
 
@@ -445,7 +446,29 @@ pub fn overflow_fade_y<'a, Message: 'a>(
         content: content.into(),
         axis: Axis::Vertical,
         fill: Box::new(fill),
+        leading: true,
     })
+}
+
+/// As [`overflow_fade_y`], but at the bottom edge only: for a list whose
+/// top edge its own pinned headers hold, which a fade there would cover.
+pub fn overflow_fade_bottom<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(OverflowFade {
+        content: content.into(),
+        axis: Axis::Vertical,
+        fill: Box::new(fill),
+        leading: false,
+    })
+}
+
+/// Fades what passes under a pinned header, `area` being the stretch just
+/// below it, into `color`: transparent at the area's bottom, `color` where it
+/// meets the header.
+pub(crate) fn fade_below_header(renderer: &mut Renderer, area: Rectangle, color: Color) {
+    fill_overflow_fade(renderer, area, Edge::Top, color);
 }
 
 /// Fade into the actual surface behind a strip, including an enclosing
@@ -461,6 +484,7 @@ pub fn overflow_fade_x_on<'a, Message: 'a>(
             a: 1.0,
             ..surface(theme)
         }),
+        leading: true,
     })
 }
 
@@ -1476,6 +1500,8 @@ struct OverflowFade<'a, Message> {
     content: Element<'a, Message>,
     axis: Axis,
     fill: Box<dyn Fn(&Theme) -> Color + 'a>,
+    /// Whether the leading edge (top or left) fades too.
+    leading: bool,
 }
 
 /// How far the fade reaches at the start and the end of the strip.
@@ -1670,7 +1696,10 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             cursor,
             viewport,
         );
-        let state = *tree.state.downcast_ref::<OverflowState>();
+        let mut state = *tree.state.downcast_ref::<OverflowState>();
+        if !self.leading {
+            state.start = 0.0;
+        }
         if state.start <= 0.0 && state.end <= 0.0 {
             return;
         }

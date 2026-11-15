@@ -6191,17 +6191,30 @@ fn project_scroll(
     filter: SidebarFilter,
     viewport: row_interaction::StickyViewport,
 ) -> Element<'_, SidebarAction> {
-    RowInteraction::filtered_scroll(
-        widget::scrollable(content)
-            .id(stable_id("projects.scroll"))
-            .direction(sidebar_scroll_direction())
-            .class(cosmic::style::iced::Scrollable::Minimal)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        filter,
-        viewport,
+    // Rows passing the list's bottom edge fade into the pane. Its top edge
+    // is a pinned project header's, which fades what passes under it. The
+    // fade wraps the filtered scroll, whose direct child must stay the
+    // scrollable: it swaps that child's state between filters.
+    crate::interaction::overflow_fade_bottom(
+        RowInteraction::filtered_scroll(
+            widget::scrollable(content)
+                .id(stable_id("projects.scroll"))
+                .direction(sidebar_scroll_direction())
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            filter,
+            viewport,
+        ),
+        pinned_header_fill,
     )
+}
+
+/// The pane's own fill, which a pinned project header is painted with and
+/// rows passing an edge of the list fade into.
+fn pinned_header_fill(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    cosmic::iced::Color::from(theme.cosmic().primary(false).base)
 }
 
 fn loading() -> Element<'static, SidebarAction> {
@@ -14226,15 +14239,40 @@ mod row_interaction {
                     cursor,
                     viewport,
                 );
+                // How far the header has travelled from its place in the list:
+                // rows are passing under it while it is pinned.
+                let pinned = header.bounds().y - layout.bounds().y;
+                if pinned > 0.0 {
+                    // What passes under the header recedes into it rather
+                    // than being cut at its edge. The fade grows over the
+                    // first stretch of travel, so it never pops in.
+                    let area = Rectangle {
+                        y: header.bounds().y + header.bounds().height,
+                        height: pinned.min(crate::interaction::OVERFLOW_FADE),
+                        ..header.bounds()
+                    };
+                    if let Some(clip) = area
+                        .intersection(&layout.bounds())
+                        .and_then(|area| area.intersection(viewport))
+                    {
+                        renderer.with_layer(clip, |renderer| {
+                            crate::interaction::fade_below_header(
+                                renderer,
+                                area,
+                                super::pinned_header_fill(theme),
+                            );
+                        });
+                    }
+                }
                 if let Some(clip) = header.bounds().intersection(viewport) {
                     renderer.with_layer(clip, |renderer| {
-                        if header.bounds().y > layout.bounds().y {
+                        if pinned > 0.0 {
                             renderer.fill_quad(
                                 renderer::Quad {
                                     bounds: header.bounds(),
                                     ..Default::default()
                                 },
-                                cosmic::iced::Color::from(theme.cosmic().primary(false).base),
+                                super::pinned_header_fill(theme),
                             );
                         }
                         // Witness the actual header draw under the scrollable's translation.
