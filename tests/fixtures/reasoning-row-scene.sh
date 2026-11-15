@@ -354,12 +354,14 @@ if [ "$scene" = plan ]; then
     printf '40\n' >"$fixture/home/.codex/fixture-plan"
     spawn_scene codex fixture-mini 'Plan fixture: work through the recorded rows.' \
         "$fixture/state/reasoning-plan-spawn.json" 'Plan at work'
+    held_from=$SECONDS
     evidence drive wait 'Check the running items' --timeout 20 >/dev/null
     sleep 4
     scroll_top
     shot plan-working
-    # The plan's own heading reads "done", so wait for the turn to end.
-    evidence drive wait 'Steer this turn' --gone --timeout 60 >/dev/null
+    # The turn, already started, holds for the marker's 40 seconds; the
+    # screen has no text unique to the finished turn, so wait out the hold.
+    while ((SECONDS < held_from + 45)); do sleep 1; done
     sleep 2
     scroll_top
     shot plan-finished
