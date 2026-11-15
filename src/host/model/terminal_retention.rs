@@ -800,6 +800,18 @@ mod tests {
             }
             let view = super::super::views::read(&registry.db, &scope_value).unwrap();
             assert_eq!((view.revision, view.panes), (7, vec![pane.clone()]));
+            // Schema 25 records each session's channel, backfilled from the
+            // saved view so the terminal keeps it after its pane goes.
+            let Scope::Channel(channel) = &scope_value else {
+                panic!("outbox19 saves a channel view")
+            };
+            assert_eq!(
+                after.remove("session_channels").unwrap(),
+                vec![vec![
+                    rusqlite::types::Value::Text(terminal(&pane).to_string()),
+                    rusqlite::types::Value::Text(channel.to_string())
+                ]]
+            );
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
                 vec![vec![
