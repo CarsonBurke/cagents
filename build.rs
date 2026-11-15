@@ -1,4 +1,4 @@
-//! Stamps the executables with the version they can report about themselves.
+//! Finds the build metadata the checkout gives the executables.
 //!
 //! `CARGO_PKG_VERSION` is the product version and nothing more: every local
 //! build of `0.1.3` and every packaged `0.1.3` carry the same string, so a bug
@@ -6,15 +6,28 @@
 //! local archive after the commit it was built from (`0.1.3+local.3d80e6d`),
 //! and that metadata has to reach the binary inside it as well.
 //!
-//! The version is resolved once here, in this order:
+//! An executable states its version with `cagents::stamp_version!()`, which
+//! reads, in this order:
 //!
-//! 1. `CAGENTS_BUILD_METADATA`, when the packaging script sets it, which is
-//!    the metadata it also uses for the archive name.
-//! 2. The Git checkout the build runs from, when there is one: no metadata at
-//!    all when `HEAD` is exactly the release tag for the manifest version and
-//!    the tree is clean, otherwise `local.<short sha>` with `.dirty` appended
-//!    for uncommitted changes.
+//! 1. `CAGENTS_BUILD_METADATA`, when the packaging script or the build gate
+//!    sets it, which is the metadata the packaging step also uses for the
+//!    archive name.
+//! 2. `CAGENTS_CHECKOUT_METADATA`, which this script sets from the Git
+//!    checkout the build runs from, when there is one: nothing when `HEAD` is
+//!    exactly the release tag for the manifest version and the tree is clean,
+//!    otherwise `local.<short sha>` with `.dirty` appended for uncommitted
+//!    changes.
 //! 3. Nothing, for a source export with no `.git` - a release build.
+//!
+//! Only the executables read either variable. A build script's rerun, or a
+//! change to a variable it watches, recompiles every target of the package,
+//! including the whole library, so this script never reads
+//! `CAGENTS_BUILD_METADATA`: Cargo tracks it in the dep-info of each executable
+//! that reads it, and a new value relinks only those. A driver that supplies
+//! the metadata for every build also sets `CAGENTS_BUILD_METADATA_SUPPLIED=1`,
+//! whose value does not change between commits, and then this script does not
+//! consult the checkout at all. Otherwise its watches below rerun it, and
+//! recompile the library, when the checkout's stamp could change.
 //!
 //! The self-updater verifies the complete installed version against this
 //! stamp, then ignores build metadata when comparing it with stable releases.
@@ -23,118 +36,16 @@
 // the checkout when Cargo shares path-package artifacts across worktrees.
 const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 fn main() {
-    // The browser bundles HarfBuzz while system FreeType loads system HarfBuzz.
-    // Exporting either bundled font API lets the dynamic loader mix their state.
-    // Localize only these definitions in the final Linux browser UI; imported
-    // system functions and unrelated runtime exports retain their usual binding.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
-        && std::env::var_os("CARGO_FEATURE_INTEGRATED_BROWSER").is_some()
-    {
-        let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-        let map = output.join("linux-ui-font-symbols.map");
-        std::fs::write(&map, "{ local: hb_*; FT_*; };\n")
-            .expect("write Linux browser UI font symbol map");
-        // Forward the complete path as one linker argument, including commas.
-        // The compiler driver splits -Wl arguments at commas in filesystem paths.
-        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
-        println!("cargo:rustc-link-arg-bin=cagents-ui=--version-script");
-        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
-        println!("cargo:rustc-link-arg-bin=cagents-ui={}", map.display());
-    }
     println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
-    println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");
-    let base = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
-    let metadata = match std::env::var("CAGENTS_BUILD_METADATA") {
-        Ok(metadata) if !metadata.trim().is_empty() => Some(metadata.trim().to_owned()),
-        _ => git_metadata(&base),
-    };
-    let version = match metadata.filter(|metadata| valid_metadata(metadata)) {
-        Some(metadata) => format!("{base}+{metadata}"),
-        None => base,
-    };
-    println!("cargo:rustc-env=CAGENTS_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA_SUPPLIED");
+    if std::env::var_os("CAGENTS_BUILD_METADATA_SUPPLIED").is_some_and(|value| value == "1") {
+        return;
+    }
+    let checkout = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
+    stamp_checkout_metadata(&checkout);
 }
 
-/// Semantic-versioning build metadata: dot-separated ASCII alphanumerics and
-/// hyphens. Anything else would make `--version` print something the
-/// packaging step's own version check rejects.
-fn valid_metadata(metadata: &str) -> bool {
-    !metadata.is_empty()
-        && metadata.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
-fn git(manifest: &Path, arguments: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(manifest)
-        .args(arguments)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    Some(text.trim().to_owned())
-}
-
-fn git_metadata(base: &str) -> Option<String> {
-    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    // A source export has no repository, and then there is nothing to say.
-    let head = git(&manifest, &["rev-parse", "--git-path", "HEAD"])?;
-    let head = if Path::new(&head).is_absolute() {
-        PathBuf::from(head)
-    } else {
-        manifest.join(head)
-    };
-    // Rebuild when the checkout moves: the HEAD file itself, the ref it points
-    // at when it is symbolic, and the index, which every commit rewrites. That
-    // covers a commit on a packed branch, whose new loose ref leaves
-    // packed-refs alone; a ref move that keeps the index, such as `update-ref`,
-    // leaves a stale short SHA until the next rebuild.
-    println!("cargo:rerun-if-changed={}", head.display());
-    if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"]) {
-        // Cargo treats a watched path that does not exist as always changed,
-        // so watching a packed branch's loose file would rebuild this crate
-        // on every invocation. Watch the file the ref actually lives in.
-        let path = git(&manifest, &["rev-parse", "--git-path", &reference])
-            .map(|path| manifest.join(path))
-            .filter(|path| path.exists())
-            .or_else(|| {
-                git(&manifest, &["rev-parse", "--git-path", "packed-refs"])
-                    .map(|path| manifest.join(path))
-                    .filter(|path| path.exists())
-            });
-        if let Some(path) = path {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-    if let Some(index) = git(&manifest, &["rev-parse", "--git-path", "index"]) {
-        println!("cargo:rerun-if-changed={index}");
-    }
-    let sha = git(&manifest, &["rev-parse", "--short", "HEAD"])?;
-    let dirty = git(
-        &manifest,
-        &["status", "--porcelain", "--untracked-files=no"],
-    )
-    .is_some_and(|status| !status.is_empty());
-    let release_tag = format!("v{base}");
-    let at_release = git(&manifest, &["tag", "--points-at", "HEAD"])
-        .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag));
-    if at_release && !dirty {
-        return None;
-    }
-    Some(if dirty {
-        format!("local.{sha}.dirty")
-    } else {
-        format!("local.{sha}")
-    })
-}
+include!("build/checkout_metadata.rs");

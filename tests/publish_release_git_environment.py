@@ -97,7 +97,7 @@ class PublisherGitEnvironment(unittest.TestCase):
     def repository(self, name):
         repository = self.directory / name
         repository.mkdir()
-        for relative in ("Cargo.toml", "crates/ceditor/Cargo.toml"):
+        for relative in ("Cargo.toml", "crates/cagents-ui/Cargo.toml", "crates/ceditor/Cargo.toml"):
             path = repository / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f'[package]\nname = "fixture"\nversion = "{VERSION}"\n')

@@ -1,2 +1,190 @@
+# The supported command interface for developing, checking, testing and
+# packaging cagents: `mise tasks` lists it and `mise run TASK --help` explains a
+# task. Tasks compose the scripts in scripts/, which keep the process, build
+# admission and verification logic; Cargo keeps dependency resolution and
+# compilation. See docs/development.md#tasks.
+
 [tools]
 zig = "0.15.2"
+
+# Each implementation graph is its own Cargo invocation. Cargo features are
+# package-wide, so no task combines `host` with `ui`. The UI lanes select the
+# cagents-ui package, which holds the application; `ui` also selects the shared
+# library, so one invocation covers both packages' targets in that graph.
+[vars]
+cli = "--locked --no-default-features"
+host = "--locked --no-default-features --features host"
+ui = "--locked --no-default-features --package cagents --package cagents-ui --features cagents/ui"
+browser = "--locked --package cagents-ui --features integrated-browser"
+editor = "--locked --package ceditor"
+# Cargo arguments a lane task forwards. Naming any replaces the default target
+# selection, so `-- --lib terminal::` narrows a lane instead of adding to it.
+# mise passes the arguments shell-quoted in $usage_cargo_args; each lane task
+# restores them with `eval "set -- $usage_cargo_args"`.
+# An aggregate refuses arguments rather than silently running every lane whole:
+# narrow one lane instead, such as `mise run test:host -- --lib terminal::`.
+# Each aggregate's first step checks; mise would expand its $ here in [vars].
+no_arguments = 'arg "[unexpected]..." var=#true hide=#true'
+all_targets = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+
+# Setup ----------------------------------------------------------------------
+
+[tasks.setup]
+description = "Install the pinned Zig and Rust toolchains, then run the doctor"
+run = [
+  "mise install",
+  'command -v rustup >/dev/null || { echo "rustup is required to install Rust: https://rustup.rs/" >&2; exit 1; }',
+  # The channel, profile and components rust-toolchain.toml names, spelled out
+  # for rustup releases that cannot read the file. Updating rustup itself stays
+  # the user's decision.
+  '''eval "set -- $(/usr/bin/python3 -I -c 'import shlex, tomllib; t = tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]; print(shlex.join([t["channel"], "--profile", t.get("profile", "minimal"), *(f"--component={c}" for c in t.get("components", ()))]))')" && rustup toolchain install --no-self-update "$@"''',
+]
+depends_post = ["doctor"]
+
+[tasks.doctor]
+description = "Report missing prerequisites and whether the build host answers"
+run = "scripts/doctor"
+
+# Development ----------------------------------------------------------------
+# The runner builds the matched CLI, UI and daemon through the build gate and
+# runs them as the isolated development instance. `raw` keeps the terminal
+# attached so Ctrl+C and the runner's prompts reach it.
+
+[tasks.dev]
+description = "Run the browserless development UI (arguments go to scripts/run-development)"
+raw = true
+run = "scripts/run-development --browserless"
+
+[tasks."dev:browser"]
+description = "Run the development UI with the embedded Servo browser"
+raw = true
+run = "scripts/run-development"
+
+# Checks ---------------------------------------------------------------------
+# Every compiling command goes through scripts/cargo-gate, which admits it to a
+# build slot on the build host. Cargo decides what is stale; nothing here is
+# task-cached.
+
+[tasks."check:cli"]
+description = "Type-check the control CLI lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.cli}} "$@"'
+
+[tasks."check:host"]
+description = "Type-check the terminal daemon lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.host}} "$@"'
+
+[tasks."check:ui"]
+description = "Type-check the browserless UI lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.ui}} "$@"'
+
+[tasks."check:browser"]
+description = "Type-check the integrated-browser UI lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.browser}} "$@"'
+
+[tasks."check:editor"]
+description = "Type-check the standalone ceditor package"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--bin=ceditor" help="Cargo arguments, after --; they replace the default --bin=ceditor"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate check {{vars.editor}} "$@"'
+
+[tasks.check]
+description = "Type-check every target of the CLI, host and UI lanes, each admitted on its own"
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
+
+[tasks."check:protocol"]
+description = "Check the IPC source contract, older-client proofs and live-update sources against a base"
+usage = 'flag "--base <ref>" help="Comparison base (default: the merge base with origin/main)"'
+run = [
+  # An empty base would check only the current snapshot, so a missing one fails.
+  '''base=${usage_base-}
+  if [ -z "$base" ]; then
+      base=$(git merge-base HEAD origin/main) || { echo "no merge base with origin/main; fetch it or pass --base REF" >&2; exit 2; }
+  fi
+  exec scripts/check-protocol-contract --base-ref "$base"''',
+  "scripts/check-older-clients",
+  "scripts/check-update-sources",
+]
+
+# Tests ----------------------------------------------------------------------
+# The gate builds each lane's tests in a slot and runs them afterwards under a
+# memory limit. HOST tests get their matched daemon helper automatically.
+
+[tasks."test:cli"]
+description = "Test the control CLI lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test {{vars.cli}} "$@"'
+
+[tasks."test:host"]
+description = "Test the terminal daemon lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test {{vars.host}} "$@"'
+
+[tasks."test:ui"]
+description = "Test the browserless UI lane"
+usage = "{{vars.all_targets}}"
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test {{vars.ui}} "$@"'
+
+[tasks.test]
+description = "Test every target of the CLI, host and UI lanes, one lane after another"
+# In sequence: each lane's tests run outside the build slot, and three suites
+# at once would compete for memory and interleave thousands of result lines.
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { task = "test:cli" }, { task = "test:host" }, { task = "test:ui" }]
+
+[tasks."test:lib"]
+description = "Build one lane's library tests once and run the named ones (see scripts/test-lib --help)"
+run = "scripts/test-lib"
+
+[tasks."test:scripts"]
+description = "Verify and run the script contract suites CI runs (optionally one JOB [SHARD])"
+usage = '''
+arg "[job]" help="One job, such as tooling; default: every job unsharded, then the source job's suites"
+arg "[shard]" help="I/N shard of a sharded job"
+'''
+run = [
+  "/usr/bin/python3 -I -B scripts/script-contracts verify",
+  '/usr/bin/python3 -I -B scripts/script-contracts run ${usage_job:+"$usage_job"} ${usage_shard:+"$usage_shard"}',
+]
+
+# Formatting -----------------------------------------------------------------
+
+[tasks.fmt]
+description = "Format Cargo roots and the Rust sources behind include! in place"
+run = "scripts/check-format --write"
+
+[tasks."fmt:check"]
+description = "Check formatting without rewriting anything"
+run = "scripts/check-format"
+
+# What GitHub CI runs; none of it compiles Rust.
+[tasks.ci]
+description = "Run the checks GitHub CI runs: formatting, protocol contracts and script suites"
+usage = "{{vars.no_arguments}}"
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
+
+# Packaging and release ------------------------------------------------------
+
+[tasks.install]
+description = "Build the committed HEAD and replace your installed cagents (see scripts/install-local --help)"
+raw = true
+run = "scripts/install-local"
+
+[tasks.package]
+description = "Build and check Linux packages from this checkout (scripts/package-linux.sh)"
+run = "scripts/package-linux.sh"
+
+[tasks."package:smoke"]
+description = "Install, upgrade and remove fixture packages in a networkless root"
+run = "scripts/smoke-package-upgrades"
+
+[tasks."release:build"]
+description = "Build an exact tag in the glibc-baseline release environment (--ref TAG --output DIR)"
+run = "scripts/build-release-linux"
+
+[tasks."release:verify"]
+description = "Verify a release bundle without publishing it (--version VERSION --dist DIR)"
+run = "scripts/publish-release --verify-only"

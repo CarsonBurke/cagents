@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Reuse a successful explicit rustfmt check only for identical local inputs.
 
 This is optional acceleration. Any source graph, tool, or filesystem input that

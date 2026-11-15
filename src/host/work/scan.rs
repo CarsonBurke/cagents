@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -43,6 +44,9 @@ pub(super) struct Worktree {
     pub link: Option<LinkedIssue>,
     /// Why this worktree's status could not be read; its siblings still were.
     pub error: Option<String>,
+    /// When `dirty` was last read from Git, so a poll can re-read only the
+    /// worktrees that are due.
+    pub status_read_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,10 +183,14 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             dirty: None,
             link: None,
             error: None,
+            status_read_at: None,
         };
         if reread {
             match git.activity_status(&record.path, cancellation) {
-                Ok(status) => apply_status(&mut worktree, &status),
+                Ok(status) => {
+                    apply_status(&mut worktree, &status);
+                    worktree.status_read_at = Some(Instant::now());
+                }
                 // Its own removal is often what the scan was woken for, and
                 // one missing checkout must not fail its siblings.
                 Err(_) if checkout_removed(&record.path) => continue,
@@ -190,6 +198,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             }
         } else if let Some(old) = old {
             worktree.dirty = old.dirty.clone();
+            worktree.status_read_at = old.status_read_at;
             if worktree.head.is_none() {
                 worktree.head = old.head.clone();
             }
@@ -708,6 +717,23 @@ mod tests {
         };
         assert_eq!(dirty(&second, &fixture.root), 1);
         assert_eq!(dirty(&second, &fixture.linked), 1, "not re-read");
+        // Each worktree remembers when its status was last read, which the
+        // board's polls are scheduled from.
+        let read_at = |local: &Local, path: &Path| {
+            local
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .unwrap()
+                .status_read_at
+                .unwrap()
+        };
+        assert!(read_at(&second, &fixture.root) > read_at(&first, &fixture.root));
+        assert_eq!(
+            read_at(&second, &fixture.linked),
+            read_at(&first, &fixture.linked),
+            "carried forward with the status it dates"
+        );
         let third = run(
             &fixture,
             Some(&second),
@@ -717,6 +743,7 @@ mod tests {
             },
         );
         assert_eq!(dirty(&third, &fixture.linked), 0);
+        assert!(read_at(&third, &fixture.linked) > read_at(&second, &fixture.linked));
 
         // A shared ref change re-reads the worktree whose head it moved and
         // carries the others forward.

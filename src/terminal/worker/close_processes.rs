@@ -349,7 +349,10 @@ fn threads_quiescent(pid: libc::pid_t, deadline: Instant) -> Result<bool, String
         check_deadline(deadline)?;
         let stat = match fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            // A thread can vanish before the open (ENOENT) or after it (ESRCH).
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                return Ok(false);
+            }
             Err(error) => return Err(error.to_string()),
         };
         let process = parse_process(tid, &stat).ok_or("Invalid terminal thread identity")?;
