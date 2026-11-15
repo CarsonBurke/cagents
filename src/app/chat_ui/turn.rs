@@ -72,6 +72,10 @@ pub(super) struct Turn {
     /// Set while any step in this group is still running, which is what marks
     /// the live group without needing a separate global flag.
     pub(super) running: bool,
+    /// Whether this group holds the newest step still running anywhere in the
+    /// transcript. Older running groups, such as one waiting on a background
+    /// command, leave the activity indicator to newer work.
+    pub(super) newest_running: bool,
     /// A failure anywhere in the group, or its last resolved state otherwise.
     /// Collapsing the group must not hide a failed step behind later success.
     pub(super) outcome: Option<ToolStatus>,
@@ -105,6 +109,7 @@ impl Turn {
             steps: Vec::new(),
             prose: Vec::new(),
             running: false,
+            newest_running: false,
             outcome: None,
             started_at: item.and_then(|item| item.started_at.or(item.at)),
             ended_at: item.and_then(|item| item.at),
@@ -318,6 +323,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
     let coordinated = |item: &Item| presented.coordinated(item);
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
+    let mut newest_running = None;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
         if !renders(&item.content) {
             continue;
@@ -354,6 +360,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         }
         // `turns` is non-empty: the branch above pushes when it would be, and
         // the states that skip it only occur once a group exists.
+        let at = turns.len() - 1;
         let turn = turns.last_mut().expect("a group is open");
         let status = item.content.status();
         match coordinated(item) {
@@ -366,8 +373,16 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     turn.running = true;
                 }
             }
-            Some(step) => turn.observe(status.map(|status| step.reading.status(status))),
-            None => turn.observe(status),
+            coordinated => {
+                let status = match coordinated {
+                    Some(step) => status.map(|status| step.reading.status(status)),
+                    None => status,
+                };
+                if slot == Slot::Step && status == Some(ToolStatus::Running) {
+                    newest_running = Some(at);
+                }
+                turn.observe(status);
+            }
         }
         turn.spans(item);
         match slot {
@@ -386,6 +401,9 @@ pub(super) fn group<'c, T: Borrow<Item>>(
     }
     for turn in &mut turns {
         turn.describe(items, &presented);
+    }
+    if let Some(turn) = newest_running.and_then(|at| turns.get_mut(at)) {
+        turn.newest_running = true;
     }
     turns
 }
