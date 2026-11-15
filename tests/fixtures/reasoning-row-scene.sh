@@ -322,8 +322,9 @@ if [ "$scene" = activity ]; then
     exit 0
 fi
 
-# Subagents still working after the lead has answered, beside an older
-# background command: the transcript keeps one activity indicator.
+# Subagents still working after the lead has answered, beside a finished one
+# and an older background command: the transcript keeps one activity
+# indicator.
 if [ "$scene" = agents ]; then
     cp "$here/reasoning-row-scene/agents.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"

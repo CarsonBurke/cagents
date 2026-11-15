@@ -316,9 +316,9 @@ turn.
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
 ```
 
-`agents` has the lead start a background command and two background
-subagents, then answer, so the subagents and the command are still working
-after the lead has finished. `plan` needs a session started with
+`agents` has the lead start a background command and three background
+subagents, one of which finishes before the lead answers, so two subagents
+and the command are still working after the lead has finished. `plan` needs a session started with
 `--codex tool-rows`: its Codex turn publishes a plan with a step in progress
 beside the running tool, collaboration and event rows, stays working for 40
 seconds through `CODEX_HOME/fixture-plan`, then finishes.
