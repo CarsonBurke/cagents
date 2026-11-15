@@ -20,7 +20,10 @@ pub mod build_version;
 pub mod names;
 pub(crate) mod native_chat_capacity;
 pub mod search_match;
-#[cfg(test)]
+// The repository fixtures the UI crate's tests share allocate through this;
+// that build uses only part of it.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod test_fixture;
 
 pub mod account;
