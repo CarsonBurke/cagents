@@ -44,6 +44,7 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
+            .width(Length::Fill)
             .height(height),
             design::dialog_base,
         ))
