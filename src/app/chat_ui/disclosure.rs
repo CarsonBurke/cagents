@@ -72,15 +72,16 @@ impl Headline {
                 .edge(crate::ui_controls::FadeEdge::Start)
                 .width(Length::Fill)
                 .into(),
-            // The space leads the path, so it is drawn while the path fits
-            // and fades with it once the path no longer does.
+            // The gap stands for the space between the words, outside the
+            // path, so the fade never takes it.
             Self::Path { verb, path } => widget::row::with_children(vec![
                 line(verb).into(),
-                line(format!(" {path}"))
+                line(path)
                     .edge(crate::ui_controls::FadeEdge::Start)
                     .width(Length::Fill)
                     .into(),
             ])
+            .spacing(space::XS)
             .width(Length::Fill)
             .into(),
         }
