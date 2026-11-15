@@ -29,6 +29,15 @@ impl From<ChannelId> for Scope {
     }
 }
 
+/// How long the daemon remembers an applied `ChangeView` operation, so a
+/// client that lost the reply can resend it and be told it already happened.
+/// A client must stop resending well before this; the window's publisher stops
+/// after a day.
+pub const OPERATION_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+pub const REMOVAL_SOURCE_CONFLICT: &str = "workspace view removal source conflict";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: CardId,
@@ -148,11 +157,7 @@ impl<'a> ManagedDisplayIndex<'a> {
     /// Shared alias reconciliation may retire an alias before canonical
     /// adoption. Fence replaced/ambiguous canonical evidence without blocking
     /// that existing migration path merely because an alias is present.
-    pub(crate) fn permits_projection(
-        &self,
-        agent: &crate::agent_execution::Agent,
-        pane: &Pane,
-    ) -> bool {
+    pub fn permits_projection(&self, agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
         let id = CardId::from_uuid(agent.id.as_uuid());
         let matches = |pane: &Pane| {
             managed_pane_matches(agent, pane)
@@ -422,7 +427,7 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
         }
         _ => return false,
     };
-    agent
+    if agent
         .session
         .as_ref()
         .is_some_and(|session| session.same_process(&current))
@@ -430,6 +435,73 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
             .console
             .as_ref()
             .is_some_and(|session| HostedSession::Terminal(session.clone()).same_process(&current))
+    {
+        return true;
+    }
+    // A stopped pane retains its managed identity while paging the captured
+    // transcript under the successor. This grants display membership only;
+    // the agent's execution descriptor and accepted run remain unchanged.
+    match (&agent.session, &current) {
+        (Some(HostedSession::Chat(original)), HostedSession::Chat(current)) => {
+            crate::upgrade::floor::display_snapshot().history_replacement(original, current)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TerminalRemovalBasis {
+    Worker {
+        owner: crate::model::HostSessionProof,
+        instance: uuid::Uuid,
+    },
+    /// Captured before the positive process-absence check, never refreshed
+    /// after that check. Eviction also invalidates an absence observation.
+    Absent {
+        owner: crate::model::HostSessionProof,
+        latest_worker: Option<uuid::Uuid>,
+        history_epoch: u64,
+    },
+}
+
+impl TerminalRemovalBasis {
+    /// Whether an observation continues the authority captured by Close.
+    pub fn follows_captured(&self, captured: Option<&Self>) -> bool {
+        match (captured, self) {
+            (
+                Some(Self::Worker {
+                    owner: a,
+                    instance: x,
+                }),
+                Self::Worker {
+                    owner: b,
+                    instance: y,
+                },
+            ) => a == b && x == y,
+            (
+                Some(Self::Worker { owner: a, instance }),
+                Self::Absent {
+                    owner: b,
+                    latest_worker,
+                    ..
+                },
+            ) => a != b || latest_worker == &Some(*instance),
+            (Some(existing), next) => existing == next,
+            (None, _) => false,
+        }
+    }
+}
+
+/// The authoritative view the person saw when Close began. Revisions alone
+/// are insufficient across store conversions, so retain the model watermark too.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CapturedTerminalSource {
+    pub registry: uuid::Uuid,
+    pub repository: PathBuf,
+    pub scope: Scope,
+    pub view_revision: u64,
+    pub model_sequence: u64,
+    pub before: Pane,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -457,6 +529,36 @@ pub enum Change {
     InsertIfEmpty {
         pane: Pane,
     },
+    /// Close consent belongs to this original source, across revision retries.
+    /// Explicit administrative Remove retains its current-membership semantics.
+    RemoveSource {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+        before: Pane,
+        terminal: Option<TerminalRemovalBasis>,
+        #[serde(default)]
+        capture: Option<CapturedTerminalSource>,
+    },
+    /// A runtime receipt cannot publish a predecessor's exit over its replacement.
+    UpdateTerminalSource {
+        before: Pane,
+        pane: Pane,
+        worker: TerminalRemovalBasis,
+    },
+}
+
+impl Change {
+    /// The pane this change is about.
+    pub fn pane_id(&self) -> CardId {
+        match self {
+            Self::Insert { pane, .. }
+            | Self::InsertIfEmpty { pane }
+            | Self::Update { pane, .. }
+            | Self::UpdateTerminalSource { pane, .. } => pane.id,
+            Self::Transfer { id, .. } | Self::Remove { id } | Self::Move { id, .. } => *id,
+            Self::RemoveSource { before, .. } => before.id,
+        }
+    }
 }
 
 impl View {
@@ -475,6 +577,20 @@ impl View {
             panes: Vec::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Whether an update from `before` to `pane` has to be refused because the
+    /// source it changes moved on. Revision-only retries must not replay an old
+    /// source over a successor or undo host-owned start/location changes. A
+    /// result that already holds replays nothing: windows reopening together
+    /// all report the same attachment.
+    pub fn source_update_conflicts(&self, before: &Pane, pane: &Pane) -> bool {
+        let holds = |source: &Pane| {
+            self.panes
+                .iter()
+                .any(|current| current.id == source.id && !updates_source(current, source))
+        };
+        updates_source(before, pane) && !holds(before) && !holds(pane)
     }
 
     /// Typed changes preserve unrelated edits; the daemon fences them with the
@@ -498,7 +614,7 @@ impl View {
                     self.panes.insert(index, pane.clone());
                 }
             }
-            Change::Update { before, pane } => {
+            Change::Update { before, pane } | Change::UpdateTerminalSource { before, pane, .. } => {
                 if before.id != pane.id {
                     return Err("pane identity cannot change".into());
                 }
@@ -533,6 +649,20 @@ impl View {
                     self.retired.push(*id);
                 }
             }
+            Change::RemoveSource { before, .. } => {
+                let mut sources = self.panes.iter().filter(|pane| pane.id == before.id);
+                if !sources
+                    .next()
+                    .is_some_and(|pane| same_removal_source(before, pane))
+                    || sources.next().is_some()
+                {
+                    return Err(REMOVAL_SOURCE_CONFLICT.into());
+                }
+                self.panes.retain(|pane| pane.id != before.id);
+                if !self.retired.contains(&before.id) {
+                    self.retired.push(before.id);
+                }
+            }
             Change::Move { id, before } => {
                 if before != &Some(*id) {
                     if let Some(index) = self.panes.iter().position(|pane| pane.id == *id) {
@@ -555,6 +685,132 @@ impl View {
 
 /// Compare two local projections. This is invoked only for local changes;
 /// adopting a host snapshot resets the projection baseline first.
+/// Whether going from `before` to `pane` changes more than presentation.
+pub fn updates_source(before: &Pane, pane: &Pane) -> bool {
+    before.kind != pane.kind
+        || before.pending_terminal_start != pane.pending_terminal_start
+        || before.scope != pane.scope
+}
+
+/// Presentation edits do not renew Close consent. An original terminal may
+/// finish, and a native conversation may stop, without becoming a successor.
+pub fn same_removal_source(before: &Pane, current: &Pane) -> bool {
+    before.id == current.id
+        && before.scope == current.scope
+        && before.pending_terminal_start == current.pending_terminal_start
+        && match (&before.kind, &current.kind) {
+            (CardKind::Terminal(before), CardKind::Terminal(current)) => {
+                let mut comparable = current.clone();
+                comparable.continuity = before.continuity.clone();
+                comparable == *before
+                    && current
+                        .continuity
+                        .live_proof()
+                        .is_none_or(|proof| before.continuity.live_proof() == Some(proof))
+            }
+            (CardKind::Chat(before), CardKind::Chat(current)) => {
+                let mut comparable = current.clone();
+                comparable.native_continuity = before.native_continuity.clone();
+                comparable == *before
+            }
+            (before, current) => shared_kind(before) == shared_kind(current),
+        }
+}
+
+pub fn removal_source_current(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+) -> bool {
+    let Change::RemoveSource { before, .. } = change else {
+        return false;
+    };
+    let mut owners = model.views.iter().flat_map(|view| {
+        view.panes
+            .iter()
+            .filter(move |pane| pane.id == before.id)
+            .map(move |pane| (&view.scope, pane))
+    });
+    let owner = owners.next();
+    owners.next().is_none() && removal_source_holds(model, scope, change, owner)
+}
+
+/// Whether `current`, the one pane holding the card, is the source a removal
+/// captured, in the registry and project the removal was captured under.
+pub fn removal_source_holds(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+    current: Option<(&Scope, &Pane)>,
+) -> bool {
+    let Change::RemoveSource {
+        registry,
+        repository,
+        before,
+        ..
+    } = change
+    else {
+        return false;
+    };
+    let owner = match scope {
+        Scope::Channel(id) => model.channel(*id).map(|channel| &channel.repository),
+        Scope::Worktree { repository, .. } => Some(repository),
+    };
+    if *registry == super::NO_REGISTRY
+        || *registry != model.identity
+        || owner != Some(repository)
+        || !model
+            .projects
+            .iter()
+            .any(|project| &project.repository == repository)
+    {
+        return false;
+    }
+    current.is_some_and(|(current_scope, pane)| {
+        current_scope == scope && same_removal_source(before, pane)
+    })
+}
+
+/// Exact cleanup can retire the original pane before its UI reply arrives.
+/// A successor or transfer with the same card ID is never an acknowledgement.
+pub fn removal_source_retired(
+    model: &super::WorkspaceModel,
+    scope: &Scope,
+    change: &Change,
+) -> bool {
+    let Change::RemoveSource {
+        registry,
+        repository,
+        before,
+        ..
+    } = change
+    else {
+        return false;
+    };
+    *registry != super::NO_REGISTRY
+        && model.identity == *registry
+        && match scope {
+            Scope::Channel(id) => model
+                .channel(*id)
+                .is_some_and(|channel| &channel.repository == repository),
+            Scope::Worktree {
+                repository: owner, ..
+            } => owner == repository,
+        }
+        && model
+            .projects
+            .iter()
+            .any(|project| &project.repository == repository)
+        && !model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == before.id))
+        && model
+            .views
+            .iter()
+            .any(|view| &view.scope == scope && view.retired.contains(&before.id))
+}
+
 pub fn changes(previous: &[Pane], desired: &[Pane]) -> Vec<Change> {
     let mut changes = Vec::new();
     let mut working = previous.to_vec();
@@ -747,6 +1003,63 @@ mod wire_kind {
 mod wire_tests {
     use super::*;
     use crate::model::*;
+    #[test]
+    fn a_missing_capture_cannot_acquire_a_later_absence_stamp() {
+        let later = TerminalRemovalBasis::Absent {
+            owner: crate::model::HostSessionProof {
+                host_session_id: "fixture".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "incarnation".into(),
+            },
+            latest_worker: Some(uuid::Uuid::new_v4()),
+            history_epoch: 0,
+        };
+        assert!(
+            !later.follows_captured(None),
+            "a replacement that finished before the delayed probe is still a replacement"
+        );
+    }
+
+    #[test]
+    fn delayed_close_does_not_remove_a_replacement_source() {
+        let original = Pane {
+            id: CardId::new(),
+            title: "original".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let removal = Change::RemoveSource {
+            registry: uuid::Uuid::new_v4(),
+            repository: "/repo".into(),
+            before: original.clone(),
+            terminal: None,
+            capture: None,
+        };
+        let mut replacement = original.clone();
+        if let CardKind::Browser(browser) = &mut replacement.kind {
+            browser.id = BrowserId::new();
+        }
+        let mut view = View::empty(ChannelId::new());
+        view.panes = vec![replacement.clone()];
+        assert!(
+            view.apply(&removal).is_err(),
+            "queued Close must refuse its replaced source"
+        );
+        assert_eq!(view.panes, vec![replacement]);
+        assert!(view.retired.is_empty());
+    }
+
     #[test]
     fn nonempty_views_round_trip_through_ipc_and_persistent_json() {
         use std::os::unix::ffi::OsStringExt;

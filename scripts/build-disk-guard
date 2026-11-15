@@ -1,0 +1,270 @@
+#!/bin/sh
+# Keep Cargo builds from filling the file system that holds build directories.
+#
+# Every worktree and every agent's target directory grows as it builds, and
+# Cargo never removes any of it. At most every few hours this starts
+# prune-build-dirs in the background, which removes build output nothing has
+# used for a week, and native-evidence builds unused for half a day. Below
+# twice the floor it starts it at once, still in the background, and it also
+# removes removed workspaces' build directories without their usual grace
+# period, and native-evidence builds unused for an hour. Each of those runs
+# first has cargo-offload bound the offload build slots no lease holds, which
+# the pruner leaves to the leases. Below the floor itself the build waits
+# for both, within a budget, then is refused if there is still too little
+# room, so it fails with an explanation instead of filling the disk that
+# other builds, agents and their logs share. A guard that cannot tell how
+# much room there is lets the build run.
+set -eu
+
+program=build-disk-guard
+usage() {
+    cat <<'EOF'
+Usage: scripts/build-disk-guard BUILD_DIR
+
+Exits 0 when the file system holding BUILD_DIR has room for builds. Exits 2,
+with an explanation, when it is below the floor even after reclaiming
+unused build directories with prune-build-dirs. Every
+CAGENTS_BUILD_PRUNE_INTERVAL_HOURS, or every hour below twice the floor, it
+also starts the pruner in the background.
+
+With the default pruner, each of its runs first has cargo-offload beside
+this guard trim this host's offload build slots that no lease holds, under
+their leases' locks, to the bound their leases keep
+(CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB); a background run's goes in the
+pruner state's .slots.log. Below the floor, the build also waits, within
+the budget, for that trim and the removal of what it moved out.
+
+Environment:
+  CAGENTS_BUILD_FREE_FLOOR_GIB  Free space below which builds are refused;
+                                default: 5% of the file system, at most 64.
+                                0 disables the guard.
+  CAGENTS_BUILD_PRUNE           Command that reclaims build directories,
+                                run before the build below twice the floor;
+                                default: prune-build-dirs beside this guard,
+                                given this repository's main checkout.
+  CAGENTS_BUILD_PRUNE_IDLE_DAYS Days unwritten after which the default
+                                pruner removes build output (default 7).
+  CAGENTS_BUILD_PRUNE_INTERVAL_HOURS
+                                Hours between background runs (default 6);
+                                0 runs the pruner only when space is low.
+  CAGENTS_BUILD_PRUNE_BUDGET_SECONDS
+                                Seconds after which the pruner run below the
+                                floor starts nothing new (default 300).
+  CAGENTS_BUILD_PRUNE_ROOTS     Directories the default pruner searches,
+                                colon-separated, besides the main checkout;
+                                default: ~/.cache and ~/.local/state of the
+                                account's home and of HOME, and /var/tmp.
+  CAGENTS_BUILD_PRUNE_STATE     Prefix of the pruner's schedule, lock, last
+                                output (.log), removals (.tsv) and slot trim
+                                (.slots.log); default:
+                                /var/tmp/cagents-prune-build-dirs-UID.
+  CAGENTS_BUILD_OFFLOAD_SLOTS   Directory of offload slots to trim; default:
+                                ~/.cache/cagents-offload of the account's
+                                home. Empty trims none.
+EOF
+}
+
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    '') usage >&2; exit 2 ;;
+esac
+directory=$1
+build_dir=$1
+# This build may wait for a slot before it writes here; meanwhile another
+# build's pruner must not find its build directory idle.
+if [ -f "$build_dir/.rustc_info.json" ] || [ -f "$build_dir/CACHEDIR.TAG" ]; then
+    touch -- "$build_dir/.cagents-gate-used" 2>/dev/null || :
+fi
+floor=${CAGENTS_BUILD_FREE_FLOOR_GIB:-}
+case $floor in
+    0) exit 0 ;;
+    '') ;;
+    0*|*[!0-9]*) usage >&2; exit 2 ;;
+esac
+interval=${CAGENTS_BUILD_PRUNE_INTERVAL_HOURS:-6}
+idle=${CAGENTS_BUILD_PRUNE_IDLE_DAYS:-7}
+budget=${CAGENTS_BUILD_PRUNE_BUDGET_SECONDS:-300}
+# Whole numbers of at most five digits; a week or more of idle days is 1 or more.
+for number in "$interval" "$idle" "$budget"; do
+    case $number in
+        ''|0?*|*[!0-9]*|??????*) usage >&2; exit 2 ;;
+    esac
+done
+[ "$idle" -gt 0 ] && [ "$budget" -gt 0 ] || { usage >&2; exit 2; }
+
+# The build directory may not exist yet; its file system is its nearest
+# existing ancestor's.
+while [ ! -d "$directory" ]; do
+    directory=$(dirname -- "$directory")
+done
+
+# Size and free space in GiB, rounded down.
+read_space() {
+    space=$(df -Pk -- "$directory" 2>/dev/null |
+        awk 'NR == 2 && $2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+            print int($2 / 1048576), int($4 / 1048576) }') || space=
+    [ -n "$space" ] || exit 0
+    size=${space% *}
+    free=${space#* }
+}
+
+# When the last reclaim for low space ran, beside the build lock, and the
+# pruner's own state for this user on this host: when it last ran on its
+# schedule, its last runs' output and every removal.
+state=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}.prune
+pruner_state=${CAGENTS_BUILD_PRUNE_STATE:-/var/tmp/cagents-prune-build-dirs-$(id -u)}
+here=$(dirname -- "$(readlink -f -- "$0")")
+quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+# Opens descriptor 7 on $1, or fails without ending the guard.
+open7() {
+    { command exec 7>>"$1"; } 2>/dev/null
+}
+prune=${CAGENTS_BUILD_PRUNE:-}
+# Running low, what is cheapest to make again goes sooner: a removed
+# workspace's build directory at once, and a native-evidence task's build,
+# whose next build in a shared slot fetches it again, after an hour unused.
+urgent='--orphan-hours 0 --evidence-hours 1'
+# The pruner beside this guard can also run detached; a command given as
+# CAGENTS_BUILD_PRUNE runs only before a build, below twice the floor.
+pruner= offload=
+if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
+    pruner="$(quote "$here/prune-build-dirs") --apply --max-idle $idle"
+    pruner="$pruner --lock $(quote "$pruner_state.lock") --log $(quote "$pruner_state.tsv")"
+    # A run that searched everything stamps the schedule.
+    pruner="$pruner --stamp $(quote "$pruner_state.scheduled")"
+    # Never the build this guard runs for.
+    pruner="$pruner --keep $(quote "$build_dir")"
+    # Worktrees' build output lives in the repository's main checkout, whose
+    # own build seeds theirs and stays. A bare repository's parent holds
+    # other repositories, so only a checkout's is searched.
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
+    case $common in
+        */.git) pruner="$pruner --root $(quote "${common%/.git}") --keep-checkout $(quote "${common%/.git}")" ;;
+    esac
+    # Out of room, a removed workspace's build directory goes at once, and
+    # the build waits for the pruner, or one already running, only so long.
+    prune="$pruner $urgent --budget $budget --wait"
+    # The pruner leaves the offload build slots here to their leases, which
+    # bound each slot as they take it. Those no lease holds now are trimmed
+    # the same way, under their leases' locks, by the helper beside this.
+    [ ! -x "$here/cargo-offload" ] || offload=$(quote "$here/cargo-offload")
+fi
+
+# Starts the pruner, with the arguments after the first three, detached and
+# at a lower priority, unless a run is under way or one searched everything
+# within $1 minutes. $2 is its nice value and $3 its ionice options. Fails
+# when it starts none.
+detach() {
+    minutes=$1 niceness=$2 class=$3
+    shift 3
+    open7 "$pruner_state.lock" || return 1
+    if ! flock -n 7 ||
+        [ -n "$(find "$pruner_state.scheduled" -mmin -"$minutes" 2>/dev/null)" ]; then
+        exec 7>&-
+        return 1
+    fi
+    exec 7>&-
+    # In a session of its own and with no descriptor of the build's: it reads
+    # every build directory, which no build should wait for, and outlives
+    # the build. Its output replaces the last but one run's.
+    (
+        exec </dev/null >/dev/null 2>&1
+        command -v ionice >/dev/null 2>&1 && ionice="ionice $class" || ionice=
+        command -v setsid >/dev/null 2>&1 && setsid=setsid || setsid=
+        # Beside the pruner, not before it: this shell then holds nothing
+        # of the build's for longer than it did, and the trim closes what
+        # it inherited as it starts.
+        if [ -n "$offload" ]; then
+            eval "exec $setsid nice -n $niceness $ionice $offload --trim-slots $floor" \
+                >"$pruner_state.slots.log" 2>&1 &
+        fi
+        eval "exec $setsid nice -n $niceness $ionice $pruner --output $(quote "$pruner_state.log") $*"
+    ) &
+}
+
+read_space
+if [ -z "$floor" ]; then
+    floor=$((size / 20))
+    [ "$floor" -le 64 ] || floor=64
+fi
+
+if [ "$free" -ge $((floor * 2)) ]; then
+    # Every few hours, at idle priority. One cut short or killed is started
+    # again by the next build.
+    if [ -n "$pruner" ] && [ "$interval" -gt 0 ]; then
+        detach $((interval * 60)) 19 -c3 || :
+    fi
+    exit 0
+fi
+
+if [ "$free" -ge "$floor" ] && [ -n "$pruner" ]; then
+    # Running low, but with room for this build: search everything at once,
+    # and again every hour, without making builds wait.
+    if detach 60 10 '-c2 -n7' $urgent; then
+        printf '%s: %s GiB free on %s; reclaiming unused build directories in the background\n' \
+            "$program" "$free" "$directory" >&2
+    fi
+    exit 0
+fi
+
+if [ -z "$prune" ]; then
+    printf '%s: %s GiB free on %s, and nothing to reclaim build directories with: %s is missing and CAGENTS_BUILD_PRUNE is unset\n' \
+        "$program" "$free" "$directory" "$here/prune-build-dirs" >&2
+fi
+# Below the floor, a complete run starts too, unless one did within the hour:
+# the build waits for it only within its budget, and it searches on after.
+if [ -n "$pruner" ]; then
+    detach 60 10 '-c2 -n7' $urgent || :
+fi
+# One reclaim at a time across the host, and at most every ten minutes: a
+# queue of builds would otherwise each scan every build directory. The stamp
+# is a separate file, whose time a full disk can still update.
+if [ -n "$prune" ] && open7 "$state"; then
+    if flock -n 7; then
+        if [ -z "$(find "$state.done" -mmin -10 2>/dev/null)" ]; then
+            printf '%s: %s GiB free on %s; reclaiming unused build directories\n' \
+                "$program" "$free" "$directory" >&2
+            # A failed reclaim leaves the decision to the free space below.
+            # Idle offload slots are trimmed beside it, within the same budget.
+            trimming=
+            if [ -n "$offload" ]; then
+                # Without timeout, nothing bounds a wait, so it runs on its
+                # own like the scheduled one.
+                if command -v timeout >/dev/null 2>&1; then
+                    eval "timeout $budget $offload --trim-slots $floor --wait" >&2 &
+                    trimming=$!
+                else
+                    (
+                        exec </dev/null >>"$pruner_state.slots.log" 2>&1 7>&-
+                        eval "exec $offload --trim-slots $floor"
+                    ) &
+                fi
+            fi
+            sh -c "$prune" >&2 || :
+            [ -z "$trimming" ] || wait "$trimming" || :
+            touch -- "$state.done" 2>/dev/null || :
+        fi
+        exec 7>&-
+    else
+        # Another build is reclaiming; its result decides for this one too.
+        printf '%s: %s GiB free; waiting for another build to reclaim space\n' \
+            "$program" "$free" >&2
+        flock -w 900 7 || :
+        exec 7>&-
+    fi
+    # Some file systems, such as btrfs, count freed space only once they
+    # commit.
+    # Every build writing meanwhile makes that slower; it need not finish.
+    command -v timeout >/dev/null 2>&1 && bounded='timeout 30' || bounded=
+    $bounded sync -f -- "$directory" 2>/dev/null || :
+    read_space
+fi
+[ "$free" -lt "$floor" ] || exit 0
+
+printf '%s: refusing to build: %s GiB free on %s, below the %s GiB floor.\n' \
+    "$program" "$free" "$directory" "$floor" >&2
+printf '%s: remove worktrees you no longer need (their build directories go with them), or set CAGENTS_BUILD_FREE_FLOOR_GIB=0 to build anyway.\n' \
+    "$program" >&2
+exit 2

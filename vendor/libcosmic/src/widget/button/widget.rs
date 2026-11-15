@@ -356,7 +356,11 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
             );
         });
         let state = tree.state.downcast_mut::<State>();
-        operation.focusable(Some(&self.id), layout.bounds(), state);
+        if self.on_press.is_some() || self.on_press_down.is_some() {
+            operation.focusable(Some(&self.id), layout.bounds(), state);
+        } else {
+            operation.focusable(Some(&self.id), layout.bounds(), &mut Disabled(state));
+        }
     }
 
     fn update(
@@ -637,11 +641,10 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
         layout: Layout<'b>,
         renderer: &crate::Renderer,
         viewport: &Rectangle,
-        mut translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
-        let position = layout.bounds().position();
-        translation.x += position.x;
-        translation.y += position.y;
+        // The child layout is already absolute; `translation` stays the
+        // ancestors' screen offset rather than also gaining this position.
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout
@@ -865,7 +868,6 @@ pub fn update<'a, Message: Clone>(
             if let Some(on_press) = on_press {
                 let state = state();
                 if state.is_focused && *key == keyboard::Key::Named(keyboard::key::Named::Enter) {
-                    state.is_pressed = true;
                     let msg = (on_press)(layout.virtual_offset(), layout.bounds());
 
                     shell.publish(msg);
@@ -1071,6 +1073,32 @@ impl operation::Focusable for State {
     #[inline]
     fn unfocus(&mut self) {
         Self::unfocus(self);
+    }
+}
+
+/// The focus of a [`Button`] nothing can activate: keyboard traversal passes
+/// it over, while operations still find it and focus aimed at it by id lands.
+struct Disabled<'a>(&'a mut State);
+
+impl operation::Focusable for Disabled<'_> {
+    #[inline]
+    fn is_focused(&self) -> bool {
+        self.0.is_focused()
+    }
+
+    #[inline]
+    fn focus(&mut self) {
+        self.0.focus();
+    }
+
+    #[inline]
+    fn unfocus(&mut self) {
+        self.0.unfocus();
+    }
+
+    #[inline]
+    fn is_focus_stop(&self) -> bool {
+        false
     }
 }
 

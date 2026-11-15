@@ -957,6 +957,95 @@ fn record_attention_committed(
     result
 }
 
+/// Drives the real bounded commit queue and journal without a portal or thread.
+#[cfg(test)]
+pub(in crate::host) struct JournalTestBridge {
+    handle: Handle,
+    _receiver: mpsc::Receiver<()>,
+    journal: Journal,
+}
+
+#[cfg(test)]
+impl JournalTestBridge {
+    pub(in crate::host) fn new(path: &std::path::Path) -> Result<(Handle, Self), String> {
+        let journal = Journal::open(path)?;
+        let (wake, receiver) = mpsc::channel(1);
+        let handle = Handle(Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        }));
+        Ok((
+            handle.clone(),
+            Self {
+                handle,
+                _receiver: receiver,
+                journal,
+            },
+        ))
+    }
+
+    pub(in crate::host) fn commit_next(
+        &mut self,
+        policy: &Preferences,
+        suppressed: bool,
+    ) -> Result<Option<Notice>, String> {
+        let next = self
+            .handle
+            .0
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .pop_front();
+        let Some((event, receipt)) = next else {
+            return Ok(None);
+        };
+        record_attention_committed_policy(
+            &mut self.journal,
+            event,
+            suppressed,
+            Some(receipt),
+            policy,
+        )
+    }
+
+    pub(in crate::host) fn pending_events(&self) -> Vec<Event> {
+        self.handle
+            .0
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+
+    pub(in crate::host) fn set_stopped(&self, stopped: bool) {
+        self.handle.0.pending.lock().unwrap().stopped = stopped;
+    }
+
+    pub(in crate::host) fn drop_pending(&self) {
+        self.handle
+            .0
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .clear();
+    }
+
+    pub(in crate::host) fn list(&mut self) -> Result<Vec<Notice>, String> {
+        self.journal.list()
+    }
+
+    pub(in crate::host) fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
+        self.journal.acknowledge(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

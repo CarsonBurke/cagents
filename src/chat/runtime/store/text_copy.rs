@@ -197,6 +197,86 @@ mod tests {
         }
     }
 
+    fn context(id: &str, body: &str) -> Item {
+        Item {
+            role: Role::System,
+            content: ItemContent::Delivery {
+                kind: crate::chat::DeliveryKind::Notice,
+                from: String::new(),
+                sender: String::new(),
+                summary: "Claude context".into(),
+                body: body.into(),
+            },
+            ..item(id, "")
+        }
+    }
+
+    #[test]
+    fn provider_context_copy_reads_unloaded_body_and_revokes_stale_authority() {
+        let mut store = Store::new().unwrap();
+        let body = format!(
+            "FIRST_CONTEXT\r\n{}MIDDLE_CONTEXT\n{}LAST_CONTEXT λ\r\n",
+            "🦀é".repeat(WINDOW_BYTES / 6),
+            "literal context\n".repeat(1024),
+        );
+        assert!(body.len() > WINDOW_BYTES);
+        store.apply(Event::Item(context("same", &body))).unwrap();
+        let window = store.window().unwrap();
+        assert!(window.items.iter().all(|item| item.id != "same"));
+        let descriptors: Vec<_> = store.copy_projection.iter().cloned().collect();
+        assert!(descriptors.len() > 1);
+        let descriptor = descriptors[0]
+            .clone()
+            .expect("paged context has full-copy authority");
+        assert!(
+            descriptors
+                .iter()
+                .all(|source| source.as_ref() == Some(&descriptor))
+        );
+        assert!(window.items.iter().all(|item| {
+            item.role == Role::System
+                && item
+                    .logical_copy_body()
+                    .is_some_and(|body| !body.contains("FIRST_CONTEXT"))
+        }));
+        assert_eq!(
+            read(&store, &descriptor).unwrap().as_bytes(),
+            body.as_bytes()
+        );
+        let mut published = crate::chat::Snapshot::default();
+        store.publish_copy_sources(&mut published);
+        assert_eq!(published.text_copy_sources.conversation, descriptors);
+
+        let appended = format!("{body}append");
+        store
+            .apply(Event::Item(context("same", &appended)))
+            .unwrap();
+        assert_eq!(read(&store, &descriptor).unwrap(), body);
+        store
+            .apply(Event::Item(context("same", "short recovered body λ\r\n")))
+            .unwrap();
+        assert!(read(&store, &descriptor).is_err());
+        let short = source(&mut store, "same");
+        assert_eq!(read(&store, &short).unwrap(), "short recovered body λ\r\n");
+        let mut user_notice = context("same", "short recovered body λ\r\n");
+        user_notice.role = Role::User;
+        store.apply(Event::Item(user_notice)).unwrap();
+        assert!(read(&store, &short).is_err());
+        store.window().unwrap();
+        assert!(store.copy_projection.iter().all(Option::is_none));
+        store
+            .apply(Event::Item(context("same", "complete again")))
+            .unwrap();
+        let recovered = source(&mut store, "same");
+        assert_eq!(read(&store, &recovered).unwrap(), "complete again");
+        store
+            .apply(Event::ItemsRemoved {
+                ids: vec!["same".into()],
+            })
+            .unwrap();
+        assert!(read(&store, &recovered).is_err());
+    }
+
     #[test]
     fn logical_copy_reads_entire_store_message_across_utf8_parts_and_unloaded_prefix() {
         let mut store = Store::new().unwrap();

@@ -65,10 +65,14 @@ fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_
         ),
         "observation did not release the worker's lock"
     );
+    // Model an unrelated child paused between fork and exec: its descriptor
+    // shares the same open-file description even with CLOEXEC set.
+    let unrelated_fork = lock.try_clone().unwrap();
     drop(lock);
     let orphan = observe_installation(&executable, LockState::Free);
     assert_eq!(orphan.heading(), "Update completion is unconfirmed");
     assert!(orphan.can_open() && !orphan.finished());
+    drop(unrelated_fork);
     assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
     assert_eq!(
         fs::metadata(state.join("status.json")).unwrap().ino(),
@@ -162,8 +166,15 @@ fn private_status_projection_never_exposes_capability_error_or_path_content() {
     ] {
         let mut job = job(phase);
         job.confirmation = Some(super::super::confirmation::Confirmation {
+            stop: None,
             nonce: "CONFIRMATION_NONCE_SENTINEL".into(),
             preview: super::super::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
+                editors: Vec::new(),
                 candidate: super::super::impact::Candidate {
                     version: "1.2.4".into(),
                     protocol: crate::terminal_ipc::PROTOCOL_VERSION,

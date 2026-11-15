@@ -1,0 +1,6 @@
+{"type": "assistant", "uuid": "fixture-launch-1", "message": {"id": "fixture-launch-1", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_reviewer_1", "name": "Agent", "input": {"description": "Review restart safety", "subagent_type": "reviewer", "prompt": "Review the retry change for restart safety.", "run_in_background": true}}]}}
+{"type": "system", "subtype": "task_started", "uuid": "fixture-start-1", "task_id": "fixture-task-toolu_reviewer_1", "tool_use_id": "toolu_reviewer_1", "task_type": "local_agent", "description": "Review restart safety"}
+{"type": "user", "uuid": "fixture-launched-1", "tool_use_result": {"status": "async_launched", "agentId": "fixture-task-toolu_reviewer_1"}, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_reviewer_1", "content": "Async agent launched"}]}}
+{"type": "assistant", "uuid": "fixture-launch-say-1", "message": {"id": "fixture-launch-say-1", "role": "assistant", "content": [{"type": "text", "text": "The reviewer is running in the background. I will report when it finishes."}], "usage": {"input_tokens": 4200, "output_tokens": 180}}}
+{"type": "result", "uuid": "fixture-result-launch", "subtype": "success", "is_error": false}
+{"_end": true}

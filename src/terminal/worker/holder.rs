@@ -707,6 +707,11 @@ pub(super) struct Holder {
 }
 
 impl Holder {
+    /// The already-authenticated original holder, never a new PID lookup.
+    pub(super) fn original_process_descriptor(&self) -> io::Result<Option<File>> {
+        self.pidfd.as_ref().map(File::try_clone).transpose()
+    }
+
     pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
         self.original_role.as_ref()
     }
@@ -2090,24 +2095,30 @@ mod tests {
         )
         .unwrap();
         let descriptor = tempfile::tempfile().unwrap();
+        let directory = pin_launch_directory(&command("true")).unwrap();
         let started = Instant::now();
-        let error = hand_over(
-            &holder,
-            descriptor.as_raw_fd(),
-            1,
-            &descriptor,
-            None,
-            "",
-            &vec![b'x'; DETACHED_OUTPUT],
-            None,
-            &mut None,
-            false,
-            &pin_launch_directory(&command("true")).unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "descriptor frame deadline expired");
+        // The successor stays open and never reads, so only the deadline can
+        // end the handover.
+        let error = crate::test_timing::returns("the handover", move || {
+            hand_over(
+                &holder,
+                descriptor.as_raw_fd(),
+                1,
+                &descriptor,
+                None,
+                "",
+                &vec![b'x'; DETACHED_OUTPUT],
+                None,
+                &mut None,
+                false,
+                &directory,
+            )
+            .unwrap_err()
+            .to_string()
+        });
+        assert_eq!(error, "descriptor frame deadline expired");
         assert!(started.elapsed() >= HANDOVER_TIMEOUT);
-        assert!(started.elapsed() < HANDOVER_TIMEOUT * 2 + Duration::from_secs(1));
+        drop(successor);
     }
 
     fn command(script: &str) -> CommandBuilder {
@@ -3068,7 +3079,7 @@ mod tests {
         }
         let holders = directory
             .as_path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join(crate::instance::runtime_subdirectory())
             .join("holders");
         let boot = crate::daemon::read_boot_id().unwrap();
         let records = registry::discover(&holders, &boot).unwrap();
@@ -3085,7 +3096,7 @@ mod tests {
         assert!(record.root.is_current());
         let runtime = directory
             .as_path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY);
+            .join(crate::instance::runtime_subdirectory());
         let paths = crate::daemon::RuntimePaths {
             directory: runtime.clone(),
             socket: runtime.join(crate::terminal::ipc::SOCKET_FILE_NAME),

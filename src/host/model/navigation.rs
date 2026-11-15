@@ -1,6 +1,8 @@
 //! Durable manual navigation order, independent of channel creation ranks.
 use super::repository_key;
-use crate::workspace_model::{ModelEdit, NavigationItem, reorder_navigation};
+use crate::workspace_model::{
+    ModelEdit, NavigationItem, merge_navigation_fallback, reorder_navigation,
+};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 const MAX_ITEMS: usize = 4096;
@@ -79,13 +81,7 @@ pub(super) fn apply(transaction: &Transaction<'_>, edit: &ModelEdit) -> Result<b
                     NavigationItem::Channel(id) => valid_channels.contains(&id.to_string()),
                     NavigationItem::Worktree(_) => true,
                 });
-                let mut known = std::collections::HashSet::new();
-                items.retain(|item| known.insert(item.clone()));
-                for item in fallback {
-                    if known.insert(item.clone()) {
-                        items.push(item.clone());
-                    }
-                }
+                merge_navigation_fallback(&mut items, fallback);
                 if items.len() > MAX_ITEMS {
                     return Err("too many retained navigation items; use Reset sidebar order in the project menu".into());
                 }

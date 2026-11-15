@@ -186,7 +186,9 @@ fn confirmed_receipt(
 /// exact identity still exists in /proc, but it can no longer own the socket.
 /// Keep this distinct from the root's stronger requirement to have been reaped.
 fn holder_exited(holder: &crate::daemon::holder_registry::Process) -> Result<bool, String> {
-    let stat = match fs::read(format!("/proc/{}/stat", holder.pid)) {
+    let stat = match fs::read(format!("/proc/{}/stat", holder.pid))
+        .map_err(crate::daemon::holder_registry::exited_as_absent)
+    {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.to_string()),
