@@ -12,7 +12,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts/memory-capped"
-LEAF = "sed -n 's|.*/||p' /proc/self/cgroup"
+# The unified hierarchy's line; a host may mount v1 controllers such as net_cls too.
+LEAF = "sed -n 's|^0::.*/||p' /proc/self/cgroup"
+
+
+def ended(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except FileNotFoundError:
+        return True
 
 
 def real_scopes_work():
@@ -248,6 +256,39 @@ class InARealScope(unittest.TestCase):
     def test_a_missing_command_fails_as_it_would_alone(self):
         result = self.run_tool(str(self.root / "absent"))
         self.assertNotEqual(result.returncode, 0)
+
+    def test_the_command_reaches_its_shell_as_written(self):
+        result = self.run_tool("sh", "-c", 'echo "$0:$$" | grep -c "^sh:[0-9]"')
+        self.assertEqual((result.returncode, result.stdout), (0, "1\n"), result.stderr)
+
+    def test_what_the_command_leaves_running_is_stopped_and_named(self):
+        marker = self.root / "pid"
+        state = self.root / "state"
+        result = subprocess.run(
+            [str(TOOL), "--stop-leftovers", "sh", "-c",
+             f'setsid sh -c \'trap "" TERM; echo $$ >"{marker}"; exec sleep 300\' & '
+             f'while [ ! -s "{marker}" ]; do sleep 0.01; done; exit 5'],
+            env=self.env | {"XDG_STATE_HOME": str(state)}, capture_output=True, text=True, timeout=60)
+        pid = int(marker.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", str(pid)], capture_output=True))
+        self.assertEqual(result.returncode, 5, result.stderr)
+        # Ended when the wrapper returns, though it ignored the request to end;
+        # the manager that inherited it may not have reaped it yet.
+        self.assertTrue(ended(pid))
+        self.assertIn("left 1 process running after it exited", result.stderr)
+        self.assertIn(f"pid {pid}, up ", result.stderr)
+        self.assertIn(": sleep 300", result.stderr)
+        log = (state / "cagents/leftover-processes.log").read_text()
+        self.assertRegex(log, r"cagents-capped-\S+\.scope in .*: sh -c ")
+        self.assertIn(f"  pid {pid}, up ", log)
+
+    def test_a_command_that_leaves_nothing_running_is_not_reported(self):
+        state = self.root / "state"
+        result = subprocess.run([str(TOOL), "--stop-leftovers", "sh", "-c", "sleep 0.1 & exit 3"],
+                                env=self.env | {"XDG_STATE_HOME": str(state)}, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stderr), (3, ""))
+        self.assertFalse(state.exists())
 
     def test_the_command_keeps_descriptors_it_inherits(self):
         # A held build slot arrives as one, as it would without this wrapper.
