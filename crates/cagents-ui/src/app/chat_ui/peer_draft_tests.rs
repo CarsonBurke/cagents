@@ -93,6 +93,16 @@ fn peer() -> Peer {
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     app.workspace_model.identity = uuid::Uuid::new_v4();
     app.workspace_model.sequence = 1;
+    // The registry lists every project its channels belong to; closing a
+    // shared pane checks its source against that.
+    app.workspace_model
+        .projects
+        .push(crate::workspace_model::ModelProject {
+            repository: std::path::PathBuf::from("/repo/.git"),
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        });
     app.workspace_model
         .channels
         .push(crate::workspace_model::ModelChannel {
