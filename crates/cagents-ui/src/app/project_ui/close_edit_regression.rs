@@ -421,10 +421,12 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             respond(
                 &mut cleanup,
                 read,
-                ServerResponse::WorkspaceMetadata(crate::workspace_model::metadata::Reply::Projects {
-                    identity: closed_model.identity,
-                    projects: closed_model.projects.clone(),
-                }),
+                ServerResponse::WorkspaceMetadata(
+                    crate::workspace_model::metadata::Reply::Projects {
+                        identity: closed_model.identity,
+                        projects: closed_model.projects.clone(),
+                    },
+                ),
             );
             let chats: ClientEnvelope = read_frame(&mut cleanup).unwrap().unwrap();
             assert!(matches!(&chats.request, ClientRequest::ChatList));
