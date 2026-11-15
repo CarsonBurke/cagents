@@ -1,4 +1,6 @@
 //! Windows mirror attention and report focus; only the daemon delivers alerts.
+use super::automation_ui::transport;
+use super::request_failure::{Activity, Failure};
 use super::*;
 use crate::{
     control::ControlClient,
@@ -21,7 +23,7 @@ pub enum Action {
     HostBound(HostSessionProof),
     LifecycleResolved {
         generation: u64,
-        result: Result<crate::automations::LifecyclePage, ()>,
+        result: Result<crate::automations::LifecyclePage, LifecycleReadError>,
     },
     SessionActivationExpired {
         session: TerminalId,
@@ -36,6 +38,14 @@ pub enum Action {
     Test,
     Tested(Result<TestOutcome, String>),
     Failed(String),
+}
+
+/// Unavailable receipts retain the existing historical fallback. A permission
+/// refusal instead explains why this window cannot read the notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleReadError {
+    Unavailable,
+    Refused(Failure),
 }
 
 /// A rendered incident, not permission to replay an arbitrary target.
@@ -84,16 +94,24 @@ fn lifecycle_backend() -> Option<(String, String, String)> {
 
 fn read_lifecycle(
     activation: &LifecycleActivation,
-) -> Result<crate::automations::LifecyclePage, ()> {
+    context: transport::Context,
+) -> Result<crate::automations::LifecyclePage, LifecycleReadError> {
     if lifecycle_backend() != activation.backend {
-        return Err(());
+        return Err(LifecycleReadError::Unavailable);
     }
-    let mut client = connect().map_err(|_| ())?;
+    let scoped = context.is_scoped();
+    let mut client = context
+        .connect_existing()
+        .map_err(|_| LifecycleReadError::Unavailable)?;
     if client.proof() != &activation.host {
-        return Err(());
+        return Err(LifecycleReadError::Unavailable);
     }
-    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
-        return Err(());
+    if client
+        .workspace_registry_identity()
+        .map_err(|_| LifecycleReadError::Unavailable)?
+        != activation.registry
+    {
+        return Err(LifecycleReadError::Unavailable);
     }
     // At SQLite's maximum sequence there cannot be a later receipt. The
     // receiver still requires exact equality; it never substitutes the latest.
@@ -102,21 +120,24 @@ fn read_lifecycle(
         .checked_add(1)
         .filter(|value| *value <= i64::MAX as u64);
     let page = match client
-        .automation(
-            crate::agent_execution::Authority::default(),
-            crate::automations::Request::Audit {
-                id: activation.id,
-                before,
-                limit: 1,
-            },
-        )
-        .map_err(|_| ())?
-    {
+        .request(crate::automations::Request::Audit {
+            id: activation.id,
+            before,
+            limit: 1,
+        })
+        .map_err(|error| {
+            Failure::permission_denied(&error, Activity::ViewLifecycle, scoped)
+                .map_or(LifecycleReadError::Unavailable, LifecycleReadError::Refused)
+        })? {
         crate::automations::Response::Audit(page) => page,
-        _ => return Err(()),
+        _ => return Err(LifecycleReadError::Unavailable),
     };
-    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
-        return Err(());
+    if client
+        .workspace_registry_identity()
+        .map_err(|_| LifecycleReadError::Unavailable)?
+        != activation.registry
+    {
+        return Err(LifecycleReadError::Unavailable);
     }
     Ok(page)
 }
@@ -786,11 +807,13 @@ impl Cagents {
                 };
                 self.notification_ui.lifecycle_read = Some(activation.generation);
                 self.notification_ui.lifecycle_activation = Some(activation.clone());
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let generation = activation.generation;
-                    let result = tokio::task::spawn_blocking(move || read_lifecycle(&activation))
-                        .await
-                        .unwrap_or(Err(()));
+                    let result =
+                        tokio::task::spawn_blocking(move || read_lifecycle(&activation, context))
+                            .await
+                            .unwrap_or(Err(LifecycleReadError::Unavailable));
                     Message::NotificationUi(Action::LifecycleResolved { generation, result })
                 })
             }
@@ -817,6 +840,13 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                let result = match result {
+                    Err(LifecycleReadError::Refused(failure)) => {
+                        self.status = Some(failure.into_notice());
+                        return self.activate_main_window(None);
+                    }
+                    result => result.map_err(|_| ()),
+                };
                 if !self.automation_ui.show_lifecycle_receipt(
                     activation.id,
                     activation.sequence,
@@ -1410,6 +1440,8 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use crate::agent::Provider;
 
@@ -3651,7 +3683,7 @@ mod tests {
                 result: if available {
                     Ok(exact_notice_page(id, sequence))
                 } else {
-                    Err(())
+                    Err(LifecycleReadError::Unavailable)
                 },
             }));
             assert!(
@@ -3776,6 +3808,46 @@ mod tests {
         assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
     #[test]
+    fn a_stale_lifecycle_refusal_does_not_replace_the_current_notice() {
+        for changed_host in [false, true] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            let generation = app.notification_ui.lifecycle_read.unwrap();
+            let cards = app.durable.cards.clone();
+            if changed_host {
+                let mut replacement = app.notification_ui.host.clone().unwrap();
+                replacement.host_incarnation = crate::model::HostIncarnation::new("new backend");
+                drop(app.update_notifications(Action::HostBound(replacement)));
+            }
+            app.status = Some(TransientNotice::success("Current action completed"));
+            let refusal = Failure::permission_denied(
+                &crate::control::ControlError::Remote {
+                    code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
+                    message: "Synthetic stale authority refusal".into(),
+                    retryable: false,
+                },
+                Activity::ViewLifecycle,
+                true,
+            )
+            .unwrap();
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation: if changed_host {
+                    generation
+                } else {
+                    generation + 1
+                },
+                result: Err(LifecycleReadError::Refused(refusal)),
+            }));
+            assert_eq!(
+                app.status.as_ref().unwrap().message,
+                "Current action completed"
+            );
+            assert_eq!(app.durable.cards, cards);
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+        }
+    }
+
+    #[test]
     fn lifecycle_activation_churn_keeps_one_actual_read_until_its_matching_completion() {
         let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
         let cards = app.durable.cards.clone();
@@ -3801,7 +3873,7 @@ mod tests {
         assert_eq!(app.notification_ui.lifecycle_read, Some(first));
         drop(app.update_notifications(Action::LifecycleResolved {
             generation: first + 1,
-            result: Err(()),
+            result: Err(LifecycleReadError::Unavailable),
         }));
         assert_eq!(app.notification_ui.lifecycle_read, Some(first));
         drop(app.update_notifications(Action::LifecycleResolved {
@@ -3824,7 +3896,7 @@ mod tests {
         );
         drop(app.update_notifications(Action::LifecycleResolved {
             generation: first,
-            result: Err(()),
+            result: Err(LifecycleReadError::Unavailable),
         }));
         assert_eq!(app.notification_ui.lifecycle_read, Some(retry));
         drop(app.update_notifications(Action::LifecycleResolved {
