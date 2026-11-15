@@ -100,15 +100,83 @@ impl TerminalCleanupAuthority {
 }
 
 impl Cagents {
+    /// The registry's pane for `card` once this window's own unanswered edits
+    /// to it land, which is what the window shows. The publisher sends them in
+    /// order ahead of any Close, so a Close started meanwhile refers to their
+    /// result. `Err` when the card has more than one owner, or when one of
+    /// those edits is based on a source the registry no longer holds: the
+    /// registry will refuse it, so the window's pane is not the one listed.
+    ///
+    /// A terminal's source is bound to a host worker at the view revision that
+    /// published it, so a terminal Close keeps to the source the registry holds.
+    fn expected_shared_pane(&self, card: CardId) -> Result<Option<(Scope, Pane)>, ()> {
+        let mut owners = self.workspace_model.views.iter().filter_map(|view| {
+            view.panes
+                .iter()
+                .find(|pane| pane.id == card)
+                .map(|pane| (view, pane))
+        });
+        let registered = owners.next();
+        if owners.next().is_some() {
+            return Err(());
+        }
+        let mut edits = self
+            .shared_views
+            .pending
+            .iter()
+            .filter(|(_, _, change)| change.pane_id() == card)
+            .peekable();
+        let terminal = |pane: &Pane| matches!(pane.kind, CardKind::Terminal(_));
+        let registered_pane = || registered.map(|(view, pane)| (view.scope.clone(), pane.clone()));
+        let Some((_, first_scope, _)) = edits.peek() else {
+            return Ok(registered_pane());
+        };
+        let base = match registered {
+            Some((_, pane)) if terminal(pane) => return Ok(registered_pane()),
+            Some((view, _)) => view,
+            None => match self
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| &view.scope == first_scope)
+            {
+                Some(view) => view,
+                None => return Ok(None),
+            },
+        };
+        // Only this card's pane and the view's retired list decide its edits.
+        let mut view = View {
+            scope: base.scope.clone(),
+            revision: base.revision,
+            panes: registered
+                .map(|(_, pane)| pane.clone())
+                .into_iter()
+                .collect(),
+            retired: base.retired.clone(),
+        };
+        for (_, scope, change) in edits {
+            if *scope != view.scope {
+                return Err(());
+            }
+            match change {
+                Change::Insert { pane, .. } if !terminal(pane) => {}
+                Change::Update { before, pane } if !terminal(before) && !terminal(pane) => {
+                    if view.source_update_conflicts(before, pane) {
+                        return Err(());
+                    }
+                }
+                Change::Move { .. } => continue,
+                _ => return Err(()),
+            }
+            view.apply(change).map_err(drop)?;
+        }
+        Ok(view.panes.pop().map(|pane| (view.scope, pane)))
+    }
+
     pub(in crate::app) fn capture_shared_removal(&mut self, card: CardId) -> bool {
         let captured = (|| {
-            let mut owners = self.workspace_model.views.iter().filter_map(|view| {
-                view.panes
-                    .iter()
-                    .find(|pane| pane.id == card)
-                    .map(|pane| (&view.scope, pane))
-            });
-            let Some((scope, before)) = owners.next() else {
+            let expected = self.expected_shared_pane(card)?;
+            let Some((scope, before)) = expected.as_ref().map(|(scope, pane)| (scope, pane)) else {
                 // An unadmitted saved draft is local text, despite cached
                 // shared membership. Closing it grants no shared authority.
                 return if self.chat_awaiting_admission(card) {
@@ -126,7 +194,7 @@ impl Cagents {
                     Ok(None)
                 };
             };
-            if owners.next().is_some() || before.pending_terminal_start {
+            if before.pending_terminal_start {
                 return Err(());
             }
             let local = self
@@ -181,7 +249,7 @@ impl Cagents {
                     }
                 }),
             };
-            if !views::removal_source_current(&self.workspace_model, scope, &change) {
+            if !self.removal_source_expected(scope, &change) {
                 return Err(());
             }
             Ok(Some(RemovalSource {
@@ -199,6 +267,22 @@ impl Cagents {
                 false
             }
         }
+    }
+
+    /// Whether the captured source is still what the registry holds for the
+    /// card, once this window's own unanswered edits to it land.
+    fn removal_source_expected(&self, scope: &Scope, change: &Change) -> bool {
+        let Change::RemoveSource { before, .. } = change else {
+            return false;
+        };
+        self.expected_shared_pane(before.id).is_ok_and(|expected| {
+            views::removal_source_holds(
+                &self.workspace_model,
+                scope,
+                change,
+                expected.as_ref().map(|(scope, pane)| (scope, pane)),
+            )
+        })
     }
 
     fn shared_removal_refused(&mut self) {
@@ -222,7 +306,7 @@ impl Cagents {
             let Change::RemoveSource { before, .. } = &source.change else {
                 unreachable!()
             };
-            (views::removal_source_current(&self.workspace_model, &source.scope, &source.change)
+            (self.removal_source_expected(&source.scope, &source.change)
                 || views::removal_source_retired(
                     &self.workspace_model,
                     &source.scope,
