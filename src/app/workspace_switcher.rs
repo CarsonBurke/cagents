@@ -980,31 +980,36 @@ impl Cagents {
         // a worktree's pull request or branch, a channel's chat. A folder of
         // its own carries its project's chip, and the caption names the
         // project for the rest. The list draws every row at full strength.
-        let glyph = |kind| -> Element<'a, Message> {
-            sidebar::row_glyph(kind, sidebar::RowInk::Full, design::ROW_ICON_SIZE)
+        let slot = |glyph: widget::Container<'a, Message, Theme>| -> Element<'a, Message> {
+            glyph
                 .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
                 .into()
         };
+        let ink = sidebar::RowInk::Full;
+        let size = design::ROW_ICON_SIZE;
         let chip = match (row.destination, project) {
             (WorkspaceDestination::Folder(_), Some(project)) => sidebar::project_chip(project),
-            (WorkspaceDestination::Folder(_), None) => widget::container(
-                widget::icon::from_name("folder-symbolic").size(design::ROW_ICON_SIZE),
-            )
-            .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
-            .into(),
-            (WorkspaceDestination::Worktree(id), project) => {
+            (WorkspaceDestination::Folder(_), None) => slot(sidebar::ink_glyph(
+                widget::icon::from_name("folder-symbolic").handle(),
+                ink,
+                size,
+            )),
+            (WorkspaceDestination::Worktree(id), project) => slot(
                 match project
                     .and_then(|project| project.worktrees.iter().find(|worktree| worktree.id == id))
                 {
-                    Some(worktree) => glyph(sidebar::WorkspaceGlyph::Worktree(worktree)),
-                    None => widget::container(
-                        widget::icon(sidebar::worktree_icon()).size(design::ROW_ICON_SIZE),
-                    )
-                    .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
-                    .into(),
-                }
-            }
-            (WorkspaceDestination::Channel(_), _) => glyph(sidebar::WorkspaceGlyph::Channel),
+                    Some(worktree) => {
+                        sidebar::row_glyph(sidebar::WorkspaceGlyph::Worktree(worktree), ink, size)
+                    }
+                    // Gone from the model while the list is held.
+                    None => sidebar::ink_glyph(sidebar::worktree_icon(), ink, size),
+                },
+            ),
+            (WorkspaceDestination::Channel(_), _) => slot(sidebar::row_glyph(
+                sidebar::WorkspaceGlyph::Channel,
+                ink,
+                size,
+            )),
         };
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())

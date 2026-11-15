@@ -7756,17 +7756,33 @@ pub(crate) fn row_glyph<'a, Message: 'a>(
     ink: RowInk,
     size: u16,
 ) -> widget::Container<'a, Message, cosmic::Theme> {
-    let tone = kind.tone(ink);
-    widget::container(widget::icon(kind.icon()).size(size)).class(theme::Container::custom(
-        move |theme| cosmic::iced::widget::container::Style {
+    toned_glyph(kind.icon(), kind.tone(ink), size)
+}
+
+/// Any other glyph that stands in a row's glyph column, in the row's `ink`.
+pub(crate) fn ink_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    ink: RowInk,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    toned_glyph(icon, GlyphTone::Ink(ink), size)
+}
+
+fn toned_glyph<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    tone: GlyphTone,
+    size: u16,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    widget::container(widget::icon(icon).size(size)).class(theme::Container::custom(move |theme| {
+        cosmic::iced::widget::container::Style {
             // Resolved here, against the theme this frame is drawing with: this
             // builder runs once per visible row, and reaching for
             // `cosmic::theme::active()` locked the process-global theme and
             // cloned it that many times per frame.
             icon_color: Some(tone.color(theme)),
             ..Default::default()
-        },
-    ))
+        }
+    }))
 }
 
 /// A neutral pull request carries no news, so its glyph follows the row's ink
