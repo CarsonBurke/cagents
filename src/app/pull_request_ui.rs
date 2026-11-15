@@ -415,16 +415,20 @@ impl Cagents {
             listed != mentions,
             &openable,
         );
-        let content: Element<'_, Action> = widget::scrollable(
-            widget::container(list)
-                .padding(design::list::scroll_padding(WORK_LIST_PADDING))
-                .width(Length::Fill),
-        )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .width(Length::Fill)
-        .into();
+        // The list scrolls between the section's header and the rule below
+        // it, on the inspector's fill.
+        let content: Element<'_, Action> = crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::container(list)
+                    .padding(design::list::scroll_padding(WORK_LIST_PADDING))
+                    .width(Length::Fill),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill),
+            design::base,
+        );
         content.map(Message::PullRequestUi)
     }
 }

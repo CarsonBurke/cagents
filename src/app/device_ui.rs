@@ -1142,19 +1142,29 @@ impl Cagents {
         }
         rows.push(design::horizontal_rule());
         let height = (size.height - 164.0).clamp(200.0, 620.0);
+        // The output and the file list sit directly on the dialog, between
+        // its controls: what scrolls past their edges fades into it.
         let output = |height| {
-            widget::scrollable(
-                design::body(if state.panel == Panel::Worktrees {
-                    &state.worktree_output
-                } else {
-                    &state.output
-                })
-                .font(iced::Font::MONOSPACE)
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::container(
+                        design::body(if state.panel == Panel::Worktrees {
+                            &state.worktree_output
+                        } else {
+                            &state.output
+                        })
+                        .font(iced::Font::MONOSPACE)
+                        .width(Length::Fill),
+                    )
+                    .padding(design::with_vertical_rail(Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(height)
                 .width(Length::Fill),
+                design::dialog_base,
             )
-            .height(height)
-            .width(Length::Fill)
-            .into()
         };
         let body: Element<'_, Message> = match state.panel {
             Panel::Files => {
@@ -1197,10 +1207,19 @@ impl Cagents {
                         .into()
                     })
                     .collect();
-                let file_list =
-                    widget::scrollable(widget::column::with_children(files).spacing(space::XXS))
-                        .width(if narrow { 176 } else { 224 })
-                        .height(height);
+                let file_list = crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(files)
+                            .spacing(space::XXS)
+                            .padding(design::with_vertical_rail(Padding::ZERO)),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .width(if narrow { 176 } else { 224 })
+                    .height(height),
+                    design::dialog_base,
+                );
                 let editor: Element<'_, Message> = if let Some(file) = &state.file {
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
@@ -1249,7 +1268,7 @@ impl Cagents {
                     .height(height)
                     .into()
                 };
-                widget::row::with_children(vec![file_list.into(), editor])
+                widget::row::with_children(vec![file_list, editor])
                     .spacing(space::L)
                     .into()
             }
@@ -1362,23 +1381,12 @@ impl Cagents {
             .into(),
         };
         rows.push(body);
-        let content = widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(space::M)
-                .padding(design::with_vertical_rail(Padding::new(space::L))),
+        dialog_ui::scrolling_surface(
+            widget::column::with_children(rows).spacing(space::M),
+            1100.0,
+            size.height.min(820.0),
+            Length::Fill,
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .height(Length::Fill);
-        widget::container(crate::interaction::opaque(
-            widget::container(content).class(cosmic::theme::Container::Dialog(false)),
-        ))
-        .height(Length::Fill)
-        .max_height(size.height.min(820.0))
-        .width(Length::Fill)
-        .max_width(1100.0)
-        .into()
     }
 }
 

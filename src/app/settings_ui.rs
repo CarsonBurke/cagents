@@ -1101,7 +1101,9 @@ fn settings_layout<'a>(
                 .spacing(space::XXS)
                 .width(Length::Fill),
             )
-            .padding(design::list::scroll_padding(space::XS))
+            // The gap below the search field is the list's own leading
+            // padding, so the rows scroll right up to the field.
+            .padding(design::list::scroll_padding(space::XS * 2.0).bottom(space::XS))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1110,7 +1112,6 @@ fn settings_layout<'a>(
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill);
-        // The rows scroll in the open gap below the search field.
         let categories = crate::interaction::overflow_fade_y(categories, design::base);
         widget::column::with_children(vec![
             widget::container(search)
@@ -1119,7 +1120,6 @@ fn settings_layout<'a>(
                 .into(),
             categories.into(),
         ])
-        .spacing(space::XS)
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
         .into()

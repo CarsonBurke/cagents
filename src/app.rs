@@ -19425,11 +19425,11 @@ impl Application for Cagents {
             ),
         ));
         Some(dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
-                    Length::Fixed((self.window_height - 112.0).clamp(120.0, 620.0)),
-                ),
+            dialog_ui::scrolling_surface(
+                widget::column::with_children(rows).spacing(space::M),
                 620.0,
+                (self.window_height - 112.0).clamp(120.0, 620.0),
+                Length::Shrink,
             ),
             Some(Message::CancelDialog),
             1.0,
