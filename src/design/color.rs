@@ -10,6 +10,8 @@ use cosmic::{
 };
 
 pub const SCRIM_ALPHA: f32 = 0.48;
+/// [`modal_scrim`]'s strength on a dark theme.
+const DARK_MODAL_SCRIM_ALPHA: f32 = 0.72;
 pub const ATTENTION_BORDER_ALPHA: f32 = 0.35;
 pub const DIFF_GUTTER_ALPHA: f32 = 0.48;
 pub const DIFF_DIVIDER_ALPHA: f32 = 0.16;
@@ -111,10 +113,38 @@ pub fn rule(theme: &Theme) -> Color {
     soften(theme, base(theme), container.divider.into())
 }
 
+/// The black laid over the window behind a modal surface, such as a dialog
+/// or the workspace switcher, so that the surface is what is read. A dark
+/// theme's surfaces are near black already, and black at [`SCRIM_ALPHA`]
+/// takes only half their text's brightness, leaving the transcript behind
+/// readable. A dark theme lays it on more heavily for the same recession.
+pub fn modal_scrim(theme: &Theme) -> Color {
+    Color::from_rgba(
+        0.0,
+        0.0,
+        0.0,
+        if theme.cosmic().is_dark {
+            DARK_MODAL_SCRIM_ALPHA
+        } else {
+            SCRIM_ALPHA
+        },
+    )
+}
+
 /// `rule` for an edge drawn on a component surface such as a popover.
 pub fn component_rule(theme: &Theme) -> Color {
-    let component = &theme.current_container().component;
-    soften(theme, component.base.into(), component.divider.into())
+    component_rule_on(theme, theme.current_container().component.base.into())
+}
+
+/// [`component_rule`] for an edge drawn over `surface` on a component, such
+/// as a selected row's tint, so it stands off that surface as far as it would
+/// off the component's own.
+pub fn component_rule_on(theme: &Theme, surface: Color) -> Color {
+    soften(
+        theme,
+        surface,
+        theme.current_container().component.divider.into(),
+    )
 }
 
 /// How strongly `theme` paints its rules. A high-contrast theme asked for its

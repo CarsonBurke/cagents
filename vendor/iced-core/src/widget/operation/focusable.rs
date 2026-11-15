@@ -14,15 +14,30 @@ pub trait Focusable {
 
     /// Unfocuses the widget.
     fn unfocus(&mut self);
+
+    /// Returns whether keyboard traversal may stop on the widget now.
+    ///
+    /// A control that cannot be activated, such as a disabled button, is
+    /// passed over by [`focus_next`] and [`focus_previous`] unless it already
+    /// holds focus. It still takes part in every other operation.
+    fn is_focus_stop(&self) -> bool {
+        true
+    }
 }
 
-/// A summary of the focusable widgets present on a widget tree.
+/// Whether keyboard traversal counts `state` as a stop: one that accepts focus
+/// now, or one that holds it, so traversal moves on from there.
+fn is_stop(state: &dyn Focusable) -> bool {
+    state.is_focus_stop() || state.is_focused()
+}
+
+/// A summary of the keyboard focus stops present on a widget tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Count {
     /// The index of the current focused widget, if any.
     pub focused: Option<usize>,
 
-    /// The total amount of focusable widgets.
+    /// The total amount of focus stops.
     pub total: usize,
 }
 
@@ -93,6 +108,10 @@ pub fn count() -> impl Operation<Count> {
             _bounds: Rectangle,
             state: &mut dyn Focusable,
         ) {
+            if !is_stop(state) {
+                return;
+            }
+
             if state.is_focused() {
                 self.count.focused = Some(self.count.total);
             }
@@ -136,7 +155,7 @@ where
             _bounds: Rectangle,
             state: &mut dyn Focusable,
         ) {
-            if self.count.total == 0 {
+            if self.count.total == 0 || !is_stop(state) {
                 return;
             }
 
@@ -183,6 +202,10 @@ where
             _bounds: Rectangle,
             state: &mut dyn Focusable,
         ) {
+            if !is_stop(state) {
+                return;
+            }
+
             match self.count.focused {
                 None if self.current == 0 => state.focus(),
                 Some(focused)
