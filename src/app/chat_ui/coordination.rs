@@ -882,12 +882,32 @@ impl Row {
     }
 }
 
+/// The still mark beside a live caption: the accent, in a dot the size of
+/// the caption's lowercase letters.
+fn live_dot() -> Element<'static, Message> {
+    const SIZE: f32 = 6.0;
+    widget::container(widget::Space::new())
+        .width(Length::Fixed(SIZE))
+        .height(Length::Fixed(SIZE))
+        .class(cosmic::theme::Container::custom(|theme| {
+            widget::container::Style {
+                background: Some(iced::Background::Color(design::accent_color(theme))),
+                border: iced::Border {
+                    radius: (SIZE / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
 struct RowStatus {
     text: &'static str,
     tone: Tone,
-    /// Still under way, which its caption says in the reader's ink.
+    /// Still under way, which a still dot beside its caption marks.
     live: bool,
     detail: Option<String>,
 }
@@ -1359,12 +1379,14 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
+        // Work under way is marked by a still dot beside its caption; the
+        // transcript's one activity indicator says that something moves.
+        if row.state.live && matches!(row.state.tone, Tone::Plain) {
+            line.push(live_dot());
+        }
         let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         line.push(
             match row.state.tone {
-                // Work under way keeps the reader's ink; the transcript's one
-                // activity indicator says that something is happening.
-                Tone::Plain if row.state.live => status,
                 Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
                 Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
                 Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
