@@ -253,19 +253,38 @@ impl Runtime {
     /// which grouping, formed only when the transcript's structure changes,
     /// cannot know.
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
+        match self.strip_headline(turn) {
+            disclosure::Headline::Text(text) => text,
+            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
+        }
+    }
+
+    /// A collapsed strip's line as it is drawn. A lone step on one file
+    /// names it as its open row does, so the two never disagree.
+    fn strip_headline(&self, turn: &turn::Turn) -> disclosure::Headline {
         let [only] = turn.steps.as_slice() else {
-            return turn.summary.clone();
+            return disclosure::Headline::Text(turn.summary.clone());
         };
-        let Some(coordinated) = self
-            .step_items()
-            .get(only.index)
-            .and_then(|item| self.presentation_cache().get(&item.id))
-            .and_then(|cached| cached.coordination.as_deref())
-        else {
-            return turn.summary.clone();
+        let Some(item) = self.step_items().get(only.index) else {
+            return disclosure::Headline::Text(turn.summary.clone());
         };
-        let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
-        format!("{}{}", turn::headline(line), turn.state_suffix())
+        let cached = self.presentation_cache().get(&item.id);
+        if let Some(coordinated) = cached.and_then(|cached| cached.coordination.as_deref()) {
+            let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
+            return disclosure::Headline::Text(format!(
+                "{}{}",
+                turn::headline(line),
+                turn.state_suffix()
+            ));
+        }
+        let title = cached.and_then(|cached| cached.title_of(item));
+        match self.named_file(item, title) {
+            Some((verb, path)) => disclosure::Headline::Path {
+                verb: verb.to_owned(),
+                path: format!("{path}{}", turn.state_suffix()),
+            },
+            None => disclosure::Headline::Text(turn.summary.clone()),
+        }
     }
 
     /// One group's activity: a summary line and how long the work took,
@@ -299,8 +318,11 @@ impl Runtime {
         } else {
             turn.duration_label(0)
         };
-        let text = self.strip_summary(turn);
-        let name = text.clone();
+        let text = self.strip_headline(turn);
+        let name = match &text {
+            disclosure::Headline::Text(text) => text.clone(),
+            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
+        };
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()
@@ -400,6 +422,28 @@ impl Runtime {
         self.step_button(item, cached, open)
     }
 
+    /// The verb and file of a step on one file, the file named the way the
+    /// agent working in its directory names it, by the part that tells it
+    /// apart. A command names the directory it ran in; anything else ran in
+    /// the conversation's.
+    fn named_file(
+        &self,
+        item: &chat::Item,
+        title: Option<&tool_title::Title>,
+    ) -> Option<(&'static str, String)> {
+        if !turn::names_path(&item.content, title) {
+            return None;
+        }
+        let (verb, label) = turn::step_title(&item.content, title);
+        let directory = match &item.content {
+            ItemContent::Command {
+                working_directory, ..
+            } if !working_directory.is_empty() => std::path::Path::new(working_directory.as_str()),
+            _ => self.session.launch.recipe.working_directory.as_path(),
+        };
+        Some((verb, turn::shown_path(&label, directory).into_owned()))
+    }
+
     /// The summary line's toggle, without the actions placed beside it.
     fn step_button(
         &self,
@@ -416,20 +460,13 @@ impl Runtime {
                 let (verb, label) = coordinated.line(&|id| self.listed_agent_name(id));
                 (verb, label, false)
             }
-            None => {
-                let title = cached.title_of(item);
-                let (verb, label) = turn::step_title(&item.content, title);
-                // A file is named the way the agent working in this
-                // directory names it, by the part that tells it apart.
-                let path = turn::names_path(&item.content, title);
-                let label = if path {
-                    turn::shown_path(&label, &self.session.launch.recipe.working_directory)
-                        .to_owned()
-                } else {
-                    label.into_owned()
-                };
-                (verb.to_owned(), label, path)
-            }
+            None => match self.named_file(item, cached.title_of(item)) {
+                Some((verb, path)) => (verb.to_owned(), path, true),
+                None => {
+                    let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
+                    (verb.to_owned(), label.into_owned(), false)
+                }
+            },
         };
         let glyph = coordinated
             .and_then(Coordinated::glyph)

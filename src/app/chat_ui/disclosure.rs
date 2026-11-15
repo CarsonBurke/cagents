@@ -68,22 +68,35 @@ impl Headline {
             // The fade is in the glyphs themselves, so it is right on the
             // row's resting, hovered, pressed and focused paint alike.
             Self::Text(text) => line(text).width(Length::Fill).into(),
-            Self::Path { verb, path } if verb.is_empty() => line(path)
-                .edge(crate::ui_controls::FadeEdge::Start)
-                .width(Length::Fill)
-                .into(),
-            // The gap stands for the space between the words, outside the
-            // path, so the fade never takes it.
-            Self::Path { verb, path } => widget::row::with_children(vec![
-                line(verb).into(),
-                line(path)
-                    .edge(crate::ui_controls::FadeEdge::Start)
+            Self::Path { verb, path } => {
+                // A path from the home directory or the root keeps that
+                // anchor in view, so a file outside the working directory
+                // still reads as outside once the rest of its path fades.
+                let anchor = ["~/", "/"]
+                    .into_iter()
+                    .find(|anchor| path.len() > anchor.len() && path.starts_with(anchor));
+                let (anchor, rest) = path.split_at(anchor.map_or(0, str::len));
+                let mut path = vec![];
+                if !anchor.is_empty() {
+                    path.push(line(anchor.to_owned()).into());
+                }
+                path.push(
+                    line(rest.to_owned())
+                        .edge(crate::ui_controls::FadeEdge::Start)
+                        .width(Length::Fill)
+                        .into(),
+                );
+                let path = widget::row::with_children(path).width(Length::Fill);
+                if verb.is_empty() {
+                    return path.into();
+                }
+                // The gap stands for the space between the words, outside
+                // the path, so the fade never takes it.
+                widget::row::with_children(vec![line(verb).into(), path.into()])
+                    .spacing(space::XS)
                     .width(Length::Fill)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .width(Length::Fill)
-            .into(),
+                    .into()
+            }
         }
     }
 }

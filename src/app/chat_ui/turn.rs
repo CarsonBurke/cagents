@@ -617,30 +617,35 @@ pub(super) fn step_title<'a>(
 pub(super) fn names_path(content: &ItemContent, title: Option<&Title>) -> bool {
     match content {
         ItemContent::Changes { changes, .. } => changes.len() == 1,
-        // A built-in read carries its file as both its label and command; a
-        // shell read or a stored "Read <file>" label is a command, not a path.
+        // A read is labelled with the file it read, whether that is also
+        // the command (a built-in read), beside a shell command (Codex), or
+        // stored as "Read <file>"; one with no label shows its command.
         ItemContent::Command {
             action: chat::CommandAction::Read,
             label,
-            command,
             ..
-        } => !label.is_empty() && label == command,
+        } => !label.is_empty(),
         ItemContent::Tool { .. } => title.is_some_and(|title| title.path),
         _ => false,
     }
 }
 
-/// A path as a step row shows it: relative to the conversation's working
-/// directory when it is inside it, as the agent itself would name it.
-pub(super) fn shown_path<'a>(path: &'a str, working_directory: &std::path::Path) -> &'a str {
-    working_directory
+/// A path as a step row shows it: relative to the working directory when it
+/// is inside it, as the agent itself would name it, and otherwise from the
+/// home directory or the root, so it still reads as lying outside.
+pub(super) fn shown_path<'a>(path: &'a str, working_directory: &std::path::Path) -> Cow<'a, str> {
+    let inside = working_directory
         .to_str()
         .map(|root| root.trim_end_matches('/'))
         .filter(|root| !root.is_empty())
         .and_then(|root| path.strip_prefix(root))
         .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(path)
+        .filter(|rest| !rest.is_empty());
+    match inside {
+        Some(relative) => Cow::Borrowed(relative),
+        None if path.starts_with('/') => crate::app::display_path(std::path::Path::new(path)),
+        None => Cow::Borrowed(path),
+    }
 }
 
 /// The verb a step is introduced with, kept separate from its target so the two
@@ -1838,7 +1843,10 @@ mod tests {
         assert!(!names_path(&edits(&["a.rs", "b.rs"]), None));
         assert!(!names_path(&edits(&[]), None));
         assert!(names_path(&read("/work/a.rs", "/work/a.rs"), None));
-        assert!(!names_path(&read("Read a.rs", "cat a.rs"), None));
+        // Codex labels a read with its file, beside the shell command.
+        assert!(names_path(&read("src/a.rs", "sed -n 1,80p src/a.rs"), None));
+        assert!(names_path(&read("Read a.rs", "cat a.rs"), None));
+        assert!(!names_path(&read("", "cat a.rs"), None));
         let tool = ItemContent::Tool {
             name: "Write".into(),
             input: String::new(),
@@ -1871,6 +1879,14 @@ mod tests {
         assert_eq!(shown_path("/home/user/project", root), "/home/user/project");
         assert_eq!(shown_path("/etc/hosts", root), "/etc/hosts");
         assert_eq!(shown_path("src/a.rs", root), "src/a.rs");
+        // Outside it, a file under the home directory is named from there.
+        if let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()) {
+            let settings = home.join(".claude/settings.json");
+            assert_eq!(
+                shown_path(settings.to_str().unwrap(), root),
+                "~/.claude/settings.json"
+            );
+        }
         assert_eq!(
             shown_path("/etc/hosts", std::path::Path::new("/")),
             "/etc/hosts"
