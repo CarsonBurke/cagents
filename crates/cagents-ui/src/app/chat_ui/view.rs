@@ -9812,7 +9812,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_native_child_renders_identity_channel_and_bounded_selector() {
+    fn selected_native_child_renders_identity_and_bounded_selector() {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         let mut child = native_child_fixture();
@@ -9865,10 +9865,6 @@ mod tests {
                 .iter()
                 .any(|label| label.starts_with("Scout · Waiting · ")
                     && label.contains("Task: Inspect repository")),
-            "{labels:?}"
-        );
-        assert!(
-            labels.iter().any(|label| label.contains("# Review")),
             "{labels:?}"
         );
         assert!(
