@@ -1057,6 +1057,13 @@ run_app() {
     if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
         # Start the isolated daemon as User before adding the synthetic caller
         # to the UI runner. It must not inherit even this invalid capability.
+        if [ "${#runner_lifecycle[@]}" -gt 0 ]; then
+            if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon stop-for-rebuild --including-subagents; then
+                printf 'could not reset the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+                return 1
+            fi
+        fi
+        runner_lifecycle=()
         if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
             printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
             return 1

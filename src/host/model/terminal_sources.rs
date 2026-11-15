@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     model::{CardId, CardKind, TerminalSession},
-    workspace_model::views::{CapturedTerminalSource, Change, TerminalRemovalBasis},
+    workspace_model::views::{CapturedTerminalSource, Change, Pane, Scope, TerminalRemovalBasis},
 };
 
 pub(in crate::host) struct SourceAdmission<'a>(rusqlite::Transaction<'a>);
@@ -61,6 +61,20 @@ impl SourceAdmission<'_> {
         views::bindings::captured(&self.0, capture, None).map(drop)
     }
 
+    pub(in crate::host) fn validate_pending(
+        &self,
+        scope: &Scope,
+        pane: &Pane,
+    ) -> Result<(), String> {
+        let view = views::read(&self.0, scope)?;
+        if view.retired.contains(&pane.id)
+            || view.panes.iter().find(|candidate| candidate.id == pane.id) != Some(pane)
+        {
+            return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+        }
+        Ok(())
+    }
+
     pub(in crate::host) fn publish(
         self,
         session: &TerminalSession,
@@ -74,6 +88,9 @@ impl SourceAdmission<'_> {
         ),
         String,
     > {
+        if pending.is_some() {
+            Registry::pending_terminal_save_fixture_error()?;
+        }
         let tx = self.0;
         let mut edges = Vec::new();
         let pane: Option<String> = tx

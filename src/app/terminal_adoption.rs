@@ -248,6 +248,9 @@ impl Cagents {
                         && matches!(&card.kind, CardKind::Terminal(saved) if saved.id == session.id)
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                         && !self.terminal_start_in_flight(card.id)
+                        // The completion request alone can replace this exact
+                        // pending source with its issued worker descriptor.
+                        && self.pending_terminal_reservation(card.id).is_none()
                 })
                 .map(|card| (card.id, self.exposure(card.id)))
                 .collect::<Vec<_>>();

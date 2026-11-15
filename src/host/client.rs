@@ -1780,6 +1780,7 @@ fn process_admitted_request(
                 // so it is told those known already. They only accumulate, so
                 // this and a concurrent change may arrive in either order.
                 extras.extend(super::chat::agent_addresses(host, session.id));
+                extras.extend(super::chat::active_model(host, session.id));
             }
             Ok((response, extras, false))
         }
@@ -1911,6 +1912,10 @@ fn process_admitted_request(
                 event_sequence: terminal.event_sequence,
             });
             Ok((ServerResponse::Spawned { terminal }, extras, false))
+        }
+        ClientRequest::RetryPendingTerminalSave { pane, terminal_id } => {
+            super::state::retry_pending_terminal_save(host, pane, terminal_id)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::CompletePendingTerminal {
             pane,

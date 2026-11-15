@@ -355,7 +355,25 @@ impl Registry {
         })
     }
 
+    pub(in crate::host) fn pending_terminal_save_fixture_error() -> Result<(), String> {
+        #[cfg(feature = "development")]
+        if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
+            PathBuf::from(root)
+                .join("home/.config/fixture-pending-terminal-save-error")
+                .exists()
+        }) {
+            return Err("fixture refused the pending terminal completion save".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
+        if matches!(edit, ModelEdit::ChangeView {
+            change: crate::workspace_model::views::Change::Update { before, pane }, ..
+        } if before.pending_terminal_start && !pane.pending_terminal_start)
+        {
+            Self::pending_terminal_save_fixture_error()?;
+        }
         self.apply_delta_guarded(edit, |_, _| Ok(()))
     }
 

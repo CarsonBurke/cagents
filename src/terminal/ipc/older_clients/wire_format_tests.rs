@@ -809,6 +809,7 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
+    // It was appended when introduced; later protocols may append more.
     assert_eq!(
         index + 1,
         variant_count(&recorded(AGENT_ADDRESSES_SINCE), "ServerMessage")
@@ -826,29 +827,6 @@ fn agent_addresses_are_beyond_every_older_recording() {
     }
 }
 
-#[test]
-fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
-    let marker = ServerMessage::TerminalWorker {
-        terminal_id: crate::model::TerminalId::new(),
-        instance: uuid::Uuid::new_v4(),
-    };
-    let index = super::variant_index(&marker).unwrap();
-    assert_eq!(index + 1, variant_count(&recorded(179), "ServerMessage"));
-    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
-        "ServerMessage",
-        "terminal_worker",
-        179
-    )));
-    for client in OLDER_CLIENTS {
-        assert!(!client.admits_message(&marker));
-    }
-    for protocol in
-        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 179)
-    {
-        assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
-    }
-}
-
 /// Only a window watching notifications is told a project's automation
 /// requests changed. Update sources do not watch them; recordings before
 /// protocol 178 have no message at its position.
@@ -858,13 +836,16 @@ fn automation_request_changes_are_beyond_recordings_before_their_introduction() 
         repository: "/fixture".into(),
     };
     let index = super::variant_index(&changed).unwrap();
-    const SINCE: u16 = 178;
-    assert_eq!(index + 1, variant_count(&recorded(SINCE), "ServerMessage"));
+    const AUTOMATION_REQUEST_CHANGES_SINCE: u16 = 178;
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AUTOMATION_REQUEST_CHANGES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
         .chain(crate::update::source::current_client_protocols())
-        .filter(|&protocol| protocol < SINCE);
+        .filter(|&protocol| protocol < AUTOMATION_REQUEST_CHANGES_SINCE);
     for protocol in older {
         assert!(
             variant_count(&recorded(protocol), "ServerMessage") <= index,
@@ -873,6 +854,63 @@ fn automation_request_changes_are_beyond_recordings_before_their_introduction() 
     }
 }
 
+#[test]
+fn active_models_are_beyond_every_older_recording() {
+    let model = ServerMessage::ChatActiveModel {
+        chat_id: crate::model::TerminalId::new(),
+        revision: 1,
+        model: None,
+    };
+    const ACTIVE_MODELS_SINCE: u16 = 182;
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "chat_active_model",
+        ACTIVE_MODELS_SINCE
+    )));
+    let index = super::variant_index(&model).unwrap();
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(ACTIVE_MODELS_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < ACTIVE_MODELS_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+#[test]
+fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
+    let marker = ServerMessage::TerminalWorker {
+        terminal_id: crate::model::TerminalId::new(),
+        instance: uuid::Uuid::new_v4(),
+    };
+    let index = super::variant_index(&marker).unwrap();
+    assert_eq!(index + 1, variant_count(&recorded(183), "ServerMessage"));
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "terminal_worker",
+        183
+    )));
+    for client in OLDER_CLIENTS {
+        assert!(!client.admits_message(&marker));
+    }
+    for protocol in
+        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 183)
+    {
+        assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
+    }
+}
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
 #[test]
 fn actual_main_178_receives_the_frozen_internal_error_for_store_contention() {
     use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode, ServerEnvelopeRef, write_frame};

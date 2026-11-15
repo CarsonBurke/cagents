@@ -495,7 +495,7 @@ pub enum Action {
     Dropped(Target, file_drop::Payload),
     RemoveAttachment(Target, usize),
     Model(Target, String),
-    Reasoning(Target, String, String),
+    Reasoning(Target, String, Option<String>),
     PermissionMode(Target, String),
     PermissionRetry(Target, String),
     PermissionDismiss(Target, String),
@@ -542,7 +542,6 @@ pub enum Action {
     Scrolled(Target, Option<String>, view::Scroll, bool),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
-    ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
     ModelQuery(Target, String),
 }
@@ -873,7 +872,6 @@ impl Action {
             Self::DismissCloseRefusal(..) => "DismissCloseRefusal",
             Self::Scrolled(..) => "Scrolled",
             Self::ModelPicker(..) => "ModelPicker",
-            Self::ReasoningPicker(..) => "ReasoningPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
             Self::ModelQuery(..) => "ModelQuery",
         }
@@ -3050,7 +3048,6 @@ pub(super) struct Runtime {
     /// when the latest page next arrives.
     unplaced_failures: Vec<String>,
     failure_ui: failure::State,
-    reasoning_picker: bool,
     permission_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
@@ -4137,7 +4134,6 @@ impl Runtime {
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
-            reasoning_picker: false,
             permission_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
@@ -6128,7 +6124,6 @@ impl Runtime {
     pub(super) fn has_open_menu(&self) -> bool {
         self.child_picker.is_some()
             || self.model_picker.is_some()
-            || self.reasoning_picker
             || self.permission_picker
             || self.account_picker
             || self.composer_actions
@@ -6605,6 +6600,13 @@ fn draft_snapshot(
         reasoning,
         ..Snapshot::default()
     }
+}
+
+/// The chosen model, including a listed default alias when no explicit model
+/// has been stored yet. A stale explicit choice does not select another model.
+pub(super) fn selected_chat_model(snapshot: &Snapshot) -> Option<&chat::Model> {
+    let selected = snapshot.selected_model.as_deref().unwrap_or("default");
+    snapshot.models.iter().find(|model| model.id == selected)
 }
 
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
@@ -7932,7 +7934,6 @@ impl Cagents {
             // Pickers listed the earlier provider's choices.
             runtime.model_picker = None;
             runtime.account_picker = false;
-            runtime.reasoning_picker = false;
             runtime.permission_picker = false;
             runtime.snapshot = Arc::new(fresh);
         } else if rehomed {
@@ -8474,12 +8475,10 @@ impl Cagents {
             return false;
         };
         let open = runtime.model_picker.take().is_some()
-            || runtime.reasoning_picker
             || runtime.permission_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
-        runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
@@ -9728,6 +9727,11 @@ impl Cagents {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             snapshot.models.hash(&mut hasher);
+            snapshot
+                .active_model
+                .as_ref()
+                .map(|model| (&model.id, &model.default_reasoning))
+                .hash(&mut hasher);
             hasher.finish()
         };
         if snapshot.models.is_empty()
@@ -9736,7 +9740,11 @@ impl Cagents {
             return Task::none();
         }
         let provider = runtime.session.launch.provider;
-        self.observe_listed_models(provider, snapshot.models.clone())
+        self.observe_listed_models(
+            provider,
+            snapshot.models.clone(),
+            snapshot.active_model.as_ref(),
+        )
     }
 
     pub(super) fn start_chat(
@@ -10378,7 +10386,6 @@ impl Cagents {
         runtime.error = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
-        runtime.reasoning_picker = false;
         runtime.session = pending.candidate.clone();
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
@@ -10458,9 +10465,7 @@ impl Cagents {
         }
         let waited = queued.since.get_or_insert_with(Instant::now).elapsed();
         if let Some((model, reasoning)) = queued.model.clone() {
-            if snapshot.selected_model.as_ref() == Some(&model)
-                && (reasoning.is_none() || snapshot.reasoning == reasoning)
-            {
+            if snapshot.selected_model.as_ref() == Some(&model) && snapshot.reasoning == reasoning {
                 queued.model = None;
             } else if let Some(listed) = snapshot.models.iter().find(|listed| listed.id == model) {
                 let reasoning = reasoning.filter(|reasoning| listed.reasoning.contains(reasoning));
@@ -10912,6 +10917,7 @@ impl Cagents {
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
+            | Action::Reasoning(target, _, _)
             | Action::PermissionMode(target, _) => {
                 self.cards.get(&target.card).and_then(|card| match card {
                     CardRuntime::Chat(runtime)
@@ -11204,7 +11210,6 @@ impl Cagents {
                     runtime.picker_keyboard = false;
                     runtime.account_picker = open && runtime.choosing();
                     runtime.model_picker = None;
-                    runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
                 }
             }
@@ -11786,7 +11791,6 @@ impl Cagents {
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
-                            runtime.reasoning_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             runtime.pending = None;
@@ -13011,7 +13015,6 @@ impl Cagents {
                     runtime.permission_picker = open;
                     if open {
                         runtime.model_picker = None;
-                        runtime.reasoning_picker = false;
                         runtime.account_picker = false;
                         runtime.permissions_form.page = permissions::Page::Blocked;
                         if runtime.session.launch.provider == Provider::Claude
@@ -14362,14 +14365,16 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                runtime.reasoning_picker = false;
-                let Some(model) = runtime.snapshot.models.iter().find(|model| {
-                    model.id == model_id
-                        && Some(&model.id) == runtime.snapshot.selected_model.as_ref()
-                }) else {
+                runtime.model_picker = None;
+                let Some(model) =
+                    selected_chat_model(&runtime.snapshot).filter(|model| model.id == model_id)
+                else {
                     return Task::none();
                 };
-                if !model.reasoning.contains(&reasoning) {
+                if reasoning
+                    .as_ref()
+                    .is_some_and(|effort| !model.reasoning.contains(effort))
+                {
                     return Task::none();
                 }
                 let model = model.id.clone();
@@ -14378,14 +14383,13 @@ impl Cagents {
                     if !runtime.choosing() {
                         return Task::none();
                     }
-                    Arc::make_mut(&mut runtime.snapshot).reasoning = Some(reasoning.clone());
-                    self.remember_chat_model(provider, Some(model), Some(reasoning));
+                    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                    snapshot.selected_model = Some(model.clone());
+                    snapshot.reasoning = reasoning.clone();
+                    self.remember_chat_model(provider, Some(model), reasoning);
                     return Task::none();
                 }
-                let command = Command::SetModel {
-                    model,
-                    reasoning: Some(reasoning),
-                };
+                let command = Command::SetModel { model, reasoning };
                 return self.chat_send(target, command, false);
             }
             Action::PermissionMode(target, mode) => {
@@ -14822,7 +14826,6 @@ impl Cagents {
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(String::new);
-                runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
                 if open {
@@ -14840,16 +14843,6 @@ impl Cagents {
                     && let Some(current) = runtime.model_picker.as_mut()
                 {
                     *current = query;
-                }
-            }
-            Action::ReasoningPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.composer_actions = false;
-                    runtime.branch_picker = false;
-                    runtime.reasoning_picker = open;
-                    runtime.model_picker = None;
-                    runtime.account_picker = false;
-                    runtime.permission_picker = false;
                 }
             }
         }
@@ -28153,6 +28146,243 @@ mod tests {
         }
     }
 
+    fn reasoning_action_draft(app: &mut Cagents, provider: Provider) -> CardId {
+        drop(app.observe_listed_models(
+            provider,
+            vec![
+                fixture_model("fixture-model", &["low", "high"]),
+                fixture_model("other-model", &["low", "high"]),
+            ],
+            None,
+        ));
+        let card = draft_chat_for_provider(app, provider);
+        let target = chat_runtime(app, card).target;
+        drop(app.update(Message::ChatUi(Action::DraftModel(
+            target,
+            provider,
+            Some("fixture-model".into()),
+        ))));
+        drop(app.update(Message::ChatUi(Action::Reasoning(
+            target,
+            "fixture-model".into(),
+            Some("high".into()),
+        ))));
+        assert_eq!(
+            chat_runtime(app, card).snapshot.reasoning.as_deref(),
+            Some("high")
+        );
+        card
+    }
+
+    #[test]
+    fn reasoning_action_default_clears_the_draft_and_its_next_draft_preference() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = reasoning_action_draft(&mut app, provider);
+            let target = chat_runtime(&app, card).target;
+            drop(app.update(Message::ChatUi(Action::Reasoning(
+                target,
+                "fixture-model".into(),
+                None,
+            ))));
+            assert!(chat_runtime(&app, card).snapshot.reasoning.is_none());
+            assert_eq!(
+                app.chat_ui.last_models.get(&provider),
+                Some(&("fixture-model".into(), None))
+            );
+            drop(app.update(Message::ChatUi(Action::DraftModel(
+                target,
+                provider,
+                Some("other-model".into()),
+            ))));
+            assert!(chat_runtime(&app, card).snapshot.reasoning.is_none());
+            let next = app.chat_draft_snapshot(provider);
+            assert_eq!(next.selected_model.as_deref(), Some("other-model"));
+            assert!(next.reasoning.is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_action_implicit_default_alias_preserves_high_and_reset_for_first_submit() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for clear in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                drop(app.observe_listed_models(
+                    provider,
+                    vec![
+                        fixture_model("other-model", &["low"]),
+                        fixture_model("default", &["low", "high"]),
+                    ],
+                    None,
+                ));
+                let card = draft_chat_for_provider(&mut app, provider);
+                let runtime = chat_runtime(&app, card);
+                assert!(runtime.snapshot.selected_model.is_none());
+                assert_eq!(
+                    selected_chat_model(&runtime.snapshot).unwrap().id,
+                    "default"
+                );
+                let target = runtime.target;
+                drop(app.update(Message::ChatUi(Action::Reasoning(
+                    target,
+                    "other-model".into(),
+                    Some("low".into()),
+                ))));
+                assert!(chat_runtime(&app, card).snapshot.selected_model.is_none());
+                drop(app.update(Message::ChatUi(Action::Reasoning(
+                    target,
+                    "default".into(),
+                    Some("high".into()),
+                ))));
+                assert_eq!(
+                    chat_runtime(&app, card).snapshot.reasoning.as_deref(),
+                    Some("high")
+                );
+                if clear {
+                    drop(app.update(Message::ChatUi(Action::Reasoning(
+                        target,
+                        "default".into(),
+                        None,
+                    ))));
+                }
+                let effort = (!clear).then(|| "high".to_owned());
+                let next = app.chat_draft_snapshot(provider);
+                assert_eq!(next.selected_model.as_deref(), Some("default"));
+                assert_eq!(next.reasoning, effort);
+                assert_eq!(
+                    app.chat_ui.last_models.get(&provider),
+                    Some(&("default".into(), effort.clone()))
+                );
+                write(&mut app, card, "hello");
+                submit(&mut app, card);
+                assert_eq!(
+                    chat_runtime(&app, card).queued.as_ref().unwrap().model,
+                    Some(("default".into(), effort))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_action_default_targets_the_staged_live_model_and_is_remembered_on_ack() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, provider, None);
+            show_chat_snapshot_for_test(
+                &mut app,
+                card,
+                Snapshot {
+                    generation: 1,
+                    ready: true,
+                    busy: true,
+                    models: vec![
+                        fixture_model("running", &["low", "high"]),
+                        fixture_model("staged", &["low", "high"]),
+                    ],
+                    selected_model: Some("staged".into()),
+                    reasoning: Some("high".into()),
+                    ..Snapshot::default()
+                },
+            );
+            let target = chat_runtime(&app, card).target;
+            // Full snapshots preserve the separately published running model.
+            // Seed that status independently of the staged model fixture.
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).active_model =
+                Some(chat::ActiveModel {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    reasoning: Some("low".into()),
+                    default_reasoning: Some("low".into()),
+                    aliases: Vec::new(),
+                });
+            app.remember_chat_model(provider, Some("staged".into()), Some("high".into()));
+            drop(app.update(Message::ChatUi(Action::Reasoning(
+                target,
+                "staged".into(),
+                None,
+            ))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.model.as_ref()),
+                Some(&("staged".into(), None))
+            );
+            assert_eq!(
+                runtime.snapshot.active_model.as_ref().unwrap().id,
+                "running"
+            );
+            assert_eq!(
+                app.chat_ui.last_models.get(&provider),
+                Some(&("staged".into(), Some("high".into())))
+            );
+            settle(&mut app, card, Ok(()));
+            assert_eq!(
+                app.chat_ui.last_models.get(&provider),
+                Some(&("staged".into(), None))
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_action_rejects_stale_models_and_unlisted_efforts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = reasoning_action_draft(&mut app, Provider::Codex);
+        let target = chat_runtime(&app, card).target;
+        for (model, effort) in [("other-model", None), ("fixture-model", Some("unlisted"))] {
+            drop(app.update(Message::ChatUi(Action::Reasoning(
+                target,
+                model.into(),
+                effort.map(str::to_owned),
+            ))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.snapshot.selected_model.as_deref(),
+                Some("fixture-model")
+            );
+            assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("high"));
+            assert!(runtime.pending.is_none());
+            assert_eq!(
+                app.chat_ui.last_models.get(&Provider::Codex),
+                Some(&("fixture-model".into(), Some("high".into())))
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_action_draft_default_is_sent_when_startup_reports_an_override() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = reasoning_action_draft(&mut app, Provider::Codex);
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Reasoning(
+            target,
+            "fixture-model".into(),
+            None,
+        ))));
+        write(&mut app, card, "hello");
+        submit(&mut app, card);
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot {
+            models: vec![fixture_model("fixture-model", &["low", "high"])],
+            selected_model: Some("fixture-model".into()),
+            reasoning: Some("high".into()),
+            ready: true,
+            ..Snapshot::default()
+        });
+        answer_start(&mut app, target, Ok(handle));
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().model,
+            Some(("fixture-model".into(), None))
+        );
+        settle(&mut app, card, Ok(()));
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).queued.is_none());
+    }
+
     /// A draft with "hello" written on `model` of the Codex catalog, which
     /// lists `gpt-a` and `gpt-b`, sent and started on a conversation that
     /// lists `listed`; returns the card once the conversation is ready.
@@ -28163,6 +28393,7 @@ mod tests {
                 fixture_model("gpt-a", &[]),
                 fixture_model("gpt-b", &["low", "high"]),
             ],
+            None,
         );
         let card = draft_chat(app);
         let target = chat_runtime(app, card).target;

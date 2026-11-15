@@ -1601,12 +1601,30 @@ impl ControlClient {
         Ok(terminal)
     }
 
+    pub fn retry_pending_terminal_save(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::RetryPendingTerminalSave { pane, terminal_id })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "a terminal save acknowledgement",
+                &response,
+            )),
+        }
+    }
+
     pub fn complete_pending_terminal(
         &mut self,
         pane: crate::model::CardId,
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     ) -> Result<TerminalDescriptor, ControlError> {
+        // Persistence can fail after publication subscribed this connection.
+        // Keep receiving this exact worker's output during recovery RPCs even
+        // when completion returns an error; envelope and foreign-ID checks stay.
+        self.terminal_streams.insert(terminal_id);
         let response = self.request_attached(
             ClientRequest::CompletePendingTerminal {
                 pane,
@@ -1625,7 +1643,6 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a reserved terminal", &response)),
         };
-        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -2443,6 +2460,7 @@ impl ControlClient {
             | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
+            | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2670,6 +2688,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatLimit { .. }
         | ServerMessage::ChatAgentAddresses { .. }
         | ServerMessage::AutomationProposalsChanged { .. }
+        | ServerMessage::ChatActiveModel { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2693,6 +2712,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
+        ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
@@ -7969,6 +7989,95 @@ mod tests {
         );
         server.join().unwrap();
     }
+    #[test]
+    fn pending_save_failure_keeps_its_stream_legal_during_recovery_reads() {
+        for foreign in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let pinned = proof("pending-save-stream", "boot", "incarnation");
+            let terminal = TerminalId::new();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let complete: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(complete.request, ClientRequest::CompletePendingTerminal { terminal_id, .. } if terminal_id == terminal)
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(complete.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            "fixture refused completion save",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+                let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                // Publication succeeded before persistence failed. Its output
+                // still arrives during the fallback's view/inventory reads.
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: pinned.clone(),
+                        message: ServerMessage::Redraw {
+                            terminal_id: if foreign { TerminalId::new() } else { terminal },
+                            generation: 1,
+                        },
+                    },
+                )
+                .unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(list.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Listed { terminals: vec![] },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            assert!(matches!(
+                client.complete_pending_terminal(
+                    crate::model::CardId::new(),
+                    terminal,
+                    TerminalSpawnOptions::default()
+                ),
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::Internal,
+                    ..
+                })
+            ));
+            let result = client.list();
+            if foreign {
+                assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedMessage { .. })
+                ));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "published worker output interrupted its recovery read: {result:?}"
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn requested_terminal_streams_do_not_break_later_rpc_or_accept_foreign_frames() {
         for invalid in ["unknown", "proof", "request-id"] {

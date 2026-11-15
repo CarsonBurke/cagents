@@ -731,6 +731,15 @@ impl Cagents {
             && !self.shared_views.registry_unavailable
     }
 
+    /// The accepted automatic start, including a save still awaiting Retry.
+    pub(super) fn pending_terminal_reservation(&self, card: CardId) -> Option<&Pane> {
+        self.workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == card && pane.pending_terminal_start)
+    }
+
     /// Whether `card` attaches as a pane of a joined registry rather than
     /// from this window's own saved descriptor.
     pub(super) fn attaches_as_shared(&self, card: CardId) -> bool {
@@ -1031,9 +1040,23 @@ impl Cagents {
                 if let Scope::Worktree { path, .. } = scope {
                     pane.scope = Some(path.clone());
                 }
+                self.hold_unsaved_terminal_pane(scope, &mut pane);
                 Some(pane)
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn initialize_terminal_save_test_scope(&mut self, scope: Scope) {
+        self.shared_views.initialized.insert(scope);
+    }
+
+    #[cfg(test)]
+    pub(super) fn local_views_for_terminal_save_test(&self, scope: &Scope) -> Pane {
+        let direct = self.local_view_panes(scope);
+        let batched = self.local_views_in(Some(&HashSet::from([scope.clone()])));
+        assert_eq!(direct, batched.panes[scope]);
+        direct[0].clone()
     }
 
     fn local_views(&self) -> LocalViews {
@@ -1105,6 +1128,7 @@ impl Cagents {
                     if let Scope::Worktree { path, .. } = scope {
                         pane.scope = Some(path.clone());
                     }
+                    self.hold_unsaved_terminal_pane(scope, &mut pane);
                     Some(pane)
                 })
                 .collect();
@@ -3102,15 +3126,18 @@ impl Cagents {
                 tasks.push(task);
                 current.extend(saved_copy);
             }
-            match &pane.user_title {
-                Some(title) => {
-                    // A user's name takes precedence over a reported title,
-                    // which must not be published back with it.
-                    self.reported_title_save.cards.remove(&pane.id);
-                    self.chrome_ui.user_titles.insert(pane.id, title.clone());
-                }
-                None => {
-                    self.chrome_ui.user_titles.remove(&pane.id);
+            let keep_live = self.observe_terminal_save(pane);
+            if !keep_live {
+                match &pane.user_title {
+                    Some(title) => {
+                        // A user's name takes precedence over a reported title,
+                        // which must not be published back with it.
+                        self.reported_title_save.cards.remove(&pane.id);
+                        self.chrome_ui.user_titles.insert(pane.id, title.clone());
+                    }
+                    None => {
+                        self.chrome_ui.user_titles.remove(&pane.id);
+                    }
                 }
             }
             let existing = self.card_state(pane.id).cloned();
@@ -3224,7 +3251,11 @@ impl Cagents {
                             self.sidebar_state.forget_card_attention(pane.id);
                         }
                     }
-                    let mut kind = pane.kind.clone();
+                    let mut kind = if keep_live {
+                        card.kind.clone()
+                    } else {
+                        pane.kind.clone()
+                    };
                     preserve_observed_terminal_exit(observed_exit.as_ref(), &mut kind);
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
@@ -3232,15 +3263,17 @@ impl Cagents {
                     // Writing a card copies it while a save still holds it,
                     // so only a card the view changes is written.
                     let changed = self.card_state(pane.id).is_some_and(|current| {
-                        (!reported && current.title != pane.title)
-                            || current.width_fraction != pane.width_fraction
+                        (!reported && !keep_live && current.title != pane.title)
+                            || !keep_live && current.width_fraction != pane.width_fraction
                             || (!resuming && current.kind != kind)
                     });
                     if changed && let Some(current) = self.card_state_mut(pane.id) {
-                        if !reported {
+                        if !reported && !keep_live {
                             current.title = pane.title.clone();
                         }
-                        current.width_fraction = pane.width_fraction;
+                        if !keep_live {
+                            current.width_fraction = pane.width_fraction;
+                        }
                         if !resuming {
                             current.kind = kind;
                         }
@@ -9638,6 +9671,54 @@ mod tests {
                 .contains_key(&aliases[1])
         );
         assert!(app.shared_chat_has_local_work(app.workspace_model.views[0].panes[1].id));
+    }
+
+    #[test]
+    fn retry_pending_terminal_preserves_the_reserved_identity() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let source = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(source.clone(), None));
+        let card = app.workspace.focused().unwrap();
+        app.terminal_starts.lock().unwrap().clear();
+        Arc::make_mut(&mut app.durable)
+            .pending_terminal_creations
+            .remove(&card);
+        app.shared_views.attached.insert(card);
+        app.shared_views.pending.clear();
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.pending_terminal_start = true;
+        let mut view = View::empty(channel);
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        app.cards
+            .insert(card, CardRuntime::Failed("completion save refused".into()));
+
+        let mut hosted = source.clone();
+        hosted.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("pending-fixture"),
+            boot_id: crate::model::BootId::new("pending-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("pending-fixture"),
+        };
+        // Reconnecting inventory is evidence that the worker exists, not
+        // permission to publish its source over the outstanding reservation.
+        drop(app.observe_hosted_terminals(vec![hosted]));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(source.clone())
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+
+        drop(app.retry_card(card));
+
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(source)
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(app.terminal_starts.lock().unwrap().contains_key(&card));
     }
 
     #[test]

@@ -246,6 +246,10 @@ use crate::{
 /// Older clients cannot decode the new error code; replace the matched set.
 /// Version 180 appends agent placement context and a narrow read of managed
 /// agents' accepted task labels, preserving the carried CLI directory layout.
+/// Version 181 appends `RetryPendingTerminalSave` to persist an already
+/// running terminal without launching another worker.
+/// Version 182 appends provider-confirmed active model status independently of
+/// chat snapshots, whose inspector encoding stays frozen for update sources.
 /// Version 183 fences shared Close on its original pane and terminal worker,
 /// with attachment metadata, captured-source reads and source-checked cleanup.
 /// Replace the matched daemon/window set.
@@ -659,6 +663,12 @@ pub enum ClientRequest {
     ReadWorkspaceMetadata {
         query: crate::workspace_model::metadata::Query,
     },
+    /// Save only a resident worker's retained automatic-start intent. This
+    /// request never allocates or replays a worker after retirement.
+    RetryPendingTerminalSave {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    },
     /// An exact source worker, or an absence stamp captured before Close's
     /// process proof. This never closes, starts or attaches a terminal.
     ReadTerminalRemovalBasis {
@@ -966,6 +976,13 @@ pub enum ServerMessage {
     /// Notification subscribers read the pending requests again.
     AutomationProposalsChanged {
         repository: std::path::PathBuf,
+    },
+    /// Provider-confirmed model and effort, independently of a staged model
+    /// selection. Each subscriber receives the current revision on attachment.
+    ChatActiveModel {
+        chat_id: TerminalId,
+        revision: u64,
+        model: Option<crate::chat::ActiveModel>,
     },
     /// Exact attachment metadata, separate from the frozen descriptor used by
     /// historical update sources. This UUID never authorizes process cleanup.
@@ -2412,6 +2429,35 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {
+        let model = crate::chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: None,
+            aliases: vec!["opusplan".into()],
+        };
+        let mut snapshot = crate::chat::Snapshot::default();
+        let before = postcard::to_allocvec(&snapshot).unwrap();
+        snapshot.active_model = Some(model.clone());
+        snapshot.active_model_revision = 3;
+        assert_eq!(postcard::to_allocvec(&snapshot).unwrap(), before);
+        let message = ServerMessage::ChatActiveModel {
+            chat_id: TerminalId::new(),
+            revision: 3,
+            model: Some(model),
+        };
+        let encoded = postcard::to_allocvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, message);
+        assert!(
+            !older_client(CANDIDATE_LINE_PROTOCOL)
+                .unwrap()
+                .admits_message(&message)
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

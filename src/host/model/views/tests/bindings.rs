@@ -220,7 +220,7 @@ fn cold_conversion_never_reuses_a_captured_generation_watermark() {
     old.view_revision = u64::MAX;
     drop(registry);
     let path = directory.path().join("model.sqlite3");
-    crate::host::model::schema::downgrade(&path, 24).unwrap();
+    crate::host::model::schema::downgrade(&path, 25).unwrap();
     let mut registry = Registry::at(&path).unwrap();
     assert!(registry.source_admission().unwrap().validate(&old).is_err());
     let fresh = capture(&registry, channel);
