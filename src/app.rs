@@ -4644,6 +4644,12 @@ pub enum Message {
     /// The switcher's selection, held open since this instant, may have
     /// rested long enough to bring its pane up for the preview.
     WorkspaceSwitcherRested(Option<Instant>),
+    /// The list of the switcher held open since `since` was scrolled to
+    /// `offset`, by the wheel or its scrollbar.
+    WorkspaceSwitcherScrolled {
+        since: Instant,
+        offset: f32,
+    },
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -5601,12 +5607,6 @@ pub struct Cagents {
     settings_search: String,
     tab_history: crate::tab_history::TabHistory<CardId>,
     workspace_history: crate::tab_history::TabHistory<WorkspaceDestination>,
-    /// When each recently used workspace was last open, in seconds since the
-    /// Unix epoch, as the workspace switcher dates its quiet rows.
-    workspace_visits: HashMap<WorkspaceDestination, u64>,
-    /// The workspace open when visits were last dated, so leaving it dates
-    /// it however the switch came about.
-    workspace_visited: Option<WorkspaceDestination>,
     workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
@@ -14667,7 +14667,6 @@ impl Application for Cagents {
                 .copied()
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
-        let workspace_visits = durable.workspace_visits.iter().copied().collect();
         let mut app = Self {
             startup_gate: startup_gate::State::default(),
             core,
@@ -14858,8 +14857,6 @@ impl Application for Cagents {
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
             workspace_history,
-            workspace_visits,
-            workspace_visited: None,
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
@@ -17344,6 +17341,12 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WorkspaceSwitcherRested(since) => self.workspace_switcher_rested(since),
+            Message::WorkspaceSwitcherScrolled { since, offset } => {
+                if self.chrome_ui.workspace_preview_since == Some(since) {
+                    self.chrome_ui.workspace_switcher_scroll = offset;
+                }
+                Task::none()
+            }
             Message::NavigationSaveDue(generation) => {
                 if self.navigation_save_due(generation) {
                     self.persist();
@@ -27025,6 +27028,34 @@ mod tests {
     }
 
     #[test]
+    fn workspace_switcher_steps_from_where_the_wheel_left_the_list() {
+        let mut app = workspace_switcher_test_app(20);
+        let step = |app: &mut Cagents| {
+            drop(app.cycle_workspace(
+                crate::workspace::FocusDirection::Right,
+                keyboard::Modifiers::ALT,
+            ))
+        };
+        step(&mut app);
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(Message::WorkspaceSwitcherScrolled {
+            since,
+            offset: 40.0,
+        }));
+        step(&mut app);
+        assert_eq!(app.workspace_history.cycle_index(), Some(2));
+        assert!(app.workspace_switcher_shows_row(2));
+        // Row 2 is in view where the wheel left the list, so it stays put.
+        assert_eq!(app.chrome_ui.workspace_switcher_scroll, 40.0);
+        // A scroll reported for an earlier hold moves nothing.
+        drop(app.update(Message::WorkspaceSwitcherScrolled {
+            since: since - Duration::from_secs(1),
+            offset: 0.0,
+        }));
+        assert_eq!(app.chrome_ui.workspace_switcher_scroll, 40.0);
+    }
+
+    #[test]
     fn workspace_switcher_tab_steers_a_compositor_safe_fallback_hold() {
         let mut app = workspace_switcher_test_app(3);
         let event = |key, physical| Message::KeyEvent {
@@ -27129,27 +27160,6 @@ mod tests {
             app.active_workspace.as_deref(),
             Some(Path::new("/folder-0"))
         );
-    }
-
-    /// The switcher dates a quiet row from when its workspace was last open,
-    /// and the dates survive a restart with the history they belong to.
-    #[test]
-    fn workspace_visits_follow_navigation_and_are_saved_with_the_history() {
-        let mut app = workspace_switcher_test_app(2);
-        let first = app.active_workspace_destination().unwrap();
-        app.capture_workspace_history();
-        drop(app.cycle_workspace(
-            crate::workspace::FocusDirection::Right,
-            keyboard::Modifiers::empty(),
-        ));
-        let second = app.active_workspace_destination().unwrap();
-        assert_ne!(first, second);
-        app.capture_workspace_history();
-        assert!(app.workspace_visits.contains_key(&first));
-        assert!(app.workspace_visits.contains_key(&second));
-        let saved = app.persistent_workspace();
-        let destinations: Vec<_> = saved.workspace_visits.iter().map(|(d, _)| *d).collect();
-        assert!(destinations.contains(&first) && destinations.contains(&second));
     }
 
     #[test]
@@ -31222,8 +31232,6 @@ mod tests {
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
             workspace_history: crate::tab_history::TabHistory::default(),
-            workspace_visits: HashMap::new(),
-            workspace_visited: None,
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,

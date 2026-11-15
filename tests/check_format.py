@@ -133,6 +133,37 @@ sys.exit({status})
                 self.assertIn("cargo diagnostic", result.stderr)
                 self.assertIn("rustfmt diagnostic", result.stderr)
 
+    def test_write_formats_both_routes_in_place_without_the_cache(self):
+        # Python stays available, so only --write can explain the direct rustfmt call.
+        for cargo_status, rustfmt_status in ((0, 0), (0, 3), (5, 0)):
+            with self.subTest(cargo=cargo_status, rustfmt=rustfmt_status):
+                log, env = self.mock_tools(cargo_status, rustfmt_status)
+                log.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [str(self.script), "--write"], cwd=self.root.parent, env=env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, cargo_status or rustfmt_status)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [
+                        [str(self.root), "cargo", "fmt"],
+                        [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
+                    ],
+                )
+        self.assertFalse((self.root / "target").exists())
+
+    def test_unknown_arguments_are_refused_before_formatting(self):
+        log, env = self.mock_tools()
+        for arguments in (["--check"], ["--write", "--write"], ["src/main.rs"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [str(self.script), *arguments], cwd=self.root.parent, env=env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(log.exists())
+
     def test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout(self):
         target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
         self.addCleanup(target.cleanup)

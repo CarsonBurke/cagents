@@ -10,8 +10,10 @@ older-head applicability case to tolerate.
                     syntax; every problem is reported at once
   plan              print the CI matrix, one entry per job shard
   protocol-base     print the commit the protocol contract compares with
-  run JOB [SHARD]   run one job's suites; SHARD (I/N) runs every Nth test of a
-                    sharded job's single suite, so the shards cover it exactly
+  run [JOB [SHARD]] run one job's suites; SHARD (I/N) runs every Nth test of a
+                    sharded job's single suite, so the shards cover it exactly.
+                    Without JOB, run every job unsharded, one after another,
+                    then the source job's suites
 """
 
 import argparse
@@ -55,12 +57,16 @@ JOBS = (
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(
-        Suite("build offload", "tests/cargo_offload.py", sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py")),
+        Suite("build offload", "tests/cargo_offload.py",
+              sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host")),
     )),
     Job("cargo gate", suites=(
         Suite("held-command cancellation", "tests/cargo_gate.py",
-              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py"),
+              sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py",
+                       "scripts/build-host", "scripts/memory-capped"),
               syntax=(("sh", "scripts/cargo-gate"),)),
+        Suite("build host admission and jobserver", "tests/build_host.py",
+              sources=("scripts/build-host", "scripts/memory-capped")),
     )),
     Job("build directories", suites=(
         Suite("build directory pruning", "tests/prune_build_dirs.py", sources=("scripts/prune-build-dirs",)),
@@ -81,6 +87,8 @@ JOBS = (
     Job("tooling", suites=(
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
+        Suite("mise tasks", "tests/mise_tasks.py", sources=("mise.toml",)),
+        Suite("doctor", "tests/doctor.py", sources=("scripts/doctor",)),
         Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
         Suite("formatter", "tests/check_format.py",
@@ -317,7 +325,8 @@ def run(root, job_name, shard_text=None, jobs=JOBS):
     job = next((job for job in jobs if job.name == job_name), None)
     if job is None:
         raise ContractError(f"Unknown job {job_name!r}; choose one of: {', '.join(j.name for j in jobs)}")
-    shard = parse_shard(shard_text or "1/1", job.shards)
+    # Without a shard, a sharded job's suite runs whole, as it does locally.
+    shard = parse_shard(shard_text, job.shards) if shard_text else None
     if job.shards == 1:
         shard = None
     problems = files_and_syntax(root, job.suites)
@@ -336,6 +345,23 @@ def run(root, job_name, shard_text=None, jobs=JOBS):
             failures.append((suite.name, returncode))
     for name, returncode in failures:
         print(f"Failed: {name} (exit {returncode})", file=sys.stderr)
+    return failures[0][1] if failures else 0
+
+
+def run_all(root, jobs=JOBS, source_fixtures=SOURCE_JOB_FIXTURES):
+    """Run every suite CI runs, continuing past failures; the first failure's status."""
+    failures = []
+    for job in jobs:
+        returncode = run(root, job.name, jobs=jobs)
+        if returncode:
+            failures.append((job.name, returncode))
+    if source_fixtures:
+        source = Job("source", tuple(Suite(Path(fixture).stem, fixture) for fixture in source_fixtures))
+        returncode = run(root, source.name, jobs=(source,))
+        if returncode:
+            failures.append((source.name, returncode))
+    for name, returncode in failures:
+        print(f"Failed job: {name} (exit {returncode})", file=sys.stderr)
     return failures[0][1] if failures else 0
 
 
@@ -373,7 +399,7 @@ def main():
     base_parser.add_argument("--event", required=True)
     base_parser.add_argument("--before")
     run_parser = commands.add_parser("run")
-    run_parser.add_argument("job")
+    run_parser.add_argument("job", nargs="?")
     run_parser.add_argument("shard", nargs="?")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -391,6 +417,8 @@ def main():
         if args.command == "plan":
             print(json.dumps(plan(), separators=(",", ":")))
             return 0
+        if args.job is None:
+            return run_all(root)
         return run(root, args.job, args.shard)
     except ContractError as error:
         print(f"Script contracts refused: {error}", file=sys.stderr)

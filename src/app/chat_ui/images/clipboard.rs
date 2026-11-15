@@ -233,7 +233,7 @@ pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) ->
 
 /// The transcript preview currently drawn with `image`, if it still is.
 pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> {
-    let (id, handle) = runtime
+    let Some((id, handle)) = runtime
         .presentation_cache()
         .iter()
         .find_map(|(id, cached)| {
@@ -242,7 +242,11 @@ pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> 
                 .as_ref()
                 .filter(|handle| handle.id() == image)
                 .map(|handle| (id, handle))
-        })?;
+        })
+    else {
+        // An image an answer's Markdown shows.
+        return runtime.figures.resolve(image);
+    };
     let item = items(runtime).iter().find(|item| item.id == *id)?;
     Some(Resolved {
         item: Some(id.clone()),
