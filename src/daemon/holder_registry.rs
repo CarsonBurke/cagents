@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{BootId, TerminalId};
 
 mod connection;
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(any(feature = "host", test))]
 pub(crate) use connection::connect_until;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
