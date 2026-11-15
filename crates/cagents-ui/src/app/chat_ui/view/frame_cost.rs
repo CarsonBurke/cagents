@@ -421,6 +421,7 @@ impl Pane {
                 true,
                 &self.shortcuts,
                 720.0,
+                0.0,
                 Place {
                     channel: None,
                     name: "project".into(),
@@ -593,6 +594,7 @@ impl Pane {
             true,
             &self.shortcuts,
             720.0,
+            0.0,
             Place {
                 channel: None,
                 name: "project".into(),

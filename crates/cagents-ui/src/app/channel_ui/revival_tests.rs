@@ -139,13 +139,18 @@ impl Fixture {
     fn close_card(&mut self) {
         self.app.workspace.request_close(self.card).unwrap();
         drop(self.app.commit_card_removal(self.card, None).unwrap());
-        assert!(self.app.channel_ui.retire_candidates.contains(&self.home));
+        assert!(
+            self.app
+                .channel_ui
+                .retire_candidates
+                .contains_key(&self.home)
+        );
     }
 
     /// The registry's view of the channel settles empty, and the window asks
     /// it to retire the channel.
-    fn send_retirement(&mut self) -> async_channel::Receiver<ModelEdit> {
-        let (send, received) = async_channel::unbounded();
+    fn send_retirement(&mut self) -> TestModelRequests {
+        let (send, received) = test_model_channel();
         self.app.workspace_model_tx = send;
         let view = &mut self.app.workspace_model.views[0];
         view.panes.clear();
@@ -191,7 +196,7 @@ impl Fixture {
     }
 
     /// The registry retires the channel, and the window learns it.
-    fn retire(&mut self) -> async_channel::Receiver<ModelEdit> {
+    fn retire(&mut self) -> TestModelRequests {
         let received = self.send_retirement();
         let channel = self.channel;
         self.answer_retirement(true);
@@ -234,6 +239,23 @@ impl Fixture {
         assert!(self.app.channel_ui.retiring.is_empty());
     }
 
+    /// Makes the channel's title the one its conversation suggested rather
+    /// than a name the person gave, here and in the registry.
+    fn title_by_conversation(&mut self) {
+        let source = crate::model::ChannelTitleSource::Prompt;
+        let channel = self.channel;
+        for row in &mut Arc::make_mut(&mut self.app.durable).channels {
+            if row.id == channel {
+                row.title_source = source;
+            }
+        }
+        for row in &mut self.app.workspace_model.channels {
+            if row.id == channel {
+                row.title_source = source;
+            }
+        }
+    }
+
     /// The registry's settled revision of the channel's view.
     fn view_revision(&self) -> u64 {
         self.app
@@ -246,8 +268,8 @@ impl Fixture {
     }
 
     /// Replaces the publisher so what the window asks next can be read.
-    fn listen(&mut self) -> async_channel::Receiver<ModelEdit> {
-        let (send, received) = async_channel::unbounded();
+    fn listen(&mut self) -> TestModelRequests {
+        let (send, received) = test_model_channel();
         self.app.workspace_model_tx = send;
         received
     }
@@ -424,7 +446,9 @@ fn shortcut_and_picker_preserve_manual_pane_names_after_retirement() {
             }
             let saved = fixture.saved();
             fixture.close_card();
-            fixture.retire();
+            // Keep the workspace connection open: a seed sent into a closed one
+            // is refused until an explicit retry, and the successor must seed.
+            let _requests = fixture.retire();
             let before_settings = fixture.app.settings_save_generation;
             if picker {
                 drop(fixture.app.resume_saved_conversation(saved));
@@ -683,7 +707,7 @@ fn a_conversation_deleted_while_open_resumes_in_its_worktree() {
 fn reopening_before_retirement_keeps_the_channel() {
     let mut fixture = fixture();
     fixture.close_card();
-    let (send, published) = async_channel::unbounded();
+    let (send, published) = test_model_channel();
     fixture.app.workspace_model_tx = send;
 
     fixture.reopen_pane();
@@ -1416,7 +1440,7 @@ fn a_channel_named_from_its_conversation_gets_the_name_back() {
     assert!(published.try_recv().is_err());
 }
 
-fn retirements(received: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+fn retirements(received: &TestModelRequests) -> Vec<ModelEdit> {
     std::iter::from_fn(|| received.try_recv().ok())
         .filter(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. }))
         .collect()
@@ -1428,6 +1452,7 @@ fn retirements(received: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> 
 #[test]
 fn leaving_a_channel_emptied_elsewhere_retires_it() {
     let mut fixture = fixture();
+    fixture.title_by_conversation();
     fixture.empty_from_elsewhere();
     assert!(
         fixture
@@ -1478,6 +1503,7 @@ fn leaving_a_channel_keeps_one_holding_work_or_recovery_evidence() {
 
     // A saved pane the registry holds that this window never attached.
     let mut unattached = fixture();
+    unattached.title_by_conversation();
     let pane = unattached.app.workspace_model.views[0].panes[0].clone();
     unattached.empty_from_elsewhere();
     unattached.app.workspace_model.views[0].panes.push(Pane {
@@ -1492,6 +1518,7 @@ fn leaving_a_channel_keeps_one_holding_work_or_recovery_evidence() {
     // was closed here.
     for closed_here in [false, true] {
         let mut detached = fixture();
+        detached.title_by_conversation();
         detached.empty_from_elsewhere();
         let agent = crate::agent_execution::Agent::fixture_placed_in(detached.channel);
         if closed_here {
@@ -1510,12 +1537,75 @@ fn leaving_a_channel_keeps_one_holding_work_or_recovery_evidence() {
     }
 }
 
+/// A name is something the person put in a channel, so neither leaving it
+/// nor the startup sweep retires a named channel, however empty: one renamed
+/// here, even while a model the registry sent before the rename still shows
+/// the old title, or one made with its name. Closing its last card still
+/// retires it, as before. An untitled one has no name to keep.
+#[test]
+fn leaving_a_named_channel_keeps_it() {
+    use super::super::chrome_ui::Action as Chrome;
+    let mut renamed = fixture();
+    renamed.title_by_conversation();
+    let channel = renamed.channel;
+    for action in [
+        Chrome::RenameChannel(channel),
+        Chrome::RenameChanged("Release notes".into()),
+        Chrome::RenameSubmit,
+    ] {
+        drop(renamed.app.update_chrome(action));
+    }
+    // The registry has not answered the rename, so the model it sends with
+    // the pane's removal still carries the title the conversation gave.
+    renamed.empty_from_elsewhere();
+    assert_eq!(
+        renamed.active_channel().title_source,
+        crate::model::ChannelTitleSource::Prompt
+    );
+    let received = renamed.listen();
+    renamed.enter_other_project();
+    renamed.app.allow_empty_channel_sweep();
+    assert!(retirements(&received).is_empty());
+    assert!(renamed.app.channel_ui.retire_candidates.is_empty());
+    assert!(
+        renamed
+            .app
+            .durable
+            .channels
+            .iter()
+            .any(|row| row.id == channel),
+        "the renamed channel stays"
+    );
+
+    // Named when it was made, as `channel spawn --title` does.
+    let mut made_named = fixture();
+    made_named.empty_from_elsewhere();
+    let received = made_named.listen();
+    made_named.enter_other_project();
+    made_named.app.allow_empty_channel_sweep();
+    assert!(retirements(&received).is_empty());
+
+    // Never given a title.
+    let mut untitled = fixture();
+    for row in &mut Arc::make_mut(&mut untitled.app.durable).channels {
+        row.title.clear();
+    }
+    for row in &mut untitled.app.workspace_model.channels {
+        row.title.clear();
+    }
+    untitled.empty_from_elsewhere();
+    let received = untitled.listen();
+    untitled.enter_other_project();
+    assert_eq!(retirements(&received).len(), 1);
+}
+
 /// After this window's restore, the channels it is not showing that hold
 /// nothing retire once, under their settled revision. The one on screen
 /// stays, and nothing is swept before the restore allows it.
 #[test]
 fn the_startup_sweep_retires_empty_channels_off_screen_once() {
     let mut swept = fixture();
+    swept.title_by_conversation();
     swept.enter_other_project();
     swept.empty_from_elsewhere();
     let received = swept.listen();
@@ -1540,6 +1630,7 @@ fn the_startup_sweep_retires_empty_channels_off_screen_once() {
 
     // The channel on screen is not swept, however empty.
     let mut shown = fixture();
+    shown.title_by_conversation();
     shown.empty_from_elsewhere();
     let received = shown.listen();
     shown.app.allow_empty_channel_sweep();
@@ -1548,6 +1639,7 @@ fn the_startup_sweep_retires_empty_channels_off_screen_once() {
 
     // A restore that left a session unattached keeps its channel for recovery.
     let mut detached = fixture();
+    detached.title_by_conversation();
     detached.enter_other_project();
     detached.empty_from_elsewhere();
     detached
@@ -1590,7 +1682,7 @@ fn closing_an_unsent_last_conversation_retires_the_channel_without_a_view_edit()
             .app
             .channel_ui
             .retire_candidates
-            .contains(&fixture.home)
+            .contains_key(&fixture.home)
     );
     // What the close's task delivers once the close has landed.
     drop(

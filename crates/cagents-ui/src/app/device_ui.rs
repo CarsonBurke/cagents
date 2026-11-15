@@ -1061,7 +1061,7 @@ impl Cagents {
             [
                 (Panel::Files, Icon::Folder, "Browse files"),
                 (Panel::Changes, Icon::Diff, "Source control"),
-                (Panel::Worktrees, Icon::Branch, "Manage worktrees"),
+                (Panel::Worktrees, Icon::Worktree, "Manage worktrees"),
             ]
             .into_iter()
             .map(|(panel, glyph, label)| {

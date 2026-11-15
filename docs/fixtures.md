@@ -45,6 +45,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
+   Restoring a seed keeps existing provider homes and transcript files in place,
+   including read-only files. Updated files regain the seed's saved permissions;
+   fixture symlinks are not followed when preparing files for restoration.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
    `shot`).
@@ -55,6 +58,23 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
+
+## A scoped UI caller
+
+Add `start SIDE --ui-scoped-fixture`, or pass `--ui-scoped-fixture` to a remote
+`pair`, to exercise permission refusals in the actual UI. The option starts
+the fixture's daemon as User, then adds the hardcoded invalid synthetic
+`native-evidence-invalid-session` authority only to the UI runner's environment.
+It accepts no credential value and forwards no caller authority. `env` and
+`cli` commands retain User authority so a scene can seed its private data.
+A later `start` without the option removes that selection; `relaunch` keeps
+the current session's selection.
+
+Run it through `--remote fw16` from a hosted session. The ordinary inherited
+authority refusal still applies before fixture setup. This fixture tests a
+rejected synthetic caller, not the permissions of a valid hosted session.
+It uses the same offline providers and isolated provider homes as other
+native-evidence scenes.
 
 ## An offline GitHub
 
@@ -316,6 +336,18 @@ turn.
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
 ```
 
+`agents` has the lead start a background command and three background
+subagents, one of which finishes before the lead answers, so two subagents
+and the command are still working after the lead has finished. `plan` needs a session started with
+`--codex tool-rows`: its Codex turn publishes a plan with a step in progress
+beside the running tool, collaboration and event rows, stays working for 40
+seconds through `CODEX_HOME/fixture-plan`, then finishes.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" agents
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" plan
+```
+
 For a short comparison against main after the background-notice changes, run
 `refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
 each revision. Build both revisions before starting either session, use
@@ -521,3 +553,70 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+## A refused shared-view seed
+
+[`seed-refusal-scene.sh`](../tests/fixtures/seed-refusal-scene.sh) creates an
+offline Claude conversation with an unsent launch-note draft. Its `refuse`
+step closes only the UI, keeps the daemon and provider alive, then uses
+[`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
+remove that channel's shared view and its active placement mappings. It keeps
+both monotonic clocks, actor/history records, window retention pins and other
+scopes. The helper then adds a trigger that published-schema admission does
+not recognize. While armed, the real registry can refuse all writes, before
+the trigger's channel-conditional body runs. The native notice reports the
+registry's schema-mismatch reason, not the trigger body's SQLite sentence.
+The fixture does not inject UI state, replace transport or weaken schema checks.
+Dropping the trigger restores admission; the selected panes can register again
+with fresh placement generations.
+
+Run the scene on the native-evidence host, with both fixture scripts in the
+same directory. When comparing a revision that predates the scripts, copy them
+into the evidence task's `tools/` directory and use that copy on both sides.
+Keep the helper outside the before and after checkouts so their recorded source
+stays unchanged. Build both revisions before taking a native slot.
+
+```sh
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/seed-refusal
+export CAGENTS_EVIDENCE_TOOL=/path/to/checkout/scripts/native-evidence
+scene=$CAGENTS_EVIDENCE_TASK/tools/seed-refusal-scene.sh
+
+# Once, with a native session running; every later start restores these bytes.
+bash "$scene" seed
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" stop
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" save-seed
+
+# After starting either side at the comparison's width:
+# Observe the closed inspector's notices icon and set its point. Passing the
+# point to refuse clears unrelated transient headless-desktop notices.
+export NOTICE_CONTROL_POINT=$observed_point
+bash "$scene" refuse wide
+# On the fixed side:
+bash "$scene" notice wide
+bash "$scene" retry wide
+```
+
+`refuse` captures the saved draft before opening notices. `notice` checks the
+existing warning control's tooltip and captures the refusal and Retry action.
+`retry` removes the fixture refusal, presses Retry and waits for the saved pane
+to reopen. Repeat with `narrow` in a new session at the narrower viewport;
+both widths restore the same seed. To avoid taking another native slot, a
+1500×900 session can instead use `native-evidence nested niri msg action
+set-column-width 900` and return to `1500`; first confirm the actual app-window
+size with `drive observe`. Capture the full native window. The manifest retains
+the requested headless viewport and separately records the actual image size;
+report the latter for a resized capture. Apply identical geometry on both sides.
+The notices icon's position depends on that
+viewport and the inspector state, so observe it instead of reusing a guessed
+point. Stop immediately after capturing the states.
+
+The helper refuses a HOME or data directory outside the private evidence
+fixture. Its offline contracts cover selected-view/placement cleanup, foreign-key
+cascades, unchanged unrelated rows and monotonic clocks, and refusal to modify
+an unrelated home or missing channel. A separate direct-SQL check exercises the
+conditional trigger body only; it does not test daemon schema admission. Real
+registry refusal and successful recovery must be checked in the native app:
+
+```sh
+python3 -I -B tests/fixtures/test_seed_refusal_registry.py -v
+```

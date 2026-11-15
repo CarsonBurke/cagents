@@ -11,6 +11,27 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// Authorization refusals remain distinct from registry/record failures until
+/// the request dispatcher assigns a protocol error code.
+#[derive(Debug, thiserror::Error)]
+pub(in crate::host) enum AuthorityError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for AuthorityError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl From<&str> for AuthorityError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 /// An identity-only projection issued by an authenticated retained Claude
 /// helper. This shape grants no authority: callers must authenticate its exact
 /// source lineage before updating a saved agent or pane.
@@ -890,12 +911,17 @@ impl Registry {
         Ok(claimed)
     }
 
-    pub(crate) fn execution_origin(&self, authority: &Authority) -> Result<Origin, String> {
+    pub(in crate::host) fn execution_origin(
+        &self,
+        authority: &Authority,
+    ) -> Result<Origin, AuthorityError> {
         let Some(token) = authority.token() else {
             return Ok(Origin::User);
         };
         if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
-            return Err("Invalid agent session authority".into());
+            return Err(AuthorityError::Denied(
+                "Invalid agent session authority".into(),
+            ));
         }
         // A session owns what its whole lineage started.
         let lineage: String = self
@@ -907,7 +933,13 @@ impl Registry {
                 [token],
                 |row| row.get(0),
             )
-            .map_err(|_| "This agent session authority is no longer registered".to_owned())?;
+            .optional()
+            .map_err(|error| AuthorityError::Failed(error.to_string()))?
+            .ok_or_else(|| {
+                AuthorityError::Denied(
+                    "This agent session authority is no longer registered".into(),
+                )
+            })?;
         Ok(Origin::Child {
             parent: Lineage(
                 lineage
@@ -923,6 +955,14 @@ impl Registry {
         &self,
         authority: &Authority,
     ) -> Result<Option<HostedSession>, String> {
+        self.checked_agent_authority_source(authority)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn checked_agent_authority_source(
+        &self,
+        authority: &Authority,
+    ) -> Result<Option<HostedSession>, AuthorityError> {
         self.execution_origin(authority)?;
         authority
             .token()
@@ -934,10 +974,14 @@ impl Registry {
                         [token],
                         |row| row.get(0),
                     )
-                    .map_err(|_| {
-                        "This agent session authority is no longer registered".to_owned()
+                    .optional()
+                    .map_err(|error| AuthorityError::Failed(error.to_string()))?
+                    .ok_or_else(|| {
+                        AuthorityError::Denied(
+                            "This agent session authority is no longer registered".into(),
+                        )
                     })?;
-                decode(&source)
+                decode(&source).map_err(AuthorityError::Failed)
             })
             .transpose()
     }
@@ -1551,6 +1595,34 @@ impl Registry {
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(|error| error.to_string())?;
         records.iter().map(|record| decode(record)).collect()
+    }
+
+    /// Presentation identities come from each agent's first accepted task,
+    /// even when its provider has never been attached by a window. Later runs
+    /// and provider titles do not rename the original delegated task.
+    pub(crate) fn agent_labels(&self) -> Result<Vec<(AgentId, String)>, String> {
+        let mut query = self.db.prepare(
+            "SELECT a.record, (SELECT r.request FROM agent_runs r WHERE r.agent=a.id ORDER BY r.rowid LIMIT 1)
+             FROM agents a WHERE a.closed=0 ORDER BY a.rowid DESC LIMIT 1024",
+        ).map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (agent, request) = row.map_err(|error| error.to_string())?;
+            let agent: Agent = decode(&agent)?;
+            let request: Option<Submit> = request.as_deref().map(decode).transpose()?;
+            Ok((
+                agent.id,
+                crate::agent_execution::agent_label(
+                    agent.name.as_deref().unwrap_or("an agent"),
+                    request.as_ref().map(|request| request.prompt.as_str()),
+                ),
+            ))
+        })
+        .collect()
     }
 
     /// Bind the daemon-issued descriptor once. Adoption may later replace it
@@ -5899,6 +5971,48 @@ mod tests {
         assert!(registry.agents(None).unwrap().is_empty());
         request.name = Some("reviewer-2_api".into());
         assert!(registry.submit_agent(&Origin::User, &request, 2).is_ok());
+    }
+
+    #[test]
+    fn unloaded_agent_labels_use_the_first_accepted_task_and_survive_reconnect() {
+        use crate::workspace_model::metadata::{Query, Reply};
+
+        let (mut registry, directory, mut request) = fixture();
+        request.name = Some("reviewer".into());
+        request.prompt = "Review the one-row cards\nCheck the narrow layout too".into();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert!(accepted.agent.session.is_none());
+        assert!(registry.model().unwrap().views.is_empty());
+        let expected = vec![(
+            accepted.agent.id,
+            "reviewer · Review the one-row cards".into(),
+        )];
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+
+        request.name = None;
+        request.destination = Destination::Existing(accepted.agent.id);
+        request.idempotency_key = "follow-up".into();
+        request.prompt = "A later task does not rename the agent".into();
+        registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        drop(registry);
+
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+        let identity = registry.model().unwrap().identity;
+        assert_eq!(
+            registry.metadata(Query::AgentLabels).unwrap(),
+            Reply::AgentLabels {
+                identity,
+                labels: expected,
+            }
+        );
+        for run in registry.unfinished_agent_runs(accepted.agent.id).unwrap() {
+            registry.cancel_agent_run_at_close(&run, 3).unwrap();
+        }
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(registry.agent_labels().unwrap().is_empty());
     }
 
     #[test]

@@ -121,6 +121,7 @@ icons! {
         Sidebar => "sidebar",
         SplitPanel => "split-panel",
         Tree => "tree",
+        Worktree => "worktree",
         WorktreeAdd => "worktree-add",
     }
     themed {
