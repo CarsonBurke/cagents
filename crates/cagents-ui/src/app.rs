@@ -4937,6 +4937,9 @@ enum DirtyCloseIntent {
     PaneGroup,
     Card(CardId),
     Application(window::Id),
+    /// A confirmed channel deletion, which continues once its editors are
+    /// saved or discarded.
+    Channel(crate::model::ChannelId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13631,6 +13634,7 @@ impl Cagents {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
                 DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
+                DirtyCloseIntent::Channel(channel) => self.resume_channel_deletion(channel),
             };
         };
         // Keep a stable workspace fallback even when another modal is
@@ -13756,6 +13760,7 @@ impl Cagents {
             // leave this close, the one the reader just asked for, turned away.
             DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
+            DirtyCloseIntent::Channel(channel) => self.resume_channel_deletion(channel),
         }
     }
 
@@ -13768,8 +13773,10 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
-        if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
-            self.chrome_ui.closing_group.clear();
+        match close.intent {
+            DirtyCloseIntent::PaneGroup => self.chrome_ui.closing_group.clear(),
+            DirtyCloseIntent::Channel(channel) => self.cancel_channel_deletion(channel),
+            DirtyCloseIntent::Card(_) | DirtyCloseIntent::Application(_) => {}
         }
         let restore_focus = self.nested_modal_focus_target().unwrap_or_else(|| {
             resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
@@ -19305,6 +19312,8 @@ impl Application for Cagents {
                 .into(),
                 design::body(if runtime.has_durability_warning() {
                     "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
+                } else if matches!(close.intent, DirtyCloseIntent::Channel(_)) {
+                    "This editor has unsaved changes. Save them before the channel is deleted, discard them, or cancel to keep the channel."
                 } else {
                     "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
                 })
