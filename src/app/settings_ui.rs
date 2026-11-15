@@ -467,8 +467,8 @@ fn settings_category_controls<'a>(
                     .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
             );
             let sidebar_worktrees = settings_choice(
-                "Worktrees in sidebar",
-                "Group worktrees after channels, list them directly, or hide them. Projects can override this default. Main stays visible.",
+                "Checkouts in sidebar",
+                "Show each project's checkouts after its channels, grouped or listed directly. Hidden hides every checkout, the repository's root checkout too, and lists each open pane under its project instead. Projects can override this default, except while it is Hidden.",
                 SettingsField::SidebarWorktrees,
                 settings::SidebarWorktrees::ALL
                     .map(|mode| (mode.label(), mode.key(), draft.sidebar_worktrees == mode)),
@@ -2117,6 +2117,7 @@ pub(super) fn shared_preferences_stream(
                     settings.sidebar_worktree_overrides.clone(),
                     settings.account_usage_display,
                     settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
+                    settings.sidebar_worktrees_when_shown,
                 );
                 if previous.as_ref() != Some(&current) {
                     previous = Some(current);

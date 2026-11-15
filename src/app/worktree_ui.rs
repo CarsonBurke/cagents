@@ -351,7 +351,6 @@ fn scope_descriptor(
         chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
-        workspace_visits: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
@@ -703,13 +702,26 @@ impl Cagents {
             .iter()
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
-        let occupied = self
+        // One resolution per pane serves both occupancy and where the pane
+        // rows place a pane that has nothing to show.
+        let mut occupied = HashSet::new();
+        let mut pane_checkouts = BTreeMap::new();
+        for card in self
             .durable
             .cards
             .iter()
             .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
-            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &index))
-            .collect::<HashSet<_>>();
+        {
+            let Some(directory) = self.unchanneled_card_worktree_indexed(card, &index) else {
+                continue;
+            };
+            occupied.insert(directory);
+            if matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                && let Some(row) = index.first_row(directory)
+            {
+                pane_checkouts.insert(card.id, row);
+            }
+        }
         let worktrees = occupied
             .iter()
             .flat_map(|path| index.rows(path))
@@ -738,6 +750,7 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         self.sidebar_state.set_worktrees_with_panes(worktrees);
+        self.sidebar_state.set_pane_checkouts(pane_checkouts);
         for (id, owner) in attention {
             self.sidebar_state.reattribute_card_attention(id, owner);
         }
