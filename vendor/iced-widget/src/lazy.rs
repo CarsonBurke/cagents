@@ -5,7 +5,6 @@ pub mod component;
 
 #[allow(deprecated)]
 pub use component::Component;
-use iced_renderer::core::widget::Operation;
 
 mod cache;
 
@@ -15,7 +14,7 @@ use crate::core::mouse;
 use crate::core::overlay;
 use crate::core::renderer;
 use crate::core::widget::tree::{self, Tree};
-use crate::core::widget::{self, Widget};
+use crate::core::widget::Widget;
 use crate::core::{
     self, Clipboard, Event, Length, Rectangle, Shell, Size, Vector,
 };

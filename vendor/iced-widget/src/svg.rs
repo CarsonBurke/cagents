@@ -31,7 +31,6 @@ use crate::core::{
 
 #[cfg(feature = "a11y")]
 use std::borrow::Cow;
-use std::marker::PhantomData;
 use std::path::PathBuf;
 
 pub use crate::core::svg::Handle;

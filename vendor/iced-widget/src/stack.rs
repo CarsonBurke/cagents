@@ -1,6 +1,5 @@
 //! Display content on top of other content.
 
-use crate::core::event;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;

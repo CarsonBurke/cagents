@@ -35,7 +35,7 @@ use crate::core::{
     color,
 };
 
-use iced_runtime::{Action, Task, task};
+use iced_runtime::{Task, task};
 
 /// A widget that aligns its contents inside of its boundaries.
 ///

@@ -599,7 +599,7 @@ where
             (x + width) as f64,
             (y + height) as f64,
         );
-        let is_hovered = state.state.downcast_ref::<State>().is_hovered;
+        let _is_hovered = state.state.downcast_ref::<State>().is_hovered;
 
         let mut node = Node::new(Role::Button);
         node.add_action(Action::Focus);

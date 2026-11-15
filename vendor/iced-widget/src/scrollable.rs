@@ -27,7 +27,6 @@ use iced_runtime::core::widget::Id;
 #[cfg(feature = "a11y")]
 use std::borrow::Cow;
 
-use crate::core::event;
 use crate::core::keyboard;
 use crate::core::layout;
 use crate::core::mouse;
@@ -933,7 +932,7 @@ where
 
                 let had_input_method = shell.input_method().is_enabled();
 
-                let mut c_event = match event.clone() {
+                let c_event = match event.clone() {
                     Event::Dnd(dnd::DndEvent::Offer(
                         id,
                         dnd::OfferEvent::Enter {
@@ -1645,7 +1644,7 @@ where
             return A11yTree::default();
         }
         let window = layout.bounds();
-        let is_hovered = cursor.is_over(window);
+        let _is_hovered = cursor.is_over(window);
         let Rectangle {
             x,
             y,
@@ -1729,7 +1728,7 @@ where
                 }))
             {
                 let scrollbar_bounds = scrollbar.total_bounds;
-                let is_hovered = cursor.is_over(scrollbar_bounds);
+                let _is_hovered = cursor.is_over(scrollbar_bounds);
                 let Rectangle {
                     x,
                     y,

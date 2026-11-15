@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-use crate::core::event::{self, Event};
+use crate::core::event::Event;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;
