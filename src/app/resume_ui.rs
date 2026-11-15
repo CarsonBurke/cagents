@@ -1833,10 +1833,10 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
             .reaches()
             .map(|reach| {
                 let label = format!("{} {}", scope.label(reach), counts[reach.index()]);
-                // The sidebar's icons: a branch for a worktree, a folder for
-                // a project.
+                // The sidebar's icons: its worktree glyph for a worktree, a
+                // folder for a project.
                 let icon = match reach {
-                    Reach::Worktree => Some(crate::ui_controls::Icon::Branch),
+                    Reach::Worktree => Some(crate::ui_controls::Icon::Worktree),
                     Reach::Project => Some(crate::ui_controls::Icon::Folder),
                     Reach::Everywhere => None,
                 };
