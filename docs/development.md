@@ -1167,6 +1167,12 @@ host. The whole remote Cargo test/bench command, including any compilation and
 doctests, runs inside the limit; `--no-run` only compiles and is not capped.
 A missing helper refuses the offloaded test rather than silently losing its cap.
 
+Tests run with `memory-capped --stop-leftovers`: when the test command exits,
+anything it left running in its scope, such as a test's daemon that was never
+shut down, is stopped. Each stopped process is named, with its age and command
+line, on stderr and in `~/.local/state/cagents/leftover-processes.log` on the
+host that ran the tests, so the test that leaked it can be found and fixed.
+
 A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
 covered, and so is its compile, which runs inside the limit there. A UI test rebuild
 peaked at about 11 GiB with page cache, so it fits, but a cold build and an

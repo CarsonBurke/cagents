@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=30
+gate_version=31
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -260,8 +260,9 @@ build_shares() {
             --features|-F|--bin|--package|-p) selection=true ;;
         esac
         case ,$names, in
-            *[,\ ]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
-            *[,\ ]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
+            # A feature may be named with its package, as in cagents/ui.
+            *[,\ /]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
+            *[,\ /]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
         esac
     done
     case $1:$lane in
