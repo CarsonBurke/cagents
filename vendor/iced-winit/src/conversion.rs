@@ -208,14 +208,16 @@ fn linux_window_attributes(
     activation_token: impl FnOnce() -> Option<winit::window::ActivationToken>,
 ) -> winit::window::WindowAttributes {
     // Winit has one typed platform slot, so select the active backend before
-    // installing attributes. An X11 window must not consume the Wayland token.
+    // installing attributes. Both backends take the single-use token, which
+    // also clears the launch-token environment that child processes inherit.
+    let token = activation_token();
     if is_wayland {
         use winit::platform::wayland::WindowAttributesWayland;
 
         let mut wayland_attributes = WindowAttributesWayland::default()
             .with_name(&settings.application_id, &settings.application_id);
 
-        if let Some(token) = activation_token() {
+        if let Some(token) = token {
             wayland_attributes =
                 wayland_attributes.with_activation_token(token);
         }
@@ -226,17 +228,21 @@ fn linux_window_attributes(
         {
             use winit::platform::x11::WindowAttributesX11;
 
-            attributes.with_platform_attributes(Box::new(
-                WindowAttributesX11::default()
-                    .with_override_redirect(settings.override_redirect)
-                    .with_name(
-                        &settings.application_id,
-                        &settings.application_id,
-                    ),
-            ))
+            let mut x11_attributes = WindowAttributesX11::default()
+                .with_override_redirect(settings.override_redirect)
+                .with_name(&settings.application_id, &settings.application_id);
+
+            if let Some(token) = token {
+                x11_attributes = x11_attributes.with_activation_token(token);
+            }
+
+            attributes.with_platform_attributes(Box::new(x11_attributes))
         }
         #[cfg(not(feature = "x11"))]
-        attributes
+        {
+            let _ = token;
+            attributes
+        }
     }
 }
 
@@ -1716,8 +1722,7 @@ mod tests {
         }
 
         #[test]
-        fn x11_keeps_identity_and_override_redirect_without_consuming_a_token()
-        {
+        fn x11_keeps_identity_override_redirect_and_its_activation_token() {
             let common = common_attributes();
             let settings = crate::core::window::settings::PlatformSpecific {
                 application_id: "dev.cagents.OwnedX11Fixture".into(),
@@ -1732,11 +1737,12 @@ mod tests {
                 || {
                     calls.set(calls.get() + 1);
                     Some(ActivationToken::from_raw(
-                        "unused-fixture-token".into(),
+                        "owned-x11-fixture-token".into(),
                     ))
                 },
             );
-            assert_eq!(calls.get(), 0);
+            // Taking the token also clears the inherited launch environment.
+            assert_eq!(calls.get(), 1);
             let platform = attributes.platform.take().expect("X11 attributes");
             assert!(platform.cast_ref::<WindowAttributesWayland>().is_none());
             let x11 = platform
@@ -1744,7 +1750,10 @@ mod tests {
                 .expect("the X11 backend can consume the selected attributes");
             let expected = WindowAttributesX11::default()
                 .with_name(&settings.application_id, &settings.application_id)
-                .with_override_redirect(true);
+                .with_override_redirect(true)
+                .with_activation_token(ActivationToken::from_raw(
+                    "owned-x11-fixture-token".into(),
+                ));
             // Payload fields are private to winit-x11 at this pinned revision.
             assert_eq!(format!("{x11:?}"), format!("{expected:?}"));
             assert_eq!(format!("{attributes:?}"), format!("{common:?}"));
