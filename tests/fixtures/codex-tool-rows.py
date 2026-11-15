@@ -24,6 +24,10 @@ webSearch item with synthetic results. This isolates the native web-search
 row without collaboration activity or unrelated tool/event rows.
 CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
 short, synthetic original diagnostic for the native Details/Copy controls.
+With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
+with one step done, one in progress and one pending, and finishes it before
+completing. The file may hold whole seconds for the turn to stay working,
+instead of the usual pause, so a slow capture still finds it running.
 """
 import copy
 import importlib.util
@@ -296,7 +300,7 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True, *, web_rows=False, diagnostics=False):
+    def notifications(self, turn, starts_child=True, *, web_rows=False, diagnostics=False, plan=None):
         starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
@@ -329,10 +333,19 @@ class Scenario:
         child_completed = [notify("turn/completed", threadId=self.child,
                                  turn={"id": f"{turn}-child", "status": "completed", "items": []}),
                            notify("thread/status/changed", threadId=self.child, status={"type": "idle"})] if starts_child else []
+        def planned(*states):
+            steps = ("Read the recorded rows", "Check the running items", "Write the summary")
+            return notify("turn/plan/updated", turnId=turn, plan={
+                "explanation": "Fixture plan",
+                "plan": [{"step": step, "status": state} for step, state in zip(steps, states)]})
+        planning = [] if plan is None else [planned("completed", "in_progress", "pending")]
+        settling = [] if plan is None else [planned("completed", "completed", "completed")]
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                *planning,
                 *replayed,
                 *child_started,
-                *started, *([] if web_rows else [diff]), {"_sleep": PAUSE}, *completed,
+                *started, *([] if web_rows else [diff]),
+                {"_sleep": PAUSE if plan is None else plan}, *completed, *settling,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
@@ -407,7 +420,13 @@ class Scenario:
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
-            after = self.notifications(turn, starts_child, web_rows=web_rows, diagnostics=diagnostics)
+            plan = None
+            marker = Path(codex_home) / "fixture-plan"
+            if not (web_rows or diagnostics) and marker.is_file():
+                held = marker.read_text().strip()
+                plan = float(held) if held.isdigit() else PAUSE
+            after = self.notifications(turn, starts_child, web_rows=web_rows,
+                                       diagnostics=diagnostics, plan=plan)
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
