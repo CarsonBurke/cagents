@@ -976,14 +976,24 @@ impl Cagents {
         let project = row
             .project
             .and_then(|project| self.sidebar_model.project(project));
-        let chip = project.map_or_else(
-            || {
-                widget::icon::from_name("folder-symbolic")
-                    .size(design::ROW_ICON_SIZE)
-                    .into()
-            },
-            sidebar::project_chip,
-        );
+        // What kind of workspace the row is, in the sidebar's glyphs: a
+        // project's own row carries its chip, and a worktree or channel row
+        // its kind, leaving the project to the caption.
+        let glyph = |handle: widget::icon::Handle| -> Element<'a, Message> {
+            widget::container(widget::icon(handle).size(design::ROW_ICON_SIZE))
+                .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
+                .into()
+        };
+        let chip = match (row.destination, project) {
+            (WorkspaceDestination::Folder(_), Some(project)) => sidebar::project_chip(project),
+            (WorkspaceDestination::Folder(_), None) => {
+                glyph(widget::icon::from_name("folder-symbolic").handle())
+            }
+            (WorkspaceDestination::Worktree(_), _) => glyph(sidebar::worktree_icon()),
+            (WorkspaceDestination::Channel(_), _) => {
+                glyph(crate::ui_controls::Icon::Channel.handle())
+            }
+        };
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())
                 .edge(row.name_edge())

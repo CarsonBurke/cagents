@@ -7294,6 +7294,9 @@ pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
             && repository.parent() == Some(worktree))
 }
 
+/// The side of a [`project_chip`], for a glyph that stands in its column.
+pub(crate) const PROJECT_CHIP_SIZE: f32 = rail::PROJECT_CHIP;
+
 /// A project's identity chip as the sidebar draws it: its avatar, or its
 /// initials on a colour of its own, for showing the project elsewhere.
 pub fn project_chip<'a, Message: 'a>(project: &SidebarProject) -> Element<'a, Message> {
