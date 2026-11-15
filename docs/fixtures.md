@@ -202,6 +202,34 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
+## A failed automatic terminal completion
+
+Development builds under `native-evidence` refuse a pending terminal's completion
+save while `home/.config/fixture-pending-terminal-save-error` exists in
+`CAGENTS_EVIDENCE_FIXTURE`. Create the file before opening a terminal. Its worker
+starts normally; the fixture refuses only the edit that clears the pane's pending
+flag. Remove the file and use the terminal's existing Retry control to exercise
+completion of that same worker.
+
+This simulates a save error in the actual daemon and native UI. It does not
+simulate SQLite contention or an execution retirement, and contacts no provider.
+The fault is absent from builds without the `development` feature.
+
+`tests/fixtures/pending-terminal-save-scene.sh` exercises this refusal in a
+native before/after pair: it types into the shell while saving fails, retries
+once while the fault remains, then removes the fault and retries saving. It
+records the pending flag and the holder-owned shell's PID/start time to
+separate worker launches from the UI's interactive PATH probes. The recovered
+shot also checks keyboard focus by typing immediately after Retry save.
+
+The scene checks the exact pane/terminal IDs and pending flag before and after
+recovery, as well as the original worker's PID/start time and fixture working
+directory. It waits for the selected workspace's empty draft and visible terminal
+output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's images
+separate; the app's responsive inspector state is preserved. Single-word OCR
+locators tolerate split text runs. The unique `Retry` locator targets the existing
+**Retry save** button even when OCR splits that label into two boxes.
+
 ## An offline Codex
 
 A session started with `--codex PEER`, or a `pair` given it, has a `codex` on

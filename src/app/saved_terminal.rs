@@ -258,6 +258,7 @@ pub(super) fn attach_existing(
         handle: TerminalSurface::from(handle),
         session: recovered.session,
         spawned: false,
+        save_failure: None,
     })
 }
 

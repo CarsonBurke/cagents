@@ -1731,6 +1731,10 @@ fn process_admitted_request(
             });
             Ok((ServerResponse::Spawned { terminal }, extras, false))
         }
+        ClientRequest::RetryPendingTerminalSave { pane, terminal_id } => {
+            super::state::retry_pending_terminal_save(host, pane, terminal_id)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::CompletePendingTerminal {
             pane,
             terminal_id,

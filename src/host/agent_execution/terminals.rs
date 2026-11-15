@@ -69,6 +69,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
         R::Spawn { session, .. } => Access::Spawn(session),
         R::CompletePendingTerminal { .. }
+        | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
