@@ -1770,10 +1770,13 @@ impl Runtime {
     /// card states its own runs in words, so the closing line spins for it.
     fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
         match selected {
-            Some(agent) => agent
-                .items
-                .last()
-                .is_some_and(|item| self.row_live(item, agent.status == chat::ToolStatus::Running)),
+            Some(agent) => agent.items.last().is_some_and(|item| {
+                Self::row_live(
+                    &self.child_cache,
+                    item,
+                    agent.status == chat::ToolStatus::Running,
+                )
+            }),
             None => {
                 let snapshot = &self.snapshot;
                 snapshot.busy
@@ -1782,7 +1785,7 @@ impl Runtime {
                     && snapshot
                         .items
                         .last()
-                        .is_some_and(|item| self.row_live(item, true))
+                        .is_some_and(|item| Self::row_live(&self.cache, item, true))
             }
         }
     }
@@ -1790,10 +1793,9 @@ impl Runtime {
     /// Whether `item` shows, with a spinner of its own, work still under
     /// way: a running step, or a thought still streaming while its agent
     /// works. Callers pass the newest item, the only one whose thought can be
-    /// live.
-    fn row_live(&self, item: &chat::Item, working: bool) -> bool {
-        let card = self
-            .cache
+    /// live, and the cache its transcript is drawn from.
+    fn row_live(cache: &HashMap<String, CachedItem>, item: &chat::Item, working: bool) -> bool {
+        let card = cache
             .get(&item.id)
             .and_then(|cached| cached.coordination.as_deref())
             .is_some_and(Coordinated::is_card);
@@ -1813,8 +1815,9 @@ impl Runtime {
     /// running strip carries the activity indicator only when it holds the
     /// newest row; otherwise a newer row or the closing line does. When the
     /// lead is idle, the group with the newest running step, such as a
-    /// background command, carries it unless the closing line already spins. A strip that does not keeps its kind
-    /// glyph, and its caption and counting time still say it is working.
+    /// background command, carries it unless the closing line already
+    /// spins. A strip that does not keeps its kind glyph, and its caption and
+    /// counting time still say it is working.
     pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<chat::ToolStatus> {
         let status = turn.glyph();
         if status != Some(chat::ToolStatus::Running) {
@@ -8227,7 +8230,7 @@ mod tests {
                     status: chat::ToolStatus::Running,
                 },
             );
-            let (mut waiting, _handle) = frame_cost::live_runtime(&[prompt.clone(), spawn]);
+            let (mut waiting, handle) = frame_cost::live_runtime(&[prompt.clone(), spawn.clone()]);
             Arc::make_mut(&mut waiting.snapshot).busy = true;
             regroup(&mut waiting);
             assert!(
@@ -8240,6 +8243,41 @@ mod tests {
             let (glyph, label) = waiting.timeline_activity(false, None).unwrap();
             assert_eq!(
                 waiting.closing_line(glyph, label, false, None).0,
+                Some(Icon::AgentWorking)
+            );
+
+            // The same holds in a subagent's own transcript, whose cards are
+            // drawn from its own cache.
+            let agent = chat::Subagent {
+                items: vec![Arc::new(chat::Item {
+                    id: "child-spawn".into(),
+                    ..spawn
+                })],
+                status: chat::ToolStatus::Running,
+                ..native_child_fixture()
+            };
+            Arc::make_mut(&mut waiting.snapshot)
+                .subagents
+                .push(agent.clone());
+            waiting.selected_subagent = Some(agent.id.clone());
+            let mut published = (*waiting.snapshot).clone();
+            published.generation += 1;
+            handle.publish_delta_snapshot_for_test(published);
+            waiting.refresh();
+            let snapshot = waiting.snapshot.clone();
+            waiting.prepare_child_cache(&snapshot);
+            preparation::drain_fixture(&mut waiting);
+            assert!(
+                waiting.child_cache["child-spawn"]
+                    .coordination
+                    .as_deref()
+                    .is_some_and(Coordinated::is_card)
+            );
+            assert!(!waiting.work_shown(Some(&agent)));
+            assert_eq!(
+                waiting
+                    .closing_line(Icon::AgentWorking, "Working".into(), false, Some(&agent))
+                    .0,
                 Some(Icon::AgentWorking)
             );
         }
