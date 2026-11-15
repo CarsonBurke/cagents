@@ -601,6 +601,11 @@ fn changed_for_instance(
                 chat_id: id,
                 addresses: addresses.clone(),
             },
+            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+                chat_id: id,
+                revision: *revision,
+                model: model.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -665,6 +670,22 @@ pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<
     // published metadata, a local one from its own lock.
     let addresses = handle.agent_addresses();
     (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
+}
+
+pub(super) fn active_model(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    let (revision, model) = handle.active_model();
+    Some(ServerMessage::ChatActiveModel {
+        chat_id,
+        revision,
+        model,
+    })
 }
 
 fn current_session_snapshot(

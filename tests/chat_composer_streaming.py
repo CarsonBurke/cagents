@@ -129,6 +129,29 @@ class Streaming(unittest.TestCase):
         peer.until(lambda f: f.get("uuid") == "replay-start-1")
         return peer
 
+    def test_permission_settings_read_is_valid_idle_and_while_replying_without_stopping_the_peer(self):
+        peer = Peer(self.project, self.config)
+        self.addCleanup(peer.close)
+        process_id = peer.process.pid
+
+        def settings(identifier):
+            peer.send(control("get_settings", identifier))
+            response = peer.response(identifier)["response"]
+            self.assertEqual(response["subtype"], "success")
+            self.assertEqual(response["response"], {"effective": {}, "sources": []})
+            self.assertIsNone(peer.process.poll(), "reading settings must keep the provider alive")
+            self.assertEqual(peer.process.pid, process_id)
+
+        settings("idle-settings")
+        peer.send(prompt(1))
+        peer.until(delta)
+        settings("busy-settings")
+        self.assertFalse(any(frame.get("type") == "result" for frame in peer.frames),
+                         "reading settings must not settle the active turn")
+        peer.interrupt()
+        settings("settled-settings")
+        self.assertEqual(sum(frame.get("type") == "result" for frame in peer.frames), 1)
+
     def test_long_replay_pause_services_controls_and_interrupts_without_late_frames(self):
         (self.config / "fixture-usage.json").write_text('{"remaining":17}')
         late = {"type": "assistant", "uuid": "replay-never-@TURN@",

@@ -265,6 +265,43 @@ result in `home/.codex/fixture-rate-limits.json`, such as
 The other peers leave the app's account and usage-limit handling unexercised,
 and no peer verifies live account credentials.
 
+The `tool-rows` peer also reads an optional `model/list` result from
+`home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
+ID on each entry; `displayName`, `supportedReasoningEfforts`,
+`defaultReasoningEffort` and `isDefault` use the app-server's field names.
+A new thread reports the requested model or the catalog's default (the first
+entry when none is marked), and reports an effort only when the launch chose
+one. Model and effort overrides sent with later turns are retained when the
+fixture thread resumes. Without the file, it keeps the usual `fixture-mini`
+catalog. This exercises catalog and selection handling, without checking
+which models or efforts a live account can use.
+With `home/.codex/fixture-unconfirmed-model` present, thread start/resume omits
+the model field while turns keep their ordinary activity and completion frames.
+Remove the marker to report the selected model on the next start/resume.
+`home/.codex/fixture-turn-pause` optionally holds a number of seconds from 0
+to 300 for the peer's busy turn, instead of its usual six-second pause.
+The footer scene uses 20 seconds so native capture can show confirmed running
+work without depending on how quickly OCR and screenshot conversion finish.
+Create `home/.codex/fixture-turn-audit.json` containing `[]` to record the last
+16 accepted turn IDs and the actual requested model/effort fields, including
+only fields present in the request. This private audit excludes prompt input and
+helps compare a native selection with the request received by the peer. Writers
+share a sibling file lock and replace the JSON atomically, so concurrent fixture
+processes using the same private home retain their records up to that limit.
+
+[`tests/fixtures/chat-footer-scene.sh`](../tests/fixtures/chat-footer-scene.sh)
+captures a draft, a started conversation, the open model picker and a selected
+high effort for Claude and Codex. Run it in a fresh `--codex tool-rows` session,
+as `wide` at 1500×900 or `narrow` at 900×900. Prepare a new task once before
+capturing: start and stop a side, run the scene as `prepare` while it is stopped,
+then `save-seed`. This removes the bootstrap's private account catalog cache,
+so both starts probe the prepared catalogs. For a remote `pair`, use a steps
+file containing `CAGENTS_EVIDENCE_TASK=$task
+"$tool/tests/fixtures/chat-footer-scene.sh" wide` (or `narrow`). The scene
+copies the recorded Claude catalog and writes an invented offline Codex
+catalog only into the fixture. It exercises the native controls and the
+provider protocol peers, without contacting either provider.
+
 For native sign-in controls, prompt the `child-errors` peer with `auth-required`.
 It refuses `turn/start` with an explicit authentication error. Put a whole number
 of seconds in `home/.codex/fixture-sign-in-seconds` to keep the fake `codex login`

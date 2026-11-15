@@ -248,7 +248,9 @@ use crate::{
 /// agents' accepted task labels, preserving the carried CLI directory layout.
 /// Version 181 appends `RetryPendingTerminalSave` to persist an already
 /// running terminal without launching another worker.
-pub const PROTOCOL_VERSION: u16 = 181;
+/// Version 182 appends provider-confirmed active model status independently of
+/// chat snapshots, whose inspector encoding stays frozen for update sources.
+pub const PROTOCOL_VERSION: u16 = 182;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -948,6 +950,13 @@ pub enum ServerMessage {
     /// offers them.
     AutomationProposalsChanged {
         repository: std::path::PathBuf,
+    },
+    /// Provider-confirmed model and effort, independently of a staged model
+    /// selection. Each subscriber receives the current revision on attachment.
+    ChatActiveModel {
+        chat_id: TerminalId,
+        revision: u64,
+        model: Option<crate::chat::ActiveModel>,
     },
 }
 
@@ -2387,6 +2396,35 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {
+        let model = crate::chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: None,
+            aliases: vec!["opusplan".into()],
+        };
+        let mut snapshot = crate::chat::Snapshot::default();
+        let before = postcard::to_allocvec(&snapshot).unwrap();
+        snapshot.active_model = Some(model.clone());
+        snapshot.active_model_revision = 3;
+        assert_eq!(postcard::to_allocvec(&snapshot).unwrap(), before);
+        let message = ServerMessage::ChatActiveModel {
+            chat_id: TerminalId::new(),
+            revision: 3,
+            model: Some(model),
+        };
+        let encoded = postcard::to_allocvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, message);
+        assert!(
+            !older_client(CANDIDATE_LINE_PROTOCOL)
+                .unwrap()
+                .admits_message(&message)
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
