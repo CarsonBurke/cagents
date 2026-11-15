@@ -21,7 +21,7 @@ use tracing::{Dispatch, Subscriber, subscriber::NoSubscriber};
 /// Runs `body` with `subscriber` as this thread's default subscriber, as
 /// `tracing::subscriber::with_default` does, but receiving every event this
 /// thread emits, whichever thread first reached its callsite.
-pub(crate) fn with_thread_subscriber<T>(
+pub fn with_thread_subscriber<T>(
     subscriber: impl Subscriber + Send + Sync + 'static,
     body: impl FnOnce() -> T,
 ) -> T {

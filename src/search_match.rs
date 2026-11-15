@@ -35,7 +35,7 @@ pub fn score(candidate: &str, query: &str) -> Option<usize> {
 /// Select the contiguous match used by ranking and label highlights.
 /// Inputs are already lowercased; the result indexes their UTF-8 bytes.
 /// Prefer a prefix, then the earliest word boundary, then the earliest match.
-pub(crate) fn contiguous_range(candidate: &str, query: &str) -> Option<std::ops::Range<usize>> {
+pub fn contiguous_range(candidate: &str, query: &str) -> Option<std::ops::Range<usize>> {
     if query.is_empty() || query.len() > candidate.len() {
         return None;
     }

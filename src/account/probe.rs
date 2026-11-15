@@ -42,7 +42,7 @@ pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// A cached identity cannot override the provider explicitly rejecting its
 /// credentials. Unsupported quota reporting can still confirm an identity.
-pub(crate) fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
+pub fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
     status != UsageStatus::NeedsLogin
         && (identity.is_some()
             || matches!(
@@ -1346,12 +1346,13 @@ fn rpc_result(mut frame: Value) -> RpcResult {
     }
 }
 
-#[cfg(all(test, feature = "ui"))]
-pub(crate) mod collector_fixture {
+#[cfg(all(any(test, feature = "test-support"), feature = "ui"))]
+#[doc(hidden)]
+pub mod collector_fixture {
     use super::*;
     use tokio::sync::oneshot;
 
-    pub(crate) enum Frames {
+    pub enum Frames {
         Claude {
             initialize: Value,
             quota: Value,
@@ -1366,7 +1367,7 @@ pub(crate) mod collector_fixture {
 
     // Exercise the production observers/finishers without preparing an account,
     // opening a session, invoking a CLI, or starting a detached cache writer.
-    pub(crate) async fn held_outcome(
+    pub async fn held_outcome(
         account: Account,
         frames: Frames,
         now: impl Fn() -> u64,
@@ -1448,7 +1449,7 @@ pub(crate) mod collector_fixture {
 
     /// The UI fixture receives the same completion policy as `run`, including
     /// an actual Failed outcome when a collected probe has no usable quota.
-    pub(crate) async fn held_completion(
+    pub async fn held_completion(
         account: Account,
         frames: Frames,
         now: impl Fn() -> u64,

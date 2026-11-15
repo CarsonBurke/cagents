@@ -1192,7 +1192,7 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// Keep historical diagnostics available to the CLI without showing a resolved
 /// installation failure as a warning in every subsequently installed window.
 #[cfg(feature = "ui")]
-pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
     #[cfg(feature = "development")]
     if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
         && let Some(job) = review_fixture::read(Path::new(&root))?

@@ -131,7 +131,8 @@ def main():
     # cargo-hot always selects host triple but puts its runnable bundle here,
     # independently of the ordinary artifact's optional triple subdirectory.
     metadata = subprocess.check_output(sandbox([
-        "cargo", "metadata", "--locked", "--no-default-features", "--features", ui_features,
+        "cargo", "metadata", "--locked", "--manifest-path", str(ROOT / "crates/cagents-ui/Cargo.toml"),
+        "--no-default-features", "--features", ui_features,
         "--filter-platform", native, "--format-version", "1"
     ]), text=True)
     target = Path(json.loads(metadata)["target_directory"])
@@ -148,7 +149,8 @@ def main():
         fail("Hot bundle has an unexpected cagents-ui entry; refusing replacement")
     else:
         alias.symlink_to("cagents-ui-hot")
-    command = sandbox([hot, "hot", "--profile", "dev-runtime", "--no-default-features",
+    # Only the UI package is patched; an edit to the shared library needs a cold restart.
+    command = sandbox([hot, "hot", "--profile", "dev-runtime", "-p", "cagents-ui", "--no-default-features",
                        "--features", ui_features, "--bin", "cagents-ui-hot", "--", *forwarded], offline=True)
     if args.fresh_daemon:
         position = command.index("--chdir")
@@ -156,7 +158,7 @@ def main():
     else:
         position = command.index("--chdir")
         command[position:position] = ["--unsetenv", "CAGENTS_HOT_FRESH_DAEMON"]
-    print("Experimental hot reload: body-only UI edits; type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
+    print("Experimental hot reload: body-only edits in crates/cagents-ui; shared-library, type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
     if args.log_file:
         with open(args.log_file, "w") as output:
             return subprocess.run(command, stdout=output, stderr=subprocess.STDOUT).returncode

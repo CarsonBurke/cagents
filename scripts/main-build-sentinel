@@ -12,7 +12,14 @@ import subprocess
 import time
 
 TITLE = "Main Rust build sentinel: compilation failure"
-LANES = ("cli", "host", "ui")
+# Each lane's selection after `check --locked --no-default-features --all-targets`.
+# `app` is the application package, absent from commits before it was split out.
+LANES = {
+    "cli": [],
+    "host": ["--features", "host"],
+    "ui": ["--features", "ui"],
+    "app": ["-p", "cagents-ui"],
+}
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -57,7 +64,7 @@ def report(repository, directory, state):
     if not failed:
         if state.get("failing"):
             gh("issue", "comment", str(state["issue"]), "--body",
-               f"Recovered at `{pending['sha']}`: CLI, host and UI all-targets checks passed on fw16.")
+               f"Recovered at `{pending['sha']}`: all-targets checks passed on fw16 in every lane.")
         state["failing"] = False
         return
     if not state.get("issue"):
@@ -73,7 +80,8 @@ def report(repository, directory, state):
             f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
             f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
             "Checks use `scripts/cargo-gate check --locked --no-default-features --all-targets` "
-            "in separate CLI, host and UI lanes.\n\n")
+            "in separate CLI, host, shared UI (`--features ui`) and application "
+            "(`-p cagents-ui`) lanes.\n\n")
     for lane, status in pending["lanes"].items():
         body += f"- {lane}: exit {status}\n"
     for lane in failed:
@@ -198,11 +206,11 @@ def tick_locked(repository, directory, github_repository):
                     git(repository, "worktree", "add", "--detach", str(checkout), sha)
                 (directory / "logs").mkdir(exist_ok=True)
                 statuses = {}
-                for lane in LANES:
+                for lane, selection in LANES.items():
+                    if lane == "app" and not (checkout / "crates/cagents-ui/Cargo.toml").exists():
+                        continue
                     command = [str(checkout / "scripts/cargo-gate"), "check", "--locked",
-                               "--no-default-features", "--all-targets"]
-                    if lane != "cli":
-                        command += ["--features", lane]
+                               "--no-default-features", "--all-targets", *selection]
                     print(f"main-build-sentinel: {sha} {lane}", flush=True)
                     with (directory / "logs" / f"{sha}-{lane}.log").open("w") as log:
                         # No priority bypass, held lease, or local compilation override.

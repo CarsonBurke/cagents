@@ -2008,7 +2008,7 @@ pub fn prepare() -> io::Result<()> {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn environment(
+pub fn environment(
     provider: crate::agent::Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {

@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "mise.toml"
 SCRIPT = re.compile(r"\bscripts/[A-Za-z0-9_.-]+")
 LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"integrated-browser"}, "editor": set()}
+# The application is its own package; the UI lanes select it, and `ui` the
+# shared library with it. No packages means the root's default member.
+PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "browser": {"cagents-ui"},
+            "editor": {"ceditor"}}
 
 
 def load():
@@ -32,11 +36,16 @@ def commands(task):
 
 
 def features(arguments):
+    """The selected graph features, whichever package names them."""
     found = set()
     for flag, value in zip(arguments, arguments[1:]):
         if flag == "--features":
-            found.update(value.split(","))
+            found.update(feature.rpartition("/")[2] for feature in value.split(","))
     return found
+
+
+def packages(arguments):
+    return {value for flag, value in zip(arguments, arguments[1:]) if flag in {"-p", "--package"}}
 
 
 class Structure(unittest.TestCase):
@@ -64,6 +73,7 @@ class Structure(unittest.TestCase):
                 arguments = variables[lane].split()
                 self.assertIn("--locked", arguments)
                 self.assertEqual(features(arguments), expected)
+                self.assertEqual(packages(arguments), PACKAGES[lane])
                 if lane in {"cli", "host", "ui"}:
                     self.assertIn("--no-default-features", arguments)
 
@@ -191,8 +201,8 @@ class Behavior(unittest.TestCase):
         result = self.mise_run("test:ui", "--", "--lib", "app::chat ui", "--", "--exact")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
-            ["cargo-gate", "test", "--locked", "--no-default-features", "--features", "ui",
-             "--lib", "app::chat ui", "--", "--exact"],
+            ["cargo-gate", "test", "--locked", "--no-default-features", "--package", "cagents",
+             "--package", "cagents-ui", "--features", "cagents/ui", "--lib", "app::chat ui", "--", "--exact"],
         ])
 
     def test_lane_arguments_without_the_separator_are_refused_before_anything_runs(self):
@@ -206,7 +216,8 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("check:browser").returncode, 0)
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["cargo-gate", "check", "--locked", "--features", "integrated-browser", "--bin=cagents-ui"],
+            ["cargo-gate", "check", "--locked", "--package", "cagents-ui", "--features", "integrated-browser",
+             "--bin=cagents-ui"],
             ["cargo-gate", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 
@@ -216,8 +227,7 @@ class Behavior(unittest.TestCase):
 
     def test_the_test_aggregate_runs_each_lane_in_order_and_stops_at_a_failure(self):
         self.assertEqual(self.mise_run("test").returncode, 0)
-        self.assertEqual([call[5] if call[4] == "--features" else "cli" for call in self.calls()],
-                         ["cli", "host", "ui"])
+        self.assertEqual([sorted(features(call)) for call in self.calls()], [[], ["host"], ["ui"]])
         self.log.unlink()
         self.assertEqual(self.mise_run("test", status=3).returncode, 3)
         self.assertEqual(len(self.calls()), 1)

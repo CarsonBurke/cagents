@@ -375,7 +375,7 @@ fn access_only(event: &Event) -> bool {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Change {
+pub struct Change {
     /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
     /// Shared refs changed: a commit, fetch or branch update. Any
@@ -627,7 +627,7 @@ impl Registrations {
 /// One native watcher for its owner, with at most one pending change set
 /// regardless of event rate. Registration happens on its coordinator, never on
 /// the owner's thread.
-pub(crate) struct Monitor {
+pub struct Monitor {
     commands: mpsc::SyncSender<()>,
     configuration: Arc<Mutex<Configuration>>,
     pending: Arc<Mutex<Pending>>,

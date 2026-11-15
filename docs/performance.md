@@ -60,7 +60,7 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
 advance one focused step per frame. Measure the UI process with one busy agent
@@ -405,7 +405,7 @@ change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
 integrated build, browser progress ticks), now skip it. A wake whose only
 change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
-one publication to shared views, every three seconds. The unit tests in `src/app/terminal_output_tests.rs`
+one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
 
 The native workload has no script. In the browserless development runner,
@@ -478,7 +478,7 @@ Run the headless viewport contract with optimized application code, separately
 from native application measurements:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+CARGO_BUILD_JOBS=2 cargo test --locked -p cagents-ui \
   --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
   --config 'profile.dev-runtime.debug-assertions=false' --lib \
   chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
@@ -508,7 +508,7 @@ state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
 raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
 40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
 the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
-most recently hidden chats warm (`src/app/chat_ui/warm.rs`): at most 8, within
+most recently hidden chats warm (`crates/cagents-ui/src/app/chat_ui/warm.rs`): at most 8, within
 an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
 it hides. The estimate is calibrated against the heap cooling frees, measured
 by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a

@@ -222,18 +222,26 @@ zig_executable() (
 )
 
 # What `build` compiles, and all a session's cargo accepts, for the lane in $1:
-# browserless, or integrated for the UI with the embedded browser. Keep these in
-# step with scripts/run-development's builds, which cannot be asked to only build:
-# the before side may predate any option. A real-runner test fails if they drift.
+# browserless, or integrated for the UI with the embedded browser, in the
+# checkout in $2, by default the current directory. Keep these in step with
+# scripts/run-development's builds, which cannot be asked to only build: the
+# before side may predate any option. A real-runner test fails if they drift.
+# A checkout from before the UI became its own package builds it from the root package.
 build_arguments() {
+    local lane=${1:-browserless} checkout=${2:-.} ui
     local common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
         "$common development,host --bin cagentsd"
-    case ${1:-browserless} in
-        integrated) printf '%s\n' '--locked --profile dev-runtime --features development,integrated-browser --bin cagents-ui' ;;
-        *) printf '%s\n' "$common development,ui --bin cagents-ui" ;;
-    esac
+    if [ -e "$checkout/crates/cagents-ui/Cargo.toml" ]; then
+        ui='--locked --profile dev-runtime -p cagents-ui --features development'
+        [ "$lane" != integrated ] || ui+=',integrated-browser'
+    elif [ "$lane" = integrated ]; then
+        ui='--locked --profile dev-runtime --features development,integrated-browser'
+    else
+        ui="$common development,ui"
+    fi
+    printf '%s\n' "$ui --bin cagents-ui"
 }
 
 refuse_running_side() {
@@ -254,7 +262,7 @@ main_build_of() {
     [ -z "$(cd -- "$checkout" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
         git -c core.excludesFile=/dev/null status --porcelain=v1)" ] || return 1
     directory=$main_builds/$(git -C "$checkout" rev-parse HEAD) || return 1
-    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments)" ] || return 1
+    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] || return 1
     printf '%s\n' "$directory"
 }
 
@@ -269,7 +277,7 @@ take_built() {
     exec 8<"$target"
     rm -f -- "$target/evidence-source"
     revision=$(source_state "$checkout")
-    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments)" ] ||
+    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] ||
         die "$from was not built as this native-evidence builds; build it again"
     # Main's are of one commit, which the checkout must still be at.
     [ "$how" != copy ] || [ "$(main_build_of "$checkout")" = "$from" ] ||
@@ -421,7 +429,7 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments "$lane")
+        done < <(build_arguments "$lane" "$checkout")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
@@ -1024,7 +1032,7 @@ write_session_cargo() {
         printf '#!/bin/bash\n'
         printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
-        printf 'recorded=%q\n' "$(build_arguments "$lane")"
+        printf 'recorded=%q\n' "$(build_arguments "$lane" "$checkout")"
         cat <<'CARGO'
 [ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {

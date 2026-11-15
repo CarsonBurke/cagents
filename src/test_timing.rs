@@ -21,10 +21,7 @@ pub(crate) const EVENTUALLY: Duration = Duration::from_secs(60);
 /// if it has not returned within [`EVENTUALLY`]. A hung operation is left
 /// running; the test process ends it.
 #[track_caller]
-pub(crate) fn returns<T: Send + 'static>(
-    what: &str,
-    operation: impl FnOnce() -> T + Send + 'static,
-) -> T {
+pub fn returns<T: Send + 'static>(what: &str, operation: impl FnOnce() -> T + Send + 'static) -> T {
     let (sender, result) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let _ = sender.send(operation());
@@ -45,7 +42,7 @@ pub(crate) fn returns<T: Send + 'static>(
 /// would make the condition hold later, such as after a fallback timeout,
 /// assert on something that tells the two apart instead.
 #[track_caller]
-pub(crate) fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+pub fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     wait_for(what, || condition().then_some(()))
 }
 

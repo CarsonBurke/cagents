@@ -115,7 +115,7 @@ const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// then flushes its session.
 const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
-pub(crate) const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
+pub const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Parser)]
@@ -800,7 +800,7 @@ impl ControlClient {
         result
     }
 
-    pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+    pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         let deadline = Instant::now() + Self::handshake_timeout();
         Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
     }
@@ -2789,7 +2789,7 @@ impl AppError {
 
 static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn daemon_autostart_disabled() -> bool {
+pub fn daemon_autostart_disabled() -> bool {
     NO_START.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))

@@ -3,7 +3,7 @@ mod accessibility;
 mod accessibility_tests;
 mod links;
 mod preview;
-pub(crate) use accessibility::ReviewInputBarrier;
+pub use accessibility::ReviewInputBarrier;
 pub use preview::SnapshotPreview;
 
 use std::{
@@ -350,7 +350,7 @@ fn font(family: &'static str, key: Face) -> Font {
 /// would leak per frame. Each distinct name is therefore leaked exactly once,
 /// so repeated frames - and an edit back to a name already seen - allocate
 /// nothing. The set of families a user types is bounded in practice.
-pub(crate) fn monospace_font(family: &str) -> Font {
+pub fn monospace_font(family: &str) -> Font {
     font(
         intern_family(family),
         Face {
@@ -1580,7 +1580,7 @@ impl<Message> TerminalWidget<Message> {
     }
 
     /// Names the input surface for focus handoffs from tabs and other panes.
-    pub(crate) fn review_boundary(
+    pub fn review_boundary(
         mut self,
         barrier: ReviewInputBarrier,
         suppress_focus_reports: bool,
