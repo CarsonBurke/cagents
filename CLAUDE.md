@@ -71,6 +71,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 ## Verify the changed surface
 
 - Run the narrow test target that covers the changed contract.
+- Never generate artificial load on this machine or fw16: no busy loops (`while :; do :; done`), stress tools, or extra parallel copies of a build or test to "reproduce" a flaky or timing-dependent test. Both machines are shared with the user and other agents. Diagnose timing problems by reading the race, adding instrumentation, or rerunning the test normally; if a failure appears only under load, report that rather than simulating it.
 - A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `mise run test:cli`, `test:host` and `test:ui` (or `mise run test` for all three) to cover the boundaries the change touches; narrow one with `-- --lib MODULE::` or `-- --test TARGET`.
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
   - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
