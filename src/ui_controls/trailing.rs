@@ -1,21 +1,23 @@
-//! A heading with something that must stay beside it, such as a duration.
+//! A label with something that must stay beside it, such as a duration or
+//! a picker's chevron.
 //!
-//! In a row sized to its contents, iced lays out a fluid child in turn with
-//! the others, so a long heading takes the whole width and pushes whatever
-//! follows it out of the pane. This lays out the trailing element first and
-//! gives the heading what is left, while the pair still shrinks to a short
-//! heading rather than stretching across the pane.
-use super::*;
+//! In a row sized to its contents, iced lays out each child in turn with the
+//! room the earlier ones left, so a long label takes the whole width and
+//! pushes whatever follows it out of view. This lays out the trailing element
+//! first and gives the label what is left, while the pair still shrinks to a
+//! short label rather than stretching across its row.
 
-use iced::advanced::{
+use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
     widget::{Operation, Tree},
 };
-use iced::{Event, Point, Rectangle, Size, Vector};
+use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector};
+use cosmic::{Element, Renderer, Theme};
 
-/// `lead`, cut to the room `trail` leaves it, followed by `trail`, both
-/// aligned to the top.
-pub(super) fn trailing<'a>(
+/// `lead`, held to the room `trail` leaves it, followed by `trail`, the two
+/// centred on one another vertically. Give `lead` a
+/// [`FadeText`](super::FadeText), which fades where it is held short.
+pub fn trailing<'a, Message: 'a>(
     lead: impl Into<Element<'a, Message>>,
     trail: impl Into<Element<'a, Message>>,
     spacing: f32,
@@ -26,12 +28,12 @@ pub(super) fn trailing<'a>(
     })
 }
 
-struct Trailing<'a> {
+struct Trailing<'a, Message> {
     children: [Element<'a, Message>; 2],
     spacing: f32,
 }
 
-impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
+impl<Message> Widget<Message, Theme, Renderer> for Trailing<'_, Message> {
     fn children(&self) -> Vec<Tree> {
         self.children.iter().map(Tree::new).collect()
     }
@@ -47,7 +49,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
     fn layout(
         &mut self,
         tree: &mut Tree,
-        renderer: &cosmic::Renderer,
+        renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         let max = limits.max();
@@ -67,22 +69,29 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
         // room given to the lead ends at the latest.
         let lead_width = lead.size().width.min(room);
         let trail_x = lead_width + self.spacing;
+        let height = lead.size().height.max(trail.size().height);
         let size = limits.resolve(
             Length::Shrink,
             Length::Shrink,
-            Size::new(
-                trail_x + trail.size().width,
-                lead.size().height.max(trail.size().height),
-            ),
+            Size::new(trail_x + trail.size().width, height),
         );
-        layout::Node::with_children(size, vec![lead, trail.move_to(Point::new(trail_x, 0.0))])
+        let centred = |node: &layout::Node| (size.height - node.size().height) / 2.0;
+        let lead_y = centred(&lead);
+        let trail_y = centred(&trail);
+        layout::Node::with_children(
+            size,
+            vec![
+                lead.move_to(Point::new(0.0, lead_y)),
+                trail.move_to(Point::new(trail_x, trail_y)),
+            ],
+        )
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        renderer: &cosmic::Renderer,
+        renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
         operation.traverse(&mut |operation| {
@@ -108,7 +117,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &cosmic::Renderer,
+        renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
@@ -135,8 +144,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
     fn draw(
         &self,
         tree: &Tree,
-        renderer: &mut cosmic::Renderer,
-        theme: &cosmic::Theme,
+        renderer: &mut Renderer,
+        theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
@@ -166,7 +175,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
-        renderer: &cosmic::Renderer,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
         self.children
             .iter()
@@ -189,10 +198,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
         &'a mut self,
         tree: &'a mut Tree,
         layout: Layout<'a>,
-        renderer: &cosmic::Renderer,
+        renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'a, Message, cosmic::Theme, cosmic::Renderer>> {
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
         overlay::from_children(
             &mut self.children,
             tree,
@@ -229,16 +238,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Trailing<'_> {
 mod tests {
     use super::*;
 
-    fn fixed<'a>(width: f32, height: f32) -> Element<'a, Message> {
+    use cosmic::widget;
+
+    fn fixed<'a>(width: f32, height: f32) -> Element<'a, ()> {
         widget::Space::new().width(width).height(height).into()
     }
 
     /// Lays out `lead` and a 40-wide trail in a row sized to its contents,
     /// as a group's header is, `available` wide: the lead's and the trail's
     /// bounds.
-    fn header(lead: Element<'static, Message>, available: f32) -> (Rectangle, Rectangle) {
-        let renderer = crate::app::tests::headless_renderer();
-        let mut element: Element<'_, Message> = widget::container(
+    fn header(lead: Element<'static, ()>, available: f32) -> (Rectangle, Rectangle) {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element: Element<'_, ()> = widget::container(
             widget::row::with_children(vec![
                 fixed(16.0, 16.0),
                 trailing(lead, fixed(40.0, 16.0), 8.0),
