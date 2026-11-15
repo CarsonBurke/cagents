@@ -5916,14 +5916,8 @@ mod tests {
         assert!(app.navigation_save.is_none());
         observe_rename(&mut app, channel, "Renamed");
         assert_eq!(app.navigation_save, Some(DeferredSave::Snapshot));
-        // A pane closed since the last save is still listed by its channel.
-        let closed = app
-            .durable
-            .cards
-            .iter()
-            .find(|card| !card.existence.is_open())
-            .map(|card| card.id)
-            .unwrap_or_else(CardId::new);
+        // A pane removed since the last save is still listed by its channel.
+        let closed = CardId::new();
         Arc::make_mut(&mut app.durable).channels[3]
             .cards
             .push(closed);
