@@ -1,7 +1,6 @@
 //! One line of text that fades out where it runs out of room.
 
 use std::borrow::Cow;
-use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -15,6 +14,9 @@ use cosmic::iced::{Event, Font, Length, Pixels, Rectangle, Size, Vector, mouse};
 use cosmic::{Element, Renderer, Theme};
 
 use crate::design;
+
+mod highlighted;
+pub use highlighted::fade_highlighted;
 
 /// How far into the text the fade reaches.
 ///
@@ -186,89 +188,10 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
         Element::new(Faded {
             line: line.into(),
             class: Some(text.class),
-            over: None,
             edge: text.edge,
             cut,
         })
     }
-}
-
-/// One line of body text, which must not break, in which the `highlighted`
-/// byte ranges, in order, are set in
-/// bold and drawn in the `highlight` colour, fading where it overflows as
-/// [`FadeText`] does, highlights included.
-///
-/// The renderer has no alpha mask, so a fade is drawn by fading a line's
-/// own colour; a span with a colour of its own would keep full strength.
-/// The line is set twice instead, identically shaped: once with the
-/// highlights clear and once with everything else clear, each in one colour
-/// the fade reaches. Only the end fades, as only plain text can be drawn
-/// moved back to show its end.
-pub fn fade_highlighted<'a, Message: 'a>(
-    content: &str,
-    highlighted: &[Range<usize>],
-    highlight: cosmic::theme::Text,
-) -> Element<'a, Message> {
-    use cosmic::iced::widget::{rich_text, text::Span};
-    let font = cosmic::font::default();
-    let bold = Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
-    let stretches = stretches(content, highlighted);
-    let layer = |shows_highlights: bool| -> Element<'a, Message> {
-        rich_text(
-            stretches
-                .iter()
-                .map(|(range, highlighted)| {
-                    let span = Span::<'a, (), Font>::new(content[range.clone()].to_owned())
-                        .font(if *highlighted { bold } else { font });
-                    if *highlighted == shows_highlights {
-                        span
-                    } else {
-                        span.color(cosmic::iced::Color::TRANSPARENT)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-        .size(design::TEXT_BODY)
-        .font(font)
-        .wrapping(Wrapping::None)
-        .into()
-    };
-    Element::new(Faded {
-        line: layer(false),
-        class: None,
-        over: Some((layer(true), highlight)),
-        edge: FadeEdge::End,
-        cut: false,
-    })
-}
-
-/// `content` cut into stretches in order, each with whether it is
-/// highlighted. A range is kept only where it follows the last one and lies
-/// within the content on character boundaries.
-fn stretches(content: &str, highlighted: &[Range<usize>]) -> Vec<(Range<usize>, bool)> {
-    let mut stretches = Vec::new();
-    let mut start = 0;
-    for range in highlighted {
-        let range = range.start.max(start)..range.end.min(content.len());
-        if range.is_empty()
-            || !content.is_char_boundary(range.start)
-            || !content.is_char_boundary(range.end)
-        {
-            continue;
-        }
-        if start < range.start {
-            stretches.push((start..range.start, false));
-        }
-        stretches.push((range.clone(), true));
-        start = range.end;
-    }
-    if start < content.len() || stretches.is_empty() {
-        stretches.push((start..content.len(), false));
-    }
-    stretches
 }
 
 /// `content` on a single line: a line break would make the label a line
@@ -302,9 +225,6 @@ struct Faded<'a, Message> {
     line: Element<'a, Message>,
     /// The text colour, or the inherited one when the line brings its own.
     class: Option<cosmic::theme::Text>,
-    /// A second setting of the same line drawn over it in a colour of its
-    /// own, shaped and faded identically; see [`fade_highlighted`].
-    over: Option<(Element<'a, Message>, cosmic::theme::Text)>,
     edge: FadeEdge,
     /// The text was cut to a budget, so it fades even where it fits.
     cut: bool,
@@ -385,17 +305,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
     }
 
     fn children(&self) -> Vec<Tree> {
-        std::iter::once(&self.line)
-            .chain(self.over.as_ref().map(|(over, _)| over))
-            .map(Tree::new)
-            .collect()
+        vec![Tree::new(&self.line)]
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        let mut lines: Vec<&mut Element<'_, Message>> = std::iter::once(&mut self.line)
-            .chain(self.over.as_mut().map(|(over, _)| over))
-            .collect();
-        tree.diff_children(&mut lines);
+        tree.diff_children(std::slice::from_mut(&mut self.line));
     }
 
     fn size(&self) -> Size<Length> {
@@ -436,11 +350,6 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
                 .width
         });
         *tree.state.downcast_mut::<Natural>() = Natural(natural);
-        if let Some((over, _)) = &mut self.over {
-            // Shaped from the same text and fonts, it takes the same room.
-            over.as_widget_mut()
-                .layout(&mut tree.children[1], renderer, limits);
-        }
         node
     }
 
@@ -510,31 +419,28 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
         if bounds.intersection(viewport).is_none() {
             return;
         }
-        let base = self
+        let color = self
             .class
             .as_ref()
             .and_then(|class| theme.style(class).color)
             .unwrap_or(style.text_color);
-        let lines: Vec<_> = std::iter::once((&self.line, base))
-            .chain(
-                self.over
-                    .as_ref()
-                    .map(|(over, class)| (over, theme.style(class).color.unwrap_or(base))),
-            )
-            .zip(&tree.children)
-            .collect();
         let Natural(natural) = *tree.state.downcast_ref::<Natural>();
         // Text that fits is drawn as any text is, clipped only to the
         // viewport, so ink above or below its line box is kept.
         if !self.cut && natural <= bounds.width + 0.5 {
-            for ((line, color), tree) in &lines {
-                let style = renderer::Style {
-                    text_color: *color,
-                    ..*style
-                };
-                line.as_widget()
-                    .draw(tree, renderer, theme, &style, layout, cursor, viewport);
-            }
+            let style = renderer::Style {
+                text_color: color,
+                ..*style
+            };
+            self.line.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                &style,
+                layout,
+                cursor,
+                viewport,
+            );
             return;
         }
         // A line that fades at its start is laid out from its start like any
@@ -554,20 +460,25 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
             .intersection(viewport) else {
                 return;
             };
+            let style = renderer::Style {
+                text_color: cosmic::iced::Color {
+                    a: color.a * alpha,
+                    ..color
+                },
+                ..*style
+            };
             renderer.with_translation(Vector::new(-shift, 0.0), |renderer| {
                 // The clip is given before the move, which applies to it too.
                 let clip = clip + Vector::new(shift, 0.0);
-                for ((line, color), tree) in &lines {
-                    let style = renderer::Style {
-                        text_color: cosmic::iced::Color {
-                            a: color.a * alpha,
-                            ..*color
-                        },
-                        ..*style
-                    };
-                    line.as_widget()
-                        .draw(tree, renderer, theme, &style, layout, cursor, &clip);
-                }
+                self.line.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    &style,
+                    layout,
+                    cursor,
+                    &clip,
+                );
             });
         };
         let (solid, fade) = split(bounds, self.edge);
@@ -649,42 +560,6 @@ mod tests {
         let (narrow, width) = measure(fade_text(title).into(), 80.0);
         assert!((narrow - natural).abs() < 0.5, "measured whatever the room");
         assert!(width <= 80.0 && narrow > width + 0.5, "{narrow} in {width}");
-    }
-
-    #[test]
-    fn highlighted_lines_are_measured_as_plain_ones_are() {
-        let title = "A conversation title long enough to run out of room";
-        let accent = cosmic::theme::Text::Accent;
-        let (plain, _) = measure(fade_text(title).into(), 80.0);
-        let (unmarked, width) = measure(fade_highlighted(title, &[], accent.clone()), 80.0);
-        assert!((unmarked - plain).abs() < 1.0, "{unmarked} vs {plain}");
-        assert!(width <= 80.0);
-        let (marked, width) = measure(fade_highlighted(title, &[2..6, 40..44], accent), 80.0);
-        assert!(marked >= unmarked && width <= 80.0 && marked > width + 0.5);
-    }
-
-    #[test]
-    fn highlights_cut_the_line_into_ordered_stretches() {
-        let line = "Open the conversation";
-        assert_eq!(
-            stretches(line, &[5..8, 9..21]),
-            vec![(0..5, false), (5..8, true), (8..9, false), (9..21, true)]
-        );
-        // Overlapping, backward and out-of-range ranges keep only the part
-        // that follows the last stretch and lies within the line.
-        assert_eq!(
-            stretches(line, &[5..8, 6..12, 2..4, 18..400]),
-            vec![
-                (0..5, false),
-                (5..8, true),
-                (8..12, true),
-                (12..18, false),
-                (18..21, true),
-            ]
-        );
-        assert_eq!(stretches("", &[]), vec![(0..0, false)]);
-        // A range inside a character is passed over rather than split it.
-        assert_eq!(stretches("é", &[0..1]), vec![(0..2, false)]);
     }
 
     #[test]
