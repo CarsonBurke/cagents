@@ -195,6 +195,20 @@ This simulates a save error in the actual daemon and native UI. It does not
 simulate SQLite contention or an execution retirement, and contacts no provider.
 The fault is absent from builds without the `development` feature.
 
+`tests/fixtures/pending-terminal-save-scene.sh` exercises this refusal in a
+native before/after pair: it types into the shell while saving fails, retries
+once while the fault remains, then removes the fault and retries saving. It
+records the pending flag and the holder-owned shell's PID/start time to
+separate worker launches from the UI's interactive PATH probes. The recovered
+shot also checks keyboard focus by typing immediately after Retry save.
+
+The scene checks the exact pane/terminal IDs and pending flag before and after
+recovery, as well as the original worker's PID/start time. It waits for visible
+terminal output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's
+images separate; `SCENE_HIDE_INSPECTOR=1` closes the fixture's default inspector
+for a narrow terminal layout. Its unique `Retry` OCR locator targets the existing
+**Retry save** button even when OCR splits that label into two boxes.
+
 ## An offline Codex
 
 A session started with `--codex PEER`, or a `pair` given it, has a `codex` on
@@ -522,17 +536,3 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
-
-`tests/fixtures/pending-terminal-save-scene.sh` exercises this refusal in a
-native before/after pair: it types into the shell while saving fails, retries
-once while the fault remains, then removes the fault and retries saving. It
-records the pending flag and the holder-owned shell's PID/start time to
-separate worker launches from the UI's interactive PATH probes. The recovered
-shot also checks keyboard focus by typing immediately after Retry save.
-
-The scene checks the exact pane/terminal IDs and pending flag before and after
-recovery, as well as the original worker's PID/start time. It waits for visible
-terminal output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's
-images separate; `SCENE_HIDE_INSPECTOR=1` closes the fixture's default inspector
-for a narrow terminal layout. Its unique `Retry` OCR locator targets the existing
-**Retry save** button even when OCR splits that label into two boxes.

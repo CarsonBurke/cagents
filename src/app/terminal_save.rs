@@ -432,16 +432,24 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                entry.retry = None;
                 match result {
                     Ok(model) => {
+                        // Keep the operation until canonical completion can
+                        // return focus from the retiring Retry save control.
                         let applied = self.apply_workspace_model_update(
                             workspace_model_sync::ModelUpdate::Read(model),
                         );
+                        if let Some(entry) = self.terminal_save.entries.get_mut(&card)
+                            && entry.retry == Some(operation)
+                        {
+                            // An older/unconfirmed read still permits retry.
+                            entry.retry = None;
+                        }
                         applied
                     }
                     Err(error) => {
                         // The shell stays mounted even if the retry fails.
+                        entry.retry = None;
                         entry.failure.error = error;
                         let failure = entry.failure.clone();
                         self.record_terminal_save_failure(card, failure);
@@ -590,6 +598,53 @@ mod tests {
             matches!(app.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
         );
         assert!(app.pending_terminal_reservation(card).is_none());
+    }
+
+    #[test]
+    fn successful_retry_restores_keyboard_focus_in_both_completion_orders() {
+        for watcher_first in [false, true] {
+            let (mut app, card, terminal, _directory) = fixture();
+            let (operation, proof) = retry(&mut app, card, terminal);
+            let model = saved_model(&app, card);
+            if watcher_first {
+                drop(app.apply_workspace_model_update(
+                    workspace_model_sync::ModelUpdate::Read(model.clone()),
+                ));
+            }
+            drop(app.update_terminal_save(Action::Finished {
+                card,
+                terminal,
+                proof,
+                operation,
+                result: Ok(model),
+            }));
+            assert_eq!(
+                app.terminal_save.focus_after_save,
+                Some((card, terminal)),
+                "save completion must return focus after retiring Retry save (watcher_first={watcher_first})"
+            );
+            assert!(!app.has_terminal_save_notices());
+            assert!(iced::runtime::task::into_stream(app.refocus_saved_terminal()).is_some());
+            assert!(app.terminal_save.focus_after_save.is_none());
+        }
+    }
+
+    #[test]
+    fn unconfirmed_retry_save_keeps_its_notice_and_reenables_retry() {
+        let (mut app, card, terminal, _directory) = fixture();
+        let (operation, proof) = retry(&mut app, card, terminal);
+        let model = app.workspace_model.clone();
+        drop(app.update_terminal_save(Action::Finished {
+            card,
+            terminal,
+            proof,
+            operation,
+            result: Ok(model),
+        }));
+        assert!(app.notice_stands(NoticeKey::TerminalSave(card, terminal)));
+        assert!(app.terminal_save.entries[&card].retry.is_none());
+        assert!(app.terminal_save.focus_after_save.is_none());
+        assert_ne!(retry(&mut app, card, terminal).0, operation);
     }
 
     #[test]
