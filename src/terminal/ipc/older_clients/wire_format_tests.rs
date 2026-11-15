@@ -861,7 +861,7 @@ fn active_models_are_beyond_every_older_recording() {
         revision: 1,
         model: None,
     };
-    const ACTIVE_MODELS_SINCE: u16 = 179;
+    const ACTIVE_MODELS_SINCE: u16 = 182;
     assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
         "ServerMessage",
         "chat_active_model",

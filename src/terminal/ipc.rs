@@ -248,7 +248,9 @@ use crate::{
 /// agents' accepted task labels, preserving the carried CLI directory layout.
 /// Version 181 appends `RetryPendingTerminalSave` to persist an already
 /// running terminal without launching another worker.
-pub const PROTOCOL_VERSION: u16 = 181;
+/// Version 182 appends provider-confirmed active model status independently of
+/// chat snapshots, whose inspector encoding stays frozen for update sources.
+pub const PROTOCOL_VERSION: u16 = 182;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
