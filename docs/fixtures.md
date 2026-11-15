@@ -529,3 +529,10 @@ once while the fault remains, then removes the fault and retries saving. It
 records the pending flag and the holder-owned shell's PID/start time to
 separate worker launches from the UI's interactive PATH probes. The recovered
 shot also checks keyboard focus by typing immediately after Retry save.
+
+The scene checks the exact pane/terminal IDs and pending flag before and after
+recovery, as well as the original worker's PID/start time. It waits for visible
+terminal output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's
+images separate; `SCENE_HIDE_INSPECTOR=1` closes the fixture's default inspector
+for a narrow terminal layout. Its unique `Retry` OCR locator targets the existing
+**Retry save** button even when OCR splits that label into two boxes.
