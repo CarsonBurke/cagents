@@ -6,6 +6,7 @@ import os
 import runpy
 import socket
 import threading
+import tempfile
 import unittest
 from unittest import mock
 
@@ -95,6 +96,99 @@ class CodexToolRowsFixture(unittest.TestCase):
         self.assertEqual(completed[0]["params"]["turn"]["status"], "interrupted")
         return sent
 
+    def test_private_diagnostics_scene_preserves_original_failed_turn_without_child(self):
+        with tempfile.TemporaryDirectory(prefix="codex-row-diagnostics-") as directory:
+            home = Path(directory)
+            (home / "fixture-row-diagnostics").touch()
+            # This marker takes precedence even after the web scene ran.
+            (home / "fixture-web-rows").touch()
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            generations = scenario.playback(replies)
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.publish(scenario, replies[:pause], generations)
+            self.assertEqual(scenario.latest["status"], "inProgress")
+            self.assertIsNone(scenario.child_latest)
+            sent = self.publish(scenario, replies[pause + 1:], generations)
+            error = next(frame["params"] for frame in sent if frame.get("method") == "error")
+            self.assertFalse(error["willRetry"])
+            self.assertEqual(scenario.latest["status"], "failed")
+            self.assertEqual(scenario.latest["items"], [])
+            self.assertEqual(scenario.latest["error"], error["error"])
+            self.assertIn("fixture-original-diagnostic", error["error"]["message"])
+            self.assertEqual(scenario.request({"id": 2, "method": "thread/list"}, str(home))[0]
+                             ["result"]["data"], [])
+            resumed = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, str(home))[0]["result"]
+            self.assertEqual(resumed["initialTurnsPage"]["data"], [scenario.latest])
+
+    def test_private_web_scene_publishes_results_without_child_or_diff(self):
+        with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
+            home = Path(directory)
+            (home / "fixture-web-rows").touch()
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            generations = scenario.playback(replies)
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.publish(scenario, replies[:pause], generations)
+            self.assertIsNone(scenario.child_latest)
+            self.assertEqual(scenario.latest["items"][0]["type"], "webSearch")
+            self.assertEqual(scenario.latest["items"][0]["results"], [])
+            self.assertFalse(any(reply.get("method") == "turn/diff/updated" for reply in replies))
+            self.assertFalse(any(reply.get("params", {}).get("threadId") == scenario.child
+                                 for reply in replies))
+            self.publish(scenario, replies[pause + 1:], generations)
+            self.assertEqual(scenario.latest["status"], "completed")
+            search, answer = scenario.latest["items"]
+            self.assertEqual(search["type"], "webSearch")
+            self.assertEqual(len(search["results"]), 2)
+            self.assertTrue(all(result["url"].startswith("https://example.test/")
+                                for result in search["results"]))
+            self.assertEqual(answer["text"], "Web references ready.")
+            threads = scenario.request({"id": 2, "method": "thread/list"}, str(home))
+            self.assertEqual(threads[0]["result"]["data"], [])
+            resumed = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, str(home))
+            self.assertEqual(resumed[0]["result"]["initialTurnsPage"]["data"], [scenario.latest])
+
+    def test_private_plan_has_a_step_in_progress_while_the_turn_works(self):
+        with tempfile.TemporaryDirectory(prefix="codex-plan-") as directory:
+            home = Path(directory)
+            (home / "fixture-plan").write_text("30\n")
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.assertEqual(replies[pause]["_sleep"], 30.0)
+            plans = [(i, reply["params"]["plan"]["plan"]) for i, reply in enumerate(replies)
+                     if reply.get("method") == "turn/plan/updated"]
+            self.assertEqual(len(plans), 2)
+            (working, steps), (settled, done) = plans
+            self.assertLess(working, pause)
+            self.assertGreater(settled, pause)
+            self.assertEqual([step["status"] for step in steps],
+                             ["completed", "in_progress", "pending"])
+            self.assertTrue(all(step["status"] == "completed" for step in done))
+            self.assertEqual(replies[-1]["method"], "turn/completed")
+
+    def test_interrupt_private_web_scene_fences_delayed_results(self):
+        with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
+            home = Path(directory)
+            (home / "fixture-web-rows").touch()
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            generations = scenario.playback(replies)
+            pause = next(i for i, reply in enumerate(replies) if "_sleep" in reply)
+            self.publish(scenario, replies[:pause], generations)
+            interrupted = self.interrupt(scenario, scenario.thread, scenario.latest["id"])
+            self.publish(scenario, interrupted)
+            self.assertEqual(scenario.latest["status"], "interrupted")
+            self.assertEqual(self.publish(scenario, replies[pause + 1:], generations), [])
+            self.assertIsNone(scenario.child_latest)
+            self.assertNotIn("answer", [item["id"] for item in scenario.latest["items"]])
     def test_rate_limits_come_from_the_fixture_home_when_it_has_them(self):
         import json
         import tempfile
@@ -106,6 +200,156 @@ class CodexToolRowsFixture(unittest.TestCase):
             limits = {"rateLimits": {"credits": {"hasCredits": True, "balance": "12.5"}}}
             Path(home, "fixture-rate-limits.json").write_text(json.dumps(limits))
             self.assertEqual(scenario.request(request, home), [{"id": 3, "result": limits}])
+
+    def test_model_catalog_and_resolved_selection_come_from_the_fixture_home(self):
+        import json
+        import tempfile
+        scenario = PEER["Scenario"]()
+        catalog = {"data": [{"id": "offline-mini", "model": "offline-mini",
+                             "displayName": "Offline Mini", "isDefault": True,
+                             "defaultReasoningEffort": "medium",
+                             "supportedReasoningEfforts": [{"reasoningEffort": effort}
+                                                           for effort in ("low", "medium", "high")]}],
+                   "nextCursor": None}
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-models.json").write_text(json.dumps(catalog))
+            self.assertEqual(scenario.request({"id": 1, "method": "model/list"}, home),
+                             [{"id": 1, "result": catalog}])
+            [started] = scenario.request({"id": 2, "method": "thread/start", "params": {}}, home)
+            self.assertEqual(started["result"]["model"], "offline-mini")
+            self.assertIsNone(started["result"]["reasoningEffort"])
+            [explicit] = scenario.request({"id": 3, "method": "thread/start", "params": {
+                "model": "offline-mini", "config": {"model_reasoning_effort": "high"}}}, home)
+            self.assertEqual(explicit["result"]["reasoningEffort"], "high")
+            restored = PEER["Scenario"]()
+            restored.restore(scenario.state())
+            [resumed] = restored.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual(resumed["result"]["model"], "offline-mini")
+            self.assertEqual(resumed["result"]["reasoningEffort"], "high")
+            restored.request({"id": 5, "method": "turn/start", "params": {
+                "threadId": restored.thread, "model": "offline-mini", "effort": "low"}}, home)
+            [resumed] = restored.request({"id": 6, "method": "thread/resume", "params": {
+                "threadId": restored.thread}}, home)
+            self.assertEqual(resumed["result"]["reasoningEffort"], "low")
+
+    def test_unconfirmed_model_preserves_busy_turn_and_reports_when_resumed_after_marker_removal(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            marker = Path(home, "fixture-unconfirmed-model")
+            marker.touch()
+            scenario = PEER["Scenario"]()
+            [started] = scenario.request({"id": 1, "method": "thread/start", "params": {}}, home)
+            self.assertNotIn("model", started["result"])
+            self.assertIn("thread", started["result"])
+            replies = scenario.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertTrue(any(frame.get("method") == "turn/started" for frame in replies))
+            self.assertEqual(scenario.latest["status"], "inProgress")
+            [unconfirmed] = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertNotIn("model", unconfirmed["result"])
+            marker.unlink()
+            [confirmed] = scenario.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual(confirmed["result"]["model"], "fixture-mini")
+            self.assertEqual(confirmed["result"]["initialTurnsPage"]["data"][0]["status"], "inProgress")
+
+    def test_an_empty_fixture_model_catalog_reports_its_cause(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-models.json").write_text('{"data": []}')
+            with self.assertRaisesRegex(ValueError, "nonempty model/list result"):
+                PEER["Scenario"]().request({"id": 1, "method": "model/list"}, home)
+
+    def test_opt_in_turn_audit_is_bounded_and_excludes_prompt_input(self):
+        import json
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            audit = Path(home, "fixture-turn-audit.json")
+            scenario = PEER["Scenario"]()
+            request = {"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread, "model": "offline-mini", "effort": "high",
+                "input": [{"type": "text", "text": "private fixture prompt"}]}}
+            scenario.request(request, home)
+            self.assertFalse(audit.exists(), "auditing must be explicitly enabled")
+            audit.write_text(json.dumps([{"turnId": f"old-{index}"} for index in range(20)]))
+            # A fresh scenario accepts this turn immediately, without playing
+            # the earlier turn or its synthetic collaboration notifications.
+            scenario = PEER["Scenario"]()
+            request["params"]["threadId"] = scenario.thread
+            replies = scenario.request(request, home)
+            records = json.loads(audit.read_text())
+            self.assertEqual(len(records), 16)
+            self.assertEqual(records[0], {"turnId": "old-5"})
+            self.assertEqual(records[-1], {
+                "turnId": replies[0]["result"]["turn"]["id"],
+                "model": "offline-mini", "effort": "high"})
+            self.assertNotIn("private fixture prompt", audit.read_text())
+            self.assertEqual(list(Path(home).glob(".fixture-turn-audit-*")), [])
+            scenario = PEER["Scenario"]()
+            scenario.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": scenario.thread, "effort": None}}, home)
+            self.assertEqual(json.loads(audit.read_text())[-1] | {"turnId": None}, {
+                "turnId": None, "effort": None})
+
+    def test_turn_audit_preserves_concurrent_processes_sharing_one_private_home(self):
+        import json
+        import multiprocessing
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            audit = Path(home, "fixture-turn-audit.json")
+            audit.write_text("[]")
+            barrier = context.Barrier(8)
+
+            def record(index):
+                scenario = PEER["Scenario"]()
+                barrier.wait(5)
+                scenario.request({"id": index, "method": "turn/start", "params": {
+                    "threadId": scenario.thread, "model": f"offline-{index}", "effort": "high"}}, home)
+
+            workers = [context.Process(target=record, args=(index,)) for index in range(8)]
+            try:
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(5)
+                    self.assertEqual(worker.exitcode, 0, "audit writer did not finish successfully")
+            finally:
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.terminate()
+                    worker.join(2)
+            records = json.loads(audit.read_text())
+            self.assertEqual(len(records), 8)
+            self.assertEqual({row["model"] for row in records}, {f"offline-{index}" for index in range(8)})
+            self.assertEqual(len({row["turnId"] for row in records}), 8)
+            self.assertTrue(all(row["effort"] == "high" for row in records))
+
+    def test_malformed_turn_audit_does_not_mutate_the_selection_or_turn(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-turn-audit.json").write_text("{}")
+            scenario = PEER["Scenario"]()
+            scenario.model, scenario.reasoning = "offline-original", "low"
+            with self.assertRaisesRegex(ValueError, "must hold an array"):
+                scenario.request({"id": 1, "method": "turn/start", "params": {
+                    "threadId": scenario.thread, "model": "offline-new", "effort": "high"}}, home)
+            self.assertEqual((scenario.model, scenario.reasoning), ("offline-original", "low"))
+            self.assertIsNone(scenario.latest)
+            self.assertIsNone(scenario.child_latest)
+
+    def test_native_evidence_can_hold_a_turn_without_environment_forwarding(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-turn-pause").write_text("20\n")
+            scenario = PEER["Scenario"]()
+            responses = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual([frame["_sleep"] for frame in responses if "_sleep" in frame], [20])
+            for invalid in ("NaN", "-1", "301", "not seconds"):
+                Path(home, "fixture-turn-pause").write_text(invalid)
+                scenario = PEER["Scenario"]()
+                with self.assertRaisesRegex(ValueError, "seconds between 0 and 300"):
+                    scenario.request({"id": 1, "method": "turn/start", "params": {
+                        "threadId": scenario.thread}}, home)
 
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()

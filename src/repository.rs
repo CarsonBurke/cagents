@@ -8,8 +8,9 @@
 mod ignored_worktree_files;
 mod managed_worktrees;
 pub use ignored_worktree_files::default_disposable_ignored_directories;
-#[cfg(test)]
-pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
@@ -31,8 +32,9 @@ pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
-#[cfg(test)]
-pub(crate) mod test_fixture;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_fixture;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
     PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
@@ -46,19 +48,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(all(test, not(feature = "host")))]
+use crate::process::WaitEvent;
 #[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(test, not(feature = "host")))]
 use std::{
     io::Write,
     process::{Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
 };
 
-#[cfg(test)]
-use crate::process::WaitEvent;
-pub(crate) use crate::process::{
+pub use crate::process::{
     CLEANUP_GRACE, DEFAULT_STDERR_LIMIT, SIGKILL, SIGTERM, TERMINATION_GRACE, process_failure,
     signal_process_group,
 };
@@ -3042,7 +3043,7 @@ fn bytes_to_path(value: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(value.to_vec()))
 }
 
-pub(crate) fn stable_worktree_id(path: &Path) -> WorktreeId {
+pub fn stable_worktree_id(path: &Path) -> WorktreeId {
     WorktreeId::from_uuid(stable_path_uuid(path))
 }
 
@@ -13514,7 +13515,7 @@ mod worktree_journal_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let repository = directory.path().join("repo");
             fs::create_dir(&repository).unwrap();
             let git = |arguments: &[&str]| {

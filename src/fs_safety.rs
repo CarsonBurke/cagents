@@ -441,7 +441,7 @@ pub use directory_creation::{
     DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
     create_directory_in_namespace, stage_directory_in_namespace,
 };
-pub(crate) use directory_creation::{
+pub use directory_creation::{
     OwnedPrivateSibling, PrivateSiblingCreateError, SaveSiblingDurability, StickyParent,
 };
 
@@ -472,17 +472,18 @@ pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), Res
 
 #[path = "fs_safety/recovery_placement.rs"]
 mod recovery_placement;
-pub(crate) use recovery_placement::{
+pub use recovery_placement::{
     RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp, validate_recovery_parent,
 };
 
 #[path = "fs_safety/recovery_cache.rs"]
 mod recovery_cache;
-#[cfg(test)]
-pub(crate) use recovery_cache::fixture_fail_next_save_preparation_sync;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use recovery_cache::fixture_fail_next_save_preparation_sync;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
-pub(crate) use recovery_cache::{
+pub use recovery_cache::{
     RecoveryDirectoryError, RecoveryParentCandidates, SavePreparationDurability,
     prepare_recovery_directory_with_owner, prepare_save_recovery_directory_with_owner,
     verify_recovery_directory_private,
@@ -1461,18 +1462,56 @@ fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+/// Access-ACL fixtures for tests of code that copies access rules, here and
+/// in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod acl_fixture {
+    use super::{File, io, write_attribute};
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
 
-    use std::{
-        fs,
-        io::Write,
-        os::unix::fs::{MetadataExt, PermissionsExt},
-    };
+    pub fn restrictive_access_acl() -> Vec<u8> {
+        // Linux POSIX ACL xattr v2: the mask is readable, but the owning group
+        // has no access. Copying st_mode alone would incorrectly grant it read.
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    pub fn set_test_access_acl(file: &File, value: &[u8]) -> bool {
+        match write_attribute(file, c"system.posix_acl_access", value) {
+            Ok(()) => true,
+            // tmpfs without ACL support rejects the unknown xattr name with
+            // EINVAL rather than EOPNOTSUPP; both mean the fixture cannot
+            // carry an ACL here, matching the Resolver::Walk fallback used
+            // by production probing.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) => {
+                false
+            }
+            Err(error) => panic!("could not set fixture access ACL: {error}"),
+        }
+    }
+
+    pub fn access_acl(file: &File) -> Option<Vec<u8>> {
+        super::read_attribute(file, c"system.posix_acl_access").unwrap()
+    }
+
+    pub fn set_default_acl(directory: &File, value: &[u8]) {
+        write_attribute(directory, c"system.posix_acl_default", value).unwrap();
+    }
 
     /// Select an actually permitted non-primary group for owned fixtures.
-    pub(crate) fn shared_group(file: &File) -> Option<libc::gid_t> {
+    pub fn shared_group(file: &File) -> Option<libc::gid_t> {
         // SAFETY: a zero count/null buffer asks only for the required count.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
         assert!(count >= 0);
@@ -1504,6 +1543,18 @@ pub(crate) mod tests {
         eprintln!("shared ownership fixture requires another permitted group");
         None
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use acl_fixture::{restrictive_access_acl, set_test_access_acl, shared_group};
+
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
 
     #[test]
     fn ownership_transfer_uses_descriptors_and_rejects_unusable_destination() {
@@ -1935,93 +1986,6 @@ pub(crate) mod tests {
                 [AttributeNotCopied::Attribute { name, .. }] if name == "user.note"
             ),
             "{lost:?}",
-        );
-    }
-
-    fn restrictive_access_acl() -> Vec<u8> {
-        // Linux POSIX ACL xattr v2: the mask is readable, but the owning group
-        // has no access. Copying st_mode alone would incorrectly grant it read.
-        let mut value = 2_u32.to_le_bytes().to_vec();
-        for (tag, permissions, id) in [
-            (0x01_u16, 6_u16, u32::MAX),
-            (0x02, 4, 12_345),
-            (0x04, 0, u32::MAX),
-            (0x10, 4, u32::MAX),
-            (0x20, 0, u32::MAX),
-        ] {
-            value.extend_from_slice(&tag.to_le_bytes());
-            value.extend_from_slice(&permissions.to_le_bytes());
-            value.extend_from_slice(&id.to_le_bytes());
-        }
-        value
-    }
-
-    fn set_test_access_acl(file: &File, value: &[u8]) -> bool {
-        match write_attribute(file, c"system.posix_acl_access", value) {
-            Ok(()) => true,
-            // tmpfs without ACL support rejects the unknown xattr name with
-            // EINVAL rather than EOPNOTSUPP; both mean the fixture cannot
-            // carry an ACL here, matching the Resolver::Walk fallback used
-            // by production probing.
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) => {
-                false
-            }
-            Err(error) => panic!("could not set fixture access ACL: {error}"),
-        }
-    }
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn editor_copy_preserves_access_acl_and_removes_unwanted_inheritance() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("restricted"), b"private contents").unwrap();
-        fs::write(directory.path().join("plain"), b"plain contents").unwrap();
-        let restricted = File::open(directory.path().join("restricted")).unwrap();
-        let acl = restrictive_access_acl();
-        if !set_test_access_acl(&restricted, &acl) {
-            return;
-        }
-        assert_eq!(
-            restricted.metadata().unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        fs::create_dir(directory.path().join("copies")).unwrap();
-        let parent = File::open(directory.path().join("copies")).unwrap();
-        write_attribute(&parent, c"system.posix_acl_default", &acl).unwrap();
-        let plain = File::open(directory.path().join("plain")).unwrap();
-        plain
-            .set_permissions(fs::Permissions::from_mode(0o640))
-            .unwrap();
-
-        for name in ["restricted", "plain"] {
-            crate::editor::copy_file(
-                directory.path(),
-                Path::new(name),
-                &Path::new("copies").join(name),
-            )
-            .unwrap();
-        }
-        let restricted_copy = File::open(directory.path().join("copies/restricted")).unwrap();
-        let plain_copy = File::open(directory.path().join("copies/plain")).unwrap();
-        assert_eq!(
-            read_attribute(&restricted_copy, c"system.posix_acl_access").unwrap(),
-            Some(acl)
-        );
-        assert_eq!(
-            read_attribute(&plain_copy, c"system.posix_acl_access").unwrap(),
-            None
-        );
-        assert_eq!(
-            plain_copy.metadata().unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert_eq!(
-            fs::read(directory.path().join("restricted")).unwrap(),
-            b"private contents"
-        );
-        assert_eq!(
-            fs::read(directory.path().join("copies/restricted")).unwrap(),
-            b"private contents"
         );
     }
 

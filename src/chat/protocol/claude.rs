@@ -632,9 +632,10 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<ScopedId, Item>,
-    /// Agent calls that published their agent's name. A child's own frames
-    /// carry at most its type, which must not rename it. Bounded by `tools`.
-    named_agents: HashSet<String>,
+    /// Agent calls that published what their agent goes by. A child's own
+    /// frames carry its type and task, which must not rename it. Bounded by
+    /// `tools`.
+    labelled_agents: HashSet<String>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -726,12 +727,14 @@ struct Claude {
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
     resolved: HashMap<String, String>,
+    resolved_labels: HashMap<String, String>,
     /// The listed model the conversation is on: the one launched with,
     /// chosen since, or the listed model the latest turn's full ID stands for.
     selected: Option<String>,
     /// The full model ID the latest turn reported running on, which keys the
     /// result's per-model usage.
     running: Option<String>,
+    running_reasoning: Option<String>,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning: Option<String>,
@@ -970,7 +973,7 @@ impl Claude {
     }
     fn forget_tool(&mut self, key: &ScopedId) {
         self.tools.remove(key);
-        self.named_agents.remove(&key.id);
+        self.labelled_agents.remove(&key.id);
         self.edit_tools.remove(key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
@@ -1429,6 +1432,14 @@ impl Claude {
         }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
+            Model::resolve_claude_labels(&mut self.models, models);
+            self.resolved_labels = models
+                .iter()
+                .filter_map(|model| {
+                    let id = model["resolvedModel"].as_str()?;
+                    Some((id.to_owned(), Model::claude_model_label(models, id)))
+                })
+                .collect();
             self.resolved = models
                 .iter()
                 .filter_map(|model| {
@@ -1504,8 +1515,51 @@ impl Claude {
         });
         if let Some(model) = data["model"].as_str() {
             self.selected = Some(self.listed(model).to_owned());
-            self.running = Some(model.to_owned());
+            self.running = Some(
+                self.resolved
+                    .get(model)
+                    .map_or(model, String::as_str)
+                    .to_owned(),
+            );
+            self.running_reasoning = self.reasoning.clone();
         }
+        let active = self
+            .running
+            .as_ref()
+            .filter(|id| {
+                !matches!(
+                    id.as_str(),
+                    "default" | "opus" | "sonnet" | "haiku" | "opusplan"
+                )
+            })
+            .map(|id| {
+                let label = self
+                    .resolved_labels
+                    .get(id)
+                    .cloned()
+                    .or_else(|| {
+                        self.models
+                            .iter()
+                            .find(|model| model.id == *id)
+                            .map(|model| model.label.clone())
+                    })
+                    .unwrap_or_else(|| id.clone());
+                let mut aliases: Vec<_> = self
+                    .resolved
+                    .iter()
+                    .filter_map(|(alias, resolved)| (resolved == id).then(|| alias.clone()))
+                    .collect();
+                aliases.sort_unstable();
+                aliases.dedup();
+                chat::ActiveModel {
+                    id: id.clone(),
+                    label,
+                    reasoning: self.running_reasoning.clone(),
+                    default_reasoning: None,
+                    aliases,
+                }
+            });
+        step.events.push(Event::ActiveModel(active));
         step.events.extend([
             Event::Models {
                 models: self.models.clone(),
@@ -1879,9 +1933,14 @@ impl Claude {
                                 if background == Some(true) {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                                let kind = agent_name(&block["input"]);
+                                let input = &block["input"];
+                                let kind = agent_label(
+                                    string(input, "name"),
+                                    string(input, "description"),
+                                    string(input, "subagent_type"),
+                                );
                                 if !kind.is_empty() {
-                                    self.named_agents.insert(tool_id.clone());
+                                    self.labelled_agents.insert(tool_id.clone());
                                 }
                                 step.events.push(Event::Subagent {
                                     model: block["input"]["model"].as_str().map(str::to_owned),
@@ -2162,12 +2221,17 @@ impl Claude {
                 waiting: None,
                 detail: None,
                 id: parent.into(),
-                // The Agent call's name, once published, outranks the type a
+                // The Agent call's label, once published, outranks what a
                 // child's frame may carry; an empty kind leaves it in place.
-                kind: if self.named_agents.contains(parent) {
+                kind: if self.labelled_agents.contains(parent) {
                     String::new()
                 } else {
-                    string(frame, "subagent_type").into()
+                    agent_label(
+                        "",
+                        string(frame, "task_description"),
+                        string(frame, "subagent_type"),
+                    )
+                    .into()
                 },
                 description: string(frame, "task_description").into(),
                 status: None,
@@ -3506,7 +3570,7 @@ impl Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
-                self.named_agents.clear();
+                self.labelled_agents.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
@@ -3660,6 +3724,12 @@ impl Claude {
                         }
                         "set_model" => {
                             self.selected = request["model"].as_str().map(str::to_owned);
+                            if !self.busy {
+                                self.running = self
+                                    .selected
+                                    .as_ref()
+                                    .map(|id| self.resolved.get(id).unwrap_or(id).clone());
+                            }
                             self.metadata(&Value::Null, &mut step);
                             let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
@@ -3712,6 +3782,9 @@ impl Claude {
                             self.reasoning = request["settings"]["effortLevel"]
                                 .as_str()
                                 .map(str::to_owned);
+                            if !self.busy {
+                                self.running_reasoning = self.reasoning.clone();
+                            }
                             self.metadata(&Value::Null, &mut step);
                         }
                         "set_permission_mode" => {
@@ -4279,14 +4352,14 @@ fn choice(id: &str, label: &str) -> Choice {
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
-/// What an Agent call's agent is called: the name it was asked to go by,
-/// else its agent type. Several agents can share a type, and the reader
-/// tells them apart by name; the task description is never the name.
-fn agent_name(input: &Value) -> &str {
-    ["name", "subagent_type"]
+/// What an agent goes by: the name its Agent call asked for, else the first
+/// line of the short task description it was given, else its agent type.
+/// Several agents share a type, such as `general-purpose`, so the type, which
+/// the call's own card still shows, is the last resort.
+fn agent_label<'a>(name: &'a str, description: &'a str, agent_type: &'a str) -> &'a str {
+    [name, description, agent_type]
         .into_iter()
-        .map(|key| string(input, key).trim())
-        .find(|name| !name.is_empty())
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or_default()
 }
 fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -7993,10 +8066,12 @@ impl History {
             }
             children.push((
                 parent.to_owned(),
-                self.agent_names
-                    .get(parent)
-                    .map_or_else(|| string(&meta, "agentType"), String::as_str)
-                    .into(),
+                agent_label(
+                    self.agent_names.get(parent).map_or("", String::as_str),
+                    string(&meta, "description"),
+                    string(&meta, "agentType"),
+                )
+                .into(),
                 string(&meta, "description").into(),
                 frames.into_iter().map(|(frame, _)| frame).collect(),
                 outcomes,
@@ -8474,7 +8549,7 @@ mod streamed_input;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
@@ -14568,7 +14643,7 @@ mod tests {
     fn child_frames_stay_in_their_subagent_transcript() {
         let mut adapter = Claude::default();
         let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"subagent_type":"Explore","description":"Inspect parser"}}]}})).unwrap();
-        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, description, status:Some(ToolStatus::Running), .. } if id == "tool-agent" && kind == "Explore" && description == "Inspect parser")));
+        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, description, status:Some(ToolStatus::Running), .. } if id == "tool-agent" && kind == "Inspect parser" && description == "Inspect parser")));
         let child = adapter.receive(json!({"type":"user","uuid":"child-carrier","parent_tool_use_id":"tool-agent","message":{"content":"Internal prompt"}})).unwrap();
         assert!(
             !child
@@ -14594,7 +14669,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_calls_name_their_agent_before_its_type_and_never_by_task() {
+    /// Several agents share a type, so an unnamed one goes by its short task
+    /// description, and only one without either by its type.
+    fn agent_calls_label_their_agent_by_name_then_task_then_type() {
         for (input, expected) in [
             (
                 json!({"name":" Scout ","subagent_type":"Explore","description":"Inspect parser"}),
@@ -14602,16 +14679,21 @@ mod tests {
             ),
             (
                 json!({"name":" \t","subagent_type":"Explore","description":"Inspect parser"}),
+                "Inspect parser",
+            ),
+            (json!({"description":"Inspect parser"}), "Inspect parser"),
+            (
+                json!({"subagent_type":"Explore","description":" \n"}),
                 "Explore",
             ),
-            (json!({"description":"Inspect parser"}), ""),
         ] {
             let mut adapter = Claude::default();
             let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":input}]}})).unwrap();
             assert!(
                 started.events.iter().any(|event| matches!(event,
                     Event::Subagent { id, kind, description, .. }
-                        if id == "tool-agent" && kind == expected && description == "Inspect parser")),
+                        if id == "tool-agent" && kind == expected
+                            && Some(description.as_str()) == input["description"].as_str())),
                 "{input}: {:?}",
                 started.events
             );
@@ -14699,7 +14781,7 @@ mod tests {
         let expect = |id: &str, name: &str, status: ToolStatus, waiting: bool| {
             assert_eq!(state[id], (name.to_owned(), Some(status), waiting), "{id}");
         };
-        expect("explore-logs", "Explore", ToolStatus::Succeeded, false);
+        expect("explore-logs", "Read logs", ToolStatus::Succeeded, false);
         expect("scout", "Scout", ToolStatus::Running, false);
         expect("planner", "Planner", ToolStatus::Running, true);
         expect("builder", "Builder", ToolStatus::Failed, false);
@@ -17664,7 +17746,7 @@ mod tests {
         let loaded = history.subagent_frames().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "tool-one");
-        assert_eq!(loaded[0].1, "Explore");
+        assert_eq!(loaded[0].1, "Inspect");
         assert_eq!(loaded[0].3.len(), 1);
         assert_eq!(loaded[0].3[0]["uuid"], "child");
     }
@@ -18309,6 +18391,128 @@ mod tests {
         assert_eq!(turn(&mut adapter, "claude-fable-5-1"), "fable");
         // A model the list does not name is shown as it is.
         assert_eq!(turn(&mut adapter, "claude-mythos-5-2"), "claude-mythos-5-2");
+    }
+
+    #[test]
+    fn default_alias_reports_the_resolved_model_label_without_changing_its_command_id() {
+        let mut adapter = Claude::default();
+        let mut catalog = Step::default();
+        adapter.metadata(&json!({"models":[
+            {"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},
+            {"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5"}
+        ]}), &mut catalog);
+        assert!(
+            adapter.selected.is_none(),
+            "a catalog alone does not start a model"
+        );
+        assert!(
+            catalog
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ActiveModel(None)))
+        );
+        let mut turn = Step::default();
+        adapter.metadata(&json!({"model":"claude-opus-5-5"}), &mut turn);
+        assert!(turn.events.iter().any(|event| matches!(event,
+            Event::Models { models, selected: Some(selected), .. }
+                if selected == "default" && models.iter().any(|model|
+                    model.id == *selected && model.label == "Default (Opus 5.5)"))));
+        assert!(turn.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-opus-5-5" && model.label == "Opus 5.5")));
+        assert_eq!(adapter.running.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(adapter.selected.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn special_alias_keeps_its_menu_choice_while_active_status_names_the_concrete_model() {
+        let mut adapter = Claude {
+            selected: Some("opusplan".into()),
+            ..Claude::default()
+        };
+        let mut step = Step::default();
+        adapter.metadata(
+            &json!({"models":[
+            {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+            {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"}
+        ], "model":"claude-sonnet-5-5"}),
+            &mut step,
+        );
+        assert_eq!(adapter.selected.as_deref(), Some("opusplan"));
+        assert_eq!(adapter.models[0].label, "Opus Plan");
+        assert!(step.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-sonnet-5-5"
+                && model.label == "Sonnet 5.5" && model.aliases == ["opusplan", "sonnet"])));
+        let mut unknown = Step::default();
+        adapter.metadata(&json!({"model":"claude-new-family-7"}), &mut unknown);
+        assert!(unknown.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model.id == "claude-new-family-7"
+                && model.label == model.id && model.aliases.is_empty())));
+    }
+
+    #[test]
+    fn active_model_aliases_follow_only_reported_resolution_while_busy() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            selected: Some("opusplan".into()),
+            reasoning: Some("high".into()),
+            ..Claude::default()
+        };
+        let mut initial = Step::default();
+        adapter.metadata(
+            &json!({"models":[
+                {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"},
+                {"value":"default","resolvedModel":"claude-sonnet-5-5","displayName":"Default (recommended)"},
+                {"value":"custom-route","resolvedModel":"claude-sonnet-5-5","displayName":"Personal choice"},
+                {"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet 5.5"},
+                {"value":"misleading","resolvedModel":"claude-opus-5-5","displayName":"Sonnet 5.5",
+                    "supportsEffort":true,"supportedEffortLevels":["high"]},
+                {"value":"unmapped","displayName":"Sonnet 5.5"},
+                {"value":"claude-sonnet-5-5","displayName":"Sonnet 5.5"},
+                {"value":"opusplan","resolvedModel":"claude-sonnet-5-5","displayName":"Opus Plan"}
+            ],"model":"claude-sonnet-5-5"}),
+            &mut initial,
+        );
+        let running = initial
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::ActiveModel(Some(model)) => Some(model.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(running.id, "claude-sonnet-5-5");
+        assert_eq!(running.label, "Sonnet 5.5");
+        assert_eq!(running.reasoning.as_deref(), Some("high"));
+        assert_eq!(
+            running.aliases,
+            ["custom-route", "default", "opusplan", "sonnet"]
+        );
+        let change = adapter
+            .command(Command::SetModel {
+                model: "misleading".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        let changed = adapter
+            .receive(reply(
+                change.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(adapter.selected.as_deref(), Some("misleading"));
+        assert_eq!(adapter.running.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(changed.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model == &running)));
+        let applied = adapter
+            .receive(reply(
+                changed.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(applied.events.iter().any(|event| matches!(event,
+            Event::ActiveModel(Some(model)) if model == &running)));
+        assert!(adapter.busy);
     }
 
     #[test]

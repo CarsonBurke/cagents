@@ -255,6 +255,39 @@ fn an_unchanged_flush_writes_only_the_workspace_generation() {
     assert_eq!(changes(&store) - before, 1);
 }
 
+/// #2629: a flush serializes only the cards that changed since the last one,
+/// open or closed, however many the window holds.
+#[test]
+fn a_flush_serializes_only_the_cards_that_changed() {
+    fn built(run: impl FnOnce()) -> usize {
+        let before = CARD_WRITES_BUILT.with(std::cell::Cell::get);
+        run();
+        CARD_WRITES_BUILT.with(std::cell::Cell::get) - before
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let store = StateStore::open(
+        directory.path().join("history.sqlite3"),
+        BootId::new("scale"),
+    )
+    .unwrap();
+    let mut state = long_lived_workspace();
+    let mut lane = Lane::default();
+    assert_eq!(
+        built(|| drop(lane.save(&store, &state))),
+        state.cards.len(),
+        "a store opened afresh is offered every card"
+    );
+    assert_eq!(built(|| drop(lane.save(&store, &state))), 0);
+    let open = state
+        .cards
+        .iter()
+        .position(|card| card.existence.is_open())
+        .unwrap();
+    state.cards[open].title = "retitled".into();
+    assert_eq!(built(|| drop(lane.save(&store, &state))), 1);
+    assert_eq!(built(|| drop(lane.save(&store, &state))), 0);
+}
+
 /// The SQL of every statement the store's connection starts while `run` runs,
 /// as SQLite's own statement trace reports it.
 fn statements_during(store: &StateStore, run: impl FnOnce()) -> Vec<String> {

@@ -4,7 +4,7 @@
 //! needs to look like part of this workbench is named here. Dimensions live
 //! in this module, the spacing scale in [`space`], semantic color in `color`,
 //! the type scale and its spacing rhythm in `typography`, the shared list grid
-//! in [`list`], and the responsive mounting of the shell's regions in `layout`. Composed controls live in [`crate::ui_controls`].
+//! in [`list`], and the responsive mounting of the shell's regions in `layout`. Composed controls live in `ui_controls` in the `cagents-ui` crate.
 
 mod color;
 mod layout;

@@ -33,7 +33,7 @@ mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 mod gh;
-pub use agents::AgentCommand;
+pub use agents::{AgentCommand, PlacedIn};
 pub use gh::GhCommand;
 mod automations;
 mod completions;
@@ -115,7 +115,7 @@ const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// then flushes its session.
 const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
-pub(crate) const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
+pub const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Parser)]
@@ -800,7 +800,7 @@ impl ControlClient {
         result
     }
 
-    pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+    pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         let deadline = Instant::now() + Self::handshake_timeout();
         Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
     }
@@ -1057,6 +1057,20 @@ impl ControlClient {
         }
     }
 
+    /// Stable names for managed agents, without loading their conversations.
+    pub fn read_agent_labels(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<(crate::model::AgentId, String)>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::AgentLabels { identity, labels },
+            ) => Ok((identity, labels)),
+            response => Err(unexpected_response("agent labels", &response)),
+        }
+    }
+
     /// Commit an edit without reading or transporting unrelated model state.
     pub fn apply_workspace_edit(
         &mut self,
@@ -1163,6 +1177,11 @@ impl ControlClient {
                 }
                 ServerMessage::NotificationActivated { target } => {
                     return Ok(crate::notifications::Update::Activated(target));
+                }
+                ServerMessage::AutomationProposalsChanged { repository } => {
+                    return Ok(crate::notifications::Update::AutomationProposalsChanged(
+                        repository,
+                    ));
                 }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
                 ServerMessage::Error(error) => {
@@ -1582,12 +1601,30 @@ impl ControlClient {
         Ok(terminal)
     }
 
+    pub fn retry_pending_terminal_save(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::RetryPendingTerminalSave { pane, terminal_id })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "a terminal save acknowledgement",
+                &response,
+            )),
+        }
+    }
+
     pub fn complete_pending_terminal(
         &mut self,
         pane: crate::model::CardId,
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     ) -> Result<TerminalDescriptor, ControlError> {
+        // Persistence can fail after publication subscribed this connection.
+        // Keep receiving this exact worker's output during recovery RPCs even
+        // when completion returns an error; envelope and foreign-ID checks stay.
+        self.terminal_streams.insert(terminal_id);
         let response = self.request_attached(
             ClientRequest::CompletePendingTerminal {
                 pane,
@@ -1606,7 +1643,6 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a reserved terminal", &response)),
         };
-        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1657,6 +1693,96 @@ impl ControlClient {
                 outcome,
             } if terminal_id == id => Ok(outcome),
             response => Err(unexpected_response("completed terminal release", &response)),
+        }
+    }
+
+    pub fn terminal_removal_basis(
+        &mut self,
+        source: crate::model::TerminalSession,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadTerminalRemovalBasis { source })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("terminal removal basis", &response)),
+        }
+    }
+
+    pub fn captured_terminal_removal_basis(
+        &mut self,
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadCapturedTerminalRemovalBasis { capture })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("captured terminal source", &response)),
+        }
+    }
+
+    pub fn close_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        self.close_captured_terminal_source(session, basis, completed_only, allow_active, None)
+    }
+
+    pub fn close_captured_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let terminal_id = session.id;
+        if !completed_only {
+            if let Err(error) = self.attach_and_synchronize(terminal_id) {
+                // The cleanup request has not been sent. Keep disappearance
+                // distinct from an unconfirmed reply after cleanup admission.
+                return Err(match error {
+                    ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        retryable: false,
+                        ..
+                    } => ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                        retryable: false,
+                    },
+                    error => error,
+                });
+            }
+        }
+        let request = ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+            capture,
+        };
+        let result = (if completed_only {
+            self.request_with_deadline(request, Instant::now() + CHAT_CLOSE_TIMEOUT)
+        } else {
+            self.request_attached_with_deadline(
+                request,
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+        })
+        .and_then(|response| match response {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id: actual,
+                outcome,
+            } if actual == terminal_id => Ok(outcome),
+            response => Err(unexpected_response(
+                "a source-checked terminal close",
+                &response,
+            )),
+        });
+        if completed_only || matches!(result, Ok(terminal::ipc::TerminalCloseResult::Closed)) {
+            result
+        } else {
+            self.finish_attachment(terminal_id, result)
         }
     }
 
@@ -1992,7 +2118,11 @@ impl ControlClient {
                 });
             }
             match envelope.message {
-                ServerMessage::Redraw {
+                ServerMessage::TerminalWorker {
+                    terminal_id: actual,
+                    ..
+                }
+                | ServerMessage::Redraw {
                     terminal_id: actual,
                     ..
                 }
@@ -2268,6 +2398,7 @@ impl ControlClient {
     /// request they interrupt.
     fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
         match message {
+            ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -2293,6 +2424,12 @@ impl ControlClient {
                 if self.observed_notifications.len() < 32 {
                     self.observed_notifications
                         .push_back(crate::notifications::Update::Activated(target));
+                }
+            }
+            ServerMessage::AutomationProposalsChanged { repository } => {
+                let update = crate::notifications::Update::AutomationProposalsChanged(repository);
+                if !self.observed_notifications.contains(&update) {
+                    self.observed_notifications.push_back(update);
                 }
             }
             ServerMessage::WorkBoard { revision, board } => {
@@ -2323,6 +2460,7 @@ impl ControlClient {
             | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
+            | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2503,7 +2641,7 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-fn is_timeout_error(error: &ControlError) -> bool {
+pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,
@@ -2529,7 +2667,8 @@ fn response_from_message(message: ServerMessage) -> Result<ServerResponse, Contr
 
 fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
     match message {
-        ServerMessage::Redraw { terminal_id, .. }
+        ServerMessage::TerminalWorker { terminal_id, .. }
+        | ServerMessage::Redraw { terminal_id, .. }
         | ServerMessage::Snapshot { terminal_id, .. }
         | ServerMessage::TerminalObserved { terminal_id, .. }
         | ServerMessage::Event { terminal_id, .. } => *terminal_id == expected,
@@ -2548,12 +2687,15 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::ChatLimit { .. }
         | ServerMessage::ChatAgentAddresses { .. }
+        | ServerMessage::AutomationProposalsChanged { .. }
+        | ServerMessage::ChatActiveModel { .. }
         | ServerMessage::Error(_) => false,
     }
 }
 
 fn message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::TerminalWorker { .. } => "terminal_worker",
         ServerMessage::Response { .. } => "response",
         ServerMessage::Redraw { .. } => "redraw",
         ServerMessage::Snapshot { .. } => "snapshot",
@@ -2570,15 +2712,18 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
+        ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
+        ServerMessage::AutomationProposalsChanged { .. } => "automation_proposals_changed",
     }
 }
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::TerminalRemovalBasis(_) => "terminal_removal_basis",
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
@@ -2742,7 +2887,7 @@ impl AppError {
 
 static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn daemon_autostart_disabled() -> bool {
+pub fn daemon_autostart_disabled() -> bool {
     NO_START.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -2904,7 +3049,8 @@ where
             command:
                 AccountCommand::Link { .. }
                 | AccountCommand::Default { .. }
-                | AccountCommand::Remove { .. },
+                | AccountCommand::Remove { .. }
+                | AccountCommand::Reset { .. },
         } => Some("Account changes require your own terminal".into()),
         _ => None,
     };
@@ -7845,6 +7991,95 @@ mod tests {
         server.join().unwrap();
     }
     #[test]
+    fn pending_save_failure_keeps_its_stream_legal_during_recovery_reads() {
+        for foreign in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let pinned = proof("pending-save-stream", "boot", "incarnation");
+            let terminal = TerminalId::new();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let complete: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(complete.request, ClientRequest::CompletePendingTerminal { terminal_id, .. } if terminal_id == terminal)
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(complete.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            "fixture refused completion save",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+                let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                // Publication succeeded before persistence failed. Its output
+                // still arrives during the fallback's view/inventory reads.
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: pinned.clone(),
+                        message: ServerMessage::Redraw {
+                            terminal_id: if foreign { TerminalId::new() } else { terminal },
+                            generation: 1,
+                        },
+                    },
+                )
+                .unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(list.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Listed { terminals: vec![] },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            assert!(matches!(
+                client.complete_pending_terminal(
+                    crate::model::CardId::new(),
+                    terminal,
+                    TerminalSpawnOptions::default()
+                ),
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::Internal,
+                    ..
+                })
+            ));
+            let result = client.list();
+            if foreign {
+                assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedMessage { .. })
+                ));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "published worker output interrupted its recovery read: {result:?}"
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn requested_terminal_streams_do_not_break_later_rpc_or_accept_foreign_frames() {
         for invalid in ["unknown", "proof", "request-id"] {
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -8421,6 +8656,14 @@ mod tests {
         checked: bool,
         case: &str,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        public_terminal_close_exchange_source(checked, case, false)
+    }
+
+    fn public_terminal_close_exchange_source(
+        checked: bool,
+        case: &str,
+        source_checked: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
         fn reply(
             stream: &mut UnixStream,
@@ -8470,6 +8713,13 @@ mod tests {
             None,
         );
         let id = terminal.session.id;
+        let source = terminal.session.clone();
+        let basis = crate::workspace_model::views::TerminalRemovalBasis::Worker {
+            owner: pinned.clone(),
+            instance: uuid::Uuid::new_v4(),
+        };
+        let peer_source = source.clone();
+        let peer_basis = basis.clone();
         let case = case.to_owned();
         let peer_case = case.clone();
         let server = thread::spawn(move || {
@@ -8490,6 +8740,28 @@ mod tests {
                     after_event_sequence: 0,
                 } if terminal_id == id
             ));
+            if peer_case == "attach-missing" {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(2),
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalNotFound,
+                        "fixture terminal disappeared before Attach",
+                        false,
+                    )),
+                );
+                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(3),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed { terminals: vec![] },
+                    },
+                );
+                return;
+            }
             reply(
                 &mut server_stream,
                 &pinned,
@@ -8511,7 +8783,15 @@ mod tests {
             let close = request(&mut server_stream, &pinned, 3);
             assert_eq!(
                 close,
-                if checked {
+                if source_checked {
+                    ClientRequest::CloseTerminalSource {
+                        session: peer_source,
+                        basis: peer_basis,
+                        completed_only: false,
+                        allow_active: false,
+                        capture: None,
+                    }
+                } else if checked {
                     ClientRequest::CloseTerminalChecked {
                         terminal_id: id,
                         allow_active: false,
@@ -8562,6 +8842,17 @@ mod tests {
                 "wrong-request" => envelope.request_id = Some(999),
                 _ => {}
             }
+            if source_checked {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    None,
+                    ServerMessage::Redraw {
+                        terminal_id: id,
+                        generation: 1,
+                    },
+                );
+            }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
             if !matches!(peer_case.as_str(), "closed" | "late-closed") {
@@ -8606,7 +8897,9 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let result = if checked {
+        let result = if source_checked {
+            client.close_terminal_source(source, basis, false, false)
+        } else if checked {
             client.close_terminal_checked(id, false)
         } else {
             client
@@ -8618,6 +8911,19 @@ mod tests {
         }
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn source_checked_terminal_close_accepts_streaming_before_its_reply() {
+        for case in ["closed", "active", "unknown", "remote-error"] {
+            let result = public_terminal_close_exchange_source(true, case, true);
+            assert_eq!(result.is_ok(), case != "remote-error", "{case}: {result:?}");
+        }
+        assert!(
+            matches!(public_terminal_close_exchange_source(true, "attach-missing", true),
+            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, message, retryable: false })
+                if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT)
+        );
     }
 
     #[test]
@@ -9205,7 +9511,9 @@ mod tests {
         assert!(
             matches!(error, ControlError::ReplyTimeout { timeout, .. } if timeout <= Duration::from_millis(100))
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
@@ -9364,7 +9672,9 @@ mod tests {
                 3 => assert!(matches!(error, ControlError::ProofMismatch)),
                 _ => assert!(matches!(error, ControlError::ConnectionClosed)),
             }
-            assert!(started.elapsed() < Duration::from_secs(1));
+            // Sooner than the connection's own I/O timeout, which a request that
+            // ignored its deadline would fall back to.
+            assert!(started.elapsed() < IO_TIMEOUT);
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
             drop(client);
@@ -9391,11 +9701,18 @@ mod tests {
                     .is_none()
             );
         });
-        let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let started = Instant::now();
-        let error = client
-            .request_with_deadline(ClientRequest::List, started + Duration::from_millis(6100))
-            .unwrap_err();
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        // The reported budget tells the full deadline apart from a single
+        // read's IO_TIMEOUT; a client that enforced neither never returns.
+        let error = crate::test_timing::returns("a request with a long deadline", move || {
+            let mut client = client;
+            client
+                .request_with_deadline(
+                    ClientRequest::List,
+                    Instant::now() + Duration::from_millis(6100),
+                )
+                .unwrap_err()
+        });
         assert!(
             matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
             "{error}"
@@ -9406,8 +9723,6 @@ mod tests {
                 .contains("the daemon did not answer within 6."),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(8));
-        drop(client);
         server.join().unwrap();
     }
 
@@ -9442,7 +9757,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
     }
 
     #[test]
@@ -9464,7 +9781,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         drop(client_stream);
         server.join().unwrap();
     }

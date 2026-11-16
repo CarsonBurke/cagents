@@ -1388,11 +1388,11 @@ impl Cards {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Cards {
     /// How many of these are the very cards `other` holds at the same place,
     /// shared rather than copied.
-    pub(crate) fn shared_with(&self, other: &Self) -> usize {
+    pub fn shared_with(&self, other: &Self) -> usize {
         self.0
             .iter()
             .zip(&other.0)
@@ -1402,7 +1402,7 @@ impl Cards {
 
     /// The cards both lists hold that these hold a copy of rather than the
     /// very card `other` holds, wherever each sits.
-    pub(crate) fn copied_from(&self, other: &Self) -> Vec<CardId> {
+    pub fn copied_from(&self, other: &Self) -> Vec<CardId> {
         let theirs = other
             .0
             .iter()

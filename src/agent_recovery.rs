@@ -269,7 +269,7 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= limit).then_some(bytes)
 }
 
-pub(crate) fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
+pub fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
     let stat = std::str::from_utf8(stat).ok()?;
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
     let group = fields.nth(2)?.parse().ok()?;
@@ -760,7 +760,7 @@ pub(crate) fn fresh_environment_key(
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn fresh_native_environment(
+pub fn fresh_native_environment(
     provider: Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {

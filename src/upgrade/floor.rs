@@ -17,7 +17,7 @@ use std::{
 pub(crate) const LIMIT: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Record {
+pub struct Record {
     pub source: HostSessionProof,
     #[serde(default)]
     pub protocol: u16,
@@ -53,7 +53,7 @@ pub(crate) struct Presentation {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Ledger {
+pub struct Ledger {
     pub records: Vec<Record>,
 }
 
@@ -414,12 +414,12 @@ fn directory() -> Result<PathBuf, String> {
 /// daemon and guarded update helpers can change these records while an existing
 /// daemon or window survives, so a process startup snapshot is not authoritative.
 /// Transcript payloads are skipped; rendering uses its attached snapshot instead.
-pub(crate) fn load() -> Result<Ledger, String> {
+pub fn load() -> Result<Ledger, String> {
     // Serialize reads and publication without holding the display lock over
     // filesystem work. An earlier read cannot overwrite a later local save.
     static LOADER: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _loader = LOADER.lock().unwrap_or_else(|poison| poison.into_inner());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     INDEX_READS.with(|reads| reads.set(reads.get() + 1));
     let ledger = load_at(&directory()?)?;
     *display_index()
@@ -443,13 +443,14 @@ pub(crate) fn display_snapshot() -> std::sync::Arc<Ledger> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn index_reads_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn index_reads_for_test() -> usize {
     INDEX_READS.with(std::cell::Cell::get)
 }
 

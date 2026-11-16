@@ -4,7 +4,7 @@
 //! against copied strings; this runs the script through the real service.
 //!
 //! The calls mirror the app's GitHub entry points: `load_repository_github` and
-//! `attached_worktree_pull_requests` in src/app.rs, `read` in
+//! `attached_worktree_pull_requests` in crates/cagents-ui/src/app.rs, `read` in
 //! src/host/work/forge.rs, and the `GitHubReviewApi` pages. When one of them
 //! starts a new gh read, add it here and teach the forge to answer it.
 use super::*;

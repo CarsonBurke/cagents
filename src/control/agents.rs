@@ -40,11 +40,18 @@ pub enum AgentCommand {
         /// given, and otherwise the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
-        /// Override the calling session's exact shared view with this channel.
-        /// The default reuses its same-project worktree or channel view;
-        /// missing or ambiguous membership creates a fresh channel with a warning.
+        /// Place the agent in this channel. By default it joins the calling
+        /// session's view, or the channel its lineage last belonged to when
+        /// that view is missing or ambiguous; an agent for another project, or
+        /// for a caller that never belonged to a channel, gets a new channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Place the agent among the panes of this open checkout, the
+        /// project's own folder or one of its linked worktrees, instead of
+        /// in a channel. It is also the working directory unless --directory
+        /// names another.
+        #[arg(long, conflicts_with = "channel")]
+        worktree: Option<PathBuf>,
         #[arg(long)]
         #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
@@ -434,7 +441,12 @@ impl ControlClient {
         // budget than an ordinary reply; a caller's own deadline still bounds it.
         let budget = match &operation {
             Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
-            Operation::Submit(_)
+            Operation::SendMessage(_)
+            | Operation::Send(_)
+            | Operation::Inbox(_)
+            | Operation::PeekInbox(_)
+            | Operation::AcknowledgeInbox(_)
+            | Operation::Submit(_)
             | Operation::Console {
                 command: crate::agent_execution::ConsoleCommand::Submit { .. },
                 ..
@@ -591,8 +603,13 @@ impl ControlClient {
     }
 }
 
+/// Where an agent the caller starts goes, and why, when that is not beside
+/// the caller. An explicit channel or checkout wins. Otherwise the agent joins the
+/// caller's exact view or, where that is missing or ambiguous, the channel the
+/// caller's lineage last belonged to. Only an agent for another project, or a
+/// caller whose lineage never belonged to a channel, gets a new channel.
 fn spawn_placement(
-    explicit: Option<ChannelId>,
+    explicit: Option<crate::agent_execution::Placement>,
     caller: Option<&crate::agent_execution::directory::Entry>,
     repository: &std::path::Path,
 ) -> (
@@ -600,34 +617,115 @@ fn spawn_placement(
     Option<&'static str>,
 ) {
     use crate::agent_execution::Placement;
-    if let Some(channel) = explicit {
-        return (Some(Placement::Channel(channel)), None);
+    const ELSEWHERE: &str = "The caller's view belongs to another project; the agent was placed in a new channel for the target project.";
+    if let Some(placement) = explicit {
+        return (Some(placement), None);
     }
     let Some(caller) = caller else {
         return (None, None);
     };
-    let Some(scope) = &caller.view_scope else {
-        return (
-            None,
-            Some(
-                "The caller has no unambiguous shared view; the agent was placed in a new channel.",
-            ),
-        );
-    };
-    let owner = match scope {
-        Placement::Channel(_) => caller.channel_repository.as_deref(),
-        Placement::Worktree { repository, .. } => Some(repository.as_path()),
+    let (placement, owner) = match (&caller.view_scope, &caller.lineage_channel) {
+        (Some(scope), _) => (
+            scope.clone(),
+            match scope {
+                Placement::Channel(_) => caller.channel_repository.as_deref(),
+                Placement::Worktree { repository, .. } => Some(repository.as_path()),
+            },
+        ),
+        (None, Some(home)) => (Placement::Channel(home.id), Some(home.repository.as_path())),
+        (None, None) => {
+            return (
+                None,
+                Some("The caller belongs to no channel; the agent was placed in a new channel."),
+            );
+        }
     };
     if owner == Some(repository) {
-        (Some(scope.clone()), None)
+        (Some(placement), None)
     } else {
-        (
-            None,
-            Some(
-                "The caller's shared view belongs to another project; the agent was placed in a new channel for the target project.",
-            ),
-        )
+        (None, Some(ELSEWHERE))
     }
+}
+
+/// The channel an accepted agent went to, when that is not the caller's own
+/// view: the place someone reading the caller's conversation has to look.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlacedIn {
+    pub channel: ChannelId,
+    /// Absent when the channel could not be read after the acceptance.
+    pub title: Option<String>,
+}
+
+fn placed_in(
+    session: &mut Session,
+    output: &CommandOutput,
+    caller_view: Option<&crate::agent_execution::Placement>,
+) -> Option<PlacedIn> {
+    let placement: crate::agent_execution::Placement =
+        serde_json::from_value(output.data["agent"]["placement"].clone()).ok()?;
+    if caller_view == Some(&placement) {
+        return None;
+    }
+    let crate::agent_execution::Placement::Channel(channel) = placement else {
+        return None;
+    };
+    // Naming it is a courtesy; the agent is accepted either way.
+    let title = session
+        .client()
+        .ok()
+        .and_then(|client| client.read_workspace_model().ok())
+        .and_then(|model| {
+            model.channel(channel).map(|channel| {
+                if channel.title.is_empty() {
+                    "New channel".to_owned()
+                } else {
+                    channel.title.clone()
+                }
+            })
+        });
+    Some(PlacedIn { channel, title })
+}
+
+/// Names the channel `placed` went to on the line after the receipt, which
+/// is where a reader of the step looks for where the agent went.
+fn with_placed_in(mut output: CommandOutput, placed: Option<PlacedIn>) -> CommandOutput {
+    let Some(placed) = placed else {
+        return output;
+    };
+    let line = match &placed.title {
+        Some(title) => format!(
+            "{PLACED_IN}{} ({})",
+            serde_json::Value::from(title.as_str()),
+            placed.channel
+        ),
+        None => format!("{PLACED_IN}{}", placed.channel),
+    };
+    output.human = match output.human.split_once('\n') {
+        Some((head, tail)) => format!("{head}\n{line}\n{tail}"),
+        None => format!("{}\n{line}", output.human),
+    };
+    output.data["placed_in"] = json!(placed);
+    output
+}
+
+/// How the line naming an agent's channel begins: `In channel "Title" (ID)`,
+/// or `In channel ID` where the title could not be read.
+pub(crate) const PLACED_IN: &str = "In channel ";
+
+/// What follows [`PLACED_IN`] on the line [`with_placed_in`] printed.
+#[cfg(feature = "ui")]
+fn read_placed_in(named: &str) -> Option<PlacedIn> {
+    if let Ok(channel) = named.parse() {
+        return Some(PlacedIn {
+            channel,
+            title: None,
+        });
+    }
+    let (title, channel) = named.strip_suffix(')')?.rsplit_once(" (")?;
+    Some(PlacedIn {
+        channel: channel.parse().ok()?,
+        title: Some(serde_json::from_str(title).ok()?),
+    })
 }
 
 fn with_placement_warning(mut output: CommandOutput, warning: Option<&str>) -> CommandOutput {
@@ -862,14 +960,19 @@ impl Session {
         ),
         AppError,
     > {
-        let Reply::Directory(directory) = self.call(Operation::Directory(scope))? else {
+        let Reply::Context(context) = self.call(Operation::Context {
+            scope,
+            standing: false,
+        })?
+        else {
             return Err(AppError::new("sessions", "Unexpected directory response"));
         };
+        let directory = context.into_sessions();
         let project = match directory.scope {
             Scope::Project(project) => Some(project),
             _ => None,
         };
-        Ok((project, directory.caller))
+        Ok((project, directory.caller.map(|caller| caller.session)))
     }
 }
 
@@ -899,6 +1002,7 @@ pub(super) fn execute_with_context(
             repository,
             directory,
             channel,
+            worktree,
             account,
             surface,
             model,
@@ -909,24 +1013,30 @@ pub(super) fn execute_with_context(
             show,
         } => {
             let prompt = prompt.read()?;
-            let absolute =
-                |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let given = if crate::device::is_remote() {
-                directory
-                    .map(|directory| {
-                        if directory.is_absolute() {
-                            Ok(directory)
-                        } else {
-                            Err(AppError::new(
-                                "target",
-                                "remote working directory must be absolute",
-                            ))
-                        }
-                    })
-                    .transpose()?
-            } else {
-                directory.map(absolute).transpose()?
+            let absolute = |path: PathBuf, flag: &str| {
+                if crate::device::is_remote() {
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Err(AppError::new(
+                            "target",
+                            format!("remote {flag} must be absolute"),
+                        ))
+                    }
+                } else {
+                    std::path::absolute(path).map_err(|e| AppError::new("target", e))
+                }
             };
+            // The daemon looks the checkout's view up by its exact path, so a
+            // trailing separator or `.` from the shell must not miss it.
+            let worktree = worktree
+                .map(|path| absolute(path, "--worktree"))
+                .transpose()?
+                .map(|path| path.components().collect::<PathBuf>());
+            let given = directory
+                .map(|path| absolute(path, "working directory"))
+                .transpose()?
+                .or_else(|| worktree.clone());
             let here = match &given {
                 Some(directory) => directory.clone(),
                 None => {
@@ -1013,11 +1123,18 @@ pub(super) fn execute_with_context(
                     }
                 }
             };
-            let (placement, placement_warning) = spawn_placement(
-                channel,
-                caller.as_ref(),
-                channel_repository.as_deref().unwrap_or(&repository),
-            );
+            let owner = channel_repository.as_deref().unwrap_or(&repository);
+            // The daemon refuses a checkout whose view it does not hold.
+            let explicit = channel
+                .map(crate::agent_execution::Placement::Channel)
+                .or_else(|| {
+                    worktree.map(|path| crate::agent_execution::Placement::Worktree {
+                        repository: owner.to_owned(),
+                        path,
+                    })
+                });
+            let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
+            let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
             let provider = provider
                 .or(caller.and_then(|caller| caller.provider))
                 .ok_or_else(|| {
@@ -1046,7 +1163,11 @@ pub(super) fn execute_with_context(
                 idempotency_key: retry.key(),
             };
             let output = submitted(&mut session, "agent.spawn", request, None, wait, show)?;
-            Ok(with_placement_warning(output, placement_warning))
+            let placed = placed_in(&mut session, &output, caller_view.as_ref());
+            Ok(with_placed_in(
+                with_placement_warning(output, placement_warning),
+                placed,
+            ))
         }
         AgentCommand::Send {
             agent,
@@ -1620,6 +1741,12 @@ fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> St
 #[cfg(feature = "ui")]
 pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
     let head = output.lines().next()?;
+    // Notes about the run follow its first line, up to the result.
+    let placed_in = output
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| read_placed_in(line.strip_prefix(PLACED_IN)?));
     if let Some(accepted) = head
         .strip_prefix("Accepted agent ")
         .or_else(|| head.strip_prefix("Already accepted agent "))
@@ -1630,6 +1757,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
             state: None,
             timed_out: false,
             result: String::new(),
+            placed_in,
             ..Default::default()
         });
     }
@@ -1665,6 +1793,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
         state: Some(state),
         timed_out,
         result: result.trim().into(),
+        placed_in,
         ..Default::default()
     })
 }
@@ -1719,6 +1848,73 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_requests_wait_for_store_replies_beyond_the_ordinary_socket_timeout() {
+        use crate::agent_execution::mailbox::{Inbox, Outgoing, Receipt, To};
+        use crate::terminal::ipc::ProtocolError;
+        let outgoing = Outgoing {
+            to: To::Session("27420000".into()),
+            body: "fixture message".into(),
+            wait_ms: None,
+        };
+        for operation in [
+            Operation::SendMessage(outgoing.clone()),
+            Operation::Send(outgoing),
+            Operation::Inbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::PeekInbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::AcknowledgeInbox(Receipt {
+                ids: vec![crate::model::MessageId::new()],
+            }),
+        ] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                // Make the ordinary socket timeout elapse before the store
+                // reply, without spending a real five seconds per operation.
+                thread::sleep(Duration::from_millis(100));
+                let _ = write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::StoreBusy,
+                            "fixture contention",
+                            true,
+                        )),
+                    },
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let result = client.agent(Authority::default(), operation);
+            server.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::StoreBusy,
+                        retryable: true,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        }
+    }
 
     #[test]
     fn only_the_daemons_limit_refusal_reads_as_agent_limited_and_names_its_reset() {
@@ -3212,6 +3408,33 @@ mod tests {
             Cli::try_parse_from(["cagents", "agent", "spawn", "a", "--prompt", "b"]).is_err(),
             "one prompt source"
         );
+        let AgentCommand::Spawn {
+            worktree,
+            directory,
+            ..
+        } = parse(&["spawn", "--worktree", "/repo-linked", "work"])
+        else {
+            panic!("agent spawn")
+        };
+        assert_eq!(worktree.as_deref(), Some(Path::new("/repo-linked")));
+        assert!(
+            directory.is_none(),
+            "the checkout supplies it when spawning"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "agent",
+                "spawn",
+                "--worktree",
+                "/repo",
+                "--channel",
+                &ChannelId::new().to_string(),
+                "work",
+            ])
+            .is_err(),
+            "one placement"
+        );
         let AgentCommand::Spawn { prompt, wait, .. } =
             parse(&["spawn", "--wait", "- fix the parser\n- add tests"])
         else {
@@ -3497,6 +3720,7 @@ mod tests {
                 channel: None,
                 view_scope: None,
                 channel_repository: None,
+                lineage_channel: None,
                 state: crate::agent::ActivityState::Idle,
                 directory: None,
                 worktree: None,
@@ -3576,7 +3800,60 @@ mod tests {
     }
 
     #[test]
-    fn spawn_placement_uses_exact_caller_view_and_explicit_channel_overrides() {
+    fn an_agent_placed_elsewhere_names_its_channel_after_the_receipt() {
+        let channel = ChannelId::new();
+        let accepted = |human: &str| CommandOutput {
+            command: "agent.spawn",
+            data: json!({}),
+            human: human.into(),
+        };
+        let placed = PlacedIn {
+            channel,
+            title: Some("casmi \"review\"".into()),
+        };
+        let output = with_placed_in(
+            with_placement_warning(
+                accepted("Accepted agent 1a2b3c4d run 5e6f7a8b"),
+                Some("The caller's view belongs to another project"),
+            ),
+            Some(placed.clone()),
+        );
+        assert_eq!(
+            output.human,
+            format!(
+                "Accepted agent 1a2b3c4d run 5e6f7a8b\nIn channel \"casmi \\\"review\\\"\" ({channel})\nWarning: The caller's view belongs to another project"
+            )
+        );
+        assert_eq!(
+            serde_json::from_value::<PlacedIn>(output.data["placed_in"].clone()).unwrap(),
+            placed
+        );
+        #[cfg(feature = "ui")]
+        {
+            let run = read_run(&output.human).unwrap();
+            assert_eq!(run.agent, "1a2b3c4d");
+            assert_eq!(run.placed_in, Some(placed));
+            // A waited run's status lines and result keep their shape.
+            let waited = with_placed_in(
+                accepted("agent 1a2b3c4d (claude) run 5e6f7a8b Succeeded\n\nDone"),
+                Some(PlacedIn {
+                    channel,
+                    title: None,
+                }),
+            );
+            let run = read_run(&waited.human).unwrap();
+            assert_eq!(run.result, "Done");
+            assert_eq!(run.placed_in.unwrap().channel, channel);
+        }
+        assert_eq!(
+            with_placed_in(accepted("Accepted agent 1a2b3c4d run 5e6f7a8b"), None).human,
+            "Accepted agent 1a2b3c4d run 5e6f7a8b",
+            "an agent beside its caller adds nothing"
+        );
+    }
+
+    #[test]
+    fn spawn_placement_keeps_the_agent_with_its_callers_view_or_lineage() {
         use crate::agent_execution::{
             Placement,
             directory::{Entry, Relation, Surface},
@@ -3591,6 +3868,7 @@ mod tests {
             channel: Some(channel),
             view_scope: Some(Placement::Channel(channel)),
             channel_repository: Some("/repo".into()),
+            lineage_channel: None,
             state: crate::agent::ActivityState::Idle,
             directory: Some("/repo".into()),
             worktree: Some("/repo".into()),
@@ -3606,7 +3884,11 @@ mod tests {
             (Some(Placement::Channel(channel)), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository),
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            ),
             (Some(Placement::Channel(explicit)), None)
         );
         caller.project = Some("/other-cwd-project".into());
@@ -3627,26 +3909,68 @@ mod tests {
             (Some(strip), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository).0,
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
             Some(Placement::Channel(explicit))
+        );
+        // A checkout named for it wins over the caller's view, as a channel does.
+        let named = Placement::Worktree {
+            repository: repository.into(),
+            path: "/repo".into(),
+        };
+        assert_eq!(
+            spawn_placement(Some(named.clone()), Some(&caller), repository),
+            (Some(named.clone()), None)
+        );
+        assert_eq!(
+            spawn_placement(Some(named.clone()), None, repository),
+            (Some(named), None),
+            "an external caller can name a checkout as it names a channel"
         );
         let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
         assert!(scope.is_none());
         assert!(warning.unwrap().contains("another project"));
+        // A missing or ambiguous view falls back to the lineage's channel.
         caller.view_scope = None;
+        let lineage = ChannelId::new();
+        caller.lineage_channel = Some(crate::agent_execution::directory::ChannelHome {
+            id: lineage,
+            repository: repository.into(),
+        });
+        assert_eq!(
+            spawn_placement(None, Some(&caller), repository),
+            (Some(Placement::Channel(lineage)), None)
+        );
+        assert_eq!(
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
+            Some(Placement::Channel(explicit)),
+            "an explicit channel still wins over the lineage's"
+        );
+        // Another project's lineage channel is no home for this one's agent.
+        let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
+        assert!(scope.is_none());
+        assert!(warning.unwrap().contains("another project"));
+        // Only a lineage that never belonged to a channel gets a new one.
+        caller.lineage_channel = None;
         let (scope, warning) = spawn_placement(None, Some(&caller), repository);
         assert!(scope.is_none());
-        assert!(warning.unwrap().contains("no unambiguous shared view"));
-        assert_eq!(
-            spawn_placement(None, None, repository),
-            (None, None),
-            "external callers retain fresh-channel behavior"
-        );
+        assert!(warning.unwrap().contains("belongs to no channel"));
         let mut legacy = serde_json::to_value(&caller).unwrap();
         legacy.as_object_mut().unwrap().remove("view_scope");
         legacy.as_object_mut().unwrap().remove("channel");
         legacy.as_object_mut().unwrap().remove("channel_repository");
+        legacy.as_object_mut().unwrap().remove("lineage_channel");
         let legacy: Entry = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.lineage_channel.is_none());
         assert!(legacy.view_scope.is_none());
         assert!(legacy.channel.is_none());
         assert!(legacy.channel_repository.is_none());

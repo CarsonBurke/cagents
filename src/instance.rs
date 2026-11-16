@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
-use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
+use crate::flock::process_owns_lock as process_owns_slot;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -29,10 +29,13 @@ use std::{
 mod daemon_admission;
 #[doc(hidden)]
 pub mod ui_options;
+#[cfg(any(feature = "host", test))]
+pub(crate) use daemon_admission::AdmissionFence;
+#[cfg(feature = "host")]
+pub(crate) use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
-    inherit_daemon_fence,
+    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -139,7 +142,7 @@ pub fn window_restore_policy() -> WindowRestorePolicy {
         })
 }
 
-pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+pub fn window_launch_restore_policy() -> WindowRestorePolicy {
     WINDOW_RESTORE_POLICY
         .get()
         .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
@@ -148,7 +151,7 @@ pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
 /// The startup gate reached its saved-pane verdict, including an incomplete
 /// recovery. Later work uses ordinary admission; already-issued pane tasks
 /// retain their explicitly captured attachment-only intent.
-pub(crate) fn finish_window_restore() {
+pub fn finish_window_restore() {
     if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
         restore.finished.store(true, Ordering::Release);
     }
@@ -177,7 +180,7 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
+pub fn runtime_directory() -> io::Result<PathBuf> {
     let path = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -221,7 +224,7 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
 #[derive(Debug)]
-pub(crate) struct OwnedLock(Option<File>);
+pub struct OwnedLock(Option<File>);
 
 impl std::ops::Deref for OwnedLock {
     type Target = File;
@@ -972,6 +975,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
 /// Windows launched meanwhile wait for it rather than report an update.
+#[cfg(feature = "host")]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
@@ -1150,7 +1154,6 @@ fn verified_window_lease_owners_in(
     use std::os::fd::FromRawFd;
     let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
-    let kernel_locks = fs::read_to_string(proc_root.join("locks"))?;
     for slot in slots {
         let lease_path = runtime.join(slot_lock_name(&slot));
         let lock = OpenOptions::new()
@@ -1166,17 +1169,19 @@ fn verified_window_lease_owners_in(
         // Btrfs subvolume st_dev can differ from the superblock device printed
         // in /proc/locks. Index by inode, then disambiguate using the actual
         // locked descriptor's stat device and inode, not a mere open descriptor.
-        let pids: std::collections::BTreeSet<_> = kernel_locks
-            .lines()
-            .filter_map(|line| flock_owner(line, &expected))
+        // The index can miss a held lock under churn, so the owner the window
+        // recorded in its lease is a candidate too.
+        let recorded: Vec<u32> = daemon_admission::recorded_owner(&lock)
+            .into_iter()
             .collect();
-        let mut matches = Vec::new();
-        for pid in pids {
+        let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
             let process = proc_root.join(pid.to_string());
+            // A candidate that exits or hides its descriptors mid-proof, as a
+            // stale recorded pid may, is simply not the owner.
             if !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == current_uid())
-                || !process_owns_slot(&process, pid, &expected)?
+                || !process_owns_slot(&process, pid, &expected).unwrap_or(false)
             {
-                continue;
+                return Ok(None);
             }
             // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -1198,16 +1203,41 @@ fn verified_window_lease_owners_in(
                     "window ownership changed during verification",
                 ));
             }
-            matches.push(verified);
+            Ok(Some(verified))
+        })?;
+        // A window that closed after the slots were listed is not live.
+        if matches.is_empty() && lease_released(&lock, &expected)? {
+            continue;
         }
         if matches.len() != 1 {
             return Err(io::Error::other(format!(
-                "cannot authenticate live window {slot}"
+                "cannot authenticate live window {slot}: {} verified lease owners",
+                matches.len()
             )));
         }
         owners.push(matches.pop().unwrap());
     }
     Ok(owners)
+}
+
+/// Whether nobody holds the lease `lock` opened, probed through a separate
+/// open of that same inode: a duplicate would share the open file description
+/// and could take a lock already held through it, and the path may since
+/// name another file.
+fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
+    let probe = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+    let probed = probe.metadata()?;
+    if probed.dev() != expected.dev() || probed.ino() != expected.ino() {
+        return Err(io::Error::other("window lease changed during verification"));
+    }
+    match owned_file_lock(probe, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn update_in_progress() -> bool {
@@ -1866,7 +1896,7 @@ impl UiUpdateGuard {
 /// What the update reports when windows did not reopen cleanly. Someone reads
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
-pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
     let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
     for (slot, error) in errors {
         let text = error
@@ -2011,7 +2041,7 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
 /// coordination link against a different device's saved window.
-pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
+pub fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
     match (crate::device::selected(), slot.starts_with("device-")) {
         (None, device_slot) => Ok(!device_slot),
         (Some(_), false) => Ok(false),
@@ -3146,6 +3176,51 @@ mod tests {
         );
         drop(replacement);
         drop(held);
+    }
+
+    #[test]
+    fn a_live_window_missing_from_the_kernel_lock_index_is_found_by_its_recorded_owner() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut held = owned_lock(
+            &runtime.path().join(slot_lock_name("second")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        daemon_admission::publish_capability(held.file_mut()).unwrap();
+        // /proc/locks can skip a held lock when other locks change while it is
+        // read; this index never lists it.
+        let proc_root = tempfile::tempdir().unwrap();
+        fs::write(proc_root.path().join("locks"), "").unwrap();
+        let pid = std::process::id();
+        symlink(
+            Path::new("/proc").join(pid.to_string()),
+            proc_root.path().join(pid.to_string()),
+        )
+        .unwrap();
+        let owners = verified_window_lease_owners_in(runtime.path(), proc_root.path()).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].pid(), pid);
+        // A held lease that no candidate proves is still refused, not taken
+        // for a window that closed.
+        let unrecorded = owned_lock(
+            &runtime.path().join(slot_lock_name("third")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let Err(refused) = verified_window_lease_owners_in(runtime.path(), proc_root.path()) else {
+            panic!("a held lease no candidate proves was accepted");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "cannot authenticate live window third: 0 verified lease owners"
+        );
+        drop(unrecorded);
+        drop(held);
+        assert!(
+            verified_window_lease_owners_in(runtime.path(), proc_root.path())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

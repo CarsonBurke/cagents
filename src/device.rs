@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+mod no_start_tests;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
@@ -38,6 +41,7 @@ struct Devices {
 /// exactly one context; this does not introduce per-pane device selection.
 struct ConnectionContext {
     device: Device,
+    no_start: bool,
     environment: OnceLock<
         std::collections::BTreeMap<
             crate::agent::Provider,
@@ -54,6 +58,9 @@ impl ConnectionContext {
     fn new(device: Device) -> Self {
         Self {
             device,
+            // Retain inherited policy before deferred bridge work. Window
+            // restoration is transient and remains an operation-level policy.
+            no_start: crate::control::daemon_autostart_disabled(),
             environment: OnceLock::new(),
             home: OnceLock::new(),
             shell: OnceLock::new(),
@@ -474,7 +481,8 @@ pub fn socket_path() -> io::Result<Option<PathBuf>> {
 }
 
 fn bridge_no_start() -> bool {
-    crate::control::daemon_autostart_disabled()
+    SELECTED.get().is_some_and(|context| context.no_start)
+        || crate::control::daemon_autostart_disabled()
         || crate::instance::window_restore_policy()
             == crate::instance::WindowRestorePolicy::ExistingOnly
 }
@@ -504,6 +512,7 @@ impl ConnectionContext {
     }
 
     fn socket_path_with_policy(&self, no_start: bool) -> io::Result<PathBuf> {
+        let no_start = self.no_start || no_start;
         let mut bridges = self.bridges.lock().unwrap_or_else(|p| p.into_inner());
         let bridge = &mut bridges[usize::from(no_start)];
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -1999,7 +2008,7 @@ pub fn prepare() -> io::Result<()> {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn environment(
+pub fn environment(
     provider: crate::agent::Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {

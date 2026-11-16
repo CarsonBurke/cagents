@@ -215,6 +215,16 @@ pub struct Snapshot {
     pub primary_cost: Option<u64>,
 }
 
+impl Snapshot {
+    /// Whether the bootstrap script's single REST read wrote this snapshot
+    /// to the shared cache. REST carries no check rollup or review decision,
+    /// so CI is unknown rather than absent; a GraphQL read that finds no
+    /// rollup reports its context list complete.
+    pub fn is_rest_bootstrap(&self) -> bool {
+        self.checks_state.is_none() && !self.checks_complete && self.checks.is_empty()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub target: PullRequestKey,
@@ -239,6 +249,15 @@ struct Cached {
 impl Cached {
     fn report(self, target: &PullRequestKey, source: &'static str, now: u64) -> Report {
         let failed = self.error.is_some() || self.snapshot.is_none();
+        let source = if self
+            .snapshot
+            .as_ref()
+            .is_some_and(Snapshot::is_rest_bootstrap)
+        {
+            "rest-bootstrap"
+        } else {
+            source
+        };
         Report {
             target: target.clone(),
             fetched_at: self.fetched_at,
@@ -1069,6 +1088,42 @@ mod tests {
         assert!(paused.stale);
         assert!(paused.snapshot.is_none());
         assert_eq!(fixture.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_shared_rest_bootstrap_snapshot_is_not_reported_as_a_ci_answer() {
+        let root = private_tempdir();
+        let fixture = Fixture::new(Vec::new());
+        let service = StatusService::new("gh", fixture.clone());
+        let mut snapshot = parse(&data(), &key()).unwrap();
+        // The shape the bootstrap script's REST read stores for this PR.
+        snapshot.checks_complete = false;
+        snapshot.primary_cost = None;
+        snapshot.pull_request.mergeable = "UNKNOWN".into();
+        let path = root
+            .path()
+            .join(format!("{}.json", target_name("account", &key())));
+        store(
+            &path,
+            &Cached {
+                fetched_at: Some(now()),
+                snapshot: Some(snapshot),
+                error: None,
+                next_attempt: now() + MAX_AGE,
+            },
+        )
+        .unwrap();
+        let report = read_fixture(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+        );
+        assert_eq!(report.source, "rest-bootstrap");
+        assert!(report.snapshot.unwrap().checks_state.is_none());
+        // It still counts as this interval's shared read.
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

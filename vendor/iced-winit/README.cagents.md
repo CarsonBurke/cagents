@@ -12,7 +12,7 @@ use the existing widget focus operation. Snapshot work runs only while assistive
 technology has activated that window.
 
 The app also uses an accessibility-preserving copy of Iced Responsive in
-src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
+crates/cagents-ui/src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
 these backports when the pinned dependency provides equivalent behavior.
 
 The hot-patch callback also wakes the native event loop after queuing its existing
@@ -57,6 +57,15 @@ is scaled by the window's current scale factor on every event, so it follows the
 window between outputs. Remove this backport when the pinned dependency honors
 tiled edges.
 
+Accessibility nodes can stay in the tree while hidden, as a wrapper's clipped
+content does: an offscreen workspace pane, or the lines a folded message cuts.
+A native Focus request now reaches the widget focus operation only when its
+target is present and not hidden, so a stale request cannot focus a control the
+reader cannot see. Published snapshots report the window as focused while the
+focused widget's node is hidden; the widget keeps its focus, and the node's
+identity is published again once it is visible. Remove this backport when the
+pinned dependency treats hidden nodes the same way.
+
 The shell reports each presented frame to an observer the application can
 install through `iced_runtime::frame::observe`, a module this patch adds to the
 vendored runtime. The event loop times its handling of each event and, on a
@@ -64,3 +73,15 @@ successful presentation, reports the work since the previous one and the
 interval between them. Without an observer, which is the case unless the
 application's development UI trace is enabled, no clock is read. Remove this
 when the pinned dependency offers equivalent frame timing.
+
+This standalone package is not a workspace member and does not see the root
+manifest's patches. Run its tests against the vendored packages with a Cargo
+configuration that repeats the root `[patch]` entries as absolute paths, for
+example:
+
+```sh
+cargo test --manifest-path vendor/iced-winit/Cargo.toml --features a11y \
+  --config /path/to/patches.toml -- accessibility_focus_tests a11y::tests
+```
+
+Its lockfile and `target/` directory are local test output.

@@ -439,13 +439,11 @@ fn is_version(word: &str) -> bool {
 /// What to do about the limit `limit_name` named. Claude names a model's
 /// limit by the model, capitalized - "Opus limit", "Fable limit" - and an
 /// account's in lower case - "weekly limit", "5-hour limit". A model's limit
-/// leaves the account's other models usable, and Fable's can be cleared at
-/// once with a Fable reset, which Claude Code offers through `/limit-reset`.
+/// leaves the account's other models usable. Account-aware reset controls
+/// are added by the interface when an available reset covers this limit.
 fn limit_action(limit: &str) -> &'static str {
     let model = limit.split(' ').next().unwrap_or_default();
-    if model.eq_ignore_ascii_case("fable") {
-        "Choose another model or account, or wait for the reported reset. If this account has a Fable reset, /limit-reset in a Claude Code terminal clears the Fable limit now."
-    } else if model.starts_with(|c: char| c.is_ascii_uppercase()) {
+    if model.starts_with(|c: char| c.is_ascii_uppercase()) {
         "Choose another model or account, or wait for the reported reset."
     } else {
         "Wait for the reported reset or choose another account."
@@ -815,9 +813,8 @@ mod tests {
         assert_ne!(weekly.unwrap().key, opus.unwrap().key);
     }
 
-    /// A model's limit leaves the account's other models usable, and only
-    /// Fable's can be cleared with a Fable reset; an account's limit leaves
-    /// waiting or another account.
+    /// Generic guidance names the remaining choices. Available reset actions
+    /// depend on the account and are added by the interface.
     #[test]
     fn a_reached_limit_suggests_what_it_leaves_open() {
         let action = |raw: &str| Failure::parse(Provider::Claude, raw).unwrap().action;
@@ -825,7 +822,7 @@ mod tests {
             "You've hit your Fable limit · resets Nov 15, 8am",
             "You've hit your Fable 5.2 limit · resets Nov 15, 8am",
         ] {
-            assert!(action(raw).contains("/limit-reset"), "{raw}");
+            assert!(!action(raw).contains("/limit-reset"), "{raw}");
             assert!(action(raw).contains("another model"), "{raw}");
         }
         let opus = action("You’ve hit your Opus limit · resets 3pm");

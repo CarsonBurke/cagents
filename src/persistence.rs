@@ -1,3 +1,5 @@
+#[cfg(any(not(feature = "ui"), test))]
+use std::time::Instant;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -6,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -378,7 +380,7 @@ impl RetainedChatCopy {
 
     /// Keep a committed copy reachable in snapshots captured before its receipt.
     /// Only an explicit tombstone can remove it; omission cannot spend it.
-    pub(crate) fn project(&self, state: &mut WorkspaceState) -> Result<()> {
+    pub fn project(&self, state: &mut WorkspaceState) -> Result<()> {
         self.validate()?;
         if state.id != self.workspace {
             return Err(invalid_state!(
@@ -615,25 +617,27 @@ pub struct StoredGenerations {
 struct StoreInner {
     connection: Connection,
     closed: bool,
-    closed_cards: ClosedCards,
+    offered_cards: OfferedCards,
 }
 
-/// What this connection has learned about the closed cards a window offers in
-/// every snapshot it saves, by card.
+/// What this connection has learned about the cards a window offers in every
+/// snapshot it saves, by card.
 ///
-/// A long-lived window holds far more closed cards than open ones, and a
-/// closed card rarely changes again. Remembering how each one was settled is
-/// what keeps every flush from offering all of them to storage once more.
+/// A window offers every card it holds in every snapshot, though a flush
+/// usually follows a change to one of them. A long-lived window holds far more
+/// closed cards than open ones, and a closed card rarely changes again.
+/// Remembering how each card was settled is what keeps every flush from
+/// serializing all of them to compare with storage once more.
 ///
 /// Neither half is persisted. A store opened afresh remembers nothing, so its
-/// first snapshot offers every closed card on its merits, as any snapshot did
-/// before this was remembered.
+/// first snapshot offers every card on its merits, as any snapshot did before
+/// this was remembered.
 #[derive(Default)]
-struct ClosedCards {
+struct OfferedCards {
     /// Closed cards whose final content storage refused.
     refused: HashMap<CardId, RefusedClosure>,
-    /// Closed cards whose final content storage holds.
-    settled: HashMap<CardId, SettledClosure>,
+    /// Cards, open or closed, whose content storage holds.
+    settled: HashMap<CardId, SettledCard>,
 }
 
 /// A closed card's final content as storage refused it, with the generation
@@ -648,14 +652,20 @@ struct ClosedCards {
 /// It is deliberately not persisted: the next run offers the content once
 /// more, which is also how a build whose rules changed gets to accept it.
 struct RefusedClosure {
+    workspace: WorkspaceId,
     offered: CardState,
     generation: u64,
 }
 
 impl RefusedClosure {
-    /// Whether offering `card` over `stored` is the offer already refused,
-    /// with nothing left for it to store.
-    fn repeats(&self, card: &CardState, stored: Option<&ExistingCard>) -> bool {
+    /// Whether offering `card` over `stored` in `workspace` is the offer
+    /// already refused, with nothing left for it to store.
+    fn repeats(
+        &self,
+        workspace: WorkspaceId,
+        card: &CardState,
+        stored: Option<&ExistingCard>,
+    ) -> bool {
         // Destructured in full so that a field added to `CardState` has to be
         // classified here: what a card write stores is compared, and what
         // only describes the running window is not.
@@ -670,6 +680,7 @@ impl RefusedClosure {
         // An open row still has the tombstone to take, so only a row that is
         // absent or already closed makes the offer a pure repeat.
         stored.is_none_or(|stored| !stored.existence.is_open())
+            && self.workspace == workspace
             && self.generation == stored.map_or(0, |stored| stored.generation)
             && *title == card.title
             && *width_fraction == card.width_fraction
@@ -678,8 +689,8 @@ impl RefusedClosure {
     }
 }
 
-/// A closed card's final content as a write by this connection left it, with
-/// the fingerprint that write stored.
+/// A card's content as a write by this connection left it, with the
+/// fingerprint that write stored.
 ///
 /// Skipping a card whose fingerprint storage already holds is what
 /// [`save_card`] does for every card; computing that fingerprint is most of
@@ -692,14 +703,14 @@ impl RefusedClosure {
 /// [`save_card`] clears that fingerprint (see [`INVALIDATE_CARD_HASH`]), and
 /// [`save_card`] writes a new one, so a row that still carries this one still
 /// holds exactly this content, whatever was committed or rolled back since.
-struct SettledClosure {
+struct SettledCard {
     workspace: WorkspaceId,
     ordinal: usize,
     card: CardState,
     content_hash: i64,
 }
 
-impl SettledClosure {
+impl SettledCard {
     /// Whether offering `card` at `ordinal` over `stored`, against the base
     /// generation `expected`, would leave storage as it is.
     ///
@@ -732,7 +743,8 @@ impl SettledClosure {
             existence,
             kind,
         } = &self.card;
-        !stored.existence.is_open()
+        // A write leaves an open card's row open and a closed card's closed.
+        stored.existence.is_open() == existence.is_open()
             && stored.generation == expected
             && stored.content_hash == Some(self.content_hash)
             && self.workspace == workspace
@@ -856,7 +868,7 @@ impl StateStore {
 
         Ok(Self {
             inner: Mutex::new(StoreInner {
-                closed_cards: ClosedCards::default(),
+                offered_cards: OfferedCards::default(),
                 connection,
                 closed: false,
             }),
@@ -898,11 +910,11 @@ impl StateStore {
         ensure_open(&inner)?;
         let StoreInner {
             connection,
-            closed_cards,
+            offered_cards,
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base, closed_cards, true)?;
+        let commit = save_workspace_transaction(&transaction, state, base, offered_cards, true)?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
@@ -1156,7 +1168,7 @@ impl StateStore {
 
     /// Resolve restored recipe ownership and commit all canonical changes in
     /// the same ordered writer transaction as their navigation snapshot.
-    pub(crate) fn save_workspace_with_terminal_panes(
+    pub fn save_workspace_with_terminal_panes(
         &self,
         state: &WorkspaceState,
         base: SnapshotBase<'_>,
@@ -1199,7 +1211,7 @@ impl StateStore {
         ensure_open(&inner)?;
         let StoreInner {
             connection,
-            closed_cards,
+            offered_cards,
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1316,7 +1328,7 @@ impl StateStore {
                 workspace: base.workspace,
                 cards: &generations,
             },
-            closed_cards,
+            offered_cards,
             false,
         )?;
         transaction.commit()?;
@@ -1539,7 +1551,7 @@ impl StateStore {
     /// Consume only the immutable witness minted by the authenticated client
     /// handshake. Two descriptor values cannot authorize a retained reset.
     #[cfg(feature = "ui")]
-    pub(crate) fn rebind_authenticated_chat_upgrade(
+    pub fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
         recovery: &crate::chat::client::UpgradeRecovery,
@@ -2579,8 +2591,9 @@ impl StateStore {
         Ok(live)
     }
 
-    #[cfg(test)]
-    pub(crate) fn audit_writer_holds_connection(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn audit_writer_holds_connection(&self) -> bool {
         matches!(
             self.inner.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
@@ -4221,7 +4234,7 @@ fn save_workspace_transaction(
     transaction: &Transaction<'_>,
     state: &WorkspaceState,
     base: SnapshotBase<'_>,
-    closed_cards: &mut ClosedCards,
+    offered_cards: &mut OfferedCards,
     isolate_refused_cards: bool,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
@@ -4290,6 +4303,12 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
         &to_json(&state.workspace_history)?,
     )?;
+    // Written by one release only; nothing reads it any more.
+    transaction
+        .prepare_cached("DELETE FROM metadata WHERE key = ?1")?
+        .execute([format!(
+            "workspace:{workspace_id}:navigation:workspace_visits"
+        )])?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:agent_updates"),
@@ -4368,28 +4387,18 @@ fn save_workspace_transaction(
     for (ordinal, card) in state.cards.iter().enumerate() {
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
         let stored = existing.get(&card.id);
-        let generation = if card.existence.is_open() && isolate_refused_cards {
+        let generation = if card.existence.is_open() {
             save_open_card(
                 transaction,
-                &workspace_id,
+                (state.id, &workspace_id),
                 ordinal,
                 card,
                 expected,
                 stored,
                 timestamp,
-                &mut refused,
+                isolate_refused_cards.then_some(&mut refused),
+                &mut offered_cards.settled,
             )
-        } else if card.existence.is_open() {
-            save_card(
-                transaction,
-                &workspace_id,
-                ordinal,
-                card,
-                expected,
-                stored,
-                timestamp,
-            )
-            .map(|saved| saved.generation)
         } else {
             save_closed_card(
                 transaction,
@@ -4399,7 +4408,7 @@ fn save_workspace_transaction(
                 expected,
                 stored,
                 timestamp,
-                closed_cards,
+                offered_cards,
             )
         }
         .map_err(|error| error.in_card(card.id))?;
@@ -4434,8 +4443,20 @@ fn save_workspace_transaction(
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
-        closed_cards.settled.remove(card_id);
     }
+    // A card this workspace no longer offers has nothing left to skip,
+    // whether its row was tombstoned above, never stored or has moved on.
+    // What this connection remembers for a workspace is bounded by the
+    // snapshot it saved last for it; other workspaces keep theirs.
+    let offered = |workspace: WorkspaceId, card: &CardId| {
+        workspace != state.id || incoming_ids.contains(card)
+    };
+    offered_cards
+        .settled
+        .retain(|card, settled| offered(settled.workspace, card));
+    offered_cards
+        .refused
+        .retain(|card, refused| offered(refused.workspace, card));
 
     Ok(WorkspaceCommit {
         generation: next,
@@ -4465,14 +4486,20 @@ fn open_chat_sessions(cards: &Cards) -> HashMap<CardId, &crate::chat::Session> {
 
 /// Writes a card the snapshot holds open.
 ///
+/// A card offered as this connection last settled it, over the row that
+/// settlement left, is what [`save_card`] would find unchanged, and is passed
+/// over without serializing it again; see [`SettledCard`]. Anything else is
+/// written, and what storage then holds is remembered in `settled`.
+///
 /// Storage refuses content that would break what a stored card promises - a
 /// conversation re-pointed without its replacement, a conversion it cannot
 /// make. Each snapshot is the whole window, so refusing it for one such card
 /// would leave every other pane's changes unsaved for as long as that card
-/// stays as it is. A card storage already holds instead keeps exactly what is
-/// stored for it, generation included, and the rest of the window commits.
-/// The refusal is returned in `refused` so the writer goes on reporting the
-/// card until a later snapshot saves it or closes it.
+/// stays as it is. With `refused`, a card storage already holds instead keeps
+/// exactly what is stored for it, generation included, and the rest of the
+/// window commits. The refusal is returned in `refused` so the writer goes on
+/// reporting the card until a later snapshot saves it or closes it. Without
+/// it, the refusal refuses the snapshot.
 ///
 /// Only content is isolated this way. A stale base still fails the snapshot,
 /// which the writer rebases, and a card storage has never held has nothing to
@@ -4482,47 +4509,64 @@ fn open_chat_sessions(cards: &Cards) -> HashMap<CardId, &crate::chat::Session> {
 #[allow(clippy::too_many_arguments)]
 fn save_open_card(
     transaction: &Transaction<'_>,
-    workspace_id: &str,
+    (workspace, workspace_id): (WorkspaceId, &str),
     ordinal: usize,
     card: &CardState,
     expected: u64,
     stored: Option<&ExistingCard>,
     timestamp: i64,
-    refused: &mut Vec<StoreError>,
+    refused: Option<&mut Vec<StoreError>>,
+    settled: &mut HashMap<CardId, SettledCard>,
 ) -> Result<u64> {
-    let Some(stored) = stored else {
-        return save_card(
+    if let Some(stored) = stored
+        && settled
+            .get(&card.id)
+            .is_some_and(|settled| settled.holds(workspace, ordinal, card, expected, stored))
+    {
+        return Ok(expected);
+    }
+    let write = |stored: Option<&ExistingCard>| {
+        save_card(
             transaction,
             workspace_id,
             ordinal,
             card,
             expected,
-            None,
+            stored,
             timestamp,
         )
-        .map(|saved| saved.generation);
     };
-    savepoint(transaction, "SAVEPOINT open_card")?;
-    match save_card(
-        transaction,
-        workspace_id,
-        ordinal,
-        card,
-        expected,
-        Some(stored),
-        timestamp,
-    ) {
-        Err(error) if error.refuses_content() => {
-            savepoint(transaction, "ROLLBACK TO open_card")?;
-            savepoint(transaction, "RELEASE open_card")?;
-            refused.push(error.in_card(card.id));
-            Ok(stored.generation)
+    let saved = match (stored, refused) {
+        (Some(stored), Some(refused)) => {
+            savepoint(transaction, "SAVEPOINT open_card")?;
+            match write(Some(stored)) {
+                Err(error) if error.refuses_content() => {
+                    savepoint(transaction, "ROLLBACK TO open_card")?;
+                    savepoint(transaction, "RELEASE open_card")?;
+                    refused.push(error.in_card(card.id));
+                    return Ok(stored.generation);
+                }
+                written => {
+                    savepoint(transaction, "RELEASE open_card")?;
+                    written?
+                }
+            }
         }
-        written => {
-            savepoint(transaction, "RELEASE open_card")?;
-            written.map(|saved| saved.generation)
-        }
-    }
+        (stored, _) => write(stored)?,
+    };
+    // Recorded before the transaction commits, which is sound for the reason
+    // `SettledCard` gives: it is trusted only while the row carries the
+    // fingerprint written here.
+    settled.insert(
+        card.id,
+        SettledCard {
+            workspace,
+            ordinal,
+            card: card.clone(),
+            content_hash: saved.content_hash,
+        },
+    );
+    Ok(saved.generation)
 }
 
 /// A card row as [`save_card`] left it.
@@ -4644,7 +4688,7 @@ fn save_card(
 /// for exactly that refusal.
 ///
 /// The window goes on offering the card in every later snapshot, so how each
-/// offer was settled is remembered in `closed_cards`. The same content offered
+/// offer was settled is remembered in `offered_cards`. The same content offered
 /// over the row it settled is neither written, nor serialized to be compared,
 /// nor, when it was refused, reported a second time.
 #[allow(clippy::too_many_arguments)]
@@ -4656,17 +4700,17 @@ fn save_closed_card(
     expected: u64,
     stored: Option<&ExistingCard>,
     timestamp: i64,
-    closed_cards: &mut ClosedCards,
+    offered_cards: &mut OfferedCards,
 ) -> Result<u64> {
     if let Some(stored) = stored
-        && closed_cards
+        && offered_cards
             .settled
             .get(&card.id)
             .is_some_and(|settled| settled.holds(workspace, ordinal, card, expected, stored))
     {
         // What a write that found its fingerprint stored would have done, as
         // the acceptance it is.
-        closed_cards.refused.remove(&card.id);
+        offered_cards.refused.remove(&card.id);
         return Ok(expected);
     }
     if let Some(stored) = stored
@@ -4685,8 +4729,8 @@ fn save_closed_card(
         // reclaim that live identity or erase the archive.
         return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
     }
-    if let Some(refused) = closed_cards.refused.get(&card.id)
-        && refused.repeats(card, stored)
+    if let Some(refused) = offered_cards.refused.get(&card.id)
+        && refused.repeats(workspace, card, stored)
     {
         return Ok(refused.generation);
     }
@@ -4719,9 +4763,10 @@ fn save_closed_card(
             // Recorded before the transaction commits, which is sound: a
             // rollback leaves the row at an earlier generation or still open,
             // and neither matches what is remembered here.
-            closed_cards.refused.insert(
+            offered_cards.refused.insert(
                 card.id,
                 RefusedClosure {
+                    workspace,
                     offered: card.clone(),
                     generation,
                 },
@@ -4731,13 +4776,13 @@ fn save_closed_card(
         written => {
             savepoint(transaction, "RELEASE closed_card")?;
             let saved = written?;
-            closed_cards.refused.remove(&card.id);
+            offered_cards.refused.remove(&card.id);
             // Recorded before the transaction commits, which is sound for the
-            // reason `SettledClosure` gives: it is trusted only while the row
+            // reason `SettledCard` gives: it is trusted only while the row
             // carries the fingerprint written here.
-            closed_cards.settled.insert(
+            offered_cards.settled.insert(
                 card.id,
-                SettledClosure {
+                SettledCard {
                     workspace,
                     ordinal,
                     card: card.clone(),
@@ -4940,7 +4985,7 @@ fn validate_chat_identity(
 /// `session` replaced it, which only an explicit replacement may do, as the
 /// [`Violation`] check an ordinary write of `session` breaks, with `{card}`
 /// standing for the card. `None` when an ordinary write can take `session`.
-pub(crate) fn chat_identity_change(
+pub fn chat_identity_change(
     stored: &crate::chat::Session,
     session: &crate::chat::Session,
 ) -> Option<&'static str> {
@@ -5579,7 +5624,7 @@ fn replace_terminal_identity_transaction(
 }
 
 /// What every workspace snapshot has to satisfy before any of it is written.
-pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
+pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
@@ -11335,7 +11380,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
-            &mut ClosedCards::default(),
+            &mut OfferedCards::default(),
             false,
         )
         .unwrap();
@@ -11421,7 +11466,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
-            &mut ClosedCards::default(),
+            &mut OfferedCards::default(),
             false,
         )
         .unwrap();
@@ -12826,7 +12871,7 @@ mod tests {
                 lane.save(&store, &workspace).unwrap();
             }
         });
-        assert_eq!(built, 3, "only the open card is offered on each flush");
+        assert_eq!(built, 0, "#2629: no unchanged card is serialized again");
         assert_eq!(
             store.lock_inner().unwrap().connection.total_changes() - changes,
             3,
@@ -12838,7 +12883,7 @@ mod tests {
         }
 
         // A restarted window remembers nothing, so its first flush offers
-        // every closed card once more, and leaves each as it is.
+        // every card once more, and leaves each as it is.
         store.shutdown().unwrap();
         let store = StateStore::open(&path, boot_id).unwrap();
         assert_eq!(
@@ -12851,11 +12896,227 @@ mod tests {
             card_writes_built(|| {
                 lane.save(&store, &workspace).unwrap();
             }),
-            1
+            0
         );
         for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
         }
+    }
+
+    /// #2629: an open card offered as storage already holds it is passed over
+    /// without being serialized again, and each change to it is written, the
+    /// latest last, whichever flush carries it.
+    #[test]
+    fn an_open_card_is_serialized_only_when_it_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[0].id;
+        let settled = stored_card_row(&store, card);
+        let changes = store.lock_inner().unwrap().connection.total_changes();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            0
+        );
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes() - changes,
+            1,
+            "only the workspace row records the flush"
+        );
+        assert_eq!(stored_card_row(&store, card), settled);
+
+        for (round, title) in ["first", "second", "third"].into_iter().enumerate() {
+            workspace.cards[0].title = title.into();
+            assert_eq!(
+                card_writes_built(|| {
+                    lane.save(&store, &workspace).unwrap();
+                }),
+                1,
+                "only the changed card is serialized"
+            );
+            assert_eq!(
+                stored_card_row(&store, card).0,
+                settled.0 + 1 + round as i64
+            );
+        }
+        // Back to a content an earlier write stored: still a change to write.
+        workspace.cards[0].title = "second".into();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        workspace.cards[0].title = "latest".into();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            0
+        );
+        store.shutdown().unwrap();
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let restored = store.load_card(card, None).unwrap().unwrap();
+        assert_eq!(restored.title, "latest", "the latest content wins");
+        assert_eq!(restored.generation, settled.0.cast_unsigned() + 5);
+    }
+
+    /// #2872: a card the window stops offering leaves what the connection
+    /// remembers, even when no tombstone is written for it because storage no
+    /// longer lists it under this workspace.
+    #[test]
+    fn a_card_the_window_stops_offering_is_forgotten() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let remembered = |store: &StateStore| {
+            store
+                .lock_inner()
+                .unwrap()
+                .offered_cards
+                .settled
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        // Tombstoned by the snapshot that drops it.
+        let dropped = workspace.cards.remove(workspace.cards.len() - 1).id;
+        lane.save(&store, &workspace).unwrap();
+        assert!(!remembered(&store).contains(&dropped));
+        // Gone from this workspace's rows without a tombstone.
+        let moved = workspace.cards.remove(workspace.cards.len() - 1).id;
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(&format!(
+                "DELETE FROM browser_restore WHERE card_id = '{moved}';
+                 DELETE FROM cards WHERE card_id = '{moved}';"
+            ))
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        store.shutdown().unwrap();
+    }
+
+    /// #2872: a refused closure the window stops offering is forgotten as
+    /// well, while what the connection remembers for another workspace
+    /// survives this one's saves.
+    #[test]
+    fn a_refused_closure_the_window_stops_offering_is_forgotten() {
+        let directory = tempdir().unwrap();
+        let (mut workspace, mut session) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        // Refused whatever storage holds, so never stored and never tombstoned.
+        session.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(session);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        let store = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let other = workspace_with_terminal(&boot("boot"));
+        let other_card = other.cards[0].id;
+        SaveLane::default().save(&store, &other).unwrap();
+        let remembered = |store: &StateStore| {
+            let inner = store.lock_inner().unwrap();
+            (
+                inner.offered_cards.refused.contains_key(&card),
+                inner.offered_cards.settled.contains_key(&other_card),
+            )
+        };
+        assert_eq!(
+            remembered(&store),
+            (true, true),
+            "each workspace keeps its own"
+        );
+
+        workspace.cards.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            remembered(&store),
+            (false, true),
+            "only the saved workspace forgets what it no longer offers"
+        );
+        store.shutdown().unwrap();
+    }
+
+    /// A settled open card whose row another path changed is written again:
+    /// that path cleared the fingerprint the settlement relies on.
+    #[test]
+    fn a_settled_open_card_whose_fingerprint_was_cleared_is_written_again() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[0].id;
+        let before = stored_card_row(&store, card);
+        {
+            let inner = store.lock_inner().unwrap();
+            inner
+                .connection
+                .execute(
+                    "UPDATE cards SET title = 'written elsewhere' WHERE card_id = ?1",
+                    [card.to_string()],
+                )
+                .unwrap();
+            inner
+                .connection
+                .execute(INVALIDATE_CARD_HASH, [card.to_string()])
+                .unwrap();
+        }
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        let after = stored_card_row(&store, card);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.2, before.2, "the snapshot's content is stored again");
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().title,
+            "terminal"
+        );
+    }
+
+    /// A stale base is still reported for a settled open card, which the
+    /// writer rebases, rather than passed over as unchanged.
+    #[test]
+    fn a_settled_open_card_offered_over_a_stale_base_is_refused() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (workspace, lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[0].id;
+        let mut stale = lane.cards.clone();
+        *stale.get_mut(&card).unwrap() -= 1;
+        assert!(matches!(
+            store.save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &stale,
+                },
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
     }
 
     #[test]
@@ -12873,7 +13134,7 @@ mod tests {
             card_writes_built(|| {
                 lane.save(&store, &workspace).unwrap();
             }),
-            2
+            1
         );
         assert_eq!(stored_card_row(&store, card).0, before.0 + 1);
         assert_eq!(
@@ -12885,7 +13146,7 @@ mod tests {
             card_writes_built(|| {
                 lane.save(&store, &workspace).unwrap();
             }),
-            1
+            0
         );
         assert_eq!(stored_card_row(&store, card).0, before.0 + 1);
     }
@@ -12904,7 +13165,7 @@ mod tests {
             card_writes_built(|| {
                 lane.save(&store, &workspace).unwrap();
             }),
-            3
+            2
         );
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(
@@ -12952,7 +13213,7 @@ mod tests {
             card_writes_built(|| {
                 lane.save(&store, &workspace).unwrap();
             }),
-            2
+            1
         );
         let after = stored_card_row(&store, card);
         assert_eq!(after.0, before.0 + 1);
