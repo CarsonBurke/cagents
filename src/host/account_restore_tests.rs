@@ -123,7 +123,7 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
     // cleanup of the start its account refused, instead of reporting busy.
     {
         let gate = host.lock().unwrap().control_gate.clone();
-        let writer = super::client::try_scoped_control_write(&gate).unwrap();
+        let writer = gate.try_exclusive().unwrap();
         let operation = crate::account::remote::Operation::Restore {
             provider: Provider::Claude,
             key: plan,

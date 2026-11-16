@@ -50,7 +50,8 @@ impl Error {
     }
 }
 
-/// Synchronous management entry: the host IPC dispatcher owns control.read().
+/// Synchronous management entry: the host IPC dispatcher holds shared control
+/// admission.
 /// No registry or HostState guard crosses target validation or actor cleanup.
 pub(in crate::host) fn process_under_control(
     host: &SharedHost,
@@ -410,7 +411,7 @@ pub(super) fn remove(host: &SharedHost, id: Uuid, revision: u64) -> Result<(), S
         .remove_automation(id, revision, now()?)
 }
 
-/// Management RPCs hold control.read(); the execution service additionally
+/// Management RPCs hold shared control admission; the execution service additionally
 /// checks the exact latest run under its per-agent gate before closing it.
 fn retire_reuse_under_control(
     host: &SharedHost,

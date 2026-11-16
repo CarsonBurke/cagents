@@ -7,6 +7,7 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
+mod control_gate;
 mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
@@ -827,7 +828,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
 /// invoking any producer Drop, provider cleanup, child wait or client work.
 fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
     let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
-    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    let _control = gate.exclusive();
     // Save intentional successor transfer BEFORE finish_upgrade takes its
     // state. Such a handoff is not a claim of original-child absence.
     if host

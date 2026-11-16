@@ -878,7 +878,7 @@ fn dispatch(
         .unwrap_or_else(|p| p.into_inner())
         .control_gate
         .clone();
-    let _control = control.read().unwrap_or_else(|p| p.into_inner());
+    let _control = control.shared();
     super::client::ensure_control_open(host).map_err(|error| before(error.message))?;
     let gate = agent_gate(host, accepted.agent.id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());

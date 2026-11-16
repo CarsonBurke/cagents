@@ -77,7 +77,7 @@ pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Op
         .unwrap_or_else(|p| p.into_inner())
         .control_gate
         .clone();
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    let _control = gate.shared();
     crate::host::client::ensure_control_open(host).ok()?;
     Some(work())
 }

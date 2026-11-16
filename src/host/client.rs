@@ -2,7 +2,7 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
+    sync::{Arc, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -20,12 +20,15 @@ use crate::{
 };
 
 use super::{
+    control_gate::{self, ControlGate, Exclusive, Shared},
     delivery::DeliveryQueue,
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
 #[cfg(test)]
 mod automation_authority_tests;
+#[cfg(test)]
+mod control_admission_tests;
 #[cfg(test)]
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
@@ -161,35 +164,23 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// here costs one maintenance pass, while the reverse would strand a worker.
 /// Startup reservations can also drop off the request path, so they wake too.
 fn may_release_retention(request: &ClientRequest) -> bool {
-    !matches!(
-        request,
-        ClientRequest::List
-            | ClientRequest::Input { .. }
-            | ClientRequest::Key { .. }
-            | ClientRequest::Mouse { .. }
-            | ClientRequest::Focus { .. }
-            | ClientRequest::Scroll { .. }
-            | ClientRequest::Resize { .. }
-            | ClientRequest::Paste { .. }
-            | ClientRequest::SetVisibility { .. }
-            | ClientRequest::Snapshot { .. }
-            | ClientRequest::AcknowledgeRedraw { .. }
-            | ClientRequest::TerminalAcknowledge { .. }
-            | ClientRequest::SearchTerminal { .. }
-            | ClientRequest::CopyTerminalSelection { .. }
-            | ClientRequest::ChatCommand { .. }
-            | ClientRequest::ChatVisibility { .. }
-            | ClientRequest::ChatRead { .. }
-            | ClientRequest::ChatAcknowledge { .. }
-            | ClientRequest::ChatList
-            | ClientRequest::ReadWorkspaceModel
-            | ClientRequest::ReadWorkspaceView { .. }
-            | ClientRequest::ReadWorkspaceSnapshot
-            | ClientRequest::ReadWorkspaceMetadata { .. }
-            | ClientRequest::ReadTerminalRemovalBasis { .. }
-            | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
-            | ClientRequest::ReadNotifications
-    )
+    !terminal_io_request(request)
+        && !matches!(
+            request,
+            ClientRequest::List
+                | ClientRequest::ChatCommand { .. }
+                | ClientRequest::ChatVisibility { .. }
+                | ClientRequest::ChatRead { .. }
+                | ClientRequest::ChatAcknowledge { .. }
+                | ClientRequest::ChatList
+                | ClientRequest::ReadWorkspaceModel
+                | ClientRequest::ReadWorkspaceView { .. }
+                | ClientRequest::ReadWorkspaceSnapshot
+                | ClientRequest::ReadWorkspaceMetadata { .. }
+                | ClientRequest::ReadTerminalRemovalBasis { .. }
+                | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
+                | ClientRequest::ReadNotifications
+        )
 }
 
 /// Whether the peer process runs the `cagents` CLI, the only client this
@@ -451,24 +442,10 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
     let _ = writer.join();
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+fn control_gate(host: &SharedHost) -> Arc<ControlGate> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
-}
-
-pub(super) fn try_scoped_control_write(
-    gate: &RwLock<()>,
-) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
-    match gate.try_write() {
-        Ok(guard) => Ok(guard),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            "The daemon is finishing another operation. Wait for it and retry.",
-            true,
-        )),
-    }
 }
 
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
@@ -561,7 +538,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     {
         let gate = control_gate(host);
-        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+        let _control = gate.shared();
         let handles = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.shutting_down && !state.ordinary_exit_cleanup_pending() {
@@ -580,7 +557,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
         }
     }
     // Outside the control gate: unwatching waits for a board being assembled,
-    // which must not hold up a writer queued at the gate.
+    // which must not hold up a writer waiting at the gate.
     let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
     if let Some(work) = work {
         work.unwatch(client_id);
@@ -755,44 +732,44 @@ impl Drop for ExplicitCloseGuard {
 /// The client allows TERMINAL_CLOSE_TIMEOUT, which also covers its teardown.
 const CLOSE_FENCE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Take the writer only while it is free and read the saved pin under it. A
-/// queued writer would hold back every client's input behind the slowest shared
-/// request, and a held one must not wait out another thread's durable commit.
+fn close_busy() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "Cagents is busy; retry closing this terminal",
+        true,
+    )
+}
+
+/// Take the writer and read the saved pin under it. Waiting for the writer
+/// never delays terminal input (see `control_gate`), but a held writer must not
+/// wait out another thread's durable commit, so it is released while the
+/// registry is busy.
 fn close_fence<'gate>(
     host: &SharedHost,
-    gate: &'gate RwLock<()>,
+    gate: &'gate ControlGate,
     terminal: crate::model::TerminalId,
     deadline: Instant,
-) -> Result<(RwLockWriteGuard<'gate, ()>, Result<Option<String>, String>), ProtocolError> {
+) -> Result<(Exclusive<'gate>, Result<Option<String>, String>), ProtocolError> {
     let registry = super::agent_execution::registry(host);
     loop {
-        let admission = match gate.try_write() {
-            Ok(admission) => Some(admission),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        let admission = gate.exclusive_until(deadline).ok_or_else(close_busy)?;
+        let registry = match &registry {
+            Ok(registry) => registry,
+            Err(cause) => return Ok((admission, Err(cause.clone()))),
+        };
+        let pin = match registry.try_lock() {
+            Ok(registry) => Some(registry.retention_pin_generation(terminal)),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().retention_pin_generation(terminal))
+            }
             Err(TryLockError::WouldBlock) => None,
         };
-        if let Some(admission) = admission {
-            let registry = match &registry {
-                Ok(registry) => registry,
-                Err(cause) => return Ok((admission, Err(cause.clone()))),
-            };
-            let pin = match registry.try_lock() {
-                Ok(registry) => Some(registry.retention_pin_generation(terminal)),
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    Some(poisoned.into_inner().retention_pin_generation(terminal))
-                }
-                Err(TryLockError::WouldBlock) => None,
-            };
-            if let Some(pin) = pin {
-                return Ok((admission, pin));
-            }
+        if let Some(pin) = pin {
+            return Ok((admission, pin));
         }
+        drop(admission);
         if Instant::now() >= deadline {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                "Cagents is busy; retry closing this terminal",
-                true,
-            ));
+            return Err(close_busy());
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -918,7 +895,7 @@ fn source_cleanup_conflict() -> ProtocolError {
 /// SQL. Readers queued on the registry can therefore finish before the retry.
 fn with_source_close_fence<T>(
     host: &SharedHost,
-    gate: &RwLock<()>,
+    gate: &ControlGate,
     terminal: crate::model::TerminalId,
     deadline: Instant,
     capture: &crate::workspace_model::views::CapturedTerminalSource,
@@ -936,12 +913,7 @@ fn with_source_close_fence<T>(
                 .source_admission()
                 .map_err(|error| ProtocolError::new(ProtocolErrorCode::Internal, error, true))?;
             let current = sql.retention_pin_generation(terminal);
-            let admission = match gate.try_write() {
-                Ok(a) => Some(a),
-                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-                Err(TryLockError::WouldBlock) => None,
-            };
-            if let Some(_admission) = admission {
+            if let Some(_admission) = gate.try_exclusive() {
                 sql.validate(capture)
                     .map_err(|_| source_cleanup_conflict())?;
                 if !matches!(&capture.before.kind, crate::model::CardKind::Terminal(s) if s.id == terminal)
@@ -952,11 +924,7 @@ fn with_source_close_fence<T>(
             }
         }
         if Instant::now() >= deadline {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                "Cagents is busy; retry closing this terminal",
-                true,
-            ));
+            return Err(close_busy());
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -1117,6 +1085,55 @@ pub(super) fn process_request(
     ))
 }
 
+/// No client sends this yet; its GitHub read has already spent part of the
+/// 120-second device-operation deadline before the writer is wanted.
+const MERGED_WORKTREE_REMOVAL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The requests that hold the control gate exclusively, and how long each waits
+/// for it: half of what its client allows for the reply. The daemon then never
+/// runs one its client has given up on, and the admitted work has the other half.
+fn exclusive_patience(request: &ClientRequest) -> Option<Duration> {
+    match request {
+        // `ControlClient::request_strict` waits five seconds for the reply.
+        ClientRequest::PrepareUpgrade { .. }
+        | ClientRequest::Shutdown
+        | ClientRequest::ShutdownV1 { .. }
+        | ClientRequest::ChatRelease { dry_run: false, .. } => Some(Duration::from_millis(2500)),
+        // `ControlClient::prepare_confirmed_upgrade` allows sixty seconds.
+        ClientRequest::PrepareConfirmedUpgrade { .. } => Some(Duration::from_secs(30)),
+        // The chat connection's `return_terminal` waits forty seconds.
+        ClientRequest::ChatReturnTerminal { .. } => Some(Duration::from_secs(20)),
+        // An account switch reads its attach connection for seventy seconds.
+        ClientRequest::ChatRecoverAccount {
+            idle_generation: Some(_),
+            ..
+        } => Some(Duration::from_secs(35)),
+        _ => None,
+    }
+}
+
+/// Requests answered from HostState and a non-blocking send to the terminal
+/// worker. They launch nothing and change no ownership, so they are admitted
+/// beside a waiting exclusive request instead of behind it.
+fn terminal_io_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Input { .. }
+            | ClientRequest::Key { .. }
+            | ClientRequest::Mouse { .. }
+            | ClientRequest::Focus { .. }
+            | ClientRequest::Scroll { .. }
+            | ClientRequest::Resize { .. }
+            | ClientRequest::Paste { .. }
+            | ClientRequest::SetVisibility { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::SearchTerminal { .. }
+            | ClientRequest::CopyTerminalSelection { .. }
+    )
+}
+
 fn process_wire_request(
     host: &SharedHost,
     client_id: ClientId,
@@ -1135,14 +1152,16 @@ fn process_wire_request(
     } = &request
     {
         let prepared = {
-            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            let _shared = gate.shared();
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
             crate::worktree_cleanup::PreparedRemoval::prepare(removal_request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
-                let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+                let _exclusive = gate
+                    .exclusive_until(Instant::now() + MERGED_WORKTREE_REMOVAL_PATIENCE)
+                    .ok_or_else(control_gate::busy)?;
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
                 prepared
@@ -1171,7 +1190,7 @@ fn process_wire_request(
     } = &request
     {
         {
-            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            let _shared = gate.shared();
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
@@ -1196,21 +1215,17 @@ fn process_wire_request(
     }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
-    let exclusive = matches!(
-        &request,
-        ClientRequest::PrepareUpgrade { .. }
-            | ClientRequest::PrepareConfirmedUpgrade { .. }
-            | ClientRequest::Shutdown
-            | ClientRequest::ShutdownV1 { .. }
-            | ClientRequest::ChatReturnTerminal { .. }
-            | ClientRequest::ChatRelease { dry_run: false, .. }
-            | ClientRequest::ChatRecoverAccount {
-                idle_generation: Some(_),
-                ..
-            }
-    );
-    let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
-    let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
+    let (_exclusive, _shared) = match exclusive_patience(&request) {
+        Some(patience) => (
+            Some(
+                gate.exclusive_until(Instant::now() + patience)
+                    .ok_or_else(control_gate::busy)?,
+            ),
+            None,
+        ),
+        None if terminal_io_request(&request) => (None, Some(gate.terminal_io())),
+        None => (None, Some(gate.shared())),
+    };
     ensure_request_open(host, &request)?;
     ensure_startup_recovery_request(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
@@ -1315,7 +1330,7 @@ fn process_admitted_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
-    _shared: Option<std::sync::RwLockReadGuard<'_, ()>>,
+    _shared: Option<Shared<'_>>,
 ) -> Result<RequestOutcome, ProtocolError> {
     // Adapt the additive request to the established close paths. Its original
     // source is checked under the same lock that selects the resident handle;
@@ -2548,7 +2563,7 @@ fn prepare_resume(
     ProtocolError,
 > {
     let gate = control_gate(host);
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    let _control = gate.shared();
     ensure_inspection_open(host).map_err(|mut failure| {
         // A refused Connect has admitted no mutations or uncertain writes.
         // Only this shutdown gate is retryable; expected-host/proof validation
@@ -3479,12 +3494,15 @@ pub(in crate::host) mod tests {
         let gate = control_gate(&host);
         let registry = super::super::agent_execution::registry(&host).unwrap();
         let input_can_enter = || {
-            (0..500).any(|_| {
-                thread::sleep(Duration::from_millis(1));
-                gate.try_read().is_ok()
-            })
+            let (entered, entry) = std::sync::mpsc::channel();
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                drop(gate.terminal_io());
+                let _ = entered.send(());
+            });
+            entry.recv_timeout(Duration::from_millis(500)).is_ok()
         };
-        let slow_request = gate.read().unwrap();
+        let slow_request = gate.shared();
         let worker = {
             let (host, handle) = (host.clone(), handle.clone());
             thread::spawn(move || finish_test_terminal_close(&host, id, &handle, pin))
@@ -3522,7 +3540,7 @@ pub(in crate::host) mod tests {
         let pin = retention_pin_generation(&host, id);
         handle.shutdown().unwrap();
         let gate = control_gate(&host);
-        let slow_request = gate.read().unwrap();
+        let slow_request = gate.shared();
         let refusal = close_fence(&host, &gate, id, Instant::now()).unwrap_err();
         assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
         assert!(refusal.retryable);
@@ -3607,7 +3625,7 @@ pub(in crate::host) mod tests {
         // An already-admitted presence can publish after its initial Host
         // check. Final compaction must drain this real reader before deciding.
         let gate = control_gate(&host);
-        let publication = gate.read().unwrap();
+        let publication = gate.shared();
         host.lock()
             .unwrap()
             .ensure_retention_available(&[id])
@@ -4344,7 +4362,7 @@ pub(in crate::host) mod tests {
         let (proof, host) = panic_test_host("resident-release-gate");
         let gate = control_gate(&host);
         // Model an admitted submission between authentication and acceptance.
-        let admitted = gate.read().unwrap();
+        let admitted = gate.shared();
         let release = crate::terminal_ipc::ChatReleaseProof {
             session: crate::chat::Session {
                 id: TerminalId::new(),
@@ -4808,10 +4826,9 @@ pub(in crate::host) mod tests {
         let gate = control_gate(&host);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match gate.try_write() {
-                Err(std::sync::TryLockError::WouldBlock) => break,
-                Ok(guard) => drop(guard),
-                Err(error) => panic!("control gate poisoned: {error}"),
+            match gate.try_exclusive() {
+                None => break,
+                Some(guard) => drop(guard),
             }
             assert!(Instant::now() < deadline, "chat close was not admitted");
             thread::yield_now();
@@ -5053,7 +5070,7 @@ pub(in crate::host) mod tests {
         // Upgrade and shutdown admission never waits for the provider listing.
         let gate = host.lock().unwrap().control_gate.clone();
         assert!(
-            gate.try_write().is_ok(),
+            gate.try_exclusive().is_some(),
             "a provider listing in flight must not hold the control gate"
         );
         // ...but it holds the lease that account and worktree reservations

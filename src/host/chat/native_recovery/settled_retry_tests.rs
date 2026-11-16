@@ -344,7 +344,7 @@ impl Fixture {
         crate::upgrade::handoff::Checkpoint,
     ) {
         let control_gate = self.host().lock().unwrap().control_gate.clone();
-        let control = control_gate.write().unwrap();
+        let control = control_gate.exclusive();
         let capability = self
             .host()
             .lock()

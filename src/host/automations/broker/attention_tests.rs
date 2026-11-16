@@ -443,7 +443,7 @@ fn withheld_journal_receipt_never_holds_control_host_or_registry_scope() {
         notifications: Mutex::default(),
     }));
     let gate = host.lock().unwrap().control_gate.clone();
-    let exclusive = gate.write().unwrap();
+    let exclusive = gate.exclusive();
     assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
     assert_eq!(journal.pending_events().len(), 1);
     assert!(registry.try_lock().is_ok());

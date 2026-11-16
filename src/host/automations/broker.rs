@@ -167,7 +167,7 @@ impl Handle {
         self.0.wake.notify();
     }
 
-    /// Called by the management dispatcher while it owns control.read().
+    /// Called by the management dispatcher while it holds shared control admission.
     pub(super) fn cancel(&self, id: Uuid, firing: Uuid) -> Result<(), String> {
         let host = self.0.host.upgrade().ok_or("The daemon is stopping")?;
         let detail = {
@@ -286,8 +286,8 @@ impl Handle {
         Ok((claim, launching))
     }
 
-    /// Caller holds the daemon control read gate, either the IPC dispatcher or
-    /// the scheduler tick below. Never recursively acquire std's RwLock.
+    /// Caller holds shared control admission, either the IPC dispatcher or the
+    /// scheduler tick below. Never acquire it again on this thread.
     fn launch(&self, host: &SharedHost, claim: Claimed) -> Result<(), String> {
         if !claim.created || !claim.firing.state.is_active() {
             return Ok(());
@@ -435,10 +435,8 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .control_gate
             .clone();
-        let _control = match control.try_read() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        let Some(_control) = control.try_shared() else {
+            return Ok(false);
         };
         if crate::host::client::ensure_control_open(host).is_err() {
             return Ok(false);
@@ -545,10 +543,8 @@ impl Handle {
         // Final update admission must exclude claims and receipt acceptance,
         // not just the eventual process spawn. Never wait behind shutdown's
         // writer: it may be joining this coordinator while dropping Broker.
-        let _control = match control.try_read() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(Duration::from_millis(250)),
+        let Some(_control) = control.try_shared() else {
+            return Ok(Duration::from_millis(250));
         };
         if crate::host::client::ensure_control_open(host).is_err() {
             return Ok(Duration::from_millis(250));
@@ -1432,7 +1428,7 @@ mod tests {
         }));
         host.lock().unwrap().automations = Some(handle.clone());
         let control = host.lock().unwrap().control_gate.clone();
-        let _admission = control.read().unwrap();
+        let _admission = control.shared();
         let without_wake = |request: Request| {
             let before = handle.0.wake.state.lock().unwrap().generation;
             let description = format!("{request:?}");
@@ -1998,7 +1994,7 @@ mod tests {
             notifications: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
-        let exclusive = gate.write().unwrap();
+        let exclusive = gate.exclusive();
         assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
         assert_eq!(
             registry
@@ -2219,7 +2215,7 @@ mod tests {
             notifications: Mutex::default(),
         }));
         let control = host.lock().unwrap().control_gate.clone();
-        let exclusive = control.write().unwrap();
+        let exclusive = control.exclusive();
         assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
         drop(exclusive);
         let delay = handle.tick(&host).unwrap();

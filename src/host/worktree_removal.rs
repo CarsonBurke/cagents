@@ -25,9 +25,7 @@ pub(super) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<Scope>>>>;
 /// check them.
 const MAX_RESERVATIONS: usize = 16;
 
-/// How long installation retries the control writer while other requests
-/// briefly hold the gate. It never waits on the writer itself, which would
-/// stall every new request behind it.
+/// How long installation waits for the requests already admitted to finish.
 const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a process found in the worktree gets to leave before it refuses
@@ -119,18 +117,9 @@ impl Reservation {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             (state.control_gate.clone(), state.worktree_removals.clone())
         };
-        let deadline = std::time::Instant::now() + patience;
-        let mut pause = std::time::Duration::from_millis(5);
-        let writer = loop {
-            match super::client::try_scoped_control_write(&gate) {
-                Ok(writer) => break writer,
-                Err(error) if std::time::Instant::now() + pause > deadline => return Err(error),
-                Err(_) => {
-                    std::thread::sleep(pause);
-                    pause = (pause * 2).min(std::time::Duration::from_millis(200));
-                }
-            }
-        };
+        let writer = gate
+            .exclusive_until(std::time::Instant::now() + patience)
+            .ok_or_else(super::control_gate::busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.values().any(|other| other.overlaps(&scope)) {
