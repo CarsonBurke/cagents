@@ -1132,21 +1132,33 @@ impl Cagents {
             Scope::Channel(id) => channel_cards.get(id).map(|cards| cards.as_slice()),
             Scope::Worktree { path, .. } => by_path.get(path.as_path()).map(Vec::as_slice),
         };
-        let publishable = |scope: &Scope| {
-            !self.shared_views.initialized.contains(scope)
-                || self
-                    .shared_views
-                    .baseline
-                    .get(scope)
-                    .is_none_or(|published| !published.is_empty())
-                || local_cards(scope).is_some_and(|cards| !cards.is_empty())
+        // Why each kept scope is kept, for the trace: unseeded, unsettled,
+        // published panes, local cards.
+        let mut kept = [0usize; 4];
+        let mut publishable = |scope: &Scope| {
+            let reason = if !self.shared_views.initialized.contains(scope) {
+                0
+            } else {
+                match self.shared_views.baseline.get(scope) {
+                    None => 1,
+                    Some(published) if !published.is_empty() => 2,
+                    Some(_) if local_cards(scope).is_some_and(|cards| !cards.is_empty()) => 3,
+                    Some(_) => return false,
+                }
+            };
+            kept[reason] += 1;
+            true
         };
+        let discovered = scopes.len();
         let scopes = scopes
             .into_iter()
             .filter(|scope| selected.is_none_or(|selected| selected.contains(&**scope)))
             .filter(|scope| publishable(scope))
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "local_scopes",
+            discovered, projected = scopes.len(), unseeded = kept[0], unsettled = kept[1],
+            published = kept[2], local = kept[3], "Selected the scopes to project");
         let pending = self
             .workspace_model
             .views
@@ -1997,24 +2009,30 @@ impl Cagents {
                 }
                 continue;
             }
-            let previous = self
-                .shared_views
-                .baseline
-                .get(&scope)
-                .cloned()
-                .unwrap_or_default();
             let revision = view_indices
                 .get(&scope)
                 .map(|&index| self.workspace_model.views[index].revision)
                 .unwrap_or(0);
-            let unfenced = |panes: &[Pane]| {
-                panes
-                    .iter()
-                    .filter(|pane| !quarantined.contains(&pane.id))
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let changes = {
+                let previous = self
+                    .shared_views
+                    .baseline
+                    .get(&scope)
+                    .map_or(&[][..], Vec::as_slice);
+                if quarantined.is_empty() {
+                    views::changes(previous, &panes)
+                } else {
+                    let unfenced = |panes: &[Pane]| {
+                        panes
+                            .iter()
+                            .filter(|pane| !quarantined.contains(&pane.id))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    views::changes(&unfenced(previous), &unfenced(&panes))
+                }
             };
-            for change in views::changes(&unfenced(&previous), &unfenced(&panes)) {
+            for change in changes {
                 // A Remove is every window's instruction to close the pane. A
                 // pane still open here has only lost its local placement.
                 if let Change::Remove { id } = &change
