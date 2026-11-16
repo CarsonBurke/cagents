@@ -54,6 +54,167 @@ impl<'a> ResolveRoot<'a> for WorktreeRoots<'a> {
     }
 }
 
+/// Every worktree root this window has known, each with its canonical form.
+///
+/// Pane ownership compares a pane's directory with these roots once
+/// filesystem aliases are resolved. A long-lived window knows thousands of
+/// roots, most of them deleted long ago, and resolving each one on every
+/// worktree switch cost a `realpath` apiece on the UI thread. So a root is
+/// resolved once, when it becomes known. One that could not be resolved, such
+/// as a checkout that does not exist yet, keeps its own path. It is tried again
+/// once the sidebar lists a row at that path, which is how a checkout created
+/// later shows up. A deleted checkout gets no row and is not tried again. A
+/// symbolic link retargeted under a root that already resolved goes unseen.
+///
+/// Roots are only added; [`Self::clear`] is for tests.
+#[derive(Clone, Debug, Default)]
+pub(super) struct KnownWorktreeRoots {
+    roots: HashSet<PathBuf>,
+    canonical: CanonicalRoots,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CanonicalRoots {
+    /// Each resolved root under its canonical form, and each unresolved root
+    /// under its own path. Aliases of one directory share an entry.
+    roots: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Roots known since the last resolution.
+    pending: Vec<PathBuf>,
+    /// Roots that could not be resolved.
+    unresolved: HashSet<PathBuf>,
+    /// The [`WorktreePathIndex::generation`] that `unresolved` was last
+    /// checked against.
+    checked_rows: Option<u64>,
+    /// Whether the forms were taken for a remote device, where paths are
+    /// never resolved here.
+    remote: bool,
+    /// Counts resolutions, for tests to tell a cached form from a fresh one.
+    #[cfg(test)]
+    resolutions: usize,
+}
+
+impl KnownWorktreeRoots {
+    /// Adds `root`, returning whether it was new.
+    pub(super) fn insert(&mut self, root: PathBuf) -> bool {
+        if self.roots.contains(&root) {
+            return false;
+        }
+        self.canonical.pending.push(root.clone());
+        self.roots.insert(root)
+    }
+
+    /// Adds every path in `roots`, copying only those not yet known.
+    pub(super) fn extend_from_paths<'a>(&mut self, roots: impl IntoIterator<Item = &'a Path>) {
+        for root in roots {
+            if !self.roots.contains(root) {
+                self.insert(root.to_owned());
+            }
+        }
+    }
+
+    pub(super) fn contains(&self, root: &Path) -> bool {
+        self.roots.contains(root)
+    }
+
+    pub(super) fn iter(&self) -> std::collections::hash_set::Iter<'_, PathBuf> {
+        self.roots.iter()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The known roots by canonical form, resolving those known since the
+    /// last call and those still unresolved that `rows` now lists.
+    fn canonical(&mut self, rows: &WorktreePathIndex) -> &HashMap<PathBuf, Vec<PathBuf>> {
+        let remote = crate::device::is_remote();
+        let canonical = &mut self.canonical;
+        if canonical.remote != remote {
+            *canonical = CanonicalRoots {
+                pending: self.roots.iter().cloned().collect(),
+                remote,
+                ..CanonicalRoots::default()
+            };
+        }
+        let resolve = |root: &Path| {
+            if remote {
+                Some(root.to_owned())
+            } else {
+                root.canonicalize().ok()
+            }
+        };
+        for root in std::mem::take(&mut canonical.pending) {
+            #[cfg(test)]
+            {
+                canonical.resolutions += 1;
+            }
+            let form = resolve(&root).unwrap_or_else(|| {
+                canonical.unresolved.insert(root.clone());
+                root.clone()
+            });
+            canonical.roots.entry(form).or_default().push(root);
+        }
+        if canonical.checked_rows != Some(rows.generation()) {
+            canonical.checked_rows = Some(rows.generation());
+            let listed = canonical
+                .unresolved
+                .iter()
+                .filter(|root| rows.lists(root))
+                .cloned()
+                .collect::<Vec<_>>();
+            for root in listed {
+                #[cfg(test)]
+                {
+                    canonical.resolutions += 1;
+                }
+                let Some(form) = resolve(&root) else {
+                    continue;
+                };
+                canonical.unresolved.remove(&root);
+                if let Some(aliases) = canonical.roots.get_mut(&root) {
+                    aliases.retain(|alias| *alias != root);
+                    if aliases.is_empty() {
+                        canonical.roots.remove(&root);
+                    }
+                }
+                canonical.roots.entry(form).or_default().push(root);
+            }
+        }
+        &self.canonical.roots
+    }
+}
+
+impl Extend<PathBuf> for KnownWorktreeRoots {
+    fn extend<I: IntoIterator<Item = PathBuf>>(&mut self, roots: I) {
+        for root in roots {
+            self.insert(root);
+        }
+    }
+}
+
+impl FromIterator<PathBuf> for KnownWorktreeRoots {
+    fn from_iter<I: IntoIterator<Item = PathBuf>>(roots: I) -> Self {
+        let mut known = Self::default();
+        known.extend(roots);
+        known
+    }
+}
+
+impl<'a> IntoIterator for &'a KnownWorktreeRoots {
+    type Item = &'a PathBuf;
+    type IntoIter = std::collections::hash_set::Iter<'a, PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// The worktree rows' paths, indexed for `refresh_sidebar_worktree_panes`,
 /// which runs after nearly every update. Hashing a path walks its components,
 /// so with a long worktree list, building these maps on each pass cost more
@@ -83,7 +244,7 @@ enum PathSource {
 }
 
 fn path_sources<'a>(
-    known: &'a HashSet<PathBuf>,
+    known: &'a KnownWorktreeRoots,
     projects: &'a [SidebarProject],
 ) -> impl Iterator<Item = (PathSource, &'a Path)> {
     let known = known.iter().map(|root| (PathSource::Known, root.as_path()));
@@ -108,7 +269,7 @@ fn path_sources<'a>(
 
 impl WorktreePathIndex {
     /// Rebuilds the maps if the known roots or the rows changed.
-    pub(super) fn refresh(&mut self, known: &HashSet<PathBuf>, projects: &[SidebarProject]) {
+    pub(super) fn refresh(&mut self, known: &KnownWorktreeRoots, projects: &[SidebarProject]) {
         let unchanged = self
             .built_from
             .iter()
@@ -600,61 +761,60 @@ impl Cagents {
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
+    ///
+    /// The known roots keep their canonical forms between calls, so this
+    /// resolves only the directories of open panes and `selected`, not every
+    /// worktree the window has known.
     fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
-            .extend(self.sidebar_model.projects.iter().flat_map(|project| {
+            .extend_from_paths(self.sidebar_model.projects.iter().flat_map(|project| {
                 project
                     .worktrees
                     .iter()
-                    .map(|worktree| worktree.path.clone())
+                    .map(|worktree| worktree.path.as_path())
             }));
-        self.known_worktree_roots.extend(
+        self.known_worktree_roots.extend_from_paths(
             self.sidebar_model
                 .projects
                 .iter()
                 .filter(|project| project.kind == ProjectKind::Folder)
-                .map(|project| project.repository.clone()),
+                .map(|project| project.repository.as_path()),
         );
         self.known_worktree_roots
-            .extend(
+            .extend_from_paths(
                 self.durable
                     .cards
                     .iter()
                     .filter_map(|card| match &card.kind {
-                        CardKind::Repository(view) => Some(view.worktree.clone()),
+                        CardKind::Repository(view) => Some(view.worktree.as_path()),
                         _ => None,
                     }),
             );
-        let roots = self
-            .known_worktree_roots
-            .iter()
-            .map(|path| {
-                (
-                    path.as_path(),
-                    if crate::device::is_remote() {
-                        path.clone()
-                    } else {
-                        path.canonicalize().unwrap_or_else(|_| path.clone())
-                    },
-                    self.sidebar_model.worktree_at(path).is_some(),
-                )
-            })
-            .collect::<Vec<_>>();
+        self.worktree_paths
+            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        let index = &self.worktree_paths;
+        let roots = self.known_worktree_roots.canonical(index);
+        let remote = crate::device::is_remote();
+        // The nearest root among the canonical directory's ancestors; of two
+        // aliases of that root, the one Projects lists.
         let resolve = |directory: &Path| {
-            let canonical = if crate::device::is_remote() {
+            let canonical = if remote {
                 directory.to_path_buf()
             } else {
                 directory
                     .canonicalize()
                     .unwrap_or_else(|_| directory.into())
             };
-            roots
-                .iter()
-                .filter(|(_, root, _)| canonical.starts_with(root))
-                .max_by_key(|(_, root, visible)| (root.components().count(), *visible))
-                .map_or_else(|| canonical.clone(), |(root, _, _)| (*root).to_path_buf())
+            nearest_root(&canonical, |ancestor| {
+                roots
+                    .get(ancestor)?
+                    .iter()
+                    .max_by_key(|root| index.lists(root))
+                    .map(PathBuf::as_path)
+            })
+            .map_or_else(|| canonical.clone(), Path::to_path_buf)
         };
         let mut directories = HashMap::<&Path, PathBuf>::new();
         self.worktree_owners = self
@@ -2228,6 +2388,101 @@ mod tests {
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![editor.id]);
     }
 
+    /// A root is resolved once, when it becomes known. One that did not
+    /// exist yet is tried again only once Projects lists a row there, as it
+    /// does for a checkout created later; a deleted one is not tried again.
+    #[cfg(unix)]
+    #[test]
+    fn known_roots_resolve_once_and_again_when_a_row_lists_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(real.join("existing")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut known = KnownWorktreeRoots::from_iter([
+            alias.join("existing"),
+            alias.join("later"),
+            alias.join("deleted"),
+        ]);
+        let mut index = WorktreePathIndex::default();
+        let mut projects = Vec::new();
+        index.refresh(&known, &projects);
+        let roots = known.canonical(&index).clone();
+        assert_eq!(roots[&real.join("existing")], [alias.join("existing")]);
+        assert_eq!(roots[&alias.join("later")], [alias.join("later")]);
+        assert_eq!(roots[&alias.join("deleted")], [alias.join("deleted")]);
+        assert_eq!(known.canonical.resolutions, 3);
+
+        // Nothing new: every form is reused, even once the directory exists.
+        std::fs::create_dir_all(real.join("later")).unwrap();
+        index.refresh(&known, &projects);
+        known.canonical(&index);
+        assert_eq!(known.canonical.resolutions, 3);
+
+        // The checkout gains its row, so it is resolved; the deleted root,
+        // still without one, is not tried again.
+        projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            alias.join("existing"),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                alias.join("later"),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        ));
+        index.refresh(&known, &projects);
+        let roots = known.canonical(&index).clone();
+        assert_eq!(known.canonical.resolutions, 4);
+        assert_eq!(roots[&real.join("later")], [alias.join("later")]);
+        assert!(!roots.contains_key(&alias.join("later")));
+        assert_eq!(roots[&alias.join("deleted")], [alias.join("deleted")]);
+
+        // A newly known root is resolved alone.
+        std::fs::create_dir_all(real.join("new")).unwrap();
+        assert!(known.insert(alias.join("new")));
+        assert!(!known.insert(alias.join("new")));
+        index.refresh(&known, &projects);
+        let roots = known.canonical(&index).clone();
+        assert_eq!(known.canonical.resolutions, 5);
+        assert_eq!(roots[&real.join("new")], [alias.join("new")]);
+    }
+
+    /// Switching worktrees resolves only the panes' directories and the
+    /// selection, never the roots already known.
+    #[cfg(unix)]
+    #[test]
+    fn switching_worktrees_reuses_the_known_roots_canonical_forms() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let nested = root.join("worktrees/feature");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        let shell = terminal(nested.join("src").to_str().unwrap());
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(
+            &mut app,
+            &[root.to_str().unwrap(), nested.to_str().unwrap()],
+        );
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![shell.clone()].into(),
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_worktree(nested.clone(), false);
+        let resolved = app.known_worktree_roots.canonical.resolutions;
+        assert!(resolved >= 2, "both rows were resolved once");
+        let _ = app.select_worktree(root.clone(), false);
+        let _ = app.select_worktree(nested.clone(), false);
+        assert_eq!(app.known_worktree_roots.canonical.resolutions, resolved);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
+    }
+
     #[test]
     fn missing_worktree_is_not_a_navigation_row_but_its_session_remains_reachable() {
         let directory = tempfile::tempdir().unwrap();
@@ -2432,7 +2687,7 @@ mod tests {
             ),
         ];
         let folder_key = projects[0].folder_key().unwrap();
-        let mut known = HashSet::from([PathBuf::from("/known")]);
+        let mut known = KnownWorktreeRoots::from_iter([PathBuf::from("/known")]);
         let mut index = WorktreePathIndex::default();
         index.refresh(&known, &projects);
         index.refresh(&known, &projects);
