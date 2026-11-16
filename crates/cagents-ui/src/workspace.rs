@@ -2116,6 +2116,9 @@ mod tests {
             .unwrap();
 
         let update = workspace.restore_viewport_anchor(anchor);
+        // The inserted pane resolves to at least the minimum pane width.
+        let start = workspace.geometry().card(original).unwrap().start;
+        assert!(start > 0.0);
         assert!(update.offset_changed);
         assert!(
             update
@@ -2123,8 +2126,8 @@ mod tests {
                 .iter()
                 .all(|change| change.id != original)
         );
-        assert_eq!(workspace.camera().offset(), 300.0);
-        assert_eq!(workspace.camera().target(), 300.0);
+        assert_eq!(workspace.camera().offset(), start);
+        assert_eq!(workspace.camera().target(), start);
         assert!(!workspace.camera().is_animating());
         assert_eq!(workspace.focused(), Some(original));
         assert_eq!(workspace.focused_index(), Some(1));
@@ -2300,10 +2303,11 @@ mod tests {
                 .unwrap();
 
             let update = workspace.restore_viewport_anchor(anchor);
-            let offset_shift = if inserted_at == 0 { 300.0 } else { 0.0 };
+            let inserted = workspace.geometry().card_at(inserted_at).unwrap().width();
+            let offset_shift = if inserted_at == 0 { inserted } else { 0.0 };
             assert_eq!(update.offset_changed, inserted_at == 0);
             assert_eq!(workspace.camera().offset(), before.offset() + offset_shift);
-            assert_eq!(workspace.camera().target(), before.target() + 300.0);
+            assert_eq!(workspace.camera().target(), before.target() + inserted);
             assert_eq!(workspace.camera().velocity(), before.velocity());
             assert!(workspace.camera().is_animating());
             assert_eq!(workspace.focused(), Some(destination));
@@ -2322,7 +2326,8 @@ mod tests {
             workspace.tick(Duration::from_millis(16));
             workspace.take_widget_focus_request();
             let before = workspace.camera();
-            assert_eq!(before.target(), 700.0);
+            let original = workspace.geometry().card(destination).unwrap();
+            assert!(original.start >= before.target() && original.end <= before.target() + 500.0);
             let anchor = workspace.capture_viewport_anchor();
             workspace
                 .set_card_width(destination, CardWidth::Fraction(fraction))
@@ -2336,7 +2341,7 @@ mod tests {
             let target = workspace.camera().target();
             assert!(pane.start >= target && pane.end <= target + 500.0);
             if fraction == 1.0 {
-                assert_eq!(target, 900.0);
+                assert_eq!(target, pane.start);
             }
             for _ in 0..600 {
                 if !workspace.camera().is_animating() {

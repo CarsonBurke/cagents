@@ -9069,6 +9069,13 @@ mod tests {
                 saved[2].id,
             ))),
         );
+        // Its composer waits until the channel's shared panes are admitted.
+        assert!(app.workspace.cards().is_empty());
+        app.acknowledge_view_edit(
+            crate::workspace_model::views::Scope::Channel(saved[2].id),
+            None,
+        );
+        drop(app.reconcile_shared_views());
         let draft_card = app.workspace.focused().expect("the old composer opens");
         let target = match app.cards.get(&draft_card) {
             Some(CardRuntime::Chat(runtime)) => runtime.target,

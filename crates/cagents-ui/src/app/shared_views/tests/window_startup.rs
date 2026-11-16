@@ -113,14 +113,15 @@ fn joining_the_first_registry_keeps_the_selected_scope_default_intent() {
     drop(app.apply_workspace_model_update(
         super::super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
-    assert_eq!(
-        app.shared_views.deferred_default,
-        Some((Scope::Channel(channel), "/repo".into()))
-    );
-    assert!(app.workspace.cards().is_empty());
-    app.acknowledge_view_edit(Scope::Channel(channel), None);
-    drop(app.reconcile_shared_views());
-    assert!(app.chat_is_unused_default(app.workspace.focused().unwrap()));
+    // The snapshot's empty view admits the scope without a seed, so the
+    // intent survives joining and opens exactly one composer.
+    assert!(app.shared_views.deferred_default.is_none());
+    let card = app
+        .workspace
+        .focused()
+        .expect("the proven empty channel opens its composer");
+    assert!(app.chat_is_unused_default(card));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), [card]);
 }
 
 #[test]

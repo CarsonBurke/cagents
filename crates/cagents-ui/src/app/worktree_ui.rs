@@ -2180,6 +2180,9 @@ mod tests {
         let _ = app.select_worktree("/repo".into(), false);
         assert!(app.workspace.card(legacy.id).is_none());
         let _ = app.select_worktree("/other".into(), true);
+        // The default terminal waits until the new scope's shared panes load.
+        assert!(app.workspace.cards().is_empty());
+        acknowledge_empty_default_scope(&mut app);
         assert!(app.workspace.card(legacy.id).is_none());
         assert!(app.workspace.card(owned.id).is_none());
         let focused = app.card_state(app.workspace.focused().unwrap()).unwrap();
