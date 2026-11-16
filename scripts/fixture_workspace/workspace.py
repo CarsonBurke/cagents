@@ -245,14 +245,19 @@ class Planner:
         for view in shown:
             project = view["project"]
             live = self.live_worktrees(project)
+            chats = []
             for kind in slots[id(view)]:
                 worktree = view["worktree"]["path"] if view.get("worktree") else stream.choice(live)["path"]
                 card = self.new_card(stream, kind, project, worktree)
                 view["panes"].append(card["id"])
+                if kind == "chat":
+                    chats.append(card["id"])
                 if view.get("channel"):
                     view["channel"]["cards"].append(card["id"])
             if view.get("channel") and view["panes"]:
-                view["channel"]["focused"] = view["panes"][0]
+                # A seeded terminal has no hosted process, so it opens as a
+                # failure; a conversation is what a window usually shows first.
+                view["channel"]["focused"] = (chats or view["panes"])[0]
         for demand, project in zip(demands, projects):
             chats = [c for c in self.cards if c["project"] == project["id"] and c["kind"]["type"] == "chat"]
             while len(chats) < demand:
@@ -489,7 +494,10 @@ class Planner:
         closed_scoped = [c for c in scoped if c["closed_at_ms"] is not None]
         card_scopes = [c["id"] for c in panes] + [c["id"] for c in stream.sample(
             closed_scoped, min(len(closed_scoped), max(0, len(self.cards) // 9)))]
-        channel_with_panes = [c for c in self.channels if c["cards"]]
+        kinds = {c["id"]: c["kind"]["type"] for c in self.cards}
+        # The window opens on a conversation where one exists (see above).
+        channel_with_panes = sorted((c for c in self.channels if c["cards"]),
+                                    key=lambda c: kinds[c["focused"]] != "chat")
         live = [w for p in self.projects for w in p["worktrees"] if not w["removed"]]
         focus = {}
         for worktree in live:

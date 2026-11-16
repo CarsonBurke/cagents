@@ -222,10 +222,13 @@ live process is absent:
 | Conversation history the resume reader reads from the providers' files | A seeded chat card's history when a window opens, which needs a daemon that hosted it |
 
 The Claude transcripts read back through the app's resume reader with the
-messages `plan.json` counts, which the Rust tests check for every intact one.
-A seeded chat card does not show its history when a window opens (see the
-launch environment above). `check-codex` below verifies the rollouts a real
-`codex` reads.
+messages `plan.json` counts, which the Rust tests check for every intact one. A
+seeded chat card does not show its history when a window opens (see the launch
+environment above). A seeded terminal card has no hosted process, so its pane
+opens as "Terminal unavailable" with Retry and Close, as a saved terminal does
+when its host is gone. Each channel therefore focuses a conversation where it
+holds one, and the primary window opens on such a channel. `check-codex` below
+verifies the rollouts a real `codex` reads.
 
 ## Other commands
 
