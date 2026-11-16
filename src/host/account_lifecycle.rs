@@ -255,10 +255,6 @@ fn physical_ancestors_for_start(
 
 /// Resolve aliases even for a not-yet-created descendant without interpreting
 /// `..` through a missing directory. Missing-home cleanup remains possible.
-fn normalize(path: &Path) -> Result<PathBuf, String> {
-    normalize_for_start(path).map_err(|error| error.to_string())
-}
-
 fn normalize_for_start(path: &Path) -> Result<PathBuf, SetupError> {
     if !path.is_absolute()
         || path

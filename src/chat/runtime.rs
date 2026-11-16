@@ -1660,10 +1660,6 @@ pub(crate) fn preflight_for_start(
 /// Only an authenticated retained server can restore its read-only connection
 /// after the original directory was removed. Authorizing commands still check
 /// the retained execution policy in the actor before any provider write.
-pub(crate) fn preflight_retained(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
-    preflight_retained_for_start(spec, initial).map_err(|error| error.to_string())
-}
-
 pub(crate) fn preflight_retained_for_start(
     spec: &ProcessSpec,
     initial: &mut Step,

@@ -141,13 +141,14 @@ pub(crate) struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Pin the selected directory before an ordinary native provider starts.
-    /// The descriptor remains authoritative after a same-filesystem move;
-    /// opening a replacement at the old spelling never changes its identity.
+    #[cfg(test)]
     pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
         Self::capture_for_start(path).map_err(|error| error.to_string())
     }
 
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
     pub(crate) fn capture_for_start(path: &std::path::Path) -> Result<Self, SetupError> {
         use std::os::unix::fs::OpenOptionsExt;
         let relative = path.strip_prefix("/").map_err(|_| {
