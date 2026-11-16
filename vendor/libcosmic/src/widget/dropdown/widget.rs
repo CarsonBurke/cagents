@@ -785,9 +785,10 @@ pub fn update<
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
         | Event::Touch(touch::Event::FingerPressed { .. }) => {
             let is_open = state.is_open.load(Ordering::Relaxed);
+            // Any press is the pointer's: the ring returns with the keyboard.
+            state.focus_visible = false;
             if !cursor.is_over(layout.bounds()) {
                 state.focused = false;
-                state.focus_visible = false;
             }
             if is_open {
                 // Event wasn't processed by overlay, so cursor was clicked either outside it's
@@ -801,7 +802,6 @@ pub fn update<
                 shell.capture_event();
             } else if cursor.is_over(layout.bounds()) {
                 state.focused = !selections.is_empty();
-                state.focus_visible = false;
                 open(shell, state, on_selected);
                 shell.capture_event();
             }
