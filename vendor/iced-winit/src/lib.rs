@@ -977,6 +977,8 @@ async fn run_instance<P>(
         };
     }
 
+    let frame_clock = crate::runtime::frame::Clock::new();
+
     'next_event: loop {
         // Empty the queue if possible
         let event = if let Ok(event) = event_receiver.try_recv() {
@@ -988,6 +990,7 @@ async fn run_instance<P>(
         let Some(event) = event else {
             break;
         };
+        let _handling = frame_clock.as_ref().map(crate::runtime::frame::Clock::handling);
 
         match event {
             Event::WindowCreated {
@@ -1386,6 +1389,9 @@ async fn run_instance<P>(
                 ) {
                     Ok(()) => {
                         present_span.finish();
+                        if let Some(clock) = &frame_clock {
+                            clock.presented();
+                        }
                     }
                     Err(error) => match error {
                         compositor::SurfaceError::OutOfMemory => {

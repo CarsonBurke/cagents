@@ -107,9 +107,6 @@ impl Registry {
             view.panes
                 .insert(saved.ordinal.min(view.panes.len()), saved.pane.clone());
             view.revision = super::views::store::next_revision(&transaction)?;
-            // Retiring the old pane removed its placement generation. This is
-            // a new canonical insertion, so issue its epoch in this same TX.
-            super::channel_work::placement::observe_view_transition(&transaction, &before, &view)?;
             super::views::store::store(&transaction, &view)?;
             super::views::bindings::sync(&transaction, &before, &view)?;
             super::terminal_retention::sync_view_pins(&transaction, &view.panes)?;
@@ -232,8 +229,6 @@ mod tests {
 
     fn store_view(db: &Connection, view: &View) {
         let tx = db.unchecked_transaction().unwrap();
-        let before = super::super::views::read(&tx, &view.scope).unwrap();
-        super::super::channel_work::placement::observe_view_transition(&tx, &before, view).unwrap();
         super::super::views::store::store(&tx, view).unwrap();
         super::super::terminal_retention::sync_view_pins(&tx, &view.panes).unwrap();
         tx.commit().unwrap();

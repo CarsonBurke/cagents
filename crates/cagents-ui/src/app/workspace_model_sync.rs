@@ -1071,17 +1071,7 @@ impl Cagents {
                 .is_some_and(|identity| identity != self.workspace_model.identity),
             _ => false,
         };
-        // Channel work is no longer shown, and its independent invalidation
-        // never advances the canonical model watermark: it projects nothing.
-        if foreign
-            || matches!(
-                &update,
-                ModelUpdate::Changed {
-                    edit: ModelEdit::ChannelWorkChanged { .. },
-                    ..
-                }
-            )
-        {
+        if foreign {
             return (Task::none(), Projection::Unchanged);
         }
         match self.presentation_scope_for_update(&update) {
@@ -1685,12 +1675,6 @@ impl Cagents {
         edit: ModelEdit,
         changes: Option<EdgeChanges>,
     ) -> Task<Message> {
-        // Channel-work is no longer shown and its independent invalidation
-        // never advances the canonical model watermark.
-        if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
-            return Task::none();
-        }
-
         if sequence <= self.workspace_model.sequence {
             // A snapshot overtook this edge, so its channel and agent rows are
             // older than the window's. A view the observer read for it can
@@ -7857,7 +7841,7 @@ mod tests {
         // Untitled: a name the person gave would keep it.
         let mut model = registry(vec![shared(channel, &repository, "", 0)]);
         model.views.push(View::empty(channel));
-        let home = crate::channel_work::Home {
+        let home = crate::workspace_model::ChannelIncarnation {
             registry: model.identity,
             channel,
             creation_ordinal: 0,

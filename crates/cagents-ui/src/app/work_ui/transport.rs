@@ -1,6 +1,5 @@
 //! Preserve the original UI request context before any resolver, future or
-//! watcher thread. Work envelopes use connection authentication, unlike the
-//! separate explicit-authority ChannelWork API.
+//! watcher thread. Work envelopes use connection authentication.
 use super::super::request_failure::{Activity, Failure};
 use crate::{agent_execution::Authority, control::ControlClient};
 use std::path::{Path, PathBuf};

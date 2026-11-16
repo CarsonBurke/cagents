@@ -2471,6 +2471,15 @@ struct WindowView {
     context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
     worktree_offsets: HashMap<PathBuf, f32>,
+    /// Each channel's strip offset. Absent from a window saved before
+    /// channels kept their own.
+    #[serde(default)]
+    channel_offsets: HashMap<crate::model::ChannelId, f32>,
+    /// Absent from a window saved before Settings kept its page.
+    #[serde(default, deserialize_with = "sidebar::known_or_default")]
+    settings_category: Option<SettingsCategory>,
+    #[serde(default)]
+    settings_search: String,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -2558,7 +2567,7 @@ async fn flush_workspace(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SettingsCategory {
     Notifications,
     General,
@@ -5842,6 +5851,66 @@ impl Cagents {
             bootstrap,
             window_view,
         })
+    }
+
+    /// Restore this window's saved presentation around its saved scope.
+    /// Strip offsets must be known before the scope binds its camera, and
+    /// binding the scope's source control clears the panel's disclosures, so
+    /// the sidebar view is applied after that first binding.
+    /// `scope_project` is the project whose worktree record holds the saved
+    /// scope. The record outlives the worktree's sidebar row, so a removed
+    /// worktree can still fall back to its own project.
+    fn restore_window_view(
+        &mut self,
+        view: Option<WindowView>,
+        scope_project: Option<ProjectId>,
+    ) -> Task<Message> {
+        if let Some(view) = &view {
+            self.worktree_offsets.clone_from(&view.worktree_offsets);
+            self.channel_offsets.clone_from(&view.channel_offsets);
+        }
+        let saved_scope = (
+            self.durable.active_worktree.clone(),
+            self.durable.active_channel,
+        );
+        let scope = self.restore_workspace_scope(view.is_some(), scope_project);
+        let Some(view) = view else {
+            return scope;
+        };
+        // Binding the restored scope cleared the panel's worktree-local
+        // state, which the view now puts back, but only when the window
+        // came back to the worktree that state was saved for.
+        let kept_scope = match saved_scope {
+            (_, Some(channel)) => self.durable.active_channel == Some(channel),
+            (worktree, None) => {
+                self.durable.active_channel.is_none() && self.durable.active_worktree == worktree
+            }
+        };
+        self.sidebar_state.restore_view(if kept_scope {
+            view.sidebar
+        } else {
+            view.sidebar.without_worktree_panel()
+        });
+        if let Some(category) = view.settings_category {
+            self.settings_category = category;
+        }
+        self.settings_search = view.settings_search;
+        // The first read was built before the view restored its file filter
+        // and open folders, so it would list neither.
+        let reload = match self.sidebar_state.active_worktree().cloned() {
+            Some(key)
+                if !self.sidebar_state.files_query().is_empty()
+                    || self
+                        .sidebar_state
+                        .expanded_directory_paths()
+                        .next()
+                        .is_some() =>
+            {
+                self.reload_source_control(&key)
+            }
+            _ => Task::none(),
+        };
+        Task::batch([scope, reload])
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -14090,10 +14159,14 @@ impl Cagents {
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
+            channel_offsets: self.channel_offsets.clone(),
+            settings_category: Some(self.settings_category),
+            settings_search: self.settings_search.clone(),
         };
-        if self.durable.active_channel.is_none()
-            && let Some(path) = &self.active_workspace
-        {
+        if let Some(channel) = self.durable.active_channel {
+            view.channel_offsets
+                .insert(channel, self.workspace.camera().offset());
+        } else if let Some(path) = &self.active_workspace {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
@@ -14759,6 +14832,12 @@ impl Application for Cagents {
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
         let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
+        let scope_project = durable.active_worktree.as_ref().and_then(|scope| {
+            worktrees
+                .iter()
+                .find(|worktree| worktree.path == *scope)
+                .map(|worktree| worktree.project_id)
+        });
         if let Some(session) = &session {
             session.save_worktrees(retired);
         }
@@ -15054,10 +15133,6 @@ impl Application for Cagents {
         for warning in restore_warnings.into_iter().chain(settings_warnings) {
             app.notices.record(TransientNotice::warning(warning));
         }
-        if let Some(view) = window_view {
-            app.sidebar_state.restore_view(view.sidebar);
-            app.worktree_offsets = view.worktree_offsets;
-        }
         app.sidebar_state
             .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
@@ -15109,7 +15184,7 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
-        let scope = app.restore_worktree_scope();
+        let scope = app.restore_window_view(window_view, scope_project);
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
             let terminal = match &card.kind {
@@ -16085,6 +16160,11 @@ impl Application for Cagents {
                     if let CardRuntime::Repository(runtime) = runtime {
                         tasks.push(repository_task(runtime.reconcile_operation_recovery(*card)));
                     }
+                }
+                // Recovery can release a clean editor's last close barrier
+                // without producing another repository event.
+                if !self.project_ui.closing.is_empty() {
+                    tasks.push(self.complete_closed_projects());
                 }
                 Task::batch(tasks)
             }
@@ -26824,10 +26904,8 @@ mod tests {
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
     }
 
-    /// Workspace previews freeze visit order until Alt is released, including
-    /// channel identities that share their project's worktree directory.
-    #[test]
-    fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
+    /// A channel and a repository with two worktrees, each holding a terminal.
+    fn alt_tab_test_app() -> (Cagents, crate::model::ChannelId) {
         use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
 
@@ -26878,6 +26956,66 @@ mod tests {
             Vec::new(),
         ));
         app.refresh_sidebar_channels();
+        (app, channel)
+    }
+
+    /// Committing a switcher choice is navigation, saved within
+    /// [`NAVIGATION_SAVE_DELAY`] like a sidebar click rather than at once on
+    /// the UI thread, and the deferred save carries the visit order.
+    #[test]
+    fn committing_a_switcher_choice_saves_with_the_navigation_burst() {
+        use super::terminal_output_tests::persists;
+        use keyboard::key::{Code, Named};
+
+        let (mut app, _) = alt_tab_test_app();
+        let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
+        for destination in &destinations {
+            drop(app.update(Message::Sidebar(destination.clone())));
+        }
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(app.navigation_save.is_none());
+        let saved = persists();
+        let previous = app.active_workspace_destination();
+
+        let alt = keyboard::Modifiers::ALT;
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(Named::Tab),
+                modified_key: keyboard::Key::Named(Named::Tab),
+                physical_key: keyboard::key::Physical::Code(Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers: alt,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        }));
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            captured: false,
+        }));
+        drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+        let chosen = app.active_workspace_destination();
+        assert_ne!(chosen, previous, "the switcher opened its choice");
+        assert_eq!(persists(), saved, "the switch waits for the burst's save");
+        assert_eq!(app.navigation_save, Some(DeferredSave::Views));
+
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+        assert!(app.navigation_save.is_none());
+        assert_eq!(
+            app.durable.workspace_history.first().copied(),
+            chosen,
+            "the saved history leads with the workspace chosen"
+        );
+    }
+
+    /// Workspace previews freeze visit order until Alt is released, including
+    /// channel identities that share their project's worktree directory.
+    #[test]
+    fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
+        let (mut app, channel) = alt_tab_test_app();
 
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
         let root = workspace_destination(&destinations[1]).unwrap();
@@ -28078,6 +28216,14 @@ mod tests {
             assert_eq!(runtime(&app, reopened).navigation(), None);
             assert_eq!(runtime(&app, source).navigation(), original_navigation);
         }
+    }
+
+    mod window_restore {
+        include!("app/window_restore_tests.rs");
+    }
+
+    mod home_admission {
+        include!("app/home_admission_tests.rs");
     }
 
     mod repository_clone_lsp_ownership {

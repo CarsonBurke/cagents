@@ -37,7 +37,8 @@ older window or daemon is still refused at its handshake, which is how a stale w
 that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
-`automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+`automation run-now` on protocols before 156. It also refuses `channel work`, which
+protocol 185 retired; the Work board (`cagents work`) tracks pull requests. It withholds notifications the CLI couldn't read.
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.

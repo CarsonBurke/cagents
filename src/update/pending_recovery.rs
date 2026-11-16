@@ -95,6 +95,7 @@ pub(crate) fn run(
         message: "Recovering retained owners without starting providers".into(),
         log_path,
         confirmation: None,
+        refusal: None,
     };
     write_job(&state, &job)?;
     let result = (|| {

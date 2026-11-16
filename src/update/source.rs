@@ -675,6 +675,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         183,
         "intermediate #2798 protocol; superseded by 184 without a qualified installed update source",
     ),
+    (
+        184,
+        "intermediate #2621 protocol; superseded by 185 without a qualified installed update source",
+    ),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {

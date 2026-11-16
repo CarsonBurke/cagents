@@ -341,6 +341,7 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
                 message: String::new(),
                 log_path: root.join("worker.log"),
                 confirmation: None,
+                refusal: None,
             },
         )
     }

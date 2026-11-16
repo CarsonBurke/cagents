@@ -338,6 +338,23 @@ pub(super) fn same_prompt(provider: Provider, left: Option<&str>, right: Option<
     }
 }
 
+/// Whether message `incoming` starts a group of its own after the typed
+/// prompt `typed`: a notice retained for `typed` is drawn after that prompt's
+/// group, so `incoming` would otherwise read as coming before it. Parts of
+/// the same message still share their prompt.
+pub(super) fn separates_prompt(
+    provider: Provider,
+    notes: &[Note],
+    typed: &str,
+    incoming: &str,
+) -> bool {
+    notes.iter().any(|note| {
+        let message = note.message.as_deref();
+        same_prompt(provider, message, Some(typed))
+            && !same_prompt(provider, message, Some(incoming))
+    })
+}
+
 /// The prompt items in `turn` that the reader typed, not deliveries.
 fn typed_prompt<'a>(runtime: &'a Runtime, turn: &'a turn::Turn) -> impl Iterator<Item = &'a str> {
     turn.prompt.iter().filter_map(|index| {
@@ -2652,7 +2669,7 @@ mod tests {
         publish_error(&mut runtime, &handle, raw);
         let first_note = runtime.failures[0].clone();
 
-        // A changed error after B joins the same visual turn must not replace A.
+        // A changed error in B's later group must not replace A's retained warning.
         publish(&mut runtime, &handle, |next| {
             next.items.push(Arc::new(text(
                 &part(provider, b, 0),
@@ -2665,7 +2682,7 @@ mod tests {
                 "Synthetic verification failure",
             ));
         });
-        assert_eq!(runtime.turns.len(), 1);
+        assert_eq!(runtime.turns.len(), 2);
         assert_eq!(runtime.failures.len(), 2);
         assert_eq!(runtime.failures[0], first_note);
         let active = |runtime: &Runtime, index: usize| {

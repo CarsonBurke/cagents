@@ -947,7 +947,7 @@ fn public_move_refuses_cross_project_before_editing() {
 }
 
 #[test]
-fn public_classification_and_staged_routing_preserve_reads_users_and_channel_work() {
+fn public_classification_and_staged_routing_preserve_reads_and_users() {
     let fixture = Fixture::new();
     let scoped = ProjectChannelContext {
         authority: Authority::session("fixture-staged-scope".into()),
@@ -977,20 +977,6 @@ fn public_classification_and_staged_routing_preserve_reads_users_and_channel_wor
     for args in [
         vec!["project".into(), "list".into()],
         vec!["channel".into(), "list".into()],
-        vec![
-            "channel".into(),
-            "work".into(),
-            "context".into(),
-            "--channel".into(),
-            fixture.source.to_string(),
-        ],
-        vec![
-            "channel".into(),
-            "work".into(),
-            "show".into(),
-            "--limit".into(),
-            "2".into(),
-        ],
     ] {
         let cli = parse(&args);
         assert!(!legacy_model_command_mutates(&cli.command));
@@ -1000,22 +986,7 @@ fn public_classification_and_staged_routing_preserve_reads_users_and_channel_wor
         );
         match cli.command {
             TopCommand::Project { command } => assert!(!project_command_mutates(&command)),
-            TopCommand::Channel {
-                command: ChannelCommand::Work { command },
-            } => {
-                assert!(matches!(
-                    command,
-                    channel_work::WorkCommand::Context { .. }
-                        | channel_work::WorkCommand::Show { .. }
-                ));
-                // This classification tests the separate public route; actual
-                // ChannelWork authority is carried by its unchanged dispatcher.
-                let work = ChannelCommand::Work { command };
-                assert_eq!(channel_command_mutates(&work), None);
-            }
-            TopCommand::Channel { command } => {
-                assert_eq!(channel_command_mutates(&command), Some(false))
-            }
+            TopCommand::Channel { command } => assert!(!channel_command_mutates(&command)),
             _ => unreachable!(),
         }
     }
