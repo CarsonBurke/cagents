@@ -5276,6 +5276,44 @@ impl TerminalRedraw {
     }
 }
 
+/// How long one redraw broadcast holds the host lock, for the opt-in
+/// `cagents::terminal_pipeline` trace. Disabled, it reads no clock.
+struct HostHold {
+    enabled: bool,
+    since: Option<Instant>,
+    held: Duration,
+}
+
+impl HostHold {
+    fn new() -> Self {
+        Self {
+            enabled: tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE),
+            since: None,
+            held: Duration::ZERO,
+        }
+    }
+
+    fn acquired(&mut self) {
+        if self.enabled {
+            self.since = Some(Instant::now());
+        }
+    }
+
+    fn released(&mut self) {
+        if let Some(since) = self.since.take() {
+            self.held += since.elapsed();
+        }
+    }
+
+    /// Records one sample per broadcast that sent at least one frame.
+    fn report(&self, frames: usize) {
+        if self.enabled && frames > 0 {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "redraw_host_lock",
+                elapsed_ns = self.held.as_nanos() as u64, frames);
+        }
+    }
+}
+
 /// Publishes a repaint to every visible subscriber of this exact worker.
 ///
 /// A subscriber for which the daemon already recorded the exact capture it last
@@ -5303,8 +5341,10 @@ fn broadcast_redraw(
         return;
     };
     let mut pending = Vec::new();
+    let mut hold = HostHold::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        hold.acquired();
         // Retirement does not drain queued callbacks. Validate the original
         // worker under the same lock as visibility, viewport and capture work;
         // an earlier identity check could race a same-ID replacement.
@@ -5384,7 +5424,14 @@ fn broadcast_redraw(
                 pending.push((delivery, Outbound::broadcast(&proof, message)));
             }
         }
+        hold.released();
     }
+    hold.report(
+        pending
+            .iter()
+            .filter(|(_, message)| matches!(message.message, ServerMessage::Snapshot { .. }))
+            .count(),
+    );
     for (delivery, message) in pending {
         let _ = delivery.push(message);
     }
