@@ -29,6 +29,24 @@ fn scrolled_body<'a, M: 'a>(
         .into()
 }
 
+/// A list inside a dialog's body that scrolls on its own once it is taller
+/// than `max_height`, fading into the dialog at its edges. Like the body
+/// around it, it keeps the dialog's text color.
+pub(crate) fn scrolled_region<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    max_height: f32,
+) -> Element<'a, M> {
+    widget::container(crate::interaction::overflow_fade_y(
+        widget::scrollable(scrolled_body(content, Padding::ZERO)).direction(
+            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
+        ),
+        design::dialog_base,
+    ))
+    .max_height(max_height)
+    .class(cosmic::theme::Container::custom(|_| Default::default()))
+    .into()
+}
+
 /// A [`surface`] whose whole body scrolls when the window is too short for
 /// it. `height` is the dialog's own: `Shrink` to fit its content, or `Fill`
 /// to take `max_height` whatever it holds.

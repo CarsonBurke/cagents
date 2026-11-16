@@ -881,24 +881,9 @@ impl Cagents {
         )
         .spacing(space::S);
         let (cascade, note) = self.group_cascade(dialog);
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            design::title(title).into(),
-            widget::container(crate::interaction::overflow_fade_y(
-                widget::scrollable(
-                    members.padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                )),
-                design::dialog_base,
-            ))
-            .max_height(240)
-            .into(),
-        ];
-        if let Some(cascade) = cascade {
-            rows.push(super::notice_body(cascade));
-        }
-        rows.push(super::notice_detail(note));
+        // What stops the deletion comes before the members, so a short window
+        // that scrolls the rest still shows why Delete is unavailable.
+        let mut rows: Vec<Element<'_, Message>> = vec![design::title(title).into()];
         let blocked = blockers.iter().filter(|blocker| blocker.is_some()).count();
         if blocked > 0 {
             let verb = match kind {
@@ -916,6 +901,11 @@ impl Cagents {
         if let Some(error) = &dialog.error {
             rows.push(super::notice_body(error.as_str()));
         }
+        rows.push(dialog_ui::scrolled_region(members, 240.0));
+        if let Some(cascade) = cascade {
+            rows.push(super::notice_body(cascade));
+        }
+        rows.push(super::notice_detail(note));
         let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(close_focus_id())
