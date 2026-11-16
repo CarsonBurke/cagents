@@ -81,6 +81,27 @@ and its admission apply exactly as they do to the commands below. No task
 combines the `host` and `ui` features, and none is cached by mise: Cargo decides
 what is stale, and a native run is never a build artifact.
 
+The lane tasks (`check:cli`, `check:host`, `check:ui`, `check:browser`,
+`check:editor` and the three `test:*` lanes) run the gate through
+`scripts/cargo-lane`, which holds the workspace's crates to the rule [main's
+build check](#watching-main-after-merges) applies: a warning from one fails the
+task. It reads Cargo's JSON messages, which the gate relays from the build host,
+and prints diagnostics as Cargo renders them, with two differences. A workspace
+crate's warning shows once, however many targets report it, and a closing line
+counts them and names where the first ten are; when Cargo otherwise succeeded,
+the task then exits 1. The vendored `[patch]` crates' warnings, over two hundred
+in the UI lanes, are counted on one line and not shown;
+`CAGENTS_VENDORED_WARNINGS=1` shows them. Errors show from every crate, Cargo's
+own status wins, and a signal reaches the gate, which cancels its build as
+before. Requesting JSON messages makes no unit stale, and Cargo replays a fresh
+unit's warnings, so a check that compiles nothing still fails on a warning it
+reported before. An explicit JSON `--message-format` passes through unfiltered,
+as does a format Cargo would refuse; `short` stays short. The matched `cagentsd`
+a HOST test build first builds shows its errors but not its warnings, which the
+tests' own build reports for what it compiles; `check:host` covers the daemon's
+whole build. Both the task and the sentinel judge a warning with
+`scripts/cargo_warnings.py`.
+
 The scripts remain the lower-level entry points, documented in the sections
 below, for options a task does not forward, other build profiles, and callers
 that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
@@ -720,7 +741,9 @@ The sentinel neither merges nor modifies another checkout or native session.
 A lane fails when it does not compile or when a workspace crate prints a
 warning; it reads Cargo's JSON messages to tell the workspace's crates, the
 checked commit's `[workspace] members`, from vendored path dependencies, whose
-warnings do not count. Its logs hold Cargo's rendered diagnostics, and
+warnings do not count. The lane tasks apply the same rule with the same code,
+`scripts/cargo_warnings.py`, so the rule an author checks a branch against is
+the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
