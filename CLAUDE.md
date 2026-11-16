@@ -46,7 +46,7 @@ You are a senior app developer tasked with creating a great Agent Development En
   - daemon/terminal host: `mise run check:host -- --bin cagentsd`
   - browserless UI: `mise run check:ui -- --bin cagents-ui`
   - integrated UI: `mise run check:browser`
-- The application (`src/app` and the other UI-only modules) is the `cagents-ui` package in `crates/cagents-ui`; the root package is the shared library with the `cagents` and `cagentsd` binaries. The `ui` and `browser` tasks select it with `-p cagents-ui`; a direct Cargo command must too.
+- The application (`crates/cagents-ui/src/app` and the other UI-only modules) is the `cagents-ui` package in `crates/cagents-ui`; the root package is the shared library with the `cagents` and `cagentsd` binaries. The `ui` and `browser` tasks select it with `-p cagents-ui`; a direct Cargo command must too.
 - The default `full` feature selects production identity only. `ui`, `host`, and
   `integrated-browser` select implementation graphs; never reunify `ui` and
   `host` in one Cargo invocation just to shorten a command.
