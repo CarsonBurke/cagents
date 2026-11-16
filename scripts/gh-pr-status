@@ -458,16 +458,21 @@ def output(saved, key, as_json):
     if snapshot:
         snapshot = {**snapshot, "checks": [reported_check(check) for check in snapshot.get("checks", [])]}
     partial = not snapshot or (not snapshot["checks_complete"] and not snapshot["checks"])
+    bootstrap = "Single REST bootstrap read; CI and review decision are unknown."
+    # The CLI's REST read, made while GraphQL is rate limited, knows CI but
+    # not the review decision; it is no reason to treat CI as unknown.
+    known = [] if partial or (snapshot or {}).get("transport") != "rest" else [
+        "Read through REST while GitHub GraphQL is rate limited; the review decision is unknown."]
     report = {"target": key, "source": "rest-bootstrap" if partial else "cache", "snapshot": snapshot,
               "fetched_at": fetched, "age_seconds": at - fetched if fetched else None,
               "stale": failed or fetched is None or at - fetched >= REFRESH,
               "error": saved.get("error"), "retry_at": saved.get("next_attempt")
               if saved.get("next_attempt", 0) > at else None,
-              "outcome": "failed" if failed else "succeeded"}
+              "outcome": "failed" if failed else "succeeded",
+              "limitations": [bootstrap] if partial else known}
     if as_json:
         print(json.dumps({"ok": True, "command": "gh.pr_status", "data": report,
-                          "limitations": ["Single REST bootstrap read; CI and review decision are unknown."]
-                          if partial else []}))
+                          "limitations": [bootstrap] if partial else []}))
     else:
         pr = (report["snapshot"] or {}).get("pull_request", {})
         print(f'{authority(key)}/{key["repository"]["owner"]}/{key["repository"]["name"]} #{key["number"]}: '

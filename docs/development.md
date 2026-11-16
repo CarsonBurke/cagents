@@ -1735,6 +1735,28 @@ for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability
 after a push, which the snapshot reports as `UNKNOWN`. No reported checks means unknown, not passing. Enterprise repositories also accept `--hostname HOST`.
 
+While GraphQL is in a primary cooldown of its own and REST (`core`) is not,
+the CLI reads through REST instead of waiting for the GraphQL reset: `pulls/N`
+for head and merge state, then `check-runs`, `check-suites` and `status` for
+that head, one page of 100 each. That is still the PR's one shared read in its
+two-minute interval; a request that fails, or whose headers spend the quota or
+ask for a pause, ends it with nothing published and no retry. Its pause is
+recorded for its resource, so a GraphQL reset never delays REST, and a read
+with both paused waits for the earlier one. These snapshots carry
+`transport: "rest"`, and `data.limitations` says the review decision is
+unknown; `reviewDecision` is null. REST has no aggregate, so the CLI derives
+`checks_state` itself: `FAILURE` when any context failed, or a GitHub Actions
+workflow failed before creating any job; `SUCCESS` only when every list is complete, every listed context
+passed and every workflow has finished; `PENDING` otherwise, including when a
+list has more than 100 entries (`checks_complete=false`) or a workflow has not
+yet created its check runs; and null when nothing at all was reported. Suites
+that installed apps leave queued with no check runs are ignored, as GitHub's
+own pages ignore them. A finished suite with check runs is judged by its runs,
+each the latest of its name, so a cancelled run that was rerun does not fail
+CI. Cache entries an earlier CLI paused until the GraphQL reset give way to
+this choice once their two-minute interval has passed. `scripts/land-pr` reads these like GraphQL snapshots,
+since it decides on CI alone.
+
 To clear bootstrap artifacts, first ensure no status command or builder is
 running. Remove only inactive `gh-pr-status-*` worktrees with `git worktree
 remove`, then remove the `gh-pr-status/` directory under the Git common dir.
@@ -1860,6 +1882,12 @@ shared cache can refresh, about every two minutes, or later when `retry_at`
 says so. Unknown or missing checks count as not passed. A read from before the
 head was known, or one that has not yet caught up with the script's own push,
 cannot report that the head moved.
+When GitHub refuses the merge because `main` moved while it was merging
+(`Base branch was modified`, HTTP 405), it reads the PR again after a short
+pause: a conflict now takes the conflict path above, and otherwise it merges
+once more at the same head. If that merge finds the PR not mergeable, the
+conflict GitHub was still computing takes the conflict path too. A second
+`Base branch was modified` refusal stops the landing.
 
 Per the merge policy, it does not bring the branch up to date with `main`
 merely because `main` moved, and it compiles nothing. When the branch

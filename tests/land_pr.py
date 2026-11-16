@@ -34,6 +34,15 @@ branch = pr["head"]["ref"]
 head = origin("rev-parse", "refs/heads/" + branch).strip()
 if args[:3] == ["api", "-X", "PUT"]:
     fields = dict(value.split("=", 1) for value in args[5::2])
+    queued = root / "merge-errors.json"  # One refusal per merge attempt, then success.
+    errors = json.loads(queued.read_text()) if queued.exists() else []
+    if errors:
+        error = errors.pop(0)
+        queued.write_text(json.dumps(errors))
+        if error.get("dirty"):  # GitHub sees the moved main conflict from now on.
+            (root / "pr.json").write_text(json.dumps({**pr, "mergeable_state": "dirty"}))
+        print(error["error"], file=sys.stderr)
+        sys.exit(1)
     if (root / "merge-error").exists():
         print((root / "merge-error").read_text(), file=sys.stderr)
         sys.exit(1)
@@ -80,9 +89,10 @@ checks = answer.get("checks", [{"__typename": "CheckRun", "name": "contracts",
                                 "status": "COMPLETED", "conclusion": "SUCCESS"}])
 print(json.dumps({"ok": True, "data": {
     "snapshot": {"pull_request": pr, "checks_state": answer.get("ci", "SUCCESS"), "checks": checks,
-                 "checks_complete": answer.get("complete", True)},
+                 "checks_complete": answer.get("complete", True),
+                 "transport": answer.get("transport", "graphql")},
     "fetched_at": int(time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
-    "error": None},
+    "error": None, "limitations": answer.get("data_limitations", [])},
     "limitations": answer.get("limitations", [])}))
 '''
 
@@ -442,6 +452,77 @@ class LandTests(unittest.TestCase):
     def test_aggregate_success_lands_past_the_hundred_listed_checks(self):
         self.status({"complete": False})
         self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_ci_read_through_rest_while_graphql_is_limited_lands_on_green(self):
+        # The CLI's REST read knows CI but not the review decision, which
+        # land-pr does not use; only its aggregate decides.
+        rest = {"transport": "rest", "data_limitations": [
+            "Read through REST while GitHub GraphQL is rate limited; the review decision is unknown."]}
+        self.status({**rest, "ci": "PENDING", "complete": False}, {**rest, "ci": "SUCCESS"})
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertIn("landed #7", self.output)
+
+    BASE_MOVED = "gh: Base branch was modified. Review and try the merge again. (HTTP 405)"
+
+    def merge_attempts(self):
+        calls = [json.loads(line) for line in (self.root / "gh-calls").read_text().splitlines()]
+        return [dict(value.split("=", 1) for value in call[5::2])["sha"]
+                for call in calls if call[:3] == ["api", "-X", "PUT"]]
+
+    def test_main_moving_during_the_merge_retries_it_once_at_the_same_head(self):
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(self.merge_attempts(), [head, head])
+        self.assertEqual(self.merged()["sha"], head)
+        self.assertEqual(self.sleeps, [land.MINIMUM_WAIT])
+
+    def test_main_moving_into_a_conflict_during_the_merge_takes_the_conflict_path(self):
+        old = self.remote_head()
+        self.advance_main("unrelated.txt", "x\n")
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED, "dirty": True}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        new = self.remote_head()
+        self.assertEqual(self.git(self.origin, "rev-parse", f"{new}^1"), old)
+        self.assertEqual(self.merge_attempts(), [old, new])
+        self.assertIn("now conflicts with main", self.output)
+
+    def test_a_conflict_github_was_still_computing_takes_the_conflict_path(self):
+        old = self.remote_head()
+        self.advance_main("unrelated.txt", "x\n")
+        (self.root / "merge-errors.json").write_text(json.dumps([
+            {"error": self.BASE_MOVED},
+            {"error": "gh: Pull Request is not mergeable (HTTP 405)", "dirty": True}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        new = self.remote_head()
+        self.assertEqual(self.merge_attempts(), [old, old, new])
+        self.assertEqual(self.git(self.origin, "rev-parse", f"{new}^1"), old)
+
+    def test_a_head_that_moved_with_main_is_not_merged_again(self):
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        original = land.read_pr
+        reads = []
+
+        def moved(repository, number):
+            pr = original(repository, number)
+            reads.append(pr)
+            if len(reads) > 1:  # Someone pushed while the merge was refused.
+                pr["head"]["sha"] = "e" * 40
+            return pr
+
+        with patch.object(land, "read_pr", moved):
+            self.assertEqual(self.run_land(), land.HEAD_MOVED, self.output)
+        self.assertEqual(len(self.merge_attempts()), 1)
+        self.assertIsNone(self.merged())
+
+    def test_main_moving_during_both_merges_is_refused_without_looping(self):
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}] * 3))
+        self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertEqual(self.merge_attempts(), [head, head])
+        self.assertIsNone(self.merged())
+        self.assertIn("keeps moving", self.output)
 
     def test_an_empty_squash_message_is_refused(self):
         with self.assertRaises(land.Stop) as refused:

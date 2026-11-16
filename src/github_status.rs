@@ -21,6 +21,8 @@ use url::Url;
 /// two minutes. An explicit server cooldown can extend that interval.
 pub const MAX_AGE: u64 = 120;
 const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+/// GitHub's largest page; a longer list is reported incomplete, never passing.
+const REST_PAGE: usize = 100;
 const QUERY: &str = "query CagentsPrStatus($owner:String!,$name:String!,$number:Int!){rateLimit{cost} repository(owner:$owner,name:$name){pullRequest(number:$number){number title url state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision updatedAt commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl} ... on StatusContext{context state targetUrl description}} pageInfo{hasNextPage endCursor}}}}}}}}}";
 
 struct StatusService<E = SystemProcessExecutor> {
@@ -42,22 +44,24 @@ impl<E: ProcessExecutor> StatusService<E> {
         }
     }
 
-    fn fetch(
+    /// Runs one read and returns its JSON body and response headers. A rate
+    /// limit in a failure is bound to `resource`, the API the request used.
+    fn execute(
         &self,
         command: &CommandSpec,
-        key: &PullRequestKey,
+        resource: &str,
         cancellation: &CancellationToken,
-    ) -> Result<(Snapshot, Option<RateLimit>), StatusError> {
+    ) -> Result<(serde_json::Value, String), StatusError> {
         let output = self
             .executor
             .execute(command, cancellation)
             .map_err(|error| {
-                classify_failure(&error.stdout, &error.stderr)
+                classify_failure(&error.stdout, &error.stderr, resource)
                     .map(StatusError::RateLimited)
                     .unwrap_or_else(|| StatusError::Message(error.reported_detail()))
             })?;
         if !output.success {
-            if let Some(limit) = classify_failure(&output.stdout, &output.stderr) {
+            if let Some(limit) = classify_failure(&output.stdout, &output.stderr, resource) {
                 return Err(StatusError::RateLimited(limit));
             }
             return Err(StatusError::Message(
@@ -68,10 +72,35 @@ impl<E: ProcessExecutor> StatusService<E> {
             ));
         }
         let body = response_body(&output.stdout);
-        let headers = String::from_utf8_lossy(&output.stdout[..output.stdout.len() - body.len()]);
-        let mut envelope: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
+        let headers = String::from_utf8_lossy(&output.stdout[..output.stdout.len() - body.len()])
+            .into_owned();
+        let body = serde_json::from_slice(body).map_err(|error| {
             StatusError::Message(format!("Invalid GitHub status JSON: {error}"))
         })?;
+        Ok((body, headers))
+    }
+
+    fn fetch(
+        &self,
+        transport: Transport,
+        key: &PullRequestKey,
+        lease: &Arc<fs::File>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Snapshot, Option<RateLimit>), StatusError> {
+        match transport {
+            Transport::Graphql => self.fetch_graphql(key, lease, cancellation),
+            Transport::Rest => self.fetch_rest(key, lease, cancellation),
+        }
+    }
+
+    fn fetch_graphql(
+        &self,
+        key: &PullRequestKey,
+        lease: &Arc<fs::File>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Snapshot, Option<RateLimit>), StatusError> {
+        let command = inherit(status_command(&self.gh, key), lease)?;
+        let (mut envelope, headers) = self.execute(&command, "graphql", cancellation)?;
         if let Some(errors) = envelope
             .get("errors")
             .and_then(serde_json::Value::as_array)
@@ -100,6 +129,66 @@ impl<E: ProcessExecutor> StatusService<E> {
             RateLimit::classify_for(&headers, now(), "graphql"),
         ))
     }
+
+    /// Reads the PR, then CI for its head, through REST (`core`) while GraphQL
+    /// is in a cooldown of its own. Four requests in sequence; one that fails
+    /// or exhausts the quota ends the read, without retrying anything.
+    fn fetch_rest(
+        &self,
+        key: &PullRequestKey,
+        lease: &Arc<fs::File>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Snapshot, Option<RateLimit>), StatusError> {
+        let repository = format!("repos/{}/{}", key.repository.owner, key.repository.name);
+        let get = |endpoint: String| {
+            if cancellation.is_cancelled() {
+                return Err(StatusError::Message("GitHub status read cancelled".into()));
+            }
+            let command = inherit(rest_command(&self.gh, key, &endpoint), lease)?;
+            let (body, headers) = self.execute(&command, "core", cancellation)?;
+            Ok::<_, StatusError>((body, RateLimit::classify_for(&headers, now(), "core")))
+        };
+        let (pull, mut limit) = get(format!("{repository}/pulls/{}", key.number))?;
+        let pull_request = rest_pull_request(&pull, key)?;
+        let head = pull_request.head_ref_oid.clone();
+        if !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StatusError::Message(
+                "GitHub returned an invalid head commit".into(),
+            ));
+        }
+        let mut pages = Vec::with_capacity(3);
+        for endpoint in ["check-runs", "check-suites", "status"] {
+            // A response that spent the quota or asked for a pause ends the
+            // read; the next request would only be refused.
+            if let Some(limit) = limit {
+                return Err(StatusError::RateLimited(limit));
+            }
+            let (page, next) = get(format!(
+                "{repository}/commits/{head}/{endpoint}?per_page={REST_PAGE}"
+            ))?;
+            pages.push(page);
+            limit = next;
+        }
+        let (checks_state, checks, checks_complete) =
+            rest_rollup(&pages[0], &pages[1], &pages[2], &head)?;
+        Ok((
+            Snapshot {
+                pull_request,
+                checks_state,
+                checks,
+                checks_complete,
+                primary_cost: None,
+                transport: Transport::Rest,
+            },
+            limit,
+        ))
+    }
+}
+
+fn inherit(command: CommandSpec, lease: &Arc<fs::File>) -> Result<CommandSpec, StatusError> {
+    command.inherit_file(Arc::clone(lease)).map_err(|error| {
+        StatusError::Message(format!("Cannot inherit the GitHub status flight: {error}"))
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,7 +208,7 @@ impl StatusError {
     }
 }
 
-fn classify_failure(stdout: &[u8], stderr: &[u8]) -> Option<RateLimit> {
+fn classify_failure(stdout: &[u8], stderr: &[u8], resource: &str) -> Option<RateLimit> {
     let body = response_body(stdout);
     let headers = String::from_utf8_lossy(&stdout[..stdout.len() - body.len()]);
     // Partial GraphQL data may contain arbitrary titles and check names. Only
@@ -135,27 +224,42 @@ fn classify_failure(stdout: &[u8], stderr: &[u8]) -> Option<RateLimit> {
     RateLimit::classify_for(
         &format!("{headers}\n{detail}\n{}", String::from_utf8_lossy(stderr)),
         now(),
-        "graphql",
+        resource,
     )
 }
 
 fn status_command(gh: &Path, key: &PullRequestKey) -> CommandSpec {
+    gh_command(gh).args([
+        "api".into(),
+        "graphql".into(),
+        "--include".into(),
+        "--hostname".into(),
+        key.repository.authority(),
+        "-f".into(),
+        format!("query={QUERY}"),
+        "-f".into(),
+        format!("owner={}", key.repository.owner),
+        "-f".into(),
+        format!("name={}", key.repository.name),
+        "-F".into(),
+        format!("number={}", key.number),
+    ])
+}
+
+fn rest_command(gh: &Path, key: &PullRequestKey, endpoint: &str) -> CommandSpec {
+    gh_command(gh).args([
+        "api".into(),
+        "--method".into(),
+        "GET".into(),
+        "--include".into(),
+        "--hostname".into(),
+        key.repository.authority(),
+        endpoint.into(),
+    ])
+}
+
+fn gh_command(gh: &Path) -> CommandSpec {
     CommandSpec::new(gh)
-        .args([
-            "api".into(),
-            "graphql".into(),
-            "--include".into(),
-            "--hostname".into(),
-            key.repository.authority(),
-            "-f".into(),
-            format!("query={QUERY}"),
-            "-f".into(),
-            format!("owner={}", key.repository.owner),
-            "-f".into(),
-            format!("name={}", key.repository.name),
-            "-F".into(),
-            format!("number={}", key.number),
-        ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")
         .env("NO_COLOR", "1")
@@ -204,15 +308,32 @@ pub struct PullRequestStatus {
     pub updated_at: String,
 }
 
+/// The API a snapshot was read through. Snapshots saved before REST reads
+/// existed came from GraphQL, or are the bootstrap script's REST shape,
+/// which [`Snapshot::is_rest_bootstrap`] recognizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Graphql,
+    /// Used while GraphQL is in a cooldown of its own. REST has no review
+    /// decision, and its aggregate is derived from the listed checks.
+    Rest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub pull_request: PullRequestStatus,
-    /// GitHub's aggregate includes every context, even when the list is paged.
-    /// None means GitHub returned no check rollup, not a passing check.
+    /// Through GraphQL, GitHub's aggregate includes every context, even when
+    /// the list is paged. Through REST it is derived from the lists read, and
+    /// is never SUCCESS when one of them is incomplete. None means no check
+    /// was reported, not a passing check.
     pub checks_state: Option<String>,
     pub checks: Vec<serde_json::Value>,
     pub checks_complete: bool,
     pub primary_cost: Option<u64>,
+    #[serde(default)]
+    pub transport: Transport,
 }
 
 /// Whether a check context has passed, by the rule `scripts/land-pr` applies.
@@ -225,6 +346,17 @@ pub fn check_passed(check: &serde_json::Value) -> bool {
             check["conclusion"].as_str(),
             Some("SUCCESS" | "NEUTRAL" | "SKIPPED")
         )
+}
+
+/// Whether a check context has failed, by the rule `scripts/land-pr` applies.
+fn check_failed(check: &serde_json::Value) -> bool {
+    if check["__typename"] == "StatusContext" {
+        return matches!(check["state"].as_str(), Some("FAILURE" | "ERROR"));
+    }
+    matches!(
+        check["conclusion"].as_str(),
+        Some("FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE")
+    )
 }
 
 /// A check context as a report shows it. Callers decide on its name and state;
@@ -253,6 +385,25 @@ impl Snapshot {
     pub fn is_rest_bootstrap(&self) -> bool {
         self.checks_state.is_none() && !self.checks_complete && self.checks.is_empty()
     }
+
+    /// What this snapshot cannot tell its reader.
+    fn limitations(&self) -> Vec<&'static str> {
+        if self.is_rest_bootstrap() {
+            return vec!["Single REST bootstrap read; CI and review decision are unknown."];
+        }
+        let mut limitations = Vec::new();
+        if self.transport == Transport::Rest {
+            limitations.push(
+                "Read through REST while GitHub GraphQL is rate limited; the review decision is unknown.",
+            );
+            if !self.checks_complete {
+                limitations.push(
+                    "More checks than one REST page holds; CI cannot pass until GraphQL reads them all.",
+                );
+            }
+        }
+        limitations
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +417,10 @@ pub struct Report {
     pub error: Option<String>,
     pub retry_at: Option<u64>,
     pub outcome: &'static str,
+    /// What the snapshot cannot tell, such as an unknown review decision.
+    /// Unlike the bootstrap script's top-level `limitations`, these do not
+    /// by themselves mean CI is unknown: read `checks_state` for that.
+    pub limitations: Vec<&'static str>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -288,6 +443,11 @@ impl Cached {
         } else {
             source
         };
+        let limitations = self
+            .snapshot
+            .as_ref()
+            .map(Snapshot::limitations)
+            .unwrap_or_default();
         Report {
             target: target.clone(),
             fetched_at: self.fetched_at,
@@ -301,6 +461,7 @@ impl Cached {
                 snapshot.checks = snapshot.checks.into_iter().map(reported_check).collect();
                 snapshot
             }),
+            limitations,
             error: self.error,
             retry_at: (self.next_attempt > now).then_some(self.next_attempt),
             outcome: if failed { "failed" } else { "succeeded" },
@@ -592,22 +753,39 @@ fn read_with<E: ProcessExecutor>(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     let current = now();
-    if cached.next_attempt > current {
+    // CLIs from before REST reads stored a failed read's GraphQL reset as the
+    // PR's next attempt. Once this PR's shared interval has passed, such a
+    // deadline gives way to the per-resource choice below, which still waits
+    // when every resource is paused.
+    let earlier_cli_pause = cached.error.is_some()
+        && cached.next_attempt > current.saturating_add(MAX_AGE)
+        && published_at(&path).is_some_and(|at| current.saturating_sub(at) >= MAX_AGE);
+    if cached.next_attempt > current && !earlier_cli_pause {
         verify_credentials()?;
         return Ok(cached.report(key, "cache", current));
     }
-    if let Some(limit) = shared_cooldown(
-        root,
-        credentials,
-        &key.repository.authority(),
-        "graphql",
-        cancellation,
-    )? {
-        cached.error = Some(limit.to_string());
-        cached.next_attempt = limit.retry_at;
-        verify_credentials()?;
-        return Ok(cached.report(key, "cache", current));
-    }
+    let host = key.repository.authority();
+    let transport = match shared_cooldown(root, credentials, &host, "graphql", cancellation)? {
+        None => Transport::Graphql,
+        // A primary reset belongs to its resource: exhausted GraphQL leaves
+        // REST quota to read with. A secondary pause covers both.
+        Some(graphql) => match shared_cooldown(root, credentials, &host, "core", cancellation)?
+            .or_else(|| bootstrap_rest_pause(root, &name, current))
+        {
+            None => Transport::Rest,
+            Some(core) => {
+                let earlier = if core.retry_at < graphql.retry_at {
+                    core
+                } else {
+                    graphql
+                };
+                cached.error = Some(earlier.to_string());
+                cached.next_attempt = earlier.retry_at;
+                verify_credentials()?;
+                return Ok(cached.report(key, "cache", current));
+            }
+        },
+    };
     // An exclusive flight must retain its original open description: an
     // independently opened shared lease would conflict with this lock. Keep
     // the scoped owner until publication so normal return unlocks unrelated
@@ -617,10 +795,7 @@ fn read_with<E: ProcessExecutor>(
             .try_clone()
             .map_err(|error| format!("Cannot inherit the GitHub status flight: {error}"))?,
     );
-    let command = status_command(&service.gh, key)
-        .inherit_file(lease)
-        .map_err(|error| format!("Cannot inherit the GitHub status flight: {error}"))?;
-    let result = service.fetch(&command, key, cancellation);
+    let result = service.fetch(transport, key, &lease, cancellation);
     if cancellation.is_cancelled() {
         return Err("GitHub status read cancelled".into());
     }
@@ -632,15 +807,17 @@ fn read_with<E: ProcessExecutor>(
         Err(error) => error.rate_limit(),
     };
     if let Some(limit) = server_limit {
-        record_cooldown(
-            root,
-            credentials,
-            &key.repository.authority(),
-            &limit,
-            cancellation,
-        )?;
+        record_cooldown(root, credentials, &host, &limit, cancellation)?;
         if result.is_err() {
-            cached.next_attempt = cached.next_attempt.max(limit.retry_at);
+            // The PR's next attempt is shared by both transports, so only a
+            // pause that covers every resource extends it. A resource's own
+            // reset stays in the host budget, where the next read finds it
+            // and chooses the other transport.
+            let shared = match limit.resource {
+                None => limit.retry_at,
+                Some(_) => limit.secondary_retry_at.unwrap_or(0),
+            };
+            cached.next_attempt = cached.next_attempt.max(shared);
         }
     }
     match result {
@@ -655,6 +832,34 @@ fn read_with<E: ProcessExecutor>(
     Ok(cached.report(key, "network", completed))
 }
 
+/// When the cache entry was last written, which a read always does.
+fn published_at(path: &Path) -> Option<u64> {
+    let modified = fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+/// A REST pause the bootstrap script kept for this PR alone, because the
+/// host budget's lock was busy when it tried to share it.
+fn bootstrap_rest_pause(root: &Path, name: &str, current: u64) -> Option<RateLimit> {
+    #[derive(Deserialize)]
+    struct RestRetry {
+        retry_at: u64,
+    }
+    let retry = load::<RestRetry>(&root.join(format!("{name}.rest-retry")))
+        .ok()
+        .flatten()?;
+    (retry.retry_at > current).then(|| RateLimit {
+        retry_at: retry.retry_at,
+        resource: Some("core".into()),
+        secondary_retry_at: None,
+    })
+}
+
 fn parse(data: &serde_json::Value, key: &PullRequestKey) -> Result<Snapshot, StatusError> {
     let pr = data
         .pointer("/repository/pullRequest")
@@ -663,16 +868,7 @@ fn parse(data: &serde_json::Value, key: &PullRequestKey) -> Result<Snapshot, Sta
     let pull_request: PullRequestStatus = serde_json::from_value(pr.clone()).map_err(|error| {
         StatusError::Message(format!("Invalid GitHub status response: {error}"))
     })?;
-    let identity =
-        PullRequestKey::from_url(pull_request.url.as_str()).map_err(StatusError::Message)?;
-    if identity.number != key.number
-        || pull_request.number != key.number
-        || !identity.repository.same_repository(&key.repository)
-    {
-        return Err(StatusError::Message(
-            "GitHub returned a different pull request".into(),
-        ));
-    }
+    same_pull_request(&pull_request, key)?;
     let commit = pr
         .pointer("/commits/nodes/0/commit")
         .filter(|commit| commit["oid"].as_str() == Some(pull_request.head_ref_oid.as_str()))
@@ -710,7 +906,170 @@ fn parse(data: &serde_json::Value, key: &PullRequestKey) -> Result<Snapshot, Sta
         primary_cost: data
             .pointer("/rateLimit/cost")
             .and_then(serde_json::Value::as_u64),
+        transport: Transport::Graphql,
     })
+}
+
+fn same_pull_request(
+    pull_request: &PullRequestStatus,
+    key: &PullRequestKey,
+) -> Result<(), StatusError> {
+    let identity =
+        PullRequestKey::from_url(pull_request.url.as_str()).map_err(StatusError::Message)?;
+    if identity.number != key.number
+        || pull_request.number != key.number
+        || !identity.repository.same_repository(&key.repository)
+    {
+        return Err(StatusError::Message(
+            "GitHub returned a different pull request".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The REST pull request in the shape GraphQL reports it. REST has no review
+/// decision, and a null `mergeable` means GitHub is still computing it.
+fn rest_pull_request(
+    pull: &serde_json::Value,
+    key: &PullRequestKey,
+) -> Result<PullRequestStatus, StatusError> {
+    let invalid =
+        |field: &str| StatusError::Message(format!("GitHub returned no pull request {field}"));
+    let text = |pointer: &str| {
+        pull.pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(pointer))
+    };
+    let flag = |field: &str| pull[field].as_bool().ok_or_else(|| invalid(field));
+    let url = text("/html_url")?;
+    let pull_request = PullRequestStatus {
+        number: pull["number"].as_u64().ok_or_else(|| invalid("number"))?,
+        title: text("/title")?,
+        url: Url::parse(&url).map_err(|_| invalid("URL"))?,
+        state: if flag("merged")? {
+            "MERGED".into()
+        } else {
+            text("/state")?.to_ascii_uppercase()
+        },
+        is_draft: flag("draft")?,
+        head_ref_name: text("/head/ref")?,
+        head_ref_oid: text("/head/sha")?,
+        base_ref_name: text("/base/ref")?,
+        mergeable: match pull["mergeable"].as_bool() {
+            Some(true) => "MERGEABLE",
+            Some(false) => "CONFLICTING",
+            None => "UNKNOWN",
+        }
+        .into(),
+        merge_state_status: Some(
+            pull["mergeable_state"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_ascii_uppercase(),
+        ),
+        review_decision: None,
+        updated_at: text("/updated_at")?,
+    };
+    same_pull_request(&pull_request, key)?;
+    Ok(pull_request)
+}
+
+/// Check suites that say whether a head's check runs exist yet. Every app
+/// that can write checks gets a suite on each push, and GitHub leaves it
+/// queued forever when the app never runs, as GitHub's own pages ignore. A
+/// GitHub Actions suite is a workflow run, which exists before its jobs'
+/// check runs do, so an unfinished one means CI is still being created.
+fn suite_counts(suite: &serde_json::Value) -> bool {
+    suite
+        .pointer("/app/slug")
+        .and_then(serde_json::Value::as_str)
+        == Some("github-actions")
+        || suite["latest_check_runs_count"].as_u64() != Some(0)
+}
+
+/// The aggregate, contexts and completeness that GraphQL's check rollup
+/// reports, derived from REST's check runs, check suites and combined
+/// commit status for `head`. SUCCESS needs every list complete, every
+/// counted suite finished and every context passed; a failure anywhere is
+/// FAILURE; nothing at all is None, as GraphQL reports a missing rollup.
+fn rest_rollup(
+    runs: &serde_json::Value,
+    suites: &serde_json::Value,
+    status: &serde_json::Value,
+    head: &str,
+) -> Result<(Option<String>, Vec<serde_json::Value>, bool), StatusError> {
+    /// A page's items, and whether they are all there are.
+    fn list<'a>(
+        page: &'a serde_json::Value,
+        field: &str,
+    ) -> Result<(&'a Vec<serde_json::Value>, bool), StatusError> {
+        let items = page[field]
+            .as_array()
+            .ok_or_else(|| StatusError::Message(format!("GitHub returned no {field} list")))?;
+        let total = page["total_count"]
+            .as_u64()
+            .ok_or_else(|| StatusError::Message(format!("GitHub returned no {field} count")))?;
+        Ok((items, items.len() as u64 == total))
+    }
+    let (runs, runs_complete) = list(runs, "check_runs")?;
+    let (suites, suites_complete) = list(suites, "check_suites")?;
+    let (statuses, statuses_complete) = list(status, "statuses")?;
+    if runs
+        .iter()
+        .chain(suites)
+        .any(|item| item["head_sha"].as_str() != Some(head))
+        || status["sha"].as_str() != Some(head)
+    {
+        return Err(StatusError::Message(
+            "The checks did not match the pull request head; retry later".into(),
+        ));
+    }
+    let upper = |value: &serde_json::Value| {
+        value.as_str().map_or(serde_json::Value::Null, |text| {
+            text.to_ascii_uppercase().into()
+        })
+    };
+    let checks = runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({"__typename":"CheckRun","name":run["name"],
+                "status":upper(&run["status"]),"conclusion":upper(&run["conclusion"]),
+                "detailsUrl":run["details_url"]})
+        })
+        .chain(statuses.iter().map(|context| {
+            serde_json::json!({"__typename":"StatusContext","context":context["context"],
+                "state":upper(&context["state"]),"targetUrl":context["target_url"],
+                "description":context["description"]})
+        }))
+        .collect::<Vec<_>>();
+    let counted = suites
+        .iter()
+        .filter(|suite| suite_counts(suite))
+        .collect::<Vec<_>>();
+    let unfinished = counted.iter().any(|suite| suite["status"] != "completed");
+    // A suite with check runs is judged by them: the list holds each check's
+    // latest run, so a cancelled suite a rerun superseded does not fail CI.
+    // A workflow that failed before creating any job shows only in its suite.
+    let suite_failed = counted.iter().any(|suite| {
+        suite["status"] == "completed"
+            && suite["latest_check_runs_count"].as_u64() == Some(0)
+            && matches!(
+                suite["conclusion"].as_str(),
+                Some("failure" | "timed_out" | "action_required" | "startup_failure")
+            )
+    });
+    let complete = runs_complete && suites_complete && statuses_complete;
+    let state = if suite_failed || checks.iter().any(check_failed) {
+        Some("FAILURE")
+    } else if complete && checks.is_empty() && !unfinished {
+        None
+    } else if complete && !unfinished && !checks.is_empty() && checks.iter().all(check_passed) {
+        Some("SUCCESS")
+    } else {
+        Some("PENDING")
+    };
+    Ok((state.map(str::to_owned), checks, complete))
 }
 
 #[cfg(test)]
@@ -860,12 +1219,24 @@ mod tests {
         .unwrap();
         assert_eq!(graphql.resource.as_deref(), Some("graphql"));
         assert_eq!(graphql.secondary_retry_at, None);
+        // The pause is GraphQL's own: the PR keeps only the shared interval,
+        // and another PR reads through REST rather than waiting it out.
+        assert!(first.retry_at.unwrap() <= now() + MAX_AGE);
         let mut another = key();
         another.number = 43;
+        fixture.results.lock().unwrap().extend(rest_read(
+            43,
+            vec![rest_run("test", "completed", Some("success"))],
+            vec![],
+            vec![],
+        ));
         let repeated = read_fixture(root.path(), "account", &another, &service, &cancellation);
-        assert_eq!(repeated.source, "cache");
-        assert_eq!(repeated.outcome, "failed");
-        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repeated.source, "network");
+        assert_eq!(repeated.outcome, "succeeded");
+        let snapshot = repeated.snapshot.unwrap();
+        assert_eq!(snapshot.transport, Transport::Rest);
+        assert_eq!(snapshot.checks_state.as_deref(), Some("SUCCESS"));
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -936,13 +1307,19 @@ mod tests {
     struct Fixture {
         calls: AtomicUsize,
         results: Mutex<VecDeque<ProcessOutput>>,
+        /// "graphql", or the REST endpoint, of each read in order.
+        endpoints: Mutex<Vec<String>>,
     }
     impl Fixture {
         fn new(results: Vec<ProcessOutput>) -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 results: Mutex::new(results.into()),
+                endpoints: Mutex::new(Vec::new()),
             })
+        }
+        fn endpoints(&self) -> Vec<String> {
+            self.endpoints.lock().unwrap().clone()
         }
     }
     impl ProcessExecutor for Fixture {
@@ -952,12 +1329,23 @@ mod tests {
             _: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            assert!(
-                command
-                    .arguments
-                    .iter()
-                    .any(|argument| argument.to_string_lossy().contains("query CagentsPrStatus"))
-            );
+            let arguments = command
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let endpoint = if arguments[1] == "graphql" {
+                assert!(
+                    arguments
+                        .iter()
+                        .any(|argument| argument.contains("query CagentsPrStatus"))
+                );
+                "graphql".to_owned()
+            } else {
+                assert_eq!(arguments[..3], ["api", "--method", "GET"]);
+                arguments.last().unwrap().clone()
+            };
+            self.endpoints.lock().unwrap().push(endpoint);
             assert!(
                 command
                     .arguments
@@ -987,6 +1375,539 @@ mod tests {
         cancellation: &CancellationToken,
     ) -> Report {
         read_with(root, credentials, key, service, cancellation, || Ok(())).unwrap()
+    }
+
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn rest(status: &str, headers: &str, body: serde_json::Value) -> ProcessOutput {
+        ProcessOutput {
+            success: status.starts_with('2'),
+            exit_code: Some(if status.starts_with('2') { 0 } else { 1 }),
+            signal: None,
+            stdout: format!(
+                "HTTP/2.0 {status}\r\nX-RateLimit-Resource: core\r\n{headers}\r\n{body}"
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+    fn rest_ok(body: serde_json::Value) -> ProcessOutput {
+        rest("200 OK", "X-RateLimit-Remaining: 4000\r\n", body)
+    }
+    fn rest_pull(number: u64) -> serde_json::Value {
+        serde_json::json!({"number":number,"title":"A pull request",
+            "html_url":format!("https://status-test.invalid/Owner/Repo/pull/{number}"),
+            "state":"open","merged":false,"draft":false,"head":{"ref":"feature","sha":HEAD},
+            "base":{"ref":"main"},"mergeable":true,"mergeable_state":"clean",
+            "updated_at":"2026-11-09T00:00:00Z"})
+    }
+    fn rest_run(name: &str, status: &str, conclusion: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"name":name,"head_sha":HEAD,"status":status,"conclusion":conclusion,
+            "details_url":"https://status-test.invalid/Owner/Repo/actions/runs/1/job/2"})
+    }
+    fn rest_suite(
+        app: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        runs: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"head_sha":HEAD,"app":{"slug":app},"status":status,
+            "conclusion":conclusion,"latest_check_runs_count":runs})
+    }
+    fn rest_context(context: &str, state: &str) -> serde_json::Value {
+        serde_json::json!({"context":context,"state":state,
+            "target_url":"https://status-test.invalid/deploy","description":"Deploy"})
+    }
+    fn runs_page(runs: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"total_count":runs.len(),"check_runs":runs})
+    }
+    fn suites_page(suites: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"total_count":suites.len(),"check_suites":suites})
+    }
+    fn status_page(statuses: Vec<serde_json::Value>) -> serde_json::Value {
+        // GitHub reports "pending" for a commit with no statuses at all.
+        serde_json::json!({"sha":HEAD,"state":"pending","total_count":statuses.len(),"statuses":statuses})
+    }
+    /// The four responses of one REST read. With no suites given, the head
+    /// has one finished GitHub Actions suite.
+    fn rest_read(
+        number: u64,
+        runs: Vec<serde_json::Value>,
+        suites: Vec<serde_json::Value>,
+        statuses: Vec<serde_json::Value>,
+    ) -> Vec<ProcessOutput> {
+        let suites = if suites.is_empty() {
+            vec![rest_suite(
+                "github-actions",
+                "completed",
+                Some("success"),
+                runs.len() as u64,
+            )]
+        } else {
+            suites
+        };
+        vec![
+            rest_ok(rest_pull(number)),
+            rest_ok(runs_page(runs)),
+            rest_ok(suites_page(suites)),
+            rest_ok(status_page(statuses)),
+        ]
+    }
+    fn exhaust_graphql(root: &Path, credentials: &str) -> u64 {
+        let reset = now() + 3600;
+        record_cooldown(
+            root,
+            credentials,
+            &key().repository.authority(),
+            &RateLimit::primary("graphql", reset),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        reset
+    }
+
+    #[test]
+    fn exhausted_graphql_reads_ci_through_rest_and_shares_that_read() {
+        let root = private_tempdir();
+        exhaust_graphql(root.path(), "account");
+        let runs = (0..11)
+            .map(|index| rest_run(&format!("check {index}"), "completed", Some("success")))
+            .collect();
+        // What #2918's head had: the Actions suite, and empty suites GitHub
+        // keeps queued for installed apps that never run.
+        let suites = vec![
+            rest_suite("github-actions", "completed", Some("success"), 11),
+            rest_suite("netlify", "queued", None, 0),
+            rest_suite("vercel", "queued", None, 0),
+        ];
+        let fixture = Fixture::new(rest_read(42, runs, suites, vec![]));
+        let service = StatusService::new("gh", fixture.clone());
+        let cancellation = CancellationToken::new();
+        let report = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(report.source, "network");
+        assert_eq!(report.outcome, "succeeded");
+        assert!(!report.stale);
+        assert_eq!(report.retry_at, Some(report.fetched_at.unwrap() + MAX_AGE));
+        assert_eq!(
+            report.limitations,
+            [
+                "Read through REST while GitHub GraphQL is rate limited; the review decision is unknown."
+            ]
+        );
+        let snapshot = report.snapshot.unwrap();
+        assert_eq!(snapshot.transport, Transport::Rest);
+        assert_eq!(snapshot.checks_state.as_deref(), Some("SUCCESS"));
+        assert!(snapshot.checks_complete);
+        assert_eq!(snapshot.checks.len(), 11);
+        assert!(snapshot.checks.iter().all(check_passed));
+        assert_eq!(
+            snapshot.checks[0],
+            serde_json::json!({"__typename":"CheckRun","name":"check 0","status":"COMPLETED","conclusion":"SUCCESS"})
+        );
+        let pr = snapshot.pull_request;
+        assert_eq!(
+            (pr.state.as_str(), pr.head_ref_oid.as_str()),
+            ("OPEN", HEAD)
+        );
+        assert_eq!(pr.mergeable, "MERGEABLE");
+        assert_eq!(pr.merge_state_status.as_deref(), Some("CLEAN"));
+        assert_eq!(pr.review_decision, None);
+        assert_eq!(snapshot.primary_cost, None);
+        assert_eq!(
+            fixture.endpoints(),
+            [
+                "repos/Owner/Repo/pulls/42".to_owned(),
+                format!("repos/Owner/Repo/commits/{HEAD}/check-runs?per_page=100"),
+                format!("repos/Owner/Repo/commits/{HEAD}/check-suites?per_page=100"),
+                format!("repos/Owner/Repo/commits/{HEAD}/status?per_page=100"),
+            ]
+        );
+        // The REST read is this interval's shared read, like a GraphQL one.
+        let again = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(again.source, "cache");
+        assert_eq!(again.snapshot.unwrap().transport, Transport::Rest);
+        assert!(!again.limitations.is_empty());
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 4);
+        // Another credential context has its own GraphQL budget.
+        fixture.results.lock().unwrap().push_back(response(data()));
+        let other = read_fixture(root.path(), "other", &key(), &service, &cancellation);
+        assert_eq!(other.snapshot.unwrap().transport, Transport::Graphql);
+        assert_eq!(fixture.endpoints().last().unwrap(), "graphql");
+    }
+
+    #[test]
+    fn a_rest_rate_limit_ends_the_read_and_pauses_only_rest() {
+        let root = private_tempdir();
+        let graphql_reset = exhaust_graphql(root.path(), "account");
+        let core_reset = now() + 1800;
+        let fixture = Fixture::new(vec![rest(
+            "200 OK",
+            &format!("X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {core_reset}\r\n"),
+            rest_pull(42),
+        )]);
+        let service = StatusService::new("gh", fixture.clone());
+        let cancellation = CancellationToken::new();
+        let first = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        // The PR read spent the quota, so no check read follows it.
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.outcome, "failed");
+        assert!(first.snapshot.is_none());
+        let core = shared_cooldown(
+            root.path(),
+            "account",
+            &key().repository.authority(),
+            "core",
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (core.resource.as_deref(), core.retry_at),
+            (Some("core"), core_reset)
+        );
+        // With both resources paused, a read waits for the earlier reset.
+        let mut another = key();
+        another.number = 43;
+        let paused = read_fixture(root.path(), "account", &another, &service, &cancellation);
+        assert_eq!(paused.source, "cache");
+        assert_eq!(paused.retry_at, Some(core_reset.min(graphql_reset)));
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_check_read_publishes_no_partial_snapshot_and_honors_retry_after() {
+        let root = private_tempdir();
+        exhaust_graphql(root.path(), "account");
+        let fixture = Fixture::new(vec![
+            rest_ok(rest_pull(42)),
+            rest(
+                "403 Forbidden",
+                "Retry-After: 300\r\n",
+                serde_json::json!({"message":"You have exceeded a secondary rate limit"}),
+            ),
+        ]);
+        let service = StatusService::new("gh", fixture.clone());
+        let before = now();
+        let report = read_fixture(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+        );
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(report.outcome, "failed");
+        assert!(
+            report.snapshot.is_none(),
+            "a PR read alone is not published"
+        );
+        assert!(report.retry_at.unwrap() >= before + 300);
+        // A secondary pause covers GraphQL as well.
+        let graphql = shared_cooldown(
+            root.path(),
+            "account",
+            &key().repository.authority(),
+            "graphql",
+            &CancellationToken::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(graphql.secondary_retry_at.unwrap() >= before + 300);
+    }
+
+    #[test]
+    fn an_earlier_clis_graphql_reset_gives_way_to_rest_after_the_shared_interval() {
+        let root = private_tempdir();
+        let reset = exhaust_graphql(root.path(), "account");
+        let path = root
+            .path()
+            .join(format!("{}.json", target_name("account", &key())));
+        // What a CLI before REST reads saved after GraphQL ran out.
+        let publish = |age: u64| {
+            store(
+                &path,
+                &Cached {
+                    fetched_at: None,
+                    snapshot: None,
+                    error: Some("GitHub rate limit reached".into()),
+                    next_attempt: reset,
+                },
+            )
+            .unwrap();
+            let at = std::time::UNIX_EPOCH + Duration::from_secs(now() - age);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        let fixture = Fixture::new(rest_read(
+            42,
+            vec![rest_run("test", "completed", Some("success"))],
+            vec![],
+            vec![],
+        ));
+        let service = StatusService::new("gh", fixture.clone());
+        let cancellation = CancellationToken::new();
+        publish(30);
+        let waiting = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(waiting.source, "cache");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "the interval is still shared"
+        );
+        publish(MAX_AGE + 1);
+        let read = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(read.source, "network");
+        assert_eq!(read.snapshot.unwrap().transport, Transport::Rest);
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn the_bootstrap_scripts_own_rest_pause_is_honored() {
+        let root = private_tempdir();
+        let reset = exhaust_graphql(root.path(), "account");
+        let due = now() + 600;
+        let name = target_name("account", &key());
+        store(
+            &root.path().join(format!("{name}.rest-retry")),
+            &serde_json::json!({"retry_at": due}),
+        )
+        .unwrap();
+        let fixture = Fixture::new(Vec::new());
+        let service = StatusService::new("gh", fixture.clone());
+        let report = read_fixture(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+        );
+        assert_eq!(report.source, "cache");
+        assert_eq!(report.retry_at, Some(due.min(reset)));
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rest_ci_never_passes_an_incomplete_or_not_yet_created_list() {
+        let pass = || rest_run("test", "completed", Some("success"));
+        let actions =
+            |status, conclusion, runs| rest_suite("github-actions", status, conclusion, runs);
+        let finished = || vec![actions("completed", Some("success"), 1)];
+        let rollup = |runs: serde_json::Value,
+                      suites: Vec<serde_json::Value>,
+                      statuses: serde_json::Value| {
+            let (state, _, complete) =
+                rest_rollup(&runs, &suites_page(suites), &statuses, HEAD).unwrap();
+            (state, complete)
+        };
+        let success = (Some("SUCCESS".to_owned()), true);
+        let pending = |complete| (Some("PENDING".to_owned()), complete);
+        assert_eq!(
+            rollup(runs_page(vec![pass()]), finished(), status_page(vec![])),
+            success
+        );
+        // A second page of check runs is unread.
+        let mut paged = runs_page((0..100).map(|_| pass()).collect());
+        paged["total_count"] = 101.into();
+        assert_eq!(
+            rollup(paged, finished(), status_page(vec![])),
+            pending(false)
+        );
+        // So is a second page of check suites or of statuses.
+        let mut suites = suites_page(finished());
+        suites["total_count"] = 2.into();
+        assert_eq!(
+            rest_rollup(
+                &runs_page(vec![pass()]),
+                &suites,
+                &status_page(vec![]),
+                HEAD
+            )
+            .unwrap()
+            .0
+            .as_deref(),
+            Some("PENDING")
+        );
+        let mut statuses = status_page(vec![rest_context("deploy", "success")]);
+        statuses["total_count"] = 2.into();
+        assert_eq!(
+            rollup(runs_page(vec![pass()]), finished(), statuses),
+            pending(false)
+        );
+        // The workflow run exists but its jobs' check runs do not, yet.
+        assert_eq!(
+            rollup(
+                runs_page(vec![]),
+                vec![actions("queued", None, 0)],
+                status_page(vec![])
+            ),
+            pending(true)
+        );
+        // One workflow passed while another has not created its runs.
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                vec![
+                    actions("completed", Some("success"), 1),
+                    actions("queued", None, 0)
+                ],
+                status_page(vec![]),
+            ),
+            pending(true)
+        );
+        // Every listed run passed, but the workflow run is still going.
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                vec![actions("in_progress", None, 1)],
+                status_page(vec![])
+            ),
+            pending(true)
+        );
+        // Nothing reported at all, apart from apps that never run, is no
+        // rollup, as GraphQL reports it: land-pr waits for checks.
+        assert_eq!(
+            rollup(
+                runs_page(vec![]),
+                vec![rest_suite("netlify", "queued", None, 0)],
+                status_page(vec![]),
+            ),
+            (None, true)
+        );
+        // Unfinished, stale and pending contexts do not pass.
+        for run in [
+            rest_run("test", "in_progress", None),
+            rest_run("test", "completed", None),
+            rest_run("test", "completed", Some("stale")),
+        ] {
+            assert_eq!(
+                rollup(runs_page(vec![run]), finished(), status_page(vec![])),
+                pending(true)
+            );
+        }
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                finished(),
+                status_page(vec![rest_context("deploy", "pending")])
+            ),
+            pending(true)
+        );
+        // A failure is final even on an incomplete list.
+        let mut failing = runs_page(vec![rest_run("test", "completed", Some("failure"))]);
+        failing["total_count"] = 200.into();
+        assert_eq!(
+            rollup(failing, finished(), status_page(vec![])),
+            (Some("FAILURE".to_owned()), false)
+        );
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                finished(),
+                status_page(vec![rest_context("deploy", "error")])
+            )
+            .0,
+            Some("FAILURE".to_owned())
+        );
+        // A run that was cancelled, then rerun, gives way to its rerun, and
+        // a workflow cancelled before it created any job does not fail CI.
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                vec![
+                    actions("completed", Some("cancelled"), 1),
+                    actions("completed", Some("success"), 1),
+                    actions("completed", Some("cancelled"), 0),
+                ],
+                status_page(vec![]),
+            ),
+            success
+        );
+        // A workflow that failed before creating any job.
+        assert_eq!(
+            rollup(
+                runs_page(vec![]),
+                vec![actions("completed", Some("failure"), 0)],
+                status_page(vec![])
+            )
+            .0,
+            Some("FAILURE".to_owned())
+        );
+        // Checks for another commit are refused, not counted.
+        let mut other = rest_run("test", "completed", Some("success"));
+        other["head_sha"] = "b".repeat(40).into();
+        assert!(
+            rest_rollup(
+                &runs_page(vec![other]),
+                &suites_page(finished()),
+                &status_page(vec![]),
+                HEAD
+            )
+            .is_err()
+        );
+        let mut status = status_page(vec![]);
+        status["sha"] = "b".repeat(40).into();
+        assert!(
+            rest_rollup(
+                &runs_page(vec![pass()]),
+                &suites_page(finished()),
+                &status,
+                HEAD
+            )
+            .is_err()
+        );
+        assert!(
+            rest_rollup(
+                &serde_json::json!({}),
+                &suites_page(finished()),
+                &status_page(vec![]),
+                HEAD
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rest_pull_requests_report_merge_state_and_refuse_another_target() {
+        let mut pull = rest_pull(42);
+        pull["mergeable"] = serde_json::Value::Null;
+        pull["mergeable_state"] = "unknown".into();
+        let status = rest_pull_request(&pull, &key()).unwrap();
+        assert_eq!(status.mergeable, "UNKNOWN");
+        pull["mergeable"] = false.into();
+        pull["mergeable_state"] = "dirty".into();
+        pull["merged"] = true.into();
+        pull["state"] = "closed".into();
+        let status = rest_pull_request(&pull, &key()).unwrap();
+        assert_eq!(
+            (
+                status.mergeable.as_str(),
+                status.merge_state_status.as_deref(),
+                status.state.as_str()
+            ),
+            ("CONFLICTING", Some("DIRTY"), "MERGED")
+        );
+        pull["html_url"] = "https://status-test.invalid/Other/Repo/pull/42".into();
+        assert!(rest_pull_request(&pull, &key()).is_err());
+        // A malformed head never becomes part of a request path.
+        let root = private_tempdir();
+        exhaust_graphql(root.path(), "account");
+        let mut pull = rest_pull(42);
+        pull["head"]["sha"] = "../../pulls/1".into();
+        let fixture = Fixture::new(vec![rest_ok(pull)]);
+        let service = StatusService::new("gh", fixture.clone());
+        let report = read_fixture(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+        );
+        assert_eq!(report.outcome, "failed");
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1215,6 +2136,7 @@ mod tests {
         assert!(classify_failure(
             br#"{"data":{"repository":{"pullRequest":{"title":"Fix API rate limit exceeded"}}},"errors":[{"message":"Forbidden","type":"FORBIDDEN"}]}"#,
             b"GraphQL: Forbidden",
+            "graphql",
         ).is_none());
     }
 
@@ -1271,12 +2193,31 @@ mod tests {
         cached.fetched_at = Some(now().saturating_sub(MAX_AGE + 1));
         cached.next_attempt = 0;
         store(&path, &cached).unwrap();
-        let stale = read_fixture(root.path(), "account", &key(), &service, &cancellation);
-        assert!(stale.stale);
-        assert_eq!(stale.outcome, "failed");
-        assert_eq!(stale.retry_at, Some(reset));
-        assert!(stale.snapshot.is_some());
-        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+        // GraphQL waits for its reset; the refresh reads REST instead.
+        fixture.results.lock().unwrap().extend(rest_read(
+            42,
+            vec![rest_run("test", "completed", Some("success"))],
+            vec![],
+            vec![],
+        ));
+        let refreshed = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert!(!refreshed.stale);
+        assert_eq!(refreshed.outcome, "succeeded");
+        assert_eq!(refreshed.snapshot.unwrap().transport, Transport::Rest);
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            shared_cooldown(
+                root.path(),
+                "account",
+                &key().repository.authority(),
+                "graphql",
+                &cancellation
+            )
+            .unwrap()
+            .unwrap()
+            .retry_at,
+            reset
+        );
     }
 
     #[test]
