@@ -8,7 +8,8 @@ const MAX_DEFINITION_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum AutomationCommand {
-    /// Save exact launch settings for approval in cagents, without creating a schedule.
+    /// Propose launch settings for approval in cagents.
+    #[command(after_help = "Saves the exact settings for approval without creating a schedule.")]
     Propose {
         #[arg(long)]
         #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
@@ -23,7 +24,10 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
-    /// Read only this conversation's immutable approval request.
+    /// Read an approval request this conversation proposed.
+    #[command(
+        after_help = "Requests are immutable, and only the proposing conversation can read one."
+    )]
     Proposal {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,
@@ -34,13 +38,14 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
-    /// Create a disabled automation from a JSON definition (use - for stdin).
+    /// Create a disabled automation from a JSON definition.
     Create {
         #[arg(long)]
         #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
-    /// List up to 100 definitions, ordered by ID; use --after for the next page.
+    /// List definitions, ordered by ID.
+    #[command(after_help = "A page holds up to 100; use --after for the next page.")]
     List {
         #[arg(long)]
         #[arg(help = "Continue after the last automation UUID in the previous page.")]
@@ -65,7 +70,8 @@ pub enum AutomationCommand {
         #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
-    /// Confirm unattended execution of the displayed definition revision.
+    /// Enable an automation at its exact revision.
+    #[command(after_help = "Confirms unattended execution of the displayed definition revision.")]
     Enable {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,
@@ -84,7 +90,8 @@ pub enum AutomationCommand {
         #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
-    /// Remove a definition. Past runs remain in history.
+    /// Remove a definition.
+    #[command(after_help = "Past runs remain in history.")]
     Remove {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,
@@ -92,11 +99,14 @@ pub enum AutomationCommand {
         #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
-    /// Run the exact execution revision once; reuse request-id for safe retry.
+    /// Run an automation once, now.
+    #[command(
+        after_help = "Runs the exact execution revision. Reuse --request-id to retry safely."
+    )]
     RunNow {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,
-        #[arg(long)]
+        #[arg(long, value_name = "REVISION")]
         #[arg(help = "Exact approved execution revision to run.")]
         execution_revision: u64,
         #[arg(long)]
@@ -128,7 +138,10 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
-    /// Inspect bounded lifecycle receipts (enable, disable, edits and system pauses).
+    /// List an automation's lifecycle receipts.
+    #[command(
+        after_help = "Receipts record enables, disables, edits and system pauses, a bounded page at a time."
+    )]
     Audit {
         /// Automation ID, including a removed definition's retained audit.
         id: Uuid,
@@ -139,7 +152,8 @@ pub enum AutomationCommand {
         #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
         limit: usize,
     },
-    /// Read one immutable firing, including its bounded execution result.
+    /// Read one firing and its execution result.
+    #[command(after_help = "Firings are immutable; the execution result is bounded.")]
     Run {
         #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,

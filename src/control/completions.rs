@@ -60,6 +60,32 @@ mod tests {
             assert!(output.human.contains("spawn"), "{shell} lacks agent spawn");
         }
     }
+    /// Subcommand help leaves the global options out, but completion still
+    /// offers them after a subcommand, where they are accepted.
+    #[test]
+    fn completions_offer_global_options_after_a_subcommand() {
+        let fish = script(clap_complete::Shell::Fish);
+        for option in ["device", "json", "no-start"] {
+            assert!(
+                fish.lines()
+                    .any(|line| line.contains("__fish_seen_subcommand_from spawn")
+                        && line.contains(&format!(" -l {option} "))),
+                "fish lacks --{option} after agent spawn"
+            );
+        }
+        let bash = script(clap_complete::Shell::Bash);
+        let spawn = bash
+            .split("cagents__agent__spawn)")
+            .nth(1)
+            .and_then(|rest| rest.lines().find(|line| line.contains("opts=")))
+            .expect("bash completes agent spawn");
+        for option in ["--device", "--json", "--no-start"] {
+            assert!(
+                spawn.contains(&format!(" {option} ")),
+                "bash lacks {option}: {spawn}"
+            );
+        }
+    }
     #[test]
     fn completions_bypass_device_and_service_routing() {
         let cli = Cli::try_parse_from([

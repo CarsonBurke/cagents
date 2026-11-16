@@ -6,7 +6,8 @@ use crate::{
 
 #[derive(Debug, clap::Subcommand)]
 pub enum GhCommand {
-    /// Read shared PR status; at most one network read per PR every two minutes.
+    /// Read a pull request's status through the shared cache.
+    #[command(after_help = "Makes at most one network read per PR every two minutes.")]
     PrStatus {
         /// Positive pull request number.
         #[arg(value_parser = clap::value_parser!(u64).range(1..=i32::MAX as u64))]

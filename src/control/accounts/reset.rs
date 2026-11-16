@@ -639,7 +639,7 @@ mod tests {
             "--yes",
         ])
         .unwrap();
-        assert_eq!(parsed.device.as_deref(), Some("remote-work"));
+        assert_eq!(parsed.global.device.as_deref(), Some("remote-work"));
         assert!(
             retry_command(&request, "Weekly", "local").starts_with("cagents --device 'local' ")
         );

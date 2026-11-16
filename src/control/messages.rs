@@ -18,8 +18,7 @@ const DEFAULT_WAIT: &str = "90";
 /// A message given as an argument, in a file, or on standard input.
 #[derive(Debug, clap::Args)]
 pub struct MessageArgs {
-    /// The message, which may begin with `-`; a lone `-` reads it from
-    /// standard input.
+    /// The message, which may begin with `-`; a lone `-` reads standard input.
     #[arg(value_name = "MESSAGE", allow_hyphen_values = true)]
     pub(super) text: Option<String>,
     /// Read the message from this file.
@@ -41,8 +40,8 @@ impl MessageArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct SendArgs {
-    /// The session: its ID, lineage or agent ID, or at least four characters
-    /// of one; or `parent`, the session that started this one.
+    /// A session, lineage or agent ID, or at least four characters of one; or
+    /// `parent`, the session that started this one.
     #[arg(value_name = "SESSION")]
     pub(super) to: String,
     #[command(flatten)]
@@ -53,7 +52,8 @@ pub struct SendArgs {
 pub struct AskArgs {
     #[command(flatten)]
     pub(super) send: SendArgs,
-    /// How long to wait for the reply. A later reply arrives as a message.
+    /// How long to wait for the reply, in seconds; a later one arrives as a
+    /// message.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait)]
     timeout: f64,
 }

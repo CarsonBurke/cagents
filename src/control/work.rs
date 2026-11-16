@@ -21,9 +21,11 @@ const REMOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
-    /// List this project's worktrees and branches in progress, newest
-    /// activity first. `cagents work` alone does this.
-    #[command(visible_alias = "ls")]
+    /// List this project's worktrees and branches in progress.
+    #[command(
+        visible_alias = "ls",
+        after_help = "Newest activity first. `cagents work` alone does this."
+    )]
     List(WorkListArgs),
     /// Pin a card to a column, overriding the column its state implies.
     Pin {
@@ -46,16 +48,17 @@ pub enum WorkCommand {
         project: Option<PathBuf>,
     },
     /// Remove a card's worktree, keeping its branch.
-    ///
-    /// Removal is refused while a session or process uses the worktree, and
-    /// unless nothing unsaved would be lost or --snapshot or --discard says
-    /// what happens to it. --dry-run shows the plan.
-    #[command(visible_alias = "remove")]
+    #[command(
+        visible_alias = "remove",
+        after_help = "Removal is refused while a session or process uses the worktree, and unless \
+            nothing unsaved would be lost or --snapshot or --discard says what happens to it. \
+            --dry-run shows the plan."
+    )]
     Rm(RemoveArgs),
     /// List the snapshots worktree removals kept, newest first.
-    ///
-    /// Restore one with `git stash apply --index REF` in any worktree of its
-    /// project.
+    #[command(
+        after_help = "Restore one with `git stash apply --index REF` in any worktree of its project."
+    )]
     Snapshots {
         /// Only the open project with this name, or containing this path.
         /// The default is the project containing the current directory, or
@@ -1582,7 +1585,7 @@ mod tests {
         assert!(matches!(
             parse(&["work", "--json", "rm", "x", "--dry-run"]),
             Ok(Cli {
-                json: true,
+                global: GlobalOptions { json: true, .. },
                 command: TopCommand::Work {
                     command: Some(WorkCommand::Rm(_)),
                     ..

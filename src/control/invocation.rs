@@ -437,10 +437,22 @@ mod tests {
                 agents: vec!["a".into(), "b".into()]
             }))
         );
-        assert_eq!(
-            parse("cagents --json terminal list", None),
-            Some(Kind::Act(Act::Cli("terminal list".into())))
-        );
+        // Global options read the same before or after the subcommand.
+        for line in [
+            "cagents --json terminal list",
+            "cagents terminal --json list",
+            "cagents terminal list --json --no-start",
+        ] {
+            assert_eq!(
+                parse(line, None),
+                Some(Kind::Act(Act::Cli("terminal list".into()))),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            parse("cagents agent spawn Review --json", None),
+            Some(Kind::Spawn(_))
+        ));
         assert_eq!(
             parse("cagents linear issue CAG-12 --full", None),
             Some(Kind::Act(Act::Linear {
