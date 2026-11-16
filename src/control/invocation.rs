@@ -238,6 +238,9 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
                 effort: agent.spec.reasoning_effort.unwrap_or_default(),
                 channel,
                 placement,
+                placed_in: data
+                    .get("placed_in")
+                    .and_then(|placed| serde_json::from_value(placed.clone()).ok()),
                 state: Some(run.state),
                 timed_out: data["timed_out"].as_bool().unwrap_or(false),
                 result: run.result.text,
@@ -247,17 +250,22 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
         .then(|| serde_json::from_value::<crate::agent_execution::mailbox::Sent>(data.clone()).ok())
         .flatten()
         .map(|sent| {
-            use crate::agent_execution::mailbox::Reach;
             use crate::chat::coordination::{Arrival, Receipt};
+            // How an agent recipient took it; absent from older output.
+            let agent = data
+                .get("agent")
+                .cloned()
+                .and_then(|agent| {
+                    serde_json::from_value::<Option<crate::agent_execution::mailbox::Handoff>>(
+                        agent,
+                    )
+                    .ok()
+                })
+                .flatten();
             Receipt {
                 message: crate::agent_execution::mailbox::short(sent.message.id),
                 recipient: sent.message.to.label(),
-                arrival: match (sent.reach, sent.message.to.lineage) {
-                    (_, None) => Arrival::User,
-                    (Reach::Conversation, _) => Arrival::WhenIdle,
-                    (Reach::Inbox, _) => Arrival::Inbox,
-                    (Reach::Offline, _) => Arrival::NextSession,
-                },
+                arrival: Arrival::of(&sent, agent.as_ref()),
             }
         });
     let messages = data

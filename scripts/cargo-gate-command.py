@@ -1,21 +1,56 @@
-#!/usr/bin/env python3
-"""Supervise one held command without passing its build-slot descriptors on."""
+#!/usr/bin/python3
+"""Supervise one owned command, and keep the gate's admission clock."""
 
-import ctypes
-import errno
-import os
-from pathlib import Path
-import signal
-import subprocess
 import sys
 import time
 
 
-SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 GRACE_SECONDS = 2.0
 
 
+def positive_integer(value):
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ValueError("expected a positive integer")
+    return int(value)
+
+
+def admission_clock(arguments):
+    if len(arguments) != 2:
+        raise ValueError("invalid admission clock arguments")
+    if arguments[0] == "--admission-deadline":
+        try:
+            seconds = positive_integer(arguments[1])
+        except ValueError:
+            print("cargo-gate: CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS must be a positive integer", file=sys.stderr)
+            return 2
+        print(time.monotonic_ns() + seconds * 1_000_000_000)
+        return 0
+    deadline = positive_integer(arguments[1])
+    return admission_expired(deadline)
+
+
+def admission_expired(deadline):
+    if deadline is not None and time.monotonic_ns() >= deadline:
+        print("cargo-gate: build admission timed out", file=sys.stderr)
+        return 124
+    return 0
+
+
 def main():
+    # Clock-only admission checks do not need command supervision's imports.
+    import ctypes
+    import errno
+    import os
+    from pathlib import Path
+    import signal
+    import subprocess
+
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+    arguments = sys.argv[1:]
+    admission_deadline = None
+    if arguments[:1] == ["--admission-until"]:
+        admission_deadline = positive_integer(arguments[1])
+        arguments = arguments[2:]
     cancellation = 0
 
     def cancelled(number, _frame):
@@ -23,11 +58,11 @@ def main():
         if not cancellation:
             cancellation = number
 
-    for number in SIGNALS:
+    for number in signals:
         signal.signal(number, cancelled)
     # An inherited SIGCHLD=SIG_IGN must not auto-reap our owned children.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    receipt = Path(sys.argv[1])
+    receipt = Path(arguments[0])
     children_path = Path(f"/proc/self/task/{os.getpid()}/children")
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER, before any spawn.
@@ -42,17 +77,19 @@ def main():
             except (FileNotFoundError, ValueError):
                 pass  # The outer gate may be in the middle of writing its receipt.
             else:
-                if number in SIGNALS:
+                if number in signals:
                     cancellation = number
         return cancellation
 
     if cancellation_requested():
         return 128 + cancellation
+    if admission_expired(admission_deadline):
+        return 124
     try:
         # Preserve the caller's terminal/session and inherited descriptors;
         # the gate has already closed its own 8 and 9. Cleanup signals only
         # actual unreaped children, never the caller's shared process group.
-        primary = subprocess.Popen(sys.argv[2:], close_fds=False)
+        primary = subprocess.Popen(arguments[1:], close_fds=False)
     except OSError as error:
         print(f"cargo-gate: {error}", file=sys.stderr)
         return 127 if error.errno == errno.ENOENT else 126
@@ -61,6 +98,20 @@ def main():
         # Do not poll(), send_signal(), or wait() the Popen here: all may reap
         # the primary and allow its PID to be reused before cleanup ends.
         return os.waitid(os.P_PID, primary.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+    def adopted_children():
+        return [pid for pid in map(int, children_path.read_text().split()) if pid != primary.pid]
+
+    def reap_exited_adoptees():
+        # Descendants whose parents exit are adopted by this subreaper, such
+        # as the intermediate process and then the master of an offload's
+        # ssh ControlPersist connection. Left unreaped, each that finishes
+        # stays a zombie for the rest of the build.
+        # Reap only listed PIDs that have already exited, never waitpid(-1):
+        # the primary stays unreaped to reserve its PID, and live adoptees
+        # keep theirs for drain().
+        for pid in adopted_children():
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG)
 
     def send(pid, number):
         try:
@@ -81,9 +132,7 @@ def main():
             force = time.monotonic() >= deadline
             if force:
                 send(primary.pid, signal.SIGKILL)
-            children = [int(value) for value in children_path.read_text().split()]
-            others = [pid for pid in children if pid != primary.pid]
-            for pid in others:
+            for pid in adopted_children():
                 # These are this supervisor's actual unreaped children. With
                 # SIGCHLD at default and one waiter, their IDs cannot be reused
                 # before this loop reaps them. Adoption includes setsid children.
@@ -110,6 +159,9 @@ def main():
             if cancellation_requested():
                 drain()
                 return 128 + cancellation
+            if admission_expired(admission_deadline):
+                drain()
+                return 124
             if primary_exited():
                 if cancellation_requested():
                     continue
@@ -117,6 +169,7 @@ def main():
                 # may outlive successful commands; only cancellation drains.
                 status = primary.wait()
                 return status if status >= 0 else 128 - status
+            reap_exited_adoptees()
             time.sleep(0.02)
     except BaseException:
         # A supervisor failure after launch must not release a live build.
@@ -126,6 +179,8 @@ def main():
 
 if __name__ == "__main__":
     try:
+        if sys.argv[1:2] in (["--admission-deadline"], ["--admission-check"]):
+            sys.exit(admission_clock(sys.argv[1:]))
         sys.exit(main())
     except Exception as error:
         print(f"cargo-gate: command supervision failed: {error}", file=sys.stderr)

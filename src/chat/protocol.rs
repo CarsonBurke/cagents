@@ -12,6 +12,32 @@ mod image_references;
 pub mod omp;
 mod terminal_output;
 
+/// Startup recovery for the same card and exact conversation. Unavailable
+/// means another attempt may succeed after an external condition changes;
+/// it promises neither immediate success nor automatic replay of uncertain
+/// writes. Existing ownership and idempotency reconciliation still run first.
+/// Invalid is reserved for known immutable identity/recipe or structural
+/// failures. An opaque operational String is not evidence of permanence:
+/// preserve retry conservatively at legacy boundaries, and classify explicit
+/// decisions here rather than inferring authority from diagnostic wording.
+#[derive(Debug)]
+pub enum SetupError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+        }
+    }
+}
+impl From<&str> for SetupError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
     /// Page an exact provider transcript without starting a provider process.
@@ -306,9 +332,13 @@ pub(crate) fn validate_launch_directory(
 }
 
 impl ProcessSpec {
-    pub(crate) fn remove_unset_environment(&mut self) {
-        self.environment
-            .retain(|name, _| !self.unset_environment.contains(name));
+    /// Remove what the process must not receive: the launch's removals, and
+    /// any provider session's identity, which a recipe saved before it was
+    /// withheld may still hold.
+    pub(crate) fn withhold_environment(&mut self) {
+        self.environment.retain(|name, _| {
+            !self.unset_environment.contains(name) && !crate::agent::is_session_variable(name)
+        });
     }
 }
 #[derive(Debug, Default)]
@@ -346,6 +376,12 @@ pub trait Adapter: Send {
     /// Whether the initial handshake still needs its matching provider reply.
     /// Advisory frames do not complete it; later readiness changes are separate.
     fn initialization_pending(&self) -> bool {
+        false
+    }
+    /// Whether a settled turn's outcome still waits on a provider reply, such
+    /// as the acknowledgement of an interrupt sent before its result arrived.
+    /// Closing keeps reading the provider until that reply decides it.
+    fn outcome_pending(&self) -> bool {
         false
     }
     fn command(&mut self, command: Command) -> Result<Step, String>;
@@ -438,6 +474,35 @@ mod launch_tests {
         fn cleanup(&self) -> Result<LaunchOutcome, String> {
             Ok(*self.0.lock().unwrap())
         }
+    }
+
+    #[test]
+    fn a_conversation_never_receives_the_session_its_recipe_was_saved_inside() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::from([
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CODE_SESSION_ID".into(), "parent".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+                ("ANTHROPIC_API_KEY".into(), "removed".into()),
+            ]),
+            unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+        };
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.withhold_environment();
+        assert_eq!(
+            spec.environment,
+            BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into())])
+        );
+        let mut environment = recipe.environment.clone();
+        recipe.withhold_environment(&mut environment);
+        assert_eq!(environment, spec.environment);
     }
 
     #[test]

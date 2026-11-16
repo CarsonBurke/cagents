@@ -1,5 +1,6 @@
-//! Absolute-budget framing for read-only holder census. Partial progress never
-//! renews its budget, and nonblocking descriptors keep socket syscalls finite.
+//! Absolute-budget framing for every retained actor request. Partial progress
+//! never renews its budget, and nonblocking descriptors keep socket syscalls
+//! finite.
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
@@ -11,7 +12,7 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero())
-        .ok_or_else(|| "Retained actor inspection deadline expired".into())
+        .ok_or_else(|| "Retained actor socket deadline expired".into())
 }
 fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<(), String> {
     loop {
@@ -35,7 +36,7 @@ fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Resu
             return Err(error.to_string());
         }
         if event.revents & libc::POLLNVAL != 0 {
-            return Err("Retained actor inspection descriptor closed".into());
+            return Err("Retained actor socket descriptor closed".into());
         }
         return Ok(());
     }
@@ -49,7 +50,7 @@ fn write_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match writer.write(bytes) {
-            Ok(0) => return Err("Retained actor inspection socket stopped accepting data".into()),
+            Ok(0) => return Err("Retained actor socket stopped accepting data".into()),
             Ok(count) => bytes = &bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -69,7 +70,7 @@ fn read_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match reader.read(bytes) {
-            Ok(0) => return Err("Retained actor inspection response ended early".into()),
+            Ok(0) => return Err("Retained actor response ended early".into()),
             Ok(count) => bytes = &mut bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -100,22 +101,55 @@ pub(super) fn receive_until<T: DeserializeOwned>(
     control: &UnixStream,
     deadline: Instant,
 ) -> Result<T, String> {
-    remaining(deadline)?;
-    control
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
-    let mut header = [0; 4];
-    read_exact_until(control, &mut header, deadline)?;
-    let size = u32::from_le_bytes(header) as usize;
-    if size > super::MAX_FRAME {
-        return Err("Retained actor frame exceeds the bounded protocol capacity".into());
-    }
-    let mut bytes = vec![0; size];
-    read_exact_until(control, &mut bytes, deadline)?;
+    let bytes = receive_bytes_until(control, deadline)?;
     remaining(deadline)?;
     let value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     remaining(deadline)?;
     Ok(value)
+}
+
+pub(super) fn receive_bytes_until(
+    control: &UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    remaining(deadline)?;
+    control.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut header = [0; 4];
+    read_exact_until(control, &mut header, deadline)?;
+    let size = u32::from_le_bytes(header) as usize;
+    if size == 0 || size > super::MAX_FRAME {
+        return Err("Retained actor frame exceeds the bounded protocol capacity".into());
+    }
+    let mut bytes = vec![0; size];
+    read_exact_until(control, &mut bytes, deadline)?;
+    Ok(bytes)
+}
+pub(super) fn send_binary_until(
+    control: &UnixStream,
+    value: &impl Serialize,
+    deadline: Instant,
+) -> Result<(), String> {
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > super::MAX_FRAME.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other(
+                    "Retained binary frame exceeds capacity",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    remaining(deadline)?;
+    let mut bytes = Bounded(Vec::new());
+    postcard::to_io(value, &mut bytes).map_err(|e| e.to_string())?;
+    control.set_nonblocking(true).map_err(|e| e.to_string())?;
+    write_exact_until(control, &(bytes.0.len() as u32).to_le_bytes(), deadline)?;
+    write_exact_until(control, &bytes.0, deadline)
 }
 
 #[cfg(test)]
@@ -123,32 +157,28 @@ mod tests {
     use super::*;
     #[test]
     fn partial_frame_progress_does_not_extend_the_absolute_deadline() {
+        // The peer announces a frame and then trickles its body a byte at a
+        // time without end. A deadline that each byte renewed would never
+        // expire, so returning at all proves it is absolute.
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let (release, wait) = crossbeam_channel::bounded(1);
         let peer = std::thread::spawn(move || {
-            let bytes = serde_json::to_vec(&"x".repeat(128)).unwrap();
             writer
-                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .write_all(&(super::super::MAX_FRAME as u32).to_le_bytes())
                 .unwrap();
-            for byte in bytes {
-                if writer.write_all(&[byte]).is_err() {
-                    break;
-                }
+            while writer.write_all(b" ").is_ok() {
                 if wait.recv_timeout(Duration::from_millis(5)).is_ok() {
                     break;
                 }
             }
         });
-        let started = Instant::now();
-        let error =
-            receive_until::<serde_json::Value>(&reader, started + Duration::from_millis(40))
-                .unwrap_err();
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("a trickled receive", move || {
+            receive_until::<serde_json::Value>(&reader, Instant::now() + Duration::from_millis(40))
+                .unwrap_err()
+        });
         let _ = release.send(());
-        drop(reader);
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
     }
     #[test]
     fn stalled_frame_write_is_bounded_and_oversized_response_is_refused_before_body_read() {
@@ -166,19 +196,18 @@ mod tests {
             },
             0
         );
-        let started = Instant::now();
-        assert!(
+        // Nobody reads, so the write stalls once the buffer fills. A write
+        // that waited for the reader would never return.
+        let error = crate::test_timing::returns("a stalled send", move || {
             send_until(
                 &writer,
                 &"x".repeat(1024 * 1024),
-                started + Duration::from_millis(40)
+                Instant::now() + Duration::from_millis(40),
             )
             .unwrap_err()
-            .contains("deadline")
-        );
-        assert!(started.elapsed() < Duration::from_millis(250));
+        });
+        assert!(error.contains("deadline"), "{error}");
         drop(reader);
-        drop(writer);
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer
             .write_all(&((super::super::MAX_FRAME + 1) as u32).to_le_bytes())

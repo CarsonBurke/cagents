@@ -146,6 +146,7 @@ pub fn accounts(rows: impl IntoIterator<Item = Row>, now: u64) -> Vec<Brokered> 
                     email,
                     organization: None,
                     plan: None,
+                    disputed_by: None,
                 },
                 snapshot: snapshot(&reading, newest),
             })
@@ -196,12 +197,15 @@ fn snapshot(reading: &[&Row], observed_at: u64) -> UsageSnapshot {
     });
     UsageSnapshot {
         status: status_for(&windows, limited, warning),
+        resets: Vec::new(),
         ordinary_usage_allowed: None,
         windows,
         credits: None,
         observed_at,
         source: UsageSource::Recorded,
         plan: None,
+        plan_display_name: None,
+        rate_limit_tier: None,
         detail: None,
     }
 }

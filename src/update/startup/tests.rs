@@ -26,6 +26,7 @@ fn job(phase: UpdatePhase) -> UpdateJob {
         message: "PRIVATE_ERROR_SENTINEL /private/path CONFIRMATION_SENTINEL".into(),
         log_path: "/private/LOG_SENTINEL".into(),
         confirmation: None,
+        refusal: None,
     }
 }
 fn write(state: &Path, job: &UpdateJob) {
@@ -42,6 +43,7 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
             waiting: 0,
             blocked: 0,
             daemon_timeout: false,
+            refused: false,
         }),
     }
 }
@@ -65,10 +67,14 @@ fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_
         ),
         "observation did not release the worker's lock"
     );
+    // Model an unrelated child paused between fork and exec: its descriptor
+    // shares the same open-file description even with CLOEXEC set.
+    let unrelated_fork = lock.try_clone().unwrap();
     drop(lock);
     let orphan = observe_installation(&executable, LockState::Free);
     assert_eq!(orphan.heading(), "Update completion is unconfirmed");
     assert!(orphan.can_open() && !orphan.finished());
+    drop(unrelated_fork);
     assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
     assert_eq!(
         fs::metadata(state.join("status.json")).unwrap().ino(),
@@ -149,6 +155,18 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
             .explanation()
             .contains("daemon did not finish starting")
     );
+    let mut refused = projected(UpdatePhase::Failed, LockState::Free, LockState::Free);
+    refused.job.as_mut().unwrap().refused = true;
+    assert_eq!(refused.heading(), "The update was not installed");
+    assert!(refused.explanation().contains("nothing was installed"));
+    assert!(
+        refused
+            .technical_summary()
+            .contains("held back, not installed")
+    );
+    // While its helper is still exiting, there is no recovery to wait for.
+    refused.helper_lock = LockState::Held;
+    assert_eq!(refused.heading(), "The update was not installed");
 }
 
 #[test]
@@ -162,8 +180,15 @@ fn private_status_projection_never_exposes_capability_error_or_path_content() {
     ] {
         let mut job = job(phase);
         job.confirmation = Some(super::super::confirmation::Confirmation {
+            stop: None,
             nonce: "CONFIRMATION_NONCE_SENTINEL".into(),
             preview: super::super::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
+                editors: Vec::new(),
                 candidate: super::super::impact::Candidate {
                     version: "1.2.4".into(),
                     protocol: crate::terminal_ipc::PROTOCOL_VERSION,
@@ -276,4 +301,32 @@ fn awaiting_approval_and_idle_blockers_use_counts_without_session_names_or_capab
     snapshot.job.as_mut().unwrap().waiting = 0;
     snapshot.job.as_mut().unwrap().phase = UpdatePhase::AwaitingConfirmation;
     assert!(snapshot.explanation().contains("cannot approve"));
+}
+
+#[test]
+fn a_recorded_refusal_reads_as_not_installed_without_its_private_reasons() {
+    let (_root, executable, state) = installation();
+    let mut job = job(UpdatePhase::Failed);
+    let refusal = super::super::impact::Refusal {
+        sessions: vec![super::super::impact::RefusedSession {
+            title: "PRIVATE_TITLE_SENTINEL".into(),
+            reason: "PRIVATE_REASON_SENTINEL".into(),
+        }],
+        blockers: Vec::new(),
+        expired: false,
+    };
+    job.message = refusal.message();
+    job.refusal = Some(refusal);
+    write(&state, &job);
+    let mut snapshot = observe_installation(&executable, LockState::Free);
+    // The helper that wrote the record has exited.
+    snapshot.helper_lock = LockState::Free;
+    assert_eq!(snapshot.heading(), "The update was not installed");
+    let visible = format!(
+        "{} {} {}",
+        snapshot.heading(),
+        snapshot.explanation(),
+        snapshot.technical_summary()
+    );
+    assert!(!visible.contains("PRIVATE"), "{visible}");
 }

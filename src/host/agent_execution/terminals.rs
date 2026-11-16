@@ -31,10 +31,16 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo
+        | R::StartupState
         | R::List
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
+        | R::ReadWorkspaceView { .. }
+        | R::ReadWorkspaceSnapshot
+        | R::ReadWorkspaceMetadata { .. }
+        | R::ReadTerminalRemovalBasis { .. }
+        | R::ReadCapturedTerminalRemovalBasis { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
@@ -62,9 +68,12 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ClearTerminalScrollback { terminal_id }
         | R::ShutdownTerminal { terminal_id }
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
-        R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
+        R::ReleaseCompletedTerminal { session, .. } | R::CloseTerminalSource { session, .. } => {
+            Access::Control(session.id)
+        }
         R::Spawn { session, .. } => Access::Spawn(session),
         R::CompletePendingTerminal { .. }
+        | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
@@ -76,6 +85,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::PrepareConfirmedUpgrade { .. }
         | R::ResolveUpgradeChat { .. }
         | R::EditWorkspaceModel { .. }
+        | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
         | R::WatchNotifications { .. }
@@ -93,6 +103,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }
+        | R::ChatLostProcesses { .. }
         | R::ChatCapacityInspect
         | R::ChatCapacitySet { .. }
         | R::ChatReleaseInspect { .. }
@@ -105,6 +116,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
         | R::ChatPrepareResume { .. }
+        | R::WatchConversationPullRequests { .. }
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }

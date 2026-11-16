@@ -63,34 +63,6 @@ pub fn enter_browser_engine_thread() {
     IS_BROWSER_ENGINE_THREAD.with(|flag| flag.set(true));
 }
 
-#[cfg(feature = "ui")]
-thread_local! {
-    // One inspector hover is visible at a time. Retain only its latest parse,
-    // and apply theme-dependent rendering in the caller on every view.
-    static INSPECTOR_MARKDOWN: std::cell::RefCell<Option<(String, Vec<cosmic::widget::markdown::Item>)>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(feature = "ui")]
-#[inline(never)]
-pub fn with_inspector_markdown(
-    source: &str,
-    render: &mut dyn FnMut(&[cosmic::widget::markdown::Item]),
-) {
-    INSPECTOR_MARKDOWN.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache
-            .as_ref()
-            .is_none_or(|(previous, _)| previous != source)
-        {
-            *cache = Some((
-                source.to_owned(),
-                cosmic::widget::markdown::parse(source).collect(),
-            ));
-        }
-        render(&cache.as_ref().unwrap().1);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,37 +102,5 @@ mod tests {
         .join()
         .unwrap();
         assert!(on_browser_engine_thread());
-    }
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn inspector_hover_reuses_equal_sources_without_cross_thread_contamination() {
-        let source = "First hover paragraph";
-        let mut first = std::ptr::null();
-        with_inspector_markdown(source, &mut |items| {
-            assert_eq!(items.len(), 1);
-            first = items.as_ptr();
-        });
-        std::thread::spawn(|| {
-            with_inspector_markdown("Another hover\n\nSecond paragraph", &mut |items| {
-                assert_eq!(items.len(), 2);
-            });
-        })
-        .join()
-        .unwrap();
-        with_inspector_markdown(&source.to_owned(), &mut |items| {
-            assert_eq!(
-                items.as_ptr(),
-                first,
-                "unchanged hover must retain its parse"
-            );
-        });
-        with_inspector_markdown("Changed hover\n\nSecond paragraph", &mut |items| {
-            assert_eq!(
-                items.len(),
-                2,
-                "a changed hover must replace cached content"
-            );
-        });
     }
 }
