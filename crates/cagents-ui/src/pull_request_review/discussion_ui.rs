@@ -1062,12 +1062,9 @@ impl State {
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Back")
                     .on_press_maybe((!self.discussion.busy).then_some(Action::CancelSubmit)),
-                crate::ui_controls::button::primary(if self.discussion.busy {
-                    "Submitting…"
-                } else {
-                    "Submit review"
-                })
-                .on_press_maybe(enabled.then_some(Action::ConfirmSubmit)),
+                crate::ui_controls::button::primary("Submit review")
+                    .instead("Submitting…", self.discussion.busy)
+                    .on_press_maybe(enabled.then_some(Action::ConfirmSubmit)),
             ));
         } else {
             rows.push(design::heading("Finish your review").into());
@@ -1190,15 +1187,12 @@ impl State {
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Cancel").on_press(Action::CloseReview),
                 crate::interaction::tooltip(
-                    crate::ui_controls::button::primary(if self.discussion.busy {
-                        "Saving…"
-                    } else {
-                        "Submit review"
-                    })
-                    .on_press_maybe(
-                        (enabled && !drafting && !empty_comment && !old_head)
-                            .then_some(Action::PrepareSubmit),
-                    ),
+                    crate::ui_controls::button::primary("Submit review")
+                        .instead("Saving…", self.discussion.busy)
+                        .on_press_maybe(
+                            (enabled && !drafting && !empty_comment && !old_head)
+                                .then_some(Action::PrepareSubmit),
+                        ),
                     if old_head {
                         "Discard the pending review on the older commit before submitting."
                     } else if empty_comment {
@@ -1723,16 +1717,13 @@ impl State {
                     crate::ui_controls::button::quiet("Reply")
                         .on_press_maybe(enabled.then_some(Action::Reply(thread.id.clone())))
                         .into(),
-                    crate::ui_controls::button::quiet(if thread.resolved {
-                        "Reopen"
-                    } else {
-                        "Resolve"
-                    })
-                    .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
-                        thread: thread.id.clone(),
-                        resolved: !thread.resolved,
-                    }))
-                    .into(),
+                    crate::ui_controls::button::quiet("Resolve")
+                        .instead("Reopen", thread.resolved)
+                        .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
+                            thread: thread.id.clone(),
+                            resolved: !thread.resolved,
+                        }))
+                        .into(),
                 ])
                 .spacing(space::S)
                 .into(),
@@ -1838,32 +1829,26 @@ impl State {
                         ),
                     )
                     .into(),
-                    crate::ui_controls::button::secondary(if has_pending_review {
-                        "Comment now"
-                    } else {
-                        "Add to review"
-                    })
-                    .on_press_maybe(
-                        (enabled
-                            && !stale
-                            && !matches!(composer.destination, Destination::Edit(_))
-                            && !composer.content.text().trim().is_empty())
-                        .then_some(if has_pending_review {
-                            Action::SaveNow
-                        } else {
-                            Action::Save
-                        }),
-                    )
-                    .into(),
+                    crate::ui_controls::button::secondary("Add to review")
+                        .instead("Comment now", has_pending_review)
+                        .on_press_maybe(
+                            (enabled
+                                && !stale
+                                && !matches!(composer.destination, Destination::Edit(_))
+                                && !composer.content.text().trim().is_empty())
+                            .then_some(if has_pending_review {
+                                Action::SaveNow
+                            } else {
+                                Action::Save
+                            }),
+                        )
+                        .into(),
                     // Local to the draft, so live through a background
                     // refresh, as typing is; only a write in flight holds them.
-                    crate::ui_controls::button::quiet(if composer.preview {
-                        "Write"
-                    } else {
-                        "Preview"
-                    })
-                    .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
-                    .into(),
+                    crate::ui_controls::button::quiet("Preview")
+                        .instead("Write", composer.preview)
+                        .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
+                        .into(),
                     crate::ui_controls::button::secondary("Cancel")
                         .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
                         .into(),

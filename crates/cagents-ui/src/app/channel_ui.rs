@@ -2224,20 +2224,20 @@ impl Cagents {
                 "The last attempt failed: {failure}"
             )));
         }
-        rows.push(super::dialog_ui::confirmation_actions(
+        let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.channel.close"))
                 .on_press(Message::ChannelUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete channel"
-            })
-            .id(widget::Id::new("dialog.channel.confirm"))
-            .on_press(Message::ChannelUi(Action::ConfirmDelete)),
-        ));
+            crate::ui_controls::button::destructive("Delete channel")
+                .instead("Retry delete", dialog.failure.is_some())
+                .id(widget::Id::new("dialog.channel.confirm"))
+                .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+        );
+        // A long failure or list of unsaved editors scrolls; the answers stay
+        // in reach.
         Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
+            actions,
             480.0,
         ))
     }
@@ -2678,6 +2678,20 @@ mod tests {
                 ordinal != crate::workspace_model::PENDING_ORDINAL
             );
         }
+    }
+
+    /// Why the last deletion failed can run long; it scrolls, and Cancel and
+    /// Retry stay in reach at the scaled minimum window.
+    #[test]
+    fn deletion_answers_stay_in_reach_beside_a_long_failure() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let (mut app, channel, _survivor, _card) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        app.channel_ui.dialog.as_mut().unwrap().failure = Some(long_message());
+        assert_actions_stay_in_reach(
+            || super::super::dialog_ui::overlay(app.channel_dialog_view().unwrap(), None, 1.0),
+            &["dialog.channel.close", "dialog.channel.confirm"].map(widget::Id::new),
+        );
     }
 
     #[test]

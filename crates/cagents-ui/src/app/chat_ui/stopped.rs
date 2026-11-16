@@ -16,6 +16,9 @@ pub(super) struct Stopped {
     pub(super) primary: Option<(&'static str, Press, bool)>,
     /// A second, lesser choice beside it.
     pub(super) secondary: Option<(&'static str, Press, bool)>,
+    /// Every label the primary action can take while this card stays in its
+    /// state, so pressing it does not resize it under the pointer.
+    pub(super) primary_labels: &'static [&'static str],
 }
 
 /// What pressing one of a stopped card's buttons does.
@@ -58,6 +61,7 @@ impl Runtime {
                     .unwrap_or_else(|| "Saved conversation history is read-only.".into()),
                 primary: Some(("Resume conversation", Press::ResumeSaved, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         if self.resumes_in_place() {
@@ -93,6 +97,7 @@ impl Runtime {
                     Press::StartFresh,
                     enabled,
                 )),
+                primary_labels: &["Resume conversation", "Resuming…", "Try again"],
             };
         }
         if unresumable {
@@ -104,6 +109,7 @@ impl Runtime {
                     Press::StartFresh,
                     enabled,
                 )),
+                primary_labels: &[],
             };
         }
         if self.disconnected || !self.connected() {
@@ -113,6 +119,7 @@ impl Runtime {
                 ),
                 primary: Some(("Reconnect", Press::Reconnect, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         if self.session.owns_codex_listener() {
@@ -122,6 +129,7 @@ impl Runtime {
                 ),
                 primary: Some(("Reconnect", Press::Reconnect, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         // Attaching again would only bring back this same stopped actor, and
@@ -132,6 +140,7 @@ impl Runtime {
             ),
             primary: None,
             secondary: None,
+            primary_labels: &[],
         }
     }
 
@@ -144,11 +153,13 @@ impl Runtime {
             guidance,
             primary,
             secondary,
+            primary_labels,
         } = self.stopped(transitioning, resuming);
         let mut controls = Vec::new();
         if let Some((label, pressed, enabled)) = primary {
             controls.push(
                 crate::ui_controls::button::primary(label)
+                    .keep_room_for(primary_labels.iter().copied())
                     .on_press_maybe(enabled.then(|| action(pressed.action(self.target))))
                     .into(),
             );

@@ -384,7 +384,7 @@ impl Cagents {
         if let Some(error) = &state.error {
             rows.push(notice_detail(error));
         }
-        rows.push(dialog_ui::confirmation_actions(
+        let actions = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("session-recovery.cancel"))
                 .on_press_maybe(
@@ -400,9 +400,15 @@ impl Cagents {
                             .is_some_and(|review| self.session_recovery_review_is_current(review)))
                     .then_some(Message::SessionRecovery(Action::Confirm)),
                 ),
-        ));
+        );
+        // A long storage error scrolls; Cancel and Recover stay in reach.
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 600.0),
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                600.0,
+                dialog_ui::MAX_HEIGHT,
+            ),
             (!state.pending).then_some(Message::SessionRecovery(Action::Cancel)),
             1.0,
         ))
@@ -480,6 +486,21 @@ mod tests {
             card,
             terminal: terminal.clone(),
         })
+    }
+
+    /// A long storage error scrolls; Cancel and Recover stay in reach at the
+    /// scaled minimum window.
+    #[test]
+    fn recovery_actions_stay_in_reach_beside_a_long_error() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let (_directory, mut app, card) = fixture();
+        app.session_recovery.target = Some(card);
+        app.session_recovery.error = Some(long_message());
+        assert_actions_stay_in_reach(
+            || app.session_recovery_dialog().unwrap(),
+            &["session-recovery.cancel", "session-recovery.confirm"].map(widget::Id::new),
+        );
+        app.session.as_mut().unwrap().shutdown();
     }
 
     #[test]

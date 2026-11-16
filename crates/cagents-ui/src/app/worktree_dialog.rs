@@ -549,12 +549,9 @@ impl Cagents {
                 ),
                 branch_note,
             ),
-            crate::ui_controls::button::quiet(if dialog.advanced {
-                "Hide options"
-            } else {
-                "Base branch & destination"
-            })
-            .icon(if dialog.advanced {
+            crate::ui_controls::button::quiet("Base branch & destination")
+                .instead("Hide options", dialog.advanced)
+                .icon(if dialog.advanced {
                 Icon::PanDown
             } else {
                 Icon::PanEnd
@@ -619,29 +616,29 @@ impl Cagents {
         } else {
             iced::widget::Space::new().width(Length::Fill).into()
         };
-        rows.push(
-            widget::row::with_children(vec![
-                status,
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("dialog.worktree.cancel"))
-                    .on_press(Message::CancelDialog)
-                    .into(),
-                crate::ui_controls::button::primary(if dialog.resolving.is_some() {
-                    "Creating…"
-                } else {
-                    "Create worktree"
-                })
-                .reserve_labels(["Create worktree", "Creating…"])
+        let actions = widget::row::with_children(vec![
+            status,
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("dialog.worktree.cancel"))
+                .on_press(Message::CancelDialog)
+                .into(),
+            crate::ui_controls::button::primary("Create worktree")
+                .instead("Creating…", dialog.resolving.is_some())
                 .id(widget::Id::new("dialog.worktree.create"))
                 .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
                 .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-        );
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center);
         Some((
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 520.0),
+            // A long Git error scrolls with the fields; Cancel and Create
+            // stay in reach.
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                520.0,
+                dialog_ui::MAX_HEIGHT,
+            ),
             editable.then_some(Message::CancelDialog),
         ))
     }
@@ -1062,6 +1059,27 @@ mod tests {
     /// Escape closes the dialog on the first press although its focused
     /// field captures the key to blur itself, and stops a running
     /// resolution.
+    /// A long Git error scrolls with the fields; Cancel and Create stay in
+    /// reach at the scaled minimum window, with the options open too.
+    #[test]
+    fn worktree_actions_stay_in_reach_beside_a_long_error() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let Fixture {
+            mut app, _state, ..
+        } = fixture();
+        let dialog = app.worktree_dialog.as_mut().unwrap();
+        dialog.draft.branch = "feature/topic".into();
+        dialog.advanced = true;
+        dialog.error = Some(WorktreeInputError {
+            field: None,
+            message: long_message(),
+        });
+        assert_actions_stay_in_reach(
+            || super::super::dialog_ui::overlay(app.worktree_dialog_view().unwrap().0, None, 1.0),
+            &["dialog.worktree.cancel", "dialog.worktree.create"].map(widget::Id::new),
+        );
+    }
+
     #[test]
     fn escape_from_a_focused_field_closes_the_dialog() {
         let Fixture { mut app, .. } = fixture();

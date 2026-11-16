@@ -201,16 +201,16 @@ impl Cagents {
                     crate::design::title(title).into(),
                     crate::design::body(body).into(),
                     self.dont_ask_again_control(QUESTION, true),
-                    dialog_ui::confirmation_actions(
-                        crate::ui_controls::button::secondary("Keep working")
-                            .id(widget::Id::new(CANCEL))
-                            .on_press(Message::CancelChatClose),
-                        crate::ui_controls::button::destructive("Stop and close")
-                            .id(widget::Id::new(CONFIRM))
-                            .on_press(Message::ConfirmChatClose),
-                    ),
                 ])
                 .spacing(space::M),
+                dialog_ui::confirmation_actions(
+                    crate::ui_controls::button::secondary("Keep working")
+                        .id(widget::Id::new(CANCEL))
+                        .on_press(Message::CancelChatClose),
+                    crate::ui_controls::button::destructive("Stop and close")
+                        .id(widget::Id::new(CONFIRM))
+                        .on_press(Message::ConfirmChatClose),
+                ),
                 560.0,
             ),
             Some(Message::CancelChatClose),

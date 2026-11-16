@@ -1196,9 +1196,11 @@ impl Cagents {
                     ),
             )]
         };
-        rows.push(widget::row::with_children(buttons).spacing(space::S).into());
+        // A long reason the daemon kept the pane scrolls; the answers stay
+        // in reach.
         Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
+            widget::row::with_children(buttons).spacing(space::S),
             560.0,
         ))
     }

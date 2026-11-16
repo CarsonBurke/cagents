@@ -148,14 +148,10 @@ pub(super) fn view<'a>(
         let resume_enabled = enabled && recovery.login_change.is_none();
         login_change = recovery.login_change;
         controls.push(
-            crate::ui_controls::button::primary(if recovery.signing_in {
-                "Signing in…"
-            } else {
-                "Sign in"
-            })
-            .reserve_labels(["Sign in", "Signing in…"])
-            .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
-            .into(),
+            crate::ui_controls::button::primary("Sign in")
+                .instead("Signing in…", recovery.signing_in)
+                .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
+                .into(),
         );
         controls.push(
             crate::ui_controls::button::secondary("Resume chat")

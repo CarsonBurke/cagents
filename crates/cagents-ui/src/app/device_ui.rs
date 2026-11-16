@@ -1035,13 +1035,39 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example build-host)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(space::S).into()];
+            let mut rows = vec![
+                design::title("Connect to a device").into(),
+                design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),
+                crate::ui_controls::field::text("Device name", &state.config_name)
+                    .on_input(|value| Message::Device(Action::ConfigName(value)))
+                    .into(),
+                crate::ui_controls::field::text(
+                    "SSH host alias (for example build-host)",
+                    &state.config_host,
+                )
+                .on_input(|value| Message::Device(Action::ConfigHost(value)))
+                .into(),
+                crate::ui_controls::field::text(
+                    "Remote cagents executable",
+                    &state.config_executable,
+                )
+                .on_input(|value| Message::Device(Action::ConfigExecutable(value)))
+                .into(),
+            ];
+            // What the last attempt said, such as an SSH error, sits above
+            // the actions it is about; a long one scrolls with the fields.
             if let Some(notice) = &state.notice {
                 rows.push(design::body(notice).into());
             }
-            return dialog_ui::surface(
+            return dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(rows).spacing(space::M),
+                widget::row::with_children(vec![
+                    button("Close", Action::Close),
+                    button("Save and switch device", Action::ConfigSave),
+                ])
+                .spacing(space::S),
                 600.0,
+                dialog_ui::MAX_HEIGHT,
             );
         }
         let icon = |name: Icon, label: &'static str, value: Action, enabled: bool| {
