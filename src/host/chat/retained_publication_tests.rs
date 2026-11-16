@@ -4,6 +4,9 @@ use std::{fs, path::Path};
 
 #[test]
 fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const CHILD: &str = "CAGENTS_RETAINED_PUBLICATION_TEST";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -23,6 +26,7 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(CHILD, "1")
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -156,6 +160,19 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
         "provider never confirmed its first turn",
     );
     let confirmed = handle.confirmed_session_id().unwrap();
+    wait(
+        || {
+            matches!(registry.lock().unwrap().retained_agent_authority_source(id).unwrap(),
+            Some(crate::agent_execution::HostedSession::Chat(source))
+                if source.launch.session_id.as_deref() == Some(confirmed.as_str()))
+        },
+        "daemon did not publish the confirmed conversation without a window",
+    );
+    let durable = registry
+        .lock()
+        .unwrap()
+        .retained_agent_authority_source(id)
+        .unwrap();
     let inspection = Handle::inspect_remote(&identity.record, first).unwrap();
     assert!(
         inspection.source == published || inspection.previous_sources.contains(&published),
@@ -201,9 +218,7 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
             .unwrap()
             .retained_agent_authority_source(id)
             .unwrap(),
-        Some(crate::agent_execution::HostedSession::Chat(
-            published.clone()
-        ))
+        durable
     );
     fault
         .execute_batch("DROP TRIGGER reject_publication;")

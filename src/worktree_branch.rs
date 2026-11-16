@@ -4,6 +4,43 @@ mod force_delete;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod registered_heads;
 use serde::{Deserialize, Serialize};
+
+/// Writes a script Git or a hook will execute, without this process ever
+/// holding a writable descriptor to it. A fork on another thread copies every
+/// open descriptor until its child execs, and executing a file that still has
+/// a writer fails with ETXTBSY. A short-lived shell owns the only writer.
+/// `create_new` refuses an existing file instead of replacing its contents.
+#[cfg(any(feature = "ui", feature = "host"))]
+fn write_executable(path: &std::path::Path, script: &[u8], create_new: bool) -> Result<(), String> {
+    use std::io::Write;
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"umask 077; if [ "$2" = new ]; then set -C; fi; /bin/cat > "$1" && /bin/chmod 700 "$1""#,
+            "write-executable",
+        ])
+        .arg(path)
+        .arg(if create_new { "new" } else { "replace" })
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let written = writer.stdin.take().expect("piped stdin").write_all(script);
+    let output = writer
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    // A shell that refused the path exits before reading, so its status
+    // explains a broken pipe better than the pipe error does.
+    if !output.status.success() {
+        return Err(format!(
+            "Could not write {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    written.map_err(|error| error.to_string())
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BranchDeleteFailureKind {
     CheckedOutElsewhere,

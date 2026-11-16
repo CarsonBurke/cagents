@@ -13,6 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod manager;
+mod workload;
+pub(crate) use workload::{CommandStop, Killer, ProviderScope};
+
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 const INVISIBLE_MANAGER: &str = "user manager peer is not visible and owned";
@@ -291,49 +295,209 @@ pub(crate) fn enroll_holder() -> io::Result<()> {
     if !manager_available() {
         return Ok(());
     }
-    enroll_process(std::process::id())
+    let pid = std::process::id();
+    with_verified_manager(ManagerNamespace::connect(), || {
+        enroll_proven_process(pid, false).map(drop)
+    })
 }
 
-/// Enroll an unreaped owned provider before its first prompt is submitted.
-/// The caller keeps the Child alive until this operation has completed.
-pub(crate) fn enroll_process(pid: u32) -> io::Result<()> {
+/// A confirmed scope membership, and whether systemd delegated the scope.
+#[derive(Debug)]
+struct Enrolled {
+    membership: String,
+    delegated: bool,
+}
+
+/// Enroll this holder in a divided scope before it starts its provider, so
+/// the provider begins in the holder's leaf and its commands can be kept
+/// apart once it runs (see [`ProviderScope::keep_commands_apart`]). The
+/// existing launch stays when no user manager or division is available.
+pub(crate) fn enroll_dividing_holder() -> io::Result<Option<ProviderScope>> {
     if !manager_available() {
-        return Ok(());
+        return Ok(None);
     }
-    with_verified_manager(ManagerNamespace::connect(), || enroll_proven_process(pid))
+    let pid = std::process::id();
+    let mut enrolled = None;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        enrolled = Some(enroll_proven_process(pid, true)?);
+        Ok(())
+    })?;
+    let enrolled = enrolled.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    // A holder has no tracing subscriber; its daemon reports shared scopes.
+    Ok(Some(if enrolled.delegated {
+        ProviderScope::divide(&enrolled.membership, pid)?.0
+    } else {
+        ProviderScope::whole(&enrolled.membership)?
+    }))
 }
 
-fn enroll_proven_process(pid: u32) -> io::Result<()> {
-    let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
+/// Enroll an unreaped owned provider before its first prompt is submitted,
+/// then keep the commands it starts in leaves of their own (see
+/// [`workload`]). The caller keeps the Child alive until this returns.
+///
+/// `Ok(None)` keeps the existing launch: no OS user manager. A scope that
+/// could not be split stays one leaf, and is still returned so a memory kill
+/// of the provider can be recognized. `wake` is written once whenever a
+/// command is stopped for memory.
+pub(crate) fn enroll_provider(
+    pid: u32,
+    wake: Option<UnixStream>,
+) -> io::Result<Option<ProviderScope>> {
+    if !manager_available() {
+        return Ok(None);
+    }
+    let mut enrolled = None;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        enrolled = Some(enroll_proven_process(pid, true)?);
+        Ok(())
+    })?;
+    let enrolled = enrolled.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    let (scope, unsplit) = if enrolled.delegated {
+        ProviderScope::new(&enrolled.membership, pid, wake)?
+    } else {
+        (
+            ProviderScope::whole(&enrolled.membership)?,
+            Some(io::Error::other("systemd did not delegate the scope")),
+        )
+    };
+    if let Some(error) = unsplit {
+        tracing::warn!(%error, pid, "provider commands share its cgroup; a memory kill can end the provider with them");
+    }
+    Ok(Some(scope))
+}
+
+/// What a divided scope is requested with, most capable first. systemd
+/// rejects a whole transient unit request for one property it doesn't know:
+/// scopes accept `OOMPolicy` from systemd 253, and older ones have no OOM
+/// policy to stop them. Without delegation the scope stays one leaf.
+const DIVIDED_SCOPE: &[&[&str]] = &[
+    // An OOM kill in one leaf must not stop the scope, and with it the
+    // provider: `continue` is systemd's default for delegated units, but the
+    // provider's survival depends on it, so it is stated.
+    &["Delegate", "b", "true", "OOMPolicy", "s", "continue"],
+    &["Delegate", "b", "true"],
+    &[],
+];
+
+/// Delegation lets the provider's owner divide the scope; systemd leaves the
+/// cgroups below a delegated unit to it. A divided scope is asked for in
+/// forms older systemd accepts too, down to the undelegated scope.
+fn enroll_proven_process(pid: u32, divide: bool) -> io::Result<Enrolled> {
+    let requests: &[&[&str]] = if divide { DIVIDED_SCOPE } else { &[&[]] };
+    first_accepted(requests, |properties| {
+        let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
+        #[cfg(test)]
+        tests::requested(&unit);
+        match enroll_with(
+            scope_request(&unit, pid, properties),
+            &unit,
+            TIMEOUT,
+            || cgroup(pid),
+        ) {
+            // systemd may still run a request given up on, once the process
+            // has exited or is exiting: the scope it starts holds nothing and
+            // is never stopped. Settle it before the process goes on.
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                match manager::withdraw(&unit, || cgroup(pid)) {
+                    Ok(Some(membership)) => Ok(membership),
+                    Ok(None) => Err(error),
+                    Err(withdrawal) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{error}; withdrawing the request failed: {withdrawal}"),
+                    )),
+                }
+            }
+            result => result,
+        }
+    })
+}
+
+/// How long a session scope must have run before an empty one is collected.
+/// A scope starts with its processes, so a minute leaves wide room for
+/// anything about systemd's start this code doesn't foresee.
+const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// Stop the running session scopes that hold no process: those an enrollment
+/// couldn't withdraw, under a user manager too slow to answer in time, and
+/// those earlier versions left. Returns how many were stopped; a scope with a
+/// process, a queued job or a recent start is left alone.
+pub(crate) fn collect_empty_scopes() -> io::Result<usize> {
+    collect_empty_scopes_after(COLLECTABLE_AFTER)
+}
+
+fn collect_empty_scopes_after(age: Duration) -> io::Result<usize> {
+    if !manager_available() {
+        return Ok(0);
+    }
+    let mut stopped = 0;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        stopped = manager::collect_empty_scopes(age)?;
+        Ok(())
+    })?;
+    Ok(stopped)
+}
+
+/// The membership from the first request systemd accepts. Only a refused
+/// request is retried: one that timed out may still be queued, and could
+/// yet move the process into its unit.
+fn first_accepted(
+    requests: &[&'static [&'static str]],
+    mut enroll: impl FnMut(&'static [&'static str]) -> io::Result<String>,
+) -> io::Result<Enrolled> {
+    let mut refused = io::Error::other("no scope request");
+    for properties in requests {
+        match enroll(properties) {
+            Ok(membership) => {
+                return Ok(Enrolled {
+                    membership,
+                    delegated: properties.contains(&"Delegate"),
+                });
+            }
+            Err(error) if error.get_ref().is_some_and(|inner| inner.is::<Refused>()) => {
+                refused = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(refused)
+}
+
+fn scope_request(unit: &str, pid: u32, properties: &[&str]) -> Command {
     let mut command = Command::new("busctl");
     command
         .env("XDG_RUNTIME_DIR", manager_runtime())
         .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    let count = (3 + properties.len() / 3).to_string();
+    let pid = pid.to_string();
     command
         .args([
             "--user",
-            "--timeout=1s",
+            // enroll_with's deadline bounds the request. busctl's own must not
+            // end it first: a request systemd may still run would read as
+            // refused, and be followed by a second one.
+            "--timeout=60s",
             "call",
             "org.freedesktop.systemd1",
             "/org/freedesktop/systemd1",
             "org.freedesktop.systemd1.Manager",
             "StartTransientUnit",
             "ssa(sv)a(sa(sv))",
-            &unit,
+            unit,
             "fail",
-            "3",
+            &count,
             "PIDs",
             "au",
             "1",
-            &pid.to_string(),
+            &pid,
             "Slice",
             "s",
             "app.slice",
             "CollectMode",
             "s",
             "inactive-or-failed",
-            "0",
         ])
+        .args(properties)
+        .arg("0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -342,15 +506,27 @@ fn enroll_proven_process(pid: u32) -> io::Result<()> {
     unsafe {
         command.pre_exec(super::seal_inherited_descriptors);
     }
-    enroll_with(command, &unit, TIMEOUT, || cgroup(pid))
+    command
 }
+
+/// systemd answered a scope request with an error.
+#[derive(Debug)]
+struct Refused(std::process::ExitStatus);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "user scope request failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 fn enroll_with(
     mut command: Command,
     unit: &str,
     timeout: Duration,
     mut membership: impl FnMut() -> io::Result<String>,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let started = Instant::now();
     // Held until this function's final wait. A retained actor's orphan sweep
     // must not consume the status this scope request is waiting for.
@@ -358,9 +534,7 @@ fn enroll_with(
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                return Err(io::Error::other(format!(
-                    "user scope request failed: {status}"
-                )));
+                return Err(io::Error::other(Refused(status)));
             }
             break;
         }
@@ -377,8 +551,9 @@ fn enroll_with(
     // StartTransientUnit acknowledges a queued job, not completed migration.
     // Verify the exact unique unit before any provider can inherit this scope.
     loop {
-        if membership()?.rsplit('/').next() == Some(unit) {
-            return Ok(());
+        let current = membership()?;
+        if current.rsplit('/').next() == Some(unit) {
+            return Ok(current);
         }
         if started.elapsed() >= timeout {
             return Err(io::Error::new(
@@ -388,6 +563,22 @@ fn enroll_with(
         }
         thread::sleep(POLL.min(timeout.saturating_sub(started.elapsed())));
     }
+}
+
+/// The session scope a membership path belongs to: the scope itself, or a
+/// leaf a provider scope was divided into.
+fn session_scope(membership: &str) -> Option<&str> {
+    let (parent, leaf) = membership.rsplit_once('/')?;
+    let scope = if leaf == "provider" || leaf.starts_with("command-") {
+        parent
+    } else {
+        membership
+    };
+    scope
+        .rsplit('/')
+        .next()
+        .is_some_and(|unit| unit.starts_with("cagents-session-") && unit.ends_with(".scope"))
+        .then_some(scope)
 }
 
 /// Holder constructors have no tracing subscriber. Their daemon logs degraded
@@ -401,13 +592,7 @@ pub(crate) fn warn_if_shared(holder: u32, root: u32) {
         let caller = cgroup(std::process::id())?;
         let owner = cgroup(holder)?;
         let provider = cgroup(root)?;
-        Ok::<_, io::Error>(
-            owner != caller
-                && provider == owner
-                && owner.rsplit('/').next().is_some_and(|unit| {
-                    unit.starts_with("cagents-session-") && unit.ends_with(".scope")
-                }),
-        )
+        Ok::<_, io::Error>(owner != caller && provider == owner && session_scope(&owner).is_some())
     })();
     if !matches!(isolated, Ok(true)) {
         tracing::warn!(
@@ -425,7 +610,10 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
     if !manager_available() {
         return;
     }
-    let Ok(expected) = cgroup(root) else {
+    let Some(expected) = cgroup(root)
+        .ok()
+        .and_then(|membership| session_scope(&membership).map(str::to_owned))
+    else {
         return;
     };
     let mut seen = std::collections::BTreeSet::from([root]);
@@ -445,7 +633,10 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
                 if !seen.insert(child) {
                     continue;
                 }
-                if cgroup(child).is_ok_and(|membership| membership != expected) {
+                // The provider's commands move to leaves of the same scope.
+                if cgroup(child)
+                    .is_ok_and(|membership| session_scope(&membership) != Some(expected.as_str()))
+                {
                     tracing::warn!(
                         root,
                         child,
@@ -465,6 +656,116 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        static REQUESTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Each scope this thread requests, for tests that check what became of it.
+    pub(super) fn requested(unit: &str) {
+        REQUESTED.with(|requested| requested.borrow_mut().push(unit.to_owned()));
+    }
+
+    /// Many requests at once, for processes that exit while theirs may still
+    /// be queued: the conditions that left thousands of empty scopes. A
+    /// manager this loaded can outlast a withdrawal, so the collection that
+    /// backs it up runs too. Run by hand; it loads the user manager.
+    #[test]
+    #[ignore = "loads the OS user manager"]
+    fn concurrent_requests_for_exiting_processes_leave_no_scope_running() {
+        if !manager_available() {
+            eprintln!("scope withdrawal unqualified: OS user manager unavailable");
+            return;
+        }
+        let workers: Vec<_> = (0..200)
+            .map(|index| {
+                thread::spawn(move || {
+                    let mut child = Command::new("/bin/sleep")
+                        .arg(format!("0.0{}", index % 9 + 1))
+                        .spawn()
+                        .unwrap();
+                    let enrolled = with_verified_manager(ManagerNamespace::connect(), || {
+                        enroll_proven_process(child.id(), false).map(drop)
+                    });
+                    // Reaped late, as a busy parent would.
+                    thread::sleep(Duration::from_secs(3));
+                    child.wait().unwrap();
+                    (
+                        enrolled.is_ok(),
+                        REQUESTED.with(|requested| requested.take()),
+                    )
+                })
+            })
+            .collect();
+        let mut enrolled = 0;
+        let mut units = Vec::new();
+        for worker in workers {
+            let (ok, requested) = worker.join().unwrap();
+            enrolled += usize::from(ok);
+            units.extend(requested);
+        }
+        // Give systemd time to stop scopes whose processes exited.
+        thread::sleep(Duration::from_secs(5));
+        let collected = collect_empty_scopes_after(Duration::ZERO).unwrap();
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=ActiveState", "--value"])
+            .args(&units)
+            .output()
+            .unwrap();
+        let running = String::from_utf8_lossy(&state.stdout)
+            .lines()
+            .filter(|state| *state == "active")
+            .count();
+        eprintln!(
+            "{} requests, {enrolled} enrolled, {collected} collected, {running} left running",
+            units.len()
+        );
+        assert_eq!(running, 0);
+    }
+
+    /// A process that has exited but isn't reaped gets a scope systemd
+    /// starts empty and never stops (#2414). Enrollment must not leave it.
+    #[test]
+    fn a_scope_requested_for_an_exiting_process_is_not_left_running() {
+        if !manager_available() {
+            eprintln!("scope withdrawal unqualified: OS user manager unavailable");
+            return;
+        }
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .starts_with('Z')
+        {
+            assert!(Instant::now() < deadline, "the child never exited");
+            thread::sleep(POLL);
+        }
+        REQUESTED.with(|requested| requested.borrow_mut().clear());
+        for divide in [false, true] {
+            let enrolled = with_verified_manager(ManagerNamespace::connect(), || {
+                enroll_proven_process(pid, divide).map(drop)
+            });
+            assert!(enrolled.is_err(), "an exited process was enrolled");
+        }
+        child.wait().unwrap();
+        let units = REQUESTED.with(|requested| requested.take());
+        assert!(!units.is_empty());
+        for unit in units {
+            let state = Command::new("systemctl")
+                .args(["--user", "show", "--property=ActiveState", "--value", &unit])
+                .output()
+                .unwrap();
+            assert_ne!(
+                String::from_utf8_lossy(&state.stdout).trim(),
+                "active",
+                "{unit} was left running"
+            );
+        }
+    }
     #[test]
     fn unproved_manager_never_attempts_numeric_pid_enrollment() {
         for error in [libc::ENOPROTOOPT, libc::EPERM, libc::EACCES, libc::ENOENT] {
@@ -698,6 +999,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn older_systemd_still_gets_a_scope_and_a_queued_request_is_not_repeated() {
+        // Each request's properties, and whether this fixture systemd knows
+        // them all: it predates scope `OOMPolicy`.
+        let mut asked = Vec::new();
+        let enrolled = first_accepted(DIVIDED_SCOPE, |properties| {
+            asked.push(properties.to_vec());
+            let command = if properties.contains(&"OOMPolicy") {
+                "/bin/false"
+            } else {
+                "/bin/true"
+            };
+            enroll_with(
+                Command::new(command),
+                "fixture.scope",
+                Duration::from_secs(1),
+                || Ok("/app.slice/fixture.scope".into()),
+            )
+        })
+        .unwrap();
+        assert_eq!(asked, [DIVIDED_SCOPE[0], DIVIDED_SCOPE[1]]);
+        assert!(enrolled.delegated);
+        assert_eq!(enrolled.membership, "/app.slice/fixture.scope");
+
+        // Refused throughout: the scope stays whole, as without division.
+        let enrolled = first_accepted(DIVIDED_SCOPE, |properties| {
+            enroll_with(
+                Command::new(if properties.is_empty() {
+                    "/bin/true"
+                } else {
+                    "/bin/false"
+                }),
+                "fixture.scope",
+                Duration::from_secs(1),
+                || Ok("/app.slice/fixture.scope".into()),
+            )
+        })
+        .unwrap();
+        assert!(!enrolled.delegated);
+
+        let mut attempts = 0;
+        let error = first_accepted(DIVIDED_SCOPE, |_| {
+            attempts += 1;
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            enroll_with(
+                command,
+                "fixture.scope",
+                Duration::from_millis(30),
+                || unreachable!(),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
     fn rejected_scope_request_preserves_fallback() {
         let error = rejected_scope_request().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
@@ -709,6 +1067,7 @@ pub(crate) mod tests {
             Duration::from_secs(1),
             || panic!("failed request must not verify membership"),
         )
+        .map(drop)
     }
     #[test]
     fn successful_request_requires_exact_confirmed_membership() {
@@ -765,12 +1124,65 @@ pub(crate) mod tests {
         let owner = cgroup(holder).unwrap();
         assert_ne!(owner, cgroup(std::process::id()).unwrap());
         assert_eq!(owner, cgroup(root).unwrap());
-        assert!(
-            owner
-                .rsplit('/')
-                .next()
+        assert!(session_scope(&owner).is_some(), "{owner}");
+    }
+
+    /// Each process `root` started has left its divided provider leaf for a
+    /// command leaf of the same scope.
+    pub(crate) fn assert_commands_apart(root: u32) {
+        let provider = cgroup(root).unwrap();
+        let Some(scope) = provider.strip_suffix("/provider") else {
+            eprintln!("command cgroups unqualified: provider scope undivided ({provider})");
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let children = loop {
+            let children = std::fs::read_to_string(format!("/proc/{root}/task/{root}/children"))
                 .unwrap()
-                .starts_with("cagents-session-")
-        );
+                .split_whitespace()
+                .map(|pid| pid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                break children;
+            }
+            assert!(Instant::now() < deadline, "the provider started no command");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        for child in children {
+            loop {
+                let leaf = cgroup(child).unwrap();
+                if leaf
+                    .strip_prefix(scope)
+                    .and_then(|name| name.strip_prefix("/command-"))
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "command {child} stayed in {leaf}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    fn a_divided_provider_scope_is_still_its_session_scope() {
+        let scope = "/user.slice/app.slice/cagents-session-a.scope";
+        for membership in [
+            scope.to_owned(),
+            format!("{scope}/provider"),
+            format!("{scope}/command-3"),
+        ] {
+            assert_eq!(session_scope(&membership), Some(scope), "{membership}");
+        }
+        for foreign in [
+            "/user.slice/app.slice/other.scope",
+            "/user.slice/app.slice/other.scope/provider",
+            "/user.slice/app.slice/cagents-session-a.scope/elsewhere",
+        ] {
+            assert_eq!(session_scope(foreign), None, "{foreign}");
+        }
     }
 }

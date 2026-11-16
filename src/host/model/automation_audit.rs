@@ -93,13 +93,13 @@ impl Registry {
     /// Historical receipts retain their project scope when a management edit
     /// moves the definition. A caller may inspect its own retained history,
     /// never receipts that were committed in the destination/source project.
-    pub(crate) fn project_automation_audit(
+    pub(in crate::host) fn project_automation_audit(
         &self,
         repository: &std::path::Path,
         id: Uuid,
         before: Option<u64>,
         limit: usize,
-    ) -> Result<LifecyclePage, String> {
+    ) -> Result<LifecyclePage, super::AuthorityError> {
         let repository = super::repository_key(repository)?;
         let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
         let allowed: bool = tx
@@ -111,9 +111,9 @@ impl Registry {
             )
             .map_err(|e| e.to_string())?;
         if !allowed {
-            return Err(
+            return Err(super::AuthorityError::Denied(
                 "Hosted conversations can inspect automations only in their own project".into(),
-            );
+            ));
         }
         let page = read_page(&tx, id, before, limit, Some(&repository))?;
         tx.commit().map_err(|e| e.to_string())?;

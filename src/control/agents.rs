@@ -4,10 +4,12 @@ use crate::{
     agent::Provider,
     agent_execution::{
         Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
-        Summary, Surface, Target, directory::Scope,
+        Summary, Surface, Target,
+        directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
 };
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
@@ -38,11 +40,18 @@ pub enum AgentCommand {
         /// given, and otherwise the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
-        /// Override the calling session's exact shared view with this channel.
-        /// The default reuses its same-project worktree or channel view;
-        /// missing or ambiguous membership creates a fresh channel with a warning.
+        /// Place the agent in this channel. By default it joins the calling
+        /// session's view, or the channel its lineage last belonged to when
+        /// that view is missing or ambiguous; an agent for another project, or
+        /// for a caller that never belonged to a channel, gets a new channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Place the agent among the panes of this open checkout, the
+        /// project's own folder or one of its linked worktrees, instead of
+        /// in a channel. It is also the working directory unless --directory
+        /// names another.
+        #[arg(long, conflicts_with = "channel")]
+        worktree: Option<PathBuf>,
         #[arg(long)]
         #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
@@ -51,7 +60,7 @@ pub enum AgentCommand {
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+            help = "Provider model ID (Claude: an alias such as fable, opus, sonnet or haiku, which the installed Claude Code resolves, or a full ID such as claude-fable-5-2; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
         )]
         model: Option<String>,
         #[arg(long)]
@@ -68,12 +77,20 @@ pub enum AgentCommand {
         #[command(flatten)]
         show: ShowArgs,
     },
-    /// Send a follow-up prompt to an owned, settled agent.
+    /// Send a follow-up prompt to an owned agent.
+    ///
+    /// An idle agent starts a run with it now, reopening its conversation if
+    /// its process stopped. A busy one holds it, unsent, and runs it as soon
+    /// as its current work ends.
     Send {
         /// The agent, by ID or a unique prefix of it.
         agent: String,
         #[command(flatten)]
         prompt: PromptArgs,
+        /// Interrupt the agent's current turn, so this prompt runs as soon as
+        /// that turn stops. Prompts already waiting still run first.
+        #[arg(long)]
+        interrupt: bool,
         #[command(flatten)]
         retry: RetryArgs,
         #[command(flatten)]
@@ -132,7 +149,8 @@ pub enum AgentCommand {
     Interrupt {
         #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
-        /// Permit the interrupt to stop the provider's running background subagents.
+        /// Permit the interrupt to stop the provider's background subagents,
+        /// including any waiting on their own background work.
         #[arg(long)]
         including_subagents: bool,
     },
@@ -419,20 +437,31 @@ impl ControlClient {
             ))
             .into());
         }
-        let closing = matches!(&operation, Operation::Close(_));
+        // Requests that wait on teardown or a durable commit get a longer
+        // budget than an ordinary reply; a caller's own deadline still bounds it.
+        let budget = match &operation {
+            Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
+            Operation::SendMessage(_)
+            | Operation::Send(_)
+            | Operation::Inbox(_)
+            | Operation::PeekInbox(_)
+            | Operation::AcknowledgeInbox(_)
+            | Operation::Submit(_)
+            | Operation::Console {
+                command: crate::agent_execution::ConsoleCommand::Submit { .. },
+                ..
+            } => Some(AGENT_SUBMIT_TIMEOUT),
+            Operation::Prompt { .. } | Operation::Deliver(_) => Some(AGENT_RESUME_TIMEOUT),
+            _ => None,
+        }
+        .map(|budget| Instant::now() + budget);
         let request = ClientRequest::Agent {
             authority,
             operation,
         };
-        let response = if closing {
-            self.request_with_deadline(
-                request,
-                Instant::now() + CHAT_CLOSE_TIMEOUT + Duration::from_secs(35),
-            )?
-        } else if let Some(deadline) = deadline {
-            self.request_with_deadline(request, deadline)?
-        } else {
-            self.request_strict(request)?
+        let response = match budget.into_iter().chain(deadline).min() {
+            Some(deadline) => self.request_with_deadline(request, deadline)?,
+            None => self.request_strict(request)?,
         };
         match response {
             ServerResponse::Agent(reply) => Ok(reply),
@@ -574,8 +603,13 @@ impl ControlClient {
     }
 }
 
+/// Where an agent the caller starts goes, and why, when that is not beside
+/// the caller. An explicit channel or checkout wins. Otherwise the agent joins the
+/// caller's exact view or, where that is missing or ambiguous, the channel the
+/// caller's lineage last belonged to. Only an agent for another project, or a
+/// caller whose lineage never belonged to a channel, gets a new channel.
 fn spawn_placement(
-    explicit: Option<ChannelId>,
+    explicit: Option<crate::agent_execution::Placement>,
     caller: Option<&crate::agent_execution::directory::Entry>,
     repository: &std::path::Path,
 ) -> (
@@ -583,34 +617,115 @@ fn spawn_placement(
     Option<&'static str>,
 ) {
     use crate::agent_execution::Placement;
-    if let Some(channel) = explicit {
-        return (Some(Placement::Channel(channel)), None);
+    const ELSEWHERE: &str = "The caller's view belongs to another project; the agent was placed in a new channel for the target project.";
+    if let Some(placement) = explicit {
+        return (Some(placement), None);
     }
     let Some(caller) = caller else {
         return (None, None);
     };
-    let Some(scope) = &caller.view_scope else {
-        return (
-            None,
-            Some(
-                "The caller has no unambiguous shared view; the agent was placed in a new channel.",
-            ),
-        );
-    };
-    let owner = match scope {
-        Placement::Channel(_) => caller.channel_repository.as_deref(),
-        Placement::Worktree { repository, .. } => Some(repository.as_path()),
+    let (placement, owner) = match (&caller.view_scope, &caller.lineage_channel) {
+        (Some(scope), _) => (
+            scope.clone(),
+            match scope {
+                Placement::Channel(_) => caller.channel_repository.as_deref(),
+                Placement::Worktree { repository, .. } => Some(repository.as_path()),
+            },
+        ),
+        (None, Some(home)) => (Placement::Channel(home.id), Some(home.repository.as_path())),
+        (None, None) => {
+            return (
+                None,
+                Some("The caller belongs to no channel; the agent was placed in a new channel."),
+            );
+        }
     };
     if owner == Some(repository) {
-        (Some(scope.clone()), None)
+        (Some(placement), None)
     } else {
-        (
-            None,
-            Some(
-                "The caller's shared view belongs to another project; the agent was placed in a new channel for the target project.",
-            ),
-        )
+        (None, Some(ELSEWHERE))
     }
+}
+
+/// The channel an accepted agent went to, when that is not the caller's own
+/// view: the place someone reading the caller's conversation has to look.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlacedIn {
+    pub channel: ChannelId,
+    /// Absent when the channel could not be read after the acceptance.
+    pub title: Option<String>,
+}
+
+fn placed_in(
+    session: &mut Session,
+    output: &CommandOutput,
+    caller_view: Option<&crate::agent_execution::Placement>,
+) -> Option<PlacedIn> {
+    let placement: crate::agent_execution::Placement =
+        serde_json::from_value(output.data["agent"]["placement"].clone()).ok()?;
+    if caller_view == Some(&placement) {
+        return None;
+    }
+    let crate::agent_execution::Placement::Channel(channel) = placement else {
+        return None;
+    };
+    // Naming it is a courtesy; the agent is accepted either way.
+    let title = session
+        .client()
+        .ok()
+        .and_then(|client| client.read_workspace_model().ok())
+        .and_then(|model| {
+            model.channel(channel).map(|channel| {
+                if channel.title.is_empty() {
+                    "New channel".to_owned()
+                } else {
+                    channel.title.clone()
+                }
+            })
+        });
+    Some(PlacedIn { channel, title })
+}
+
+/// Names the channel `placed` went to on the line after the receipt, which
+/// is where a reader of the step looks for where the agent went.
+fn with_placed_in(mut output: CommandOutput, placed: Option<PlacedIn>) -> CommandOutput {
+    let Some(placed) = placed else {
+        return output;
+    };
+    let line = match &placed.title {
+        Some(title) => format!(
+            "{PLACED_IN}{} ({})",
+            serde_json::Value::from(title.as_str()),
+            placed.channel
+        ),
+        None => format!("{PLACED_IN}{}", placed.channel),
+    };
+    output.human = match output.human.split_once('\n') {
+        Some((head, tail)) => format!("{head}\n{line}\n{tail}"),
+        None => format!("{}\n{line}", output.human),
+    };
+    output.data["placed_in"] = json!(placed);
+    output
+}
+
+/// How the line naming an agent's channel begins: `In channel "Title" (ID)`,
+/// or `In channel ID` where the title could not be read.
+pub(crate) const PLACED_IN: &str = "In channel ";
+
+/// What follows [`PLACED_IN`] on the line [`with_placed_in`] printed.
+#[cfg(feature = "ui")]
+fn read_placed_in(named: &str) -> Option<PlacedIn> {
+    if let Ok(channel) = named.parse() {
+        return Some(PlacedIn {
+            channel,
+            title: None,
+        });
+    }
+    let (title, channel) = named.strip_suffix(')')?.rsplit_once(" (")?;
+    Some(PlacedIn {
+        channel: channel.parse().ok()?,
+        title: Some(serde_json::from_str(title).ok()?),
+    })
 }
 
 fn with_placement_warning(mut output: CommandOutput, warning: Option<&str>) -> CommandOutput {
@@ -789,22 +904,45 @@ impl Session {
         }
     }
 
+    /// The sessions of these agents as a listing reports them, with each
+    /// one's usage limit and account. A listing is context for a status, so
+    /// one that fails leaves the status as it was rather than failing it.
+    fn members(&mut self, agents: &[AgentId]) -> Vec<Member> {
+        let Ok(Reply::Sessions(listing)) = self.call(Operation::Sessions(Scope::All)) else {
+            return Vec::new();
+        };
+        listing
+            .caller
+            .into_iter()
+            .chain(listing.sessions)
+            .filter(|member| {
+                member
+                    .session
+                    .delegation
+                    .as_ref()
+                    .is_some_and(|delegation| agents.contains(&delegation.agent))
+            })
+            .collect()
+    }
+
     /// Submits once, and once more with the same key if the daemon's answer
     /// was lost: the key makes the retry return the first acceptance rather
-    /// than start the work twice. Says whether it retried.
-    fn submit(&mut self, request: Submit) -> Result<(Reply, bool), AppError> {
+    /// than start the work twice. Says whether it retried. `operation` makes
+    /// the request's operation, which is `Submit` or `Prompt`.
+    fn submit(
+        &mut self,
+        request: Submit,
+        operation: impl Fn(Submit) -> Operation,
+    ) -> Result<(Reply, bool), AppError> {
         let authority = self.context.authority.clone();
-        match self
-            .client()?
-            .agent(authority, Operation::Submit(request.clone()))
-        {
+        match self.client()?.agent(authority, operation(request.clone())) {
             Ok(reply) => Ok((reply, false)),
             Err(
                 ControlError::Frame(_) | ControlError::ConnectionClosed | ControlError::Connect(_),
             ) => {
                 // A new connection, to the daemon that is running now.
                 self.connection = None;
-                Ok((self.call(Operation::Submit(request))?, true))
+                Ok((self.call(operation(request))?, true))
             }
             Err(error) => Err(protocol_error(error)),
         }
@@ -822,14 +960,19 @@ impl Session {
         ),
         AppError,
     > {
-        let Reply::Directory(directory) = self.call(Operation::Directory(scope))? else {
+        let Reply::Context(context) = self.call(Operation::Context {
+            scope,
+            standing: false,
+        })?
+        else {
             return Err(AppError::new("sessions", "Unexpected directory response"));
         };
+        let directory = context.into_sessions();
         let project = match directory.scope {
             Scope::Project(project) => Some(project),
             _ => None,
         };
-        Ok((project, directory.caller))
+        Ok((project, directory.caller.map(|caller| caller.session)))
     }
 }
 
@@ -859,6 +1002,7 @@ pub(super) fn execute_with_context(
             repository,
             directory,
             channel,
+            worktree,
             account,
             surface,
             model,
@@ -869,24 +1013,30 @@ pub(super) fn execute_with_context(
             show,
         } => {
             let prompt = prompt.read()?;
-            let absolute =
-                |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let given = if crate::device::is_remote() {
-                directory
-                    .map(|directory| {
-                        if directory.is_absolute() {
-                            Ok(directory)
-                        } else {
-                            Err(AppError::new(
-                                "target",
-                                "remote working directory must be absolute",
-                            ))
-                        }
-                    })
-                    .transpose()?
-            } else {
-                directory.map(absolute).transpose()?
+            let absolute = |path: PathBuf, flag: &str| {
+                if crate::device::is_remote() {
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Err(AppError::new(
+                            "target",
+                            format!("remote {flag} must be absolute"),
+                        ))
+                    }
+                } else {
+                    std::path::absolute(path).map_err(|e| AppError::new("target", e))
+                }
             };
+            // The daemon looks the checkout's view up by its exact path, so a
+            // trailing separator or `.` from the shell must not miss it.
+            let worktree = worktree
+                .map(|path| absolute(path, "--worktree"))
+                .transpose()?
+                .map(|path| path.components().collect::<PathBuf>());
+            let given = directory
+                .map(|path| absolute(path, "working directory"))
+                .transpose()?
+                .or_else(|| worktree.clone());
             let here = match &given {
                 Some(directory) => directory.clone(),
                 None => {
@@ -973,11 +1123,18 @@ pub(super) fn execute_with_context(
                     }
                 }
             };
-            let (placement, placement_warning) = spawn_placement(
-                channel,
-                caller.as_ref(),
-                channel_repository.as_deref().unwrap_or(&repository),
-            );
+            let owner = channel_repository.as_deref().unwrap_or(&repository);
+            // The daemon refuses a checkout whose view it does not hold.
+            let explicit = channel
+                .map(crate::agent_execution::Placement::Channel)
+                .or_else(|| {
+                    worktree.map(|path| crate::agent_execution::Placement::Worktree {
+                        repository: owner.to_owned(),
+                        path,
+                    })
+                });
+            let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
+            let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
             let provider = provider
                 .or(caller.and_then(|caller| caller.provider))
                 .ok_or_else(|| {
@@ -1005,33 +1162,66 @@ pub(super) fn execute_with_context(
                 prompt,
                 idempotency_key: retry.key(),
             };
-            let output = submitted(&mut session, "agent.spawn", request, wait, show)?;
-            Ok(with_placement_warning(output, placement_warning))
+            let output = submitted(&mut session, "agent.spawn", request, None, wait, show)?;
+            let placed = placed_in(&mut session, &output, caller_view.as_ref());
+            Ok(with_placed_in(
+                with_placement_warning(output, placement_warning),
+                placed,
+            ))
         }
         AgentCommand::Send {
             agent,
             prompt,
+            interrupt,
             retry,
             wait,
             show,
         } => {
             let prompt = prompt.read()?;
+            let agent = session.agent(&agent)?;
+            // Read before the run starts a turn, which clears the limit.
+            let limit = member_of(&session.members(&[agent]), agent)
+                .and_then(|member| member.limit.clone());
             let request = Submit {
                 name: None,
-                destination: Destination::Existing(session.agent(&agent)?),
+                destination: Destination::Existing(agent),
                 prompt,
                 idempotency_key: retry.key(),
             };
-            submitted(&mut session, "agent.send", request, wait, show)
+            // The daemon refuses an agent stopped until a known reset, after
+            // answering a retry of an accepted submission with its acceptance.
+            let now = super::sessions::now_ms();
+            let mut output = submitted(
+                &mut session,
+                "agent.send",
+                request,
+                Some(interrupt),
+                wait,
+                show,
+            )
+            .map_err(|error| limited_refusal(error, limit.as_ref(), now))?;
+            if let Some(limit) = limit {
+                let notice = format!(
+                    "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
+                    super::sessions::limit_phrase(&limit, now)
+                );
+                output.human = format!("{}\n{notice}", output.human);
+                output.data["notice"] = json!(notice);
+            }
+            Ok(output)
         }
         AgentCommand::Status { agent, show } => {
             let agent = session.agent(&agent)?;
             let reply = session.call(Operation::Status(agent))?;
             let (agent, run) = status_reply(reply)?;
-            let human = status_lines(&agent, &run, false, show);
+            let members = session.members(&[agent.id]);
+            let member = member_of(&members, agent.id);
+            let human = with_standing(status_lines(&agent, &run, false, show), member);
+            let mut data = json!({"agent": agent, "run": run, "timed_out": false});
+            standing_json(&mut data, member);
             Ok(CommandOutput {
                 command: "agent.status",
-                data: json!({"agent": agent, "run": run, "timed_out": false}),
+                data,
                 human,
             })
         }
@@ -1065,10 +1255,19 @@ pub(super) fn execute_with_context(
                 .into_iter()
                 .map(status_reply)
                 .collect::<Result<Vec<_>, _>>()?;
+            let members = session.members(
+                &statuses
+                    .iter()
+                    .map(|(agent, _)| agent.id)
+                    .collect::<Vec<_>>(),
+            );
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
-                    status_lines(agent, run, timed_out && !run.state.wait_ready(), show)
+                    with_standing(
+                        status_lines(agent, run, timed_out && !run.state.wait_ready(), show),
+                        member_of(&members, agent.id),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
@@ -1166,16 +1365,99 @@ pub(super) fn execute_with_context(
     }
 }
 
-/// Reports an acceptance, after waiting on its run when asked to.
+/// The daemon's refusal of a follow-up for an agent a usage limit stops
+/// until a known reset, reported as `agent_limited`. The refusal names the
+/// reset in the provider's words; the limit read before submitting dates it
+/// where the account's usage readings do.
+fn limited_refusal(mut error: AppError, limit: Option<&UsageLimit>, now: u64) -> AppError {
+    if !is_limited_refusal(&error) {
+        return error;
+    }
+    error.kind = "agent_limited";
+    if let Some(limit) = limit.filter(|limit| limit.resets_at.is_some()) {
+        error.message = format!(
+            "{} ({}), so the prompt was not sent. {}",
+            crate::agent_execution::LIMITED_REFUSAL,
+            super::sessions::limit_phrase(limit, now),
+            crate::agent_execution::LIMITED_ADVICE,
+        );
+    }
+    error
+}
+
+fn is_limited_refusal(error: &AppError) -> bool {
+    error
+        .message
+        .starts_with(crate::agent_execution::LIMITED_REFUSAL)
+}
+
+/// `error` with the key that makes retrying its submission safe, when a
+/// retry could still start the work.
+fn with_retry_key(mut error: AppError, key: &str) -> AppError {
+    // A limit's refusal is definite: nothing was accepted to retry. A run
+    // that ended has spent its key: retrying reports the same end.
+    if is_limited_refusal(&error) || ended_run(&error) {
+        return error;
+    }
+    error.message = format!(
+        "{}; retry with --idempotency-key {key} to avoid starting the work twice",
+        error.message
+    );
+    let mut details = match error.details.take() {
+        Some(Value::Object(details)) => details,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("idempotency_key".into(), json!(key));
+    error.details = Some(Value::Object(details));
+    error
+}
+
+/// Whether the daemon reports the run a follow-up was accepted as having
+/// ended, sent or not, so its key can no longer start it.
+fn ended_run(error: &AppError) -> bool {
+    use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
+    [NOT_SENT, OUTCOME_UNKNOWN, ENDED]
+        .iter()
+        .any(|prefix| error.message.starts_with(prefix))
+}
+
+/// How a follow-up's acceptance line ends: whether the prompt went to the
+/// agent now or waits, and for what.
+fn start_phrase(start: &crate::agent_execution::Start, interrupted: bool) -> String {
+    use crate::agent_execution::Start;
+    match start {
+        Start::Sent { resumed: false } => "; sent it to the agent now".into(),
+        Start::Sent { resumed: true } => {
+            "; the agent's process had stopped, so cagents reopened its conversation and sent it"
+                .into()
+        }
+        Start::Queued { behind } => {
+            let ahead = match behind {
+                Some(run) => format!("run {}", short(*run)),
+                None => "the agent's current turn".into(),
+            };
+            if interrupted {
+                format!("; interrupted {ahead}, and it starts once that has stopped")
+            } else {
+                format!("; it waits, unsent, until {ahead} ends, then starts")
+            }
+        }
+    }
+}
+
+/// Reports an acceptance, after waiting on its run when asked to. A
+/// follow-up for an existing agent says whether `interrupt` is to stop its
+/// current work, and is reported with whether it was sent now.
 fn submitted(
     session: &mut Session,
     command: &'static str,
     request: Submit,
+    interrupt: Option<bool>,
     wait: WaitArgs,
     show: ShowArgs,
 ) -> Result<CommandOutput, AppError> {
     request
-        .validate()
+        .validate_client()
         .map_err(|e| AppError::new("agent_request", e))?;
     let key = request.idempotency_key.clone();
     let device = crate::device::selected()
@@ -1183,21 +1465,17 @@ fn submitted(
         .unwrap_or("local");
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
-    let (reply, retried) = session.submit(request).map_err(|mut error| {
-        error.message = format!(
-            "{}; retry with --idempotency-key {key} to avoid starting the work twice",
-            error.message
-        );
-        let mut details = match error.details.take() {
-            Some(Value::Object(details)) => details,
-            _ => serde_json::Map::new(),
-        };
-        details.insert("idempotency_key".into(), json!(key));
-        error.details = Some(Value::Object(details));
-        error
-    })?;
-    let Reply::Accepted(accepted) = reply else {
-        return Err(AppError::new(command, "Unexpected submit response"));
+    let operation = |request| match interrupt {
+        Some(interrupt) => Operation::Prompt { request, interrupt },
+        None => Operation::Submit(request),
+    };
+    let (reply, retried) = session
+        .submit(request, operation)
+        .map_err(|error| with_retry_key(error, &key))?;
+    let (accepted, start) = match reply {
+        Reply::Accepted(accepted) => (accepted, None),
+        Reply::Prompted { accepted, start } => (accepted, Some(start)),
+        _ => return Err(AppError::new(command, "Unexpected submit response")),
     };
     let mut human = format!(
         "{} agent {} run {}",
@@ -1210,10 +1488,18 @@ fn submitted(
         short(accepted.agent.id),
         short(accepted.run.id)
     );
+    if let Some(start) = &start {
+        human.push_str(&start_phrase(start, interrupt == Some(true)));
+    }
     let mut data = json!({
         "agent": accepted.agent,
         "run": accepted.run,
+        "start": start,
         "created": accepted.created,
+        // Whether this invocation resubmitted after losing the daemon's
+        // answer. A retry reports `created: false` even when its own lost
+        // attempt created the work.
+        "retried": retried,
         "idempotency_key": key,
     });
     if wait.wait {
@@ -1229,7 +1515,7 @@ fn submitted(
         let (agent, run) = match replies.pop() {
             Some(reply) => status_reply(reply)
                 .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
-            None => (accepted.agent, accepted.run),
+            None => (accepted.agent.clone(), accepted.run.clone()),
         };
         human = status_lines(&agent, &run, timed_out, show);
         human.push_str(&arrived_lines(&messages));
@@ -1246,11 +1532,61 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
+    // A run that settled says what stops its provider now, and the account.
+    let members = session.members(&[accepted.agent.id]);
+    let member = member_of(&members, accepted.agent.id);
+    if wait.wait {
+        human = with_standing(human, member);
+    }
+    standing_json(&mut data, member);
     Ok(CommandOutput {
         command,
         data,
         human,
     })
+}
+
+/// The listed session of `agent`.
+fn member_of(members: &[Member], agent: AgentId) -> Option<&Member> {
+    members.iter().find(|member| {
+        member
+            .session
+            .delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.agent == agent)
+    })
+}
+
+/// A status with what stops the agent's provider and the account it runs
+/// on, after its first line, which readers of the output parse.
+fn with_standing(lines: String, member: Option<&Member>) -> String {
+    let Some(member) = member else {
+        return lines;
+    };
+    let now = super::sessions::now_ms();
+    let mut standing = String::new();
+    if let Some(limit) = &member.limit {
+        standing.push_str(&format!(
+            "\nStopped by a usage limit: {}",
+            super::sessions::limit_phrase(limit, now)
+        ));
+    }
+    if let Some(account) = &member.account {
+        standing.push_str(&format!(
+            "\nAccount {}",
+            super::sessions::account_phrase(account, now)
+        ));
+    }
+    match lines.split_once('\n') {
+        Some((head, rest)) => format!("{head}{standing}\n{rest}"),
+        None => format!("{lines}{standing}"),
+    }
+}
+
+/// The agent's usage limit and account, as `sessions --json` reports them.
+fn standing_json(data: &mut Value, member: Option<&Member>) {
+    data["limit"] = json!(member.and_then(|member| member.limit.as_ref()));
+    data["account"] = json!(member.and_then(|member| member.account.as_ref()));
 }
 
 /// A failed observation must not hide work the daemon already accepted.
@@ -1405,6 +1741,12 @@ fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> St
 #[cfg(feature = "ui")]
 pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
     let head = output.lines().next()?;
+    // Notes about the run follow its first line, up to the result.
+    let placed_in = output
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| read_placed_in(line.strip_prefix(PLACED_IN)?));
     if let Some(accepted) = head
         .strip_prefix("Accepted agent ")
         .or_else(|| head.strip_prefix("Already accepted agent "))
@@ -1415,6 +1757,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
             state: None,
             timed_out: false,
             result: String::new(),
+            placed_in,
             ..Default::default()
         });
     }
@@ -1450,6 +1793,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
         state: Some(state),
         timed_out,
         result: result.trim().into(),
+        placed_in,
         ..Default::default()
     })
 }
@@ -1504,6 +1848,110 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_requests_wait_for_store_replies_beyond_the_ordinary_socket_timeout() {
+        use crate::agent_execution::mailbox::{Inbox, Outgoing, Receipt, To};
+        use crate::terminal::ipc::ProtocolError;
+        let outgoing = Outgoing {
+            to: To::Session("27420000".into()),
+            body: "fixture message".into(),
+            wait_ms: None,
+        };
+        for operation in [
+            Operation::SendMessage(outgoing.clone()),
+            Operation::Send(outgoing),
+            Operation::Inbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::PeekInbox(Inbox {
+                all: false,
+                replies_to: None,
+            }),
+            Operation::AcknowledgeInbox(Receipt {
+                ids: vec![crate::model::MessageId::new()],
+            }),
+        ] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                // Make the ordinary socket timeout elapse before the store
+                // reply, without spending a real five seconds per operation.
+                thread::sleep(Duration::from_millis(100));
+                let _ = write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::StoreBusy,
+                            "fixture contention",
+                            true,
+                        )),
+                    },
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let result = client.agent(Authority::default(), operation);
+            server.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::StoreBusy,
+                        retryable: true,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn only_the_daemons_limit_refusal_reads_as_agent_limited_and_names_its_reset() {
+        use crate::agent_execution::{LIMITED_ADVICE, LIMITED_REFUSAL};
+        // As the daemon words it: the provider's reset wording, if any.
+        let refused = || {
+            AppError::new(
+                "protocol",
+                format!(
+                    "{LIMITED_REFUSAL} (Claude weekly limit reached), so the prompt was not sent. {LIMITED_ADVICE}"
+                ),
+            )
+        };
+        let now = 1_000_000_000;
+        let dated = UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: Some(1_000_000 + 3 * 3600),
+        };
+        let error = limited_refusal(refused(), Some(&dated), now);
+        assert_eq!(error.kind, "agent_limited");
+        assert_eq!(
+            error.message,
+            format!(
+                "{LIMITED_REFUSAL} (Claude weekly limit reached, resets in 3 hr), so the prompt was not sent. {LIMITED_ADVICE}"
+            ),
+            "the reset the account's readings date is named, and no retry is offered"
+        );
+        // Without a dated limit read beforehand, the daemon's words stand.
+        let undated = limited_refusal(refused(), None, now);
+        assert_eq!(undated.kind, "agent_limited");
+        assert_eq!(undated.message, refused().message);
+        let other = AppError::new("protocol", "The agent is not running");
+        let other = limited_refusal(other, Some(&dated), now);
+        assert_eq!(other.kind, "protocol");
+        assert_eq!(other.message, "The agent is not running");
+    }
 
     #[test]
     fn accepted_wait_recovery_keeps_device_routing_and_original_error_details() {
@@ -1905,6 +2353,216 @@ mod tests {
     }
 
     #[test]
+    fn a_submission_answered_after_a_slow_durable_commit_is_still_accepted() {
+        slow_durable_submission(false);
+    }
+
+    #[test]
+    fn a_console_submission_answered_after_a_slow_durable_commit_is_still_accepted() {
+        slow_durable_submission(true);
+    }
+
+    #[test]
+    fn console_reads_and_controls_keep_ordinary_reply_budget() {
+        use crate::agent_execution::ConsoleCommand;
+
+        struct ReleasePeer {
+            stream: UnixStream,
+            release: crossbeam_channel::Sender<()>,
+        }
+        impl Drop for ReleasePeer {
+            fn drop(&mut self) {
+                // Also unblock both threads if setup, observation or an
+                // assertion unwinds. Cleanup cannot supply a successful reply.
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                let _ = self.release.try_send(());
+            }
+        }
+
+        for command in [
+            ConsoleCommand::Read {
+                after_generation: None,
+                after_run: None,
+            },
+            ConsoleCommand::Interrupt {
+                including_subagents: false,
+            },
+            ConsoleCommand::Control(crate::chat::Command::Refresh),
+        ] {
+            let expected = command.clone();
+            let sent = command.clone();
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let (seen, observed, server, caller) = thread::scope(|scope| {
+                let (release, released) = crossbeam_channel::bounded(1);
+                let cleanup = ReleasePeer {
+                    stream: server_stream.try_clone().unwrap(),
+                    release,
+                };
+                let (received, request_seen) = crossbeam_channel::bounded(1);
+                let (finished, result) = crossbeam_channel::bounded(1);
+                let server = scope.spawn(move || {
+                    answer(&mut server_stream, |_| true, connected());
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Agent {
+                        operation: Operation::Console { command, .. }, ..
+                    } if command == expected));
+                    let _ = received.send(());
+                    // A finite sleep after receipt cannot establish when the
+                    // caller entered its socket read. Keep the response held
+                    // until its result has actually been observed instead.
+                    let _ = released.recv();
+                    let _ = write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Agent(Reply::Console(None)),
+                            },
+                        },
+                    );
+                });
+                let caller = scope.spawn(move || {
+                    let mut client = ControlClient::from_stream(client_stream).unwrap();
+                    let before = client.stream.read_timeout().unwrap();
+                    let read = client.agent(
+                        Authority::default(),
+                        Operation::Console {
+                            agent: crate::model::AgentId::new(),
+                            command: sent,
+                        },
+                    );
+                    let after = client.stream.read_timeout().unwrap();
+                    let _ = finished.send((read, before, after));
+                });
+                // This is a fixture guard, not the client's reply budget.
+                // An accidentally extended budget must fail observation,
+                // rather than wait forever or accept a cleanup-induced EOF.
+                let guard = IO_TIMEOUT + Duration::from_secs(5);
+                let seen = request_seen.recv_timeout(guard);
+                let observed = seen.is_ok().then(|| result.recv_timeout(guard));
+                drop(cleanup);
+                (seen, observed, server.join(), caller.join())
+            });
+            assert!(server.is_ok(), "console peer failed for {command:?}");
+            assert!(caller.is_ok(), "console caller failed for {command:?}");
+            assert!(
+                seen.is_ok(),
+                "console request was not received: {command:?}"
+            );
+            let observed = observed.unwrap();
+            assert!(
+                observed.is_ok(),
+                "console reply exceeded the fixture guard for {command:?}: {observed:?}"
+            );
+            let (read, before, after) = observed.unwrap();
+            assert_eq!(before, Some(IO_TIMEOUT), "before {command:?}");
+            assert_eq!(after, Some(IO_TIMEOUT), "after {command:?}");
+            assert!(
+                matches!(&read, Err(ControlError::ReplyTimeout { timeout, .. }) if *timeout == IO_TIMEOUT),
+                "a stalled console command must keep the ordinary timeout: {command:?}: {read:?}"
+            );
+        }
+    }
+
+    fn slow_durable_submission(console: bool) {
+        use crate::agent_execution::ConsoleCommand;
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (_, reply) = running();
+        let (agent, run) = status_reply(reply).unwrap();
+        let accepted = Accepted {
+            agent,
+            run,
+            created: true,
+        };
+        let operation = if console {
+            Operation::Console {
+                agent: accepted.agent.id,
+                command: ConsoleCommand::Submit {
+                    prompt: "durable work".into(),
+                    idempotency_key: "slow-commit".into(),
+                },
+            }
+        } else {
+            Operation::Submit(Submit {
+                name: None,
+                destination: Destination::New(accepted.agent.spec.clone()),
+                prompt: "durable work".into(),
+                idempotency_key: "slow-commit".into(),
+            })
+        };
+        let expected = operation.clone();
+        let answered = accepted.clone();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(request.request,
+                ClientRequest::Agent { operation, .. } if operation == expected));
+            // The acceptance's commit waits on a loaded disk for longer than
+            // an ordinary reply may take.
+            thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            let sent = write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Agent(Reply::Accepted(answered)),
+                    },
+                },
+            );
+            if sent.is_err() {
+                return;
+            }
+            // The next read uses this same connection: a late acceptance must
+            // not be mistaken for a later console response or cause a resend.
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(
+                        request,
+                        ClientRequest::Agent {
+                            operation: Operation::Console {
+                                command: ConsoleCommand::Read { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                },
+                ServerResponse::Agent(Reply::Console(None)),
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let reply = client.agent(Authority::default(), operation);
+        if reply.is_ok() {
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            let read = client
+                .agent(
+                    Authority::default(),
+                    Operation::Console {
+                        agent: accepted.agent.id,
+                        command: ConsoleCommand::Read {
+                            after_generation: None,
+                            after_run: None,
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(read, Reply::Console(None));
+        }
+        let timeout = client.stream.read_timeout().unwrap();
+        // Close even a timed-out connection before joining the peer: a late
+        // acceptance may have been written successfully but never read.
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(reply.unwrap(), Reply::Accepted(accepted));
+        assert_eq!(timeout, Some(IO_TIMEOUT));
+    }
+
+    #[test]
     fn stalled_initial_wait_read_returns_timeout_without_inventing_a_run() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let (run_id, _) = running();
@@ -2103,6 +2761,474 @@ mod tests {
         assert!(printed.contains("  Use the staging database"), "{printed}");
     }
 
+    /// Feeds the transcript through `frames` and returns what each one prints.
+    fn console_output(frames: &[&str]) -> Vec<String> {
+        let mut transcript = ConsoleTranscript::default();
+        frames.iter().map(|text| transcript.advance(text)).collect()
+    }
+
+    #[test]
+    fn console_prints_a_growing_line_once_it_is_complete() {
+        assert_eq!(
+            console_output(&[
+                "User: Build it\nAssistant: Star",
+                "User: Build it\nAssistant: Starting the build.",
+                "User: Build it\nAssistant: Starting the build.\nSecond li",
+                "User: Build it\nAssistant: Starting the build.\nSecond line.\n",
+            ]),
+            [
+                "User: Build it\n",
+                "",
+                "Assistant: Starting the build.\n",
+                "Second line.\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn console_prints_late_settled_steps_without_replaying_the_transcript() {
+        let built = "User: Build it\nAssistant: Started the build.\n";
+        assert_eq!(
+            console_output(&[
+                built,
+                // A background tool settles before text already printed.
+                "User: Build it\nCalled Agent\nAssistant: Started the build.\n",
+                // Growth at the end still streams as a plain suffix.
+                "User: Build it\nCalled Agent\nAssistant: Started the build.\nAssistant: Done\n",
+                // A second step with the same name is a new line.
+                "User: Build it\nCalled Agent\nCalled Agent\nAssistant: Started the build.\nAssistant: Done\n",
+            ]),
+            [
+                built,
+                "Called Agent\n",
+                "Assistant: Done\n",
+                "Called Agent\n"
+            ]
+        );
+    }
+
+    /// Lines leaving the front of a bounded transcript print nothing, and a
+    /// recurring line arriving at its end is still new. Counting occurrences
+    /// without their position would take one for the other.
+    #[test]
+    fn console_keeps_new_lines_when_the_front_of_the_transcript_drops() {
+        assert_eq!(
+            console_output(&["Ran tests\nEdited a.rs\n", "Edited a.rs\nRan tests\n"]),
+            ["Ran tests\nEdited a.rs\n", "Ran tests\n"]
+        );
+        assert_eq!(
+            console_output(&["Ran tests\nEdited a.rs\nRead b.rs\n", "Read b.rs\n"]),
+            ["Ran tests\nEdited a.rs\nRead b.rs\n", ""]
+        );
+    }
+
+    /// Recurring steps must not make a sliding transcript print out of order.
+    #[test]
+    fn console_keeps_order_while_a_long_transcript_slides() {
+        let round = |n: u32| format!("Assistant: Round {n}\nRan test {n}\nCalled Agent\n");
+        let window = |rounds: std::ops::Range<u32>| rounds.map(round).collect::<String>();
+        let mut transcript = ConsoleTranscript::default();
+        let mut printed = transcript.advance(&window(0..40));
+        for end in 41..=80 {
+            printed.push_str(&transcript.advance(&window(end - 40..end)));
+        }
+        assert_eq!(printed, window(0..80));
+    }
+
+    /// A window that slides by a part of a round can start on any of its lines.
+    #[test]
+    fn console_keeps_order_when_the_window_slides_by_single_lines() {
+        let lines = (0..300)
+            .flat_map(|n| {
+                [
+                    format!("Assistant: Round {n}\n"),
+                    "Called Agent\n".to_owned(),
+                    "Called Agent\n".to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut transcript = ConsoleTranscript::default();
+        let mut printed = String::new();
+        for end in 1..=lines.len() {
+            printed.push_str(&transcript.advance(&lines[end.saturating_sub(128)..end].concat()));
+        }
+        assert_eq!(printed, lines.concat());
+    }
+
+    #[test]
+    fn console_rereads_periodically_only_while_a_run_is_working() {
+        let unchanged = |working| {
+            (1..=16)
+                .filter(|reads| console_read_cursor(Some(7), working, *reads).is_none())
+                .count()
+        };
+        assert_eq!(unchanged(false), 0);
+        assert_eq!(unchanged(true), 2);
+        assert_eq!(console_read_cursor(None, false, 1), None);
+    }
+
+    /// A question's context prints before it; a line that goes on being written
+    /// afterwards prints complete, once.
+    #[test]
+    fn console_prints_the_held_line_before_a_question() {
+        let mut transcript = ConsoleTranscript::default();
+        assert_eq!(transcript.advance("Ran x\nAssistant: Which"), "Ran x\n");
+        assert_eq!(
+            transcript.advance_to_question("Ran x\nAssistant: Which"),
+            "Assistant: Which\n"
+        );
+        assert_eq!(transcript.advance("Ran x\nAssistant: Which"), "");
+        assert_eq!(
+            transcript.advance("Ran x\nAssistant: Which one?\n"),
+            "Assistant: Which one?\n"
+        );
+        assert_eq!(transcript.advance_to_question("Ran x\n"), "");
+    }
+
+    /// A line it has shown going back to being held open prints nothing new,
+    /// and nothing twice when it completes.
+    #[test]
+    fn console_does_not_reprint_a_line_held_open_again() {
+        assert_eq!(
+            console_output(&[
+                "Ran x\n",
+                "Ran x",
+                "Ran x\nAssistant: Lo",
+                "Ran x\nAssistant: Long\n"
+            ]),
+            ["Ran x\n", "", "", "Assistant: Long\n"]
+        );
+    }
+
+    /// A step settling while the front drops prints only that step and what
+    /// was appended.
+    #[test]
+    fn console_prints_a_late_step_while_the_window_slides() {
+        let round = |n: u32| format!("Assistant: Round {n}\nCalled Agent\n");
+        let window = |rounds: std::ops::Range<u32>| rounds.map(round).collect::<String>();
+        let mut transcript = ConsoleTranscript::default();
+        transcript.advance(&window(0..40));
+        let settled = format!("{}Ran late step\n{}", window(1..39), window(39..41),);
+        assert_eq!(
+            transcript.advance(&settled),
+            format!("Ran late step\n{}", round(40)),
+        );
+    }
+
+    #[test]
+    fn console_run_outcomes_name_no_transport_identifier() {
+        use crate::agent_execution::{ResultSummary, Run, State};
+        let mut run = Run {
+            id: crate::model::RunId::new(),
+            agent: AgentId::new(),
+            state: State::Running,
+            revision: 1,
+            accepted_ms: 0,
+            started_ms: None,
+            finished_ms: None,
+            provider_key: None,
+            result: ResultSummary::default(),
+        };
+        assert_eq!(console_run_outcome(&run), None);
+        run.state = State::Succeeded;
+        assert_eq!(console_run_outcome(&run).unwrap(), "Finished");
+        run.result.usage.input_tokens = 12;
+        run.result.usage.output_tokens = 3;
+        assert_eq!(
+            console_run_outcome(&run).unwrap(),
+            "Finished (12 input, 3 output tokens)"
+        );
+    }
+
+    #[test]
+    fn console_requests_read_as_questions_with_the_ids_to_answer_them() {
+        use crate::chat::{Choice, Field, Request, RequestKind};
+        let choice = |id: &str, label: &str| Choice {
+            id: id.into(),
+            label: label.into(),
+            description: String::new(),
+        };
+        let mut request = Request {
+            kind: RequestKind::Question,
+            id: "request-1".into(),
+            title: "Which branch?".into(),
+            description: "Pick the base.".into(),
+            fields: vec![Field {
+                id: "base".into(),
+                label: "Base".into(),
+                description: "Where it lands".into(),
+                choices: vec![choice("main", "Main branch")],
+                multiple: true,
+                secret: false,
+                initial: String::new(),
+            }],
+            actions: vec![choice("submit", "Submit"), choice("deny", "deny")],
+        };
+        assert_eq!(
+            console_request(&request),
+            "Input requested: Which branch?\n\
+             Pick the base.\n\
+             Field base (Base): Where it lands\n\
+             Choices: main (Main branch).\n\
+             Several values allowed.\n\
+             Actions: submit (Submit); deny\n\
+             Use /answer request-1 ACTION [{\"field\":\"base\",\"values\":[\"VALUE\"]}]"
+        );
+        let mut second = request.fields[0].clone();
+        second.id = "head".into();
+        request.fields.push(second);
+        assert!(
+            console_request(&request).ends_with(
+                r#"[{"field":"base","values":["VALUE"]},{"field":"head","values":["VALUE"]}]"#
+            ),
+            "every field has to be answered"
+        );
+        request.fields.pop();
+        request.actions[1].description = "Stop here".into();
+        request.fields[0].label = String::new();
+        request.fields[0].initial = "main".into();
+        let text = console_request(&request);
+        assert!(
+            text.contains("Actions: submit (Submit); deny: Stop here\n"),
+            "{text}"
+        );
+        assert!(text.contains("Field base: Where it lands"), "{text}");
+        assert!(text.contains("\nCurrently: main."), "{text}");
+        request.fields[0].secret = true;
+        let text = console_request(&request);
+        assert!(text.contains("this console shows what you type"), "{text}");
+        assert!(
+            !text.contains("Currently"),
+            "a secret's value stays hidden: {text}"
+        );
+        request.fields.clear();
+        assert!(console_request(&request).ends_with("Use /answer request-1 ACTION"));
+    }
+
+    #[test]
+    fn replacement_console_waits_for_the_daemons_initial_listener_and_handshake() {
+        use crate::terminal_ipc::{
+            ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+            read_frame, write_frame,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            let listener = std::os::unix::net::UnixListener::bind(server_socket).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            thread::sleep(Duration::from_millis(30));
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("console"),
+                boot_id: crate::model::BootId::new("console"),
+                host_incarnation: crate::model::HostIncarnation::new("restored"),
+            };
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        connect_console(&socket, Instant::now() + Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+        assert!(!console_connection_transient(
+            &ControlError::UnsupportedVersion { actual: 1 }
+        ));
+        assert!(!console_connection_transient(&ControlError::ProofMismatch));
+    }
+
+    #[test]
+    fn replacement_console_connection_has_a_bounded_startup_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        assert!(
+            connect_console(
+                &root.path().join("absent.sock"),
+                start + Duration::from_millis(30)
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn replacement_console_waits_for_its_exact_startup_owner_then_reads_console_rpc() {
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.path().into(),
+            socket: root.path().join("daemon.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("console"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("slow-startup"),
+        };
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = proof.clone();
+        let server = thread::spawn(move || {
+            // Later unrelated restores outlast both the initial grace and
+            // multiple handshake attempts. This is the actual RPC codec.
+            thread::sleep(Duration::from_millis(180));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "the startup console never reconnected"
+                );
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                    continue;
+                };
+                // Discard attempts which ended before the daemon began serving.
+                stream.set_nonblocking(true).unwrap();
+                let mut byte = [0u8; 1];
+                if matches!(std::io::Read::read(&mut stream, &mut byte), Ok(0)) {
+                    continue;
+                }
+                stream.set_nonblocking(false).unwrap();
+                if write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: peer.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: peer.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                    continue;
+                };
+                assert!(matches!(
+                    request.request,
+                    ClientRequest::Agent {
+                        operation: crate::agent_execution::Operation::Console {
+                            command: crate::agent_execution::ConsoleCommand::Read { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: peer,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Agent(
+                                crate::agent_execution::Reply::Console(None),
+                            ),
+                        },
+                    },
+                )
+                .unwrap();
+                break;
+            }
+        });
+        let started = Instant::now();
+        let startup = ConsoleStartup {
+            deadline: started + Duration::from_millis(20),
+            owner: Some((paths.lock, proof)),
+            attempt_timeout: Duration::from_millis(30),
+        };
+        let mut client = startup.connect(&paths.socket).unwrap();
+        let response = client
+            .agent(
+                Authority::default(),
+                crate::agent_execution::Operation::Console {
+                    agent: AgentId::new(),
+                    command: crate::agent_execution::ConsoleCommand::Read {
+                        after_generation: None,
+                        after_run: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            response,
+            crate::agent_execution::Reply::Console(None)
+        ));
+        assert!(started.elapsed() > Duration::from_millis(180));
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn replacement_console_stops_waiting_when_its_exact_startup_owner_leaves() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.path().into(),
+            socket: root.path().join("absent.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("console"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("gone-startup"),
+        };
+        let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let startup = ConsoleStartup {
+            deadline: Instant::now() + Duration::from_secs(45),
+            owner: Some((paths.lock, proof)),
+            attempt_timeout: Duration::from_millis(30),
+        };
+        let reader = thread::spawn(move || startup.connect(&paths.socket).is_err());
+        thread::sleep(Duration::from_millis(80));
+        drop(lease);
+        let stopped = Instant::now();
+        assert!(reader.join().unwrap());
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn console_refusal_names_no_protocol_code() {
+        let refusal = console_refusal(&ControlError::Remote {
+            code: crate::terminal::ipc::ProtocolErrorCode::InvalidRequest,
+            message: "The agent is busy".into(),
+            retryable: false,
+        });
+        assert_eq!(refusal, "The agent is busy");
+    }
+
     #[test]
     fn console_answers_require_explicit_request_action_and_structured_fields() {
         use crate::agent_execution::ConsoleCommand;
@@ -2282,6 +3408,33 @@ mod tests {
             Cli::try_parse_from(["cagents", "agent", "spawn", "a", "--prompt", "b"]).is_err(),
             "one prompt source"
         );
+        let AgentCommand::Spawn {
+            worktree,
+            directory,
+            ..
+        } = parse(&["spawn", "--worktree", "/repo-linked", "work"])
+        else {
+            panic!("agent spawn")
+        };
+        assert_eq!(worktree.as_deref(), Some(Path::new("/repo-linked")));
+        assert!(
+            directory.is_none(),
+            "the checkout supplies it when spawning"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "agent",
+                "spawn",
+                "--worktree",
+                "/repo",
+                "--channel",
+                &ChannelId::new().to_string(),
+                "work",
+            ])
+            .is_err(),
+            "one placement"
+        );
         let AgentCommand::Spawn { prompt, wait, .. } =
             parse(&["spawn", "--wait", "- fix the parser\n- add tests"])
         else {
@@ -2306,6 +3459,94 @@ mod tests {
             prompt.read().is_err(),
             "standard input is read only when asked for"
         );
+    }
+
+    #[test]
+    fn a_follow_up_says_whether_it_went_now_or_waits() {
+        use crate::agent_execution::Start;
+        let AgentCommand::Send { interrupt, .. } = parse(&["send", "1a2b", "Stop that"]) else {
+            panic!("agent send")
+        };
+        assert!(
+            !interrupt,
+            "a busy agent's follow-up waits unless asked to interrupt"
+        );
+        let AgentCommand::Send { interrupt, .. } =
+            parse(&["send", "1a2b", "Stop that", "--interrupt"])
+        else {
+            panic!("agent send")
+        };
+        assert!(interrupt);
+
+        assert_eq!(
+            start_phrase(&Start::Sent { resumed: false }, false),
+            "; sent it to the agent now"
+        );
+        assert!(start_phrase(&Start::Sent { resumed: true }, false).contains("reopened"));
+        let run = crate::model::RunId::new();
+        assert_eq!(
+            start_phrase(&Start::Queued { behind: Some(run) }, false),
+            format!(
+                "; it waits, unsent, until run {} ends, then starts",
+                short(run)
+            )
+        );
+        assert_eq!(
+            start_phrase(&Start::Queued { behind: None }, true),
+            "; interrupted the agent's current turn, and it starts once that has stopped"
+        );
+    }
+
+    #[test]
+    fn only_a_retry_that_can_still_start_the_work_names_its_key() {
+        use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
+        let lost = with_retry_key(AppError::new("daemon", "The connection closed"), "k1");
+        assert!(
+            lost.message
+                .ends_with("retry with --idempotency-key k1 to avoid starting the work twice"),
+            "{}",
+            lost.message
+        );
+        assert_eq!(lost.details.unwrap()["idempotency_key"], "k1");
+        for ended in [
+            format!("{NOT_SENT}run 1 ended before the agent received it. Resume it from its pane."),
+            format!(
+                "{OUTCOME_UNKNOWN}run 1 was interrupted without proof of whether the agent received it."
+            ),
+            format!("{ENDED}run 1 ended cancelled after the agent received it. Interrupted."),
+        ] {
+            let error = with_retry_key(AppError::new("daemon", ended.clone()), "k1");
+            assert_eq!(
+                error.message, ended,
+                "retrying its key reports the same end"
+            );
+            assert!(error.details.is_none());
+        }
+    }
+
+    #[test]
+    fn a_client_cannot_mint_a_message_run_key() {
+        let mut request = crate::agent_execution::Submit {
+            name: None,
+            destination: crate::agent_execution::Destination::Existing(crate::model::AgentId::new()),
+            prompt: "Carry on".into(),
+            idempotency_key: format!(
+                "{}{}",
+                crate::agent_execution::MESSAGE_RUN_KEY,
+                crate::model::MessageId::new()
+            ),
+        };
+        // The daemon's courier makes such requests itself, so they are well
+        // formed; only a client is refused them.
+        assert!(request.validate().is_ok());
+        assert!(
+            request
+                .validate_client()
+                .unwrap_err()
+                .contains("reserved for messages")
+        );
+        request.idempotency_key = "retry-1".into();
+        assert!(request.validate_client().is_ok());
     }
 
     #[test]
@@ -2464,6 +3705,77 @@ mod tests {
     }
 
     #[test]
+    fn a_status_names_the_limit_and_account_without_moving_its_run_line() {
+        use crate::agent_execution::directory::{
+            Delegation, Entry, Member, Owner, Relation, SessionAccount, Surface, UsageLimit,
+        };
+        let agent = AgentId::new();
+        let id = crate::model::TerminalId::new();
+        let member = Member {
+            session: Entry {
+                id,
+                surface: Surface::Chat,
+                provider: Some(Provider::Claude),
+                title: None,
+                channel: None,
+                view_scope: None,
+                channel_repository: None,
+                lineage_channel: None,
+                state: crate::agent::ActivityState::Idle,
+                directory: None,
+                worktree: None,
+                project: None,
+                project_name: None,
+                delegation: Some(Delegation {
+                    agent,
+                    owner: Owner::User,
+                    run: None,
+                    run_state: None,
+                }),
+                relation: Relation::Child,
+                lineage: crate::agent_execution::Lineage(id),
+            },
+            exited: false,
+            failure: None,
+            active_at: None,
+            limit: Some(UsageLimit {
+                summary: "Claude weekly limit reached".into(),
+                reset: Some("3pm".into()),
+                resets_at: None,
+            }),
+            account: Some(SessionAccount {
+                id: "claude/system".parse().unwrap(),
+                label: None,
+                status: None,
+                remaining: Vec::new(),
+                stale: false,
+                observed_at: None,
+                ordinary_usage_allowed: None,
+            }),
+        };
+        let members = [member];
+        assert!(member_of(&members, AgentId::new()).is_none());
+        let found = member_of(&members, agent);
+        let status = "agent 1234 (claude) run 5678 Failed\n\nActual result";
+        let human = with_standing(status.into(), found);
+        assert_eq!(
+            human,
+            "agent 1234 (claude) run 5678 Failed\nStopped by a usage limit: Claude weekly limit reached, resets 3pm\nAccount claude/system: allowance unknown\n\nActual result"
+        );
+        #[cfg(feature = "ui")]
+        {
+            let run = read_run(&human).unwrap();
+            assert_eq!(run.state, Some(crate::agent_execution::State::Failed));
+            assert_eq!(run.result, "Actual result");
+        }
+        assert_eq!(with_standing(status.into(), None), status);
+        let mut data = json!({});
+        standing_json(&mut data, found);
+        assert_eq!(data["limit"]["reset"], "3pm");
+        assert_eq!(data["account"]["id"], "claude/system");
+    }
+
+    #[test]
     fn unknown_placement_is_visible_in_human_and_json_without_polluting_run_output() {
         let output = with_placement_warning(
             CommandOutput {
@@ -2488,7 +3800,60 @@ mod tests {
     }
 
     #[test]
-    fn spawn_placement_uses_exact_caller_view_and_explicit_channel_overrides() {
+    fn an_agent_placed_elsewhere_names_its_channel_after_the_receipt() {
+        let channel = ChannelId::new();
+        let accepted = |human: &str| CommandOutput {
+            command: "agent.spawn",
+            data: json!({}),
+            human: human.into(),
+        };
+        let placed = PlacedIn {
+            channel,
+            title: Some("casmi \"review\"".into()),
+        };
+        let output = with_placed_in(
+            with_placement_warning(
+                accepted("Accepted agent 1a2b3c4d run 5e6f7a8b"),
+                Some("The caller's view belongs to another project"),
+            ),
+            Some(placed.clone()),
+        );
+        assert_eq!(
+            output.human,
+            format!(
+                "Accepted agent 1a2b3c4d run 5e6f7a8b\nIn channel \"casmi \\\"review\\\"\" ({channel})\nWarning: The caller's view belongs to another project"
+            )
+        );
+        assert_eq!(
+            serde_json::from_value::<PlacedIn>(output.data["placed_in"].clone()).unwrap(),
+            placed
+        );
+        #[cfg(feature = "ui")]
+        {
+            let run = read_run(&output.human).unwrap();
+            assert_eq!(run.agent, "1a2b3c4d");
+            assert_eq!(run.placed_in, Some(placed));
+            // A waited run's status lines and result keep their shape.
+            let waited = with_placed_in(
+                accepted("agent 1a2b3c4d (claude) run 5e6f7a8b Succeeded\n\nDone"),
+                Some(PlacedIn {
+                    channel,
+                    title: None,
+                }),
+            );
+            let run = read_run(&waited.human).unwrap();
+            assert_eq!(run.result, "Done");
+            assert_eq!(run.placed_in.unwrap().channel, channel);
+        }
+        assert_eq!(
+            with_placed_in(accepted("Accepted agent 1a2b3c4d run 5e6f7a8b"), None).human,
+            "Accepted agent 1a2b3c4d run 5e6f7a8b",
+            "an agent beside its caller adds nothing"
+        );
+    }
+
+    #[test]
+    fn spawn_placement_keeps_the_agent_with_its_callers_view_or_lineage() {
         use crate::agent_execution::{
             Placement,
             directory::{Entry, Relation, Surface},
@@ -2503,6 +3868,7 @@ mod tests {
             channel: Some(channel),
             view_scope: Some(Placement::Channel(channel)),
             channel_repository: Some("/repo".into()),
+            lineage_channel: None,
             state: crate::agent::ActivityState::Idle,
             directory: Some("/repo".into()),
             worktree: Some("/repo".into()),
@@ -2518,7 +3884,11 @@ mod tests {
             (Some(Placement::Channel(channel)), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository),
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            ),
             (Some(Placement::Channel(explicit)), None)
         );
         caller.project = Some("/other-cwd-project".into());
@@ -2539,26 +3909,68 @@ mod tests {
             (Some(strip), None)
         );
         assert_eq!(
-            spawn_placement(Some(explicit), Some(&caller), repository).0,
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
             Some(Placement::Channel(explicit))
+        );
+        // A checkout named for it wins over the caller's view, as a channel does.
+        let named = Placement::Worktree {
+            repository: repository.into(),
+            path: "/repo".into(),
+        };
+        assert_eq!(
+            spawn_placement(Some(named.clone()), Some(&caller), repository),
+            (Some(named.clone()), None)
+        );
+        assert_eq!(
+            spawn_placement(Some(named.clone()), None, repository),
+            (Some(named), None),
+            "an external caller can name a checkout as it names a channel"
         );
         let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
         assert!(scope.is_none());
         assert!(warning.unwrap().contains("another project"));
+        // A missing or ambiguous view falls back to the lineage's channel.
         caller.view_scope = None;
+        let lineage = ChannelId::new();
+        caller.lineage_channel = Some(crate::agent_execution::directory::ChannelHome {
+            id: lineage,
+            repository: repository.into(),
+        });
+        assert_eq!(
+            spawn_placement(None, Some(&caller), repository),
+            (Some(Placement::Channel(lineage)), None)
+        );
+        assert_eq!(
+            spawn_placement(
+                Some(Placement::Channel(explicit)),
+                Some(&caller),
+                repository
+            )
+            .0,
+            Some(Placement::Channel(explicit)),
+            "an explicit channel still wins over the lineage's"
+        );
+        // Another project's lineage channel is no home for this one's agent.
+        let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
+        assert!(scope.is_none());
+        assert!(warning.unwrap().contains("another project"));
+        // Only a lineage that never belonged to a channel gets a new one.
+        caller.lineage_channel = None;
         let (scope, warning) = spawn_placement(None, Some(&caller), repository);
         assert!(scope.is_none());
-        assert!(warning.unwrap().contains("no unambiguous shared view"));
-        assert_eq!(
-            spawn_placement(None, None, repository),
-            (None, None),
-            "external callers retain fresh-channel behavior"
-        );
+        assert!(warning.unwrap().contains("belongs to no channel"));
         let mut legacy = serde_json::to_value(&caller).unwrap();
         legacy.as_object_mut().unwrap().remove("view_scope");
         legacy.as_object_mut().unwrap().remove("channel");
         legacy.as_object_mut().unwrap().remove("channel_repository");
+        legacy.as_object_mut().unwrap().remove("lineage_channel");
         let legacy: Entry = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.lineage_channel.is_none());
         assert!(legacy.view_scope.is_none());
         assert!(legacy.channel.is_none());
         assert!(legacy.channel_repository.is_none());
@@ -2639,6 +4051,108 @@ mod tests {
     }
 }
 
+/// Replacement views start while the daemon is restoring behind its listener.
+/// Pin the same endpoint and let its handshake wait for that restore; only
+/// connection setup and reads are retried, never a prompt or control command.
+struct ConsoleStartup {
+    deadline: Instant,
+    owner: Option<(std::path::PathBuf, crate::model::HostSessionProof)>,
+    attempt_timeout: Duration,
+}
+
+impl ConsoleStartup {
+    fn capture(socket: &Path) -> Result<Self, AppError> {
+        let owner = std::env::var(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV)
+            .ok()
+            .map(|value| -> Result<_, AppError> {
+                let proof = serde_json::from_str(&value)
+                    .map_err(|error| AppError::new("agent_console", error))?;
+                let paths = crate::daemon::RuntimePaths::discover()
+                    .map_err(|error| AppError::new("agent_console", error))?;
+                if paths.socket != socket {
+                    return Err(AppError::new(
+                        "agent_console",
+                        "The console startup owner belongs to another terminal service",
+                    ));
+                }
+                Ok((paths.lock, proof))
+            })
+            .transpose()?;
+        Ok(Self {
+            deadline: Instant::now() + Duration::from_secs(45),
+            owner,
+            attempt_timeout: Duration::from_secs(1),
+        })
+    }
+
+    fn pending(&self) -> bool {
+        self.owner.as_ref().map_or_else(
+            || Instant::now() < self.deadline,
+            |(lock, proof)| crate::daemon::lease_owner(lock, proof).is_ok(),
+        )
+    }
+
+    fn connect(&self, socket: &Path) -> Result<ControlClient, ControlError> {
+        loop {
+            if !self.pending() {
+                return Err(ControlError::ConnectionClosed);
+            }
+            let deadline = self
+                .owner
+                .as_ref()
+                .map_or(self.deadline, |_| Instant::now() + self.attempt_timeout);
+            let connected = super::connect_control_socket(
+                socket,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(ControlError::Connect)
+            .and_then(|stream| ControlClient::from_stream_with_deadline(stream, deadline));
+            match connected {
+                Ok(client)
+                    if self
+                        .owner
+                        .as_ref()
+                        .is_some_and(|(_, proof)| client.proof() != proof) =>
+                {
+                    return Err(ControlError::ProofMismatch);
+                }
+                Err(error) if self.pending() && console_connection_transient(&error) => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn connect_console(socket: &Path, deadline: Instant) -> Result<ControlClient, ControlError> {
+    ConsoleStartup {
+        deadline,
+        owner: None,
+        attempt_timeout: Duration::from_secs(1),
+    }
+    .connect(socket)
+}
+
+fn console_connection_transient(error: &ControlError) -> bool {
+    match error {
+        ControlError::ConnectionClosed | ControlError::ReplyTimeout { .. } => true,
+        ControlError::Connect(error)
+        | ControlError::Frame(crate::terminal_ipc::FrameError::Io(error)) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::Interrupted
+        ),
+        _ => false,
+    }
+}
+
 fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     use crate::agent_execution::ConsoleCommand;
     use std::io::{BufRead, Write};
@@ -2650,7 +4164,11 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         ));
     }
     let socket = terminal::ipc::daemon_socket_path().map_err(|e| AppError::new("daemon", e))?;
-    let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+    let startup = ConsoleStartup::capture(&socket)?;
+    if startup.owner.is_some() {
+        println!("Reconnecting to the agent console…");
+    }
+    let mut client = startup.connect(&socket).map_err(protocol_error)?;
     let (sender, input) = std::sync::mpsc::sync_channel(8);
     thread::Builder::new()
         .name("console-input".into())
@@ -2685,59 +4203,60 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         })
         .map_err(|e| AppError::new("console_input", e))?;
     println!(
-        "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
+        "Agent console: type a prompt to send it.\n/interrupt [--including-subagents] stops the current work. /quit leaves the console; the agent keeps running.\nThis shows one line per step, without command output or tool details.\n"
     );
-    let startup = Instant::now() + Duration::from_secs(10);
     let mut generation = None;
-    let mut previous = String::new();
+    let mut transcript = ConsoleTranscript::default();
     let mut last_run = None;
     let mut last_requests = Vec::new();
+    let mut working = false;
+    let mut reads = 0u32;
+    let mut noted_earlier = false;
     loop {
+        reads = reads.wrapping_add(1);
         match client.agent(
             authority.clone(),
             Operation::Console {
                 agent,
                 command: ConsoleCommand::Read {
-                    after_generation: generation,
+                    after_generation: console_read_cursor(generation, working, reads),
                     after_run: last_run,
                 },
             },
         ) {
             Ok(Reply::Console(Some(view))) => {
                 generation = Some(view.generation);
+                working = console_run_outcome(&view.run).is_none();
                 let text: String = view
                     .text
                     .chars()
                     .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
                     .collect();
-                if let Some(delta) = text.strip_prefix(&previous) {
-                    print!("{delta}");
-                } else if text != previous {
-                    print!(
-                        "\n--- Current transcript{} ---\n{text}",
-                        if view.truncated { " (bounded)" } else { "" }
-                    );
+                if view.truncated && transcript.is_empty() && !noted_earlier {
+                    noted_earlier = true;
+                    println!("Earlier activity is not shown here.");
                 }
-                previous = text;
+                print!("{}", transcript.advance(&text));
                 if last_run != Some((view.run.id, view.run.revision)) {
-                    println!(
-                        "\nRun {}: {:?}; usage: {}",
-                        view.run.id,
-                        view.run.state,
-                        serde_json::to_string(&view.run.result.usage).unwrap_or_default()
-                    );
-                    if let Some(diagnostic) = &view.run.result.diagnostic {
-                        println!("{diagnostic}");
+                    if let Some(outcome) = console_run_outcome(&view.run) {
+                        println!("\n{outcome}");
+                        if let Some(diagnostic) = &view.run.result.diagnostic {
+                            println!("{diagnostic}");
+                        }
                     }
                     last_run = Some((view.run.id, view.run.revision));
                 }
                 if view.requests != last_requests {
-                    for request in &view.requests {
-                        println!(
-                            "\nInput requested:\n{}\nUse /answer {} ACTION [ANSWERS_JSON] with an action and field IDs shown above.",
-                            serde_json::to_string_pretty(request).unwrap_or_default(),
-                            request.id
-                        );
+                    let mut asked = view
+                        .requests
+                        .iter()
+                        .filter(|request| !last_requests.contains(*request))
+                        .peekable();
+                    if asked.peek().is_some() {
+                        print!("{}", transcript.advance_to_question(&text));
+                    }
+                    for request in asked {
+                        println!("\n{}", console_request(request));
                     }
                     last_requests = view.requests;
                 }
@@ -2752,10 +4271,18 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
             }
             Err(ControlError::Remote { message, .. })
                 if generation.is_none()
-                    && Instant::now() < startup
+                    && startup.pending()
                     && (message.contains("not attached yet")
                         || message.contains("no longer live")
                         || message.contains("paired provider console is unavailable")) => {}
+            Err(error)
+                if generation.is_none()
+                    && startup.pending()
+                    && console_connection_transient(&error) =>
+            {
+                client = startup.connect(&socket).map_err(protocol_error)?;
+                continue;
+            }
             Err(error) => return Err(protocol_error(error)),
         }
         match input.recv_timeout(Duration::from_millis(250)) {
@@ -2777,9 +4304,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     }
                 };
                 match client.agent(authority.clone(), Operation::Console { agent, command }) {
-                    Ok(Reply::Accepted(accepted)) => println!("Accepted run {}", accepted.run.id),
+                    Ok(Reply::Accepted(_)) => println!("Prompt accepted."),
                     Ok(_) => {}
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => eprintln!("{}", console_refusal(&error)),
                 }
                 generation = None;
             }
@@ -2790,6 +4317,159 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         data: json!({ "agent": agent, "detached": true }),
         human: "Console detached; the provider remains hosted until explicitly closed.".into(),
     })
+}
+
+/// What the terminal has shown of the agent's transcript, which it cannot take
+/// back. Only complete lines are printed, so output never leaves the cursor in
+/// the middle of a line someone may be typing on, and a line still being
+/// written is shown once rather than again each time it grows.
+#[derive(Default)]
+struct ConsoleTranscript {
+    shown: String,
+}
+
+impl ConsoleTranscript {
+    fn is_empty(&self) -> bool {
+        self.shown.is_empty()
+    }
+
+    /// What to print before a question: the line still being written too, which
+    /// is usually what the question is about. If it does go on being written,
+    /// it prints once more when it's complete.
+    fn advance_to_question(&mut self, text: &str) -> String {
+        if text.is_empty() || text.ends_with('\n') {
+            return self.advance(text);
+        }
+        self.advance(&format!("{text}\n"))
+    }
+
+    /// What to print for the transcript now reading `text`. It usually only
+    /// grew, but a step can settle after later text and the front drops once it
+    /// is long. Steps recur, so a line diff may match a repeated line to any of
+    /// its occurrences; sliding each change as far down as it goes makes what
+    /// prints continue from what was shown, in order.
+    fn advance(&mut self, text: &str) -> String {
+        let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
+        // A line it has shown can go back to being held open; that's nothing new.
+        if self.shown.starts_with(complete) {
+            return String::new();
+        }
+        let delta = match complete.strip_prefix(self.shown.as_str()) {
+            Some(grown) => grown.to_owned(),
+            None => {
+                let input = InternedInput::new(self.shown.as_str(), complete);
+                let mut diff = Diff::compute(Algorithm::Myers, &input);
+                diff.postprocess_no_heuristic(&input);
+                diff.hunks()
+                    .flat_map(|hunk| {
+                        &input.after[hunk.after.start as usize..hunk.after.end as usize]
+                    })
+                    .map(|line| input.interner[*line])
+                    .collect()
+            }
+        };
+        self.shown.clear();
+        self.shown.push_str(complete);
+        delta
+    }
+}
+
+/// A finished run's outcome. Runs in progress say nothing here: the transcript
+/// already shows what they are doing.
+fn console_run_outcome(run: &crate::agent_execution::Run) -> Option<String> {
+    use crate::agent_execution::State;
+    let outcome = match run.state {
+        State::Accepted | State::Running | State::Waiting => return None,
+        State::Succeeded => "Finished",
+        State::Failed => "Failed",
+        State::Cancelled => "Stopped",
+        State::Interrupted => "Interrupted, and it may have done some of its work",
+    };
+    let usage = &run.result.usage;
+    Some(if usage.input_tokens + usage.output_tokens == 0 {
+        outcome.to_owned()
+    } else {
+        format!(
+            "{outcome} ({} input, {} output tokens)",
+            usage.input_tokens, usage.output_tokens
+        )
+    })
+}
+
+/// Reads ask only for what changed, but a step that keeps running changes
+/// nothing, and the console says so once it has taken a while. So while a run is
+/// working, every eighth read (two seconds) asks for the transcript regardless.
+fn console_read_cursor(generation: Option<u64>, working: bool, reads: u32) -> Option<u64> {
+    generation.filter(|_| !working || !reads.is_multiple_of(8))
+}
+
+/// A request as someone answers it: what is being asked, then the exact IDs
+/// `/answer` takes, which no other view of the console provides.
+fn console_request(request: &crate::chat::Request) -> String {
+    use crate::chat::Choice;
+    use std::fmt::Write;
+    let named = |id: &str, label: &str| {
+        if label.is_empty() || label == id {
+            id.to_owned()
+        } else {
+            format!("{id} ({label})")
+        }
+    };
+    let choices = |choices: &[Choice]| {
+        choices
+            .iter()
+            .map(|choice| {
+                let name = named(&choice.id, &choice.label);
+                if choice.description.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {}", choice.description)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut text = format!("Input requested: {}\n", request.title);
+    if !request.description.is_empty() {
+        let _ = writeln!(text, "{}", request.description);
+    }
+    for field in &request.fields {
+        let _ = write!(text, "Field {}", named(&field.id, &field.label));
+        if !field.description.is_empty() {
+            let _ = write!(text, ": {}", field.description);
+        }
+        if !field.choices.is_empty() {
+            let _ = write!(text, "\nChoices: {}.", choices(&field.choices));
+        }
+        if field.multiple {
+            text.push_str("\nSeveral values allowed.");
+        }
+        if field.secret {
+            text.push_str("\nThis is secret, and this console shows what you type.");
+        } else if !field.initial.is_empty() {
+            let _ = write!(text, "\nCurrently: {}.", field.initial);
+        }
+        text.push('\n');
+    }
+    let _ = writeln!(text, "Actions: {}", choices(&request.actions));
+    let _ = write!(text, "Use /answer {} ACTION", request.id);
+    if !request.fields.is_empty() {
+        let example = request
+            .fields
+            .iter()
+            .map(|field| serde_json::json!({"field": field.id, "values": ["VALUE"]}))
+            .collect::<Vec<_>>();
+        let _ = write!(text, " {}", serde_json::Value::Array(example));
+    }
+    text
+}
+
+/// Why the daemon refused what was typed, without the protocol's framing.
+fn console_refusal(error: &ControlError) -> String {
+    match error {
+        ControlError::Remote { message, .. } => message.clone(),
+        error => error.to_string(),
+    }
 }
 
 fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, String> {

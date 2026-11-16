@@ -35,7 +35,7 @@ program = Path(sys.argv[0]).name
 cargo = program == "cargo"
 phase = ("metadata" if cargo and sys.argv[1:2] == ["metadata"] else
     "compiler" if cargo else "disk" if program == "df" else
-    "prune" if program == "prune-cargo-build-dirs" else
+    "prune" if program == "prune-build-dirs" else
     "list-ignored" if "--ignored" in sys.argv else
     "list-all" if "--list" in sys.argv else "test")
 
@@ -78,7 +78,9 @@ if config.get("hold") == phase:
 if phase == "metadata":
     if config.get("metadata_exit"):
         raise SystemExit(config["metadata_exit"])
-    metadata = dict(target_directory=str(root / "owned-target"))
+    metadata = {}
+    if not config.get("metadata_omit_target_directory"):
+        metadata["target_directory"] = str(root / "owned-target")
     if not config.get("metadata_omit_build_directory"):
         metadata["build_directory"] = config.get("metadata_build_directory", str(root / "owned-build"))
     print(json.dumps(metadata, separators=(",", ":")))
@@ -98,8 +100,10 @@ if phase == "prune":
     raise SystemExit(config.get("prune_exit", 0))
 
 if phase == "compiler":
-    artifact = dict(reason="compiler-artifact", manifest_path=str(root / "Cargo.toml"),
-                    target=dict(name="cagents", kind=["lib"]),
+    application = sys.argv[sys.argv.index("--package") + 1] == "cagents-ui"
+    manifest = root / "crates/cagents-ui/Cargo.toml" if application else root / "Cargo.toml"
+    artifact = dict(reason="compiler-artifact", manifest_path=str(manifest),
+                    target=dict(name="cagents_ui" if application else "cagents", kind=["lib"]),
                     profile=dict(test=True), executable=str(root / "libtest"))
     variant = config.get("artifact", "valid")
     if variant == "wrong-manifest":
@@ -163,7 +167,7 @@ class TestLib(unittest.TestCase):
         self.root = Path(temporary.name)
         scripts = self.root / "scripts"
         scripts.mkdir()
-        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py"):
+        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py", "build-host"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         for name in ("seed-build-dir", "build-disk-guard"):
             if (ROOT / "scripts" / name).exists():
@@ -184,6 +188,9 @@ class TestLib(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
             "CAGENTS_BUILD_SEED": "0", "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
+            "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_REMOTE": "local",
+            # Build in place: no systemd scope or shared jobserver.
+            "CAGENTS_BUILD_SCOPE": "0",
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
         self.configure()
@@ -223,7 +230,7 @@ class TestLib(unittest.TestCase):
         return [event for event in events if phase is None or event["phase"] == phase]
 
     def clear(self):
-        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune"):
+        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune", "slot.lock.prune.done"):
             (self.root / name).unlink(missing_ok=True)
         for path in self.root.glob("*.ready"):
             path.unlink()
@@ -249,13 +256,18 @@ class TestLib(unittest.TestCase):
         self.assertEqual(self.events("test"), [])
 
     def disk_policy(self):
-        # Neither a real disk query nor an installed host pruner can be used.
-        for name in ("df", "prune-cargo-build-dirs"):
-            path = self.root / "bin" / name
+        # Neither a real disk query nor the real pruner beside the guard can
+        # be used, and the pruner's schedule would add runs of its own.
+        for path in (self.root / "bin/df", self.root / "scripts/prune-build-dirs"):
             path.write_text(TOOL)
             path.chmod(0o700)
         environment = self.env.copy()
         environment.pop("CAGENTS_BUILD_FREE_FLOOR_GIB")
+        environment["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "0"
+        environment["CAGENTS_BUILD_PRUNE_STATE"] = str(self.root / "pruner")
+        # A complete run just now: below the floor the guard starts no
+        # background one, whose events would interleave with these.
+        (self.root / "pruner.scheduled").touch()
         return environment
 
     def assert_one_build_then_direct_harness(self):
@@ -268,8 +280,19 @@ class TestLib(unittest.TestCase):
         self.assertTrue(all(event["program"] == "libtest" for event in after), after)
         self.assertTrue(all(not event["held"] for event in after), after)
 
+    def test_the_test_binary_runs_under_a_memory_limit(self):
+        ran = self.root / "limited"
+        limit = self.root / "scripts/memory-capped"
+        limit.write_text(f'#!/bin/sh\necho "$1 $2" >"{ran}"\nshift\nexec "$@"\n')
+        limit.chmod(0o755)
+        result = self.invoke("cli", "module::one")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # What a test leaves running is stopped with it.
+        self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
+
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
-        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("ui", "test")):
+        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
+                              ("ui", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
@@ -277,11 +300,12 @@ class TestLib(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
                 compiler = self.events("compiler")[0]
+                package = "cagents-ui" if lane == "ui" else "cagents"
                 expected = ["test", "--locked", "--no-default-features", "--manifest-path",
-                            str(self.root / "Cargo.toml"), "--package", "cagents", "--lib",
+                            str(self.root / "Cargo.toml"), "--package", package, "--lib",
                             "--no-run", "--message-format=json-render-diagnostics"]
-                if lane != "cli":
-                    expected += ["--features", lane]
+                expected += {"host": ["--features", "host"],
+                             "shared-ui": ["--features", "ui"]}.get(lane, [])
                 self.assertEqual(compiler["arguments"], expected + extra)
                 self.assertTrue(compiler["held"], events)
                 metadata = self.events("metadata")[0]
@@ -311,8 +335,12 @@ class TestLib(unittest.TestCase):
                 events = self.events()
                 self.assertEqual([event["phase"] for event in events], ["metadata", "disk", "prune", "disk"])
                 self.assertTrue(all(not event["held"] for event in events), events)
+                pruner = str(self.root / "pruner")
                 self.assertEqual(self.events("prune")[0]["arguments"],
-                                 ["--apply", "--orphan-grace", "0", "--max-idle", "36500"])
+                                 ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
+                                  "--log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
+                                  "--keep", str(self.root / "owned-build"),
+                                  "--orphan-hours", "0", "--evidence-hours", "1", "--budget", "300", "--wait"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
                 self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
                 self.assert_no_test()
@@ -323,17 +351,18 @@ class TestLib(unittest.TestCase):
         self.configure(size_gib=100, free_gib=4, after_prune_free_gib=5)
         result = self.invoke("cli", "module::one", env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("reclaiming removed worktrees", result.stderr)
+        self.assertIn("reclaiming unused build directories", result.stderr)
         self.assertNotIn("refusing to build", result.stderr)
         self.assertEqual([event["phase"] for event in self.events()[:5]],
                          ["metadata", "disk", "prune", "disk", "compiler"])
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assert_one_build_then_direct_harness()
 
-    def test_failed_empty_or_target_only_metadata_bypasses_disk_guard(self):
+    def test_failed_or_pathless_metadata_bypasses_disk_guard(self):
         environment = self.disk_policy()
-        for config in ({"metadata_exit": 37}, {"metadata_build_directory": ""},
-                       {"metadata_omit_build_directory": True}):
+        for config in ({"metadata_exit": 37},
+                       {"metadata_build_directory": "", "metadata_omit_target_directory": True},
+                       {"metadata_omit_build_directory": True, "metadata_omit_target_directory": True}):
             with self.subTest(config=config):
                 self.clear()
                 # The fake disk would refuse this build if the guard ran.
@@ -345,6 +374,23 @@ class TestLib(unittest.TestCase):
                 self.assertEqual([event["phase"] for event in self.events()[:2]], ["metadata", "compiler"])
                 self.assertTrue(self.events("compiler")[0]["held"])
                 self.assert_one_build_then_direct_harness()
+
+    def test_disk_guard_uses_the_build_directory_else_the_target(self):
+        environment = self.disk_policy()
+        for name in ("owned-build", "owned-target"):
+            (self.root / name).mkdir()
+        for config, guarded in (({}, "owned-build"),
+                                ({"metadata_build_directory": ""}, "owned-target"),
+                                ({"metadata_omit_build_directory": True}, "owned-target")):
+            with self.subTest(config=config):
+                self.clear()
+                # The fake disk refuses, so the path it was asked about is the guarded one.
+                self.configure(size_gib=100, free_gib=0, **config)
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.events("disk")[0]["arguments"],
+                                 ["-Pk", "--", str(self.root / guarded)])
+                self.assertEqual(self.events("compiler"), [])
 
     def test_artifact_must_be_unique_matching_absolute_and_runnable(self):
         for variant in ("missing", "duplicate", "wrong-manifest", "wrong-name", "wrong-kind",
@@ -392,7 +438,7 @@ class TestLib(unittest.TestCase):
 
     def test_interleaved_options_and_ignored_prefix_union_with_ordinary_exact(self):
         self.configure(available=["module::ignored", "other::three"])
-        result = self.invoke("ui", "--profile", "dev-runtime", "--prefix", "module::",
+        result = self.invoke("shared-ui", "--profile", "dev-runtime", "--prefix", "module::",
                              "other::three", "--test-threads", "3")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping ignored module::ignored", result.stderr)
@@ -406,6 +452,8 @@ class TestLib(unittest.TestCase):
             (("module::ignored",), {}, "explicit ignored tests"),
             (("--prefix", "absent::"), {}, "selects no tests"),
             (("--prefix", "module::"), {"available": ["module::ignored"]}, "no ordinary tests"),
+            (("--prefix", "module::"), {"available": [], "ignored": []},
+             "lane compiled no library tests"),
         ):
             with self.subTest(names=names):
                 self.clear()
@@ -478,6 +526,46 @@ class TestLib(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("inherited descriptor holds build admission", result.stderr)
                     self.assertEqual(self.events(), [])
+
+    def test_a_parent_flock_close_is_refused_before_compile(self):
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), sys.executable, "-I", "-B",
+             str(self.root / "scripts/test-lib"), "cli", "module::one"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def under_flock(self, slot, *inner, pass_fds=()):
+        return subprocess.run(
+            ["flock", "--close", str(slot), *inner, sys.executable, "-I", "-B",
+             str(self.root / "scripts/test-lib"), "cli", "module::one"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10, pass_fds=pass_fds,
+        )
+
+    def test_a_flock_further_up_is_refused_too(self):
+        command = f'{sys.executable} -I -B "{self.root}/scripts/test-lib" cli module::one; exit $?'
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), "sh", "-c", f"sh -c '{command}'; exit $?"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a parent flock holds build admission", result.stderr)
+
+    def test_a_flock_on_another_lock_is_not_refused(self):
+        result = self.under_flock(self.root / "unrelated.lock")
+        self.assertNotIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_flock_with_the_slot_open_but_not_locked_is_not_refused(self):
+        with self.lock.open("a") as opened:
+            result = self.under_flock(self.root / "unrelated.lock", pass_fds=(opened.fileno(),))
+        self.assertNotIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unlocked_inherited_descriptor_does_not_falsely_refuse(self):
         with self.lock.open("a") as lock:
@@ -587,7 +675,9 @@ class TestLib(unittest.TestCase):
                     _stdout, stderr = process.communicate("", timeout=5)
                     self.assertEqual(process.returncode, 128 + number, stderr)
                     received = [event["signal"] for event in self.events(phase) if "signal" in event]
-                    self.assertIn(signal.SIGTERM if phase == "compiler" else number, received)
+                    # build-host interrupts the build as Ctrl-C would, whatever
+                    # signal cancelled it; test-lib forwards a listing's own.
+                    self.assertIn(signal.SIGINT if phase == "compiler" else number, received)
                     self.assertFalse(self.held())
                     self.assert_no_test()
 

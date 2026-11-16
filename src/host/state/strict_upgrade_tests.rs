@@ -65,7 +65,9 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
         }
     }
     let mut cleanup = Cleanup(Vec::new());
-    for (index, fault) in ["carry", "save", "none"].iter().enumerate() {
+    // "publish" carries like "none"; its successor's Registry then refuses
+    // the adopted source's publication.
+    for (index, fault) in ["carry", "save", "none", "publish"].iter().enumerate() {
         let mut state = HostState::new(proof.clone());
         state.enable_holder_recovery();
         let host = Arc::new(crate::host::state::HostLock::new(state));
@@ -144,7 +146,11 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
         }
         let (shutdown, _) = host.lock().unwrap().graceful_shutdown();
         let result = super::super::finish_chat_shutdown(&host);
-        assert_eq!(result.is_err(), *fault != "none", "{result:?}");
+        assert_eq!(
+            result.is_err(),
+            matches!(*fault, "carry" | "save"),
+            "{result:?}"
+        );
         for handle in shutdown {
             let _ = handle.shutdown();
         }
@@ -161,7 +167,7 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
             );
             assert_eq!(
                 retained.phase,
-                if *fault == "none" {
+                if matches!(*fault, "none" | "publish") {
                     Phase::Ready
                 } else {
                     Phase::Prepared
@@ -183,11 +189,42 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
         lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
         let mut state = HostState::new(proof.clone());
         state.enable_holder_recovery();
-        state.install_model(
-            crate::host::model::Registry::at(&root.join(format!("registry-{index}.sqlite3")))
-                .unwrap(),
-        );
+        let registry_path = root.join(format!("registry-{index}.sqlite3"));
+        state.install_model(crate::host::model::Registry::at(&registry_path).unwrap());
         let successor = Arc::new(crate::host::state::HostLock::new(state));
+        if *fault == "publish" {
+            rusqlite::Connection::open(&registry_path)
+                .unwrap()
+                .execute_batch(
+                    "ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities",
+                )
+                .unwrap();
+            let error = restore_upgrade(&successor).unwrap_err();
+            assert!(error.contains("source publication failed"), "{error}");
+            let adopted = {
+                let state = successor.lock().unwrap();
+                assert!(state.startup_recovery().is_some());
+                // The kept original still resolves by the previous daemon's
+                // source, like one whose publication committed.
+                let record = &state.terminals[&source.id];
+                assert_eq!(record.upgrade_sources.last().map(|s| s.id), Some(source.id));
+                record.handle.clone()
+            };
+            assert_eq!(adopted.holder_identity(), Some(&owner));
+            assert!(owner.root.is_current() && owner.holder.is_current());
+            assert_eq!(
+                fs::read_to_string(&launches).unwrap(),
+                "launch\n",
+                "recipe was executed twice"
+            );
+            assert_eq!(
+                adopted.close_checked(true),
+                crate::terminal_ipc::TerminalCloseResult::Closed
+            );
+            assert!(!owner.root.is_current());
+            store.remove().unwrap();
+            continue;
+        }
         restore_upgrade(&successor).unwrap();
         restore_orphaned_holders(&successor).unwrap();
         let adopted = successor.lock().unwrap().terminals[&source.id]

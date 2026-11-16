@@ -110,7 +110,7 @@ fi
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
-    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
+    [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
     # Native build scripts run outside the repository and cannot rely on a mise
     # shim rediscovering mise.toml. Resolve the real executable up front.
@@ -128,16 +128,25 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
 
     # The archive is named after the version's build metadata (the part after
     # `+`, e.g. `local.3d80e6d`), and the binaries inside it report the same
-    # string from `--version`. A bare release version carries none, and an
-    # empty value tells build.rs to look at the checkout instead.
-    CAGENTS_BUILD_METADATA=${VERSION#*+}
-    [ "$CAGENTS_BUILD_METADATA" != "$VERSION" ] || CAGENTS_BUILD_METADATA=
-    export CAGENTS_BUILD_METADATA
+    # string from `--version`. A bare release version carries none, and the
+    # binaries then take the checkout's metadata instead, so a dirty or
+    # untagged tree cannot pass for the release. Leave the variable unset
+    # rather than empty: Cargo tracks set-but-empty as a different value, and
+    # the editor package would rebuild the same binaries just to see it unset
+    # again. A build gate's marker, inherited, would have build.rs skip the
+    # checkout.
+    if [ "${VERSION#*+}" != "$VERSION" ]; then
+        CAGENTS_BUILD_METADATA=${VERSION#*+}
+        export CAGENTS_BUILD_METADATA
+    else
+        unset CAGENTS_BUILD_METADATA
+    fi
+    unset CAGENTS_BUILD_METADATA_SUPPLIED
 
     build_target() {
         product=$1
         shift
-        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
+        /usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --profile "$PROFILE" \
@@ -153,11 +162,11 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     if [ "$VARIANT" = browserless ]; then
         CLI_BINARY=$(build_target cagents --no-default-features --bin cagents)
         HOST_BINARY=$(build_target cagentsd --no-default-features --features host --bin cagentsd)
-        UI_BINARY=$(build_target cagents-ui --no-default-features --features ui --bin cagents-ui)
+        UI_BINARY=$(build_target cagents-ui -p cagents-ui --bin cagents-ui)
     else
         CLI_BINARY=$(build_target cagents --bin cagents)
         HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
-        UI_BINARY=$(build_target cagents-ui --features integrated-browser --bin cagents-ui)
+        UI_BINARY=$(build_target cagents-ui -p cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
@@ -177,16 +186,18 @@ if [ "$ARCHIVE_ONLY" = 0 ]; then
     if [ "$VARIANT" = browserless ]; then
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                --no-default-features --features ui,host --edges normal --prefix none |
-                sed 's/ (\*)$//' |
+                -p cagents -p cagents-ui --no-default-features --features cagents/host \
+                --edges normal --prefix none |
+                sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
                 wc -l
         )
     else
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                --features host,integrated-browser --edges normal --prefix none |
-                sed 's/ (\*)$//' |
+                -p cagents -p cagents-ui --features cagents/host,cagents-ui/integrated-browser \
+                --edges normal --prefix none |
+                sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
                 wc -l
         )
