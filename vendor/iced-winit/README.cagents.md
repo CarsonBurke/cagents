@@ -66,6 +66,14 @@ focused widget's node is hidden; the widget keeps its focus, and the node's
 identity is published again once it is visible. Remove this backport when the
 pinned dependency treats hidden nodes the same way.
 
+The shell reports each presented frame to an observer the application can
+install through `iced_runtime::frame::observe`, a module this patch adds to the
+vendored runtime. The event loop times its handling of each event and, on a
+successful presentation, reports the work since the previous one and the
+interval between them. Without an observer, which is the case unless the
+application's development UI trace is enabled, no clock is read. Remove this
+when the pinned dependency offers equivalent frame timing.
+
 This standalone package is not a workspace member and does not see the root
 manifest's patches. Run its tests against the vendored packages with a Cargo
 configuration that repeats the root `[patch]` entries as absolute paths, for

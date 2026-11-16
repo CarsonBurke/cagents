@@ -113,6 +113,10 @@ pub enum UpdateError {
     TargetRecoveryRequired(#[from] recovery::TargetRecoveryRequired),
     #[error("Update cancelled")]
     Cancelled,
+    /// The review was closed, or expired, while something it named had to
+    /// be resolved by hand first. Unlike a cancellation, this says what.
+    #[error("{}", .0.report())]
+    Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
     #[error("{0}")]
@@ -186,6 +190,32 @@ pub struct UpdateJob {
     pub log_path: PathBuf,
     #[serde(default)]
     pub confirmation: Option<confirmation::Confirmation>,
+    /// What held a refused update back. A refused job ends `Failed` with this
+    /// set and `message` naming the same reasons, so a reader that predates
+    /// this field still shows them rather than a cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<impact::Refusal>,
+}
+
+impl UpdateError {
+    /// What a refused update's record keeps. A refusal is not a phase of its
+    /// own: windows and CLIs of other versions read the job, and an unknown
+    /// phase would hide it from them. They read `Failed` and the message.
+    fn refusal(&self) -> Option<impact::Refusal> {
+        match self {
+            Self::Refused(refusal) => Some((**refusal).clone()),
+            _ => None,
+        }
+    }
+
+    /// The job's message for this failure. A refusal keeps every reason on
+    /// one line there, the form readers of other versions parse.
+    fn record_message(&self) -> String {
+        match self {
+            Self::Refused(refusal) => refusal.message(),
+            error => error.to_string(),
+        }
+    }
 }
 
 impl UpdateJob {
@@ -357,6 +387,12 @@ fn installed_version(text: &str) -> Result<Version, UpdateError> {
 /// Blocking, bounded network discovery. Run on an async runtime's blocking pool.
 /// No installation or updater files are created by this call.
 pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateError> {
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        && let Some(release) = review_fixture::release(Path::new(&root))?
+    {
+        return Ok(UpdateState::Available { release });
+    }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
         Err(error) => {
@@ -451,7 +487,27 @@ enum UpdateRequest {
     InstalledFromTerminal { root: PathBuf },
 }
 
+/// Whether this build asks for newer releases. A development build never
+/// does, apart from offering the native evidence fixture's release.
+pub fn discovers_releases() -> bool {
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        .is_some_and(|root| review_fixture::offers_release(Path::new(&root)))
+    {
+        return true;
+    }
+    crate::instance::NAME != "development"
+}
+
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
+    // A native evidence session may be offered the fixture's release, and
+    // never installs any release.
+    #[cfg(all(feature = "ui", feature = "development"))]
+    if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some() {
+        return Err(invalid(
+            "a native evidence session never installs a release",
+        ));
+    }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
@@ -831,7 +887,7 @@ fn drive_terminal_review_with(
                         continue;
                     }
                     if matches!(choice, UpdateChoice::Cancel) {
-                        return Err(UpdateError::Cancelled);
+                        return Err(confirmation::closed(&confirmation.preview));
                     }
                     submitted.insert(confirmation.nonce.clone());
                     continue;
@@ -872,8 +928,9 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            let _ =
-                                terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                            // A failed read is not the person's answer, so
+                            // it ends the update as the stop list's does.
+                            let _ = terminal.cancel(&job.id);
                             return Err(error.into());
                         }
                     }
@@ -881,7 +938,8 @@ fn drive_terminal_review_with(
                 match choice {
                     OrdinaryChoice::Cancel => {
                         terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
-                        return Err(UpdateError::Cancelled);
+                        // Says what the worker records for this review.
+                        return Err(confirmation::closed(&confirmation.preview));
                     }
                     OrdinaryChoice::InterruptNow => {
                         reviewed = Some(confirmation.preview.clone());
@@ -1085,6 +1143,7 @@ fn start_job(
         message: "Starting verified update".into(),
         log_path: state.join(format!("{id}.log")),
         confirmation: None,
+        refusal: None,
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
@@ -1432,10 +1491,11 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         UpdatePhase::Failed
     };
     job.confirmation = None;
+    job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
     job.message = match &result {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(_) if settled_failure => job.message.clone(),
-        Err(error) => error.to_string(),
+        Err(error) => error.record_message(),
     };
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(&survivors.recovery_report());
@@ -2041,7 +2101,8 @@ fn record_primary_failure(
         UpdatePhase::Failed
     };
     job.confirmation = None;
-    job.message = error.to_string();
+    job.refusal = error.refusal();
+    job.message = error.record_message();
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(recovery_report);
     }
@@ -3171,6 +3232,7 @@ mod tests {
             message: String::new(),
             log_path: directory.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
@@ -4532,6 +4594,7 @@ finally:
             message: "installed daemon startup failed".into(),
             log_path: root.join(".update/historical-failure.log"),
             confirmation: None,
+            refusal: None,
         };
         let superseded = |job: &UpdateJob, switched| {
             failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
@@ -4696,6 +4759,7 @@ finally:
             message: String::new(),
             log_path: root.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let result = Err(invalid("the original startup failure"));
         // A failed status write must leave the reservation intact.
@@ -4930,6 +4994,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             message: String::new(),
             log_path: root.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
         let census = if matches!(
@@ -5368,6 +5433,7 @@ sys.stdin.buffer.read(1)
             message: String::new(),
             log_path: state.join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         let monitor = thread::spawn(move || {
@@ -5393,6 +5459,7 @@ sys.stdin.buffer.read(1)
             message: String::new(),
             log_path: directory.path().join("worker.log"),
             confirmation: None,
+            refusal: None,
         };
         let report = concat!(
             "\nThe terminal service accepted the stop.\n",
@@ -5424,6 +5491,138 @@ sys.stdin.buffer.read(1)
                 first_failure.message
             );
         }
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_failed_with_its_reasons_for_every_reader() {
+        let refusal = impact::tests::blocked_preview().refusal().unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Review the update".into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: None,
+            refusal: None,
+        };
+        record_primary_failure(
+            &mut job,
+            &UpdateError::Refused(Box::new(refusal.clone())),
+            "",
+            "",
+        );
+        assert_eq!(job.phase, UpdatePhase::Failed);
+        assert_eq!(job.refusal.as_ref(), Some(&refusal));
+        // Readers that predate `refusal` find every reason in the message.
+        assert_eq!(job.message, refusal.message());
+        let mut record = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            serde_json::from_value::<UpdateJob>(record.clone())
+                .unwrap()
+                .refusal,
+            Some(refusal)
+        );
+        // A record written before the field still reads.
+        record.as_object_mut().unwrap().remove("refusal");
+        assert_eq!(
+            serde_json::from_value::<UpdateJob>(record).unwrap().refusal,
+            None
+        );
+    }
+
+    /// Answering n at a blocked review tells the person what the worker
+    /// records: nothing was installed, and what held it back.
+    #[test]
+    fn declining_a_blocked_review_in_the_cli_reports_the_refusal() {
+        struct Terminal {
+            job: UpdateJob,
+            decided: Vec<UpdateChoice>,
+            output: Vec<u8>,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(
+                &mut self,
+                _: &str,
+                _: &str,
+                choice: UpdateChoice,
+            ) -> Result<(), UpdateError> {
+                self.decided.push(choice);
+                Ok(())
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("declining the review must not cancel the whole update");
+            }
+            fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+                answer.push_str("n\n");
+                Ok(answer.len())
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn worker_running(&mut self) -> Result<bool, UpdateError> {
+                Ok(true)
+            }
+            fn pause(&mut self) {}
+        }
+        let preview = impact::tests::blocked_preview();
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: preview.candidate.version.clone(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Review the update".into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: Some(confirmation::Confirmation {
+                nonce: "review".into(),
+                expires_at_unix_ms: u64::MAX,
+                preview,
+                stop: None,
+            }),
+            refusal: None,
+        };
+        let mut terminal = Terminal {
+            job: job.clone(),
+            decided: Vec::new(),
+            output: Vec::new(),
+        };
+        let error = drive_terminal_review_with(job, false, false, &mut terminal).unwrap_err();
+        assert!(matches!(terminal.decided[..], [UpdateChoice::Cancel]));
+        assert!(
+            matches!(&error, UpdateError::Refused(refusal) if !refusal.sessions.is_empty()),
+            "{error:?}"
+        );
+        // One reason per line, where the record keeps them on one.
+        let UpdateError::Refused(refusal) = &error else {
+            unreachable!()
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Update not installed: {}.\n{}",
+                refusal.summary(),
+                refusal
+                    .details()
+                    .iter()
+                    .map(|detail| format!("  {detail}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        );
+        assert_eq!(error.record_message(), refusal.message());
     }
 
     #[test]
@@ -5487,6 +5686,7 @@ sys.stdin.buffer.read(1)
             .into(),
             log_path: "/fake/update-worker.log".into(),
             confirmation: None,
+            refusal: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),

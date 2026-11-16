@@ -1,0 +1,8 @@
+{
+  "version": "9.8.7",
+  "url": "https://example.invalid/cagents/releases/9.8.7",
+  "id": 1,
+  "archive": { "id": 2, "name": "cagents-9.8.7-x86_64-linux.tar.zst", "size": 1 },
+  "checksums": { "id": 3, "name": "SHA256SUMS", "size": 1 },
+  "installer": { "id": 4, "name": "install.sh", "size": 1 }
+}
