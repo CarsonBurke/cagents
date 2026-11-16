@@ -6,8 +6,6 @@
 //! second application, and every dialog that mixed the two had no single
 //! control height to align to.
 
-mod reserved_label;
-
 use std::borrow::Cow;
 
 use cosmic::{
@@ -141,7 +139,20 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         if let Some(icon) = icon {
             content = content.push(widget::icon(icon).size(design::ROW_ICON_SIZE));
         }
-        content = content.push(reserved_label::view(label.clone(), reserved_labels));
+        let heading = |label: Cow<'a, str>| -> Element<'a, Message> {
+            design::heading(label)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into()
+        };
+        content = content.push(if reserved_labels.is_empty() {
+            heading(label.clone())
+        } else {
+            super::reserved(
+                heading(label.clone()),
+                reserved_labels.into_iter().map(heading),
+                iced::alignment::Horizontal::Center,
+            )
+        });
         let mut button = widget::button::custom(
             widget::container(content)
                 // COSMIC's transparent container resets the inherited ink.

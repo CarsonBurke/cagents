@@ -977,6 +977,13 @@ fn refused_marker<'a>() -> Element<'a, Message> {
         .into()
 }
 
+const SAVED: &str = "Saved";
+const SAVING: &str = "Saving…";
+const NOT_SAVED: &str = "Not saved";
+/// Every save report of a fixed length. Only a count of refused settings
+/// may be longer.
+const FIXED_SAVE_REPORTS: [&str; 3] = [SAVING, SAVED, NOT_SAVED];
+
 /// Whether the last edits reached the settings file, beside the page title.
 fn save_status<'a>(
     feedback: Option<&'a SettingsFeedback>,
@@ -988,13 +995,13 @@ fn save_status<'a>(
             .into()
     };
     Some(match feedback? {
-        SettingsFeedback::Saved => design::caption("Saved").into(),
-        SettingsFeedback::Pending => design::caption("Saving…").into(),
+        SettingsFeedback::Saved => design::caption(SAVED).into(),
+        SettingsFeedback::Pending => design::caption(SAVING).into(),
         SettingsFeedback::Invalid => refused_text(match refused {
             1 => "1 setting not saved".to_owned(),
             count => format!("{count} settings not saved"),
         }),
-        SettingsFeedback::Error(_) => refused_text("Not saved".to_owned()),
+        SettingsFeedback::Error(_) => refused_text(NOT_SAVED.to_owned()),
     })
 }
 
@@ -1071,8 +1078,20 @@ fn settings_layout<'a>(
             })
             .width(Length::Fill)
             .into();
+            // The report keeps the room of every fixed-length one, so the
+            // picker keeps its width while a save comes and goes. Only a
+            // count of refused settings may take more.
+            let report = crate::ui_controls::reserved(
+                status
+                    .take()
+                    .unwrap_or_else(|| iced::widget::Space::new().into()),
+                FIXED_SAVE_REPORTS
+                    .into_iter()
+                    .map(|report| design::caption(report).into()),
+                iced::alignment::Horizontal::Right,
+            );
             rows.push(
-                widget::row::with_children(std::iter::once(picker).chain(status.take()))
+                widget::row::with_children([picker, report])
                     .spacing(space::S)
                     .align_y(Alignment::Center)
                     .width(Length::Fill)
@@ -1803,8 +1822,20 @@ mod keyboard_table_tests {
         for width in [400.0, 900.0] {
             let category = SettingsCategory::Appearance;
             let unsaved = laid_out_with(category, width, None);
+            let saving = laid_out_with(category, width, Some(&SettingsFeedback::Pending));
             let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved));
+            assert_eq!(
+                unsaved.0, saving.0,
+                "controls moved while saving at {width}"
+            );
             assert_eq!(unsaved.0, saved.0, "controls moved at {width}");
+            assert!(
+                !unsaved
+                    .1
+                    .iter()
+                    .any(|(text, _)| FIXED_SAVE_REPORTS.contains(&text.as_str())),
+                "reserved reports stay hidden at {width}"
+            );
             assert!(
                 saved.1.iter().any(|(text, _)| text == "Saved"),
                 "no save report at {width}"
