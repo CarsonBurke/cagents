@@ -1651,6 +1651,10 @@ Exit zero confirms a readable snapshot; inspect `checks_state` to decide
 whether CI passed, failed or is pending.
 For GraphQL snapshots, the aggregate check state covers all contexts;
 `checks_complete=false` means the displayed context list stops at 100.
+Each context in `checks` keeps its name and state; only one that has not
+passed keeps its link (`detailsUrl`, or `targetUrl` and `description`), and
+none carries timestamps. Without `--json`, passing checks are counted on the
+`Checks:` line and only the others are listed, a finished one with its link.
 REST bootstrap snapshots have no check aggregate. The CLI keeps serving one
 for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability

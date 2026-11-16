@@ -2,6 +2,7 @@
 """Offline bootstrap, concurrency and shared-wire coverage; never builds Rust."""
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -372,6 +373,30 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
                 status.target(repository, hostname, number)
         self.assertFalse(self.lines("requests"))
         self.assertFalse(self.lines("builds"))
+
+    def test_a_cached_graphql_snapshot_is_reported_like_the_cli_reports_it(self):
+        key = status.target("o/r", "github.com", 7)
+        link = "https://github.com/o/r/actions/runs/1/job/2"
+        times = {"startedAt": "2026-11-09T00:00:00Z", "completedAt": "2026-11-09T00:01:00Z"}
+        checks = [{"__typename": "CheckRun", "name": "passed", "status": "COMPLETED", "conclusion": "SUCCESS",
+                   "detailsUrl": link, **times},
+                  {"__typename": "CheckRun", "name": "failed", "status": "COMPLETED", "conclusion": "FAILURE",
+                   "detailsUrl": link, **times},
+                  {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS", "targetUrl": link,
+                   "description": "Deployed"}]
+        saved = {"fetched_at": int(time.time()), "error": None, "next_attempt": 0,
+                 "snapshot": {"pull_request": {"headRefOid": "a" * 40}, "checks_state": "FAILURE",
+                              "checks": checks, "checks_complete": True, "primary_cost": 1}}
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(status.output(saved, key, True), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["data"]["snapshot"]["checks"], [
+            {"__typename": "CheckRun", "name": "passed", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "CheckRun", "name": "failed", "status": "COMPLETED", "conclusion": "FAILURE",
+             "detailsUrl": link},
+            {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}])
+        self.assertEqual(report["limitations"], [])
+        self.assertIn("startedAt", saved["snapshot"]["checks"][0], "the cache itself is left as it was")
 
     def test_an_account_switch_during_a_cache_hit_discards_the_private_snapshot(self):
         key = status.target("o/r", "github.com", 7)
