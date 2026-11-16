@@ -6,6 +6,7 @@
 - [Development runner](#development-runner)
 - [Build and test resource usage](#build-and-test-resource-usage)
 - [Testing](#testing)
+- [Output agents read](#output-agents-read)
 - [Shared GitHub traffic](#shared-github-traffic)
 - [Native evidence](#native-evidence)
 - [Installer and package checks](#installer-and-package-checks)
@@ -1604,6 +1605,50 @@ For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
+
+## Output agents read
+
+Agents run this repository's scripts and the `cagents` CLI far more often than
+people do, and pay for every token of output in context and money. Measure
+output in BPE tokens, not bytes. Under `o200k_base`, prose runs about 4.7 bytes
+a token, but a UUID or commit hash about 2 and compact JSON about 2.7; an
+absolute path is cheap per byte but long, and costly when repeated on every
+row. `scripts/output-tokens` counts them:
+
+```sh
+scripts/output-tokens -- scripts/gh-pr-status 2900 -R CarsonBurke/cagents --json
+cagents ls --json | scripts/output-tokens        # count standard input instead
+scripts/output-tokens --json --show -- mise run check:cli   # pass the output through too
+```
+
+It runs the command and prints one line, such as `412 tokens, 1650 bytes
+(stdout 398/1580, stderr 14/70), exit 0`: the total and, when the command wrote
+to standard error, each stream's tokens and bytes. It exits with the command's
+status, even when counting fails, which it reports on standard error; counting
+standard input exits 125 when counting fails. `--show` passes the output
+through as it arrives. The count uses OpenAI's
+`o200k_base` encoding through tiktoken. No public tokenizer matches every
+agent's, so compare outputs under one encoding rather than reading the numbers
+as a bill; `--encoding cl100k_base` selects another. It imports tiktoken when
+the current Python has it, and otherwise runs `uv run --offline` with the
+pinned tiktoken, going online only when uv's cache lacks it. The first use
+downloads what is missing: the package into uv's cache, for an environment
+built on `/usr/bin/python3`, and the vocabulary into `TIKTOKEN_CACHE_DIR` (default
+`~/.cache/tiktoken`), where tiktoken checks its hash. Later counts need no
+network or API key.
+
+Print what the caller needs to decide its next step, and put the rest behind a
+flag:
+
+- Say nothing on success beyond the result; keep progress, banners and
+  repeated status lines off the success path.
+- List only what needs attention, such as failed checks, and count the rest.
+- Show an ID by a prefix that is unique where it is shown, and a path relative
+  to the checkout, unless the caller passes it on to something that needs it
+  whole.
+- Keep `--json` complete for what callers decide on, without bulk such as
+  per-item URLs and timestamps nobody reads. Before changing a shape, find its
+  callers with `git grep` and update them and their tests.
 
 ## Shared GitHub traffic
 
