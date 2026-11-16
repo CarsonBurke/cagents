@@ -430,7 +430,8 @@ pub enum DaemonCommand {
         /// before an update.
         schema: u32,
     },
-    /// Stop any development daemon without relying on its wire protocol.
+    /// Stop any development daemon without relying on its wire protocol, waiting
+    /// up to 30 seconds for it to exit.
     #[command(hide = true)]
     StopForRebuild {
         /// Confirm that every development job, including background subagents, stops.
@@ -4234,15 +4235,17 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "Rebuilding stops all development terminal/chat jobs and their background subagents; pass --including-subagents to permit this.",
                 ));
             }
-            let stopped = crate::daemon::terminate_daemon_from_lock()
+            // Returns only once the original process has exited, so a caller
+            // can start its replacement at once without polling the socket.
+            let stopped = crate::daemon::terminate_daemon_from_lock(DAEMON_STOP_TIMEOUT)
                 .map_err(|error| AppError::new("daemon_process", error))?;
             Ok(CommandOutput {
                 command: "daemon.stop_for_rebuild",
                 data: json!({ "instance": instance::NAME, "stopped": stopped }),
                 human: if stopped {
-                    format!("{} daemon stopping", instance::NAME)
-                } else {
                     format!("{} daemon stopped", instance::NAME)
+                } else {
+                    format!("{} daemon was not running", instance::NAME)
                 },
             })
         }
