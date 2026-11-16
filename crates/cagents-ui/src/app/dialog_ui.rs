@@ -16,6 +16,19 @@ pub(crate) fn surface<'a, M: 'a>(
     .into()
 }
 
+/// A dialog's scrolled content, held off the scrollbar's rail by `padding`.
+/// It keeps the dialog's text color: cosmic's default container would set
+/// the window background's instead, dimming everything inside.
+fn scrolled_body<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    padding: Padding,
+) -> Element<'a, M> {
+    widget::container(content)
+        .padding(design::with_vertical_rail(padding))
+        .class(cosmic::theme::Container::custom(|_| Default::default()))
+        .into()
+}
+
 /// A [`surface`] whose whole body scrolls when the window is too short for
 /// it. `height` is the dialog's own: `Shrink` to fit its content, or `Fill`
 /// to take `max_height` whatever it holds.
@@ -34,13 +47,14 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
     let edge = space::L - design::BORDER_WIDTH;
     crate::interaction::opaque(
         widget::container(crate::interaction::overflow_fade_y(
-            widget::scrollable(
-                widget::container(content).padding(design::with_vertical_rail(Padding {
+            widget::scrollable(scrolled_body(
+                content,
+                Padding {
                     top: edge,
                     bottom: edge,
                     ..Padding::ZERO
-                })),
-            )
+                },
+            ))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
@@ -80,13 +94,14 @@ pub(crate) fn scrolling_surface_with_actions<'a, M: 'a>(
     crate::interaction::opaque(
         widget::container(crate::interaction::footed(
             crate::interaction::overflow_fade_y(
-                widget::scrollable(
-                    widget::container(content).padding(design::with_vertical_rail(Padding {
+                widget::scrollable(scrolled_body(
+                    content,
+                    Padding {
                         top: space::L - design::BORDER_WIDTH,
                         bottom: space::M,
                         ..Padding::ZERO
-                    })),
-                )
+                    },
+                ))
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     design::scrollbar(),
                 ))
