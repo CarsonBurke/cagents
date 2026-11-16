@@ -594,13 +594,13 @@ fn unrelated_model_changes_never_close_a_first_send_in_a_worktree_strip() {
         let durable = Arc::make_mut(&mut world.app.durable);
         durable.cards.retain(|card| card.id != world.card);
         durable.active_channel = None;
-        durable
+        let entry = durable
             .channels
             .iter_mut()
             .find(|entry| entry.id == channel)
-            .unwrap()
-            .cards
-            .clear();
+            .unwrap();
+        entry.cards.clear();
+        entry.focused = None;
     }
     world.app.workspace_model.views.push(View {
         revision: 1,
