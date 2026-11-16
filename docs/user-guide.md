@@ -486,12 +486,18 @@ A pin shows at once. A card's sessions are buttons that focus the session in
 whichever window shows it.
 
 ```sh
-cagents work ls                      # every open project, newest activity first
-cagents work ls --project redact     # one project, by name or path
-cagents work ls --column in-review   # one column
-cagents work ls --fresh              # rescan and poll GitHub first, up to 20 s
-cagents work ls --json               # the full board
+cagents work                      # this project, the newest 10 cards of each column
+cagents work --all                # every open project
+cagents work --project redact     # one project, by name or path
+cagents work --column in-review   # one column
+cagents work --limit 0            # every card
+cagents work --fresh              # rescan and poll GitHub first, up to 20 s
+cagents work --json               # the full board
 ```
+
+`cagents work` is short for `cagents work ls`. Outside every open project it
+lists them all. Its last line suggests what to run next, such as how to list
+the rest of a column it cut short.
 
 Every linked worktree has a card, and so does the primary checkout while it is
 dirty, ahead of the default branch or has an agent session. A branch without a

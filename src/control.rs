@@ -51,7 +51,7 @@ pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
 mod work;
-pub use work::WorkCommand;
+pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -181,10 +181,13 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
-    /// Show every worktree and branch in progress, newest activity first.
+    /// List this project's worktrees and branches in progress, newest activity first; or pin or remove one.
+    #[command(args_conflicts_with_subcommands = true)]
     Work {
         #[command(subcommand)]
-        command: WorkCommand,
+        command: Option<WorkCommand>,
+        #[command(flatten)]
+        list: WorkListArgs,
     },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
@@ -3396,10 +3399,13 @@ fn execute_with_model_context(
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),
         },
-        TopCommand::Work { command } => match service_context {
-            Some(context) => work::execute_with_context(command, &context),
-            None => work::execute(command),
-        },
+        TopCommand::Work { command, list } => {
+            let command = command.unwrap_or(WorkCommand::List(list));
+            match service_context {
+                Some(context) => work::execute_with_context(command, &context),
+                None => work::execute(command),
+            }
+        }
         TopCommand::Agent { command } => match service_context {
             Some(context) => agents::execute_with_context(command, &context),
             None => agents::execute(command),

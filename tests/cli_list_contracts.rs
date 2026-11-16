@@ -34,6 +34,7 @@ enum Listing {
     Terminals,
     TerminalShow,
     Sessions,
+    Work,
 }
 
 impl Listing {
@@ -47,6 +48,8 @@ impl Listing {
             Self::Terminals => &["terminal", "list"],
             Self::TerminalShow => &["terminal", "show", "00000000-0000-4000-8000-000000000001"],
             Self::Sessions => &["sessions"],
+            // The noun alone lists, as `work ls` does.
+            Self::Work => &["work"],
         }
     }
 
@@ -287,6 +290,58 @@ impl Listing {
                     vec![]
                 };
                 ServerResponse::Listed { terminals }
+            }
+            (
+                Self::Work,
+                ClientRequest::Work(cagents::work::Request::Board {
+                    scope: cagents::work::Scope::All,
+                    fresh: false,
+                }),
+            ) => {
+                let items = if populated {
+                    serde_json::json!([{
+                        "project": "/fixture/.git",
+                        "project_name": "Fixture",
+                        "key": {"branch": "fixture/branch"},
+                        "branch": "fixture/branch",
+                        "worktree": {
+                            "path": "/fixture/.worktrees/branch",
+                            "primary": false,
+                            "locked": false,
+                            "created_at_unix_ms": null
+                        },
+                        "head": null,
+                        "comparison": {"base": "origin/main", "ahead": 2, "behind": 0},
+                        "dirty": {"paths": 0, "conflicted": 0, "newest_modified_at_unix_ms": null},
+                        "pull_request": null,
+                        "linear": null,
+                        "sessions": [],
+                        "last_activity": null,
+                        "error": null,
+                        "column": "in_progress",
+                        "derived": "in_progress",
+                        "pinned": false
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let board = serde_json::from_value(serde_json::json!({
+                    "generated_at_unix_ms": 0,
+                    "stale_after_days": 7,
+                    "projects": [{
+                        "repository": "/fixture/.git",
+                        "name": "Fixture",
+                        "root": "/fixture",
+                        "base": "origin/main",
+                        "scanned_at_unix_ms": 0,
+                        "scan_error": null,
+                        "forge": "not_git_hub"
+                    }],
+                    "items": items,
+                    "linear_unavailable": null
+                }))
+                .unwrap();
+                ServerResponse::Work(cagents::work::Response::Board(board))
             }
             _ => panic!("CLI sent a request outside its expected read contract"),
         }
@@ -813,6 +868,12 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
             "No live sessions",
             "Fixture session",
         ),
+        (
+            Listing::Work,
+            "IN PROGRESS (1)\nCARD ",
+            "No cards",
+            "fixture/branch",
+        ),
     ] {
         assert_eq!(output(listing, false, false).trim(), empty);
         let human = output(listing, true, false);
@@ -826,6 +887,23 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
             assert!(!human.contains(raw), "raw value {raw}: {human}");
         }
     }
+}
+
+#[test]
+fn work_alone_lists_the_board_in_its_json_envelope() {
+    let human = output(Listing::Work, true, false);
+    // One project's cards name it once, and an empty column is no column.
+    assert!(human.ends_with("\n(project Fixture)\n"), "{human}");
+    assert!(!human.contains("PROJECT"), "{human}");
+    assert!(human.contains(".worktrees/branch"), "{human}");
+    let value: serde_json::Value =
+        serde_json::from_str(&output(Listing::Work, true, true)).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "work.list");
+    assert_eq!(
+        value["data"]["board"]["items"][0]["branch"],
+        "fixture/branch"
+    );
 }
 
 #[test]
