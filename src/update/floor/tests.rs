@@ -21,6 +21,7 @@ struct FakeSource {
     records: Arc<Mutex<Vec<Record>>>,
     outcomes: VecDeque<ShutdownOutcome>,
     prepare_refusals: usize,
+    prepare_busy: bool,
     lose_prepare_ack: bool,
     predicted_service: bool,
     fail_inventory: bool,
@@ -120,6 +121,12 @@ impl FloorSource for FakeSource {
             self.event("PrepareConfirmedUpgrade sent; acknowledgement lost");
             return Err(source::PrepareError::Unconfirmed(invalid(
                 "connection closed",
+            )));
+        }
+        if self.prepare_busy {
+            self.event("PrepareConfirmedUpgrade busy");
+            return Err(source::PrepareError::Busy(invalid(
+                "The source daemon stayed busy; nothing was stopped",
             )));
         }
         if self.prepare_refusals > 0 {
@@ -409,6 +416,7 @@ fn fixture() -> FakeSource {
         records: Arc::new(Mutex::new(Vec::new())),
         outcomes: VecDeque::new(),
         prepare_refusals: 1,
+        prepare_busy: false,
         lose_prepare_ack: false,
         predicted_service: false,
         fail_inventory: false,
@@ -1448,6 +1456,23 @@ fn refused_prepare_is_known_before_the_only_destructive_confirmation() {
             assert_no_destructive_actions(&source);
         }
     }
+}
+
+#[test]
+fn a_source_that_stays_busy_ends_the_update_without_offering_to_stop_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.prepare_busy = true;
+    // `finish` fails if the worker publishes the stop review and waits on it.
+    let worker = spawn_source(source, directory.path(), true);
+    let (result, source) = finish(worker);
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("nothing was stopped"), "{error}");
+    assert_eq!(
+        *source.events.lock().unwrap(),
+        ["PrepareConfirmedUpgrade busy"]
+    );
+    assert_no_destructive_actions(&source);
 }
 
 #[test]

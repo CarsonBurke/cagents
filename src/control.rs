@@ -746,6 +746,14 @@ pub enum ControlError {
 }
 
 impl ControlError {
+    /// Whether the daemon refused an exclusive request only because another
+    /// operation held it past the request's deadline. Nothing was admitted,
+    /// so the same request may be sent again.
+    pub fn is_daemon_busy(&self) -> bool {
+        matches!(self, Self::Remote { retryable: true, message, .. }
+            if message == crate::terminal_ipc::DAEMON_BUSY)
+    }
+
     /// The daemon's own sentence for a person; every other failure as it stands.
     pub fn reason(self) -> String {
         match self {
