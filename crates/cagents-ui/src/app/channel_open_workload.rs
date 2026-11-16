@@ -591,6 +591,70 @@ fn navigation_save_timing() {
     }
 }
 
+/// Opening worktrees that hold no card yet, after the daemon has settled
+/// every seed: the deferred save that publishes each one's new pane, then the
+/// complete save its terminal's start makes.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn new_worktree_save_timing() {
+    let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
+    // The daemon acknowledges each seed and lists its view.
+    for scope in app.shared_views.seeding_scopes() {
+        app.acknowledge_view_edit(scope.clone(), None);
+        if !app
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.scope == scope)
+        {
+            let mut view = View::empty(ChannelId::new());
+            view.scope = scope;
+            view.revision = 1;
+            app.workspace_model.views.push(view);
+        }
+    }
+    let project = &app.sidebar_model.projects[0];
+    // Past the worktrees where `large_workspace` puts a loose terminal or a
+    // closed card.
+    let targets = project.worktrees[1701..]
+        .iter()
+        .step_by(50)
+        .map(|row| SidebarAction::OpenWorktree {
+            project_id: project.id,
+            worktree_id: row.id,
+            path: row.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (mut navigation, mut started) = (Vec::new(), Vec::new());
+    for (index, action) in targets.iter().enumerate() {
+        let SidebarAction::OpenWorktree { path, .. } = action else {
+            unreachable!();
+        };
+        assert!(
+            !app.durable
+                .cards
+                .iter()
+                .any(|card| super::worktree_ui::card_directory(card) == Some(path)),
+            "no card is in the worktree yet"
+        );
+        drop(app.update(Message::Sidebar(action.clone())));
+        let begun = Instant::now();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        let save = begun.elapsed();
+        let begun = Instant::now();
+        app.persist();
+        let start = begun.elapsed();
+        if index >= 5 {
+            navigation.push(save);
+            started.push(start);
+        }
+    }
+    eprintln!("new worktree workload: {} worktrees opened", targets.len());
+    summary("update(NavigationSaveDue)", &mut navigation);
+    summary("persist() as a terminal starts", &mut started);
+}
+
 /// Where a steady frame's build time goes, phase by phase, as
 /// `UserInterface::build` runs them: the named-state extraction, the
 /// reconciliation, the restoration of states that cached subtrees kept, and

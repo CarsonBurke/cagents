@@ -103,7 +103,7 @@ impl Default for KnownWorktreeRoots {
         Self {
             roots: HashSet::new(),
             canonical: CanonicalRoots::default(),
-            generation: super::shared_views::next_generation(),
+            generation: crate::sidebar::next_revision(),
         }
     }
 }
@@ -137,7 +137,7 @@ impl KnownWorktreeRoots {
             return false;
         }
         self.canonical.pending.push(root.clone());
-        self.generation = super::shared_views::next_generation();
+        self.generation = crate::sidebar::next_revision();
         self.roots.insert(root)
     }
 

@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
-fn next_revision() -> u64 {
+/// A revision no earlier call returned. Other caches that tell states apart
+/// by a revision draw theirs here too, so one never repeats another's.
+pub(crate) fn next_revision() -> u64 {
     NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
 }
 

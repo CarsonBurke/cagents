@@ -1,41 +1,88 @@
-//! Which scopes this window has seeded and published, with a generation for
-//! their key sets.
+//! Which scopes this window has seeded and published, with a journal of the
+//! scopes whose membership changed.
 //!
 //! A complete save keeps only the scopes a publication can act on, and most
 //! of what decides that is whether a scope is seeded and has a settled
-//! baseline at all. [`super::ViewDiscovery`] keeps that split between saves,
-//! so it must learn when either key set changes. Every change of a key set
-//! draws a new generation from one process-wide counter, as does every new
-//! set, so equal generations mean the same set with the same keys. Changing a
-//! value in place leaves the generation alone: whether a baseline is empty is
-//! read afresh on each pass.
+//! baseline at all. [`super::discovery::ViewDiscovery`] keeps that split
+//! between saves, so it must learn which scopes joined or left either key
+//! set: seeding a worktree changes one scope's, and must not cost a
+//! rediscovery of thousands. Each set records the scopes it gained or lost
+//! until they are taken. Changing a value in place records nothing: whether a
+//! baseline is empty is read afresh on each pass.
+//!
+//! Each set also carries an identity, new for every set and every copy, so a
+//! set replaced wholesale is never mistaken for the one whose journal was
+//! followed.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::sidebar::next_revision;
 use crate::workspace_model::views::Scope;
 
-static GENERATION: AtomicU64 = AtomicU64::new(1);
+/// Scopes recorded before a journal gives up and says only that it lost
+/// track, which a rediscovery costs no more than replaying.
+const JOURNAL_LIMIT: usize = 1024;
 
-/// A value no earlier call returned, for caches to tell states apart.
-pub(in crate::app) fn next_generation() -> u64 {
-    GENERATION.fetch_add(1, Ordering::Relaxed)
+/// The scopes a key set gained or lost since they were last taken.
+#[derive(Debug)]
+struct Journal {
+    identity: u64,
+    changed: Vec<Scope>,
+    overflowed: bool,
 }
 
-/// Scopes in a set whose membership carries a generation. A copy keeps the
-/// generation, as it keeps the keys.
-#[derive(Clone, Debug)]
-pub(in crate::app) struct ScopeSet {
-    scopes: HashSet<Scope>,
-    generation: u64,
-}
-
-impl Default for ScopeSet {
+impl Default for Journal {
     fn default() -> Self {
         Self {
-            scopes: HashSet::new(),
-            generation: next_generation(),
+            identity: next_revision(),
+            changed: Vec::new(),
+            overflowed: false,
+        }
+    }
+}
+
+impl Journal {
+    fn record(&mut self, scope: &Scope) {
+        if self.changed.len() < JOURNAL_LIMIT {
+            self.changed.push(scope.clone());
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn take(&mut self) -> KeyChanges {
+        let changed = std::mem::take(&mut self.changed);
+        KeyChanges {
+            identity: self.identity,
+            changed: (!std::mem::take(&mut self.overflowed)).then_some(changed),
+        }
+    }
+}
+
+/// What a key set's journal held when it was taken.
+#[derive(Debug)]
+pub(in crate::app) struct KeyChanges {
+    /// The set these changes belong to.
+    pub(in crate::app) identity: u64,
+    /// The scopes that joined or left it, or `None` if there were too many
+    /// to record.
+    pub(in crate::app) changed: Option<Vec<Scope>>,
+}
+
+/// Scopes in a set that records which ones joined or left it.
+#[derive(Debug, Default)]
+pub(in crate::app) struct ScopeSet {
+    scopes: HashSet<Scope>,
+    journal: Journal,
+}
+
+/// A copy is a new set, with a new identity and an empty journal.
+impl Clone for ScopeSet {
+    fn clone(&self) -> Self {
+        Self {
+            scopes: self.scopes.clone(),
+            journal: Journal::default(),
         }
     }
 }
@@ -64,17 +111,13 @@ impl<'a> IntoIterator for &'a ScopeSet {
 }
 
 impl ScopeSet {
-    pub(in crate::app) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Adds `scope`, returning whether it was new.
     pub(in crate::app) fn insert(&mut self, scope: Scope) -> bool {
-        let added = self.scopes.insert(scope);
-        if added {
-            self.generation = next_generation();
+        if self.scopes.contains(&scope) {
+            return false;
         }
-        added
+        self.journal.record(&scope);
+        self.scopes.insert(scope)
     }
 
     /// Removes `scope`, returning whether it was there.
@@ -82,9 +125,13 @@ impl ScopeSet {
     pub(in crate::app) fn remove(&mut self, scope: &Scope) -> bool {
         let removed = self.scopes.remove(scope);
         if removed {
-            self.generation = next_generation();
+            self.journal.record(scope);
         }
         removed
+    }
+
+    pub(in crate::app) fn take_changes(&mut self) -> KeyChanges {
+        self.journal.take()
     }
 
     #[cfg(test)]
@@ -101,19 +148,28 @@ impl Extend<Scope> for ScopeSet {
     }
 }
 
-/// A value per scope, whose key set carries a generation. A copy keeps the
-/// generation, as it keeps the keys.
-#[derive(Clone, Debug)]
+/// A value per scope, in a map that records which scopes joined or left it.
+#[derive(Debug)]
 pub(in crate::app) struct ScopeMap<V> {
     values: HashMap<Scope, V>,
-    generation: u64,
+    journal: Journal,
 }
 
 impl<V> Default for ScopeMap<V> {
     fn default() -> Self {
         Self {
             values: HashMap::new(),
-            generation: next_generation(),
+            journal: Journal::default(),
+        }
+    }
+}
+
+/// A copy is a new map, with a new identity and an empty journal.
+impl<V: Clone> Clone for ScopeMap<V> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            journal: Journal::default(),
         }
     }
 }
@@ -142,23 +198,19 @@ impl<'a, V> IntoIterator for &'a ScopeMap<V> {
 }
 
 impl<V> ScopeMap<V> {
-    pub(in crate::app) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub(in crate::app) fn insert(&mut self, scope: Scope, value: V) -> Option<V> {
-        let previous = self.values.insert(scope, value);
-        if previous.is_none() {
-            self.generation = next_generation();
+        if let Some(slot) = self.values.get_mut(&scope) {
+            return Some(std::mem::replace(slot, value));
         }
-        previous
+        self.journal.record(&scope);
+        self.values.insert(scope, value)
     }
 
     #[cfg(test)]
     pub(in crate::app) fn remove(&mut self, scope: &Scope) -> Option<V> {
         let removed = self.values.remove(scope);
         if removed.is_some() {
-            self.generation = next_generation();
+            self.journal.record(scope);
         }
         removed
     }
@@ -173,9 +225,13 @@ impl<V> ScopeMap<V> {
         V: Default,
     {
         if !self.values.contains_key(&scope) {
-            self.generation = next_generation();
+            self.journal.record(&scope);
         }
         self.values.entry(scope).or_default()
+    }
+
+    pub(in crate::app) fn take_changes(&mut self) -> KeyChanges {
+        self.journal.take()
     }
 
     #[cfg(test)]
@@ -188,27 +244,46 @@ impl<V> ScopeMap<V> {
 mod tests {
     use super::*;
 
+    fn scope() -> Scope {
+        Scope::Channel(crate::model::ChannelId::new())
+    }
+
     #[test]
-    fn only_a_changed_key_set_draws_a_new_generation() {
-        let scope = Scope::Channel(crate::model::ChannelId::new());
+    fn only_a_changed_key_is_journaled() {
+        let scope = scope();
         let mut set = ScopeSet::default();
-        let other = ScopeSet::default();
-        assert_ne!(set.generation(), other.generation(), "a new set is new");
-        let empty = set.generation();
         assert!(set.insert(scope.clone()));
-        let one = set.generation();
-        assert_ne!(one, empty);
         assert!(!set.insert(scope.clone()));
-        assert_eq!(set.generation(), one);
+        let changes = set.take_changes();
+        assert_eq!(changes.changed, Some(vec![scope.clone()]));
+        assert_eq!(set.take_changes().changed, Some(Vec::new()), "taken once");
 
         let mut map = ScopeMap::<Vec<u8>>::default();
-        let empty = map.generation();
         map.entry_or_default(scope.clone()).push(1);
-        let one = map.generation();
-        assert_ne!(one, empty);
         map.entry_or_default(scope.clone()).push(2);
         map.get_mut(&scope).unwrap().clear();
         assert_eq!(map.insert(scope.clone(), vec![3]), Some(Vec::new()));
-        assert_eq!(map.generation(), one, "values change in place");
+        assert_eq!(
+            map.take_changes().changed,
+            Some(vec![scope.clone()]),
+            "values change in place"
+        );
+        assert!(map.remove(&scope).is_some());
+        assert_eq!(map.take_changes().changed, Some(vec![scope]));
+    }
+
+    #[test]
+    fn a_copy_or_an_overflowing_journal_is_told_apart() {
+        let mut set = ScopeSet::default();
+        let identity = set.take_changes().identity;
+        assert_ne!(set.clone().take_changes().identity, identity);
+        assert_ne!(ScopeSet::default().take_changes().identity, identity);
+        for _ in 0..=JOURNAL_LIMIT {
+            set.insert(scope());
+        }
+        let changes = set.take_changes();
+        assert_eq!(changes.identity, identity);
+        assert_eq!(changes.changed, None, "too many to replay");
+        assert_eq!(set.take_changes().changed, Some(Vec::new()));
     }
 }

@@ -3,7 +3,6 @@
 mod discovery;
 pub(super) mod seed_refusal;
 mod settlement;
-pub(super) use settlement::next_generation;
 
 use super::*;
 use crate::workspace_model::{
@@ -319,6 +318,11 @@ impl State {
             || (self.initialized.contains(scope)
                 && !self.seeding.contains(scope)
                 && !self.blocked.contains(scope))
+    }
+
+    #[cfg(test)]
+    pub(super) fn seeding_scopes(&self) -> Vec<Scope> {
+        self.seeding.iter().cloned().collect()
     }
 
     /// Stops comparing each complete pass with a rediscovery, for timing
@@ -2033,7 +2037,11 @@ impl Cagents {
             return;
         }
         let mut discovery = std::mem::take(&mut self.shared_views.discovery);
-        let projected = self.discovered_local_views(&mut discovery);
+        let settlement = discovery::Settlement {
+            initialized: self.shared_views.initialized.take_changes(),
+            baseline: self.shared_views.baseline.take_changes(),
+        };
+        let projected = self.discovered_local_views(&mut discovery, settlement);
         self.shared_views.discovery = discovery;
         self.publish_projected_view_changes(projected, ViewProjection::All);
     }

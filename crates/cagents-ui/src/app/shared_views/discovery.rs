@@ -3,45 +3,62 @@
 //! A complete save publishes the scopes this window shows, but finding them
 //! meant rediscovering every scope it ever showed: every listed worktree
 //! view, every known root and every card's worktree, in a workspace that
-//! accumulates thousands of each. A pass now reuses three results, each kept
-//! with the inputs it was derived from and derived again when one differs:
+//! accumulates thousands of each. A pass now keeps three results between
+//! saves:
 //!
 //! - the scope topology, from the sidebar's projects and the known roots;
-//! - each card's worktree, from the card's directory, owner and filing;
-//! - the discovered scopes, and which of them are not yet seeded or settled.
+//! - each card's worktree, from the card's directory, owner, filing and
+//!   channel;
+//! - the discovered worktree scopes, with what makes each one discovered,
+//!   and which of them are not yet seeded or settled.
 //!
-//! The active workspace is left out of the kept scopes, since navigation
-//! changes it on most saves; each pass offers its scope on its own.
+//! The topology is derived again when the projects or the known roots
+//! change, and everything after it with it. Otherwise a pass follows what
+//! changed: a card's worktree is resolved again when its own inputs differ, a
+//! worktree gaining its first card or losing its last adds or drops its
+//! scope, the listed views are compared with those last seen, and the seeded
+//! and settled key sets journal the scopes that joined or left them. Seeding
+//! one worktree therefore touches one scope. Inputs are compared by value or
+//! by a revision their owner takes on every change, never by counting on each
+//! writer to report one.
 //!
-//! The inputs are compared by value, or by a generation their owner draws
-//! afresh on every change, never by counting on each writer to report one.
-//! Everything else a projection reads, the publishable filter included, is
-//! read afresh on every pass, so the scopes a pass publishes are the ones a
-//! complete rediscovery would, in the same order.
+//! Channels are few and every one is offered, so they are not kept. Nor is
+//! the active workspace, which navigation changes on most saves: its scope
+//! is offered on its own. Everything the publishable filter reads is read
+//! afresh, so a pass keeps the scopes, members and panes a complete
+//! rediscovery would. Their order is not always the same: channels keep
+//! theirs, but worktree scopes come in the order they were first discovered
+//! since the last complete discovery, so one found since then comes last
+//! wherever a rediscovery would place it. Publication does not depend on the
+//! order of scopes: each scope's edits are its own, and transfers already go
+//! out in map order.
 
+use super::settlement::KeyChanges;
 use super::*;
-use crate::model::ChannelId;
-use crate::sidebar::SidebarProject;
+use crate::sidebar::{Revisioned, SidebarProject, next_revision};
 
 #[derive(Default)]
 pub(in crate::app) struct ViewDiscovery {
     topology: Option<Topology>,
     cards: CardWorktrees,
-    scopes: Option<Discovered>,
-    /// Passes that reused the discovered scopes, so tests can tell the
-    /// comparison with a complete rediscovery exercised the kept ones.
+    worktrees: Option<Worktrees>,
+    /// Passes that followed changes rather than discovering every worktree
+    /// scope again, so tests can tell the kept scopes were exercised.
     #[cfg(test)]
     pub(super) reused: usize,
-    /// Leaves out that comparison, for timing workloads that measure a pass.
+    /// Leaves out the comparison with a complete rediscovery, for timing
+    /// workloads that measure a pass.
     #[cfg(test)]
     pub(super) unchecked: bool,
 }
 
 /// What `borrowed_view_scope_topology` builds, owned.
 struct Topology {
-    generation: u64,
+    revision: u64,
     roots_generation: u64,
-    /// Each project's repository and worktree paths, in sidebar order.
+    projects_revision: u64,
+    /// Each project's repository and worktree paths, in sidebar order, for
+    /// when the projects took a revision without changing them.
     projects: Vec<(PathBuf, Vec<PathBuf>)>,
     repositories: HashMap<PathBuf, PathBuf>,
     project_repositories: HashSet<PathBuf>,
@@ -49,9 +66,8 @@ struct Topology {
 }
 
 impl Topology {
-    fn built_from(&self, roots_generation: u64, projects: &[SidebarProject]) -> bool {
-        self.roots_generation == roots_generation
-            && self.projects.len() == projects.len()
+    fn lists(&self, projects: &[SidebarProject]) -> bool {
+        self.projects.len() == projects.len()
             && self
                 .projects
                 .iter()
@@ -72,6 +88,14 @@ impl Topology {
             projects: &self.project_repositories,
         }
     }
+
+    fn worktree_scope(&self, path: &Path) -> Option<Scope> {
+        let repository = self.authorities().repository_for(path)?.to_owned();
+        Some(Scope::Worktree {
+            repository,
+            path: path.to_owned(),
+        })
+    }
 }
 
 /// Each card's worktree, as `unchanneled_card_worktree_indexed` resolves it
@@ -81,9 +105,9 @@ struct CardWorktrees {
     cards: HashMap<CardId, CardWorktree>,
     /// How many cards resolve to each worktree.
     paths: HashMap<PathBuf, usize>,
-    /// Drawn afresh whenever a worktree gains its first card or loses its
-    /// last, which is when the discovered scopes can change.
-    generation: u64,
+    /// The worktrees that gained their first card or lost their last since
+    /// the kept scopes last followed them.
+    changed: Vec<PathBuf>,
     pass: u64,
 }
 
@@ -123,85 +147,219 @@ impl CardWorktrees {
             let count = self.paths.entry(worktree.to_owned()).or_default();
             *count += 1;
             if *count == 1 {
-                self.generation = next_generation();
+                self.changed.push(worktree.to_owned());
             }
         } else if let Some(count) = self.paths.get_mut(worktree) {
             *count -= 1;
             if *count == 0 {
                 self.paths.remove(worktree);
-                self.generation = next_generation();
+                self.changed.push(worktree.to_owned());
             }
         }
     }
 }
 
-/// The discovered scopes, kept with the inputs that decide them.
-struct Discovered {
-    topology: u64,
-    cards: u64,
-    initialized: u64,
-    baseline: u64,
-    channels: Vec<ChannelId>,
-    views: Vec<Scope>,
-    scopes: Vec<Scope>,
-    index: HashMap<Scope, usize>,
-    /// The worktree scopes at each path. A listed view can name a path under
-    /// another repository than the one its topology resolves.
-    at_path: HashMap<PathBuf, Vec<usize>>,
-    /// The scopes not yet seeded, or seeded with no settled baseline, which
-    /// the publishable filter keeps whatever they hold.
-    unsettled: Vec<usize>,
+/// What makes a worktree scope discovered. It stays while any holds.
+#[derive(Default)]
+struct Sources {
+    /// When the scope was discovered, which orders the scopes a pass offers.
+    order: u64,
+    /// Listed views naming the scope.
+    views: usize,
+    /// A known root at its path.
+    root: bool,
+    /// A card outside every channel at its path.
+    cards: bool,
 }
 
-impl Discovered {
-    fn derived_from(&self, app: &Cagents, topology: u64, cards: u64) -> bool {
-        self.topology == topology
-            && self.cards == cards
-            && self.initialized == app.shared_views.initialized.generation()
-            && self.baseline == app.shared_views.baseline.generation()
-            && self.channels.iter().copied().eq(app
-                .durable
-                .channels
+impl Sources {
+    fn any(&self) -> bool {
+        self.views > 0 || self.root || self.cards
+    }
+}
+
+/// The seeded and settled scopes' key sets, as taken for one pass.
+pub(super) struct Settlement {
+    pub(super) initialized: KeyChanges,
+    pub(super) baseline: KeyChanges,
+}
+
+/// The discovered worktree scopes, kept with what they were derived from.
+struct Worktrees {
+    topology: u64,
+    initialized: u64,
+    baseline: u64,
+    /// The listed views' scopes, as last followed.
+    views: Vec<Scope>,
+    sources: HashMap<Scope, Sources>,
+    /// The scopes at each path. A listed view can name a path under another
+    /// repository than the one its topology resolves.
+    at_path: HashMap<PathBuf, Vec<Scope>>,
+    /// The scopes not yet seeded, or seeded with no settled baseline, which
+    /// the publishable filter keeps whatever they hold.
+    unsettled: HashSet<Scope>,
+    discovered: u64,
+}
+
+impl Worktrees {
+    fn change(&mut self, app: &Cagents, scope: Scope, change: impl FnOnce(&mut Sources)) {
+        if let Some(sources) = self.sources.get_mut(&scope) {
+            change(sources);
+            if !sources.any() {
+                self.sources.remove(&scope);
+                self.unsettled.remove(&scope);
+                let Scope::Worktree { path, .. } = &scope else {
+                    unreachable!("only worktree scopes are kept");
+                };
+                if let Some(scopes) = self.at_path.get_mut(path) {
+                    scopes.retain(|kept| *kept != scope);
+                    if scopes.is_empty() {
+                        self.at_path.remove(path);
+                    }
+                }
+            }
+            return;
+        }
+        self.discovered += 1;
+        let mut sources = Sources {
+            order: self.discovered,
+            ..Sources::default()
+        };
+        change(&mut sources);
+        if !sources.any() {
+            return;
+        }
+        let Scope::Worktree { path, .. } = &scope else {
+            unreachable!("only worktree scopes are kept");
+        };
+        self.at_path
+            .entry(path.clone())
+            .or_default()
+            .push(scope.clone());
+        self.sources.insert(scope.clone(), sources);
+        self.settle(app, scope);
+    }
+
+    /// Reads again whether a kept `scope` is seeded and settled.
+    fn settle(&mut self, app: &Cagents, scope: Scope) {
+        if !self.sources.contains_key(&scope) {
+            return;
+        }
+        let views = &app.shared_views;
+        if views.initialized.contains(&scope) && views.baseline.contains_key(&scope) {
+            self.unsettled.remove(&scope);
+        } else {
+            self.unsettled.insert(scope);
+        }
+    }
+
+    fn view_scope<'v>(topology: &Topology, scope: &'v Scope) -> Option<&'v Scope> {
+        match scope {
+            Scope::Worktree { repository, .. }
+                if topology.authorities().contains_repository(repository) =>
+            {
+                Some(scope)
+            }
+            _ => None,
+        }
+    }
+
+    /// Follows the listed views from those last seen to `views`, comparing
+    /// past their common start and end.
+    fn follow_views(&mut self, app: &Cagents, topology: &Topology, views: &[View]) {
+        let kept = &self.views;
+        if kept.len() == views.len()
+            && kept
                 .iter()
-                .map(|channel| channel.id))
-            && self
-                .views
-                .iter()
-                .eq(app.workspace_model.views.iter().map(|view| &view.scope))
+                .zip(views)
+                .all(|(kept, view)| *kept == view.scope)
+        {
+            return;
+        }
+        let start = kept
+            .iter()
+            .zip(views)
+            .take_while(|(kept, view)| **kept == view.scope)
+            .count();
+        let end = kept[start..]
+            .iter()
+            .rev()
+            .zip(views[start..].iter().rev())
+            .take_while(|(kept, view)| **kept == view.scope)
+            .count();
+        let left = self
+            .views
+            .splice(
+                start..self.views.len() - end,
+                views[start..views.len() - end]
+                    .iter()
+                    .map(|view| view.scope.clone()),
+            )
+            .collect::<Vec<_>>();
+        for scope in left {
+            if let Some(scope) = Self::view_scope(topology, &scope) {
+                self.change(app, scope.clone(), |sources| {
+                    sources.views = sources.views.saturating_sub(1)
+                });
+            }
+        }
+        for view in &views[start..views.len() - end] {
+            if let Some(scope) = Self::view_scope(topology, &view.scope) {
+                self.change(app, scope.clone(), |sources| sources.views += 1);
+            }
+        }
     }
 }
 
 impl Cagents {
-    /// [`Self::local_views`], reusing what `discovery` kept from the last
-    /// pass where its inputs are unchanged.
-    pub(super) fn discovered_local_views(&self, discovery: &mut ViewDiscovery) -> LocalViews {
+    /// [`Self::local_views`], keeping in `discovery` what the next pass can
+    /// follow rather than discover again. `settlement` holds the seeded and
+    /// settled scopes' journals, taken for this pass.
+    pub(super) fn discovered_local_views(
+        &self,
+        discovery: &mut ViewDiscovery,
+        settlement: Settlement,
+    ) -> LocalViews {
         let mut phase = WorkspaceProjectionTiming::new(true);
-        let topology = self.refresh_view_topology(discovery);
+        let kept_topology = discovery
+            .topology
+            .as_ref()
+            .map(|topology| topology.revision);
+        let revision = self.refresh_view_topology(discovery);
         let channel_cards = self
             .durable
             .channels
             .iter()
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
-        let kept = discovery.topology.as_ref().expect("refreshed above");
-        self.refresh_card_worktrees(&mut discovery.cards, kept, &channel_cards);
-        let cards = discovery.cards.generation;
-        let reused = discovery
-            .scopes
-            .as_ref()
-            .is_some_and(|scopes| scopes.derived_from(self, topology, cards));
-        if reused {
+        let topology = discovery.topology.as_ref().expect("refreshed above");
+        self.refresh_card_worktrees(&mut discovery.cards, topology, &channel_cards);
+        let followed = match discovery.worktrees.as_mut() {
+            Some(worktrees) => {
+                self.follow_worktrees(worktrees, topology, &mut discovery.cards, &settlement)
+            }
+            None => Err("none kept"),
+        };
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "kept_discovery",
+            topology_kept = kept_topology == Some(revision),
+            rediscovered = followed.err(),
+            initialized_changes = settlement.initialized.changed.as_ref().map(Vec::len),
+            baseline_changes = settlement.baseline.changed.as_ref().map(Vec::len),
+            "Followed or discovered again the kept worktree scopes");
+        if followed.is_ok() {
             #[cfg(test)]
             {
                 discovery.reused += 1;
             }
         } else {
-            discovery.scopes = Some(self.discover_scopes(discovery, topology, cards));
+            discovery.cards.changed.clear();
+            discovery.worktrees =
+                Some(self.discover_worktrees(topology, &discovery.cards, revision, &settlement));
         }
         let ViewDiscovery {
             topology: Some(topology),
             cards,
-            scopes: Some(discovered),
+            worktrees: Some(worktrees),
             ..
         } = &*discovery
         else {
@@ -216,57 +374,57 @@ impl Cagents {
                 Some((card, worktree))
             })
             .collect::<Vec<_>>();
-        // Every scope the publishable filter can keep: those not settled,
-        // those with published panes and those holding a card here. Channels
-        // are few, so each is offered.
-        let mut offered = discovered.unsettled.clone();
-        offered.extend(
-            self.durable
-                .channels
-                .iter()
-                .filter_map(|channel| discovered.index.get(&Scope::Channel(channel.id))),
-        );
+        // Every worktree scope the publishable filter can keep: those not
+        // settled, those with published panes, those holding a card here and
+        // the active workspace's, in the order they were discovered.
+        let kept = |scope: &Scope| worktrees.sources.get_key_value(scope);
+        let mut offered = worktrees
+            .unsettled
+            .iter()
+            .filter_map(kept)
+            .collect::<Vec<_>>();
         offered.extend(
             self.shared_views
                 .baseline
                 .iter()
                 .filter(|(_, panes)| !panes.is_empty())
-                .filter_map(|(scope, _)| discovered.index.get(scope)),
+                .filter_map(|(scope, _)| kept(scope)),
         );
         let mut held = HashSet::new();
         for (card, path) in &worktree_cards {
             if card.existence.is_open()
                 && !card.kind.is_utility()
                 && held.insert(*path)
-                && let Some(indices) = discovered.at_path.get(*path)
+                && let Some(scopes) = worktrees.at_path.get(*path)
             {
-                offered.extend(indices);
+                offered.extend(scopes.iter().filter_map(kept));
             }
         }
-        // A complete rediscovery lists the active workspace after the known
-        // roots and before the cards' worktrees; one it does not otherwise
-        // find is offered last, which offers the same set.
-        let authorities = topology.authorities();
-        let active = self.active_workspace.as_deref().and_then(|path| {
-            let repository = authorities.repository_for(path)?;
-            Some(Scope::Worktree {
-                repository: repository.to_owned(),
-                path: path.to_owned(),
-            })
-        });
-        let active = match active.as_ref().map(|scope| discovered.index.get(scope)) {
-            Some(Some(&index)) => {
-                offered.push(index);
+        let active = self
+            .active_workspace
+            .as_deref()
+            .and_then(|path| topology.worktree_scope(path));
+        let active = match active.as_ref().map(kept) {
+            Some(Some(scope)) => {
+                offered.push(scope);
                 None
             }
             _ => active,
         };
-        offered.sort_unstable();
-        offered.dedup();
-        let scopes = offered
+        offered.sort_unstable_by_key(|(_, sources)| sources.order);
+        offered.dedup_by_key(|(_, sources)| sources.order);
+        let offered = offered
             .into_iter()
-            .map(|index| Cow::Borrowed(&discovered.scopes[index]))
-            .chain(active.map(Cow::Owned))
+            .map(|(scope, _)| Cow::Borrowed(scope))
+            .chain(active.map(Cow::Owned));
+        let mut channels = HashSet::new();
+        let scopes = self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| channels.insert(channel.id))
+            .map(|channel| Cow::Owned(Scope::Channel(channel.id)))
+            .chain(offered)
             .collect();
         phase.mark("local_discover");
         let projected = self.project_local_views(
@@ -284,15 +442,18 @@ impl Cagents {
         projected
     }
 
-    /// The topology generation, rebuilding the topology if the projects or
-    /// the known roots differ from those it was built from.
+    /// The topology revision, rebuilding the topology if the projects or the
+    /// known roots differ from those it was built from.
     fn refresh_view_topology(&self, discovery: &mut ViewDiscovery) -> u64 {
         let roots_generation = self.known_worktree_roots.generation();
         let projects = &self.sidebar_model.projects;
-        if let Some(topology) = &discovery.topology
-            && topology.built_from(roots_generation, projects)
+        let projects_revision = Revisioned::revision(projects);
+        if let Some(topology) = &mut discovery.topology
+            && topology.roots_generation == roots_generation
+            && (topology.projects_revision == projects_revision || topology.lists(projects))
         {
-            return topology.generation;
+            topology.projects_revision = projects_revision;
+            return topology.revision;
         }
         #[cfg(test)]
         self.record_topology_build();
@@ -303,8 +464,9 @@ impl Cagents {
                 .or_insert_with(|| repository.to_owned());
         }
         let topology = Topology {
-            generation: next_generation(),
+            revision: next_revision(),
             roots_generation,
+            projects_revision,
             projects: projects
                 .iter()
                 .map(|project| {
@@ -325,9 +487,9 @@ impl Cagents {
                 .collect(),
             roots: self.worktree_root_paths().into_iter().collect(),
         };
-        let generation = topology.generation;
+        let revision = topology.revision;
         discovery.topology = Some(topology);
-        generation
+        revision
     }
 
     /// Resolves again each card whose directory, owner, filing or channel
@@ -338,7 +500,7 @@ impl Cagents {
         kept: &Topology,
         channel_cards: &HashSet<CardId>,
     ) {
-        let topology = kept.generation;
+        let topology = kept.revision;
         cards.pass = cards.pass.wrapping_add(1);
         let pass = cards.pass;
         let mut roots = None;
@@ -359,6 +521,7 @@ impl Cagents {
                 .then(|| self.unchanneled_card_worktree_indexed(card, roots))
                 .flatten()
                 .map(Path::to_owned);
+            cards.count(worktree.as_deref(), true);
             let previous = cards.cards.insert(
                 card.id,
                 CardWorktree {
@@ -371,8 +534,6 @@ impl Cagents {
                     worktree,
                 },
             );
-            let added = cards.cards[&card.id].worktree.clone();
-            cards.count(added.as_deref(), true);
             if let Some(previous) = previous {
                 cards.count(previous.worktree.as_deref(), false);
             }
@@ -390,67 +551,78 @@ impl Cagents {
         }
     }
 
-    fn discover_scopes(&self, discovery: &ViewDiscovery, topology: u64, cards: u64) -> Discovered {
+    /// Brings the kept worktree scopes up to date with what changed since
+    /// they were last followed, or says why they must be discovered again:
+    /// the topology or a key set was replaced, or a journal lost track.
+    fn follow_worktrees(
+        &self,
+        worktrees: &mut Worktrees,
+        topology: &Topology,
+        cards: &mut CardWorktrees,
+        settlement: &Settlement,
+    ) -> Result<(), &'static str> {
+        let (Some(initialized), Some(baseline)) = (
+            settlement.initialized.changed.as_ref(),
+            settlement.baseline.changed.as_ref(),
+        ) else {
+            return Err("too many seeded or settled scopes changed");
+        };
+        if worktrees.topology != topology.revision {
+            return Err("topology");
+        }
+        if worktrees.initialized != settlement.initialized.identity
+            || worktrees.baseline != settlement.baseline.identity
+        {
+            return Err("seeded or settled scopes replaced");
+        }
+        worktrees.follow_views(self, topology, &self.workspace_model.views);
+        for path in std::mem::take(&mut cards.changed) {
+            if let Some(scope) = topology.worktree_scope(&path) {
+                let held = cards.paths.contains_key(&path);
+                worktrees.change(self, scope, |sources| sources.cards = held);
+            }
+        }
+        for scope in initialized.iter().chain(baseline) {
+            worktrees.settle(self, scope.clone());
+        }
+        Ok(())
+    }
+
+    /// Every worktree scope, discovered as `discovered_scopes` does, but for
+    /// the active workspace.
+    fn discover_worktrees(
+        &self,
+        topology: &Topology,
+        cards: &CardWorktrees,
+        revision: u64,
+        settlement: &Settlement,
+    ) -> Worktrees {
         #[cfg(test)]
         self.shared_views
             .scope_discovery_count
             .set(self.shared_views.scope_discovery_count.get() + 1);
-        let kept = discovery.topology.as_ref().expect("refreshed first");
-        let worktrees = &discovery.cards.cards;
-        let scopes = self
-            .discovered_scopes(
-                &kept.authorities(),
-                None,
-                self.durable
-                    .cards
-                    .iter()
-                    .filter_map(|card| worktrees.get(&card.id)?.worktree.as_deref()),
-            )
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect::<Vec<_>>();
-        let index = scopes
-            .iter()
-            .enumerate()
-            .map(|(index, scope)| (scope.clone(), index))
-            .collect::<HashMap<_, _>>();
-        let mut at_path = HashMap::<PathBuf, Vec<usize>>::new();
-        for (index, scope) in scopes.iter().enumerate() {
-            if let Scope::Worktree { path, .. } = scope {
-                at_path.entry(path.clone()).or_default().push(index);
+        let mut worktrees = Worktrees {
+            topology: revision,
+            initialized: settlement.initialized.identity,
+            baseline: settlement.baseline.identity,
+            views: Vec::new(),
+            sources: HashMap::new(),
+            at_path: HashMap::new(),
+            unsettled: HashSet::new(),
+            discovered: 0,
+        };
+        worktrees.follow_views(self, topology, &self.workspace_model.views);
+        for root in self.known_worktree_roots.iter() {
+            if let Some(scope) = topology.worktree_scope(root) {
+                worktrees.change(self, scope, |sources| sources.root = true);
             }
         }
-        let unsettled = scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, scope)| {
-                !self.shared_views.initialized.contains(*scope)
-                    || !self.shared_views.baseline.contains_key(*scope)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        Discovered {
-            topology,
-            cards,
-            initialized: self.shared_views.initialized.generation(),
-            baseline: self.shared_views.baseline.generation(),
-            channels: self
-                .durable
-                .channels
-                .iter()
-                .map(|channel| channel.id)
-                .collect(),
-            views: self
-                .workspace_model
-                .views
-                .iter()
-                .map(|view| view.scope.clone())
-                .collect(),
-            scopes,
-            index,
-            at_path,
-            unsettled,
+        for path in cards.paths.keys() {
+            if let Some(scope) = topology.worktree_scope(path) {
+                worktrees.change(self, scope, |sources| sources.cards = true);
+            }
         }
+        worktrees
     }
 
     /// Every pass in tests checks itself against a complete rediscovery,
@@ -487,7 +659,7 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::app::channel_open_workload::{Scale, card, large_workspace, terminal};
-    use crate::model::{Existence, ProjectChannel, Tombstone};
+    use crate::model::{ChannelId, Existence, ProjectChannel, ProjectKind, Tombstone};
     use crate::workspace_model::views::View;
 
     const SMALL: Scale = Scale {
@@ -523,7 +695,11 @@ mod tests {
     /// read between saves would leave it.
     fn project(app: &mut Cagents) {
         let mut discovery = std::mem::take(&mut app.shared_views.discovery);
-        drop(app.discovered_local_views(&mut discovery));
+        let settlement = Settlement {
+            initialized: app.shared_views.initialized.take_changes(),
+            baseline: app.shared_views.baseline.take_changes(),
+        };
+        drop(app.discovered_local_views(&mut discovery, settlement));
         app.shared_views.discovery = discovery;
     }
 
@@ -585,7 +761,7 @@ mod tests {
             .map(|card| card.id)
             .collect::<Vec<_>>();
         let card_id = rng.pick(&card_ids).copied();
-        match rng.below(17) {
+        match rng.below(24) {
             0 => {
                 let Some(id) = card_id else { return "none" };
                 let durable = Arc::make_mut(&mut app.durable);
@@ -796,6 +972,85 @@ mod tests {
                     }
                 }
             }
+            16 => {
+                let cards = &mut Arc::make_mut(&mut app.durable).cards;
+                let (a, b) = (rng.below(cards.len()), rng.below(cards.len()));
+                cards.swap(a, b);
+                "reorder cards"
+            }
+            17 => {
+                let views = &mut app.workspace_model.views;
+                let (a, b) = (rng.below(views.len()), rng.below(views.len()));
+                views.swap(a, b);
+                "reorder views"
+            }
+            18 => {
+                let state = card("Settings".into(), CardKind::Settings, Existence::Open);
+                let id = state.id;
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards.push(state);
+                if rng.below(2) == 0 {
+                    durable.card_scopes.insert(id, path);
+                } else {
+                    app.worktree_owners.insert(id, path);
+                }
+                "add a utility card"
+            }
+            19 => {
+                let project = rng.below(app.sidebar_model.projects.len());
+                let kind = &mut app.sidebar_model.projects[project].kind;
+                *kind = match kind {
+                    ProjectKind::Git => ProjectKind::Folder,
+                    ProjectKind::Folder => ProjectKind::Git,
+                };
+                // Admits a Folder project's root, as a sidebar pass does.
+                app.refresh_sidebar_worktree_panes();
+                "turn a project into a folder or back"
+            }
+            20 => {
+                let seeding = app.shared_views.seeding.iter().cloned().collect::<Vec<_>>();
+                let Some(scope) = rng.pick(&seeding).cloned() else {
+                    return "none";
+                };
+                app.acknowledge_view_edit(scope, None);
+                "acknowledge a seed"
+            }
+            21 => {
+                let views = app.local_views();
+                let held = views
+                    .cards
+                    .iter()
+                    .filter_map(|(scope, cards)| Some((scope.clone(), *cards.first()?)))
+                    .collect::<Vec<_>>();
+                let Some((scope, card)) = rng.pick(&held).cloned() else {
+                    return "none";
+                };
+                app.shared_views.baseline.remove(&scope);
+                app.shared_views.initialized.insert(scope.clone());
+                app.publish_new_managed_pane(scope, card);
+                "publish a new managed pane"
+            }
+            22 => {
+                // A change, then a copy put in the set's place, as tests do:
+                // the journal that recorded the change goes with the set.
+                let scopes = app.local_view_scopes();
+                let Some(scope) = rng.pick(&scopes).cloned() else {
+                    return "none";
+                };
+                let views = &mut app.shared_views;
+                if rng.below(2) == 0 {
+                    if !views.initialized.remove(&scope) {
+                        views.initialized.insert(scope);
+                    }
+                    views.initialized = views.initialized.clone();
+                } else {
+                    if views.baseline.remove(&scope).is_none() {
+                        views.baseline.insert(scope, Vec::new());
+                    }
+                    views.baseline = views.baseline.clone();
+                }
+                "replace the seeded or settled scopes"
+            }
             _ => {
                 app.shared_views = State::for_workspace(&app.durable);
                 "join a new workspace model"
@@ -809,14 +1064,14 @@ mod tests {
     /// publication seed and settle the scopes it acts on.
     #[test]
     fn kept_discovery_agrees_with_rediscovery_across_random_edits() {
+        let (mut passes, mut followed) = (0, 0);
         for seed in 0..12 {
             let (mut app, _, _directory) = large_workspace(&SMALL);
             let mut rng = Rng(seed);
-            app.shared_views.discovery = ViewDiscovery::default();
-            let mut reused = 0;
-            for step in 0..120 {
-                let before = app.shared_views.discovery.reused;
+            for step in 0..150 {
                 let edit = edit(&mut app, &mut rng);
+                // A new model replaces the kept discovery with it.
+                let before = app.shared_views.discovery.reused;
                 let run = || {
                     if rng.below(3) == 0 {
                         project(&mut app);
@@ -828,11 +1083,13 @@ mod tests {
                     eprintln!("seed {seed}, step {step}: after {edit}");
                     std::panic::resume_unwind(panic);
                 }
-                // A new model replaces the kept discovery with it.
-                reused += app.shared_views.discovery.reused.saturating_sub(before);
+                passes += 1;
+                followed += app.shared_views.discovery.reused - before;
             }
-            assert!(reused > 0, "seed {seed} reused no pass");
         }
+        eprintln!("{followed} of {passes} passes followed the kept scopes");
+        // Most edits leave the topology and both key sets in place.
+        assert!(followed * 2 > passes, "{followed} of {passes}");
     }
 
     /// The save a channel click defers reuses what the last save discovered,

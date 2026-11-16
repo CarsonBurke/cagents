@@ -51,6 +51,7 @@ mod rail;
 
 mod revisioned;
 pub use revisioned::Revisioned;
+pub(crate) use revisioned::next_revision;
 
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
