@@ -1,5 +1,6 @@
 use super::tests::{
-    KNOWN_THREAD, chat_runtime, fresh_close_answer, fresh_close_request, live_chat,
+    KNOWN_THREAD, answer_start, chat_runtime, chat_runtime_attempt, fresh_close_answer,
+    fresh_close_request, live_chat,
 };
 use super::*;
 use iced_accessibility::{
@@ -574,7 +575,7 @@ fn blocked_first_message_disables_unchanged_send_and_close_requires_discard() {
     assert!(app.chat_close_dialog_visible());
     let (tree, mut cancel) = frame(app.chat_close_dialog(), 900.0, Some("Cancel"));
     assert!(labels(&tree).contains(&"Discard this message?"));
-    assert!(labels(&tree).contains(&"Closing this card discards your unsent message."));
+    assert!(labels(&tree).contains(&"Closing this tab discards your unsent message."));
     drop(app.update(cancel.pop().unwrap()));
     assert!(!app.chat_close_dialog_visible());
     assert_eq!(
@@ -1148,6 +1149,51 @@ fn closing_a_blocked_saved_conversation_asks_before_discarding_its_draft() {
         None,
         "nothing typed, nothing to ask"
     );
+}
+
+/// The restart caption promises the unsent message comes back with the
+/// conversation: it is saved with the workspace whether the refusal left a
+/// runtime or a failed card, and the next start's restore puts it back.
+#[test]
+fn a_restart_blocked_draft_is_saved_and_returns_with_the_restore() {
+    for runtime in [true, false] {
+        let (mut app, card) =
+            blocked_app_with(true, true, runtime, blocked_recovery::Reopen::AfterRestart);
+        let source = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(source) => source.clone(),
+            other => panic!("the card is a chat: {other:?}"),
+        };
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.chat_drafts.get(&card).map(String::as_str),
+            Some("Keep this unsent note."),
+            "runtime: {runtime}"
+        );
+
+        // The next start: only what was saved, and this card's restore.
+        app.chat_forget(card);
+        app.chat_ui.blocked_starts.remove(&card);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.chat_ui.drafts = saved.chat_drafts.clone();
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let attempt = chat_runtime_attempt(&app, card);
+        let restored = Snapshot {
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            native_continuity: source.native_continuity.clone(),
+            ..Snapshot::default()
+        };
+        answer_start(
+            &mut app,
+            attempt,
+            Ok(Arc::new(ClientHandle::fixture(source, restored))),
+        );
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent note.",
+            "runtime: {runtime}"
+        );
+    }
 }
 
 /// A paste still arriving disables Fresh where it is, rather than withdrawing

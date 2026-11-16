@@ -47,13 +47,25 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
     }
 }
 
+/// [`super::UNPROVEN_OWNER_REFUSAL`] as an earlier daemon worded it. A
+/// daemon outlives the client upgrades it serves, so a client still meets
+/// this sentence until that daemon is replaced.
+const EARLIER_UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after this computer restarts";
+
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
     let recovery = match error.code {
         ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
         _ if error.retryable => super::Recovery::Retry,
         // Only the daemon's own whole sentence, never text that quotes it.
-        _ if error.message == super::UNPROVEN_OWNER_REFUSAL => super::Recovery::AfterRestart,
+        _ if [
+            super::UNPROVEN_OWNER_REFUSAL,
+            EARLIER_UNPROVEN_OWNER_REFUSAL,
+        ]
+        .contains(&error.message.as_str()) =>
+        {
+            super::Recovery::AfterRestart
+        }
         _ => super::Recovery::Blocked,
     };
     StartFailure {
@@ -4023,6 +4035,11 @@ mod tests {
             Recovery::AfterRestart
         );
         assert!(Recovery::AfterRestart.is_blocked());
+        // A daemon still running from before the sentence was reworded.
+        assert_eq!(
+            recovery(super::EARLIER_UNPROVEN_OWNER_REFUSAL, false),
+            Recovery::AfterRestart
+        );
         // A provider or wrapper quoting the sentence names no restart.
         assert_eq!(
             recovery(&format!("Provider said: {UNPROVEN_OWNER_REFUSAL}"), false),

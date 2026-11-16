@@ -163,7 +163,7 @@ impl Runtime {
         // nothing here can start its provider on the conversation yet.
         Stopped {
             guidance: format!(
-                "{provider} stopped, and this card can't start it again. To continue, copy your draft, close this card, then reopen the conversation with Resume conversation in the new tab (+) menu."
+                "{provider} stopped, and this tab can't start it again. To continue, copy your draft, close this tab, then reopen the conversation with Resume conversation in the new tab (+) menu."
             ),
             primary: None,
             secondary: None,

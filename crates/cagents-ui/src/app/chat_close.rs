@@ -212,7 +212,7 @@ impl Cagents {
             )
         };
         let body = if discard_draft {
-            "Closing this card discards your unsent message."
+            "Closing this tab discards your unsent message."
         } else if first_message.is_some() {
             "Its first message is still on its way. Closing it stops the conversation, discards that message and closes it in every window."
         } else if intent.is_some_and(|intent| intent.certain) {
