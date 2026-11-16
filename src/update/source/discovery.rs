@@ -21,9 +21,8 @@ pub(super) fn discover_qualified_protocol(
 }
 
 /// Read any source protocol, qualified or not, with the peer that served it,
-/// so an unqualified install is told how to cold-install. The caller must
-/// admit the protocol and authenticate a fresh handshake before inspecting
-/// the installation.
+/// leaving admission to the caller. The caller must admit the protocol and
+/// authenticate a fresh handshake before inspecting the installation.
 pub(super) fn discover_protocol_and_peer(
     socket: &Path,
     deadline: Instant,
