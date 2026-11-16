@@ -753,7 +753,14 @@ fn read_with<E: ProcessExecutor>(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     let current = now();
-    if cached.next_attempt > current {
+    // CLIs from before REST reads stored a failed read's GraphQL reset as the
+    // PR's next attempt. Once this PR's shared interval has passed, such a
+    // deadline gives way to the per-resource choice below, which still waits
+    // when every resource is paused.
+    let earlier_cli_pause = cached.error.is_some()
+        && cached.next_attempt > current.saturating_add(MAX_AGE)
+        && published_at(&path).is_some_and(|at| current.saturating_sub(at) >= MAX_AGE);
+    if cached.next_attempt > current && !earlier_cli_pause {
         verify_credentials()?;
         return Ok(cached.report(key, "cache", current));
     }
@@ -762,11 +769,18 @@ fn read_with<E: ProcessExecutor>(
         None => Transport::Graphql,
         // A primary reset belongs to its resource: exhausted GraphQL leaves
         // REST quota to read with. A secondary pause covers both.
-        Some(graphql) => match shared_cooldown(root, credentials, &host, "core", cancellation)? {
+        Some(graphql) => match shared_cooldown(root, credentials, &host, "core", cancellation)?
+            .or_else(|| bootstrap_rest_pause(root, &name, current))
+        {
             None => Transport::Rest,
             Some(core) => {
-                cached.error = Some(graphql.to_string());
-                cached.next_attempt = graphql.retry_at.min(core.retry_at);
+                let earlier = if core.retry_at < graphql.retry_at {
+                    core
+                } else {
+                    graphql
+                };
+                cached.error = Some(earlier.to_string());
+                cached.next_attempt = earlier.retry_at;
                 verify_credentials()?;
                 return Ok(cached.report(key, "cache", current));
             }
@@ -816,6 +830,34 @@ fn read_with<E: ProcessExecutor>(
     }
     store(&path, &cached).map_err(|error| error.to_string())?;
     Ok(cached.report(key, "network", completed))
+}
+
+/// When the cache entry was last written, which a read always does.
+fn published_at(path: &Path) -> Option<u64> {
+    let modified = fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+/// A REST pause the bootstrap script kept for this PR alone, because the
+/// host budget's lock was busy when it tried to share it.
+fn bootstrap_rest_pause(root: &Path, name: &str, current: u64) -> Option<RateLimit> {
+    #[derive(Deserialize)]
+    struct RestRetry {
+        retry_at: u64,
+    }
+    let retry = load::<RestRetry>(&root.join(format!("{name}.rest-retry")))
+        .ok()
+        .flatten()?;
+    (retry.retry_at > current).then(|| RateLimit {
+        retry_at: retry.retry_at,
+        resource: Some("core".into()),
+        secondary_retry_at: None,
+    })
 }
 
 fn parse(data: &serde_json::Value, key: &PullRequestKey) -> Result<Snapshot, StatusError> {
@@ -1005,26 +1047,24 @@ fn rest_rollup(
         .iter()
         .filter(|suite| suite_counts(suite))
         .collect::<Vec<_>>();
+    let unfinished = counted.iter().any(|suite| suite["status"] != "completed");
+    // A suite with check runs is judged by them: the list holds each check's
+    // latest run, so a cancelled suite a rerun superseded does not fail CI.
+    // A workflow that failed before creating any job shows only in its suite.
     let suite_failed = counted.iter().any(|suite| {
         suite["status"] == "completed"
+            && suite["latest_check_runs_count"].as_u64() == Some(0)
             && matches!(
                 suite["conclusion"].as_str(),
-                Some("failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure")
-            )
-    });
-    let suites_finished = counted.iter().all(|suite| {
-        suite["status"] == "completed"
-            && matches!(
-                suite["conclusion"].as_str(),
-                Some("success" | "neutral" | "skipped")
+                Some("failure" | "timed_out" | "action_required" | "startup_failure")
             )
     });
     let complete = runs_complete && suites_complete && statuses_complete;
     let state = if suite_failed || checks.iter().any(check_failed) {
         Some("FAILURE")
-    } else if complete && checks.is_empty() && counted.is_empty() {
+    } else if complete && checks.is_empty() && !unfinished {
         None
-    } else if complete && suites_finished && !checks.is_empty() && checks.iter().all(check_passed) {
+    } else if complete && !unfinished && !checks.is_empty() && checks.iter().all(check_passed) {
         Some("SUCCESS")
     } else {
         Some("PENDING")
@@ -1576,6 +1616,81 @@ mod tests {
     }
 
     #[test]
+    fn an_earlier_clis_graphql_reset_gives_way_to_rest_after_the_shared_interval() {
+        let root = private_tempdir();
+        let reset = exhaust_graphql(root.path(), "account");
+        let path = root
+            .path()
+            .join(format!("{}.json", target_name("account", &key())));
+        // What a CLI before REST reads saved after GraphQL ran out.
+        let publish = |age: u64| {
+            store(
+                &path,
+                &Cached {
+                    fetched_at: None,
+                    snapshot: None,
+                    error: Some("GitHub rate limit reached".into()),
+                    next_attempt: reset,
+                },
+            )
+            .unwrap();
+            let at = std::time::UNIX_EPOCH + Duration::from_secs(now() - age);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        let fixture = Fixture::new(rest_read(
+            42,
+            vec![rest_run("test", "completed", Some("success"))],
+            vec![],
+            vec![],
+        ));
+        let service = StatusService::new("gh", fixture.clone());
+        let cancellation = CancellationToken::new();
+        publish(30);
+        let waiting = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(waiting.source, "cache");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "the interval is still shared"
+        );
+        publish(MAX_AGE + 1);
+        let read = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(read.source, "network");
+        assert_eq!(read.snapshot.unwrap().transport, Transport::Rest);
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn the_bootstrap_scripts_own_rest_pause_is_honored() {
+        let root = private_tempdir();
+        let reset = exhaust_graphql(root.path(), "account");
+        let due = now() + 600;
+        let name = target_name("account", &key());
+        store(
+            &root.path().join(format!("{name}.rest-retry")),
+            &serde_json::json!({"retry_at": due}),
+        )
+        .unwrap();
+        let fixture = Fixture::new(Vec::new());
+        let service = StatusService::new("gh", fixture.clone());
+        let report = read_fixture(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+        );
+        assert_eq!(report.source, "cache");
+        assert_eq!(report.retry_at, Some(due.min(reset)));
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn rest_ci_never_passes_an_incomplete_or_not_yet_created_list() {
         let pass = || rest_run("test", "completed", Some("success"));
         let actions =
@@ -1696,6 +1811,20 @@ mod tests {
             )
             .0,
             Some("FAILURE".to_owned())
+        );
+        // A run that was cancelled, then rerun, gives way to its rerun, and
+        // a workflow cancelled before it created any job does not fail CI.
+        assert_eq!(
+            rollup(
+                runs_page(vec![pass()]),
+                vec![
+                    actions("completed", Some("cancelled"), 1),
+                    actions("completed", Some("success"), 1),
+                    actions("completed", Some("cancelled"), 0),
+                ],
+                status_page(vec![]),
+            ),
+            success
         );
         // A workflow that failed before creating any job.
         assert_eq!(

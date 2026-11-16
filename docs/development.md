@@ -1723,13 +1723,16 @@ recorded for its resource, so a GraphQL reset never delays REST, and a read
 with both paused waits for the earlier one. These snapshots carry
 `transport: "rest"`, and `data.limitations` says the review decision is
 unknown; `reviewDecision` is null. REST has no aggregate, so the CLI derives
-`checks_state` itself: `FAILURE` when any context or GitHub Actions workflow
-failed; `SUCCESS` only when every list is complete, every listed context
+`checks_state` itself: `FAILURE` when any context failed, or a GitHub Actions
+workflow failed before creating any job; `SUCCESS` only when every list is complete, every listed context
 passed and every workflow has finished; `PENDING` otherwise, including when a
 list has more than 100 entries (`checks_complete=false`) or a workflow has not
 yet created its check runs; and null when nothing at all was reported. Suites
 that installed apps leave queued with no check runs are ignored, as GitHub's
-own pages ignore them. `scripts/land-pr` reads these like GraphQL snapshots,
+own pages ignore them. A finished suite with check runs is judged by its runs,
+each the latest of its name, so a cancelled run that was rerun does not fail
+CI. Cache entries an earlier CLI paused until the GraphQL reset give way to
+this choice once their two-minute interval has passed. `scripts/land-pr` reads these like GraphQL snapshots,
 since it decides on CI alone.
 
 To clear bootstrap artifacts, first ensure no status command or builder is
