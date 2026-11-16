@@ -61,7 +61,7 @@ impl<'a> WorktreeRoots<'a> {
                 nearest_root(directory, |ancestor| roots.get(ancestor).copied())
             }
             RootSet::Indexed(roots) => {
-                let roots: &'a HashSet<PathBuf> = roots;
+                let roots = *roots;
                 nearest_root(directory, |ancestor| {
                     roots.get(ancestor).map(PathBuf::as_path)
                 })
@@ -103,7 +103,7 @@ impl Default for KnownWorktreeRoots {
         Self {
             roots: HashSet::new(),
             canonical: CanonicalRoots::default(),
-            generation: crate::sidebar::next_revision(),
+            generation: crate::revision::next_revision(),
         }
     }
 }
@@ -137,7 +137,7 @@ impl KnownWorktreeRoots {
             return false;
         }
         self.canonical.pending.push(root.clone());
-        self.generation = crate::sidebar::next_revision();
+        self.generation = crate::revision::next_revision();
         self.roots.insert(root)
     }
 

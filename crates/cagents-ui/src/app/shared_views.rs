@@ -101,12 +101,12 @@ enum ViewScopeAuthorities<'a> {
         repositories: HashMap<PathBuf, PathBuf>,
         projects: HashSet<PathBuf>,
     },
-    /// Borrowed from the topology [`discovery::ViewDiscovery`] keeps
-    /// between saves.
-    Indexed {
-        repositories: &'a HashMap<PathBuf, PathBuf>,
-        projects: &'a HashSet<PathBuf>,
-    },
+}
+
+/// Whether `card` is a pane of the worktree view it resolves to: an open
+/// card that is not a utility page.
+fn shows_in_worktree(card: &CardState) -> bool {
+    card.existence.is_open() && !card.kind.is_utility()
 }
 
 impl ViewScopeAuthorities<'_> {
@@ -114,7 +114,6 @@ impl ViewScopeAuthorities<'_> {
         match self {
             Self::Borrowed { repositories, .. } => repositories.get(path).copied(),
             Self::Owned { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
-            Self::Indexed { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
         }
     }
 
@@ -122,7 +121,6 @@ impl ViewScopeAuthorities<'_> {
         match self {
             Self::Borrowed { projects, .. } => projects.contains(repository),
             Self::Owned { projects, .. } => projects.contains(repository),
-            Self::Indexed { projects, .. } => projects.contains(repository),
         }
     }
 }
@@ -991,6 +989,17 @@ impl Cagents {
         })
     }
 
+    /// `view_repository_paths`, owned, keeping each path's first authority.
+    fn owned_view_repositories(&self) -> HashMap<PathBuf, PathBuf> {
+        let mut repositories = HashMap::new();
+        for (path, repository) in self.view_repository_paths() {
+            repositories
+                .entry(path.to_owned())
+                .or_insert_with(|| repository.to_owned());
+        }
+        repositories
+    }
+
     #[cfg(test)]
     fn record_topology_build(&self) {
         self.shared_views
@@ -1030,16 +1039,10 @@ impl Cagents {
     ) -> ViewScopeTopology<'a> {
         #[cfg(test)]
         self.record_topology_build();
-        let mut repositories = HashMap::new();
-        for (path, repository) in self.view_repository_paths() {
-            repositories
-                .entry(path.to_owned())
-                .or_insert_with(|| repository.to_owned());
-        }
         ViewScopeTopology {
             roots,
             authorities: ViewScopeAuthorities::Owned {
-                repositories,
+                repositories: self.owned_view_repositories(),
                 projects: self
                     .sidebar_model
                     .projects
@@ -1159,7 +1162,7 @@ impl Cagents {
         let worktree = worktree_cards
             .iter()
             .find(|(state, _)| state.id == card)
-            .filter(|(state, _)| state.existence.is_open() && !state.kind.is_utility())
+            .filter(|(state, _)| shows_in_worktree(state))
             .map(|(_, path)| *path);
         scopes
             .into_iter()
@@ -1214,8 +1217,7 @@ impl Cagents {
                     .cards
                     .iter()
                     .filter(|card| {
-                        card.existence.is_open()
-                            && !card.kind.is_utility()
+                        shows_in_worktree(card)
                             && !channel_cards.contains(&card.id)
                             && self.unchanneled_card_worktree_indexed(card, &roots)
                                 == Some(path.as_path())
@@ -1350,7 +1352,7 @@ impl Cagents {
             .collect::<HashMap<_, _>>();
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
-            if card.existence.is_open() && !card.kind.is_utility() {
+            if shows_in_worktree(card) {
                 by_path.entry(path).or_default().push(card.id);
             }
         }
@@ -1590,10 +1592,7 @@ impl Cagents {
             .cards
             .iter()
             .copied()
-            .filter(|id| {
-                self.card_state(*id)
-                    .is_some_and(|card| card.existence.is_open() && !card.kind.is_utility())
-            })
+            .filter(|id| self.card_state(*id).is_some_and(shows_in_worktree))
             .collect();
         if current != before.panes.iter().map(|pane| pane.id).collect::<Vec<_>>() {
             return Err("local membership is unsettled");
@@ -1696,9 +1695,7 @@ impl Cagents {
         {
             return None;
         }
-        if !self
-            .card_state(card)
-            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
+        if !self.card_state(card).is_some_and(shows_in_worktree)
             || self
                 .shared_views
                 .requested_transfers
@@ -2785,8 +2782,7 @@ impl Cagents {
             }
         }
         for (card, path) in discovery.worktree_cards {
-            if card.existence.is_open()
-                && !card.kind.is_utility()
+            if shows_in_worktree(card)
                 && let Some(scopes) = scopes_by_path.get(path)
             {
                 owners
@@ -3136,8 +3132,7 @@ impl Cagents {
                         .cards
                         .iter()
                         .filter(|card| {
-                            card.existence.is_open()
-                                && !card.kind.is_utility()
+                            shows_in_worktree(card)
                                 && !channel_cards.contains(&card.id)
                                 && local_worktrees.get(card.id) == Some(path)
                         })

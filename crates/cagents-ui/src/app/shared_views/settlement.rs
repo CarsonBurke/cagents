@@ -14,15 +14,16 @@
 //! set replaced wholesale is never mistaken for the one whose journal was
 //! followed.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 
-use crate::sidebar::next_revision;
+use crate::revision::next_revision;
 use crate::workspace_model::views::Scope;
 
 /// Scopes recorded before a journal gives up and says only that it lost
 /// track, which a rediscovery costs no more than replaying.
-const JOURNAL_LIMIT: usize = 1024;
+pub(super) const JOURNAL_LIMIT: usize = 1024;
 
 /// The scopes a key set gained or lost since they were last taken.
 #[derive(Debug)]
@@ -113,6 +114,8 @@ impl<'a> IntoIterator for &'a ScopeSet {
 impl ScopeSet {
     /// Adds `scope`, returning whether it was new.
     pub(in crate::app) fn insert(&mut self, scope: Scope) -> bool {
+        // `HashSet` has no stable entry API, so a new scope is hashed twice
+        // rather than copied for the journal whether or not it is new.
         if self.scopes.contains(&scope) {
             return false;
         }
@@ -199,11 +202,14 @@ impl<'a, V> IntoIterator for &'a ScopeMap<V> {
 
 impl<V> ScopeMap<V> {
     pub(in crate::app) fn insert(&mut self, scope: Scope, value: V) -> Option<V> {
-        if let Some(slot) = self.values.get_mut(&scope) {
-            return Some(std::mem::replace(slot, value));
+        match self.values.entry(scope) {
+            Entry::Occupied(mut entry) => Some(entry.insert(value)),
+            Entry::Vacant(entry) => {
+                self.journal.record(entry.key());
+                entry.insert(value);
+                None
+            }
         }
-        self.journal.record(&scope);
-        self.values.insert(scope, value)
     }
 
     #[cfg(test)]
@@ -224,10 +230,13 @@ impl<V> ScopeMap<V> {
     where
         V: Default,
     {
-        if !self.values.contains_key(&scope) {
-            self.journal.record(&scope);
+        match self.values.entry(scope) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                self.journal.record(entry.key());
+                entry.insert(V::default())
+            }
         }
-        self.values.entry(scope).or_default()
     }
 
     pub(in crate::app) fn take_changes(&mut self) -> KeyChanges {
