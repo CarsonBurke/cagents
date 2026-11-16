@@ -339,18 +339,59 @@ impl Installation {
     }
 
     fn state_dir(&self) -> Result<PathBuf, UpdateError> {
-        let path = self.prefix.join(".update");
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error.into()),
-        }
-        let meta = fs::symlink_metadata(&path)?;
-        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(invalid("unsafe updater state directory"));
-        }
-        Ok(path)
+        state_dir(&self.prefix)
     }
+}
+
+fn state_dir(prefix: &Path) -> Result<PathBuf, UpdateError> {
+    let path = prefix.join(".update");
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(invalid("unsafe updater state directory"));
+    }
+    Ok(path)
+}
+
+/// Holds the update job lease of the installation at `prefix`, so no job can
+/// run or start while the caller changes what that installation serves.
+/// [`UpdateError::Busy`] means a job is active: its worker keeps the lease for
+/// its whole lifetime, including review and confirmation.
+pub(crate) fn exclude_update_jobs(
+    prefix: &Path,
+) -> Result<crate::instance::OwnedLock, UpdateError> {
+    acquire_lock(&state_dir(prefix)?)
+}
+
+/// Left by `install.sh` in a version tree whose readiness it could not
+/// verify; a later install of that release revalidates the tree.
+const RETAINED_CANDIDATE_MARKER: &str = ".cagents-retained-candidate-v1.json";
+/// Left by `install.sh` in a tree it extracted for an update worker, including
+/// one kept after that worker's installation failed and rolled back.
+const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
+
+/// Whether `install.sh` left the version tree at `root` as a candidate it has
+/// not verified, such as one kept after a failed or rolled-back update. It
+/// removes both markers once it verifies a publication; a later install of that
+/// release revalidates a marked tree. Releases before that removal left the
+/// prepared marker on trees they published, which are refused here too.
+pub(crate) fn is_unverified_candidate(root: &Path) -> bool {
+    [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
+        .iter()
+        .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
+}
+
+/// Whether `install.sh` would refuse to install `version` again because this
+/// installation already holds it as an ordinary tree, served or not, such as
+/// a staged build that was withdrawn. Only candidate trees it marked can be
+/// reinstalled, which revalidates them.
+fn holds_installed_tree(prefix: &Path, version: &str) -> bool {
+    let root = prefix.join("versions").join(version);
+    fs::symlink_metadata(&root).is_ok() && !is_unverified_candidate(&root)
 }
 
 fn invalid(message: impl Into<String>) -> UpdateError {
@@ -409,7 +450,18 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         let complete = page_releases.len() < 100;
         releases.extend(page_releases);
         if complete {
-            return select_release(releases, &installation.version);
+            return Ok(match select_release(releases, &installation.version)? {
+                // Offering it would only end in the installer's refusal. An
+                // installed newer build is offered through `current` instead.
+                UpdateState::Available { release }
+                    if holds_installed_tree(&installation.prefix, &release.version) =>
+                {
+                    UpdateState::Current {
+                        version: installation.version,
+                    }
+                }
+                state => state,
+            });
         }
     }
     Err(invalid(
@@ -1313,10 +1365,19 @@ fn failed_job_is_superseded(
         && daemon.is_some_and(|owner| {
             owner.prefix == window.prefix && owner.version_root == window.version_root
         })
-        && installed_version(&job.version)
+        && (installed_version(&job.version)
             .ok()
             .zip(installed_version(&window.version).ok())
             .is_some_and(|(target, running)| target <= running)
+            // A newer build still installed here but no longer served was
+            // withdrawn by selecting this one; its failure no longer applies.
+            || matches!(
+                Path::new(&job.version).components().collect::<Vec<_>>()[..],
+                [std::path::Component::Normal(_)]
+            ) && {
+                let root = window.prefix.join("versions").join(&job.version);
+                root.is_dir() && !is_unverified_candidate(&root)
+            })
 }
 
 /// The installed UI executable, when the installation this window runs from has
@@ -4578,6 +4639,25 @@ finally:
     }
 
     #[test]
+    fn an_installed_ordinary_tree_is_not_offered_for_download_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        install_tree(root, &["0.1.3", "0.1.4", "0.1.5", "0.1.6"], "0.1.3");
+        assert!(holds_installed_tree(root, "0.1.4"), "a withdrawn build");
+        assert!(!holds_installed_tree(root, "0.1.7"));
+        for (version, marker) in [
+            ("0.1.5", RETAINED_CANDIDATE_MARKER),
+            ("0.1.6", PREPARED_CANDIDATE_MARKER),
+        ] {
+            fs::write(root.join("versions").join(version).join(marker), b"{}").unwrap();
+            assert!(
+                !holds_installed_tree(root, version),
+                "{marker}: installing again revalidates a candidate"
+            );
+        }
+    }
+
+    #[test]
     fn a_failed_build_requires_a_later_matched_installation_to_be_superseded() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -4613,6 +4693,22 @@ finally:
         assert!(
             !superseded(&job, true),
             "the running build can still have failed"
+        );
+        job.version = "0.1.4".into();
+        fs::create_dir_all(root.join("versions/0.1.4/bin")).unwrap();
+        assert!(
+            superseded(&job, true),
+            "a newer build withdrawn by selecting this one no longer applies"
+        );
+        assert!(!superseded(&job, false), "nor is a rollback a withdrawal");
+        fs::write(
+            root.join("versions/0.1.4").join(PREPARED_CANDIDATE_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        assert!(
+            !superseded(&job, true),
+            "a candidate kept after its update failed was never withdrawn"
         );
         job.version = "0.1.2".into();
         assert!(superseded(&job, true));
