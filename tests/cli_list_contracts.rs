@@ -294,7 +294,7 @@ impl Listing {
             // The board is scoped to the open Git project containing the
             // current directory, which this fixture's projects do not.
             (
-                Self::Work,
+                Self::Work | Self::Agents,
                 ClientRequest::ReadWorkspaceMetadata {
                     query: cagents::workspace_model::metadata::Query::Projects,
                 },
@@ -430,9 +430,24 @@ fn output(listing: Listing, populated: bool, json: bool) -> String {
             loop {
                 assert_eq!(request.proof.as_ref(), Some(&proof));
                 // A read that only chooses what a Work listing covers
-                // precedes it on the same connection.
-                let preliminary = matches!(listing, Listing::Work)
-                    && matches!(request.request, ClientRequest::ReadWorkspaceMetadata { .. });
+                // precedes it on the same connection, and a populated agent
+                // listing follows with one that names its projects.
+                let preliminary = match listing {
+                    Listing::Work => {
+                        matches!(request.request, ClientRequest::ReadWorkspaceMetadata { .. })
+                    }
+                    Listing::Agents => {
+                        populated
+                            && matches!(
+                                request.request,
+                                ClientRequest::Agent {
+                                    operation: Operation::List,
+                                    ..
+                                }
+                            )
+                    }
+                    _ => false,
+                };
                 let response = listing.reply(request.request, populated);
                 write_frame(
                     &mut stream,
@@ -917,6 +932,25 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
             assert!(!human.contains(raw), "raw value {raw}: {human}");
         }
     }
+}
+
+#[test]
+fn agent_list_names_its_project_and_the_next_step() {
+    let human = output(Listing::Agents, true, false);
+    // The daemon's project name labels the one checkout the agents share,
+    // and the waiting agent's handle is its shortest unique prefix.
+    assert!(
+        human.contains("\n(project Fixture at /fixture)\n"),
+        "{human}"
+    );
+    assert!(!human.contains("PROJECT"), "{human}");
+    assert!(
+        human.trim_end().ends_with(
+            "hint: `cagents agent status abcdef00` shows its latest result; \
+             `cagents agent requests abcdef00` lists what it asks"
+        ),
+        "{human}"
+    );
 }
 
 #[test]
