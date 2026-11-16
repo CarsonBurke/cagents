@@ -5,7 +5,7 @@ use crate::upgrade::ensure_no_surviving_process;
 use crate::{
     control::ControlClient,
     model::{HostSessionProof, TerminalSession},
-    terminal::ensure_daemon_ready,
+    terminal::{ensure_daemon_ready, ipc::TerminalDescriptor},
     upgrade::{ScanError, UnreadableProcess, exact_conversation},
 };
 
@@ -54,11 +54,8 @@ pub(super) fn reconcile(
     explicit_retry: bool,
 ) -> Result<RecoveredTerminal, String> {
     if session.continuity.live_proof().is_none() {
-        return Ok(RecoveredTerminal {
-            attach_completed: false,
-            session,
-            expected_host: None,
-            recovery_lease: None,
+        return reconcile_without_proof(session, explicit_retry, || {
+            ensure_daemon_ready().map_err(|error| error.to_string())
         });
     }
     let socket = ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -75,6 +72,32 @@ pub(super) fn reconcile(
     })
 }
 
+/// Nothing else stops a second provider on a conversation a live terminal holds:
+/// the daemon starts whatever it is asked to. A daemon still restoring can't
+/// show that no terminal holds it, and refuses the launch a Retry asks for, so
+/// both wait for it. A pane opened with no conversation to protect has nothing
+/// to ask, so it doesn't start a daemon here.
+fn reconcile_without_proof(
+    session: TerminalSession,
+    explicit_retry: bool,
+    daemon: impl FnOnce() -> Result<std::path::PathBuf, String>,
+) -> Result<RecoveredTerminal, String> {
+    let agent = session.agent_resume_recipe().is_some();
+    if explicit_retry || agent {
+        let mut client = ControlClient::connect(&daemon()?).map_err(|error| error.to_string())?;
+        ensure_admitted(&mut client)?;
+        if agent {
+            refuse_conversation_held_elsewhere(&session, &mut client)?;
+        }
+    }
+    Ok(RecoveredTerminal {
+        attach_completed: false,
+        session,
+        expected_host: None,
+        recovery_lease: None,
+    })
+}
+
 /// Resolve saved-pane ownership at its captured endpoint without starting a daemon.
 /// The caller may attach the result, but must not execute a returned replay plan.
 pub(super) fn inspect_saved_at(
@@ -82,6 +105,204 @@ pub(super) fn inspect_saved_at(
     socket: &Path,
 ) -> Result<RecoveredTerminal, String> {
     reconcile_with(session, false, socket, Path::new("/proc"), holder_of_kind)
+}
+
+const CONVERSATION_HELD: &str = "the saved agent conversation is already hosted by another terminal; preserving the live session";
+
+fn refuse_conversation_held_elsewhere(
+    session: &TerminalSession,
+    client: &mut ControlClient,
+) -> Result<(), String> {
+    let proof = client.proof().clone();
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    if conversation_hosted_elsewhere(session, &proof, &terminals) {
+        return Err(CONVERSATION_HELD.into());
+    }
+    Ok(())
+}
+
+/// An inventory taken during retained startup can be partial, so it can attach
+/// to what it lists but can't show that a terminal is gone. Admission readiness
+/// comes first, and the inventory that proves absence is read after it.
+pub(super) fn inventory_proving_absence<C>(
+    session: &TerminalSession,
+    client: &mut C,
+    list: impl Fn(&mut C) -> Result<Vec<TerminalDescriptor>, String>,
+    ready: impl Fn(&mut C) -> Result<(), String>,
+) -> Result<Vec<TerminalDescriptor>, String> {
+    let terminals = list(client)?;
+    if terminals
+        .iter()
+        .any(|hosted| hosted.session.id == session.id)
+    {
+        return Ok(terminals);
+    }
+    ready(client)?;
+    list(client)
+}
+
+/// Whether the daemon admits ordinary requests, so that an inventory it gives
+/// now can show a terminal is gone. It answers this even while it restores,
+/// so a pane can say why it is waiting rather than relay the refusal.
+pub(super) fn admitted(state: crate::terminal::ipc::StartupState) -> Result<(), String> {
+    use crate::terminal::ipc::StartupState;
+    match state {
+        StartupState::Ready => Ok(()),
+        StartupState::Restoring { .. } => Err(super::terminal_failure::TERMINALS_RESTORING.into()),
+        StartupState::Retained { detail } => Err(format!(
+            "Startup recovery retained original ownership: {detail}"
+        )),
+    }
+}
+
+/// [`admitted`], asked of a connected daemon.
+pub(super) fn ensure_admitted(client: &mut ControlClient) -> Result<(), String> {
+    admitted(client.startup_state().map_err(|error| error.to_string())?)
+}
+
+pub(super) fn list_terminals(
+    client: &mut ControlClient,
+) -> Result<Vec<TerminalDescriptor>, String> {
+    client.list().map_err(|error| error.to_string())
+}
+
+/// What a shared pane attaches to: its terminal if the daemon hosts it, and
+/// otherwise what Retry will find, once an absence can be shown.
+pub(super) fn hosted_proving_absence(
+    session: &TerminalSession,
+    client: &mut ControlClient,
+) -> Result<TerminalDescriptor, String> {
+    let terminals = inventory_proving_absence(session, client, list_terminals, ensure_admitted)?;
+    let proof = client.proof().clone();
+    Ok(hosted_or_missing(session, &proof, terminals)?)
+}
+
+/// A shared pane attaches only to what the daemon hosts. When it hosts nothing
+/// under this identity, the error says what Retry will find.
+pub(super) fn hosted_or_missing(
+    session: &TerminalSession,
+    proof: &HostSessionProof,
+    mut terminals: Vec<TerminalDescriptor>,
+) -> Result<TerminalDescriptor, &'static str> {
+    match terminals
+        .iter()
+        .position(|hosted| hosted.session.id == session.id)
+    {
+        Some(index) => Ok(terminals.swap_remove(index)),
+        None => Err(super::terminal_failure::missing_terminal_message(
+            session, proof, &terminals,
+        )),
+    }
+}
+
+/// The live terminal that carries on a saved terminal's work, if a proven
+/// lineage names one. An error means a live terminal has a conflicting claim
+/// that recovery must preserve.
+pub(super) fn adoptable_lineage<'a>(
+    session: &TerminalSession,
+    expected: &HostSessionProof,
+    proof: &HostSessionProof,
+    terminals: &'a [TerminalDescriptor],
+) -> Result<Option<&'a TerminalDescriptor>, &'static str> {
+    // A committed checkpoint or authenticated holder receipt authorizes this
+    // exact lineage. Ordinary ID coincidence remains forbidden.
+    if proof != expected {
+        if let Some(restored) = terminals.iter().find(|terminal| {
+            terminal.upgrade_sources.iter().any(|source| {
+                source.id == session.id
+                    && source.launch == session.launch
+                    && source.continuity.live_proof().as_ref() == Some(expected)
+            }) && (terminal.session.continuity.can_resume_live(proof)
+                || matches!(
+                    &terminal.session.continuity,
+                    crate::model::TerminalContinuity::RelaunchAvailable { .. }
+                ))
+        }) {
+            return Ok(Some(restored));
+        }
+        if terminals
+            .iter()
+            .any(|terminal| terminal.session.id == session.id)
+        {
+            return Err(
+                "a different daemon owns this terminal ID; preserving that session instead of retargeting it",
+            );
+        }
+    }
+    // Recovery can span more than one daemon replacement. Upgrade receipts
+    // describe only the latest handoff, while the stable recovery origin still
+    // identifies the saved card's process lineage. Adopt a live descendant
+    // only when its exact conversation or plain terminal recipe agrees too.
+    let origin = session.recovery_origin.unwrap_or(session.id);
+    let mut related = terminals.iter().filter(|terminal| {
+        terminal.session.recovery_origin == Some(origin)
+            && terminal.session.continuity.can_resume_live(proof)
+    });
+    let mut descendants = related
+        .clone()
+        .filter(|terminal| same_recovery_content(session, &terminal.session));
+    if let Some(restored) = descendants.next() {
+        if descendants.next().is_some() {
+            return Err("multiple live terminals claim this saved conversation");
+        }
+        return Ok(Some(restored));
+    }
+    if related.next().is_some() {
+        return Err(
+            "a live terminal shares this recovery lineage but its command or conversation differs; preserving it",
+        );
+    }
+    Ok(None)
+}
+
+/// Whether another live terminal already resumed this saved conversation.
+pub(super) fn conversation_hosted_elsewhere(
+    session: &TerminalSession,
+    proof: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+) -> bool {
+    session
+        .agent_resume_recipe()
+        .as_ref()
+        .and_then(exact_conversation)
+        .is_some_and(|identity| {
+            terminals.iter().any(|terminal| {
+                terminal.session.continuity.can_resume_live(proof)
+                    && terminal
+                        .session
+                        .agent_resume_recipe()
+                        .as_ref()
+                        .and_then(exact_conversation)
+                        == Some(identity)
+            })
+        })
+}
+
+/// A terminal Retry reaches without replacing anything.
+enum Reached<'a> {
+    /// The saved terminal, still live under the daemon that started it.
+    Live(&'a TerminalDescriptor),
+    /// What its committed lineage restored under another daemon.
+    Lineage(&'a TerminalDescriptor),
+}
+
+/// What Retry reaches in this inventory. A lineage conflict is an answer too:
+/// a terminal the daemon lists already holds this work.
+fn reached<'a>(
+    session: &TerminalSession,
+    expected: &HostSessionProof,
+    proof: &HostSessionProof,
+    terminals: &'a [TerminalDescriptor],
+) -> Result<Option<Reached<'a>>, String> {
+    if proof == expected
+        && let Some(terminal) = terminals.iter().find(|terminal| {
+            terminal.session.id == session.id && terminal.session.launch == session.launch
+        })
+        && terminal.session.continuity.can_resume_live(expected)
+    {
+        return Ok(Some(Reached::Live(terminal)));
+    }
+    Ok(adoptable_lineage(session, expected, proof, terminals)?.map(Reached::Lineage))
 }
 
 fn reconcile_with(
@@ -109,14 +330,18 @@ fn reconcile_with(
     );
     let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
-    let terminals = client.list().map_err(|error| error.to_string())?;
-    let original = terminals.iter().find(|terminal| {
-        terminal.session.id == session.id && terminal.session.launch == session.launch
-    });
-    if proof == expected {
-        if let Some(terminal) = original
-            && terminal.session.continuity.can_resume_live(&expected)
-        {
+    let mut terminals = client.list().map_err(|error| error.to_string())?;
+    // A daemon still restoring lists and attaches, so a terminal it lists is
+    // reached as before. One it doesn't list may be among those still being
+    // restored, and the replacement a press would go on to ask for is refused
+    // until then, so the press says that, and reads the inventory again once
+    // the daemon is ready.
+    if explicit_retry && reached(&session, &expected, &proof, &terminals)?.is_none() {
+        ensure_admitted(&mut client)?;
+        terminals = client.list().map_err(|error| error.to_string())?;
+    }
+    match reached(&session, &expected, &proof, &terminals)? {
+        Some(Reached::Live(terminal)) => {
             return Ok(RecoveredTerminal {
                 attach_completed: false,
                 session: terminal.session.clone(),
@@ -124,67 +349,21 @@ fn reconcile_with(
                 recovery_lease,
             });
         }
-    }
-    if proof != expected
-        && let Some(restored) = terminals.iter().find(|terminal| {
-            terminal.upgrade_sources.iter().any(|source| {
-                source.id == session.id
-                    && source.launch == session.launch
-                    && source.continuity.live_proof().as_ref() == Some(&expected)
-            }) && (terminal.session.continuity.can_resume_live(&proof)
-                || matches!(
-                    &terminal.session.continuity,
-                    crate::model::TerminalContinuity::RelaunchAvailable { .. }
-                ))
-        })
-    {
-        crate::daemon::replacement_owner(socket, &proof)
-            .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
-        // A committed checkpoint or authenticated holder receipt authorizes
-        // this exact lineage. Ordinary ID coincidence remains forbidden.
-        return Ok(RecoveredTerminal {
-            attach_completed: !restored.session.continuity.can_resume_live(&proof),
-            session: restored.session.clone(),
-            expected_host: Some(proof),
-            recovery_lease,
-        });
-    }
-    if proof != expected
-        && terminals
-            .iter()
-            .any(|terminal| terminal.session.id == session.id)
-    {
-        return Err("a different daemon owns this terminal ID; preserving that session instead of retargeting it".into());
-    }
-    // Recovery can span more than one daemon replacement. Upgrade receipts
-    // describe only the latest handoff, while the stable recovery origin still
-    // identifies the saved card's process lineage. Adopt a live descendant
-    // only when its exact conversation or plain terminal recipe agrees too.
-    let origin = session.recovery_origin.unwrap_or(session.id);
-    let mut descendants = terminals.iter().filter(|terminal| {
-        terminal.session.recovery_origin == Some(origin)
-            && terminal.session.continuity.can_resume_live(&proof)
-            && same_recovery_content(&session, &terminal.session)
-    });
-    if let Some(restored) = descendants.next() {
-        if descendants.next().is_some() {
-            return Err("multiple live terminals claim this saved conversation".into());
+        Some(Reached::Lineage(restored)) => {
+            crate::daemon::replacement_owner(socket, &proof)
+                .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
+            return Ok(RecoveredTerminal {
+                attach_completed: !restored.session.continuity.can_resume_live(&proof),
+                session: restored.session.clone(),
+                expected_host: Some(proof),
+                recovery_lease,
+            });
         }
-        crate::daemon::replacement_owner(socket, &proof)
-            .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
-        return Ok(RecoveredTerminal {
-            attach_completed: false,
-            session: restored.session.clone(),
-            expected_host: Some(proof),
-            recovery_lease,
-        });
+        None => {}
     }
-    if terminals.iter().any(|terminal| {
-        terminal.session.recovery_origin == Some(origin)
-            && terminal.session.continuity.can_resume_live(&proof)
-    }) {
-        return Err("a live terminal shares this recovery lineage but its command or conversation differs; preserving it".into());
-    }
+    let original = terminals.iter().find(|terminal| {
+        terminal.session.id == session.id && terminal.session.launch == session.launch
+    });
     // An earlier recovery may already have replaced this terminal in the
     // same daemon. Discover that authenticated live descendant before offering
     // replay of the completed original; replay would duplicate its process.
@@ -244,23 +423,8 @@ fn reconcile_with(
         }
         replacement_id = recovery_terminal_id(replacement_id, &proof);
     }
-    if session
-        .agent_resume_recipe()
-        .as_ref()
-        .and_then(exact_conversation)
-        .is_some_and(|identity| {
-            terminals.iter().any(|terminal| {
-                terminal.session.continuity.can_resume_live(&proof)
-                    && terminal
-                        .session
-                        .agent_resume_recipe()
-                        .as_ref()
-                        .and_then(exact_conversation)
-                        == Some(identity)
-            })
-        })
-    {
-        return Err("the saved agent conversation is already hosted by another terminal; preserving the live session".into());
+    if conversation_hosted_elsewhere(&session, &proof, &terminals) {
+        return Err(CONVERSATION_HELD.into());
     }
     // A holder doesn't carry the terminal's markers, so the scan below can't see
     // one. Only a terminal the daemon saw exit keeps a holder with nothing running
@@ -330,6 +494,9 @@ fn reconcile_with(
     );
     let mut replacement = super::fresh_terminal_relaunch(&session);
     replacement.id = replacement_id;
+    // Named for the identity it now records. A file named for any other is
+    // neither openable as this terminal's nor kept by the next launch's prune.
+    replacement.transcript_path = super::transcript_path_for(&recipe, replacement_id);
     replacement.recovery_origin = Some(session.recovery_origin.unwrap_or(session.id));
     replacement.launch = recipe.clone();
     replacement.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
@@ -871,7 +1038,7 @@ mod tests {
         model::{HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity, TerminalId},
         terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
-            ServerResponse, TerminalDescriptor, read_frame, write_frame,
+            ServerResponse, read_frame, write_frame,
         },
     };
     use std::{
@@ -961,6 +1128,23 @@ mod tests {
         terminals: Vec<TerminalDescriptor>,
         probes: usize,
     ) -> thread::JoinHandle<()> {
+        discovery_in(
+            socket,
+            proof,
+            terminals,
+            probes,
+            crate::terminal::ipc::StartupState::Ready,
+        )
+    }
+
+    /// [`discovery`] from a daemon that answers this startup state.
+    fn discovery_in(
+        socket: &Path,
+        proof: HostSessionProof,
+        terminals: Vec<TerminalDescriptor>,
+        probes: usize,
+        state: crate::terminal::ipc::StartupState,
+    ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
             let mut stream = accept_within(&listener);
@@ -986,28 +1170,131 @@ mod tests {
                 },
             )
             .unwrap();
-            let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-            assert_eq!(list.proof, Some(proof.clone()));
-            assert_eq!(list.request, ClientRequest::List);
-            write_frame(
-                &mut stream,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(list.request_id),
-                    proof,
-                    message: ServerMessage::Response {
-                        response: ServerResponse::Listed { terminals },
+            // Recovery is read-only: it lists, and a press asks whether the
+            // daemon admits it, but no Spawn, Attach, Shutdown, or Input
+            // reaches this connection. A returned plan must use a fresh handle.
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                assert_eq!(request.proof, Some(proof.clone()));
+                let response = match request.request {
+                    ClientRequest::List => ServerResponse::Listed {
+                        terminals: terminals.clone(),
                     },
-                },
-            )
-            .unwrap();
-            // Recovery is read-only: no Spawn, Attach, Shutdown, or Input reaches
-            // this connection. A newly returned plan must use a fresh handle.
-            assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
+                    ClientRequest::StartupState => ServerResponse::StartupState(state.clone()),
+                    other => panic!("recovery sent {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            }
             for _ in 0..probes {
                 accept_within(&listener);
             }
         })
+    }
+
+    fn hosted(session: &TerminalSession) -> TerminalDescriptor {
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(session.id, session.launch.clone(), None);
+        descriptor.session = session.clone();
+        descriptor
+    }
+
+    #[test]
+    fn a_shared_pane_says_what_retry_will_find_for_a_missing_terminal() {
+        use super::super::terminal_failure::{
+            TERMINAL_DAEMON_RESTARTED, TERMINAL_MOVED, TERMINAL_NOT_HOSTED, TERMINAL_RETIRED,
+            TERMINAL_SUPERSEDED,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let saved_on = proof("old");
+        let replacement = proof("replacement");
+        let daemon = HostSessionProof {
+            boot_id: crate::model::BootId::new("a-later-boot"),
+            ..proof("current")
+        };
+        let saved = session(directory.path(), &saved_on);
+        let missing = |session: &TerminalSession, proof, terminals| {
+            hosted_or_missing(session, proof, terminals).err().unwrap()
+        };
+
+        // Listed under its own identity: attach, whatever else is hosted.
+        let same_id = session(directory.path(), &daemon);
+        assert_eq!(
+            hosted_or_missing(&same_id, &daemon, vec![hosted(&same_id)])
+                .unwrap()
+                .session,
+            same_id
+        );
+
+        // Nothing carries it on: its daemon is gone, or still runs and ended it.
+        assert_eq!(missing(&saved, &daemon, Vec::new()), TERMINAL_NOT_HOSTED);
+        assert_eq!(missing(&saved, &saved_on, Vec::new()), TERMINAL_RETIRED);
+        let unrelated = hosted(&session(directory.path(), &daemon));
+        assert_eq!(
+            missing(&saved, &daemon, vec![unrelated]),
+            TERMINAL_NOT_HOSTED
+        );
+
+        // A replaced daemon on this boot: its process may have survived.
+        assert_eq!(
+            missing(&saved, &replacement, Vec::new()),
+            TERMINAL_DAEMON_RESTARTED
+        );
+
+        // A committed upgrade or a live descendant: Retry attaches to it.
+        let mut upgraded = hosted(&session(directory.path(), &daemon));
+        upgraded.upgrade_sources = vec![saved.clone()];
+        assert_eq!(missing(&saved, &daemon, vec![upgraded]), TERMINAL_MOVED);
+        let mut descendant = session(directory.path(), &daemon);
+        descendant.recovery_origin = Some(saved.id);
+        assert_eq!(
+            missing(&saved, &daemon, vec![hosted(&descendant)]),
+            TERMINAL_MOVED
+        );
+
+        // A conflicting live claim: Retry refuses to disturb it.
+        let mut other_descendant = descendant.clone();
+        other_descendant.id = TerminalId::new();
+        assert_eq!(
+            missing(
+                &saved,
+                &daemon,
+                vec![hosted(&descendant), hosted(&other_descendant)]
+            ),
+            TERMINAL_SUPERSEDED
+        );
+        let mut same_conversation = saved.clone();
+        same_conversation.launch.program = "codex".into();
+        same_conversation.launch.arguments = vec![
+            "resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        let mut elsewhere = session(directory.path(), &daemon);
+        elsewhere.launch = same_conversation.launch.clone();
+        assert_eq!(
+            missing(&same_conversation, &daemon, vec![hosted(&elsewhere)]),
+            TERMINAL_SUPERSEDED
+        );
+
+        // Without a live proof Retry reconciles nothing and launches again.
+        let mut ended = saved.clone();
+        ended.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: ended.launch.clone(),
+            last_exit: None,
+        };
+        let mut would_match = hosted(&session(directory.path(), &daemon));
+        would_match.upgrade_sources = vec![ended.clone()];
+        assert_eq!(
+            missing(&ended, &daemon, vec![would_match]),
+            TERMINAL_NOT_HOSTED
+        );
     }
 
     #[test]
@@ -1143,6 +1430,34 @@ mod tests {
         descriptor.upgrade_sources = vec![original.clone(), intermediate];
         let server = discovery(&socket, owner.clone(), vec![descriptor], 1);
         let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(recovered.session, restored);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    /// A daemon still restoring lists what it restored, so Retry adopts it
+    /// there without waiting for the rest.
+    #[test]
+    fn a_retry_adopts_a_restored_lineage_while_the_daemon_is_still_restoring() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("upgraded");
+        let original = session(directory.path(), &proof("old"));
+        let _lease = lease(directory.path(), &owner);
+        let mut restored = session(directory.path(), &owner);
+        restored.id = original.id;
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(restored.id, restored.launch.clone(), None);
+        descriptor.session = restored.clone();
+        descriptor.upgrade_sources = vec![original.clone()];
+        let server = discovery_in(
+            &socket,
+            owner.clone(),
+            vec![descriptor],
+            1,
+            crate::terminal::ipc::StartupState::Restoring { awaiting: 1 },
+        );
+        let recovered = reconcile_at(original, true, &socket, directory.path()).unwrap();
         server.join().unwrap();
         assert_eq!(recovered.session, restored);
         assert_eq!(recovered.expected_host, Some(owner));
@@ -1379,6 +1694,26 @@ mod tests {
         let server = discovery(&socket, proof("replacement"), Vec::new(), 0);
         assert!(reconcile_at(original, false, &socket, directory.path()).is_err());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_replacement_records_its_transcript_under_its_own_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("same-owner");
+        let original = session(directory.path(), &owner);
+        let _lease = lease(directory.path(), &owner);
+        let descriptor =
+            TerminalDescriptor::relaunchable(original.id, original.launch.clone(), None);
+        let server = discovery(&socket, owner, vec![descriptor], 2);
+        let recovered = reconcile_at(original.clone(), true, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_ne!(recovered.session.id, original.id);
+        assert!(recovered.session.transcript_path.is_some());
+        assert_eq!(
+            recovered.session.transcript_path,
+            super::super::terminal_transcript_path(recovered.session.id)
+        );
     }
 
     #[test]
@@ -2004,6 +2339,11 @@ mod tests {
         agents: Vec<crate::agent_execution::Agent>,
         /// A daemon in startup recovery answers inventory reads but not this.
         recovery_only: bool,
+        /// A daemon whose startup failed and kept original ownership, which
+        /// waiting doesn't resolve.
+        retained: Option<String>,
+        /// What it lists once it has answered that it is ready.
+        listed_once_ready: Option<Vec<TerminalDescriptor>>,
         /// Owner authentication connects once before and once after the scan.
         owner_probes: usize,
         /// How a pane's Close of a conversation it hosts no longer is
@@ -2063,6 +2403,19 @@ mod tests {
                             ClientRequest::BuildInfo => ServerResponse::BuildInfo {
                                 version: "fixture".into(),
                             },
+                            ClientRequest::StartupState => {
+                                use crate::terminal::ipc::StartupState;
+                                ServerResponse::StartupState(if inventory.recovery_only {
+                                    StartupState::Restoring { awaiting: 1 }
+                                } else if let Some(detail) = inventory.retained.clone() {
+                                    StartupState::Retained { detail }
+                                } else {
+                                    if let Some(listed) = inventory.listed_once_ready.take() {
+                                        inventory.terminals = listed;
+                                    }
+                                    StartupState::Ready
+                                })
+                            }
                             ClientRequest::List => ServerResponse::Listed {
                                 terminals: inventory.terminals.clone(),
                             },
@@ -2109,6 +2462,359 @@ mod tests {
         proc_root: &Path,
     ) -> Result<RecoveredTerminal, String> {
         reconcile_with(session, explicit_retry, socket, proc_root, |_, _| Ok(None))
+    }
+
+    /// What a pane says Retry will do has to be what Retry does, so both get the
+    /// same saved terminal and the same inventory.
+    #[test]
+    fn what_a_pane_says_is_what_retry_does() {
+        use super::super::terminal_failure::{
+            TERMINAL_DAEMON_RESTARTED, TERMINAL_MOVED, TERMINAL_NOT_HOSTED, TERMINAL_RETIRED,
+            TERMINAL_SUPERSEDED, missing_terminal_message, missing_terminal_warning,
+        };
+        #[derive(Debug, PartialEq)]
+        enum Press {
+            Launches,
+            Adopts,
+            Refuses,
+        }
+        let held = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let descendant = |directory: &Path, of: &TerminalSession, on: &HostSessionProof| {
+            let mut live = session(directory, on);
+            live.recovery_origin = Some(of.id);
+            hosted(&live)
+        };
+        type Case<'a> = (
+            &'static str,
+            Press,
+            bool,
+            &'a dyn Fn(&Path) -> (TerminalSession, HostSessionProof, Vec<TerminalDescriptor>),
+        );
+        let cases: [Case; 6] = [
+            (TERMINAL_NOT_HOSTED, Press::Launches, true, &|directory| {
+                let saved = session(directory, &other_boot("old"));
+                (saved, proof("current"), Vec::new())
+            }),
+            (
+                TERMINAL_DAEMON_RESTARTED,
+                Press::Launches,
+                true,
+                &|directory| {
+                    (
+                        session(directory, &proof("old")),
+                        proof("current"),
+                        Vec::new(),
+                    )
+                },
+            ),
+            (TERMINAL_RETIRED, Press::Refuses, true, &|directory| {
+                (
+                    session(directory, &proof("current")),
+                    proof("current"),
+                    Vec::new(),
+                )
+            }),
+            (TERMINAL_MOVED, Press::Adopts, false, &|directory| {
+                let saved = session(directory, &proof("current"));
+                let live = descendant(directory, &saved, &proof("current"));
+                (saved, proof("current"), vec![live])
+            }),
+            (TERMINAL_SUPERSEDED, Press::Refuses, true, &|directory| {
+                let saved = session(directory, &proof("current"));
+                let first = descendant(directory, &saved, &proof("current"));
+                let second = descendant(directory, &saved, &proof("current"));
+                (saved, proof("current"), vec![first, second])
+            }),
+            (TERMINAL_SUPERSEDED, Press::Refuses, true, &|directory| {
+                let mut saved = session(directory, &proof("old"));
+                saved.launch.program = "/usr/bin/codex".into();
+                saved.launch.arguments = vec!["resume".into(), held.into()];
+                let mut live = session(directory, &proof("current"));
+                live.launch = saved.launch.clone();
+                (saved, proof("current"), vec![hosted(&live)])
+            }),
+        ];
+        for (message, press, warns, case) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let (saved, daemon, terminals) = case(directory.path());
+            assert_eq!(
+                missing_terminal_message(&saved, &daemon, &terminals),
+                message
+            );
+            assert_eq!(
+                missing_terminal_warning(message, &saved).is_some(),
+                warns,
+                "{message}"
+            );
+            let _lease = lease(directory.path(), &daemon);
+            // A launch checks ownership twice and an adoption once. A refusal
+            // that gets as far as the conversation has checked it once too.
+            let probes = match (&press, terminals.len(), saved.launch.arguments.is_empty()) {
+                (Press::Launches, _, _) => 2,
+                (Press::Adopts, _, _) => 1,
+                (Press::Refuses, _, false) => 1,
+                (Press::Refuses, _, true) => 0,
+            };
+            let server = discovery(&socket, daemon.clone(), terminals, probes);
+            let id = saved.id;
+            let result = reconcile_at(saved, true, &socket, directory.path());
+            server.join().unwrap();
+            let actual = match result {
+                Err(_) => Press::Refuses,
+                Ok(recovered)
+                    if recovered.session.recovery_origin == Some(id)
+                        && matches!(
+                            recovered.session.continuity,
+                            TerminalContinuity::RelaunchAvailable { .. }
+                        ) =>
+                {
+                    Press::Launches
+                }
+                Ok(_) => Press::Adopts,
+            };
+            assert_eq!(actual, press, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_retry_with_no_proof_does_not_start_a_conversation_a_live_terminal_holds() {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for held in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let daemon = proof("current");
+            let mut saved = session(directory.path(), &daemon);
+            saved.launch.program = "/usr/bin/codex".into();
+            saved.launch.arguments = vec!["resume".into(), id.into()];
+            saved.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: saved.launch.clone(),
+                last_exit: None,
+            };
+            let mut live = session(directory.path(), &daemon);
+            if held {
+                live.launch = saved.launch.clone();
+            }
+            let server = discovery(&socket, daemon, vec![hosted(&live)], 0);
+            let result = reconcile_without_proof(saved, false, || Ok(socket.clone()));
+            server.join().unwrap();
+            assert_eq!(result.is_err(), held);
+        }
+        // A plain shell has no conversation to protect, so no daemon is asked.
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = session(directory.path(), &proof("current"));
+        saved.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: saved.launch.clone(),
+            last_exit: None,
+        };
+        let result = reconcile_without_proof(saved, false, || panic!("no daemon is needed"));
+        assert!(result.is_ok());
+    }
+
+    /// While the daemon restores, every path that would read its inventory or
+    /// ask it to start something says so, rather than relaying its refusal of
+    /// the request or concluding from a partial inventory. A daemon that
+    /// refuses build information, as this one does while restoring, fails
+    /// these if a path asks for that instead of its startup state.
+    #[test]
+    fn every_path_that_would_rely_on_a_restoring_daemon_says_it_is_restoring() {
+        use super::super::terminal_failure::{TERMINAL_NOT_HOSTED, TERMINALS_RESTORING};
+        let restoring = || Inventory {
+            recovery_only: true,
+            ..Default::default()
+        };
+        let ready = Inventory::default;
+        let served = |directory: &Path, served: Inventory| {
+            let socket = directory.join("daemon.sock");
+            (inventory(&socket, proof("current"), served), socket)
+        };
+        let saved_shell = |directory: &Path, live: bool| {
+            let mut saved = session(directory, &other_boot("old"));
+            if !live {
+                saved.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: saved.launch.clone(),
+                    last_exit: None,
+                };
+            }
+            saved
+        };
+        for (daemon, expected) in [
+            (restoring(), TERMINALS_RESTORING),
+            (ready(), TERMINAL_NOT_HOSTED),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let saved = saved_shell(directory.path(), true);
+            let (server, socket) = served(directory.path(), daemon);
+            let mut client = ControlClient::connect(&socket).unwrap();
+            // A shared pane's open.
+            assert_eq!(
+                hosted_proving_absence(&saved, &mut client).map(|_| ()),
+                Err(expected.into())
+            );
+            // An initial pane's attach at startup.
+            assert_eq!(
+                super::super::initial_terminal_from_daemon(&saved, &mut client),
+                Err(expected.into())
+            );
+            drop(client);
+            server.join().unwrap();
+        }
+        // Retry on a pane with a live proof, and on one without.
+        for live in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let saved = saved_shell(directory.path(), live);
+            let (server, socket) = served(directory.path(), restoring());
+            let result = if live {
+                reconcile_at(saved, true, &socket, directory.path())
+            } else {
+                reconcile_without_proof(saved, true, || Ok(socket.clone()))
+            };
+            server.join().unwrap();
+            assert_eq!(
+                result.err(),
+                Some(TERMINALS_RESTORING.to_owned()),
+                "live {live}"
+            );
+        }
+        // A restoring daemon still lists and attaches, so a press reaches a
+        // terminal it lists without waiting for the restore to finish.
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("current"));
+        let (server, socket) = served(
+            directory.path(),
+            Inventory {
+                terminals: vec![hosted(&saved)],
+                ..restoring()
+            },
+        );
+        let result = reconcile_at(saved.clone(), true, &socket, directory.path());
+        server.join().unwrap();
+        let recovered = result.unwrap();
+        assert_eq!(recovered.session.id, saved.id);
+        assert!(!recovered.attach_completed);
+        // A retained daemon also lists and attaches, so the same press reaches
+        // a listed terminal, and one it doesn't list keeps that daemon's detail.
+        for listed in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let saved = session(directory.path(), &proof("current"));
+            let (server, socket) = served(
+                directory.path(),
+                Inventory {
+                    terminals: if listed {
+                        vec![hosted(&saved)]
+                    } else {
+                        Vec::new()
+                    },
+                    retained: Some("holder 7 did not answer".into()),
+                    ..Default::default()
+                },
+            );
+            let result = reconcile_at(saved.clone(), true, &socket, directory.path());
+            server.join().unwrap();
+            match result {
+                Ok(recovered) => {
+                    assert!(listed);
+                    assert_eq!(recovered.session.id, saved.id);
+                }
+                Err(refusal) => {
+                    assert!(!listed);
+                    assert!(refusal.contains("holder 7 did not answer"), "{refusal}");
+                }
+            }
+        }
+        // A terminal listed only once the daemon is ready is reached from
+        // the inventory read after it answered.
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("current"));
+        let (server, socket) = served(
+            directory.path(),
+            Inventory {
+                listed_once_ready: Some(vec![hosted(&saved)]),
+                ..Default::default()
+            },
+        );
+        let result = reconcile_at(saved.clone(), true, &socket, directory.path());
+        server.join().unwrap();
+        assert_eq!(result.unwrap().session.id, saved.id);
+        // Once restored, a Retry without a proof goes ahead.
+        let directory = tempfile::tempdir().unwrap();
+        let saved = saved_shell(directory.path(), false);
+        let (server, socket) = served(directory.path(), ready());
+        let result = reconcile_without_proof(saved, true, || Ok(socket.clone()));
+        server.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_partial_inventory_during_startup_does_not_prove_a_terminal_is_gone() {
+        struct Daemon {
+            ready: bool,
+            before_ready: Vec<TerminalDescriptor>,
+            after_ready: Vec<TerminalDescriptor>,
+            admits: bool,
+        }
+        let list = |daemon: &mut Daemon| {
+            Ok(if daemon.ready {
+                daemon.after_ready.clone()
+            } else {
+                daemon.before_ready.clone()
+            })
+        };
+        let ready = |daemon: &mut Daemon| {
+            if daemon.admits {
+                daemon.ready = true;
+                Ok(())
+            } else {
+                Err("the daemon is still recovering".to_owned())
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("old"));
+        let listed = hosted(&saved);
+        // Listed at once: attach without asking anything more.
+        let mut daemon = Daemon {
+            ready: false,
+            before_ready: vec![listed.clone()],
+            after_ready: Vec::new(),
+            admits: false,
+        };
+        let found = inventory_proving_absence(&saved, &mut daemon, list, ready).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!daemon.ready);
+        // Listed only once startup finished: that second inventory decides.
+        let mut daemon = Daemon {
+            ready: false,
+            before_ready: Vec::new(),
+            after_ready: vec![listed],
+            admits: true,
+        };
+        let found = inventory_proving_absence(&saved, &mut daemon, list, ready).unwrap();
+        assert_eq!(found.len(), 1);
+        // Still starting up: no answer, rather than an absence.
+        let mut daemon = Daemon {
+            ready: false,
+            before_ready: Vec::new(),
+            after_ready: Vec::new(),
+            admits: false,
+        };
+        assert!(inventory_proving_absence(&saved, &mut daemon, list, ready).is_err());
+    }
+
+    #[test]
+    fn only_a_ready_daemon_can_show_that_a_terminal_is_gone() {
+        use crate::terminal::ipc::StartupState;
+        assert_eq!(admitted(StartupState::Ready), Ok(()));
+        // Restoring ends on its own, so the pane says that in its own words.
+        assert_eq!(
+            admitted(StartupState::Restoring { awaiting: 2 }),
+            Err(super::super::terminal_failure::TERMINALS_RESTORING.to_owned())
+        );
+        // A retained failure doesn't, so its detail is kept.
+        let retained = admitted(StartupState::Retained {
+            detail: "holder 7 did not answer".into(),
+        })
+        .unwrap_err();
+        assert!(retained.contains("holder 7 did not answer"), "{retained}");
     }
 
     fn other_boot(incarnation: &str) -> HostSessionProof {

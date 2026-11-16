@@ -23,6 +23,8 @@ pub enum Unavailable {
     Changed,
     #[error("The desktop could not open the transcript folder")]
     DesktopUnavailable,
+    #[error("This terminal saved no output")]
+    NothingSaved,
 }
 
 fn root() -> Result<PathBuf, Unavailable> {
@@ -154,6 +156,29 @@ pub fn open(
     open_with_receipt(&root()?, terminal, metadata)
 }
 
+/// A terminal's earlier output after its daemon is gone, so no host can issue a
+/// receipt. The path comes from the identity and never from saved state, and
+/// `open_in` applies the same ownership and mode checks. An empty file holds no
+/// earlier output to reach, so it isn't offered as if it did.
+pub fn open_without_host(terminal: TerminalId) -> Result<ValidatedTranscript, Unavailable> {
+    open_without_host_in(&root()?, terminal)
+}
+
+fn open_without_host_in(
+    root: &Path,
+    terminal: TerminalId,
+) -> Result<ValidatedTranscript, Unavailable> {
+    let validated = open_in(root, terminal, &root.join(format!("{terminal}.log")))?;
+    let saved = validated
+        ._file
+        .metadata()
+        .map_err(|_| Unavailable::UnsafeStorage)?;
+    if saved.len() == 0 {
+        return Err(Unavailable::NothingSaved);
+    }
+    Ok(validated)
+}
+
 fn open_with_receipt(
     root: &Path,
     terminal: TerminalId,
@@ -213,6 +238,18 @@ mod tests {
         temporary_directory_in(&tempfile::env::temp_dir())
     }
 
+    #[test]
+    fn an_empty_file_is_no_transcript_to_offer_without_a_host() {
+        let (root, terminal, path) = fixture();
+        fs::write(&path, b"").unwrap();
+        assert_eq!(
+            open_without_host_in(root.path(), terminal).err(),
+            Some(Unavailable::NothingSaved)
+        );
+        fs::write(&path, b"output\n").unwrap();
+        assert!(open_without_host_in(root.path(), terminal).is_ok());
+    }
+
     fn fixture() -> (tempfile::TempDir, TerminalId, PathBuf) {
         fixture_in(&tempfile::env::temp_dir())
     }
@@ -225,6 +262,25 @@ mod tests {
         fs::write(&file, "private transcript contents").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         (root, terminal, file)
+    }
+
+    #[test]
+    fn a_transcript_with_no_host_still_needs_its_identity_and_private_mode() {
+        let (root, terminal, file) = fixture();
+        assert!(open_without_host_in(root.path(), terminal).is_ok());
+        // Another terminal's identity names no file here.
+        assert!(open_without_host_in(root.path(), TerminalId::new()).is_err());
+        // A readable-by-others file is refused, with or without a receipt.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_without_host_in(root.path(), terminal).is_err());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        // A symlink in its place is refused.
+        fs::remove_file(&file).unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        fs::write(&elsewhere, "other").unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&elsewhere, &file).unwrap();
+        assert!(open_without_host_in(root.path(), terminal).is_err());
     }
 
     #[test]

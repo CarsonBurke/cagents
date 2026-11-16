@@ -334,6 +334,8 @@ enum NoticeKey {
     BrowserUnavailable,
     /// Saving the reservation for this already running terminal.
     TerminalSave(CardId, TerminalId),
+    /// Starting or restoring the terminal in this card.
+    TerminalStart(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6273,11 +6275,12 @@ impl Cagents {
                         created = save_failure.is_none();
                         Some(hosted)
                     } else {
-                        client
-                            .list()
-                            .map_err(|error| error.to_string())?
-                            .into_iter()
-                            .find(|hosted| hosted.session.id == session.id)
+                        // Name what the daemon shows about a terminal it no
+                        // longer lists, rather than a reconnect it can't make.
+                        Some(daemon_recovery::hosted_proving_absence(
+                            &session,
+                            &mut client,
+                        )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
                     shared_terminal_attachment(hosted.session, client.proof().clone())
@@ -6488,6 +6491,7 @@ impl Cagents {
         let mut tasks = Vec::new();
         match result {
             Ok(started) => {
+                self.resolve_notice(NoticeKey::TerminalStart(card));
                 let unsaved = started.save_failure.is_some();
                 if let Some(failure) = started.save_failure {
                     self.record_terminal_save_failure(card, failure);
@@ -6594,7 +6598,11 @@ impl Cagents {
             }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
-                self.status = Some(TransientNotice::error(error));
+                let notice = self.missing_terminal_notice(card);
+                self.status = Some(
+                    TransientNotice::error(notice.unwrap_or(error))
+                        .with_key(NoticeKey::TerminalStart(card)),
+                );
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
         }
@@ -9370,7 +9378,7 @@ impl Cagents {
         };
         let succeeded = result.is_ok();
         let result = result.map_err(|message| RuntimeError {
-            code: "runtime_hydration_failed".into(),
+            code: terminal_failure::runtime_error_code(&message, "runtime_hydration_failed").into(),
             message,
         });
         if !self.lifecycle.hydration_finished(card, epoch, result) {
@@ -9399,7 +9407,7 @@ impl Cagents {
         };
         let residency = Residency::Failed {
             typed_error: RuntimeError {
-                code: "runtime_failed".into(),
+                code: terminal_failure::runtime_error_code(&message, "runtime_failed").into(),
                 message,
             },
             retryable: true,
@@ -11536,7 +11544,11 @@ impl Cagents {
                                 }
                                 controls
                             } else { vec![
-                                crate::ui_controls::button::primary(retry_label)
+                                (if self.terminal_retry_is_blocked(id) {
+                                    crate::ui_controls::button::secondary(retry_label)
+                                } else {
+                                    crate::ui_controls::button::primary(retry_label)
+                                })
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
                                     // Retry does nothing once Close owns the pane.
@@ -13219,6 +13231,7 @@ impl Cagents {
                     key @ (NoticeKey::ChatAttach(card)
                     | NoticeKey::ChatReturn(card)
                     | NoticeKey::ChatClose(card)
+                    | NoticeKey::TerminalStart(card)
                     | NoticeKey::TerminalSave(card, _)),
                 ) if self
                     .card_state(*card)
@@ -20245,9 +20258,7 @@ fn attach_initial_terminal(
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
-    let terminals = client.list().map_err(|error| error.to_string())?;
-    let session = initial_terminal_attachment(&source, &terminals, &proof)?
-        .ok_or("The recovered daemon no longer holds this terminal. Its saved pane is kept; use Retry explicitly to reconnect or relaunch it")?;
+    let session = initial_terminal_from_daemon(&source, &mut client)?;
     saved_terminal::attach_existing(
         card,
         daemon_recovery::RecoveredTerminal {
@@ -20260,6 +20271,51 @@ fn attach_initial_terminal(
         proof,
         sender,
     )
+}
+
+/// [`initial_terminal_proving_absence`], asked of a connected daemon.
+fn initial_terminal_from_daemon(
+    source: &TerminalSession,
+    client: &mut crate::control::ControlClient,
+) -> Result<TerminalSession, String> {
+    let proof = client.proof().clone();
+    initial_terminal_proving_absence(
+        source,
+        &proof,
+        client,
+        daemon_recovery::list_terminals,
+        daemon_recovery::ensure_admitted,
+    )
+}
+
+/// The terminal an initial pane attaches to. A listing taken while the daemon
+/// is still restoring can be partial, so it can attach to what it lists but
+/// can't show that a terminal is gone: absence is read again after admission
+/// readiness, as a shared pane's open does.
+fn initial_terminal_proving_absence<C>(
+    source: &TerminalSession,
+    proof: &HostSessionProof,
+    client: &mut C,
+    list: impl Fn(&mut C) -> Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>,
+    ready: impl Fn(&mut C) -> Result<(), String>,
+) -> Result<TerminalSession, String> {
+    if let Some(session) = initial_terminal_attachment(source, &list(client)?, proof)? {
+        return Ok(session);
+    }
+    ready(client)?;
+    initial_terminal_or_missing(source, &list(client)?, proof)
+}
+
+/// When its daemon no longer lists an initial pane's terminal, the pane is
+/// kept and the error says what Retry will find.
+fn initial_terminal_or_missing(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<TerminalSession, String> {
+    initial_terminal_attachment(source, terminals, proof)?.ok_or_else(|| {
+        terminal_failure::missing_terminal_message(source, proof, terminals).to_owned()
+    })
 }
 
 fn initial_terminal_attachment(
