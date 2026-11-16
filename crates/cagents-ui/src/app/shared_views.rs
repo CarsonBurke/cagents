@@ -850,7 +850,10 @@ impl Cagents {
             Some(topology) => self.discover_view_scopes_with(topology),
             None => self.discover_view_scopes(),
         };
-        view_scope_hold(&self.shared_views, discovery.scopes.iter().map(|scope| &**scope))
+        view_scope_hold(
+            &self.shared_views,
+            discovery.scopes.iter().map(|scope| &**scope),
+        )
     }
 
     /// A queued row may attach only after its own canonical view is admitted.
