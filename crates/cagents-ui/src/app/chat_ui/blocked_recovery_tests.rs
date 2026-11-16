@@ -193,6 +193,60 @@ fn blocked_recovery_actions_are_enabled_and_dispatch_for_every_settled_surface()
     }
 }
 
+/// A blocked failed card leads with Start a new conversation, and neither of
+/// its actions can be pressed while Close is checking the source.
+#[test]
+fn blocked_failed_card_leads_with_fresh_and_disables_it_while_closing() {
+    let buttons = |tree: &A11yTree| {
+        let mut buttons = tree
+            .root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| node.node().role() == Role::Button && !node.node().is_hidden())
+            .filter_map(|node| {
+                let label = node.node().label()?;
+                (label == "Start a new conversation"
+                    || label == "Close Chat"
+                    || label.starts_with("Retry"))
+                .then(|| {
+                    (
+                        label.to_owned(),
+                        node.node().is_disabled(),
+                        node.node().bounds().map_or(0.0, |bounds| bounds.x0),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        buttons.sort_by(|a, b| a.2.total_cmp(&b.2));
+        buttons
+            .into_iter()
+            .map(|(label, disabled, _)| (label, disabled))
+            .collect::<Vec<_>>()
+    };
+    let (mut app, card) = blocked_app(true, true, false);
+    assert!(app.chat_offers_fresh_conversation(card));
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert_eq!(
+        buttons(&tree),
+        [
+            ("Start a new conversation".to_owned(), false),
+            ("Close Chat".to_owned(), false)
+        ],
+        "Fresh leads, Close follows, and no Retry is offered"
+    );
+    app.completed_release = Some(card);
+    assert!(app.terminal_close_in_progress(card));
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert_eq!(
+        buttons(&tree),
+        [
+            ("Start a new conversation".to_owned(), true),
+            ("Close Chat".to_owned(), true)
+        ],
+        "Close owns the card until it settles"
+    );
+}
+
 #[test]
 fn blocked_recovery_keeps_permanent_diagnostics_only_under_details() {
     use iced::futures::StreamExt;

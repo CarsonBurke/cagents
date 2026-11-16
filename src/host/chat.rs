@@ -1990,6 +1990,36 @@ pub(super) fn shared_removal_in_transition(
             .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
+/// Why a native start that built its provider may no longer publish it.
+///
+/// Shutdown, a reserved terminal and a new daemon proof are transient, and a
+/// chat that gained a live owner can be attached instead, as at entry: all are
+/// retryable. Only a lost reservation means another action took this start
+/// over, which repeating it cannot undo.
+fn publication_refusal(
+    state: &HostState,
+    session: &Session,
+    proof: &HostSessionProof,
+    reservation_id: TerminalId,
+    reservation: &Session,
+) -> Option<ProtocolError> {
+    const MESSAGE: &str = "Native startup ownership changed before attachment publication";
+    let transient = state.shutting_down
+        || require_unreserved_terminals(state, session).is_err()
+        || state.proof() != proof
+        || state
+            .chats
+            .get(&session.id)
+            .is_some_and(|current| current.handle.owns_work());
+    if transient {
+        Some(retryable_unavailable(MESSAGE))
+    } else if state.chat_spawning.get(&reservation_id) != Some(reservation) {
+        Some(unavailable(MESSAGE))
+    } else {
+        None
+    }
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -2952,26 +2982,16 @@ fn start_with_execution(
         };
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        // Shutdown, a reserved terminal and a new daemon proof are transient,
-        // and a chat that gained a live owner can be attached instead, as at
-        // entry. Only a lost reservation means another action took this start
-        // over, which repeating it cannot undo.
-        let transient = state.shutting_down
-            || require_unreserved_terminals(&state, &record.session).is_err()
-            || state.proof() != &proof
-            || state
-                .chats
-                .get(&id)
-                .is_some_and(|current| current.handle.owns_work());
-        if transient || state.chat_spawning.get(&reservation_id) != Some(&reservation) {
+        if let Some(refusal) = publication_refusal(
+            &state,
+            &record.session,
+            &proof,
+            reservation_id,
+            &reservation,
+        ) {
             drop(state);
             let _ = record.handle.close();
-            let message = "Native startup ownership changed before attachment publication";
-            return Err(if transient {
-                retryable_unavailable(message)
-            } else {
-                unavailable(message)
-            });
+            return Err(refusal);
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);

@@ -635,8 +635,9 @@ python3 tests/fixtures/native-retired-ownership.py \
     ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
 ```
 
-The helper recognizes only schema 22 shared views or schema 23 normalized
-panes with descriptor format 1. It requires one current committed Claude pane
+The helper recognizes only schema 22 shared views or schema 23 to 28
+normalized panes with descriptor format 1. Schemas 24 to 28 add tables beside
+those panes without changing their columns. It requires one current committed Claude pane
 for that exact thread, matching ownership source and proof, and a completed
 retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
 ownership row using SQLite compare-and-swap. The card, transcript, provider

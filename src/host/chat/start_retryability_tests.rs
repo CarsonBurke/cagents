@@ -901,3 +901,148 @@ fn connect_shutdown_can_retry_but_an_exact_other_host_is_blocked() {
     assert!(host.lock().unwrap().chat_spawning.is_empty());
     assert!(host.lock().unwrap().native_actor_startups.is_empty());
 }
+
+/// The final check before a built native start is published. Each transient
+/// change leaves Retry; only a lost or replaced reservation is permanent.
+#[test]
+fn publication_retries_transient_changes_and_blocks_a_lost_reservation() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+    let root = tempfile::tempdir().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("publication"),
+        boot_id: BootId::new("publication"),
+        host_incarnation: HostIncarnation::new("publication"),
+    };
+    let source = session(root.path(), Provider::Claude, vec![]);
+    let mut state = HostState::new(proof.clone());
+    state.register_client(1);
+    state.chat_spawning.insert(source.id, source.clone());
+    let refusal = |state: &HostState, proof: &HostSessionProof| {
+        publication_refusal(state, &source, proof, source.id, &source)
+    };
+    let retryable = |refusal: Option<ProtocolError>, case: &str| {
+        let refusal = refusal.unwrap_or_else(|| panic!("{case} must refuse publication"));
+        assert_eq!(
+            refusal.code,
+            ProtocolErrorCode::TerminalUnavailable,
+            "{case}"
+        );
+        refusal.retryable
+    };
+    assert!(
+        refusal(&state, &proof).is_none(),
+        "an unchanged start publishes"
+    );
+
+    state.shutting_down = true;
+    assert!(retryable(refusal(&state, &proof), "shutdown"));
+    state.shutting_down = false;
+
+    let mut restarted = proof.clone();
+    restarted.host_incarnation = HostIncarnation::new("publication-restarted");
+    assert!(retryable(refusal(&state, &restarted), "a new daemon proof"));
+
+    let (owner, _replacement) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    assert!(owner.owns_work(), "the fixture owner must hold live work");
+    state.chats.insert(
+        source.id,
+        Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: source.clone(),
+            handle: owner,
+            source_process: None,
+            subscribers: Default::default(),
+            observations: Default::default(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    assert!(retryable(refusal(&state, &proof), "a new live owner"));
+    drop(state.chats.remove(&source.id));
+
+    let mut recipe = LaunchRecipe::shell(root.path().into()).unwrap();
+    recipe.program = "/bin/true".into();
+    recipe.arguments.clear();
+    let terminal = crate::model::TerminalSession {
+        id: source.id,
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let (worker, release) = crate::terminal::TerminalHandle::spawn_with_wedged_worker_for_test();
+    state
+        .finish_spawn(1, terminal, worker.clone(), true)
+        .unwrap();
+    state.terminal_retirements.insert(
+        source.id,
+        crate::host::state::Retirement::submitting(worker),
+    );
+    assert!(retryable(refusal(&state, &proof), "a reserved terminal"));
+    state.terminal_retirements.remove(&source.id);
+    assert!(
+        refusal(&state, &proof).is_none(),
+        "the released terminal no longer refuses"
+    );
+
+    let mut replaced = source.clone();
+    replaced.launch.session_id = None;
+    state.chat_spawning.insert(source.id, replaced);
+    assert!(!retryable(
+        refusal(&state, &proof),
+        "a replaced reservation"
+    ));
+    state.chat_spawning.remove(&source.id);
+    assert!(!retryable(refusal(&state, &proof), "a lost reservation"));
+    let _ = release.send(());
+}
+
+/// An update floor the daemon cannot read is no reason to give up on a start:
+/// the read can succeed later, and nothing was launched.
+#[test]
+fn an_unreadable_update_floor_keeps_retry_without_launching() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated("an_unreadable_update_floor_keeps_retry_without_launching") else {
+        return;
+    };
+    let provider = root.join("bin/claude");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'unexpected launch\\n' > \"$HOME/../launches\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    // A file where the floor's directory belongs: every read fails.
+    let floor = crate::instance::project_dirs()
+        .unwrap()
+        .data_local_dir()
+        .join("daemon-upgrade/update-floor");
+    fs::create_dir_all(floor.parent().unwrap()).unwrap();
+    fs::write(&floor, b"not a directory").unwrap();
+    assert!(crate::upgrade::floor::load().is_err());
+    let source = session(&root, Provider::Claude, vec![]);
+    let (host, proof) = setup(&root, "unreadable-floor");
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let failure = refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Retry,
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("launches").exists());
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+}

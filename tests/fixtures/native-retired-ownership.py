@@ -3,8 +3,8 @@
 
 The caller must first retire and reap its synthetic Claude actor normally.
 This helper changes only that retired actor's recorded recipe, not live state.
-Version 4 recognizes schema 22 shared views and schema 23 normalized panes
-with descriptor format 1. --restore undoes only this helper's recorded CAS.
+Version 5 recognizes schema 22 shared views and schema 23 to 28 normalized
+panes with descriptor format 1. Schemas 24 to 28 only add tables beside them. --restore undoes only this helper's recorded CAS.
 --self-test uses invented in-memory SQLite, never an app or provider home.
 """
 import argparse
@@ -17,7 +17,9 @@ import sqlite3
 import stat
 import uuid
 
-VERSION = 4
+VERSION = 5
+# Normalized pane layouts. Later schemas add tables but keep these columns.
+NORMALIZED = range(23, 29)
 NATIVE_TABLES = {'native_actor_ownerships', 'native_actor_retirements'}
 
 
@@ -37,9 +39,9 @@ def selected_card(database, thread):
     if not NATIVE_TABLES <= tables:
         return None
     cards = []
-    if version == 23:
+    if version in NORMALIZED:
         if not {'view_scopes', 'panes'} <= tables or 'shared_views' in tables:
-            raise ValueError('Unrecognized schema 23 normalized view layout')
+            raise ValueError(f'Unrecognized schema {version} normalized view layout')
         require_columns(database, 'view_scopes', ['id', 'revision'])
         require_columns(database, 'panes', ['id', 'scope', 'kind', 'resource', 'provider', 'provider_session', 'descriptor_format', 'descriptor'])
         query = '''SELECT p.id,p.scope,p.kind,p.resource,p.provider,p.provider_session,
@@ -66,7 +68,7 @@ def selected_card(database, thread):
                 if provider != launch['provider'] or session != launch['session_id']:
                     raise ValueError('Pane provider indexes disagree with its descriptor')
                 if provider == 'Claude' and session == thread:
-                    cards.append({'schema': 23, 'pane': pane, 'scope': scope, 'revision': revision, 'descriptor': descriptor})
+                    cards.append({'schema': version, 'pane': pane, 'scope': scope, 'revision': revision, 'descriptor': descriptor})
     elif version == 22:
         if not {'shared_views', 'shared_view_scopes', 'shared_view_panes'} <= tables or 'panes' in tables:
             raise ValueError('Unrecognized schema 22 shared view layout')
@@ -280,7 +282,7 @@ def self_test():
         db = sqlite3.connect(':memory:')
         db.executescript('CREATE TABLE native_actor_ownerships(actor TEXT,ownership TEXT); CREATE TABLE native_actor_retirements(actor TEXT,receipt TEXT);')
         db.execute(f'PRAGMA user_version={version}')
-        if version == 23:
+        if version in NORMALIZED:
             db.executescript('CREATE TABLE view_scopes(id INTEGER,revision INTEGER); CREATE TABLE panes(id TEXT,scope INTEGER,kind TEXT,resource TEXT,provider TEXT,provider_session TEXT,descriptor_format INTEGER,descriptor TEXT); INSERT INTO view_scopes VALUES(7,11);')
             db.execute('INSERT INTO panes VALUES(?,?,?,?,?,?,?,?)', (pane, 7, 'chat', source, 'Claude', thread, 1, json.dumps(descriptor)))
         else:
@@ -288,7 +290,7 @@ def self_test():
             db.execute('INSERT INTO shared_view_panes VALUES(?,?)', (pane, 'current'))
             db.execute('INSERT INTO shared_views VALUES(?,?,?)', ('current', 11, json.dumps([{'id': pane, 'kind': descriptor}])))
         return db
-    for version in [22, 23]:
+    for version in [22, *NORMALIZED]:
         with closing(database(version)) as db:
             chosen = selected_card(db, thread)
             assert chosen['pane'] == pane and chosen['descriptor'] == descriptor
@@ -337,7 +339,7 @@ def self_test():
             count += 1
         else:
             raise AssertionError('Accepted unindexed legacy card')
-    for version in [0, 24]:
+    for version in [0, 29]:
         with closing(database(version)) as db:
             try:
                 selected_card(db, thread)
@@ -361,7 +363,7 @@ def self_test():
         db.commit()
         return {'helper_version': VERSION, 'selected': selected, 'thread': thread,
                 'actor': actor, 'original': original, 'faulted': faulted, 'retirement': retirement}
-    for version in [22, 23]:
+    for version in [22, *NORMALIZED]:
         with closing(database(version)) as db:
             record = recorded_fault(db)
             restore_record(db, record)
@@ -381,7 +383,7 @@ def self_test():
                 elif mismatch == 'retirement':
                     db.execute('UPDATE native_actor_retirements SET receipt=?', (json.dumps({'confirmed_session': 'another-thread'}),))
                 elif mismatch == 'card':
-                    if version == 23:
+                    if version in NORMALIZED:
                         db.execute('UPDATE view_scopes SET revision=revision+1')
                     else:
                         db.execute('UPDATE shared_views SET revision=revision+1')
@@ -405,7 +407,7 @@ def self_test():
                 else:
                     raise AssertionError(f'Accepted a {version} {mismatch} restore mismatch')
     return {'helper_version': VERSION, 'selection_checks_passed': count,
-            'restore_checks_passed': restore_count, 'schemas': [22, 23],
+            'restore_checks_passed': restore_count, 'schemas': [22, *NORMALIZED],
             'scope': 'invented in-memory SQLite only; no app fixture or provider execution'}
 
 
