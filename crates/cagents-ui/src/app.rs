@@ -11422,6 +11422,11 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
+                        pane_inspector::TOGGLE_CLEARANCE
+                    } else {
+                        0.0
+                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
