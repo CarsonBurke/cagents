@@ -799,6 +799,13 @@ impl Cagents {
             };
         }
         let closed = self.apply_viewport(update, true, DurableChange::Content);
+        // A project closed in another window waits for its open editors. Closing
+        // the last of them, or discarding its edits, releases the close here.
+        let projects = if self.project_ui.closing.is_empty() {
+            Task::none()
+        } else {
+            self.complete_closed_projects()
+        };
         // A chat returned to a terminal is replaced only now that it
         // is closed, so no state ever holds both.
         let replacement = replacement
@@ -824,8 +831,16 @@ impl Cagents {
             Task::none()
         };
         Some(
-            Task::batch([closed, replacement, settings, emptied, reopen, focus])
-                .chain(self.next_queued_card_close()),
+            Task::batch([
+                closed,
+                projects,
+                replacement,
+                settings,
+                emptied,
+                reopen,
+                focus,
+            ])
+            .chain(self.next_queued_card_close()),
         )
     }
 

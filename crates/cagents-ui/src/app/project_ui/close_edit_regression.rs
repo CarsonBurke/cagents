@@ -706,7 +706,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                 app.notices
                     .entries
                     .iter()
-                    .any(|entry| entry.notice.message.contains("resolve file recovery"))
+                    .any(|entry| entry.notice.message.contains("finish closing it here"))
             );
             if matches!(case, Case::SaveDuringCleanup) {
                 assert_eq!(editor(&app, card).editor_text().as_deref(), Some(BASELINE));

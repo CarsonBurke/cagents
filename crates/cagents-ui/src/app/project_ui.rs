@@ -581,9 +581,7 @@ impl Cagents {
             .insert(project, self.project_ui.next_close_generation);
         self.repository_generations.remove(&project);
         if self.project_has_unsaved_editors(project) {
-            self.status = Some(TransientNotice::warning(
-                "Project closed in another window; save its open editor buffers before removing its local row.",
-            ));
+            self.status = Some(self.closed_elsewhere_notice(project));
         }
         let channels = self
             .durable
@@ -703,6 +701,18 @@ impl Cagents {
         })
     }
 
+    /// Why a project another window closed is still here: its open files
+    /// hold changes that only this window can save or discard.
+    fn closed_elsewhere_notice(&self, project: ProjectId) -> TransientNotice {
+        let name = self
+            .sidebar_model
+            .project(project)
+            .map_or("This project", |row| row.name.as_str());
+        TransientNotice::warning(format!(
+            "{name} was closed in another window. Save or discard the changes in its open files to finish closing it here."
+        ))
+    }
+
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
         let scope = self.project_session_scope(project);
         self.cards.iter().any(|(id, runtime)| {
@@ -808,12 +818,10 @@ impl Cagents {
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
         // Editors remain usable while session cleanup runs. Recheck their
-        // navigation fence before retiring any local owner; saving or recovery
-        // will resume the pending close through complete_closed_projects.
+        // navigation fence before retiring any local owner; saving, discarding
+        // or recovery resumes the pending close through complete_closed_projects.
         if self.project_has_unsaved_editors(id) {
-            self.status = Some(TransientNotice::warning(
-                "Project closed in another window; save your edits or resolve file recovery before removing its local row.",
-            ));
+            self.status = Some(self.closed_elsewhere_notice(id));
             return Task::none();
         }
         // An accepted checkout can begin after session census but before this
@@ -3917,6 +3925,52 @@ mod tests {
                     .is_open()
             );
         }
+    }
+
+    /// A project closed in another window keeps its row for an unsaved
+    /// editor. Discarding those edits and closing the editor finishes the
+    /// close; nothing else is left to wake it.
+    #[test]
+    fn discarding_the_last_unsaved_editor_resumes_a_peer_close() {
+        let repository = PathBuf::from("/repo");
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, repository.clone());
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        drop(app.close_shared_project(&repository));
+        assert!(app.project_ui.closing.contains_key(&project));
+        assert!(
+            !app.project_ui.close_in_flight.contains(&project),
+            "the unsaved editor holds the close"
+        );
+
+        drop(app.update(Message::CloseCard(card)));
+        drop(app.update(Message::DiscardAndCloseRepository(card)));
+        drop(app.update(Message::CommitClose(card)));
+
+        assert!(!app.cards.contains_key(&card));
+        assert!(
+            app.project_ui.close_in_flight.contains(&project),
+            "closing the discarded editor resumes the project's close"
+        );
     }
 
     #[test]
