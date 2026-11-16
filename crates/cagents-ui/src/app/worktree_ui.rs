@@ -1136,11 +1136,9 @@ impl Cagents {
         self.restore_workspace_scope(false, None)
     }
 
-    /// The nearest surviving project can provide a useful destination after
-    /// its saved checkout disappeared. An unrelated project's first worktree
-    /// is never a substitute for the removed one.
     /// The checkout a window saved on `removed` falls back to: one in the
-    /// project its record names, otherwise in the project that contains it.
+    /// project its record names, otherwise in the nearest project that
+    /// contains it. An unrelated project's worktree is never a substitute.
     fn surviving_project_scope(
         &self,
         removed: &Path,
