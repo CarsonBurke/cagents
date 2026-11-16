@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt},
@@ -149,6 +149,8 @@ pub enum HostedTerminalStartError {
     HostReadyTimeout { path: PathBuf, timeout: Duration },
     #[error("could not complete cagents daemon startup: {0}")]
     HostStartup(String),
+    #[error("cagents is updating; try again shortly")]
+    UpdateInProgress(#[source] crate::instance::UpdateInProgress),
     #[error("could not verify the running cagents daemon: {0}")]
     HostProtocol(#[source] crate::control::ControlError),
     #[error(
@@ -168,7 +170,18 @@ pub enum HostedTerminalStartError {
 #[derive(Default)]
 struct AttachmentState {
     confirmed: bool,
+    /// The exact terminal was accepted on the current observed connection.
+    /// Unlike remembered identity, this is retired when that connection ends.
+    current_proof: Option<HostSessionProof>,
     failure: Option<String>,
+}
+
+struct CurrentAttachment<'a>(&'a HostedPublishedState);
+
+impl Drop for CurrentAttachment<'_> {
+    fn drop(&mut self) {
+        self.0.clear_current_attachment();
+    }
 }
 
 #[derive(Default)]
@@ -182,7 +195,27 @@ struct RetainedFrame {
     expires: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputRejectionReason {
+    QueueFull,
+    WorkerClosed,
+    Coalesced,
+}
+
+impl InputRejectionReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::QueueFull => {
+                "The terminal input queue is full; input was not accepted. Retry when output drains."
+            }
+            Self::WorkerClosed => "The terminal is not accepting input; this input was not sent.",
+            Self::Coalesced => "Terminal input was refused before it was sent.",
+        }
+    }
+}
+
 struct HostedPublishedState {
+    execution_instance: Mutex<Option<uuid::Uuid>>,
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
     ///
@@ -214,6 +247,9 @@ struct HostedPublishedState {
     /// unrelated pointer event repainted the widget from this snapshot.
     announced_generation: AtomicU64,
     semantic_wake_pending: AtomicBool,
+    // At most one coalesced local refusal outlives a full semantic inbox. No
+    // input bytes, daemon error payload or unbounded per-request list is kept.
+    input_rejection: Mutex<Option<(Sender<TerminalEvent>, &'static str, InputRejectionReason)>>,
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
@@ -223,6 +259,19 @@ struct HostedPublishedState {
 }
 
 impl HostedPublishedState {
+    fn observe_worker(&self, instance: uuid::Uuid) -> bool {
+        let mut current = self
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if instance.is_nil() || current.is_some_and(|current| current != instance) {
+            return false;
+        }
+        *current = Some(instance);
+        self.request_semantic_wake();
+        true
+    }
+
     fn new(
         expected_host: Option<HostSessionProof>,
         visible: bool,
@@ -230,6 +279,7 @@ impl HostedPublishedState {
     ) -> Self {
         let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
         Self {
+            execution_instance: Mutex::new(None),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             retained: ArcSwapOption::empty(),
             generation: AtomicU64::new(0),
@@ -242,6 +292,7 @@ impl HostedPublishedState {
             acknowledgement_rx,
             announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
+            input_rejection: Mutex::new(None),
             output_observation: Mutex::new(OutputObservation::default()),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
                 TerminalVisibility::Visible
@@ -464,6 +515,66 @@ impl HostedPublishedState {
 
     fn begin_event_drain(&self) {
         self.semantic_wake_pending.store(false, Ordering::Release);
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let full = if let Some((events, operation, reason)) = pending.take() {
+            match events.try_send(Self::input_rejected(operation, reason)) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => false,
+                Err(TrySendError::Full(_)) => {
+                    *pending = Some((events, operation, reason));
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        drop(pending);
+        if full {
+            // This drain frees inbox capacity. A second semantic turn must
+            // retry the retained notice even if no further server data arrives.
+            self.request_semantic_wake();
+        }
+    }
+
+    fn input_rejected(operation: &'static str, reason: InputRejectionReason) -> TerminalEvent {
+        TerminalEvent::InputRejected {
+            operation,
+            message: reason.message().into(),
+        }
+    }
+
+    fn reject_input(
+        &self,
+        events: &Sender<TerminalEvent>,
+        operation: &'static str,
+        reason: InputRejectionReason,
+    ) {
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (operation, reason) = if let Some((_, _, previous)) = pending.as_ref() {
+            (
+                "send terminal input",
+                if *previous == reason {
+                    reason
+                } else {
+                    InputRejectionReason::Coalesced
+                },
+            )
+        } else {
+            (operation, reason)
+        };
+        match events.try_send(Self::input_rejected(operation, reason)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => *pending = None,
+            Err(TrySendError::Full(_)) => *pending = Some((events.clone(), operation, reason)),
+        }
+        drop(pending);
+        // Never wait on the UI here: Stop and queued ShutdownTerminal must
+        // remain serviceable while its bounded event channel is full.
+        self.request_semantic_wake();
     }
 
     fn hibernate(&self) {
@@ -610,12 +721,37 @@ impl HostedPublishedState {
         }
     }
 
-    fn confirm_attachment(&self) {
-        self.attachment
+    fn confirm_attachment(&self, proof: &HostSessionProof) {
+        {
+            let mut attachment = self
+                .attachment
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attachment.confirmed = true;
+            if attachment.failure.is_none() {
+                attachment.current_proof = Some(proof.clone());
+            }
+        }
+        self.attachment_changed.notify_all();
+        self.request_semantic_wake();
+    }
+
+    fn clear_current_attachment(&self) {
+        let changed = self
+            .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .confirmed = true;
-        self.attachment_changed.notify_all();
+            .current_proof
+            .take()
+            .is_some();
+        if changed {
+            self.attachment_changed.notify_all();
+            // Connection cleanup also runs during worker unwinding. Retire
+            // its state without invoking a callback during another panic.
+            if !thread::panicking() {
+                self.request_semantic_wake();
+            }
+        }
     }
 
     fn fail_attachment(&self, message: String) {
@@ -623,9 +759,11 @@ impl HostedPublishedState {
             .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attachment.current_proof = None;
         if attachment.failure.is_none() {
             attachment.failure = Some(message);
         }
+        drop(attachment);
         self.attachment_changed.notify_all();
     }
 
@@ -879,6 +1017,33 @@ impl HostedTerminalHandle {
         )
     }
 
+    /// Connect using an explicitly supplied caller scope. Every connection,
+    /// including reconnects, authenticates before restoring or mutating a terminal.
+    /// The authority is retained opaquely; this adapter never reads the environment.
+    pub fn attach_or_spawn_at_with_authority(
+        socket: impl Into<PathBuf>,
+        session: TerminalSession,
+        options: impl Into<TerminalSpawnOptions>,
+        expected_host: Option<HostSessionProof>,
+        authority: crate::agent_execution::Authority,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        let terminal_id = session.id;
+        Self::start(
+            socket.into(),
+            terminal_id,
+            ConnectionIntent::AuthorizedSpawn {
+                spawn: Box::new(SpawnIntent {
+                    session,
+                    options: options.into(),
+                }),
+                authority,
+            },
+            expected_host,
+            Arc::new(wake),
+        )
+    }
+
     fn start(
         socket: PathBuf,
         terminal_id: TerminalId,
@@ -896,7 +1061,9 @@ impl HostedTerminalHandle {
         let (event_tx, event_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
         let initially_visible = match &intent {
             ConnectionIntent::Attach => true,
-            ConnectionIntent::Spawn(spawn) => spawn.options.initially_visible,
+            ConnectionIntent::Spawn(spawn) | ConnectionIntent::AuthorizedSpawn { spawn, .. } => {
+                spawn.options.initially_visible
+            }
         };
         let published = Arc::new(HostedPublishedState::new(
             expected_host,
@@ -938,6 +1105,15 @@ impl HostedTerminalHandle {
         self.inner.terminal_id
     }
 
+    pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> {
+        *self
+            .inner
+            .published
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Returns the fenced host identity only after the daemon accepted this terminal.
     pub fn proof(&self) -> Option<HostSessionProof> {
         let confirmed = self
@@ -948,6 +1124,38 @@ impl HostedTerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .confirmed;
         confirmed.then(|| self.inner.published.proof()).flatten()
+    }
+
+    /// Why the daemon refused this terminal's attachment for good, if it did.
+    /// Unlike a detached snapshot, which a hibernated view also holds, this
+    /// is only set by the refusal itself.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failure
+            .clone()
+    }
+
+    /// The exact terminal accepted on the current observed connection.
+    /// Remembered recovery identity alone does not establish this state.
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        let attachment = self
+            .inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reason) = &attachment.failure {
+            return Err(reason.clone());
+        }
+        if self.inner.stop.is_requested() {
+            return Err("hosted terminal connection stopped".to_owned());
+        }
+        Ok(attachment.current_proof.clone())
     }
 
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
@@ -1024,10 +1232,26 @@ impl HostedTerminalHandle {
         origin: PasteOrigin,
     ) -> Result<(), TerminalSendError> {
         let text = text.into();
+        let bytes = text.len();
+        let origin_name = match origin {
+            PasteOrigin::Clipboard => "clipboard",
+            PasteOrigin::Drop => "drop",
+        };
         if text.len() > MAX_INPUT_BYTES {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+                stage = "hosted_enqueue", origin = origin_name, bytes, outcome = "too_large");
             return Err(TerminalSendError::PasteTooLarge(text.len()));
         }
-        self.try_command(ClientCommand::Paste(text, origin))
+        let result = self.try_command(ClientCommand::Paste(text, origin));
+        tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+        stage = "hosted_enqueue", origin = origin_name, bytes,
+        outcome = match &result {
+            Ok(()) => "queued",
+            Err(TerminalSendError::Full) => "full",
+            Err(TerminalSendError::Closed) => "closed",
+            Err(TerminalSendError::PasteTooLarge(_)) => "too_large",
+        });
+        result
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
@@ -1108,15 +1332,27 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn visibility(&self) -> TerminalVisibility {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn visibility(&self) -> TerminalVisibility {
         self.inner.published.desired_visibility()
     }
 
     /// Ends the connection for good, as giving up on a lost daemon does.
-    #[cfg(test)]
-    pub(crate) fn stop_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stop_for_test(&self) {
         self.inner.stop.request();
+    }
+
+    /// A stopped surface with an authenticated receipt for reducer fixtures.
+    /// Framed-socket tests exercise transport authentication separately.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.inner.stop.request();
+        assert!(self.inner.published.pin_proof(owner));
+        assert!(self.inner.published.observe_worker(worker));
+        self.inner.published.confirm_attachment(owner);
     }
 
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
@@ -1166,12 +1402,27 @@ impl HostedTerminalHandle {
 enum ConnectionIntent {
     Attach,
     Spawn(Box<SpawnIntent>),
+    AuthorizedSpawn {
+        spawn: Box<SpawnIntent>,
+        authority: crate::agent_execution::Authority,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct SpawnIntent {
     session: TerminalSession,
     options: TerminalSpawnOptions,
+}
+
+impl SpawnIntent {
+    fn matches_source(&self, current: &TerminalSession) -> bool {
+        // Runtime continuity, transcript location and resume hints can evolve.
+        current.id == self.session.id
+            && current.launch == self.session.launch
+            && current.owned_codex_listener == self.session.owned_codex_listener
+            && current.recovery_origin == self.session.recovery_origin
+            && current.predecessor == self.session.predecessor
+    }
 }
 
 #[derive(Debug)]
@@ -1181,26 +1432,58 @@ enum PendingRequest {
     Snapshot,
     Acknowledge,
     Command(&'static str),
+    // QueueFull for these commands proves no PTY input was admitted. Keep the
+    // type of the original request, rather than classifying an operation label.
+    Input(&'static str),
     Hibernate,
     Shutdown(Sender<()>),
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
-/// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance. On systemd hosts the daemon runs in its own
+/// Startup has a bounded base allowance, extended per session for upgrade
+/// restoration. The same allowance bounds authentication to a daemon started
+/// by this call or another launcher. On systemd hosts the daemon runs in its own
 /// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
 /// hosted sessions. Other hosts retain the detached process-group fallback.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
+pub fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+    match crate::device::existing_socket_path()? {
+        Some(socket) => Ok(socket),
+        None => daemon_socket_path(),
+    }
+}
+
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    if crate::instance::window_restore_policy()
+        == crate::instance::WindowRestorePolicy::ExistingOnly
+    {
+        // Background readers and model publishers share this boundary. A
+        // recovery window cannot turn an ordinary reconnect into a new daemon.
+        verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
+        return Ok(socket);
+    }
     if !crate::device::is_remote() {
         ensure_daemon_ready_at(&socket, application)?;
     }
+    Ok(socket)
+}
+
+/// Provider activation requested by a person, after an attach-only recovery.
+/// Its transport is separate from the window's automatic read-only readers.
+pub fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError> {
+    if let Some(socket) = crate::device::socket_path_for_explicit_action()
+        .map_err(HostedTerminalStartError::SocketPath)?
+    {
+        return Ok(socket);
+    }
+    let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
     Ok(socket)
 }
 
@@ -1213,7 +1496,13 @@ fn ensure_daemon_ready_at(
             // A listening socket can belong to an older development build.
             // Verify the wire protocol before opening a window whose actions
             // would otherwise all fail against that daemon.
-            return verify_daemon_protocol(stream);
+            // A concurrent launcher may still be restoring behind this bound
+            // listener. Authenticate with the same startup allowance as our
+            // own launch. Budget estimation is not readiness authority: a
+            // stale damaged checkpoint must not reject a serving daemon.
+            let timeout = crate::upgrade::handoff::startup_timeout()
+                .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
+            return verify_startup_stream(socket, stream, Instant::now() + timeout);
         }
         Err(error)
             if !matches!(
@@ -1229,6 +1518,8 @@ fn ensure_daemon_ready_at(
         Err(_) => {}
     }
 
+    refuse_update_launch(socket)?;
+
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe =
@@ -1240,15 +1531,32 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    start_daemon_at(
-        socket,
-        timeout,
-        &daemon_binary,
-        systemd_user_manager_available()
-            && !crate::instance::has_inherited_daemon_fence()
-                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
-        |scoped| spawn_daemon(&daemon_binary, application, scoped),
-    )?;
+    // User scopes execute the command locally and preserve explicitly
+    // forwarded descriptors, including both update admission and inventory.
+    // Recovery authority belongs to the verified daemon itself. A scope
+    // launcher must never receive or relay its receipt and continuous fences.
+    let recovery = crate::upgrade::recovery::has_inherited_receipt()
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    let scoped = systemd_user_manager_available() && !recovery;
+    start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
+        spawn_daemon(&daemon_binary, application, scoped)
+    })
+}
+
+/// The daemon binds its listener before restoring retained sessions and
+/// accepts clients only once restoration finishes, so a connected socket
+/// proves the reservation, not service. The handshake therefore shares the
+/// startup allowance: an ordinary five-second reply budget turned a restore of
+/// 34 sessions that took 5.5 s into a failed `daemon start` (#2400).
+fn start_and_verify_daemon_at(
+    socket: &Path,
+    timeout: Duration,
+    daemon_binary: &Path,
+    scoped: bool,
+    launch: impl FnMut(bool) -> io::Result<Child>,
+) -> Result<(), HostedTerminalStartError> {
+    let deadline = Instant::now() + timeout;
+    start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
     let stream =
@@ -1256,18 +1564,48 @@ fn ensure_daemon_ready_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_daemon_protocol(stream)
+    verify_startup_stream(socket, stream, deadline)
 }
 
-fn verify_daemon_protocol(stream: UnixStream) -> Result<(), HostedTerminalStartError> {
-    crate::control::ControlClient::from_stream(stream)
-        .map(|_| ())
-        .map_err(|error| match error {
-            crate::control::ControlError::UnsupportedVersion { actual } => {
-                HostedTerminalStartError::HostIncompatible { actual }
-            }
-            error => HostedTerminalStartError::HostProtocol(error),
-        })
+fn launch_is_updating(socket: &Path) -> Result<bool, HostedTerminalStartError> {
+    crate::instance::daemon_launch_is_updating(socket)
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))
+}
+
+fn refuse_update_launch(socket: &Path) -> Result<(), HostedTerminalStartError> {
+    if launch_is_updating(socket)? {
+        return Err(HostedTerminalStartError::UpdateInProgress(
+            crate::instance::UpdateInProgress,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_startup_stream(
+    socket: &Path,
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<(), HostedTerminalStartError> {
+    // A serving daemon remains usable during review. An ordinary reader of
+    // an update's bound-but-unready listener gets the normal handshake budget;
+    // only an admitted/inherited launch may need checkpoint restoration time.
+    let client = if launch_is_updating(socket)? {
+        crate::control::ControlClient::from_stream(stream)
+    } else {
+        crate::control::ControlClient::from_stream_until(stream, deadline)
+    };
+    verify_daemon_protocol(client)
+}
+
+fn verify_daemon_protocol(
+    client: Result<crate::control::ControlClient, crate::control::ControlError>,
+) -> Result<(), HostedTerminalStartError> {
+    client.map(|_| ()).map_err(|error| match error {
+        crate::control::ControlError::UnsupportedVersion { actual } => {
+            HostedTerminalStartError::HostIncompatible { actual }
+        }
+        error => HostedTerminalStartError::HostProtocol(error),
+    })
 }
 
 fn start_daemon_at(
@@ -1385,6 +1723,7 @@ fn spawn_daemon(
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     crate::instance::inherit_daemon_fence(&mut command)?;
+    crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut command)?;
     command.spawn()
 }
 
@@ -1408,11 +1747,14 @@ fn daemon_startup_ready(
             });
         }
     }
+    refuse_update_launch(socket)?;
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
-        // listener is deliberately absent until every session has restored.
-        if !crate::daemon::HostLease::is_held_at(socket)
+        // listener may not be bound yet; the lease proves its ownership.
+        if crate::daemon::lease_handoff::has_inherited_lease()
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+            || !crate::daemon::HostLease::is_held_at(socket)
+                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
         {
             return Err(HostedTerminalStartError::HostExited {
                 path: socket.to_owned(),
@@ -1694,6 +2036,29 @@ fn coalesce_client_scroll_command(
     ClientCommand::Scroll(TerminalScroll::Lines(delta))
 }
 
+// Measure provisional wire payload without allocating a second serialized
+// frame. Even a sparse decoded snapshot must fit the remaining aggregate cap.
+fn provisional_frame_bytes(envelope: &ServerEnvelope, limit: usize) -> Option<usize> {
+    struct Budget(usize);
+    impl io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(io::Error::other(
+                    "provisional source frame capacity exhausted",
+                ));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget(limit);
+    serde_json::to_writer(&mut budget, envelope).ok()?;
+    Some(limit - budget.0)
+}
+
 fn serve_connection(
     context: &ConnectionContext<'_>,
     carried: &mut Option<ClientCommand>,
@@ -1709,6 +2074,17 @@ fn serve_connection(
         stop,
     } = context;
     let terminal_id = *terminal_id;
+    published.clear_current_attachment();
+    // Retire currentness on every EOF, retry, stop, or unwind before the next
+    // connection can authenticate. The remembered proof remains unchanged.
+    let _attachment = CurrentAttachment(published);
+    if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
+        published
+            .attachment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .confirmed = false;
+    }
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
@@ -1739,11 +2115,17 @@ fn serve_connection(
         proof: None,
         request: ClientRequest::Connect {
             expected_host: published.proof(),
-            resume: vec![ResumeCursor {
-                terminal_id,
-                generation: published.snapshot_cursor(),
-                event_sequence: published.event_sequence.load(Ordering::Acquire),
-            }],
+            // Explicit callers must not confirm attachment before authentication.
+            // Trusted GUI connections keep their original atomic resume path.
+            resume: if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
+                Vec::new()
+            } else {
+                vec![ResumeCursor {
+                    terminal_id,
+                    generation: published.snapshot_cursor(),
+                    event_sequence: published.event_sequence.load(Ordering::Acquire),
+                }]
+            },
         },
     };
     if write_frame(&mut stream, &connect).is_err() {
@@ -1827,6 +2209,19 @@ fn serve_connection(
                         ),
                     );
                 }
+                if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !resumed.is_empty()
+                {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon resumed an explicit caller before authentication",
+                            false,
+                        ),
+                    );
+                }
                 let attached = resumed
                     .iter()
                     .any(|terminal| terminal.session.id == terminal_id && terminal.attached);
@@ -1841,7 +2236,7 @@ fn serve_connection(
                     {
                         return ConnectionEnd::Retry;
                     }
-                    published.confirm_attachment();
+                    published.confirm_attachment(&proof);
                     did_attach();
                 }
                 #[cfg(feature = "ui")]
@@ -1855,23 +2250,166 @@ fn serve_connection(
         }
     };
 
+    let mut next_request_id = connect_id + 1;
+    let mut authorized_existing = false;
+    if let ConnectionIntent::AuthorizedSpawn { spawn, authority } = intent {
+        // Keep all queued commands untouched until both replies are authenticated,
+        // correlated, and pinned to this connection's exact host proof.
+        let mut exchange = |request| -> Result<ServerResponse, ConnectionEnd> {
+            let request_id = next_request_id;
+            next_request_id += 1;
+            if write_frame(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request,
+                },
+            )
+            .is_err()
+            {
+                return Err(ConnectionEnd::Retry);
+            }
+            loop {
+                if stop.is_requested() {
+                    return Err(ConnectionEnd::Stop);
+                }
+                if Instant::now() >= handshake_deadline {
+                    return Err(ConnectionEnd::Retry);
+                }
+                let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+                    Ok(Some(envelope)) => envelope,
+                    Ok(None) => return Err(ConnectionEnd::Retry),
+                    Err(FrameError::Io(error)) if is_timeout(&error) => continue,
+                    Err(_) => return Err(ConnectionEnd::Retry),
+                };
+                if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
+                    return Err(reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "Daemon authentication reply changed protocol or host proof",
+                            false,
+                        ),
+                    ));
+                }
+                if envelope.request_id != Some(request_id) {
+                    return Err(reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon authentication reply was not correlated",
+                            false,
+                        ),
+                    ));
+                }
+                match envelope.message {
+                    ServerMessage::Response { response } => return Ok(response),
+                    ServerMessage::Error(error) => {
+                        return Err(reject_handshake(events, published, stop, error));
+                    }
+                    _ => {
+                        return Err(reject_handshake(
+                            events,
+                            published,
+                            stop,
+                            ProtocolError::new(
+                                ProtocolErrorCode::InvalidRequest,
+                                "Unexpected daemon authentication message",
+                                false,
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
+        match exchange(ClientRequest::Authenticate {
+            authority: authority.clone(),
+        }) {
+            Ok(ServerResponse::Accepted) => {}
+            Err(end) => return end,
+            _ => {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Daemon did not accept caller authentication",
+                        false,
+                    ),
+                );
+            }
+        }
+        let terminals = match exchange(ClientRequest::List) {
+            Ok(ServerResponse::Listed { terminals }) => terminals,
+            Err(end) => return end,
+            _ => {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Daemon did not return authenticated terminal inventory",
+                        false,
+                    ),
+                );
+            }
+        };
+        if let Some(terminal) = terminals
+            .iter()
+            .find(|terminal| terminal.session.id == terminal_id)
+        {
+            if !spawn.matches_source(&terminal.session) {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Existing terminal has a different original source",
+                        false,
+                    ),
+                );
+            }
+            authorized_existing = true;
+        }
+    }
+
     let mut connection = match ConnectionIo::new(stream, terminal_id) {
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
+    // This inner guard is dropped before ConnectionIo, whose destructor joins
+    // its reader. EOF/retry must retire currentness before that join can wait.
+    let _connected_attachment = CurrentAttachment(published);
 
-    let mut next_request_id = connect_id + 1;
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
 
     if !attached {
         let (kind, request) = match intent {
+            ConnectionIntent::AuthorizedSpawn { .. } if authorized_existing => (
+                PendingRequest::Attach,
+                ClientRequest::Attach {
+                    terminal_id,
+                    after_generation: published.snapshot_cursor(),
+                    after_event_sequence: published.event_sequence.load(Ordering::Acquire),
+                },
+            ),
             ConnectionIntent::Attach => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
@@ -1880,7 +2418,7 @@ fn serve_connection(
                     after_event_sequence: published.event_sequence.load(Ordering::Acquire),
                 },
             ),
-            ConnectionIntent::Spawn(spawn) => {
+            ConnectionIntent::Spawn(spawn) | ConnectionIntent::AuthorizedSpawn { spawn, .. } => {
                 let mut options = spawn.options.clone();
                 options.initially_visible = published.is_visible();
                 (
@@ -1907,52 +2445,81 @@ fn serve_connection(
     }
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
 
-    if send_request(
-        connection.writer(),
-        &proof,
-        &mut next_request_id,
-        &mut pending,
-        PendingRequest::Command("restore hosted terminal visibility"),
-        ClientRequest::SetVisibility {
-            terminal_id,
-            visibility: published.desired_visibility(),
-        },
-    )
-    .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-    let epoch = published
-        .output_observation
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .epoch;
-    if epoch != 0
-        && send_request(
-            connection.writer(),
-            &proof,
-            &mut next_request_id,
-            &mut pending,
-            PendingRequest::Command("restore terminal output observation"),
-            ClientRequest::TerminalAcknowledge { terminal_id, epoch },
-        )
-        .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-
+    // Explicit callers must validate the actual Attach/Spawn descriptor before
+    // restoring presentation or acknowledging a former output scope. Trusted
+    // GUI callers retain their existing pre-reply restoration order.
+    let mut presentation_restore_pending = true;
+    let mut provisional_frames = VecDeque::new();
+    let mut provisional_bytes = 0_usize;
     loop {
-        published.expire_retained(Instant::now());
-        if stop.is_requested() {
+        // Exact attachment wakes its waiter, which may immediately stop this
+        // explicit caller. Do not restore presentation after that stop.
+        if presentation_restore_pending
+            && matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
+            && stop.is_requested()
+        {
+            published.clear_current_attachment();
             connection.close();
             return ConnectionEnd::Stop;
         }
-        while pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        if presentation_restore_pending
+            && (!matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) || attached)
+        {
+            if send_request(
+                connection.writer(),
+                &proof,
+                &mut next_request_id,
+                &mut pending,
+                PendingRequest::Command("restore hosted terminal visibility"),
+                ClientRequest::SetVisibility {
+                    terminal_id,
+                    visibility: published.desired_visibility(),
+                },
+            )
+            .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+            let epoch = published
+                .output_observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .epoch;
+            if epoch != 0
+                && send_request(
+                    connection.writer(),
+                    &proof,
+                    &mut next_request_id,
+                    &mut pending,
+                    PendingRequest::Command("restore terminal output observation"),
+                    ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+                )
+                .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+
+            presentation_restore_pending = false;
+        }
+        published.expire_retained(Instant::now());
+        if stop.is_requested() {
+            published.clear_current_attachment();
+            connection.close();
+            return ConnectionEnd::Stop;
+        }
+        while pending.len() < MAX_IN_FLIGHT_REQUESTS && provisional_frames.is_empty() {
+            // An explicit caller also waits for the exact source reply before
+            // consuming queued input: inventory may change before Attach.
+            if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached {
+                break;
+            }
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -1968,15 +2535,21 @@ fn serve_connection(
             };
             command = coalesce_client_scroll_command(command, commands, carried);
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
             if matches!(command, ClientCommand::Stop) {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::Input(_)
+                | ClientCommand::Paste(..)
+                | ClientCommand::Key(_)
+                | ClientCommand::Mouse(_) => PendingRequest::Input(operation),
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -2019,7 +2592,11 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        let work = if attached && !provisional_frames.is_empty() {
+            ClientWork::Server(provisional_frames.pop_front().unwrap())
+        } else if pending.len() < MAX_IN_FLIGHT_REQUESTS
+            && !(matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached)
+        {
             wait_for_client_work(stop, commands, connection.incoming(), published)
         } else {
             wait_for_server_or_stop(stop, connection.incoming(), published)
@@ -2027,6 +2604,7 @@ fn serve_connection(
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2036,6 +2614,7 @@ fn serve_connection(
             }
             ClientWork::Server(envelope) => envelope,
             ClientWork::CommandsClosed => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2053,8 +2632,56 @@ fn serve_connection(
         if envelope.proof != proof {
             return ConnectionEnd::Retry;
         }
+        if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
+            && !attached
+            && envelope.request_id.is_none()
+            && matches!(
+                &envelope.message,
+                ServerMessage::TerminalObserved { terminal_id: id, .. }
+                    | ServerMessage::TerminalWorker { terminal_id: id, .. }
+                    | ServerMessage::Redraw { terminal_id: id, .. }
+                    | ServerMessage::Snapshot { terminal_id: id, .. }
+                    | ServerMessage::Event { terminal_id: id, .. }
+                    | ServerMessage::Synchronized { terminal_id: id, .. }
+                    if *id == terminal_id
+            )
+        {
+            // Host subscriptions are installed before their response is queued,
+            // so genuine broadcasts can precede the exact source descriptor.
+            // Hold them without publication, requests or cursor advancement;
+            // preserve their order only after that descriptor is authenticated.
+            let encoded_bytes = provisional_frame_bytes(
+                &envelope,
+                MAX_FRAME_BYTES.saturating_sub(provisional_bytes),
+            );
+            if provisional_frames.len() == EVENT_CAPACITY || encoded_bytes.is_none() {
+                // The old replay cursor is unchanged. Reconnect can ask the
+                // authenticated original for its replay instead of dropping data.
+                return ConnectionEnd::Retry;
+            }
+            provisional_bytes += encoded_bytes.unwrap();
+            provisional_frames.push_back(envelope);
+            continue;
+        }
 
         match envelope.message {
+            ServerMessage::TerminalWorker {
+                terminal_id: id,
+                instance,
+            } if envelope.request_id.is_none() && id == terminal_id => {
+                if !published.observe_worker(instance) {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "The attached terminal worker changed",
+                            false,
+                        ),
+                    );
+                }
+            }
             ServerMessage::Response { response } => {
                 let Some(request_id) = envelope.request_id else {
                     return ConnectionEnd::Retry;
@@ -2062,10 +2689,33 @@ fn serve_connection(
                 let Some(kind) = pending.remove(&request_id) else {
                     return ConnectionEnd::Retry;
                 };
+                // Diagnostic correlation only; IDs are scoped to this connection.
+                if matches!(&kind, PendingRequest::Input("paste into terminal")) {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if matches!(&response, ServerResponse::Accepted) {
+                        "accepted"
+                    } else {
+                        "unexpected_response"
+                    });
+                }
                 match (kind, response) {
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if let ConnectionIntent::AuthorizedSpawn { spawn, .. } = intent
+                            && !spawn.matches_source(&terminal.session)
+                        {
+                            return reject_handshake(
+                                events,
+                                published,
+                                stop,
+                                ProtocolError::new(
+                                    ProtocolErrorCode::InvalidRequest,
+                                    "Attached terminal has a different original source",
+                                    false,
+                                ),
+                            );
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2083,12 +2733,26 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if let ConnectionIntent::AuthorizedSpawn { spawn, .. } = intent
+                            && !spawn.matches_source(&terminal.session)
+                        {
+                            return reject_handshake(
+                                events,
+                                published,
+                                stop,
+                                ProtocolError::new(
+                                    ProtocolErrorCode::InvalidRequest,
+                                    "Attached terminal has a different original source",
+                                    false,
+                                ),
+                            );
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2106,7 +2770,7 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (
@@ -2141,12 +2805,16 @@ fn serve_connection(
                         }
                     }
                     (PendingRequest::Acknowledge, ServerResponse::Accepted)
-                    | (PendingRequest::Command(_), ServerResponse::Accepted) => {}
+                    | (PendingRequest::Command(_), ServerResponse::Accepted)
+                    | (PendingRequest::Input(_), ServerResponse::Accepted) => {}
                     (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
                     }
-                    (PendingRequest::Command(operation), unexpected) => {
+                    (
+                        PendingRequest::Command(operation) | PendingRequest::Input(operation),
+                        unexpected,
+                    ) => {
                         publish_event(
                             events,
                             published,
@@ -2162,6 +2830,21 @@ fn serve_connection(
                 }
             }
             ServerMessage::Error(error) => {
+                // Keep refusal diagnostics behind the same version/proof fence
+                // and an existing pending request, without retaining paste data.
+                if let Some(request_id) = envelope.request_id
+                    && matches!(
+                        pending.get(&request_id),
+                        Some(PendingRequest::Input("paste into terminal"))
+                    )
+                {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if error.code == ProtocolErrorCode::QueueFull {
+                        "queue_full"
+                    } else {
+                        "refused"
+                    });
+                }
                 if is_committed_daemon_shutdown(&error) {
                     // In-flight controls can reach the old daemon after its
                     // checkpoint commits. Keep the runtime alive until the
@@ -2185,8 +2868,36 @@ fn serve_connection(
                         ConnectionEnd::Stop
                     };
                 };
+                let request = pending.remove(&request_id);
+                if let Some(PendingRequest::Input(operation)) = &request {
+                    let refusal = match (error.code, error.retryable, error.message.as_str()) {
+                        (ProtocolErrorCode::QueueFull, true, _) => {
+                            Some(InputRejectionReason::QueueFull)
+                        }
+                        // These exact host admission errors precede any input
+                        // effect. Completion can race its response; keep the
+                        // attachment to receive the actual Completed event.
+                        (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            true,
+                            "the terminal worker has closed",
+                        )
+                        | (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            false,
+                            "terminal output has completed",
+                        ) => Some(InputRejectionReason::WorkerClosed),
+                        _ => None,
+                    };
+                    if let Some(reason) = refusal {
+                        // Version, proof and exact request correlation have
+                        // passed. Never replay this refused command.
+                        published.reject_input(events, *operation, reason);
+                        continue;
+                    }
+                }
                 let mut attachment_failed = false;
-                let operation = match pending.remove(&request_id) {
+                let operation = match request {
                     Some(PendingRequest::Attach) => {
                         attachment_failed = true;
                         published.mark_detached();
@@ -2204,7 +2915,9 @@ fn serve_connection(
                     Some(PendingRequest::Acknowledge) => "acknowledge hosted terminal redraw",
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
-                    Some(PendingRequest::Command(operation)) => operation,
+                    Some(PendingRequest::Command(operation) | PendingRequest::Input(operation)) => {
+                        operation
+                    }
                     None => return ConnectionEnd::Retry,
                 };
                 let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -2335,7 +3048,26 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    codec.write(
+    let paste = match &request {
+        ClientRequest::Paste {
+            terminal_id,
+            text,
+            origin,
+        } => Some((
+            *terminal_id,
+            text.len(),
+            match origin {
+                PasteOrigin::Clipboard => "clipboard",
+                PasteOrigin::Drop => "drop",
+            },
+        )),
+        _ => None,
+    };
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = "started");
+    }
+    let result = codec.write(
         stream,
         &ClientEnvelope {
             version: PROTOCOL_VERSION,
@@ -2343,7 +3075,12 @@ fn send_request(
             proof: Some(proof.clone()),
             request,
         },
-    )?;
+    );
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = if result.is_ok() { "written" } else { "failed" });
+    }
+    result?;
     pending.insert(request_id, kind);
     Ok(())
 }
@@ -2467,6 +3204,9 @@ fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    mod explicit_authority_tests;
+    mod input_rejection_tests;
+
     use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
 
     use crate::{
@@ -2475,6 +3215,17 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn attachment_worker_receipt_cannot_change_on_an_existing_surface() {
+        let state = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+        let original = uuid::Uuid::new_v4();
+        assert!(!state.observe_worker(uuid::Uuid::nil()));
+        assert!(state.observe_worker(original));
+        assert!(state.observe_worker(original));
+        state.mark_detached();
+        assert!(!state.observe_worker(uuid::Uuid::new_v4()));
+        assert_eq!(*state.execution_instance.lock().unwrap(), Some(original));
+    }
     #[test]
     fn stopping_an_attachment_interrupts_blocked_socket_io() {
         let stop = Arc::new(WorkerStop::default());
@@ -2527,6 +3278,118 @@ mod tests {
         // Match the daemon's explicit unlock: a concurrent fork can still own
         // a copy of the descriptor after this thread drops its copy.
         crate::daemon::HostLease::acquire_for_maintenance(&paths).unwrap()
+    }
+
+    #[test]
+    fn update_fence_interrupts_ordinary_readiness_but_preserves_admission_and_serving_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_READINESS";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::process::ExitStatusExt;
+
+            let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let socket = runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            std::fs::create_dir(socket.parent().unwrap()).unwrap();
+            let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+            let _worker_lease = hold_startup_lease(&socket);
+            let started = Instant::now();
+            let error = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HostedTerminalStartError::UpdateInProgress(_)
+            ));
+            assert!(crate::instance::is_update_in_progress(&error));
+            // This is an already-dispatched launch: a failed child plus the
+            // update worker's lease must not look like a restoring daemon.
+            let result = start_daemon_at(
+                &socket,
+                Duration::from_secs(125),
+                Path::new("fixture-daemon"),
+                false,
+                |_| Command::new("/bin/false").spawn(),
+            );
+            assert!(matches!(
+                result,
+                Err(HostedTerminalStartError::UpdateInProgress(_))
+            ));
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            for compatible in [true, false] {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                    let proof = proof("serving-during-review");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: if compatible {
+                                PROTOCOL_VERSION
+                            } else {
+                                PROTOCOL_VERSION + 1
+                            },
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: vec![],
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                });
+                let result =
+                    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+                if compatible {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(HostedTerminalStartError::HostIncompatible { .. })
+                    ));
+                }
+                server.join().unwrap();
+                std::fs::remove_file(&socket).unwrap();
+            }
+            drop(update);
+            let _admission = crate::instance::AdmissionFence::acquire().unwrap();
+            assert!(
+                !daemon_startup_ready(
+                    &socket,
+                    Duration::from_secs(125),
+                    Duration::from_secs(60),
+                    Some(ExitStatus::from_raw(1 << 8)),
+                )
+                .unwrap(),
+                "a declared concurrent admission still owns its restoration allowance"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2644,7 +3507,228 @@ mod tests {
     }
 
     #[test]
+    fn existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint() {
+        use std::io::Write;
+        const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
+        const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
+        let Ok(checkpoint) = std::env::var(CHILD) else {
+            for checkpoint in ["absent", "damaged"] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::create_dir(root.path().join("tmp")).unwrap();
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .env_clear()
+                    .env(CHILD, checkpoint)
+                    .env("HOME", root.path().join("home"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                    .env("TMPDIR", root.path().join("tmp"))
+                    .env("PATH", "/usr/bin:/bin")
+                    .args(["--exact", TEST, "--nocapture"]);
+                if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                    command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+                }
+                assert!(
+                    command.status().unwrap().success(),
+                    "{checkpoint} checkpoint fixture failed"
+                );
+            }
+            return;
+        };
+        let upgrade = crate::instance::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("daemon-upgrade");
+        if checkpoint == "damaged" {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::create_dir_all(&upgrade).unwrap();
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(upgrade.join("daemon-upgrade.json"))
+                .unwrap()
+                .write_all(b"damaged checkpoint")
+                .unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5_600));
+            let mut stream = accept_connection(&listener);
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            let proof = proof("restored-existing");
+            let _ = write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            );
+        });
+        let result = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+        server.join().unwrap();
+        result.unwrap();
+        if checkpoint == "absent" {
+            assert!(
+                !upgrade.exists(),
+                "budget estimation must not create upgrade storage"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(upgrade.join("daemon-upgrade.json")).unwrap(),
+                b"damaged checkpoint"
+            );
+        }
+    }
+
+    /// A fixture daemon whose listener is bound at launch and serves only
+    /// after `restore`, as `listener_before_restore` does.
+    fn restoring_daemon(
+        socket: &Path,
+        restore: Duration,
+    ) -> impl FnMut(bool) -> io::Result<Child> + use<> {
+        let socket = socket.to_owned();
+        move |_scoped| {
+            let listener = UnixListener::bind(&socket).unwrap();
+            thread::spawn(move || {
+                thread::sleep(restore);
+                // Readiness probes connect and close; answer the handshake.
+                loop {
+                    let mut stream = accept_connection(&listener);
+                    let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                        continue;
+                    };
+                    let proof = proof("restored");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                    return;
+                }
+            });
+            Command::new("/bin/true").spawn()
+        }
+    }
+
+    #[test]
+    fn launched_daemon_handshake_waits_out_restoration_beyond_five_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        // The #2400 rehearsal restored 34 sessions in 5.48 s; the CLI's ordinary
+        // handshake gave up at 5 s while the startup allowance was far larger.
+        let started = Instant::now();
+        start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(30),
+            Path::new("fixture-daemon"),
+            false,
+            restoring_daemon(&socket, Duration::from_millis(5_600)),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(5_600));
+    }
+
+    #[test]
+    fn launched_daemon_that_dies_while_restoring_fails_without_its_allowance() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let path = socket.clone();
+        let started = Instant::now();
+        let result = start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(60),
+            Path::new("fixture-daemon"),
+            false,
+            move |_scoped| {
+                let listener = UnixListener::bind(&path).unwrap();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    drop(listener);
+                });
+                Command::new("/bin/true").spawn()
+            },
+        );
+        assert!(
+            matches!(result, Err(HostedTerminalStartError::HostProtocol(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn scope_fixture_lease(root: &Path) -> crate::daemon::lease_handoff::LeaseHandoff {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.to_owned(),
+            socket: root.join("daemon.sock"),
+            lock: root.join("cagentsd.lock"),
+        };
+        let mut lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+        drop(lock);
+        crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap()
+    }
+
+    #[test]
+    fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("systemd-run");
+        // The scope launcher executes locally and preserves inherited fds.
+        // This fake checks the selected mode and reproduces that exec contract.
+        std::fs::write(&launcher, "#!/bin/sh\n[ \"$1\" = --user ] && [ \"$2\" = --scope ] || exit 7\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = scope_fixture_lease(root.path());
+        let mut command = daemon_launch_command(
+            Path::new("/bin/sh"),
+            crate::notifications::Application::Cagents,
+            true,
+        );
+        command.env("PATH", root.path()).args([
+            "-c",
+            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199",
+        ]);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
+        assert!(command.status().unwrap().success());
+    }
+
+    #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::io::{Read, Seek};
 
         if !systemd_user_manager_available() {
@@ -2652,6 +3736,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        let lease = scope_fixture_lease(directory.path());
         // Regular files avoid waiting for the background holder to close a pipe.
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
@@ -2686,12 +3771,14 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args(["-c", "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199 || exit 8; sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
         command
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
         let status = command.status().unwrap();
         assert!(
             status.success(),
@@ -2706,18 +3793,27 @@ mod tests {
         let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
         // SAFETY: this PID belongs to the fixture's own background sleep.
         unsafe { libc::kill(holder_pid, libc::SIGTERM) };
-        let holder_cgroup = holder_cgroup.unwrap();
-        let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        // Hybrid hosts also list v1 controllers (`1:net_cls:/`); membership
+        // is the unified hierarchy's `0::` entry, as in process_scope.
+        let unified = |cgroup: &str| {
+            cgroup
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .unwrap()
+                .to_owned()
+        };
+        let holder_cgroup = unified(&holder_cgroup.unwrap());
+        let caller = unified(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
         let mut lines = evidence.lines();
         let scope = lines.next().unwrap();
-        assert_ne!(scope, caller.trim());
+        assert_ne!(scope, caller);
         assert!(
             scope.contains("cagentsd-") && scope.ends_with(".scope"),
             "{scope}"
         );
         assert_eq!(lines.next(), Some("$HOME"));
         assert_eq!(lines.next(), Some("caller-value"));
-        assert_eq!(holder_cgroup.trim(), scope);
+        assert_eq!(holder_cgroup, scope);
     }
 
     #[test]
@@ -4133,7 +5229,12 @@ mod tests {
                     },
                 },
             );
-            let wake = wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Confirming the resumed attachment also wakes the view once,
+            // before any frame, so its owner sees the attachment is current.
+            let wake =
+                std::iter::repeat_with(|| wake_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+                    .find(|wake| wake.generation != 0)
+                    .unwrap();
             assert_eq!(wake.generation, generation);
             let observed = handle.snapshot();
             assert_eq!(observed.lines[0].cells[0].text, text);

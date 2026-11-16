@@ -2,7 +2,9 @@ mod accessibility;
 #[cfg(test)]
 mod accessibility_tests;
 mod links;
-pub(crate) use accessibility::ReviewInputBarrier;
+mod preview;
+pub use accessibility::ReviewInputBarrier;
+pub use preview::SnapshotPreview;
 
 use std::{
     cell::RefCell,
@@ -15,7 +17,7 @@ use std::{
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::graphics::text::{self as graphics_text, cosmic_text, font_system};
-use cosmic::iced::advanced::text::Paragraph as _;
+use cosmic::iced::advanced::text::{Blink, Paragraph as _};
 use cosmic::{
     Element, Renderer, Theme,
     iced::{
@@ -49,6 +51,19 @@ const REVIEW_BAR_HEIGHT: f32 = 24.0;
 /// How long the cursor stays lit, and then dark, while it blinks. 530ms is
 /// what xterm and Ghostty both default to.
 const BLINK_PHASE: Duration = Duration::from_millis(530);
+
+/// The terminal cursor's blink when the desktop states none, which rests lit
+/// once the cursor has held still for the shared text-cursor timeout, as
+/// VTE's does. A desktop blink replaces it, as it does VTE's.
+const BLINK: Blink = Blink::new(BLINK_PHASE);
+
+/// The blink a terminal cursor follows, or `None` when it holds steady: its
+/// program asked for a steady cursor, or the desktop turned blinking off, which
+/// holds even a cursor whose program asked for a blink.
+fn cursor_blink(program_blinks: bool, desktop: Option<Blink>) -> Option<Blink> {
+    let blink = desktop.unwrap_or(BLINK);
+    (program_blinks && blink.blinks()).then_some(blink)
+}
 
 /// How long a terminal's grid must hold still before its PTY follows it.
 ///
@@ -335,7 +350,7 @@ fn font(family: &'static str, key: Face) -> Font {
 /// would leak per frame. Each distinct name is therefore leaked exactly once,
 /// so repeated frames - and an edit back to a name already seen - allocate
 /// nothing. The set of families a user types is bounded in practice.
-pub(crate) fn monospace_font(family: &str) -> Font {
+pub fn monospace_font(family: &str) -> Font {
     font(
         intern_family(family),
         Face {
@@ -1021,6 +1036,10 @@ struct WidgetState {
     cursor_dark: bool,
     /// The cell the blink phase is anchored to.
     blink_anchor: Option<(u16, u16)>,
+    /// When the cursor last moved, took a key or regained focus: the blink's
+    /// timeout runs from here until the cursor rests lit. `None` while nothing
+    /// blinks.
+    blink_woke_at: Option<Instant>,
     /// Text being composed by the input method, held so the shell can paint it
     /// at the cursor until it is committed.
     preedit: Option<input_method::Preedit>,
@@ -1093,22 +1112,54 @@ impl WidgetState {
         }
     }
 
+    /// Restarts the blink lit, as typing does even when the cursor stays
+    /// where it was. Returns whether a frame is needed to show it: the cursor
+    /// had come to rest, or was in its dark phase.
+    fn restart_blink(&mut self) -> bool {
+        let resting = self.blink_woke_at.is_some() && self.blink_since.is_none();
+        let needs_frame = resting || self.cursor_dark;
+        self.blink_woke_at = None;
+        self.blink_since = None;
+        self.cursor_dark = false;
+        needs_frame
+    }
+
     /// Advances the cursor-blink phase to the frame instant `now` and returns
-    /// the instant the next phase begins.
+    /// the instant the cursor next changes, or `None` once it rests lit.
     ///
     /// The phase is driven from the frame clock and one scheduled redraw per
     /// phase rather than a frame subscription, so a terminal sitting at an idle
     /// prompt wakes the compositor twice a second instead of sixty times - and
     /// an unfocused or steady-cursor terminal, which never calls this, wakes it
     /// not at all.
-    fn advance_blink(&mut self, now: Instant, anchor: Option<(u16, u16)>) -> Instant {
+    fn advance_blink(
+        &mut self,
+        now: Instant,
+        anchor: Option<(u16, u16)>,
+        blink: Blink,
+    ) -> Option<Instant> {
+        // Only the cursor moving or the blink starting afresh restarts the
+        // timeout; a frame drawn for something else must not wake a cursor
+        // that has come to rest. The rest follows the timeout given now, so
+        // a desktop that changes it takes effect without waiting for input.
+        let woke_at = match self.blink_woke_at {
+            Some(woke_at) if self.blink_anchor == anchor => woke_at,
+            _ => *self.blink_woke_at.insert(now),
+        };
+        let rests_at = woke_at + blink.timeout;
+        if now >= rests_at {
+            self.blink_since = None;
+            self.blink_anchor = anchor;
+            self.cursor_dark = false;
+            return None;
+        }
         // Frames stop entirely while a terminal is unfocused or occluded, so a
         // resumed cycle - or a cursor that just moved under the user's typing -
         // restarts lit rather than folding an unbounded number of phases.
         let since = match self.blink_since {
             Some(since)
                 if self.blink_anchor == anchor
-                    && now.saturating_duration_since(since) < BLINK_PHASE * 2 =>
+                    && now.saturating_duration_since(since) < blink.interval * 2 =>
             {
                 since
             }
@@ -1119,12 +1170,23 @@ impl WidgetState {
                 now
             }
         };
-        if now.saturating_duration_since(since) >= BLINK_PHASE {
+        let next = if now.saturating_duration_since(since) >= blink.interval {
             self.cursor_dark = !self.cursor_dark;
-            self.blink_since = Some(since + BLINK_PHASE);
-            return since + BLINK_PHASE * 2;
-        }
-        since + BLINK_PHASE
+            self.blink_since = Some(since + blink.interval);
+            since + blink.interval * 2
+        } else {
+            since + blink.interval
+        };
+        Some(next.min(rests_at))
+    }
+
+    /// Holds the cursor lit with nothing to animate, so the next blink starts
+    /// lit and no further frames are asked for.
+    fn hold_blink(&mut self, anchor: Option<(u16, u16)>) {
+        self.blink_since = None;
+        self.blink_anchor = anchor;
+        self.blink_woke_at = None;
+        self.cursor_dark = false;
     }
 
     /// Converts one wheel event's `travel` into the work it implies, carrying
@@ -1518,7 +1580,7 @@ impl<Message> TerminalWidget<Message> {
     }
 
     /// Names the input surface for focus handoffs from tabs and other panes.
-    pub(crate) fn review_boundary(
+    pub fn review_boundary(
         mut self,
         barrier: ReviewInputBarrier,
         suppress_focus_reports: bool,
@@ -1926,12 +1988,19 @@ impl<Message> TerminalWidget<Message> {
     /// at the moment the text arrives.
     fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
         if self.read_only || text.is_empty() {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                stage = "widget_dispatch", bytes = text.len(),
+                outcome = if self.read_only { "read_only" } else { "empty" });
             return;
         }
         if let Some(callback) = &self.on_paste {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                stage = "widget_dispatch", bytes = text.len(), outcome = "callback");
             shell.publish(callback(text.to_owned()));
             return;
         }
+        tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+            stage = "widget_dispatch", bytes = text.len(), outcome = "hosted");
         if let Err(error) = self.handle.paste(text, PasteOrigin::Clipboard) {
             self.publish_error(error, shell);
         }
@@ -2498,8 +2567,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                             }
                         }
                         ClipboardChord::Paste => {
-                            if let Some(text) = clipboard.read(clipboard::Kind::Standard) {
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "standard", outcome = "started");
+                            let text = clipboard.read(clipboard::Kind::Standard);
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "standard",
+                                bytes = text.as_ref().map_or(0, String::len),
+                                outcome = if text.is_some() { "some" } else { "none" });
+                            if let Some(text) = text {
                                 self.paste(&text, shell);
+                                if state.restart_blink() {
+                                    shell.request_redraw();
+                                }
                             }
                         }
                     }
@@ -2546,7 +2625,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     *repeat,
                 );
                 match self.handle.key(input) {
-                    Ok(()) => shell.capture_event(),
+                    Ok(()) => {
+                        if state.restart_blink() {
+                            shell.request_redraw();
+                        }
+                        shell.capture_event();
+                    }
                     Err(error) => self.publish_error(error, shell),
                 }
             }
@@ -2652,13 +2736,24 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 position,
                                 agent_drag,
                             );
+                            state.restart_blink();
                             shell.request_redraw();
                         }
                         IcedMouseButton::Middle if ours => {
                             // The primary selection is what a middle click
                             // pastes everywhere else on X11 and Wayland.
-                            if let Some(text) = clipboard.read(clipboard::Kind::Primary) {
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "primary", outcome = "started");
+                            let text = clipboard.read(clipboard::Kind::Primary);
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "primary",
+                                bytes = text.as_ref().map_or(0, String::len),
+                                outcome = if text.is_some() { "some" } else { "none" });
+                            if let Some(text) = text {
                                 self.paste(&text, shell);
+                                if state.restart_blink() {
+                                    shell.request_redraw();
+                                }
                             }
                         }
                         button => {
@@ -2878,6 +2973,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 shell.capture_event();
             }
+            // Coming back to the window restarts the blink, as VTE does on
+            // focus-in, so the cursor shows where typing will land.
+            Event::Window(window::Event::Focused) => {
+                if state.restart_blink() {
+                    shell.request_redraw();
+                }
+            }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 // Every viewport move folded since the last frame is applied
                 // exactly once, here, so that a gesture costs one command, one
@@ -2891,14 +2993,16 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     .cursor
                     .filter(|caret| caret.visible && !self.read_only);
                 let anchor = caret.map(|caret| (caret.column, caret.row));
-                if self.model_focused && caret.is_some_and(|caret| caret.blinking) {
-                    shell.request_redraw_at(state.advance_blink(*now, anchor));
-                } else {
-                    // Nothing to animate: drop the phase so the next blink
-                    // starts lit, and ask for no further frames.
-                    state.blink_since = None;
-                    state.blink_anchor = anchor;
-                    state.cursor_dark = false;
+                let blink = caret
+                    .filter(|_| self.model_focused)
+                    .and_then(|caret| cursor_blink(caret.blinking, Blink::preferred()));
+                match blink {
+                    Some(blink) => {
+                        if let Some(next) = state.advance_blink(*now, anchor, blink) {
+                            shell.request_redraw_at(next);
+                        }
+                    }
+                    None => state.hold_blink(anchor),
                 }
                 // The shell only honours an input-method request raised during
                 // a redraw, and only the focused terminal returns an enabled
@@ -2933,6 +3037,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     {
                         self.publish_error(error, shell);
                     }
+                    state.restart_blink();
                     shell.capture_event();
                     shell.request_redraw();
                 }
@@ -4234,30 +4339,154 @@ mod tests {
         let anchor = Some((3, 4));
         // The first frame lights the cursor and asks for exactly one redraw,
         // one phase out.
-        assert_eq!(state.advance_blink(start, anchor), start + BLINK_PHASE);
+        assert_eq!(
+            state.advance_blink(start, anchor, BLINK),
+            Some(start + BLINK_PHASE)
+        );
         assert!(!state.cursor_dark);
         // Crossing a boundary flips the phase once.
         assert_eq!(
-            state.advance_blink(start + BLINK_PHASE, anchor),
-            start + BLINK_PHASE * 2
+            state.advance_blink(start + BLINK_PHASE, anchor, BLINK),
+            Some(start + BLINK_PHASE * 2)
         );
         assert!(state.cursor_dark);
         // A frame inside the phase changes nothing and does not move the
         // deadline.
         assert_eq!(
-            state.advance_blink(start + BLINK_PHASE + BLINK_PHASE / 2, anchor),
-            start + BLINK_PHASE * 2
+            state.advance_blink(start + BLINK_PHASE + BLINK_PHASE / 2, anchor, BLINK),
+            Some(start + BLINK_PHASE * 2)
         );
         assert!(state.cursor_dark);
         // A long gap - unfocused, occluded - restarts the cycle lit instead of
         // folding every elapsed phase.
         let resumed = start + BLINK_PHASE * 9;
-        state.advance_blink(resumed, anchor);
+        state.advance_blink(resumed, anchor, BLINK);
         assert!(!state.cursor_dark);
-        state.advance_blink(resumed + BLINK_PHASE, anchor);
+        state.advance_blink(resumed + BLINK_PHASE, anchor, BLINK);
         assert!(state.cursor_dark);
         // A cursor that moved - the user typed - is lit again immediately.
-        state.advance_blink(resumed + BLINK_PHASE, Some((3, 5)));
+        state.advance_blink(resumed + BLINK_PHASE, Some((3, 5)), BLINK);
+        assert!(!state.cursor_dark);
+    }
+
+    #[test]
+    fn a_still_cursor_stops_blinking_lit_until_it_moves() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((3, 4));
+        let mut frame = start;
+        let mut frames = 0;
+        // Follow every redraw the blink asks for, as the shell would.
+        while let Some(next) = state.advance_blink(frame, anchor, BLINK) {
+            assert!(next > frame);
+            frame = next;
+            frames += 1;
+            assert!(frames < 100, "the blink never came to rest");
+        }
+        assert_eq!(frame, start + BLINK.timeout);
+        assert!(!state.cursor_dark);
+        // Frames drawn for something else leave the resting cursor lit.
+        let later = frame + BLINK_PHASE * 7;
+        assert_eq!(state.advance_blink(later, anchor, BLINK), None);
+        assert!(!state.cursor_dark);
+        // Moving the cursor starts a fresh blink with a fresh timeout.
+        assert_eq!(
+            state.advance_blink(later, Some((3, 5)), BLINK),
+            Some(later + BLINK_PHASE)
+        );
+        state.advance_blink(later + BLINK_PHASE, Some((3, 5)), BLINK);
+        assert!(state.cursor_dark);
+    }
+
+    #[test]
+    fn a_desktop_blink_sets_the_phase_and_the_rest() {
+        let desktop = Blink {
+            interval: Duration::from_millis(600),
+            timeout: Duration::from_secs(3),
+        };
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((0, 0));
+        assert_eq!(
+            state.advance_blink(start, anchor, desktop),
+            Some(start + desktop.interval)
+        );
+        state.advance_blink(start + desktop.interval, anchor, desktop);
+        assert!(state.cursor_dark);
+        let mut frame = start + desktop.interval;
+        while let Some(next) = state.advance_blink(frame, anchor, desktop) {
+            frame = next;
+        }
+        assert_eq!(frame, start + desktop.timeout);
+        assert!(!state.cursor_dark);
+    }
+
+    #[test]
+    fn a_desktop_with_blinking_off_holds_even_a_blinking_program_steady() {
+        let desktop = Blink {
+            interval: Duration::from_millis(600),
+            timeout: Duration::from_secs(3),
+        };
+        assert_eq!(cursor_blink(true, None), Some(BLINK));
+        assert_eq!(cursor_blink(true, Some(desktop)), Some(desktop));
+        assert_eq!(cursor_blink(false, Some(desktop)), None);
+        assert_eq!(cursor_blink(true, Some(Blink::STEADY)), None);
+        // Turned off mid-blink, the dark cursor is lit again and a later blink
+        // starts afresh.
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((0, 0));
+        state.advance_blink(start, anchor, BLINK);
+        state.advance_blink(start + BLINK_PHASE, anchor, BLINK);
+        assert!(state.cursor_dark);
+        state.hold_blink(anchor);
+        assert!(!state.cursor_dark);
+        let later = start + BLINK_PHASE * 3;
+        assert_eq!(
+            state.advance_blink(later, anchor, BLINK),
+            Some(later + BLINK_PHASE)
+        );
+    }
+
+    #[test]
+    fn a_changed_timeout_moves_the_rest_without_new_input() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((0, 0));
+        state.advance_blink(start, anchor, BLINK);
+        let shorter = Blink {
+            interval: BLINK_PHASE,
+            timeout: Duration::from_secs(2),
+        };
+        let past_it = start + Duration::from_secs(2);
+        assert_eq!(state.advance_blink(past_it, anchor, shorter), None);
+        assert!(!state.cursor_dark);
+    }
+
+    #[test]
+    fn typing_wakes_a_resting_cursor_where_it_stands() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((3, 4));
+        // Nothing has blinked yet, so a key needs no frame of its own.
+        assert!(!state.restart_blink());
+        let mut frame = start;
+        while let Some(next) = state.advance_blink(frame, anchor, BLINK) {
+            frame = next;
+        }
+        // A key the child answers without moving the cursor, such as
+        // Backspace at the start of a prompt, still restarts the blink lit.
+        assert!(state.restart_blink());
+        let typed = frame + BLINK_PHASE * 3;
+        assert_eq!(
+            state.advance_blink(typed, anchor, BLINK),
+            Some(typed + BLINK_PHASE)
+        );
+        assert!(!state.cursor_dark);
+        state.advance_blink(typed + BLINK_PHASE, anchor, BLINK);
+        assert!(state.cursor_dark);
+        // Typing during the dark phase brings the cursor straight back.
+        assert!(state.restart_blink());
         assert!(!state.cursor_dark);
     }
 

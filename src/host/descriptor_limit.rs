@@ -64,8 +64,56 @@ fn current() -> Option<libc::rlimit> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Call only in a private subprocess: both the limit and INHERITED belong
+    /// to the process, rather than to the current test thread.
+    pub(crate) fn raise_with_fixture_limit() -> libc::rlimit {
+        let mut limit = current().unwrap();
+        assert!(
+            limit.rlim_max > 64,
+            "fixture needs room below the hard limit"
+        );
+        limit.rlim_cur = limit.rlim_cur.min(1024).min(limit.rlim_max - 1);
+        // SAFETY: the initialized value only lowers the current soft limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        raise();
+        assert_daemon_limit_remains_raised(&limit);
+        limit
+    }
+
+    pub(crate) fn assert_daemon_limit_remains_raised(original: &libc::rlimit) {
+        let raised = current().unwrap();
+        assert_eq!(raised.rlim_cur, original.rlim_max);
+        assert_eq!(raised.rlim_max, original.rlim_max);
+    }
+
+    pub(crate) fn assert_process_limit(pid: u32, expected: &libc::rlimit) {
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let mut fields = limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
+            .expect("kernel reports the open-descriptor limit")
+            .split_whitespace();
+        let format = |limit: libc::rlim_t| {
+            if limit == libc::RLIM_INFINITY {
+                "unlimited".to_owned()
+            } else {
+                limit.to_string()
+            }
+        };
+        assert_eq!(
+            fields.next().unwrap(),
+            format(expected.rlim_cur),
+            "process {pid} must retain the incoming soft descriptor limit"
+        );
+        assert_eq!(
+            fields.next().unwrap(),
+            format(expected.rlim_max),
+            "process {pid} must retain the incoming hard descriptor limit"
+        );
+    }
 
     #[test]
     fn children_start_with_the_limit_the_daemon_was_given() {
@@ -94,15 +142,8 @@ mod tests {
         }
         // Both RLIMIT_NOFILE and INHERITED belong to the process. Exercise
         // them in isolation from the descriptor-heavy parallel host tests.
-        let mut limit = current().unwrap();
         // A daemon started with the customary soft limit, below its hard one.
-        limit.rlim_cur = limit.rlim_cur.min(1024).min(limit.rlim_max - 1);
-        // SAFETY: `limit` is a live rlimit; lowering a soft limit is always
-        // permitted.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-        raise();
-        let raised = current().unwrap();
-        assert_eq!(raised.rlim_cur, raised.rlim_max);
+        let limit = raise_with_fixture_limit();
 
         let mut child = Command::new("/bin/sh");
         child.args(["-c", "ulimit -n"]);
@@ -113,5 +154,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             INHERITED.get().unwrap().rlim_cur.to_string()
         );
+        assert_daemon_limit_remains_raised(&limit);
     }
 }

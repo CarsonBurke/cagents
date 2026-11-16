@@ -6,16 +6,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
     git_watch,
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
-    repository::{
-        CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot,
-        WorktreeRecord,
-    },
+    repository::{CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot},
     work::{Comparison, Dirty, Head},
 };
 
@@ -44,6 +42,9 @@ pub(super) struct Worktree {
     pub link: Option<LinkedIssue>,
     /// Why this worktree's status could not be read; its siblings still were.
     pub error: Option<String>,
+    /// When `dirty` was last read from Git, so a poll can re-read only the
+    /// worktrees that are due.
+    pub status_read_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +80,9 @@ pub(super) struct Local {
     pub ancestry: BTreeMap<(String, String), bool>,
     pub plan: Option<Arc<git_watch::Project>>,
     pub plan_error: Option<String>,
-    records: Vec<WorktreeRecord>,
+    /// Checkouts a failed plan read was asked to re-read. A retry re-reads
+    /// them again while reusing every other retained census.
+    plan_retry: BTreeSet<WorktreeId>,
     divergence: HashMap<(String, String), Divergence>,
 }
 
@@ -148,8 +151,8 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
 
     let mut worktrees = Vec::new();
     for record in records.iter().filter(|record| !record.bare) {
-        let old = previous
-            .and_then(|previous| previous.worktrees.iter().find(|old| old.id == record.id));
+        let old =
+            previous.and_then(|previous| previous.worktrees.iter().find(|old| old.id == record.id));
         // A shared ref change names no worktree; a commit, reset or branch
         // switch moves the head `git worktree list` reports.
         let reread = full
@@ -166,10 +169,12 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             created_at_unix_ms: record
                 .created_at_unix_ms
                 .and_then(|at| u64::try_from(at).ok()),
-            branch: record
-                .branch
-                .as_deref()
-                .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).to_owned()),
+            branch: record.branch.as_deref().map(|branch| {
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_owned()
+            }),
             head: record.head_oid.clone().map(|oid| Head {
                 oid,
                 committed_at_unix_ms: None,
@@ -178,10 +183,14 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             dirty: None,
             link: None,
             error: None,
+            status_read_at: None,
         };
         if reread {
             match git.activity_status(&record.path, cancellation) {
-                Ok(status) => apply_status(&mut worktree, &status),
+                Ok(status) => {
+                    apply_status(&mut worktree, &status);
+                    worktree.status_read_at = Some(Instant::now());
+                }
                 // Its own removal is often what the scan was woken for, and
                 // one missing checkout must not fail its siblings.
                 Err(_) if checkout_removed(&record.path) => continue,
@@ -189,6 +198,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             }
         } else if let Some(old) = old {
             worktree.dirty = old.dirty.clone();
+            worktree.status_read_at = old.status_read_at;
             if worktree.head.is_none() {
                 worktree.head = old.head.clone();
             }
@@ -234,7 +244,10 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let times = git
             .commit_times(repository, &missing_times, cancellation)
             .unwrap_or_default();
-        for head in worktrees.iter_mut().filter_map(|worktree| worktree.head.as_mut()) {
+        for head in worktrees
+            .iter_mut()
+            .filter_map(|worktree| worktree.head.as_mut())
+        {
             if head.committed_at_unix_ms.is_none() {
                 head.committed_at_unix_ms = times.get(&head.oid).copied();
             }
@@ -344,9 +357,9 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         };
         for head in heads {
             let key = (branch.oid.clone(), head.clone());
-            let known = (branch.oid == *head).then_some(true).or_else(|| {
-                previous.and_then(|previous| previous.ancestry.get(&key).copied())
-            });
+            let known = (branch.oid == *head)
+                .then_some(true)
+                .or_else(|| previous.and_then(|previous| previous.ancestry.get(&key).copied()));
             let contained = match known {
                 Some(contained) => Some(contained),
                 None => git
@@ -365,31 +378,56 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         }
     }
 
-    let vanished = previous.is_some_and(|previous| {
-        previous
-            .records
-            .iter()
-            .any(|old| !records.iter().any(|record| record.id == old.id))
-    });
+    // A periodic scan also repairs topology events the watcher missed. Compare
+    // the plan with the checkouts this scan actually accepted, rather than
+    // only looking for vanished records: newly discovered or moved checkouts
+    // otherwise get cards without ever joining the watch plan. Comparing the
+    // retained plan also retries a membership change whose plan read failed.
+    let roots = worktrees
+        .iter()
+        .map(|worktree| (worktree.id, &worktree.path))
+        .collect::<BTreeMap<_, _>>();
     let previous_plan = previous.and_then(|previous| previous.plan.clone());
+    let membership_changed = previous_plan.as_ref().is_none_or(|plan| {
+        plan.worktrees.len() != roots.len()
+            || plan
+                .worktrees
+                .iter()
+                .any(|worktree| roots.get(&worktree.id).copied() != Some(&worktree.root))
+    });
+    let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
+    let mut plan_retry = BTreeSet::new();
     let (plan, plan_error) =
-        if previous_plan.is_none() || change.membership || change.topology || vanished {
+        if membership_changed || change.membership || change.topology || retry_plan {
             let listed = records
                 .iter()
-                .filter(|record| worktrees.iter().any(|worktree| worktree.id == record.id))
+                .filter(|record| roots.contains_key(&record.id))
                 .cloned()
                 .collect::<Vec<_>>();
+            // A failed read may have been the only one told which checkouts
+            // changed. Carry those IDs until a read succeeds, so a retry
+            // refreshes them without discarding every other census.
+            let changed = previous
+                .map(|previous| &previous.plan_retry)
+                .into_iter()
+                .flatten()
+                .chain(&change.worktrees)
+                .copied()
+                .collect::<BTreeSet<_>>();
             match git_watch::Project::read_changed(
                 id,
                 repository.to_path_buf(),
                 &listed,
                 cancellation,
                 previous_plan.as_deref(),
-                &change.worktrees,
+                &changed,
             ) {
                 Ok(plan) => (Some(Arc::new(plan)), None),
                 // Without a plan the project is polled; its cards still stand.
-                Err(error) => (previous_plan, Some(error)),
+                Err(error) => {
+                    plan_retry = changed;
+                    (previous_plan, Some(error))
+                }
             }
         } else {
             (
@@ -408,7 +446,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         ancestry,
         plan,
         plan_error,
-        records,
+        plan_retry,
         divergence,
     })
 }
@@ -568,12 +606,23 @@ mod tests {
         git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
             &root,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
         );
         let linked = directory.path().join("linked");
         git(
             &root,
-            &["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
         );
         std::fs::write(linked.join("README"), "two\n").unwrap();
         git(&linked, &["commit", "-q", "-am", "two"]);
@@ -649,7 +698,11 @@ mod tests {
         assert!(first.worktrees.iter().any(|worktree| worktree.primary));
 
         assert_eq!(
-            first.branches.keys().map(String::as_str).collect::<Vec<_>>(),
+            first
+                .branches
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             ["feature", "main", "mine"],
             "a branch without a worktree or pull request is not a candidate"
         );
@@ -689,11 +742,33 @@ mod tests {
         };
         assert_eq!(dirty(&second, &fixture.root), 1);
         assert_eq!(dirty(&second, &fixture.linked), 1, "not re-read");
-        let third = run(&fixture, Some(&second), &git_watch::Change {
-            topology: true,
-            ..git_watch::Change::default()
-        });
+        // Each worktree remembers when its status was last read, which the
+        // board's polls are scheduled from.
+        let read_at = |local: &Local, path: &Path| {
+            local
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .unwrap()
+                .status_read_at
+                .unwrap()
+        };
+        assert!(read_at(&second, &fixture.root) > read_at(&first, &fixture.root));
+        assert_eq!(
+            read_at(&second, &fixture.linked),
+            read_at(&first, &fixture.linked),
+            "carried forward with the status it dates"
+        );
+        let third = run(
+            &fixture,
+            Some(&second),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         assert_eq!(dirty(&third, &fixture.linked), 0);
+        assert!(read_at(&third, &fixture.linked) > read_at(&second, &fixture.linked));
 
         // A shared ref change re-reads the worktree whose head it moved and
         // carries the others forward.
@@ -715,11 +790,241 @@ mod tests {
         let fixture = fixture();
         let first = run(&fixture, None, &git_watch::Change::default());
         std::fs::remove_dir_all(&fixture.linked).unwrap();
-        let second = run(&fixture, Some(&first), &git_watch::Change {
-            topology: true,
-            ..git_watch::Change::default()
-        });
+        let second = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         assert_eq!(second.worktrees.len(), 1);
         assert!(second.worktrees[0].primary);
+    }
+
+    #[test]
+    fn polling_discovers_new_worktrees_in_the_watch_plan_without_topology_events() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let added = fixture.root.parent().unwrap().join("added");
+        git(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "added",
+                added.to_str().unwrap(),
+            ],
+        );
+        // A periodic rescan names only worktrees known before the scan. It
+        // cannot manufacture the missing topology notification for this one.
+        let poll = git_watch::Change {
+            worktrees: first.worktrees.iter().map(|worktree| worktree.id).collect(),
+            ..git_watch::Change::default()
+        };
+        let second = run(&fixture, Some(&first), &poll);
+        let added = added.canonicalize().unwrap();
+        assert!(
+            second
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == added)
+        );
+        let plan = second.plan.as_ref().unwrap();
+        assert!(plan.worktrees.iter().any(|worktree| worktree.root == added));
+        assert!(!Arc::ptr_eq(first.plan.as_ref().unwrap(), plan));
+
+        // Ordinary scans must not repeatedly reconfigure the monitor once
+        // all discovered checkouts belong to the plan.
+        let third = run(&fixture, Some(&second), &poll);
+        assert!(Arc::ptr_eq(plan, third.plan.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn polling_replaces_a_moved_checkout_root_in_the_watch_plan() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let moved = fixture.root.parent().unwrap().join("moved");
+        git(
+            &fixture.root,
+            &[
+                "worktree",
+                "move",
+                fixture.linked.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
+        let second = run(&fixture, Some(&first), &git_watch::Change::default());
+        let plan = second.plan.as_ref().unwrap();
+        let moved = moved.canonicalize().unwrap();
+        assert!(plan.worktrees.iter().any(|worktree| worktree.root == moved));
+        assert!(
+            !plan
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.root == fixture.linked)
+        );
+        assert_eq!(plan.worktrees.len(), second.worktrees.len());
+    }
+
+    #[test]
+    fn polling_retries_a_discovered_checkout_after_its_plan_read_failed() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let added = fixture.root.parent().unwrap().join("added");
+        git(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "added",
+                added.to_str().unwrap(),
+            ],
+        );
+        // The administrative worktree list still names this checkout, but
+        // its temporarily invalid marker prevents reading its watch plan.
+        let marker = added.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let failed = run(&fixture, Some(&first), &git_watch::Change::default());
+        assert!(failed.plan_error.is_some());
+        assert!(Arc::ptr_eq(
+            first.plan.as_ref().unwrap(),
+            failed.plan.as_ref().unwrap()
+        ));
+        assert!(
+            failed
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == added)
+        );
+
+        // A later scan no longer has a new record relative to Local. Its
+        // retained plan must remain the authority for detecting the mismatch.
+        std::fs::write(&marker, original).unwrap();
+        let recovered = run(&fixture, Some(&failed), &git_watch::Change::default());
+        assert!(recovered.plan_error.is_none());
+        assert!(
+            recovered
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.root == added)
+        );
+    }
+
+    #[test]
+    fn polling_retries_failed_plan_when_checkout_membership_is_unchanged() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let added = fixture.linked.join("new-directory/added.rs");
+        std::fs::create_dir_all(added.parent().unwrap()).unwrap();
+        std::fs::write(&added, "new tracked file\n").unwrap();
+        git(&fixture.linked, &["add", "new-directory/added.rs"]);
+        let marker = fixture.linked.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let failed = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                membership: true,
+                worktrees: first.worktrees.iter().map(|worktree| worktree.id).collect(),
+                ..Default::default()
+            },
+        );
+        assert!(failed.plan_error.is_some());
+        assert!(Arc::ptr_eq(
+            first.plan.as_ref().unwrap(),
+            failed.plan.as_ref().unwrap()
+        ));
+        assert_eq!(
+            failed
+                .worktrees
+                .iter()
+                .map(|worktree| (&worktree.id, &worktree.path))
+                .collect::<Vec<_>>(),
+            first
+                .worktrees
+                .iter()
+                .map(|worktree| (&worktree.id, &worktree.path))
+                .collect::<Vec<_>>()
+        );
+        std::fs::write(&marker, original).unwrap();
+        // Shared refs can wake the next scan without checkout IDs. The lost
+        // membership edge still needs a fresh census before its error clears.
+        let recovered = run(
+            &fixture,
+            Some(&failed),
+            &git_watch::Change {
+                references: true,
+                ..Default::default()
+            },
+        );
+        assert!(recovered.plan_error.is_none());
+        let plan = recovered.plan.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(first.plan.as_ref().unwrap(), plan));
+        assert_ne!(first.plan.as_ref().unwrap().worktrees, plan.worktrees);
+        let cancellation = CancellationToken::new();
+        let repository = fixture.root.join(".git");
+        let records = RepositoryService::system("git")
+            .list_worktrees(&repository, &cancellation)
+            .unwrap();
+        let fresh = git_watch::Project::read_changed(
+            plan.id,
+            repository,
+            &records,
+            &cancellation,
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.worktrees, fresh.worktrees);
+        let unchanged = run(&fixture, Some(&recovered), &git_watch::Change::default());
+        assert!(unchanged.plan_error.is_none());
+        assert!(
+            Arc::ptr_eq(plan, unchanged.plan.as_ref().unwrap()),
+            "successful recovery restores ordinary reuse"
+        );
+    }
+
+    #[test]
+    fn persistent_plan_failure_retries_only_the_checkouts_it_could_not_read() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let linked = first
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fixture.linked)
+            .unwrap()
+            .id;
+        let marker = fixture.linked.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let only_linked = git_watch::Change {
+            membership: true,
+            worktrees: BTreeSet::from([linked]),
+            ..Default::default()
+        };
+        let failed = run(&fixture, Some(&first), &only_linked);
+        assert!(failed.plan_error.is_some());
+        assert_eq!(failed.plan_retry, BTreeSet::from([linked]));
+
+        // While the checkout stays unreadable, unrelated scans retry it alone
+        // rather than rebuilding every retained census each time.
+        let still = run(&fixture, Some(&failed), &git_watch::Change::default());
+        assert!(still.plan_error.is_some());
+        assert_eq!(still.plan_retry, BTreeSet::from([linked]));
+
+        std::fs::write(&marker, original).unwrap();
+        let recovered = run(&fixture, Some(&still), &git_watch::Change::default());
+        assert!(recovered.plan_error.is_none());
+        assert!(recovered.plan_retry.is_empty());
     }
 }

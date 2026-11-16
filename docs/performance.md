@@ -1,10 +1,18 @@
 # Performance measurements
 
 - [Redraw scheduling](#redraw-scheduling)
+- [Activity spinner cost](#activity-spinner-cost)
+- [Idle UI wakeups](#idle-ui-wakeups)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
+- [Workspace model edits](#workspace-model-edits)
+- [Native chat viewport](#native-chat-viewport)
+- [Idle retained actors](#idle-retained-actors)
+- [Work board polling](#work-board-polling)
+- [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -48,6 +56,121 @@ non-gating until a named reference baseline is accepted.
 in-process terminal scroll workload (no compositor, daemon, or release build).
 It reports what one viewport scroll command costs, and so what applying one
 coalesced move per frame saves over applying every wheel notch.
+
+## Activity spinner cost
+
+Each visible activity spinner asks for a whole-window redraw every
+`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
+focused. An unfocused window may still be in view, so its spinners keep turning,
+but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
+advance one focused step per frame. Measure the UI process with one busy agent
+on screen:
+
+1. Run `scripts/run-development --browserless` without `--debug` in a nested
+   session, using the isolated environment from
+   [chat-composer-fixture.md](chat-composer-fixture.md). The fixture's first
+   turn stays busy, so its channel shows sidebar, tab and footer spinners
+   without a real model.
+2. Open the busy channel, leave the pointer still, and read `utime + stime`
+   from `/proc/<ui-pid>/stat` across a 20 s interval. Also read the main
+   thread's `voluntary_ctxt_switches` from `/proc/<ui-pid>/task/<ui-pid>/status`.
+3. Repeat with another window focused, then with the agent interrupted for the
+   idle floor.
+
+Local reference: Ryzen 7 7840HS, Radeon RX 7600S, `dev-runtime` build, nested
+niri 26.04 inside a headless KWin 6.4 virtual output, 1596x929, scale 1.0.
+Each row reports 20 s samples, as a percentage of one core:
+
+| State | Before (`c07b6f78e`) | After |
+| --- | --- | --- |
+| One busy agent, window focused | 11.1-12.6% (73-86 wakeups/s) | 4.1-4.2% (30-34 wakeups/s) |
+| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | 1.15-1.25% (5-6 wakeups/s) |
+| Agent interrupted, window focused | not measured | 1.6% (7 wakeups/s) |
+
+Two changes produced the focused result. At the 100 ms cadence alone, the UI
+still used 11.8% of a core because Iced's event loop kept a deadline that had
+already elapsed. After a redraw scheduled a later deadline, the event loop
+polled with a zero timeout until that deadline arrived (about 630
+`epoll_pwait` calls per second). The vendored `iced-winit` now replaces an
+elapsed deadline with the requested one; see `vendor/iced-winit/README.cagents.md`.
+Each remaining step still repaints the whole window, which is why a busy
+agent still costs about 3% of a core above idle in this build. Slowing
+unfocused spinners instead of stopping them costs little: an earlier revision
+that stopped them entirely measured 1.0-1.6% with another window focused
+(3 wakeups/s).
+
+## Idle UI wakeups
+
+A focused text cursor blinks for ten seconds after the last input, then rests
+visible and asks for no more frames, following GTK's
+`gtk-cursor-blink-timeout`. Every cursor shares that schedule:
+`iced_core::text::Blink` in `vendor/iced-core`, used by iced's text editor and
+text input (`vendor/iced-widget`), libcosmic's text input, the app's code editor
+and the terminal. Before, each focused cursor repainted the whole window every
+500 ms for as long as it held focus, and the chat composer holds focus after a
+chat opens or a message is sent.
+
+Where the desktop states its own blink through the settings portal
+(`org.gnome.desktop.interface` on GNOME, GTK and COSMIC), cursors use its
+interval and timeout instead, and follow changes while the app runs. With
+blinking turned off, every cursor is steady and asks for no frames, including a
+terminal whose program requested a blinking cursor.
+
+To measure it, seed a fixture with 30 settled chats, start a session with
+`scripts/native-evidence start SIDE --ui-trace`, spawn three agents whose
+first turn stays busy, then interrupt them. Leave the composer focused and the
+pointer still. Sample each UI thread's `voluntary_ctxt_switches` and
+`schedstat` CPU time from `/proc/PID/task/*` over 60 s, 30 s after spawning
+and 20 s after interrupting. The `ui-trace` summaries give the redraw count and
+time per five-second window.
+
+Local reference: fw16 (Ryzen 7 7840HS), `dev-runtime` build, headless nested
+session at 1500x900. Before is `374370965`; after is `2aec4b05c`. CPU is a
+percentage of one core:
+
+| State | Before | After |
+| --- | --- | --- |
+| Agents settled, composer focused: UI thread | 7.0 wakeups/s, 2.0% | 1.7 wakeups/s, 1.1% |
+| Agents settled, composer focused: redraws | 2.7/s | 0.8/s |
+| Agents settled, composer focused: clipboard thread | 6.2 wakeups/s | 2.2 wakeups/s |
+| Three agents working: UI thread | 26.4 wakeups/s, 6.1% | 23.5 wakeups/s, 5.5% |
+
+The after build also has the wgpu-core change below, which makes every frame
+cheaper, so the CPU columns credit both changes. The wakeups and redraws are
+the cursor's alone. With agents working, the spinners already ask for ten
+frames a second, so the cursor's frames made little difference there. Neither side logged a UI-thread
+call over 50 ms after startup. The remaining settled redraws follow the app's
+own updates.
+
+`dev-runtime` builds also turn off wgpu-core's debug assertions. With them,
+WGPU captured a backtrace whenever it took its snatch lock, on every frame, and
+the runner's `RUST_BACKTRACE=1` made that a real stack walk: about 16% of the
+UI thread's profile samples with three agents working. Release builds never
+paid it. The CPU difference in the working row is within the noise of the
+shared build host.
+
+## UI thread trace
+
+Development UI builds started with `CAGENTS_UI_TRACE` set log, every five
+seconds, how much wall time the UI thread spent in `update` (by the message's
+outer two variant names, such as `ChatUi(Stream`), `view`, `subscription`, and
+the window content's layout, draw, event handling (by event kind), tree diff,
+widget operations, accessibility tree and overlay collection. Beneath each
+total, the sidebar's and the workspace's shares are broken out. Each call that
+takes 50 ms or more is logged as it returns, as `ui-trace slow PHASE LABEL MS`.
+A nested `update` counts toward the outermost one. Overlays' own layout and
+drawing, the libcosmic chrome around the application view, and the renderer's
+presentation run outside the measured root, so the thread's CPU time exceeds
+the traced total.
+`scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
+the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
+flag, and other builds compile the trace out.
+
+Use it to tell which work keeps the UI thread busy when the app stalls. Pair it
+with `/proc/PID/task/PID/syscall` sampling to see whether the thread is ever
+blocked rather than busy: a thread in `epoll_pwait` is idle, while `futex`,
+`read` or `wait4` on the UI thread is a stall that no amount of view caching
+fixes.
 
 ## Native chat stage attribution
 
@@ -272,6 +395,399 @@ ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
 helper delegates to the original character-by-character implementation.
 The two additional Unicode-miss guard workloads have optimized samples only
 in this reference; no before/after claim is made for those cases.
+
+## Busy terminals and the update tail
+
+After most messages, `Cagents::update` runs a tail of whole-workspace
+projection: sidebar channels and worktree panes, worktree protections,
+selection, source control, transcript probes and chrome. Terminal wakes that
+change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
+integrated build, browser progress ticks), now skip it. A wake whose only
+change is a reported terminal title (OSC 0/2) runs only chrome, which includes
+the window title. Reported titles on their own cause at most one save, and
+one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
+count the tail passes, chrome syncs and saves each message causes.
+
+The native workload has no script. In the browserless development runner,
+inside a nested niri session with fresh private HOME and XDG directories, open
+20 terminals with Ctrl+Shift+T. Then use `cagents terminal write` to start one
+of these in every terminal:
+
+- Title churn: `bash -c 'i=0; while :; do printf "\033]0;build step %d\007" $((i++)); sleep 0.1; done'`
+  (20 terminals, 10 titles per second each).
+- Streaming: `bash -c 'while :; do yes cagents-N | head -c 200M; done'`.
+
+After five seconds, sample `utime+stime` from `/proc/<ui>/task/<ui>/stat`
+(UI main thread), `/proc/<ui>/stat` (UI process) and the matched `cagentsd`
+over 20-second windows.
+
+Local reference on a Ryzen 7 7840HS, `dev-runtime`, `c07b6f78e` (before)
+against the #1103 branch (after). Each build had one fresh run with two
+windows per workload. The host was shared with other builds, with a load
+average of 35 to 45, so treat the differences as indicative only.
+
+| Workload | Main thread before | Main thread after | Daemon before | Daemon after |
+| --- | --- | --- | --- | --- |
+| Idle, 20 terminals | 0.4% | 0.2% | 0.1% | 0.2% |
+| Title churn | 83.7%, 80.9% | 53.7%, 53.2% | 43.7%, 42.8% | 34.6%, 33.4% |
+| Streaming | 15.5%, 14.8% | 17.4%, 14.8% | 423%, 420% | 443%, 418% |
+
+Streaming output already took the metadata-unchanged fast path before this
+change, so it is unchanged. Its main-thread profile is terminal widget
+resolution, layout, accessibility projection and allocation. After the change,
+the remaining title-churn time is mostly the same view, layout and render work
+that each title causes; `sync_chrome` is about 0.2% of samples.
+
+## Workspace model edits
+
+A pane edit in one window reaches every other window as a model edge. The
+window applies the edge's effects to its copy and, for a settled presentation
+change such as a pane title, projects only that scope. Two trace targets show
+where that work goes; with both disabled these paths read no clock and
+allocate nothing.
+
+- `cagents::workspace_pipeline=debug` records the inclusive wall time of each
+  shared-model update, including its projection tail, and of each replica
+  snapshot timer and capture.
+- `cagents::workspace_projection=trace` records whether each update projected
+  one scope or the whole workspace, with the reason when it fell back. A unit
+  fixture's eligibility does not show that a native workload qualifies, so
+  count selected and full projections in the native run.
+
+Measure edits on the generated large workspace with fixture agents streaming,
+one of them visible, and drive a fixed number of pane title edits at a fixed
+interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
+main-thread CPU and the UI thread trace's update and frame times over the edit
+interval on both sides.
+
+Start the native evidence session with `--ui-trace --workspace-trace` to
+record both inclusive update time and the selected/full projection decisions.
+`scripts/native-evidence open-window window-2` opens the peer through the
+development runner using the same recorded binaries, without compiling under
+the native lock. Its trace is `logs/ui-SIDE-window-2.log`; the primary trace
+is `logs/ui-SIDE.log`.
+
+The current-main comparison for the UI half of this work is tracked in
+[#2789](https://github.com/CarsonBurke/cagents/pull/2789). Its measurement table
+identifies the actual application revisions, workload, raw receipts and
+qualifications; historical #2573 results are not measurements of this branch.
+
+## Native chat viewport
+
+Run the headless viewport contract with optimized application code, separately
+from native application measurements:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --locked -p cagents-ui \
+  --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
+  --config 'profile.dev-runtime.debug-assertions=false' --lib \
+  chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The workload compares a 16 KiB answer with ten tool rows against single 1 MiB
+paragraph, many-paragraph and fenced-code answers with 300 tool rows, at a fixed
+viewport. It warms the real pane/composer, then records refresh separately from
+view, native widget layout, pointer update, headless draw and widget/cache
+disposal CPU time. The event total includes those latter stages. Its median must
+be at most 2 ms and at most twice the small workload. These are explicit test
+budgets, not claims of achieved results. The test excludes GPU submission and
+compositor presentation. Run the neighboring long-streaming workloads separately
+for a busy parent and a selected running child whose parent is idle. Streaming
+fixtures apply validated `Presentation` deltas and record append lineage. They
+complete and verify each current rendered publication before sampling its steady
+frame, and separately report synchronous fixture wall time for refresh, the owned
+parser engine, installation and geometry settling. This phase is diagnostic work
+attribution, not native worker scheduling/input latency. An unconsumed new source
+or a Loading placeholder cannot count as the rendered streaming workload. Native
+80-delta/second input and completion timing must be measured separately.
+
+A native comparison must use the same scripted provider, workload text, pane
+geometry and build profile on both revisions. Record the exact commit and dirty
+state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
+raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
+40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
+the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
+most recently hidden chats warm (`crates/cagents-ui/src/app/chat_ui/warm.rs`): at most 8, within
+an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
+it hides. The estimate is calibrated against the heap cooling frees, measured
+by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a
+chat that goes cold, the UI must return within 30 MB of its prior baseline;
+while chats are warm, within 30 MB of that baseline plus their estimate. Record
+RSS for 1, 4, 8 and 9 hidden chats, the ninth sending the first cold. Freed
+heap is not always returned to the system, so compare RSS after the repeat
+cycles too, not only after the first. Repeat hide/reveal and close cycles,
+including Hide tab. Use the isolated development runner described in
+[development.md](development.md), preserving existing sessions.
+
+Full-context shaping holds one output permit through UI consumption; queued
+completion messages do not release it. Accepted installation releases the permit
+while the visible paragraph keeps its geometry. Discarded results retain the
+permit through background disposal. Parser and shaper workers wait for earlier
+retirement before allocating another generation. A hide can retire its existing
+active graph as one batch; this bounds generation amplification, not total live
+glyph storage or process RSS. Optional `cagents::memory=trace` includes pending
+retirement item counts for native visit/hide qualification. Actual permit release
+also publishes one coalesced availability event; visible deferred readers retry
+without depending on unrelated input, provider output, or another redraw. Parser
+disposal checks continuation/reference allocations even when the document has no
+rendered items. The selected growing source retains its Markdown parser
+continuation across verified appends. A changed fence rebuilds its syntax
+palettes on the worker; only unchanged matching fences share prepared palettes.
+Worker placement does not establish acceptable streaming CPU or input latency;
+those costs remain part of native qualification.
+
+Nested reader bookmarks retain a byte length and full source digest, alongside
+geometry and the exact logical reader identity. After hiding releases bodies,
+the admitted parser worker verifies that exact prefix in the authoritative new
+code/tool source, including its partial final hash chunk. Only the matching
+context/reader bookmark advances to the verified new digest. Inputs and outputs
+are bounded by the existing 1,024 bookmark entries; unbookmarked sources need no
+extra verification pass. No source bytes or acceptance graph remain hidden.
+Changed tools with exact remembered reader paths use the same admitted worker
+even while collapsed. Reopening preserves pending verification; installation
+uses the current disclosure state. The worker also builds immutable tool text
+and source descriptors, shared through visible collapse/reopen instead of
+rehashing/copying the full body during UI installation. Hiding evicts these
+body owners with the rest of the cache. A rewrite cannot overwrite a valid
+bookmark before verification.
+
+Literal user messages use the same admitted preparation engine without Markdown
+interpretation. The worker prepares their full text, legacy collapsed preview
+and selection checkpoints. Cold views show a bounded preview until the exact
+current source is ready. A queued first message moves its canonical string into
+an immutable local source and retains the same source reservation through its
+final raw destruction, including cancellation before a subscription starts.
+Compact local follow-ups prepare their preview at explicit submission. Provider
+queue previews reuse immutable records across unrelated publications; changed
+records are copied only within the existing 128-message, 16 KiB source-preview
+limits, with the existing truncation marker appended. Comparing those bounded
+sources on a changed snapshot remains UI work.
+Copy resolves the exact current record at explicit intent and preserves raw
+bytes independently of its displayed preview.
+
+Search results, Notice bodies and Image descriptions/paths use the same admitted
+literal preparation boundary. Stable logical readers preserve their displayed
+text for selection and Find without interpreting it as Markdown. Search fields
+share prepared document storage; long Notice previews preserve the existing
+three-line policy. Ready values must match the current canonical item before
+installation, and rejected or evicted payloads use the existing reclaimer.
+
+Find Next/Previous retains its existing matching-turn/item counts and temporary
+disclosure ownership. Raw group discovery, provider-aware disclosure plans,
+rendered-block lookup and lazy visible Flow highlights share one try-admitted
+worker. A fixed aggregate small-input path handles tiny searches synchronously.
+Unicode query folding and its matcher table are shared across phases. Large
+sources are scanned on the worker, with cancellation checked inside both query
+preparation and source matching. Highlights bind the exact painted ready source;
+their existing 4,096-range limit applies to each block. Output reservations stay
+with painted range owners, including retained widget clones.
+Retained Flow widgets read current marks against the exact ready prefix they
+paint, so an asynchronous completion does not require rebuilding the element.
+A late per-block limit notice appears below the text without moving its glyph
+origin. Accepted query contexts carry a separate render revision when their
+exact tool-disclosure bindings change; unrelated publications reuse it.
+
+Link destinations share immutable storage through parser output, native spans,
+hit testing and reader actions. Rendering does not clone a long URL just because
+its displayed label is short. Resolving a clicked destination remains explicit
+UI work and preserves its complete destination.
+
+Every normal raw outcome, including failure, retains the same admission through
+message consumption or background disposal. Query and attempt epochs reject old
+errors before they can change a newer search. Metadata pressure retires displaced
+plans and waits for actual metadata capacity release, independently of worker-slot
+wakes. Pending searches and failed searches have distinct visible states; failure
+does not masquerade as a successful zero-match result. Exact unchanged groups can
+remain available during unrelated streamed publications while changed groups
+await current indexing.
+
+Each selected group is resolved to its first matching rendered logical block and
+UTF-8 byte. Navigation
+then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
+geometry, including horizontal readers. One initial coarse realization may be
+needed while matching worker geometry is pending; it belongs to the intent's
+maximum sixteen actual coordinate corrections and absolute thirty-second
+deadline. Waiting for that geometry does not consume further corrections,
+including across verified source publications or unrelated completion wakes.
+Parser and shape completions wake pending geometry without a timer subscription.
+Matching metadata without rendered plaintext keeps the coarse group anchor.
+Loading is never an exact glyph match.
+Independent intent and rendered-document epochs guard both async replies and
+the eventual native scroll mutation. Query/context/disclosure/hide changes and
+native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
+queued corrections. A Find scroll does not masquerade as new user input.
+
+The final owners of parser requests, canonical continuations and logical
+selection catalogs transfer their raw allocations to the same reclaimer. This
+also covers subscriptions and retained widgets that outlive cache eviction.
+Canceled and discarded work releases reservations after its actual owned payloads.
+Independent native widget/read clones still contribute to measured event and
+cache-disposal costs; this is not a guarantee that every UI allocation frees on
+the reclaimer.
+
+The pane inspector's diagnostics disclose known source, prepared-presentation
+and logical-selection payload owners for the selected chat. These counters
+exclude opaque parser/font/renderer/image allocations and allocator retention;
+they are not RSS or a complete heap estimate. Use process measurements to verify
+residency budgets rather than inferring them from logical byte counts.
+
+Transcript row factories share one UI-local immutable AST root per parser
+publication, using index paths for quotes, lists and table cells. Ordinary
+publications clone that graph once on the parser worker; the unchanged
+inline/code text backing is shared. This removes recursive factory clones
+during view rebuilding. Final raw graph disposal runs on the persistent
+reclaimer even when retained widgets outlive the cache. Raw graphs in rejected
+output are dropped inside the existing retirement batch before its admission
+permit and FIFO barrier. Coordination recognition and all rich prompt, brief
+and result parts use the same provider-aware admitted parser worker; the UI
+detects preparation candidates from bounded item metadata. Exact-source
+disclosure changes reuse those parts and their palettes. Canonical coordination
+graphs and recognition
+metadata also retire off the UI thread. Process measurements must include the
+extra publication graph containers. The worker also prepares aggregate subtree
+sizes, code line counts and row estimates. A recursive tree of short quote/list
+children cannot opt into a dense column merely because each immediate list is
+small. Rows share slices of one flat logical outline. Binding that outline to
+an item/root namespace first visits logical metadata on the UI thread; later
+views reuse the binding. Virtual column geometry/index rebuilding still visits
+its aliases on a revision change. These costs are not claimed constant-time or
+small for arbitrary rich documents.
+Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains
+required.
+
+Parser admission retains at most 128 selected-source entries and 72 MiB of
+queued source bytes; these are source reservations, not RSS estimates.
+Temporary pressure leaves the immutable source in its authoritative snapshot
+and resumes automatically from a metadata cursor after entry or final
+source-lease release. Each resumed pump visits at most 128 positions; initial
+cache enumeration still visits the selected history. The watch sends a
+current-state event when subscribed so an idle UI cannot miss capacity released
+during subscription installation. Newest text gets first admission; historical
+inputs retain deterministic order. Sources that individually cannot fit the
+budget remain explicit errors. No shell/JSON parse runs on the UI during
+pressure; commands of at most 2,048 bytes can be excluded using the
+recognizer's existing program-name predicate. Full rich coordination parts are
+still reparsed on changed publications; off-thread ownership does not make this
+cost incremental.
+
+## Idle retained actors
+
+Each retained Claude agent keeps a `cagents-native --cagents-native-actor`
+process alive between turns. An idle actor should not wake: its serve loop
+reaps adopted tool orphans when a child exits, read from a signalfd, and its
+`cagents-commands` cgroup sweeper backs off from 1 s to 8 s once a provider
+that reports its own activity has been quiet.
+
+`scripts/measure-idle-wakeups` counts context switches and on-CPU time per
+thread name from `/proc` alone, without signalling anything, so it is safe to
+run against the actors of a live session:
+
+```sh
+scripts/measure-idle-wakeups --seconds 60
+```
+
+`scripts/measure-idle-actors BIN_DIR [COUNT] [SECONDS]` builds a private
+fixture (HOME, XDG directories, runtime directory and project) from a matched
+`cagents` and `cagentsd`, spawns COUNT agents with the offline fixture provider
+one at a time, waits for each to settle, and then measures only the fixture's
+actors. It removes every process and directory it created on exit. Run it from
+a genuine user shell, such as `ssh fw16`; it refuses agent authority.
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 45 idle actors,
+60 s, `0b8b9aace` (before) against `6e62e851a` (after). The host was shared
+with other builds, so treat CPU as indicative; the wakeup counts are timer
+periods and barely depend on load.
+
+| Wakeups/s | Before | After |
+| --- | --- | --- |
+| `cagents-native` (serve loop) | 188.47 | 0 |
+| `cagents-command` (cgroup sweep) | 46.30 | 5.92 |
+| `cagents-chat` | 0 | 0 |
+| Total | 234.77 | 5.92 |
+| Per actor | 5.22 | 0.13 |
+
+CPU across all 45 actors fell from 3.32% to 0.08% of one core.
+
+`/proc` truncates the `cagents-commands` thread name to `cagents-command`.
+The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
+7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
+started without an announcement.
+
+## Work board polling
+
+The daemon's Work board keeps each open project's Git facts current. The Git
+watcher covers projects within a budget of 8192 directory watches, and each
+checkout's tracked directories count against it, so a repository with
+hundreds of worktrees is polled instead. Each worktree of a polled project
+comes due on its own. A worktree with an edit or agent session in the active
+window is read every 15 s, and any other every 120 s; reads due within the
+next 15 s share one scan. Previously one recent edit anywhere made the whole
+project re-read every worktree every 15 s.
+
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
+private fixture from a matched `cagents` and `cagentsd`: a project of
+WORKTREES worktrees (default 250) with 40 tracked directories each, which it
+checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
+worktrees. After the board has read every checkout once, it counts the
+`git status` reads the daemon starts and the CPU of its exited children over
+SECONDS (default 300). It removes everything it created on exit and refuses
+agent authority; run it from `ssh fw16`.
+
+Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
+300 s, `0ac78d249` (before) against `9b8523e9a` (after):
+
+| | Before | After |
+| --- | --- | --- |
+| `git status` per second | 15.79 | 2.47 |
+| Git CPU, % of one core | 7.22 | 1.71 |
+| Daemon CPU, % of one core | 1.83 | 0.45 |
+
+A fixture checkout holds 40 files. A real checkout costs more per read: on a
+347-worktree repository with 8 active worktrees, the scanner's Git processes
+took at least half a core before this change.
+
+## Git watcher during builds
+
+The daemon's Git watcher (`notify-rs inotify loop`, from the `notify` crate)
+covers each project's tracked directories and Git metadata. It asks the kernel
+for changes only: creations, removals, renames, content and metadata writes.
+An inotify watch that includes opens wakes the thread whenever `git status`, a
+compiler or an editor merely reads a watched file or lists a watched directory.
+Ignored output such as `target/` is never watched, because content watches come
+from the tracked-directory census.
+
+`scripts/measure-watch-wakeups BIN_DIR [SECONDS]` opens a shared clone of the
+checkout as the only project of a private daemon fixture. It then checks the
+clone's CLI through the build gate over and over, touching `src/main.rs` before
+each check, while `scripts/measure-idle-wakeups` counts the daemon's threads.
+Run it from a genuine user shell on the build host, with rustup's Cargo first
+on `PATH`:
+
+```sh
+scripts/measure-watch-wakeups ~/.local/state/cev/watch/target-after/dev-runtime 120
+```
+
+Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 120 s of
+builds, `7c7430da9` (before, notify 8.2) against `3611b064f` (after, notify 9
+with `EventKindMask::CORE`). Both sides used the same fixture from the after
+checkout; the host was shared with other builds.
+
+| Daemon, per second | Before | After |
+| --- | --- | --- |
+| `notify-rs inoti` wakeups | 937.08 | 0.47 |
+| `work-scan` wakeups | 3.05 | 5.75 |
+| All daemon threads, wakeups | 943.03 | 10.05 |
+| All daemon threads, CPU % of a core | 0.81 | 0.10 |
+| Checks completed | 26 | 49 |
+
+`work-scan` wakes to read a worktree's status after a real change. It followed
+the build rate on both sides, about 14 wakeups per check, so each touched source
+still reaches the Work board. The watcher's remaining 0.47 wakeups/s are about
+one per touch (0.41/s).
+
+A live daemon with 8,715 watches across several large projects showed the same
+pattern. A 60 s replica of its watch set saw 714 events/s, 701 of them opens.
 
 ## Reference results
 

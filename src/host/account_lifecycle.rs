@@ -27,6 +27,11 @@ type Map = BTreeMap<uuid::Uuid, Arc<Reserved>>;
 #[derive(Clone)]
 pub(super) struct Reserved {
     homes: Vec<Home>,
+    /// The unregistered home this reservation restores, if that is what it
+    /// is for. A restore changes no home and writes the list only under its
+    /// locks, so it does not hold up a shutdown, an upgrade or a chat's
+    /// attachment the way a sign-in or a removal does.
+    restores: Option<(crate::agent::Provider, uuid::Uuid)>,
 }
 pub(super) type Reservations = Arc<Mutex<Map>>;
 
@@ -130,7 +135,10 @@ impl Home {
 
 /// Walk the actual directory parent chain through descriptors. Lexical
 /// aliases can change when a reserved home/provider parent is renamed.
-pub(super) fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+pub(super) fn physical_ancestors(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, String> {
     let mut cursor = if let Some(pin) = pin {
         pin.try_clone().map_err(|error| error.to_string())?
     } else {
@@ -246,12 +254,21 @@ impl Reservation {
     /// and installs the immutable home token. Existing admitted starts
     /// prevent this writer from overtaking their check/effect boundary.
     pub(super) fn install(host: &SharedHost, accounts: &[Account]) -> Result<Self, ProtocolError> {
+        Self::install_restoring(host, accounts, None)
+    }
+
+    fn install_restoring(
+        host: &SharedHost,
+        accounts: &[Account],
+        restores: Option<(crate::agent::Provider, uuid::Uuid)>,
+    ) -> Result<Self, ProtocolError> {
         let store = Store::installation().ok_or_else(|| refusal("Account registry unavailable"))?;
         Self::install_with_store(
             host,
             accounts,
             store,
             crate::account::home::Homes::installation().as_ref(),
+            restores,
         )
     }
 
@@ -260,6 +277,7 @@ impl Reservation {
         accounts: &[Account],
         store: Store,
         installed_homes: Option<&crate::account::home::Homes>,
+        restores: Option<(crate::agent::Provider, uuid::Uuid)>,
     ) -> Result<Self, ProtocolError> {
         let gate = host
             .lock()
@@ -282,9 +300,17 @@ impl Reservation {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(refusal)?;
-        let registry = store
-            .try_load()
-            .map_err(|error| refusal(error.to_string()))?;
+        let registry = store.try_load().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Another window is saving the account list. Try again in a moment.",
+                    true,
+                )
+            } else {
+                refusal(error.to_string())
+            }
+        })?;
         // The request's account lookup happened before this snapshot. Never
         // pair an old linked path with a newer registration under the same ID.
         let current_accounts = registry.all_accounts(installed_homes);
@@ -359,7 +385,7 @@ impl Reservation {
                 "An operation is already changing this account home. Wait for it to finish, then retry.",
             ));
         }
-        entries.insert(token, Arc::new(Reserved { homes }));
+        entries.insert(token, Arc::new(Reserved { homes, restores }));
         drop(entries);
         drop(writer);
         let reservation = Self {
@@ -391,13 +417,38 @@ impl Reservation {
         store: Store,
         homes: &crate::account::home::Homes,
     ) -> Result<Self, ProtocolError> {
-        Self::install_with_store(host, accounts, store, Some(homes))
+        Self::install_with_store(host, accounts, store, Some(homes), None)
     }
 
     fn ensure_no_active_owners(&self, host: &SharedHost) -> Result<(), ProtocolError> {
         // The installed token prevents new related startups. Copy only actual
         // execution-root metadata while holding HostState, then resolve paths
         // outside that lock and outside the global control writer.
+        // An agent observation reading a reserved home was admitted before the
+        // token, since later ones are refused. Wait for it to end.
+        let probes = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).agent_probes);
+        let reading = probes
+            .running()
+            .into_iter()
+            .filter(|(_, probe)| {
+                ensure_credential_roots(
+                    host,
+                    &probe.working_directory,
+                    &probe.environment,
+                    &probe.unset,
+                    false,
+                )
+                .is_err()
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if !probes.wait_for(&reading).is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Cagents is still checking an agent that uses this account. Try again in a moment.",
+                true,
+            ));
+        }
         let owners = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut owners = state
@@ -460,7 +511,11 @@ impl Reservation {
         } else {
             None
         };
-        let mut reservation = Self::install(host, &accounts)?;
+        let restores = match operation {
+            crate::account::remote::Operation::Restore { provider, key } => Some((*provider, *key)),
+            _ => None,
+        };
+        let mut reservation = Self::install_restoring(host, &accounts, restores)?;
         if create.is_some()
             && reservation
                 .current()
@@ -709,6 +764,206 @@ impl Reservation {
     }
 }
 
+/// How many times a sweep asks again about a home whose check was refused by
+/// something busy - a window holding the registry lock, another probe of the
+/// same provider, a reservation that overlaps it.
+const RESTORE_ATTEMPTS: u32 = 3;
+const RESTORE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the daemon looks for homes the account list has lost since it
+/// last looked. A look is two directory listings and a registry read; only a
+/// home not yet examined is asked about.
+const RESTORE_SCAN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a requested restore waits out other control operations - the
+/// retirement of the start its account refused, typically - before saying the
+/// daemon is busy.
+const RESTORE_ADMISSION: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long it waits for another restore of the same home - the daemon's own
+/// sweep, or another window - to finish. Once that one has listed the home,
+/// this one answers without asking the provider; if it did not, this one
+/// still asks twice, and the whole answer must reach the window before its
+/// request deadline.
+const RESTORE_OVERLAP: std::time::Duration = std::time::Duration::from_secs(
+    crate::control::DEVICE_OPERATION_DEADLINE.as_secs()
+        - 2 * crate::account::probe::TIMEOUT.as_secs()
+        - 10,
+);
+/// The most sweeps a home whose check did not finish - its provider timed
+/// out, say - is passed over before it is asked about again.
+const RESTORE_BACKOFF_LIMIT: u32 = 64;
+
+/// Reserves a requested restore. The chat asks for one as soon as a start is
+/// refused, alongside its own cleanup of that start, so a busy control gate
+/// is waited out rather than reported, as is another restore of the same
+/// home already asking its provider: the restore changes nothing until the
+/// provider confirms the login, so arriving a moment later is harmless, and
+/// once the other one has listed the home this one reports it registered.
+pub(super) fn reserve_restore(
+    host: &SharedHost,
+    operation: &crate::account::remote::Operation,
+) -> Result<Reservation, ProtocolError> {
+    let target = match operation {
+        crate::account::remote::Operation::Restore { provider, key } => Some((*provider, *key)),
+        _ => None,
+    };
+    let restoring = || {
+        target.is_some_and(|target| {
+            let map = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .account_lifecycle
+                .clone();
+            map.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .any(|reserved| reserved.restores == Some(target))
+        })
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let overlapped = restoring();
+        match Reservation::for_operation(host, operation) {
+            Err(error)
+                if (error.retryable && started.elapsed() < RESTORE_ADMISSION)
+                    || ((overlapped || restoring()) && started.elapsed() < RESTORE_OVERLAP) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Keeps the managed homes a lost or reset account list no longer names
+/// usable, so their accounts and the conversations pinned to them work
+/// without any manual step: at startup, and when the list loses rows while
+/// the daemon runs.
+///
+/// Each home is verified by asking its provider CLI, so this runs on its own
+/// thread, one home at a time, each under its own reservation and through
+/// the same operation an explicit restore uses. A home that was examined and
+/// left alone - its provider reports no login, say - is not asked about again
+/// by this daemon; an explicit restore still can. One whose check did not
+/// finish is asked about again after a number of sweeps that doubles each
+/// time.
+pub(super) fn restore_unregistered_homes(host: std::sync::Weak<super::state::HostLock>) {
+    let mut sweep = RestoreSweep::default();
+    while restore_pass(&host, &mut sweep) {
+        std::thread::sleep(RESTORE_SCAN);
+    }
+}
+
+/// What the sweep remembers between passes.
+#[derive(Default)]
+pub(super) struct RestoreSweep {
+    /// Homes examined and left as they are.
+    pub(super) examined: BTreeSet<(crate::agent::Provider, uuid::Uuid)>,
+    /// Homes whose check did not finish: how many times in a row, and how
+    /// many more sweeps pass them over.
+    pub(super) deferred: BTreeMap<(crate::agent::Provider, uuid::Uuid), (u32, u32)>,
+}
+
+impl RestoreSweep {
+    /// Whether this pass skips the home, counting the pass if so.
+    fn defers(&mut self, home: (crate::agent::Provider, uuid::Uuid)) -> bool {
+        if self.examined.contains(&home) {
+            return true;
+        }
+        match self.deferred.get_mut(&home) {
+            Some((_, remaining)) if *remaining > 0 => {
+                *remaining -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn unfinished(&mut self, home: (crate::agent::Provider, uuid::Uuid)) {
+        let (failures, remaining) = self.deferred.entry(home).or_default();
+        *failures = failures.saturating_add(1);
+        *remaining = 1u32
+            .checked_shl(*failures - 1)
+            .unwrap_or(u32::MAX)
+            .min(RESTORE_BACKOFF_LIMIT);
+    }
+}
+
+/// One sweep. `false` once the daemon has stopped.
+pub(super) fn restore_pass(
+    host: &std::sync::Weak<super::state::HostLock>,
+    sweep: &mut RestoreSweep,
+) -> bool {
+    let (Some(store), Some(homes)) = (
+        Store::installation(),
+        crate::account::home::Homes::installation(),
+    ) else {
+        return false;
+    };
+    let registry = match store.load() {
+        Ok(registry) if !registry.is_newer() => registry,
+        Ok(_) => return host.strong_count() > 0,
+        Err(error) => {
+            tracing::debug!(%error, "the account list could not be read to restore lost accounts");
+            return host.strong_count() > 0;
+        }
+    };
+    for (provider, key, _) in homes.unregistered(&registry) {
+        if registry.is_released(key) || sweep.defers((provider, key)) {
+            continue;
+        }
+        let operation = crate::account::remote::Operation::Restore { provider, key };
+        for attempt in 1..=RESTORE_ATTEMPTS {
+            // Never keep a stopping daemon's state alive, not even while the
+            // provider is being asked: the reservation holds only its token.
+            let Some(strong) = host.upgrade() else {
+                return false;
+            };
+            let reservation = Reservation::for_operation(&strong, &operation);
+            drop(strong);
+            let result = reservation
+                .map_err(|error| crate::account::remote::RestoreFailure::from(error.message))
+                .and_then(|reservation| {
+                    crate::account::remote::restore_installation_home(&reservation, provider, key)
+                });
+            match result {
+                Ok(restored) => {
+                    sweep.deferred.remove(&(provider, key));
+                    tracing::info!(
+                        provider = provider.executable(),
+                        %key,
+                        restored = ?restored.restored,
+                        "restored an account the account list had lost"
+                    );
+                    break;
+                }
+                Err(failure) if failure.settled => {
+                    sweep.deferred.remove(&(provider, key));
+                    sweep.examined.insert((provider, key));
+                    tracing::info!(
+                        provider = provider.executable(),
+                        %key,
+                        reason = %failure.message,
+                        "an unlisted account home was left unchanged"
+                    );
+                    break;
+                }
+                Err(failure) if attempt == RESTORE_ATTEMPTS => {
+                    sweep.unfinished((provider, key));
+                    tracing::debug!(
+                        provider = provider.executable(),
+                        %key,
+                        reason = %failure.message,
+                        "an unlisted account home could not be checked yet"
+                    );
+                    break;
+                }
+                Err(_) => std::thread::sleep(RESTORE_RETRY),
+            }
+        }
+    }
+    host.strong_count() > 0
+}
+
 /// Caller already owns shared admission through its ensuing startup/write.
 /// Clone reservation metadata, then perform path resolution outside all locks.
 pub(super) fn ensure_paths(
@@ -918,7 +1173,12 @@ pub(super) fn ensure_idle(host: &SharedHost) -> Result<(), ProtocolError> {
         .unwrap_or_else(|p| p.into_inner())
         .account_lifecycle
         .clone();
-    if map.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+    if map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .all(|reserved| reserved.restores.is_some())
+    {
         Ok(())
     } else {
         Err(refusal(
@@ -1362,6 +1622,24 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn a_home_whose_restore_check_keeps_failing_is_asked_about_less_often() {
+        let home = (Provider::Claude, uuid::Uuid::new_v4());
+        let mut sweep = RestoreSweep::default();
+        let mut asked = Vec::new();
+        for pass in 0..200 {
+            if !sweep.defers(home) {
+                asked.push(pass);
+                sweep.unfinished(home);
+            }
+        }
+        let gaps: Vec<_> = asked.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(&gaps[..7], [2, 3, 5, 9, 17, 33, 65]);
+        assert!(gaps[7..].iter().all(|gap| *gap == 65), "{gaps:?}");
+        sweep.examined.insert(home);
+        sweep.deferred.clear();
+        assert!(sweep.defers(home), "a settled home is not asked again");
+    }
+    #[test]
     fn empty_codex_home_never_proves_foreign_home_for_a_reserved_working_directory() {
         let root = tempfile::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
@@ -1501,5 +1779,56 @@ pub(crate) mod tests {
         drop(reservation);
         environment.insert("HOME".into(), "relative-home".into());
         ensure_launch(&host, &cwd, &environment, &unset, false).unwrap();
+    }
+    #[test]
+    fn a_reservation_waits_for_an_observation_reading_its_home_and_refuses_one_that_stays() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let home = root.path().join("claude-home");
+        std::fs::create_dir(&home).unwrap();
+        let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
+        let host = host();
+        let probes = Arc::clone(&host.lock().unwrap().agent_probes);
+        let probe = |home: &Path| super::super::activity::Probe {
+            working_directory: root.path().to_path_buf(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().to_str().unwrap().into()),
+                ("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into()),
+            ]),
+            unset: BTreeSet::new(),
+        };
+
+        // A listing that ends soon is waited for; one reading another home
+        // is not, however long it runs.
+        let elsewhere = root.path().join("other-home");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let unrelated = probes.admit(probe(&elsewhere));
+        let brief = probes.admit(probe(&home));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(brief);
+        });
+        let reservation =
+            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
+        releaser.join().unwrap();
+        drop(reservation);
+
+        // One that outlasts the wait refuses the reservation, as retryable.
+        let stuck = probes.admit(probe(&home));
+        let error =
+            match Reservation::test_install(&host, &[account.clone()], store.clone(), &homes) {
+                Ok(_) => panic!("a listing reading the home must refuse its reservation"),
+                Err(error) => error,
+            };
+        assert!(error.retryable, "{}", error.message);
+        assert!(
+            error.message.contains("still checking"),
+            "{}",
+            error.message
+        );
+        drop(stuck);
+        Reservation::test_install(&host, &[account], store, &homes).unwrap();
+        drop(unrelated);
     }
 }

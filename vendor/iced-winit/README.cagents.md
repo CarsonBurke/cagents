@@ -12,7 +12,7 @@ use the existing widget focus operation. Snapshot work runs only while assistive
 technology has activated that window.
 
 The app also uses an accessibility-preserving copy of Iced Responsive in
-src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
+crates/cagents-ui/src/ui_controls/responsive.rs and forwards transcript wrapper nodes. Remove
 these backports when the pinned dependency provides equivalent behavior.
 
 The hot-patch callback also wakes the native event loop after queuing its existing
@@ -34,3 +34,46 @@ reads keep their original paths. Raw-transfer errors remain logs/None under the
 generic clipboard API. Remove this fallback when the pinned backend provides
 equivalently bounded raw X11 reads. The ignored raw_selection_fixture test pairs
 with a real private X11 owner for direct, INCR and malformed-transfer coverage.
+
+The pinned shell kept an already-elapsed `WaitUntil` deadline whenever a later
+one was requested, because it always preferred the earlier deadline. A redraw
+scheduled with `RedrawRequest::At` while an older deadline was still the event
+loop's control flow therefore left the loop polling with a zero timeout until
+the new deadline arrived: one timed animation held the UI thread busy for most
+of every interval between its frames. An elapsed deadline is no longer pending
+and now yields to the requested one; pending deadlines keep their precedence.
+Remove this backport when the pinned dependency merges control flow the same way.
+
+The client-side resize border no longer covers edges that the compositor reports
+as tiled. xdg-shell describes a tiled edge as adjoining another part of the
+compositor's layout, so a client should not offer resizing there. Without this
+check, the border took presses from content at those edges, such as the
+scrollbar of a pane at the window's right edge, in tiled niri and COSMIC
+windows. Maximized and fullscreen windows still have no border, and floating
+windows keep it on every edge. A press is located by its own position and
+checked against the current window state, because the pointer can re-enter the
+window without moving and the state can change under a still pointer. The border
+is scaled by the window's current scale factor on every event, so it follows the
+window between outputs. Remove this backport when the pinned dependency honors
+tiled edges.
+
+Accessibility nodes can stay in the tree while hidden, as a wrapper's clipped
+content does: an offscreen workspace pane, or the lines a folded message cuts.
+A native Focus request now reaches the widget focus operation only when its
+target is present and not hidden, so a stale request cannot focus a control the
+reader cannot see. Published snapshots report the window as focused while the
+focused widget's node is hidden; the widget keeps its focus, and the node's
+identity is published again once it is visible. Remove this backport when the
+pinned dependency treats hidden nodes the same way.
+
+This standalone package is not a workspace member and does not see the root
+manifest's patches. Run its tests against the vendored packages with a Cargo
+configuration that repeats the root `[patch]` entries as absolute paths, for
+example:
+
+```sh
+cargo test --manifest-path vendor/iced-winit/Cargo.toml --features a11y \
+  --config /path/to/patches.toml -- accessibility_focus_tests a11y::tests
+```
+
+Its lockfile and `target/` directory are local test output.

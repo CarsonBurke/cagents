@@ -22,8 +22,7 @@ pub struct Divergence {
     pub behind: u32,
 }
 
-const TIP_FORMAT: &str =
-    "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00";
+const TIP_FORMAT: &str = "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00";
 const TIP_FIELDS: usize = 4;
 
 /// `for-each-ref` ends every record with a newline that its fields cannot
@@ -247,7 +246,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A pattern also matches refs below it (`refs/heads/fix` matches
             // `refs/heads/fix/a`); keep exactly the refs asked about.
             let parsed = invalid_output(parse_divergence(&output.stdout), output)?;
-            counts.extend(parsed.into_iter().filter(|(refname, _)| batch.contains(refname)));
+            counts.extend(
+                parsed
+                    .into_iter()
+                    .filter(|(refname, _)| batch.contains(refname)),
+            );
         }
         Ok(counts)
     }
@@ -340,6 +343,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parse_status(&output.stdout), output)
     }
 
+    /// Lines the worktree's uncommitted changes to tracked files add and
+    /// remove against `HEAD`, staged and unstaged together. Binary files
+    /// count no lines. An unborn branch has nothing to compare against.
+    pub fn uncommitted_line_totals(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(u64, u64), RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "diff",
+                "HEAD",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--ignore-submodules=dirty",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        let records = invalid_output(parse_numstat(&output.stdout), output)?;
+        Ok(records.iter().fold((0, 0), |(added, removed), record| {
+            (
+                added + record.added.unwrap_or(0),
+                removed + record.removed.unwrap_or(0),
+            )
+        }))
+    }
+
     /// The committer time of each of `oids`, such as detached worktree heads,
     /// in one process. Commits that are not present locally fail the read.
     pub fn commit_times(
@@ -406,8 +440,7 @@ mod tests {
 
     #[test]
     fn divergence_counts_parse_per_ref() {
-        let counts =
-            parse_divergence(b"refs/heads/a\x009 77\0\nrefs/heads/b\x000 0\0\n").unwrap();
+        let counts = parse_divergence(b"refs/heads/a\x009 77\0\nrefs/heads/b\x000 0\0\n").unwrap();
         assert_eq!(
             counts["refs/heads/a"],
             Divergence {
@@ -447,7 +480,12 @@ mod tests {
                 .arg("-C")
                 .arg(&root)
                 .args(["-c", "user.name=Test", "-c", "user.email=me@example.com"])
-                .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
                 .args(arguments)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
@@ -469,7 +507,14 @@ mod tests {
             "refs/remotes/origin/main",
         ]);
         let linked = directory.path().join("linked");
-        git(&["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ]);
         std::fs::write(root.join("README"), "two\n").unwrap();
         git(&["commit", "-q", "-am", "two"]);
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -479,8 +524,24 @@ mod tests {
         std::fs::write(root.join("scratch/deep/b"), "b").unwrap();
         std::fs::write(root.join("README"), "three\n").unwrap();
 
+        std::fs::write(root.join("staged"), "a\nb\n").unwrap();
+        git(&["add", "staged"]);
+
         let service = RepositoryService::system("git");
         let cancellation = CancellationToken::new();
+        // Staged and unstaged lines count together; untracked files do not.
+        assert_eq!(
+            service
+                .uncommitted_line_totals(&root, &cancellation)
+                .unwrap(),
+            (3, 1)
+        );
+        assert_eq!(
+            service
+                .uncommitted_line_totals(&linked, &cancellation)
+                .unwrap(),
+            (0, 0)
+        );
         assert_eq!(
             service
                 .default_branch_ref(&root, &cancellation)
@@ -497,7 +558,11 @@ mod tests {
             .unwrap();
         assert!(main.committed_at_unix_ms.is_some());
         assert_eq!(
-            main.worktree.as_deref().map(fs::canonicalize).transpose().unwrap(),
+            main.worktree
+                .as_deref()
+                .map(fs::canonicalize)
+                .transpose()
+                .unwrap(),
             Some(fs::canonicalize(&root).unwrap())
         );
         assert!(main.committed_at_unix_ms.is_some());
@@ -506,7 +571,12 @@ mod tests {
             .find(|tip| tip.refname == "refs/heads/feature")
             .unwrap();
         assert_eq!(
-            feature.worktree.as_deref().map(fs::canonicalize).transpose().unwrap(),
+            feature
+                .worktree
+                .as_deref()
+                .map(fs::canonicalize)
+                .transpose()
+                .unwrap(),
             Some(fs::canonicalize(&linked).unwrap())
         );
 
@@ -529,7 +599,12 @@ mod tests {
         // The per-ref fallback for Git older than 2.41 agrees.
         assert_eq!(
             service
-                .revision_divergence(&root, "refs/remotes/origin/main", "refs/heads/main", &cancellation)
+                .revision_divergence(
+                    &root,
+                    "refs/remotes/origin/main",
+                    "refs/heads/main",
+                    &cancellation
+                )
                 .unwrap(),
             counts["refs/heads/main"]
         );
@@ -560,7 +635,11 @@ mod tests {
         );
         assert_eq!(
             service
-                .commit_times(&root, &[main.oid.clone(), feature.oid.clone()], &cancellation)
+                .commit_times(
+                    &root,
+                    &[main.oid.clone(), feature.oid.clone()],
+                    &cancellation
+                )
                 .unwrap(),
             BTreeMap::from([
                 (main.oid.clone(), main.committed_at_unix_ms.unwrap()),
@@ -577,12 +656,20 @@ mod tests {
         // The untracked directory is one entry and the ignored tree is absent.
         assert_eq!(
             paths,
-            BTreeSet::from([PathBuf::from("README"), PathBuf::from("scratch/")])
+            BTreeSet::from([
+                PathBuf::from("README"),
+                PathBuf::from("scratch/"),
+                PathBuf::from("staged")
+            ])
         );
 
         // A fork compares with its parent, not with itself.
         git(&["update-ref", "refs/remotes/upstream/main", "HEAD"]);
-        git(&["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/main"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/upstream/HEAD",
+            "refs/remotes/upstream/main",
+        ]);
         assert_eq!(
             service
                 .default_branch_ref(&root, &cancellation)

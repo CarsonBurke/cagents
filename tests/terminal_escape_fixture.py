@@ -17,11 +17,21 @@ class TerminalEscapeFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             messages = []
-            thread = threading.Thread(target=PEER["run_stream"], args=(messages.append, root, "private-thread", 2049))
+            worker_errors = []
+
+            def run_stream():
+                try:
+                    PEER["run_stream"](messages.append, root, "private-thread", 2049)
+                except BaseException as error:
+                    worker_errors.append(error)
+
+            thread = threading.Thread(target=run_stream)
             thread.start()
             try:
                 deadline = time.monotonic() + 3
                 while not (root / "stream-paused.json").exists():
+                    if worker_errors:
+                        raise worker_errors[0]
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(0.001)
                 receipt = json.loads((root / "stream-paused.json").read_text())
@@ -29,6 +39,20 @@ class TerminalEscapeFixture(unittest.TestCase):
                 self.assertEqual(receipt["expected_stream_output"], PEER["EXPECTED"])
                 self.assertFalse(any(message["method"] == "item/completed" for message in messages))
                 deltas = [message["params"]["delta"] for message in messages if message["method"].endswith("outputDelta")]
+                # Check the actual stream independently of the peer's receipt
+                # and EXPECTED constant, before the aggregate gate is opened.
+                self.assertEqual(
+                    [delta for delta in deltas if delta.endswith(" stream sentinel\n")],
+                    [
+                        "osc stream sentinel\n",
+                        "dcs stream sentinel\n",
+                        "apc stream sentinel\n",
+                        "sos stream sentinel\n",
+                        "pm stream sentinel\n",
+                        "csi stream sentinel\n",
+                        "esc stream sentinel\n",
+                    ],
+                )
                 self.assertEqual(deltas[:2], ["\x1b", "]"])
                 self.assertIn(["\x1b", "\\"], [deltas[index:index + 2] for index in range(len(deltas) - 1)])
                 self.assertEqual(sum(record["payload_bytes"] for record in receipt["families"]), 7 * 2049)
@@ -38,6 +62,10 @@ class TerminalEscapeFixture(unittest.TestCase):
                 (root / "complete-stream").touch()
                 thread.join(timeout=3)
             self.assertFalse(thread.is_alive())
+            # Thread exceptions are otherwise only printed, even if the peer
+            # already emitted item/completed and its aggregate looks correct.
+            if worker_errors:
+                raise worker_errors[0]
             completed = next(message for message in messages if message["method"] == "item/completed")
             self.assertEqual(completed["params"]["item"]["aggregatedOutput"], "COMPLETED AGGREGATE REPLACED STREAM\n")
             self.assertNotIn("stream sentinel", completed["params"]["item"]["aggregatedOutput"])
@@ -46,6 +74,7 @@ class TerminalEscapeFixture(unittest.TestCase):
         reader, writer = socket.socketpair()
         try:
             writer.sendall(PEER["frame"](b"heartbeat", opcode=9) + PEER["frame"]({"id": 4, "method": "models/list"}))
+            writer.shutdown(socket.SHUT_WR)
             pongs = []
             message = PEER["receive"](reader, pongs.append)
             self.assertEqual(pongs, [b"heartbeat"])

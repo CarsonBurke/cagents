@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+mod no_start_tests;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
@@ -38,6 +41,7 @@ struct Devices {
 /// exactly one context; this does not introduce per-pane device selection.
 struct ConnectionContext {
     device: Device,
+    no_start: bool,
     environment: OnceLock<
         std::collections::BTreeMap<
             crate::agent::Provider,
@@ -46,27 +50,33 @@ struct ConnectionContext {
     >,
     home: OnceLock<PathBuf>,
     shell: OnceLock<String>,
-    bridge: Mutex<Option<Bridge>>,
+    // Existing-only readers and explicit starts keep separate transports.
+    bridges: Mutex<[Option<Bridge>; 2]>,
     closed: std::sync::atomic::AtomicBool,
 }
 impl ConnectionContext {
     fn new(device: Device) -> Self {
         Self {
             device,
+            // Retain inherited policy before deferred bridge work. Window
+            // restoration is transient and remains an operation-level policy.
+            no_start: crate::control::daemon_autostart_disabled(),
             environment: OnceLock::new(),
             home: OnceLock::new(),
             shell: OnceLock::new(),
-            bridge: Mutex::new(None),
+            bridges: Mutex::new([None, None]),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
     fn close(&self) {
         // Serialize closure with bridge initialization. Existing consumers may
         // retain their streams, but no caller can reopen a closed context.
-        let mut bridge = self.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        let mut bridges = self.bridges.lock().unwrap_or_else(|p| p.into_inner());
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
-        drop(bridge.take());
+        for bridge in bridges.iter_mut() {
+            drop(bridge.take());
+        }
     }
 }
 impl Drop for ConnectionContext {
@@ -113,9 +123,10 @@ fn selected_daemon_absent() -> bool {
         .get()
         .and_then(|context| {
             context
-                .bridge
+                .bridges
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
+                [usize::from(bridge_no_start())]
                 .as_ref()
                 .map(|bridge| {
                     bridge
@@ -466,14 +477,44 @@ impl Drop for Slot {
 /// the control sockets beside the proxy stay on this host in the same private
 /// directory, and grant only the SSH access their owner already has.
 pub fn socket_path() -> io::Result<Option<PathBuf>> {
+    socket_path_with_policy(bridge_no_start())
+}
+
+fn bridge_no_start() -> bool {
+    SELECTED.get().is_some_and(|context| context.no_start)
+        || crate::control::daemon_autostart_disabled()
+        || crate::instance::window_restore_policy()
+            == crate::instance::WindowRestorePolicy::ExistingOnly
+}
+
+/// An explicit provider action can use autostart without changing the bridge
+/// used by ordinary restoration and background recovery readers.
+pub(crate) fn socket_path_for_explicit_action() -> io::Result<Option<PathBuf>> {
+    socket_path_with_policy(crate::control::daemon_autostart_disabled())
+}
+
+/// An issued initial pane keeps its read-only transport even after the
+/// window's startup gate has finished and new operations use autostart.
+pub(crate) fn existing_socket_path() -> io::Result<Option<PathBuf>> {
+    socket_path_with_policy(true)
+}
+
+fn socket_path_with_policy(no_start: bool) -> io::Result<Option<PathBuf>> {
     SELECTED
         .get()
-        .map(ConnectionContext::socket_path)
+        .map(|context| context.socket_path_with_policy(no_start))
         .transpose()
 }
 impl ConnectionContext {
+    #[cfg(test)]
     fn socket_path(&self) -> io::Result<PathBuf> {
-        let mut bridge = self.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        self.socket_path_with_policy(bridge_no_start())
+    }
+
+    fn socket_path_with_policy(&self, no_start: bool) -> io::Result<PathBuf> {
+        let no_start = self.no_start || no_start;
+        let mut bridges = self.bridges.lock().unwrap_or_else(|p| p.into_inner());
+        let bridge = &mut bridges[usize::from(no_start)];
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(io::Error::other("device connection is closed"));
         }
@@ -481,7 +522,7 @@ impl ConnectionContext {
             return Ok(bridge.transport.directory.join("daemon.sock"));
         }
         let runtime =
-            crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
+            crate::instance::runtime_directory()?.join(crate::instance::runtime_subdirectory());
         crate::secure_file::prepare_private_directory(&runtime)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let directory = runtime.join(format!("device-{}", &token[..12]));
@@ -489,7 +530,7 @@ impl ConnectionContext {
         fs::create_dir(&directory)?;
         let transport = Arc::new(Transport {
             device: self.device.clone(),
-            no_start: crate::control::daemon_autostart_disabled(),
+            no_start,
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
@@ -1023,6 +1064,12 @@ fn forward(transport: &Arc<Transport>, stream: UnixStream) -> io::Result<()> {
 /// Runs on the selected host through SSH. stdout contains only framed protocol
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
 pub fn serve_stdio() -> io::Result<()> {
+    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "A daemon bridge requires your own terminal",
+        ));
+    }
     if is_remote() {
         return Err(io::Error::other(
             "a daemon bridge cannot target another device",
@@ -1198,7 +1245,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let owned = transport.clone();
         let worker = thread::spawn(move || run_bridge(listener, owned));
-        *context.bridge.lock().unwrap() = Some(Bridge {
+        context.bridges.lock().unwrap()[0] = Some(Bridge {
             transport,
             worker: Some(worker),
         });
@@ -1242,6 +1289,128 @@ mod tests {
         assert_eq!(
             command.last().unwrap(),
             "'cagents' --no-start daemon bridge"
+        );
+    }
+
+    #[test]
+    fn recovery_readers_and_explicit_actions_keep_separate_bridge_policies() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ConnectionContext::new(Device {
+            name: "fixture".into(),
+            host: "must-not-connect".into(),
+            executable: "cagents".into(),
+        });
+        let mut retained = Vec::new();
+        for no_start in [false, true] {
+            let directory = root.path().join(if no_start { "reader" } else { "action" });
+            fs::create_dir(&directory).unwrap();
+            let mut transport = fixture_transport(context.device.clone(), directory.clone());
+            Arc::get_mut(&mut transport).unwrap().no_start = no_start;
+            retained.push(transport.clone());
+            context.bridges.lock().unwrap()[usize::from(no_start)] = Some(Bridge {
+                transport,
+                worker: None,
+            });
+        }
+        let reader = context.socket_path_with_policy(true).unwrap();
+        let action = context.socket_path_with_policy(false).unwrap();
+        assert_ne!(reader, action);
+        assert_eq!(context.socket_path_with_policy(true).unwrap(), reader);
+        assert_eq!(context.socket_path_with_policy(false).unwrap(), action);
+        let command = |transport: &Transport| {
+            bridge_command(transport, None)
+                .get_args()
+                .last()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(command(&retained[0]), "'cagents' daemon bridge");
+        assert_eq!(command(&retained[1]), "'cagents' --no-start daemon bridge");
+        context.close();
+        assert!(
+            retained
+                .iter()
+                .all(|transport| transport.cancelled.is_cancelled())
+        );
+        assert!(context.socket_path_with_policy(true).is_err());
+        assert!(context.socket_path_with_policy(false).is_err());
+    }
+
+    #[test]
+    fn finishing_initial_restore_returns_default_remote_connections_to_the_ordinary_bridge() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_RESTORE_FINISHED";
+        if std::env::var_os(CHILD).is_some() {
+            crate::instance::initialize_window_restore_policy(
+                crate::instance::WindowRestorePolicy::ExistingOnly,
+            )
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let context = ConnectionContext::new(Device {
+                name: "fixture".into(),
+                host: "must-not-connect".into(),
+                executable: "cagents".into(),
+            });
+            let mut captured = Vec::new();
+            for no_start in [false, true] {
+                let directory = root
+                    .path()
+                    .join(if no_start { "reader" } else { "ordinary" });
+                fs::create_dir(&directory).unwrap();
+                let mut transport = fixture_transport(context.device.clone(), directory);
+                Arc::get_mut(&mut transport).unwrap().no_start = no_start;
+                captured.push(transport.clone());
+                context.bridges.lock().unwrap()[usize::from(no_start)] = Some(Bridge {
+                    transport,
+                    worker: None,
+                });
+            }
+            let initial = context.socket_path().unwrap();
+            assert_eq!(initial, captured[1].directory.join("daemon.sock"));
+            crate::instance::finish_window_restore();
+            assert_eq!(
+                context.socket_path().unwrap(),
+                captured[0].directory.join("daemon.sock")
+            );
+            assert_eq!(context.socket_path_with_policy(true).unwrap(), initial);
+            let command = bridge_command(&captured[1], None);
+            assert_eq!(
+                command.get_args().last().unwrap(),
+                "'cagents' --no-start daemon bridge"
+            );
+            let command = bridge_command(&captured[0], None);
+            assert_eq!(
+                command.get_args().last().unwrap(),
+                "'cagents' daemon bridge"
+            );
+            context.close();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for leaf in ["home", "runtime", "config", "data", "cache"] {
+            fs::create_dir(root.path().join(leaf)).unwrap();
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -1556,7 +1725,10 @@ mod tests {
             scoped_window_slot("a-b", "c"),
             scoped_window_slot("a", "b-c")
         );
-        assert_ne!(scoped_window_slot("build-host", "primary"), "build-host-primary");
+        assert_ne!(
+            scoped_window_slot("build-host", "primary"),
+            "build-host-primary"
+        );
         assert_eq!(
             scoped_window_slot("build-host", "primary"),
             scoped_window_slot("build-host", "primary")
@@ -1817,35 +1989,43 @@ pub fn prepare() -> io::Result<()> {
             ) + &SELECTED
                 .get()
                 .unwrap()
-                .bridge
+                .bridges
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-                .and_then(|bridge| {
-                    bridge
-                        .transport
-                        .last_error
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone()
-                })
-                .map(|error| format!("; {error}"))
-                .unwrap_or_default(),
+                .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
+            .as_ref()
+            .and_then(|bridge| {
+                bridge
+                    .transport
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+            .map(|error| format!("; {error}"))
+            .unwrap_or_default(),
         )),
     }
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn environment(
+pub fn environment(
     provider: crate::agent::Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {
     if persistable {
+        // An older device service may still report the session its daemon
+        // was started inside; that is never this conversation's.
         SELECTED
             .get()
             .and_then(|context| context.environment.get())
             .and_then(|environment| environment.get(&provider))
-            .cloned()
+            .map(|environment| {
+                environment
+                    .iter()
+                    .filter(|(name, _)| !crate::agent::is_session_variable(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         Default::default()

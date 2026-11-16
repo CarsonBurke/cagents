@@ -127,7 +127,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let mut request = self.resolve_worktree_request(&input, cancellation)?;
         if !consent.track && !request.track {
-            let existing = self.resolve_optional_revision(
+            let existing = self.resolve_optional_ref(
                 &request.repository,
                 &request.branch.full_ref(),
                 cancellation,
@@ -308,7 +308,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .env(format!("GIT_CONFIG_VALUE_{count}"), endpoint)
             .env("GIT_NO_REPLACE_OBJECTS", "1");
-        command.inherited_lease = Some(lease.as_raw_fd());
+        command.inherited_lease = Some(inherited_worktree_lease(lease)?);
         let output = self.executor.execute(&command, cancellation);
         match output {
             Ok(output) if output.success => {}

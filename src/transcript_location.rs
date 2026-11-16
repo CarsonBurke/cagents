@@ -203,14 +203,59 @@ mod tests {
         os::unix::fs::{PermissionsExt, symlink},
     };
 
+    fn temporary_directory_in(parent: &Path) -> tempfile::TempDir {
+        // The positive fixture must not inherit symlink components from TMPDIR.
+        // Production deliberately refuses those components when opening storage.
+        tempfile::tempdir_in(parent.canonicalize().unwrap()).unwrap()
+    }
+
+    fn temporary_directory() -> tempfile::TempDir {
+        temporary_directory_in(&tempfile::env::temp_dir())
+    }
+
     fn fixture() -> (tempfile::TempDir, TerminalId, PathBuf) {
-        let root = tempfile::tempdir().unwrap();
+        fixture_in(&tempfile::env::temp_dir())
+    }
+
+    fn fixture_in(parent: &Path) -> (tempfile::TempDir, TerminalId, PathBuf) {
+        let root = temporary_directory_in(parent);
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let terminal = TerminalId::new();
         let file = root.path().join(format!("{terminal}.log"));
         fs::write(&file, "private transcript contents").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         (root, terminal, file)
+    }
+
+    #[test]
+    fn fixture_under_symlinked_temporary_parent_uses_physical_path() {
+        let parent = temporary_directory();
+        let physical = parent.path().join("physical");
+        fs::create_dir(&physical).unwrap();
+        let alias = parent.path().join("alias");
+        symlink(&physical, &alias).unwrap();
+
+        let (root, terminal, path) = fixture_in(&alias);
+        assert_eq!(root.path(), root.path().canonicalize().unwrap());
+        assert_eq!(root.path().parent(), Some(physical.as_path()));
+        let root_metadata = fs::metadata(root.path()).unwrap();
+        let file_metadata = fs::metadata(&path).unwrap();
+        let opened = open_in(root.path(), terminal, &path).unwrap();
+        assert_eq!(
+            (opened.receipt.root_device, opened.receipt.root_inode),
+            (root_metadata.dev(), root_metadata.ino())
+        );
+        assert_eq!(
+            (opened.receipt.file_device, opened.receipt.file_inode),
+            (file_metadata.dev(), file_metadata.ino())
+        );
+
+        let lexical_root = alias.join(root.path().file_name().unwrap());
+        let lexical_path = lexical_root.join(path.file_name().unwrap());
+        assert!(matches!(
+            open_in(&lexical_root, terminal, &lexical_path),
+            Err(Unavailable::UnsafeStorage)
+        ));
     }
 
     #[test]
@@ -275,7 +320,7 @@ mod tests {
             open_with_receipt(root.path(), terminal, &metadata),
             Err(Unavailable::Changed)
         ));
-        let parent = tempfile::tempdir().unwrap();
+        let parent = temporary_directory();
         let alias = parent.path().join("transcripts");
         symlink(root.path(), &alias).unwrap();
         assert!(open_in(&alias, terminal, &alias.join(path.file_name().unwrap())).is_err());
@@ -283,7 +328,7 @@ mod tests {
 
     #[test]
     fn replacing_private_root_invalidates_receipt() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = temporary_directory();
         let root = parent.path().join("transcripts");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

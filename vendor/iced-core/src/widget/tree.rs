@@ -201,6 +201,15 @@ impl Tree {
                         }
                     })
                 {
+                    // The retained state still belongs to this named widget.
+                    // Keep its native numeric ID too: a queued accessibility
+                    // action cannot carry the custom name across the backend.
+                    if let Some(Id(Internal::Custom(_, name))) = &self.id
+                        && name == &n
+                        && let Some(id) = self.id.clone()
+                    {
+                        borrowed.set_id(id);
+                    }
                     std::mem::swap(&mut self.state, &mut state);
                     // The tag already matches. Restore existing children;
                     // Widget::diff below reconciles them without constructing

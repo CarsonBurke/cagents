@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Qualify owned source/stamp freshness across worktrees sharing a Cargo cache.
 
 The tiny workspace uses this repository's actual Cargo config and build script.
@@ -12,8 +12,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifacts
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,11 +26,12 @@ ANCHOR = f'const _: Option<&str> = option_env!("{IDENTITY}");\n'
 OLD_TIME = 946684800
 VENDOR_BUILD_HOOKS = (
     "vendor/iced-core", "vendor/iced-runtime", "vendor/iced-winit",
-    "vendor/libcosmic", "vendor/libsqlite3-sys",
+    "vendor/libcosmic", "vendor/libsqlite3-sys", "vendor/iced-wgpu",
 )
 VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
-    "vendor/accesskit-atspi-common", "vendor/harfrust", "vendor/smithay-clipboard",
+    "vendor/accesskit-atspi-common", "vendor/harfrust", "vendor/cosmic-text",
+    "vendor/smithay-clipboard",
     "vendor/iced-graphics",
 )
 ENV_WATCH = f'println!("cargo:rerun-if-env-changed={IDENTITY}");'
@@ -58,8 +63,16 @@ def guard_vendor_hooks():
 
 
 def run(*arguments, cwd, env=None):
+    # Fixture Git and Git invoked by Cargo build scripts must use the fixture's
+    # own repository, index and objects, never a caller-selected location.
+    environment = dict(os.environ if env is None else env)
+    for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        environment.pop(name, None)
     result = subprocess.run(
-        arguments, cwd=cwd, env=env, text=True, capture_output=True
+        arguments, cwd=cwd, env=environment, text=True, capture_output=True
     )
     if result.returncode:
         raise RuntimeError(f"{arguments[0]} failed in {cwd}:\n{result.stdout}\n{result.stderr}")
@@ -69,6 +82,33 @@ def run(*arguments, cwd, env=None):
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def build_workspace(checkout, env, names):
+    output, log = run("cargo", "build", "--offline", "--workspace", "--verbose",
+                      "--message-format=json-render-diagnostics", cwd=checkout, env=env)
+    artifacts = CargoArtifacts()
+    messages = [message for line in output.splitlines()
+                if (message := artifacts.read(line)) is not None]
+    products = {name: artifacts.executable(name) for name in names}
+    return products, messages, log
+
+
+def generated_output_paths(messages):
+    # Bind the fixture library's package identity to its build-script report.
+    # OUT_DIR locates its run files even with a target triple/separate build-dir.
+    packages = {message["package_id"] for message in messages
+                if message.get("reason") == "compiler-artifact"
+                and message.get("target", {}).get("name") == "qualification_generated"
+                and "lib" in message.get("target", {}).get("kind", [])}
+    reports = [message for message in messages
+               if message.get("reason") == "build-script-executed"
+               and message.get("package_id") in packages and message.get("out_dir")]
+    if len(reports) != 1:
+        raise RuntimeError("expected exactly one generated build-script OUT_DIR")
+    execution = Path(reports[0]["out_dir"]).parent
+    return {path for path in (execution / "output", execution / "run/output", execution / "run/stdout")
+            if path.is_file()}
 
 
 def qualify(directory, fixed):
@@ -101,12 +141,12 @@ qualification-dependency={path="../dependency"}
         build = build.replace(f'    println!("cargo:rerun-if-env-changed={IDENTITY}");\n', "")
     # Vary the actual stamp-producing script body independently of its runtime
     # Git lookup. A rerun in B can report B's dirty state using A's stale body.
-    directive = 'println!("cargo:rustc-env=CAGENTS_VERSION={version}");'
+    directive = 'println!("cargo:rustc-env=CAGENTS_CHECKOUT_METADATA={metadata}");'
     assert build.count(directive) == 1
-    build = build.replace(directive, directive.replace("{version}", "{version}.body-A"))
+    build = build.replace(directive, directive.replace("{metadata}", "{metadata}.body-A"))
     write(checkout_a / "build.rs", build)
     anchor = ANCHOR if fixed else ""
-    write(checkout_a / "src/lib.rs", anchor + '''pub const VERSION: &str = env!("CAGENTS_VERSION");
+    write(checkout_a / "src/lib.rs", anchor + '''pub const VERSION: &str = concat!("0.1.3+", env!("CAGENTS_CHECKOUT_METADATA"));
 pub fn value() -> &'static str { "root-A" }
 ''')
     write(checkout_a / "src/main.rs", '''fn main() {
@@ -184,6 +224,7 @@ pub fn generated() -> &'static str { GENERATED }
         run("git", "status", "--porcelain", "--untracked-files=no", cwd=checkout)
     env = os.environ.copy()
     env.pop("CAGENTS_BUILD_METADATA", None)
+    env.pop("CAGENTS_BUILD_METADATA_SUPPLIED", None)
     env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(lane / "build"), CARGO_BUILD_JOBS="2")
     # The configured force=true must defeat an inherited checkout identity.
     env[IDENTITY] = "deliberately-stale-inherited-value"
@@ -194,6 +235,7 @@ pub fn generated() -> &'static str { GENERATED }
     expected_outcomes = []
     patch_outcomes = []
     generated_directives = None
+    directive_paths = set()
     checkouts = (checkout_a, checkout_b, checkout_a) + ((checkout_a,) if fixed else ())
     for step, checkout in enumerate(checkouts):
         if step == 3:
@@ -202,11 +244,11 @@ pub fn generated() -> &'static str { GENERATED }
             # independently of a checkout-identity change. Keep Rust source old.
             write(checkout / "vendor/generated/input.txt", "generated-output-A-edited")
         env["QUALIFICATION_PROBE_CHECKOUT"] = str(checkout)
-        _, log = run("cargo", "build", "--offline", "--workspace", "--verbose", cwd=checkout, env=env)
+        products, messages, log = build_workspace(checkout, env, ("cagents", "ceditor", "cache-probe"))
         write(lane / f"build-{step}.log", log)
-        root, _ = run(str(target / "debug/cagents"), cwd=checkout)
-        editor, _ = run(str(target / "debug/ceditor"), cwd=checkout)
-        probe, _ = run(str(target / "debug/cache-probe"), cwd=checkout)
+        root, _ = run(str(products["cagents"]), cwd=checkout)
+        editor, _ = run(str(products["ceditor"]), cwd=checkout)
+        probe, _ = run(str(products["cache-probe"]), cwd=checkout)
         observed_checkout, probe = probe.split("|", 1)
         assert observed_checkout == str(checkout), ("observer executable was stale", checkout, observed_checkout)
         letter = "B" if step == 1 else "A"
@@ -222,18 +264,12 @@ pub fn generated() -> &'static str { GENERATED }
             assert probe == "plain-A|generated-source-A|generated-output-A", probe
         # Rerunning the fixed generator changes OUT_DIR contents while keeping
         # its emitted cfg/link/watch directives byte-identical across checkouts.
-        # Cargo's older flat layout and pinned nightly's crate/hash/run layout
-        # are the only searches; do not recursively inventory the target tree.
-        output_patterns = (
-            "debug/build/qualification-generated-*/output",
-            "debug/build/qualification-generated/*/run/output",
-            "debug/build/qualification_generated/*/run/output",
-            "debug/build/qualification-generated/*/run/stdout",
-            "debug/build/qualification_generated/*/run/stdout",
-        )
-        directives = [p.read_bytes() for base in (target, lane / "build")
-                      for pattern in output_patterns for p in base.glob(pattern)]
-        assert directives, "missing generated build-script output in known Cargo layouts"
+        # Retain comparisons with earlier reported run files without scanning
+        # guessed profile directories or accepting an unrelated stale output.
+        reported_paths = generated_output_paths(messages)
+        assert reported_paths, "missing generated build-script output for reported OUT_DIR"
+        directive_paths.update(reported_paths)
+        directives = [path.read_bytes() for path in sorted(directive_paths) if path.is_file()]
         if generated_directives is None:
             generated_directives = directives[0]
         assert all(value == generated_directives for value in directives), "generator directives changed"
@@ -359,7 +395,7 @@ links="qualification_paths"
                                "qualification-path-source", cwd=checkout, env=env)
             write(lane / "bootstrap-clean.log", clean_log)
         env["QUALIFICATION_PROBE_CHECKOUT"] = str(checkout)
-        _, log = run("cargo", "build", "--offline", "--workspace", "--verbose", cwd=checkout, env=env)
+        products, _, log = build_workspace(checkout, env, ("qualification-path-observer",))
         write(lane / f"build-{step}.log", log)
         if historical:
             compilations = sum("--crate-name build_script_build" in line
@@ -373,7 +409,7 @@ links="qualification_paths"
             dep_info = dep_infos[0].read_text()
             write(lane / f"build-{step}.dep-info", dep_info)
             compiler_anchors.append(f"# env-dep:{IDENTITY}=" in dep_info)
-        observed, _ = run(str(target / "debug/qualification-path-observer"), cwd=checkout)
+        observed, _ = run(str(products["qualification-path-observer"]), cwd=checkout)
         observer, input_value, include = observed.split("|")
         assert observer == str(checkout), ("metadata observer was stale", checkout, observer)
         assert input_value == ("input-B" if step == 1 else "input-A"), (checkout, input_value)
@@ -419,13 +455,14 @@ def main():
     args = parser.parse_args()
     config = tomllib.loads((ROOT / ".cargo/config.toml").read_text())
     assert config["env"][IDENTITY] == {"value": ".", "relative": True, "force": True}
-    # Both compilation roots share the unconditional anchor in modules.rs.
-    for source in ("src/lib.rs", "src/hot-ui.rs"):
+    # Each compilation root shares the unconditional anchor in its modules.rs.
+    for source in ("src/lib.rs", "crates/cagents-ui/src/lib.rs", "crates/cagents-ui/src/hot-ui.rs"):
         assert (ROOT / source).read_text().splitlines().count(
             'include!("modules.rs");'
         ) == 1, source
     for source in (
-        "build.rs", "src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+        "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
+        "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
     ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source

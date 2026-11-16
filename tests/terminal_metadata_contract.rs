@@ -269,7 +269,7 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let cli = |args: &[&str], json: bool| -> Result<String, String> {
+        let cli = |args: &[&str], json: bool| -> Result<(String, String), String> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("inventory CLI deadline expired".into());
@@ -293,23 +293,45 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
                 .execute(&command, &CancellationToken::new())
                 .and_then(|output| output.require_success(executable))
                 .map_err(|e| e.to_string())?;
-            String::from_utf8(output.stdout).map_err(|e| e.to_string())
+            let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            Ok((stdout, stderr))
         };
         let human = cli(&["terminal", "list", "--all"], false)?;
+        let listed_output = cli(&["terminal", "list"], true)?;
         let listed: serde_json::Value =
-            serde_json::from_str(&cli(&["terminal", "list"], true)?).map_err(|e| e.to_string())?;
+            serde_json::from_str(&listed_output.0).map_err(|e| e.to_string())?;
+        let shown_output = cli(&["terminal", "show", &id.to_string()], true)?;
         let shown: serde_json::Value =
-            serde_json::from_str(&cli(&["terminal", "show", &id.to_string()], true)?)
-                .map_err(|e| e.to_string())?;
-        Ok((id, human, listed, shown))
+            serde_json::from_str(&shown_output.0).map_err(|e| e.to_string())?;
+        Ok((id, human, listed_output, listed, shown))
     })();
     // Close original control/CLI connections and reap the exact private daemon
     // before assertions. The outer family guardian checks descendant settlement.
     drop(daemon);
-    let (id, human, listed, shown) = observed.unwrap();
+    let (id, (human, human_stderr), (listed_stdout, listed_stderr), listed, shown) =
+        observed.unwrap();
     assert!(human.starts_with("TERMINAL"), "{human}");
     assert!(human.contains("CLI inventory title"), "{human}");
     assert!(human.contains("running"), "{human}");
+    // Inspect both original streams: parsing JSON can discard duplicate fields,
+    // and a diagnostic on stderr is still visible to the CLI user. Retain the
+    // parsed check as well so JSON escapes cannot conceal the fixture canaries.
+    let listed_json = listed.to_string();
+    for (kind, output) in [
+        ("human stdout", &human),
+        ("human stderr", &human_stderr),
+        ("JSON stdout", &listed_stdout),
+        ("JSON stderr", &listed_stderr),
+        ("JSON decoded", &listed_json),
+    ] {
+        for canary in ["FIXTURE_DISPLAY_ONLY", "full descriptor only"] {
+            assert!(
+                !output.contains(canary),
+                "{kind} terminal list exposed launch-environment fixture canary {canary:?}"
+            );
+        }
+    }
     let row = &listed["data"]["terminals"][0];
     assert_eq!(row["id"], id.to_string());
     assert_eq!(row["state"], "running");

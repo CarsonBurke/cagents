@@ -8,6 +8,8 @@ fn main() {
     std::process::exit(2);
 }
 
+cagents::stamp_version!();
+
 #[cfg(feature = "host")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use cagents::{
@@ -196,9 +198,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         vec![selected]
     };
+    // Capture the caller once. Never turn an inherited invalid credential into
+    // User scope, and retain the same opaque authority across hosted reconnects.
+    let authority = cagents::agent_execution::Authority::from_environment();
     let mut control = socket
         .as_ref()
-        .map(|socket| ControlClient::connect(socket))
+        .map(|socket| {
+            let mut client = ControlClient::connect(socket)?;
+            client.authenticate(authority.clone())?;
+            Ok::<_, cagents::control::ControlError>(client)
+        })
         .transpose()?;
     for mode in modes {
         if ![
@@ -267,11 +276,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             handles.push(
                 if let (Some(socket), Some(control)) = (&socket, &mut control) {
-                    BenchTerminal::Hosted(HostedTerminalHandle::attach_or_spawn_at(
+                    BenchTerminal::Hosted(HostedTerminalHandle::attach_or_spawn_at_with_authority(
                         socket,
                         session,
                         config,
                         Some(control.proof().clone()),
+                        authority.clone(),
                         callback,
                     )?)
                 } else {

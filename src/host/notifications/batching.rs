@@ -23,7 +23,14 @@ pub(super) struct Schedule(BTreeMap<uuid::Uuid, (Instant, Instant)>);
 
 impl Schedule {
     pub fn update(&mut self, target: Target, kind: Kind, now: Instant) {
-        let delay = if matches!(kind, Kind::Waiting | Kind::Failed | Kind::Interrupted) {
+        let delay = if matches!(
+            kind,
+            Kind::Waiting
+                | Kind::Failed
+                | Kind::Interrupted
+                | Kind::AutomationPaused
+                | Kind::AutomationBlocked
+        ) {
             Duration::from_millis(200)
         } else {
             Duration::from_millis(600)
@@ -93,6 +100,49 @@ mod tests {
         assert!(
             schedule.ready(&a, now + Duration::from_secs(2)),
             "continuous updates cannot starve delivery"
+        );
+    }
+
+    #[test]
+    fn automation_revisions_share_one_urgent_group_without_stealing_actor_identity() {
+        let id = uuid::Uuid::new_v4();
+        let old = Target::Automation { id, sequence: 17 };
+        let current = Target::Automation { id, sequence: 18 };
+        assert_ne!(old, current);
+        assert_eq!(desktop_id(&old), desktop_id(&current));
+        for other in [
+            Target::Session(crate::model::TerminalId::from_uuid(id)),
+            Target::AgentRun(crate::model::RunId::from_uuid(id)),
+            Target::Automation {
+                id: uuid::Uuid::new_v4(),
+                sequence: 18,
+            },
+        ] {
+            assert_ne!(desktop_id(&current), desktop_id(&other));
+        }
+        let now = Instant::now();
+        let mut schedule = Schedule::default();
+        schedule.update(old.clone(), Kind::AutomationPaused, now);
+        assert!(!schedule.ready(&current, now + Duration::from_millis(199)));
+        assert!(schedule.ready(&current, now + Duration::from_millis(200)));
+        for index in 1..30 {
+            schedule.update(
+                Target::Automation {
+                    id,
+                    sequence: 18 + index,
+                },
+                Kind::AutomationBlocked,
+                now + Duration::from_millis(index * 100),
+            );
+        }
+        assert_eq!(
+            schedule.0.len(),
+            1,
+            "new sequence does not grow a second delivery group"
+        );
+        assert!(
+            schedule.ready(&current, now + Duration::from_secs(2)),
+            "busy state changes cannot defer review forever"
         );
     }
 }

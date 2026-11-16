@@ -175,7 +175,111 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
-pub const PROTOCOL_VERSION: u16 = 105;
+/// Version 110 bounds channel-work projections with independent current/history
+/// cursors and adds exact-target and metadata-only home reads for safe recovery.
+/// Version 115 appends an explicit recoverable input notice. Older clients
+/// cannot decode this unsolicited event, so all three executables must match.
+/// Version 116 combines channel-work requests/responses with recoverable input
+/// notices. Neither predecessor identifies this combined matched executable set.
+/// Version 119 replaces a channel-work caller's incidental whole-view revision
+/// with an explicit durable placement_epoch. Matched executables are required;
+/// old saved actor requests are refused without rebasing their captured intent.
+/// Known private account experiments use 117 and 118 and are not adopted here.
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
+/// Version 125 raises terminal history to an explicit byte budget (16 MiB by
+/// default, up to 1 GiB). Published protocol-119 hosts reject values above
+/// 1,000,000, so their unchanged positional field encoding is not sufficient
+/// compatibility: replace the matched daemon before sending the new budgets.
+/// Version 127 combines both contracts in the matched set. Version 126 is
+/// reserved for the separate native Goal integration and is not adopted here.
+/// Version 128 appends the startup-state inspection request and its response.
+/// A reopened window sends it to the daemon an update just started, so a
+/// same-numbered older daemon that would drop the undecodable frame must be
+/// refused at connection instead. Version 128 was published by the install
+/// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
+/// daemons are update sources this release inspects and replaces, not peers.
+/// Version 129 is this release's matched set with the same extension.
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
+/// and are not adopted here.
+/// Version 155 appends two agent operations and their replies: the transcript
+/// read and the channel member listing. Versions 152 to 154 are reserved for
+/// parallel branches and are not adopted.
+/// Version 156 appends the exact skipped-occurrence count and range to Firing.
+/// An older client is refused the replies holding one.
+/// Version 160 appends the `Sessions` and `Send` agent operations and their
+/// replies, which report each session's usage limit and account, and extends
+/// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
+/// which reaches every chat subscriber unasked. 157 to 159 are reserved for
+/// parallel branches and are not adopted here.
+/// Version 165 appends `ChatLostProcesses`, which lists and ends what a dead
+/// Cagents helper left running for a conversation, and its reply. 161 to 164
+/// are reserved for parallel branches and are not adopted here.
+/// Version 166 adds a tool status for an agent waiting on its own background
+/// work, which an older client is sent as running.
+/// Version 172 appends the worktrees a conversation edited to
+/// `ConversationPullRequests`. 167 to 171 are reserved for parallel branches
+/// and are not adopted here.
+/// Version 173 appends `ServerMessage::ChatAgentAddresses`, which says how a
+/// provider addresses a chat's subagents. Snapshots keep their layout, which
+/// the update sources share.
+/// Version 174 appends the agent operations `Prompt` and `Deliver`, which say
+/// whether an existing agent took a prompt or message as a run now or holds
+/// it behind its current work, and their replies `Prompted` and `Handed`.
+/// Version 175 adds scope revisions, closed pane identities and canonical
+/// changed rows to `WorkspaceModelEdited`. Windows apply matching revisions or
+/// read only the affected scope with `ReadWorkspaceView`; reconnect snapshots,
+/// typed edit receipts and narrow metadata reads have appended requests/replies.
+/// The changed watch snapshot and edge shape require matched windows; older
+/// carried CLIs retain explicit whole-model reads/edits but cannot watch.
+/// Version 176 separates cancelled and skipped Work check counts from failures
+/// and passes. Board reads, pins and subscriptions require a matching client.
+/// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
+/// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
+/// a window watching notifications that a project's pending automation
+/// requests changed, so it reads them then rather than polling.
+/// Version 179 appends retryable `StoreBusy` errors for mailbox contention.
+/// Older clients cannot decode the new error code; replace the matched set.
+/// Version 180 appends agent placement context and a narrow read of managed
+/// agents' accepted task labels, preserving the carried CLI directory layout.
+/// Version 181 appends `RetryPendingTerminalSave` to persist an already
+/// running terminal without launching another worker.
+/// Version 182 appends provider-confirmed active model status independently of
+/// chat snapshots, whose inspector encoding stays frozen for update sources.
+/// Version 183 fences shared Close on its original pane and terminal worker,
+/// with attachment metadata, captured-source reads and source-checked cleanup.
+/// Version 184 adds reset inventories and reported plan display names and
+/// tiers to account readings, which older CLIs are sent without, and appends
+/// the account-reset and after-sign-in probe device operations, with a
+/// JSON-framed reset reply that older CLIs cannot request.
+/// Replace the matched daemon/window set.
+pub const PROTOCOL_VERSION: u16 = 184;
+/// A correlated refusal issued before source-checked cleanup has any effect.
+pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
+    "The terminal changed or still owns work; nothing was closed";
+/// No resident was selected; disappearance is not a successor publication.
+pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
+    "The captured terminal is no longer resident; nothing was closed";
+/// The install candidate line's protocol. Every message an update exchanges
+/// with its daemon (Connect, the upgrade preview and preparation, and the
+/// inspector's frozen and saved-history requests) has this release's
+/// encoding, so an update may speak it as a source with this release's
+/// client. Its daemons and windows are never peers. Its CLI, which chats
+/// carried across an update keep running, is served as an [`OlderClient`]:
+/// the one wire difference, the device account `Restore` operation this
+/// release appended, is a request that CLI cannot send.
+pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+
+mod older_clients;
+pub(crate) use older_clients::{
+    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+};
+pub use older_clients::{OlderClient, is_cli_peer, older_client};
+
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -205,7 +309,7 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
             )
         })?;
     Ok(runtime
-        .join(instance::RUNTIME_SUBDIRECTORY)
+        .join(instance::runtime_subdirectory())
         .join(SOCKET_FILE_NAME))
 }
 
@@ -525,6 +629,71 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
+    ChannelWork {
+        authority: crate::agent_execution::Authority,
+        request: crate::channel_work_api::Request,
+    },
+    /// Whether startup recovery finished, is still awaiting original owners,
+    /// or kept them after a failure. Answered during recovery, unlike every
+    /// request that recovery refuses with the same `TerminalUnavailable`.
+    StartupState,
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
+    /// Lists what still runs for a conversation whose Cagents helper died,
+    /// which is what holds its Close. It first ends each process in `end`
+    /// that is still the one listed and proved to be the conversation's: the
+    /// ones the person was shown and chose to end. Ends nothing while its
+    /// helper runs.
+    ChatLostProcesses {
+        session: crate::chat::Session,
+        end: Vec<ProcessStart>,
+    },
+    /// Read one scope of the shared model, for a watcher that cannot apply an
+    /// edge to the copy it holds. Answered with
+    /// [`ServerResponse::WorkspaceView`].
+    ReadWorkspaceView {
+        scope: crate::workspace_model::views::Scope,
+    },
+    /// Commit an edit and return only its authoritative effects.
+    ApplyWorkspaceEdit {
+        edit: crate::workspace_model::ModelEdit,
+    },
+    /// Read a reconnect baseline including closed identities, without subscribing.
+    ReadWorkspaceSnapshot,
+    /// Read only the metadata needed for an ownership or identity check.
+    ReadWorkspaceMetadata {
+        query: crate::workspace_model::metadata::Query,
+    },
+    /// Save only a resident worker's retained automatic-start intent. This
+    /// request never allocates or replays a worker after retirement.
+    RetryPendingTerminalSave {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    },
+    /// An exact source worker, or an absence stamp captured before Close's
+    /// process proof. This never closes, starts or attaches a terminal.
+    ReadTerminalRemovalBasis {
+        source: TerminalSession,
+    },
+    /// Close only the worker captured by the original pane gesture. Completed
+    /// release and checked live close share the same resident-generation fence.
+    CloseTerminalSource {
+        session: TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        #[serde(default)]
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    },
+    /// Resolve only the canonical generation from the original complete view.
+    ReadCapturedTerminalRemovalBasis {
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,7 +709,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty history page budget in bytes. The legacy JSON name also meant bytes.
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -552,7 +723,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -566,7 +737,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -628,6 +799,31 @@ pub struct ServerEnvelope {
     pub message: ServerMessage,
 }
 
+/// A host reply whose transcript may already be encoded by a retained helper.
+#[cfg(feature = "host")]
+#[derive(Debug)]
+pub(crate) enum PreparedResponse {
+    Decoded(ServerResponse),
+    EncodedChat { chat_id: TerminalId, bytes: Vec<u8> },
+}
+#[cfg(feature = "host")]
+impl From<ServerResponse> for PreparedResponse {
+    fn from(response: ServerResponse) -> Self {
+        Self::Decoded(response)
+    }
+}
+#[cfg(feature = "host")]
+impl PreparedResponse {
+    pub(crate) fn decode(self) -> Result<ServerResponse, String> {
+        match self {
+            Self::Decoded(response) => Ok(response),
+            Self::EncodedChat { bytes, .. } => {
+                postcard::from_bytes(&bytes).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
 /// A borrowed, serialize-only view of [`ServerEnvelope`].
 ///
 /// The daemon fans one broadcast out to every subscriber of a terminal, and the
@@ -638,13 +834,28 @@ pub struct ServerEnvelope {
 ///
 /// The field order, names and types are exactly [`ServerEnvelope`]'s, so the
 /// postcard encoding is byte-identical; `borrowed_envelope_encodes_identically`
-/// pins that.
-#[derive(Debug, Serialize)]
+/// pins that. An envelope in an older client's version encodes its message as
+/// that client decodes it.
+#[derive(Debug)]
 pub struct ServerEnvelopeRef<'envelope> {
     pub version: u16,
     pub request_id: Option<u64>,
     pub proof: &'envelope HostSessionProof,
     pub message: &'envelope ServerMessage,
+}
+
+impl Serialize for ServerEnvelopeRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        older_clients::encoding_for(self.version, || {
+            let mut envelope = serializer.serialize_struct("ServerEnvelopeRef", 4)?;
+            envelope.serialize_field("version", &self.version)?;
+            envelope.serialize_field("request_id", &self.request_id)?;
+            envelope.serialize_field("proof", self.proof)?;
+            envelope.serialize_field("message", self.message)?;
+            envelope.end()
+        })
+    }
 }
 
 // Boxing the large payload would change this public wire type's construction and
@@ -712,10 +923,14 @@ pub enum ServerMessage {
     /// The edit travels rather than the whole model so an edge stays the size
     /// of what changed, and `sequence` is the registry's value after applying
     /// it, which is what lets a receiver tell an edge it has already seen from
-    /// one it has not.
+    /// one it has not. `effects` names each scope the edit changed with its
+    /// revision before and after, the panes it closed, and the channel and
+    /// agent rows it changed beyond what the edit says, so a receiver can
+    /// apply the edit to its copy instead of reading the model.
     WorkspaceModelEdited {
         sequence: u64,
         edit: crate::workspace_model::ModelEdit,
+        effects: crate::workspace_model::delta::EditEffects,
     },
     /// What a native chat's provider reported about the account the chat runs
     /// on, delivered to every subscriber whatever its visibility. It names no
@@ -737,6 +952,49 @@ pub enum ServerMessage {
     WorkBoard {
         revision: u64,
         board: Box<crate::work::Board>,
+    },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
+    },
+    /// The usage limit that stops a native chat now, or none: the daemon's one
+    /// judgement of it, which `cagents sessions` reports too. Delivered to
+    /// every subscriber whatever its visibility, whenever the judgement
+    /// changes and once to each new subscriber.
+    ChatLimit {
+        chat_id: TerminalId,
+        limit: Option<crate::agent_execution::directory::UsageLimit>,
+    },
+    /// Every address the provider gave a native chat's subagents, such as the
+    /// agent IDs Claude Code's `SendMessage` names them by, with the ID its
+    /// snapshot lists each under. Addresses only accumulate, so a receiver
+    /// keeps every one it was sent. Delivered to every subscriber whatever its
+    /// visibility, whenever one is learned and once to each new subscriber.
+    ChatAgentAddresses {
+        chat_id: TerminalId,
+        addresses: Vec<crate::chat::AgentAddress>,
+    },
+    /// The project gained or resolved a pending automation request.
+    /// Notification subscribers read the pending requests again.
+    AutomationProposalsChanged {
+        repository: std::path::PathBuf,
+    },
+    /// Provider-confirmed model and effort, independently of a staged model
+    /// selection. Each subscriber receives the current revision on attachment.
+    ChatActiveModel {
+        chat_id: TerminalId,
+        revision: u64,
+        model: Option<crate::chat::ActiveModel>,
+    },
+    /// Exact attachment metadata, separate from the frozen descriptor used by
+    /// historical update sources. This UUID never authorizes process cleanup.
+    TerminalWorker {
+        terminal_id: TerminalId,
+        instance: uuid::Uuid,
     },
 }
 
@@ -856,6 +1114,40 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
+    ChannelWork(crate::channel_work_api::Response),
+    StartupState(StartupState),
+    /// What [`ClientRequest::ChatLostProcesses`] found still running, after
+    /// ending what it ended.
+    ChatLostProcesses {
+        processes: Vec<LostProcess>,
+    },
+    /// One scope of the shared model and the model sequence it is consistent
+    /// with. `view` is `None` when the registry has no such scope.
+    WorkspaceView {
+        view: Option<crate::workspace_model::views::View>,
+        sequence: u64,
+    },
+    /// Initial subscriber state and the closed identities that fence adoption.
+    WorkspaceSnapshot {
+        model: crate::workspace_model::WorkspaceModel,
+        closed: Vec<crate::model::CardId>,
+    },
+    WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
+    WorkspaceMetadata(crate::workspace_model::metadata::Reply),
+    TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
+}
+
+/// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupState {
+    /// Startup finished; ordinary requests are admitted.
+    Ready,
+    /// Adopted original owners whose startup outcome is still pending.
+    Restoring { awaiting: u64 },
+    /// Startup failed and kept original ownership. This does not resolve by
+    /// waiting: only inspection and explicit Close are admitted.
+    Retained { detail: String },
 }
 
 /// Maximum compact inventory rows in one capacity response.
@@ -887,6 +1179,28 @@ pub struct ChatReleaseProof {
     pub session: crate::chat::Session,
     pub execution_instance: uuid::Uuid,
     pub generation: u64,
+}
+
+/// One process, as it was when it was listed: a PID, and the start time
+/// that tells it apart from a later process given the same PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessStart {
+    pub pid: i32,
+    /// Clock ticks after boot, as `/proc/<pid>/stat` gives it.
+    pub start: u64,
+}
+
+/// A process that still runs for a conversation whose Cagents helper died.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostProcess {
+    pub process: ProcessStart,
+    /// The executable's short name, as `ps` shows it.
+    pub name: String,
+    /// Its command line, shortened; empty when it shows none.
+    pub command: String,
+    /// Whether it is proved to be the conversation's, so that Cagents may
+    /// end it. One that isn't is only named, and still holds the Close.
+    pub proved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -961,11 +1275,32 @@ pub enum ShutdownOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct ProtocolError {
     pub code: ProtocolErrorCode,
     pub message: String,
     pub retryable: bool,
+}
+
+impl Serialize for ProtocolError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Carried CLIs know Internal for transient daemon contention. Preserve
+        // the diagnostic and retryability without sending a new enum variant.
+        let code = match self.code {
+            ProtocolErrorCode::StoreBusy
+                if older_clients::encoding_before(older_clients::STORE_BUSY_ERROR) =>
+            {
+                ProtocolErrorCode::Internal
+            }
+            code => code,
+        };
+        let mut error = serializer.serialize_struct("ProtocolError", 3)?;
+        error.serialize_field("code", &code)?;
+        error.serialize_field("message", &self.message)?;
+        error.serialize_field("retryable", &self.retryable)?;
+        error.end()
+    }
 }
 
 impl ProtocolError {
@@ -995,6 +1330,7 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    StoreBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1547,6 +1883,10 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    InputNotice {
+        operation: String,
+        message: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
@@ -1584,6 +1924,10 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 Self::AgentActivityChanged { activity }
             }
             TerminalEvent::Bell => Self::Bell,
+            TerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: operation.to_owned(),
+                message,
+            },
             TerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1593,7 +1937,11 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 signal,
                 intentional,
             },
-            TerminalEvent::Error { operation, message } => Self::Error {
+            // InputRejected is client-local. If serialized by a future caller,
+            // preserve the conservative existing wire Error semantics; a bare
+            // wire event must never issue trusted nonfatal admission evidence.
+            TerminalEvent::Error { operation, message }
+            | TerminalEvent::InputRejected { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
             },
@@ -1640,6 +1988,19 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 Self::AgentActivityChanged(activity)
             }
             WireTerminalEvent::Bell => Self::Bell,
+            WireTerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: match operation.as_str() {
+                    "cancel terminal input" => "cancel terminal input",
+                    "write terminal input" => "write terminal input",
+                    "write encoded key" => "write encoded key",
+                    "write terminal paste" => "write terminal paste",
+                    "write encoded mouse event" => "write encoded mouse event",
+                    "write terminal response" => "write terminal response",
+                    "interrupt terminal" => "interrupt terminal",
+                    _ => "terminal input",
+                },
+                message,
+            },
             WireTerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1695,6 +2056,36 @@ pub struct FrameCodec {
     payload_length: Option<usize>,
     payload_read: usize,
     maximum: usize,
+    memory_id: u64,
+    small_reads: u8,
+    small_writes: u8,
+}
+
+// A codec moves from handshake into a reader thread. Pointer identity would
+// leave a phantom owner at its former stack address in memory census traces.
+fn next_memory_codec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// Normal interactive frames keep a reusable quarter-mebibyte allocation. A
+// one-off transcript/image transfer must not permanently multiply its peak
+// capacity across every attached chat. Eight consecutive frames at least four
+// times smaller retire an outlier; interleaved snapshots/acknowledgements keep
+// hot capacity. Hidden chat transports explicitly release their spare buffers.
+const FRAME_REUSE_FLOOR: usize = 256 * 1024;
+
+fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
+    buffer.clear();
+    if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
+        *small_frames = small_frames.saturating_add(1);
+        if *small_frames >= 8 {
+            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            *small_frames = 0;
+        }
+    } else {
+        *small_frames = 0;
+    }
 }
 
 impl FrameCodec {
@@ -1707,7 +2098,30 @@ impl FrameCodec {
             payload_length: None,
             payload_read: 0,
             maximum,
+            memory_id: next_memory_codec_id(),
+            small_reads: 0,
+            small_writes: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities_for_test(&self) -> (usize, usize) {
+        (self.read_buffer.capacity(), self.write_buffer.capacity())
+    }
+
+    /// Release outlier scratch when a connection becomes hidden or idle.
+    /// A timed-out partial frame remains intact until it is decoded.
+    pub fn release_spare(&mut self) {
+        if self.payload_length.is_none() && self.prefix_read == 0 {
+            self.read_buffer.clear();
+            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            self.small_reads = 0;
+        }
+        self.write_buffer.clear();
+        self.write_buffer.shrink_to(FRAME_REUSE_FLOOR);
+        self.small_writes = 0;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
     }
 
     pub fn read<T: DeserializeOwned>(
@@ -1767,7 +2181,45 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
+        recycle_frame_buffer(&mut self.read_buffer, length, &mut self.small_reads);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
+    }
+
+    /// Append an already encoded response after the ordinary envelope header.
+    #[cfg(feature = "host")]
+    pub(crate) fn write_encoded_response(
+        &mut self,
+        writer: &mut impl Write,
+        version: u16,
+        request_id: Option<u64>,
+        proof: &HostSessionProof,
+        response: &[u8],
+    ) -> Result<(), FrameError> {
+        // Response is the first ServerMessage variant. A unit enum emits only
+        // its discriminant, leaving the response's bytes immediately after it.
+        #[derive(Serialize)]
+        enum MessagePrefix {
+            Response,
+        }
+        encode_frame(
+            &mut self.write_buffer,
+            self.maximum,
+            &(version, request_id, proof, MessagePrefix::Response),
+        )?;
+        let mut sink = CappedSink {
+            buffer: &mut self.write_buffer,
+            maximum: self.maximum,
+            failure: None,
+        };
+        sink.write_all(response).map_err(FrameError::Io)?;
+        let length = self.write_buffer.len() - LENGTH_PREFIX_BYTES;
+        validate_frame_length(length, self.maximum)?;
+        self.write_buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_be_bytes());
+        writer.write_all(&self.write_buffer)?;
+        writer.flush()?;
+        recycle_frame_buffer(&mut self.write_buffer, length, &mut self.small_writes);
+        Ok(())
     }
 
     pub fn write<T: Serialize>(
@@ -1786,7 +2238,20 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        recycle_frame_buffer(
+            &mut self.write_buffer,
+            payload_length,
+            &mut self.small_writes,
+        );
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
+    }
+}
+
+impl Drop for FrameCodec {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            released = true, read_capacity = 0usize, write_capacity = 0usize);
     }
 }
 
@@ -1972,6 +2437,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {
+        let model = crate::chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: None,
+            aliases: vec!["opusplan".into()],
+        };
+        let mut snapshot = crate::chat::Snapshot::default();
+        let before = postcard::to_allocvec(&snapshot).unwrap();
+        snapshot.active_model = Some(model.clone());
+        snapshot.active_model_revision = 3;
+        assert_eq!(postcard::to_allocvec(&snapshot).unwrap(), before);
+        let message = ServerMessage::ChatActiveModel {
+            chat_id: TerminalId::new(),
+            revision: 3,
+            model: Some(model),
+        };
+        let encoded = postcard::to_allocvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, message);
+        assert!(
+            !older_client(CANDIDATE_LINE_PROTOCOL)
+                .unwrap()
+                .admits_message(&message)
+        );
+    }
+
+    #[test]
+    fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct LegacyOptions {
+            columns: u16,
+            rows: u16,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            max_scrollback: usize,
+            initially_visible: bool,
+            theme: TerminalTheme,
+        }
+        for budget in [
+            0,
+            10_000,
+            TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
+            TerminalConfig::MAX_SCROLLBACK_BYTES,
+        ] {
+            let legacy = LegacyOptions {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                max_scrollback: budget,
+                initially_visible: true,
+                theme: TerminalTheme::default(),
+            };
+            let decoded: TerminalSpawnOptions =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            assert_eq!(decoded.max_scrollback_bytes, budget);
+            let mut old_frame = Vec::new();
+            write_frame(&mut old_frame, &legacy).unwrap();
+            let mut new_frame = Vec::new();
+            write_frame(&mut new_frame, &decoded).unwrap();
+            assert_eq!(old_frame, new_frame);
+            assert_eq!(
+                read_frame::<TerminalSpawnOptions>(&mut Cursor::new(&old_frame)).unwrap(),
+                Some(decoded)
+            );
+            assert_eq!(
+                read_frame::<LegacyOptions>(&mut Cursor::new(&new_frame)).unwrap(),
+                Some(legacy)
+            );
+        }
+        let options = TerminalSpawnOptions::from(TerminalConfig::default());
+        assert_eq!(options.max_scrollback_bytes, 16 * 1024 * 1024);
+        let mut duplicate = serde_json::to_value(options).unwrap();
+        duplicate["max_scrollback"] = serde_json::json!(10_000);
+        assert!(serde_json::from_value::<TerminalSpawnOptions>(duplicate).is_err());
+    }
+
+    #[test]
     fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
         let response = ServerResponse::ChatSnapshot {
             chat_id: TerminalId::new(),
@@ -1995,6 +2540,79 @@ mod tests {
             legacy.native_continuity,
             crate::chat::NativeContinuity::ReconnectOnly
         );
+    }
+
+    #[test]
+    fn frame_codec_sheds_oversized_capacity_after_small_frame_without_losing_reuse() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        let mut frames = Vec::new();
+        codec.write(&mut frames, &large).unwrap();
+        assert!(codec.write_buffer.capacity() >= large.len());
+        for _ in 0..8 {
+            codec.write(&mut frames, &"small").unwrap();
+        }
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
+        let reused = codec.write_buffer.capacity();
+        codec.write(&mut Vec::new(), &"small").unwrap();
+        assert_eq!(codec.write_buffer.capacity(), reused);
+        let mut reader = Cursor::new(frames);
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), Some(large));
+        assert!(codec.read_buffer.capacity() >= 3 * 1024 * 1024);
+        for _ in 0..8 {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some("small")
+            );
+        }
+        assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn recoverable_input_notice_does_not_reclassify_error_or_admission_evidence() {
+        let message = "Previously delivered input was preserved; unsent input was canceled.";
+        let notice = TerminalEvent::InputNotice {
+            operation: "cancel terminal input",
+            message: message.into(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &WireTerminalEvent::from(notice.clone())).unwrap();
+        let received = read_frame::<WireTerminalEvent>(&mut Cursor::new(bytes))
+            .unwrap()
+            .unwrap();
+        assert_eq!(TerminalEvent::from(received), notice);
+
+        // An old or genuine failure with identical text is still a failure.
+        // Only the explicit event variant carries recoverable semantics.
+        let error = TerminalEvent::from(WireTerminalEvent::Error {
+            operation: "cancel terminal input".into(),
+            message: message.into(),
+        });
+        assert!(matches!(error, TerminalEvent::Error { .. }));
+        assert!(matches!(
+            WireTerminalEvent::from(TerminalEvent::InputRejected {
+                operation: "write terminal input",
+                message: "local correlated refusal".into(),
+            }),
+            WireTerminalEvent::Error { .. }
+        ));
+        assert!(PROTOCOL_VERSION > 105);
+    }
+
+    #[test]
+    fn alternating_large_frames_and_acknowledgements_keep_hot_capacity_until_hidden() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        codec.write(&mut Vec::new(), &large).unwrap();
+        let hot = codec.write_buffer.capacity();
+        for _ in 0..8 {
+            codec.write(&mut Vec::new(), &"ack").unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+            codec.write(&mut Vec::new(), &large).unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+        }
+        codec.release_spare();
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
     }
 
     #[test]
@@ -2038,12 +2656,14 @@ mod tests {
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         // A writer on the same connection must not overwrite a partial read.
         codec.write(&mut Vec::new(), &"outbound").unwrap();
         assert!(matches!(
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         assert_eq!(
             codec.read::<String>(&mut reader).unwrap(),
             Some("a split payload".into())
@@ -2201,6 +2821,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn an_envelope_for_an_older_client_encodes_its_message_for_it() {
+        use crate::chat::*;
+        let chat_id = TerminalId::new();
+        let message = |status| ServerMessage::Response {
+            response: ServerResponse::ChatFileChangePatches {
+                chat_id,
+                page: FileChangePage {
+                    request_id: 8,
+                    key: FileChangeKey {
+                        source: FileChangeSource::Subagent {
+                            id: "delegate".into(),
+                        },
+                        path: "a.rs".into(),
+                    },
+                    revision: 5,
+                    patches: vec![FileChangePatch {
+                        ownership_unverified: false,
+                        item_id: "edit".into(),
+                        kind: ChangeKind::Updated,
+                        status,
+                        imported: false,
+                        offset: 0,
+                        total_bytes: 3,
+                        diff: "+a\n".into(),
+                    }],
+                    next: None,
+                    error: None,
+                },
+            },
+        };
+        let proof = proof("session", "boot", "incarnation");
+        let encode = |version, message: &ServerMessage| {
+            let mut bytes = Vec::new();
+            write_frame(
+                &mut bytes,
+                &ServerEnvelopeRef {
+                    version,
+                    request_id: Some(7),
+                    proof: &proof,
+                    message,
+                },
+            )
+            .unwrap();
+            bytes
+        };
+        let ended = message(ToolStatus::Ended);
+        let stopped = message(ToolStatus::Stopped);
+        assert_eq!(
+            encode(CANDIDATE_LINE_PROTOCOL, &ended),
+            encode(CANDIDATE_LINE_PROTOCOL, &stopped)
+        );
+        assert_ne!(
+            encode(PROTOCOL_VERSION, &ended),
+            encode(PROTOCOL_VERSION, &stopped)
+        );
+        let waiting = message(ToolStatus::Waiting);
+        let running = message(ToolStatus::Running);
+        assert_eq!(
+            encode(CANDIDATE_LINE_PROTOCOL, &waiting),
+            encode(CANDIDATE_LINE_PROTOCOL, &running)
+        );
+        assert_ne!(
+            encode(PROTOCOL_VERSION, &waiting),
+            encode(PROTOCOL_VERSION, &running)
+        );
     }
 
     #[test]

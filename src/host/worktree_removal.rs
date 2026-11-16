@@ -159,6 +159,21 @@ impl Reservation {
     /// automation work targets it, or an account operation is changing a
     /// credential directory inside it. Call outside HostState.
     pub(super) fn ensure_unoccupied(&self, host: &SharedHost) -> Result<(), String> {
+        // An agent observation running in the worktree was admitted before
+        // this reservation, since later ones are refused. Wait for it to end.
+        let probes = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).agent_probes);
+        let inside = probes
+            .running()
+            .into_iter()
+            .filter(|(_, probe)| self.contains(&probe.working_directory))
+            .map(|(id, _)| id)
+            .collect();
+        if !probes.wait_for(&inside).is_empty() {
+            return Err(
+                "Cagents is still checking an agent in this worktree. Try again in a moment."
+                    .into(),
+            );
+        }
         let hosted = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut hosted: Vec<(&'static str, PathBuf)> = Vec::new();
@@ -180,10 +195,16 @@ impl Reservation {
                 }
             }
             for session in state.chat_spawning.values() {
-                hosted.push(("A starting chat", session.launch.recipe.working_directory.clone()));
+                hosted.push((
+                    "A starting chat",
+                    session.launch.recipe.working_directory.clone(),
+                ));
             }
             for binding in state.chat_bindings.values() {
-                hosted.push(("An agent being adopted", binding.working_directory().to_owned()));
+                hosted.push((
+                    "An agent being adopted",
+                    binding.working_directory().to_owned(),
+                ));
             }
             for handoff in state.chat_handoffs.values() {
                 for directory in handoff.working_directories() {
@@ -232,8 +253,8 @@ impl Reservation {
     }
 
     /// Refuses while any process this user can inspect has its working
-    /// directory, root, executable or an open file inside the worktree. This
-    /// sees what the daemon does not host: shells, editors, build watchers.
+    /// directory, root, executable, open file or mapped file inside the worktree.
+    /// This sees what the daemon does not host: shells, editors, build watchers.
     pub(crate) fn ensure_no_processes(&self) -> Result<(), String> {
         let scan = || occupant(Path::new("/proc"), &self.scope.path, std::process::id());
         let mut found = scan();
@@ -248,7 +269,9 @@ impl Reservation {
             Ok(Some((pid, name))) => Err(format!(
                 "{name} (process {pid}) is using this worktree; close it and retry"
             )),
-            Err(error) => Err(format!("Cannot check processes using the worktree: {error}")),
+            Err(error) => Err(format!(
+                "Cannot check processes using the worktree: {error}"
+            )),
         }
     }
 
@@ -324,8 +347,7 @@ pub(super) fn admit(
     Ok(())
 }
 
-const STARTING_INSIDE: &str =
-    "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
+const STARTING_INSIDE: &str = "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
 
 /// Refuses a launch whose working directory lies in a worktree being removed.
 /// Caller holds shared control admission through the launch it checks.
@@ -368,7 +390,7 @@ pub(super) fn ensure_outside_directory(
 }
 
 /// The first process under `proc` other than `own` with its working
-/// directory, root, executable or an open file descriptor inside `scope`.
+/// directory, root, executable, open descriptor or mapped file inside `scope`.
 /// Processes that vanish, or that belong to another user, are skipped.
 fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, String)>> {
     let inside = |link: &Path| match std::fs::read_link(link) {
@@ -415,6 +437,26 @@ fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, Stri
                     Err(error) => return Err(error),
                 };
                 if inside(&descriptor.path())? {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            // Closing a descriptor does not release a file-backed mapping.
+            // A writer can still change that file after the content inspection.
+            let mappings = match std::fs::read_dir(process.join("map_files")) {
+                Ok(mappings) => mappings,
+                Err(error) if skippable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            for mapping in mappings {
+                let mapping = match mapping {
+                    Ok(mapping) => mapping,
+                    Err(error) if skippable(&error) => break,
+                    Err(error) => return Err(error),
+                };
+                if inside(&mapping.path())? {
                     found = true;
                     break;
                 }

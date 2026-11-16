@@ -17,7 +17,8 @@ pub struct TerminalConfig {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty history page budget in bytes, allocated lazily.
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
     pub command_capacity: usize,
@@ -31,11 +32,19 @@ pub struct TerminalConfig {
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
     /// Daemon-issued identity for child-agent tools, never a durable recipe.
     pub agent_authority: crate::agent_execution::Authority,
+    /// Exact launching daemon, while its thin console waits for startup.
+    /// This transient proof is not part of the durable terminal recipe.
+    pub console_startup_owner: Option<crate::model::HostSessionProof>,
     /// Take over the terminal a previous daemon left to its holder, which
     /// waits on this socket, instead of starting the session's launch.
     pub adoption: Option<std::path::PathBuf>,
     #[cfg(feature = "host")]
     pub holder_recovery: Option<super::holder::Recovery>,
+}
+
+impl TerminalConfig {
+    pub const DEFAULT_SCROLLBACK_BYTES: usize = 16 * 1024 * 1024;
+    pub const MAX_SCROLLBACK_BYTES: usize = 1024 * 1024 * 1024;
 }
 
 impl Default for TerminalConfig {
@@ -45,7 +54,7 @@ impl Default for TerminalConfig {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: Self::DEFAULT_SCROLLBACK_BYTES,
             initially_visible: true,
             theme: TerminalTheme::default(),
             command_capacity: DEFAULT_COMMAND_CAPACITY,
@@ -54,6 +63,7 @@ impl Default for TerminalConfig {
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
             agent_authority: Default::default(),
+            console_startup_owner: None,
             adoption: None,
             #[cfg(feature = "host")]
             holder_recovery: None,
@@ -78,6 +88,18 @@ pub enum TerminalEvent {
         intentional: bool,
     },
     Error {
+        operation: &'static str,
+        message: String,
+    },
+    /// A locally correlated daemon admission refusal; the command had no
+    /// effects and this attachment remains live. Never inferred from wire text.
+    InputRejected {
+        operation: &'static str,
+        message: String,
+    },
+    /// A recoverable condition reported by the input owner. Earlier input may
+    /// already have effects; this neither promises rejection nor requests replay.
+    InputNotice {
         operation: &'static str,
         message: String,
     },
@@ -212,6 +234,14 @@ pub enum TerminalStartError {
     Worker(String),
     #[error("terminal worker exited before startup completed")]
     WorkerExited,
+    /// The original worker and already-read output remain owned. This is not
+    /// a successful startup, and callers must retain the handle for recovery.
+    #[cfg(feature = "host")]
+    #[error("terminal startup retained original custody: {message}")]
+    CustodyRetained {
+        handle: super::TerminalHandle,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]

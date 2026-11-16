@@ -157,8 +157,8 @@ where
     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
 
     let instance = Box::pin(run_instance::<P>(
-        program,
         runtime,
+        program,
         proxy.clone(),
         boot_receiver,
         event_receiver,
@@ -397,20 +397,12 @@ where
                     task::Poll::Pending => match self.receiver.try_next() {
                         Ok(Some(control)) => match control {
                             Control::ChangeFlow(flow) => {
-                                use winit::event_loop::ControlFlow;
-
-                                match (event_loop.control_flow(), flow) {
-                                    (
-                                        ControlFlow::WaitUntil(current),
-                                        ControlFlow::WaitUntil(new),
-                                    ) if current < new => {}
-                                    (
-                                        ControlFlow::WaitUntil(target),
-                                        ControlFlow::Wait,
-                                    ) if target > Instant::now() => {}
-                                    _ => {
-                                        event_loop.set_control_flow(flow);
-                                    }
+                                if let Some(flow) = merged_control_flow(
+                                    event_loop.control_flow(),
+                                    flow,
+                                    Instant::now(),
+                                ) {
+                                    event_loop.set_control_flow(flow);
                                 }
                             }
                             Control::CreateWindow {
@@ -438,6 +430,8 @@ where
                                         monitor
                                             .or(event_loop.primary_monitor()),
                                         self.id.clone(),
+                                        #[cfg(target_os = "linux")]
+                                        winit::platform::wayland::ActiveEventLoopExtWayland::is_wayland(event_loop),
                                     )
                                     .with_visible(false);
 
@@ -448,9 +442,7 @@ where
                                         .with_canvas(self.canvas.take())
                                 };
 
-                                log::info!(
-                                    "Window attributes for id `{id:#?}`: {window_attributes:#?}"
-                                );
+                                log::info!("Creating window {id:?}");
 
                                 // On macOS, the `position` in `WindowAttributes` represents the "inner"
                                 // position of the window; while on other platforms it's the "outer" position.
@@ -734,6 +726,80 @@ where
     }
 }
 
+// An accessibility tree can retain structurally necessary nodes that are
+// explicitly hidden after clipping. Such nodes must not regain focus through
+// a stale native action before the widget's ordinary event guard runs.
+#[cfg(feature = "a11y")]
+fn visible_accessibility_target(
+    tree: &iced_accessibility::A11yTree,
+    target: &core::widget::Id,
+) -> bool {
+    let target = iced_accessibility::A11yId::from(target.clone());
+    tree.root().iter().chain(tree.children()).any(|node| {
+        iced_accessibility::IdEq::eq(node.id(), &target)
+            && !node.node().is_hidden()
+    })
+}
+
+#[cfg(all(test, feature = "a11y"))]
+mod accessibility_focus_tests {
+    use super::visible_accessibility_target;
+    use crate::core::widget::Id;
+    use iced_accessibility::{
+        A11yNode, A11yTree,
+        accesskit::{Node, Role},
+    };
+
+    #[test]
+    fn native_focus_requires_a_visible_existing_target() {
+        let root = Id::unique();
+        let child = Id::unique();
+        let missing = Id::unique();
+        let tree = A11yTree::node_with_child_tree(
+            A11yNode::new(Node::new(Role::Window), root.clone()),
+            A11yTree::leaf(Node::new(Role::Button), child.clone()),
+        );
+        assert!(visible_accessibility_target(&tree, &root));
+        assert!(visible_accessibility_target(&tree, &child));
+        assert!(!visible_accessibility_target(&tree, &missing));
+    }
+
+    #[test]
+    fn native_focus_rejects_explicitly_hidden_root_and_child_nodes() {
+        let root = Id::unique();
+        let child = Id::unique();
+        let mut parent = Node::new(Role::Window);
+        parent.set_hidden();
+        let mut button = Node::new(Role::Button);
+        button.set_hidden();
+        let tree = A11yTree::node_with_child_tree(
+            A11yNode::new(parent, root.clone()),
+            A11yTree::leaf(button, child.clone()),
+        );
+        // Structural membership remains available to other tree consumers.
+        assert!(tree.contains(&root.clone().into()));
+        assert!(tree.contains(&child.clone().into()));
+        assert!(!visible_accessibility_target(&tree, &root));
+        assert!(!visible_accessibility_target(&tree, &child));
+    }
+
+    #[test]
+    fn native_focus_keeps_stable_named_identity_when_target_returns() {
+        let original = Id::new("workspace-editor");
+        // Native action IDs carry the numeric identity, while a rebuilt
+        // widget can also retain the same stable name.
+        let numeric = Id::from(u64::from(original.clone()));
+        let rebuilt = Id::new("workspace-editor");
+        let mut hidden = Node::new(Role::TextInput);
+        hidden.set_hidden();
+        let hidden = A11yTree::leaf(hidden, original.clone());
+        assert!(!visible_accessibility_target(&hidden, &numeric));
+        let returned = A11yTree::leaf(Node::new(Role::TextInput), original);
+        assert!(visible_accessibility_target(&returned, &numeric));
+        assert!(visible_accessibility_target(&returned, &rebuilt));
+    }
+}
+
 enum Event<Message: 'static> {
     WindowCreated {
         id: window::Id,
@@ -791,9 +857,11 @@ enum Control {
     StartDnd,
 }
 
+// Parameters drop in reverse order. Drop the program and its cancellation
+// guards before the runtime waits for their blocking tasks.
 async fn run_instance<P>(
-    mut program: program::Instance<P>,
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
+    mut program: program::Instance<P>,
     mut proxy: Proxy<P::Message>,
     boot: oneshot::Receiver<()>,
     mut event_receiver: mpsc::UnboundedReceiver<Event<P::Message>>,
@@ -1698,10 +1766,11 @@ async fn run_instance<P>(
                             let target = core::widget::Id::from(
                                 action_request.target_node.0,
                             );
-                            if interface
-                                .a11y_nodes(mouse::Cursor::Unavailable)
-                                .contains(&target.clone().into())
-                            {
+                            if visible_accessibility_target(
+                                &interface
+                                    .a11y_nodes(mouse::Cursor::Unavailable),
+                                &target,
+                            ) {
                                 interface.operate(
                                     &window.renderer,
                                     &mut operation::focusable::focus::<()>(
@@ -2080,7 +2149,7 @@ where
     {
         clipboard.register_dnd_destination(
             DndSurface(Arc::new(Box::new(raw.clone()))),
-            dnd_rectangles.into_rectangles(),
+            dnd_rectangles.into_native_rectangles(),
         );
     }
 
@@ -2786,6 +2855,97 @@ fn system_information(
         graphics_backend: graphics.backend,
     }
 }
+
+/// The control flow to adopt when `requested` arrives while `current` is in
+/// effect, or `None` to keep `current`.
+///
+/// An earlier pending deadline wins over a later one, and a pending deadline
+/// survives a request to wait indefinitely. A deadline that has already
+/// passed is not pending, though: keeping it over a later request leaves the
+/// event loop polling with a zero timeout until that later deadline, which is
+/// a busy loop for the whole interval between two timed redraws.
+fn merged_control_flow(
+    current: winit::event_loop::ControlFlow,
+    requested: winit::event_loop::ControlFlow,
+    now: Instant,
+) -> Option<winit::event_loop::ControlFlow> {
+    use winit::event_loop::ControlFlow;
+
+    match (current, requested) {
+        (ControlFlow::WaitUntil(current), ControlFlow::WaitUntil(new))
+            if current < new && current > now =>
+        {
+            None
+        }
+        (ControlFlow::WaitUntil(target), ControlFlow::Wait) if target > now => {
+            None
+        }
+        _ => Some(requested),
+    }
+}
+
+#[cfg(test)]
+mod control_flow_tests {
+    use super::*;
+    use std::time::Duration;
+    use winit::event_loop::ControlFlow;
+
+    #[test]
+    fn an_elapsed_deadline_yields_to_a_later_one() {
+        let now = Instant::now();
+        let elapsed = now - Duration::from_millis(5);
+        let later = now + Duration::from_millis(100);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(elapsed),
+                ControlFlow::WaitUntil(later),
+                now
+            ),
+            Some(ControlFlow::WaitUntil(later))
+        );
+    }
+
+    #[test]
+    fn a_pending_deadline_keeps_its_place() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(10);
+        let later = now + Duration::from_millis(100);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(soon),
+                ControlFlow::WaitUntil(later),
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(soon),
+                ControlFlow::Wait,
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(later),
+                ControlFlow::WaitUntil(soon),
+                now
+            ),
+            Some(ControlFlow::WaitUntil(soon))
+        );
+        let elapsed = now - Duration::from_millis(5);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(elapsed),
+                ControlFlow::Wait,
+                now
+            ),
+            Some(ControlFlow::Wait)
+        );
+    }
+}
+
 #[cfg(feature = "program")]
 pub use program::Program;
 

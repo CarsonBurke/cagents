@@ -45,7 +45,10 @@ impl Editor {
                 self.open_requested_review()
             }
             Action::Observed(notifications::ui::Action::Activated(
-                Target::Session(_) | Target::SessionInbox(_) | Target::AgentRun(_),
+                Target::Session(_)
+                | Target::SessionInbox(_)
+                | Target::AgentRun(_)
+                | Target::Automation { .. },
             )) => Task::none(),
             Action::Observed(notifications::ui::Action::ActivateWindow(token)) => iced::Task::done(
                 cosmic::Action::Cosmic(cosmic::app::Action::Activate(token.unwrap_or_default())),

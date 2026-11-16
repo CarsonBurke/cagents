@@ -164,6 +164,9 @@ fn assert_provider_isolation(provider: &Process, forms: &[Vec<u8>]) {
 #[test]
 fn recognition_survives_real_helper_lease_rotation_and_store_pagination_without_provider_key_exposure()
  {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const CHILD: &str = "CAGENTS_RETAINED_RECOGNITION_TEST";
     if std::env::var_os(CHILD).is_none() {
         let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -346,7 +349,7 @@ print(read(struct.unpack('<I',read(4))[0]).decode())
     );
     original.0.refresh_state().unwrap();
     assert_eq!(original.0.state().next_input, sequence);
-    original.0.preserve().unwrap();
+    fixture_preserve_and_join(&original.0);
     drop(lease);
     let mut proof = source.proof.clone().unwrap();
     proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());

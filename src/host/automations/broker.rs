@@ -1,17 +1,18 @@
 //! One sleeping coordinator owns schedule deadlines and bounded precheck
 //! observations. Provider execution stays in the shared execution service.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
 
 use super::{
-    precheck::worker::{Request, Status, Worker},
+    notification_event, notifications,
+    precheck::worker::{LaunchError, Request, Status, Worker},
     schedule::Compiled,
     service,
 };
@@ -58,35 +59,75 @@ struct Inner {
     root: PathBuf,
     wake: Wake,
     workers: Mutex<BTreeMap<Uuid, Worker>>,
+    // A manual claim becomes durable before its precheck owner can be
+    // published. Only this daemon's exact in-flight launches defer recovery.
+    launching: Mutex<BTreeSet<Uuid>>,
     // One lazy startup census catches receipts left after a committed result
     // followed by daemon loss. Each wake visits at most 32 owned directories.
     cleanup: Mutex<Option<std::fs::ReadDir>>,
-    // The journal is bounded. Polling must not resurrect a blocked run after
-    // newer unrelated events evict its durable replay identity.
-    attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
+    // Only transactionally pending source edges are transferred. Original
+    // journal receipts stay owned until exact source acknowledgement succeeds.
+    attention: Mutex<AttentionTransfer>,
+    // The independent no-run lifecycle transfer owns its original receipt.
+    notifications: Mutex<notifications::Transfer>,
 }
 
 #[derive(Clone)]
 pub(in crate::host) struct Handle(Arc<Inner>);
+
+struct PendingLaunch<'a> {
+    inner: &'a Inner,
+    firing: Uuid,
+}
+
+impl Drop for PendingLaunch<'_> {
+    fn drop(&mut self) {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.firing);
+    }
+}
 
 pub(in crate::host) struct Broker {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
 }
 
+fn warn_history_maintenance(error: &str) {
+    let diagnostic: String = error
+        .chars()
+        .flat_map(char::escape_default)
+        .take(512)
+        .collect();
+    tracing::warn!(error = %diagnostic, "automation history maintenance is temporarily unavailable");
+}
+
 impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let registry = agent_execution::registry(host)?;
-        let attention = initial_attention(&registry.lock().unwrap_or_else(|p| p.into_inner()))?;
+        // Registry admission already succeeded. Optional history housekeeping
+        // must not prevent durable delivery or normal coordinator startup.
+        let now = service::now()?;
+        if let Err(error) = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_automation_history(now)
+        {
+            warn_history_maintenance(&error);
+        }
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
             registry,
             root,
             wake: Wake::default(),
             workers: Mutex::new(BTreeMap::new()),
+            launching: Mutex::default(),
             cleanup: Mutex::new(Some(cleanup)),
-            attention: Mutex::new(attention),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -186,22 +227,17 @@ impl Handle {
         }
         service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
-        let claim = self
-            .0
-            .registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .claim_automation(
-                id,
-                revision,
-                None,
-                Trigger::Manual { request },
-                automation.next,
-                confirmed,
-                service::now()?,
-            )?;
+        let (claim, launching) = self.claim_manual(
+            id,
+            revision,
+            request,
+            automation.next,
+            confirmed,
+            service::now()?,
+        )?;
         let firing = claim.firing.clone();
         let result = self.launch(&host, claim);
+        drop(launching);
         self.wake();
         result?;
         self.0
@@ -211,6 +247,45 @@ impl Handle {
             .automation_firing(firing.id)
     }
 
+    fn claim_manual(
+        &self,
+        id: Uuid,
+        revision: u64,
+        request: Uuid,
+        next: Option<crate::automations::Occurrence>,
+        confirmed: bool,
+        now: u64,
+    ) -> Result<(Claimed, Option<PendingLaunch<'_>>), String> {
+        let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let claim = registry.claim_automation(
+            id,
+            revision,
+            None,
+            Trigger::Manual { request },
+            next,
+            confirmed,
+            now,
+        )?;
+        // Publish before releasing the registry census lock. A tick that sees
+        // this newly committed firing must also see its launch custody. No
+        // registry or launching lock is held over validation or process I/O.
+        let launching = (claim.created
+            && claim.firing.state == FiringState::Prechecking
+            && claim.definition.precheck.is_some())
+        .then(|| {
+            self.0
+                .launching
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(claim.firing.id);
+            PendingLaunch {
+                inner: &self.0,
+                firing: claim.firing.id,
+            }
+        });
+        Ok((claim, launching))
+    }
+
     /// Caller holds the daemon control read gate, either the IPC dispatcher or
     /// the scheduler tick below. Never recursively acquire std's RwLock.
     fn launch(&self, host: &SharedHost, claim: Claimed) -> Result<(), String> {
@@ -218,11 +293,17 @@ impl Handle {
             return Ok(());
         }
         if let Err(error) = crate::host::client::ensure_control_open(host) {
-            self.0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(claim.firing.id, error.message, service::now()?, false)?;
+            let now = service::now()?;
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.fail_automation_start(claim.firing.id, error.message, now, false)?;
+            if claim.definition.precheck.is_some() {
+                // This branch precedes any Worker::launch attempt or proof file.
+                registry.confirm_unlaunched_automation_precheck(
+                    claim.firing.id,
+                    claim.firing.revision,
+                    now,
+                )?;
+            }
             return Ok(());
         }
         let directory =
@@ -232,11 +313,17 @@ impl Handle {
                 }) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .fail_automation_start(claim.firing.id, error, service::now()?, true)?;
+                    let now = service::now()?;
+                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    registry.fail_automation_start(claim.firing.id, error, now, true)?;
+                    if claim.definition.precheck.is_some() {
+                        // Target/account refusal happened before Worker::launch.
+                        registry.confirm_unlaunched_automation_precheck(
+                            claim.firing.id,
+                            claim.firing.revision,
+                            now,
+                        )?;
+                    }
                     return Ok(());
                 }
             };
@@ -258,7 +345,10 @@ impl Handle {
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(claim.firing.id, worker);
                 }
-                Err(error) => {
+                Err(LaunchError {
+                    error,
+                    nothing_created,
+                }) => {
                     let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         // A colliding private record could belong to an earlier
@@ -278,6 +368,32 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        if nothing_created {
+                            match registry.confirm_unlaunched_automation_precheck(
+                                claim.firing.id,
+                                claim.firing.revision,
+                                service::now()?,
+                            ) {
+                                Ok(()) => return Ok(()),
+                                Err(error) => warn_history_maintenance(&error),
+                            }
+                        }
+                        drop(registry);
+                        // Failed launch may have written partial private proof.
+                        // Retain actual Worker::retire custody even if no child
+                        // spawned; directory absence alone is not our ACK.
+                        self.0
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                claim.firing.id,
+                                Worker::recover(
+                                    &self.0.root,
+                                    claim.firing.id,
+                                    claim.firing.revision,
+                                ),
+                            );
                     }
                 }
             }
@@ -286,7 +402,53 @@ impl Handle {
     }
 
     fn run(&self) {
-        self.run_with(|host| self.tick(host));
+        let mut maintained = Instant::now();
+        self.run_with(|host| self.tick_with_history_maintenance(host, &mut maintained));
+    }
+
+    fn tick_with_history_maintenance(
+        &self,
+        host: &SharedHost,
+        maintained: &mut Instant,
+    ) -> Result<Duration, String> {
+        if maintained.elapsed() >= Duration::from_secs(60) {
+            match self.maintain_history_under_control(host) {
+                Ok(false) => {} // No attempt while the control writer owns admission.
+                result => {
+                    // Failure is an attempted pass too. Preserve the finite
+                    // retry interval instead of warning on every fast tick.
+                    *maintained = Instant::now();
+                    if let Err(error) = result {
+                        warn_history_maintenance(&error);
+                    }
+                }
+            }
+        }
+        // Optional maintenance cannot gate either transfer or actual work.
+        // Errors from those real-work paths retain their existing handling.
+        self.tick(host)
+    }
+
+    fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {
+        let control = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let _control = match control.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        };
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return Ok(false);
+        }
+        self.0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_removed_automation_history(service::now()?)?;
+        Ok(true)
     }
 
     fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
@@ -316,7 +478,65 @@ impl Handle {
         }
     }
 
+    fn transfer_attention(&self, host: &SharedHost) -> Option<Duration> {
+        // Attention custody is independent of execution admission. Never poll
+        // journal receipts behind the shutdown/update control writer, which
+        // may be joining this coordinator. No receiver wait crosses any gate.
+        let notifications = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        {
+            let mut attention = self.0.attention.lock().unwrap_or_else(|p| p.into_inner());
+            match attention.pump(&self.0.registry, notifications.as_ref()) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    // Storage failures are reported only when the bounded
+                    // local retry is due, never once per ordinary tick.
+                    tracing::warn!(%error, "automation attention is awaiting durable acknowledgement");
+                    Some(attention.retry_remaining())
+                }
+            }
+        }
+    }
+
     fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+        let attention_delay = self.transfer_attention(host);
+        // Receipt polling must remain possible while shutdown owns control.
+        // Neither the HostState guard nor the control gate reaches advance().
+        let notification_delay = self.advance_notifications(host);
+        self.tick_under_control(host).map(|delay| {
+            let delay = delay.min(notification_delay);
+            attention_delay.map_or(delay, |attention| delay.min(attention))
+        })
+    }
+
+    fn advance_notifications(&self, host: &SharedHost) -> Duration {
+        let notifications = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        let Some(notifications) = notifications else {
+            return notifications::RETRY;
+        };
+        match self
+            .0
+            .notifications
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance(&self.0.registry, &notifications, notification_event::build)
+        {
+            Ok(delay) => delay,
+            Err(error) => {
+                tracing::warn!(%error, "automation attention transfer is temporarily unavailable");
+                notifications::RETRY
+            }
+        }
+    }
+
+    fn tick_under_control(&self, host: &SharedHost) -> Result<Duration, String> {
         let control = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -341,13 +561,6 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
-        let runs: std::collections::BTreeSet<_> =
-            active.iter().filter_map(|firing| firing.run).collect();
-        self.0
-            .attention
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|run, _| runs.contains(run));
         let mut checking = false;
         let candidates = self
             .0
@@ -359,36 +572,17 @@ impl Handle {
             .copied()
             .collect::<Vec<_>>();
         for id in candidates {
-            // A manual request can add a worker after the active census. The
-            // absent snapshot entry alone never authorizes deleting its proof.
-            if self
+            let revision = self
                 .0
-                .registry
+                .workers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?
-                .is_none()
-            {
-                continue;
-            }
-            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(worker) = workers.get_mut(&id) else {
+                .get(&id)
+                .map(Worker::revision);
+            let Some(revision) = revision else {
                 continue;
             };
-            match worker.retire() {
-                Ok(true) => {
-                    workers.remove(&id);
-                }
-                Ok(false) => {} // Reap/reclaim again on the next bounded tick.
-                Err(error) => {
-                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
-                    // A reaped owner may leave inaccessible files for the next
-                    // startup census; never spin on permanent storage errors.
-                    if worker.reaped().unwrap_or(false) {
-                        workers.remove(&id);
-                    }
-                }
-            }
+            self.retire_precheck(id, revision)?;
         }
         checking |= self.sweep_prechecks()?;
         for firing in active {
@@ -399,22 +593,6 @@ impl Handle {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .reconcile_automation_run(run, now)?;
-                let detail = self
-                    .0
-                    .registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .automation_run_detail(firing.id)?;
-                if let Some(event) = run_attention(&detail) {
-                    let mut attention = self.0.attention.lock().unwrap_or_else(|p| p.into_inner());
-                    if attention.get(&run) != Some(&event.evidence)
-                        && let Some(notifications) =
-                            &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
-                    {
-                        attention.insert(run, event.evidence.clone());
-                        notifications.record(event);
-                    }
-                }
                 if let Some(firing) = reconciled.filter(|firing| firing.release_pending) {
                     checking |= self.release_run(host, &firing, now)?;
                 }
@@ -498,13 +676,18 @@ impl Handle {
         let delay = next.map_or(Duration::from_secs(60), |due| {
             Duration::from_millis(due.saturating_sub(now).max(50))
         });
-        // Wall-clock changes are noticed at least once a minute. Only actual
-        // precheck owners require subsecond receipt observation.
-        Ok(delay.min(if checking {
+        // Wall-clock changes are noticed at least once a minute. Precheck
+        // observation and outstanding journal receipts shorten the next wake.
+        let delay = delay.min(if checking {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(60)
-        }))
+        });
+        drop(_control);
+        // Reconciliation above may have committed a new source edge. Transfer
+        // it before sleeping, outside the execution-admission guard as well.
+        let attention_delay = self.transfer_attention(host);
+        Ok(attention_delay.map_or(delay, |attention| delay.min(attention)))
     }
 
     fn release_run(&self, host: &SharedHost, firing: &Firing, now: u64) -> Result<bool, String> {
@@ -592,6 +775,15 @@ impl Handle {
         firing: &Firing,
         now: u64,
     ) -> Result<bool, String> {
+        if self
+            .0
+            .launching
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&firing.id)
+        {
+            return Ok(true);
+        }
         let status = {
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             workers
@@ -624,6 +816,85 @@ impl Handle {
         Ok(false)
     }
 
+    fn retire_precheck(&self, id: Uuid, revision: u64) -> Result<(), String> {
+        // Neither an absent active-census entry nor a missing proof directory
+        // authorizes retirement. Distinguish the exact durable model states.
+        let state = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .automation_precheck_retirement(id, revision)?;
+        if state.is_protected() {
+            return Ok(());
+        }
+        let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let directory_missing = match self.0.root.join(id.to_string()).symlink_metadata() {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !workers.contains_key(&id)
+            && directory_missing
+            && Worker::retirement_revision(&self.0.root, id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            // A census can contain both names, or a cached DirEntry already
+            // removed by the first pass. Absence skips work; it proves no ACK.
+            return Ok(());
+        }
+        let worker = workers
+            .entry(id)
+            .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
+        if worker.revision() != revision {
+            return Err("Precheck retirement does not match its mapped worker".into());
+        }
+        if state.is_missing()
+            && !worker.retirement_is_unlinked()
+            && Worker::retirement_revision(&self.0.root, id).map_err(|error| error.to_string())?
+                != Some(revision)
+        {
+            return Err("Missing firing has no exact durable retirement receipt".into());
+        }
+        match worker.retire() {
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
+                // Proofs (or their durable retirement receipt) remain on disk.
+                // Keep live Child custody, but avoid retaining and rescanning
+                // every inaccessible historical directory on ordinary ticks.
+                if worker.reaped().unwrap_or(false) {
+                    workers.remove(&id);
+                }
+                return Ok(());
+            }
+            Ok(true) => {}
+        }
+        // The actual mapped Child is reaped, and a durable exact receipt now
+        // survives both directory deletion and ACK-triggered compaction.
+        drop(workers);
+        if state.needs_ack() {
+            self.0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+        }
+        let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let worker = workers
+            .get_mut(&id)
+            .ok_or("Precheck retirement lost its mapped owner")?;
+        if worker.revision() != revision {
+            return Err("Precheck retirement does not match its mapped worker".into());
+        }
+        worker
+            .forget_retirement()
+            .map_err(|error| error.to_string())?;
+        workers.remove(&id);
+        Ok(())
+    }
+
     fn sweep_prechecks(&self) -> Result<bool, String> {
         let (entries, more) = {
             let mut scan = self.0.cleanup.lock().unwrap_or_else(|p| p.into_inner());
@@ -641,108 +912,737 @@ impl Handle {
             (entries, more)
         };
         for entry in entries {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let Some(id) = entry
-                .file_name()
-                .to_str()
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let (id, revision) = if let Some(id) = name
+                .strip_suffix(".retired")
                 .and_then(|name| Uuid::parse_str(name).ok())
-            else {
+            {
+                let revision = match Worker::retirement_revision(&self.0.root, id) {
+                    Ok(Some(revision)) => revision,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%id, %error, "precheck retirement receipt could not be verified");
+                        continue;
+                    }
+                };
+                (id, revision)
+            } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let Some(id) = Uuid::parse_str(name).ok() else {
+                    continue;
+                };
+                let Some(revision) = self
+                    .0
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retired_automation_precheck(id)?
+                else {
+                    continue;
+                };
+                (id, revision)
+            } else {
                 continue;
             };
-            let revision = self
-                .0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?;
-            let Some(revision) = revision else {
-                continue;
-            };
-            let mut worker = Worker::recover(&self.0.root, id, revision);
-            match worker.retire() {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.0
-                        .workers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .entry(id)
-                        .or_insert(worker);
-                }
-                Err(error) => {
-                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
-                }
-            }
+            self.retire_precheck(id, revision)?;
         }
         Ok(more)
     }
 }
 
-fn initial_attention(
-    registry: &crate::host::model::Registry,
-) -> Result<BTreeMap<crate::model::RunId, crate::notifications::Evidence>, String> {
-    let mut attention = BTreeMap::new();
-    // Existing terminal/waiting states are history, even if cleanup remains
-    // blocked. Startup cannot reannounce them after journal eviction.
-    for firing in registry.active_automation_firings()? {
-        if let Some(run) = firing.run
-            && let Some(event) = run_attention(&registry.automation_run_detail(firing.id)?)
-        {
-            attention.insert(run, event.evidence);
-        }
-    }
-    Ok(attention)
+// Bound both receipt ownership and work per scheduler wake. The durable source
+// query has the same maximum; an unavailable journal cannot grow daemon memory.
+const MAX_ATTENTION_IN_FLIGHT: usize = 100;
+
+enum AttentionCommit {
+    Waiting(std::sync::mpsc::Receiver<Result<(), String>>),
+    Committed,
 }
 
-fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifications::Event> {
-    use crate::{
-        agent_execution::{HostedSession, Origin, State},
-        notifications::{Event, Evidence, Kind, Target},
-    };
-    let run = detail.run.as_ref()?;
-    let agent = detail.agent.as_ref()?;
-    if run.agent != agent.id
-        || detail.firing.run != Some(run.id)
-        || !matches!(agent.origin, Origin::Automation { id } if id == detail.firing.automation)
-    {
-        return None;
-    }
-    let kind = match run.state {
-        State::Succeeded => Kind::Succeeded,
-        State::Failed => Kind::Failed,
-        State::Interrupted => Kind::Interrupted,
-        State::Cancelled => Kind::Cancelled,
-        State::Waiting => Kind::Waiting,
-        _ => return None,
-    };
-    let source_session = agent.session.as_ref().map(|session| match session {
-        HostedSession::Chat(session) => session.id,
-        HostedSession::Terminal(session) => session.id,
-    });
-    Some(Event {
-        content: None,
-        target: Target::AgentRun(run.id),
-        source_session,
-        provider: Some(agent.spec.provider),
-        directory: Some(agent.spec.target.directory.clone()),
-        destination: None,
-        evidence: Evidence {
-            key: if kind == Kind::Waiting {
-                format!("{}:waiting:{}", run.id, run.revision)
-            } else {
-                run.id.to_string()
-            },
-            kind,
-        },
-    })
+#[derive(Default)]
+struct AttentionTransfer {
+    in_flight: BTreeMap<crate::host::model::AutomationAttentionReceipt, AttentionCommit>,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
 }
+
+enum AttentionProgress {
+    Idle,
+    Waiting,
+    Retry,
+}
+
+impl AttentionTransfer {
+    fn defer_retry(&mut self) -> Duration {
+        self.retry_delay = if self.retry_delay.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            self.retry_delay
+                .saturating_mul(2)
+                .min(Duration::from_secs(30))
+        };
+        self.retry_at = Some(Instant::now() + self.retry_delay);
+        self.retry_delay
+    }
+
+    fn retry_remaining(&self) -> Duration {
+        self.retry_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    /// No journal wait occurs here. Queue admission is bounded, and receipts
+    /// are polled before taking the registry lock. A committed receipt survives
+    /// a source-ACK storage failure so the next wake can retry that ACK alone.
+    fn pump(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        notifications: Option<&crate::host::notifications::Handle>,
+    ) -> Result<Option<Duration>, String> {
+        if self
+            .retry_at
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            // A send/storage cooldown never stops observing original receipt
+            // completion. Defer database retries, not ownership bookkeeping.
+            self.poll_receipts(registry, false)?;
+            let delay = self.retry_remaining();
+            return Ok(Some(
+                if self
+                    .in_flight
+                    .values()
+                    .any(|state| matches!(state, AttentionCommit::Waiting(_)))
+                {
+                    delay.min(Duration::from_millis(250))
+                } else {
+                    delay
+                },
+            ));
+        }
+        self.retry_at = None;
+        match self.pump_ready(registry, notifications) {
+            Ok(AttentionProgress::Retry) => Ok(Some(self.defer_retry())),
+            Ok(AttentionProgress::Idle) => {
+                self.retry_delay = Duration::ZERO;
+                Ok(None)
+            }
+            // Queue admission and pending receipts do not prove recovery.
+            // Preserve prior failures until the durable handoff is idle.
+            Ok(AttentionProgress::Waiting) => Ok(Some(Duration::from_millis(250))),
+            Err(error) => {
+                self.defer_retry();
+                Err(error)
+            }
+        }
+    }
+
+    fn poll_receipts(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        acknowledge: bool,
+    ) -> Result<bool, String> {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut retry = false;
+        let receipts = self.in_flight.keys().copied().collect::<Vec<_>>();
+        for receipt in receipts {
+            let state = self.in_flight.get_mut(&receipt).expect("captured receipt");
+            match state {
+                AttentionCommit::Waiting(receiver) => match receiver.try_recv() {
+                    Ok(Ok(())) => *state = AttentionCommit::Committed,
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        // The journal did not prove commit. The source row is
+                        // still durable; retry only that pending evidence.
+                        self.in_flight.remove(&receipt);
+                        retry = true;
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) => continue,
+                },
+                AttentionCommit::Committed => {}
+            }
+        }
+        if acknowledge {
+            let committed = self
+                .in_flight
+                .iter()
+                .filter_map(|(receipt, state)| {
+                    matches!(state, AttentionCommit::Committed).then_some(*receipt)
+                })
+                .collect::<Vec<_>>();
+            if !committed.is_empty() {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ack_automation_attention_batch(&committed)?;
+                // Retire proof only after the whole transaction commits. Any
+                // failure retains every Committed entry for ACK-only retry.
+                // An exact stale ACK can never remove a replacement edge.
+                for receipt in committed {
+                    self.in_flight.remove(&receipt);
+                }
+            }
+        }
+
+        Ok(retry)
+    }
+
+    fn pump_ready(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        notifications: Option<&crate::host::notifications::Handle>,
+    ) -> Result<AttentionProgress, String> {
+        if self.poll_receipts(registry, true)? {
+            return Ok(AttentionProgress::Retry);
+        }
+        // The first page may consist entirely of these original in-flight
+        // edges. At capacity do not acquire a source write transaction merely
+        // to rediscover them. Keep the full page limit below when partially
+        // occupied, so an in-flight prefix cannot starve later source rows.
+        if self.in_flight.len() == MAX_ATTENTION_IN_FLIGHT {
+            return Ok(AttentionProgress::Waiting);
+        }
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // Nothing owed: a read settles an idle tick without waiting on another
+        // connection's write lock while this registry mutex is held. A row
+        // committed just after this read is the same as one after the transaction.
+        if self.in_flight.is_empty() && !registry.has_pending_automation_attention()? {
+            return Ok(AttentionProgress::Idle);
+        }
+        // A short Immediate source transaction also excludes writers using a
+        // separate execution connection. A stale loaded edge must not enqueue
+        // after its committed replacement. Handle admission is only a bounded
+        // queue operation; no journal/receiver wait runs inside this callback.
+        registry.with_pending_automation_attention(MAX_ATTENTION_IN_FLIGHT, |pending| {
+            let busy = !pending.is_empty() || !self.in_flight.is_empty();
+            if !busy {
+                return Ok(AttentionProgress::Idle);
+            }
+            let Some(notifications) = notifications else {
+                return Ok(AttentionProgress::Retry);
+            };
+            for pending in pending {
+                if self.in_flight.contains_key(&pending.receipt) {
+                    continue;
+                }
+                if self.in_flight.len() == MAX_ATTENTION_IN_FLIGHT {
+                    break;
+                }
+                match notifications.record_committed(pending.event) {
+                    Ok(receiver) => {
+                        self.in_flight
+                            .insert(pending.receipt, AttentionCommit::Waiting(receiver));
+                    }
+                    // Full/stopped queues leave the source untouched. Do not
+                    // make backpressure fail an unrelated scheduling tick.
+                    Err(_) => return Ok(AttentionProgress::Retry),
+                }
+            }
+            Ok(AttentionProgress::Waiting)
+        })
+    }
+}
+
+#[cfg(test)]
+mod attention_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::state::HostState;
+
+    fn manual_precheck_fixture() -> (
+        tempfile::TempDir,
+        SharedHost,
+        Handle,
+        crate::automations::Automation,
+    ) {
+        use crate::{host::model::Registry, model::ProjectKind, workspace_model::ModelEdit};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: "/fixture".into(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Manual check", "prompt":"Fixture prompt",
+            "agent":{"provider":"Claude","account":null,"target":{"repository":"/fixture","directory":"/fixture","channel":null},"surface":"Chat","model":null,"permission_mode":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":{"command":"exit 0","timeout_seconds":1}
+        })).unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(registry)),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        (directory, host, handle, automation)
+    }
+
+    #[test]
+    fn manual_precheck_claim_defers_only_its_own_recovery_until_worker_publication() {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+        let (_directory, host, handle, automation) = manual_precheck_fixture();
+        let request = Uuid::new_v4();
+        let (claim, launching) = handle
+            .claim_manual(automation.id, 1, request, None, true, 200)
+            .unwrap();
+        assert!(launching.is_some());
+        // A concurrent retry reads the same durable receipt but must not take
+        // away the original launch's custody when its own scope ends.
+        let (retried, retry_launching) = handle
+            .claim_manual(automation.id, 1, request, None, true, 201)
+            .unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.firing.id, claim.firing.id);
+        assert!(retry_launching.is_none());
+        drop(retry_launching);
+
+        // This other committed firing has no in-process launch custodian,
+        // exactly as after restart. Its absent receipt must remain uncertain.
+        let recovered = {
+            let mut registry = handle.0.registry.lock().unwrap();
+            let other = registry
+                .create_automation(
+                    automation.definition.clone(),
+                    100,
+                    automation.target_identity,
+                )
+                .unwrap();
+            registry
+                .claim_automation(
+                    other.id,
+                    1,
+                    None,
+                    Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap()
+                .firing
+        };
+        let observer = handle.clone();
+        let observed_host = host.clone();
+        let pending_id = claim.firing.id;
+        let recovered_id = recovered.id;
+        std::thread::spawn(move || {
+            // Obtain the actual committed active census, as tick does; do not
+            // inject a fabricated firing into the observation under test.
+            let active = observer
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap();
+            assert_eq!(active.len(), 2);
+            for firing in active {
+                assert_eq!(
+                    observer
+                        .observe_precheck(&observed_host, &firing, 300)
+                        .unwrap(),
+                    firing.id == pending_id
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        {
+            let registry = handle.0.registry.lock().unwrap();
+            assert_eq!(
+                registry.automation_firing(pending_id).unwrap().state,
+                FiringState::Prechecking
+            );
+            assert_eq!(
+                registry.automation_firing(recovered_id).unwrap().state,
+                FiringState::Interrupted
+            );
+            assert!(
+                registry
+                    .automation(automation.id)
+                    .unwrap()
+                    .blocked
+                    .is_none()
+            );
+        }
+        assert!(!handle.0.workers.lock().unwrap().contains_key(&pending_id));
+
+        // Publish a real lease-backed owner record, without launching a shell
+        // or provider. Publication precedes releasing the launch guard, just
+        // as Worker::launch followed by workers.insert does in production.
+        crate::secure_file::prepare_private_directory(&handle.0.root).unwrap();
+        let owner_directory = handle.0.root.join(pending_id.to_string());
+        crate::secure_file::prepare_private_directory(&owner_directory).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(owner_directory.join("lease"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        handle.0.workers.lock().unwrap().insert(
+            pending_id,
+            Worker::recover(&handle.0.root, pending_id, claim.firing.revision),
+        );
+        drop(launching);
+        assert!(handle.observe_precheck(&host, &claim.firing, 400).unwrap());
+        assert_eq!(
+            handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .automation_firing(pending_id)
+                .unwrap()
+                .state,
+            FiringState::Prechecking
+        );
+        // Once ownership really disappears without a receipt, normal recovery
+        // must still record uncertainty rather than inventing success.
+        drop(lease);
+        assert!(!handle.observe_precheck(&host, &claim.firing, 500).unwrap());
+        assert_eq!(
+            handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .automation_firing(pending_id)
+                .unwrap()
+                .state,
+            FiringState::Interrupted
+        );
+    }
+
+    #[test]
+    fn failed_or_panicked_manual_launch_does_not_hide_missing_cleanup_forever() {
+        for panic in [false, true] {
+            let (_directory, host, handle, automation) = manual_precheck_fixture();
+            let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (_claim, _launching) = handle
+                    .claim_manual(automation.id, 1, Uuid::new_v4(), None, true, 200)
+                    .unwrap();
+                if panic {
+                    panic!("launch interrupted before owner publication");
+                }
+                Err::<(), _>("launch failed before owner publication")
+            }));
+            if panic {
+                assert!(attempted.is_err());
+            } else {
+                assert!(attempted.unwrap().is_err());
+            }
+            let active = handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap();
+            assert_eq!(active.len(), 1);
+            assert!(!handle.observe_precheck(&host, &active[0], 300).unwrap());
+            let registry = handle.0.registry.lock().unwrap();
+            let interrupted = registry.automation_firing(active[0].id).unwrap();
+            assert_eq!(interrupted.state, FiringState::Interrupted);
+            assert_eq!(
+                registry.automation(automation.id).unwrap().active_firing,
+                Some(interrupted.id)
+            );
+            assert!(
+                registry
+                    .automation(automation.id)
+                    .unwrap()
+                    .blocked
+                    .is_some()
+            );
+            assert!(interrupted.run.is_none());
+        }
+    }
+
+    #[test]
+    fn proposal_inspection_does_not_wake_scheduler_but_a_new_decline_does() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Authority, Lineage, Origin, Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, ProposalState, ProposalSummary, Request, Response,
+                Schedule, SchedulePattern,
+            },
+            host::model::Registry,
+            model::{ProjectKind, TerminalId},
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_path_buf();
+        let foreign_repository = directory.path().join("other-project");
+        let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        for path in [&repository, &foreign_repository] {
+            model
+                .apply(&ModelEdit::OpenProject {
+                    repository: path.clone(),
+                    name: "Read wake fixture".into(),
+                    kind: ProjectKind::Folder,
+                })
+                .unwrap();
+        }
+        let host = crate::host::service::test_host();
+        host.lock().unwrap().install_model(model);
+        let registry = agent_execution::registry(&host).unwrap();
+        // No coordinator thread, worker, provider, or timer is started. Inspect
+        // the actual wake generation the scheduler's Condvar observes.
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().into(),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        host.lock().unwrap().automations = Some(handle.clone());
+        let control = host.lock().unwrap().control_gate.clone();
+        let _admission = control.read().unwrap();
+        let without_wake = |request: Request| {
+            let before = handle.0.wake.state.lock().unwrap().generation;
+            let description = format!("{request:?}");
+            let result = service::process_under_control(&host, Authority::default(), request);
+            assert_eq!(
+                handle.0.wake.state.lock().unwrap().generation,
+                before,
+                "read-only request woke the scheduler: {description}"
+            );
+            result
+        };
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: None,
+                limit: 1,
+            })
+            .unwrap(),
+            Response::Proposals(Vec::new())
+        );
+        let owner = Origin::Child {
+            parent: Lineage(TerminalId::new()),
+        };
+        let mut proposals = Vec::new();
+        for (id, path) in [(1, &repository), (2, &repository), (3, &foreign_repository)] {
+            let definition = Definition {
+                name: format!("Read fixture {id}"),
+                prompt: "A saved fixture, never dispatched".into(),
+                agent: Spec {
+                    provider: Provider::Claude,
+                    account: None,
+                    target: Target {
+                        repository: path.clone(),
+                        directory: path.clone(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    reasoning_effort: None,
+                    permission_mode: None,
+                },
+                schedule: Schedule {
+                    pattern: SchedulePattern::Hourly { minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Fresh,
+                precheck: None,
+            };
+            proposals.push(
+                registry
+                    .lock()
+                    .unwrap()
+                    .propose_automation(
+                        Uuid::from_u128(id),
+                        owner.clone(),
+                        definition.clone(),
+                        definition,
+                        DirectoryIdentity {
+                            device: 1,
+                            inode: id as u64,
+                        },
+                        None,
+                        100,
+                    )
+                    .unwrap(),
+            );
+        }
+        let before_model = registry.lock().unwrap().model().unwrap();
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: None,
+                limit: 1,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[0])])
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: Some(proposals[0].id),
+                limit: 100,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[1])])
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: foreign_repository,
+                after: None,
+                limit: 100,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[2])])
+        );
+        assert_eq!(
+            without_wake(Request::Proposal {
+                id: proposals[0].id
+            })
+            .unwrap(),
+            Response::Proposal(Box::new(proposals[0].clone()))
+        );
+        let error = without_wake(Request::Proposal {
+            id: Uuid::from_u128(4),
+        })
+        .unwrap_err();
+        let service::Error::Invalid(message) = error else {
+            panic!("a missing proposal must remain an invalid request: {error}");
+        };
+        assert_eq!(message, "The automation proposal is unavailable");
+        {
+            let registry = registry.lock().unwrap();
+            assert_eq!(registry.model().unwrap(), before_model);
+            for proposal in &proposals {
+                assert_eq!(
+                    registry
+                        .automation_proposal(proposal.id, None)
+                        .unwrap()
+                        .as_ref(),
+                    Some(proposal)
+                );
+            }
+            assert!(registry.automations(None, 100).unwrap().is_empty());
+        }
+        // Windows watching notifications are told the project's pending
+        // requests changed, so they need not poll for them.
+        let (watching, unwatched) = {
+            let mut host = host.lock().unwrap();
+            let watching = host.register_client(1);
+            let unwatched = host.register_client(2);
+            host.watch_notifications(
+                1,
+                crate::notifications::Presence {
+                    window: "primary".into(),
+                    application: Default::default(),
+                    focused_target: None,
+                    sessions: Vec::new(),
+                    focused: None,
+                },
+            );
+            (watching, unwatched)
+        };
+        // Everything sent so far, without waiting for more.
+        let told = |delivery: &crate::host::delivery::DeliveryQueue| {
+            delivery.close_after_drain();
+            std::iter::from_fn(|| delivery.pop())
+                .filter_map(|envelope| match envelope.message {
+                    crate::terminal_ipc::ServerMessage::AutomationProposalsChanged {
+                        repository,
+                    } => Some(repository),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = handle.0.wake.state.lock().unwrap().generation;
+        let decision = Request::ResolveProposal {
+            id: proposals[0].id,
+            revision: proposals[0].revision,
+            approved: false,
+        };
+        let mut declined = proposals[0].clone();
+        declined.state = ProposalState::Declined;
+        assert_eq!(
+            service::process_under_control(&host, Authority::default(), decision.clone()).unwrap(),
+            Response::Proposal(Box::new(declined.clone()))
+        );
+        assert_eq!(
+            handle.0.wake.state.lock().unwrap().generation,
+            before.wrapping_add(1),
+            "a newly committed decision must still wake scheduling"
+        );
+        assert_eq!(told(&watching), [repository.clone()]);
+        assert!(told(&unwatched).is_empty());
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_proposal(declined.id, None)
+                .unwrap(),
+            Some(declined.clone())
+        );
+        assert_eq!(
+            without_wake(Request::Proposal { id: declined.id }).unwrap(),
+            Response::Proposal(Box::new(declined.clone()))
+        );
+        assert_eq!(
+            without_wake(decision).unwrap(),
+            Response::Proposal(Box::new(declined)),
+            "terminal decision replay does not commit another change"
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository,
+                after: None,
+                limit: 100
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[1])])
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .automations(None, 100)
+                .unwrap()
+                .is_empty(),
+            "inspection and decline never create a schedule"
+        );
+        assert!(handle.0.workers.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn busy_cleanup_preserves_schedule_and_never_reenables_explicit_pause() {
@@ -768,8 +1668,10 @@ mod tests {
             root: path.parent().unwrap().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
         // a real offline native actor held busy beyond the cleanup grace.
@@ -1005,8 +1907,10 @@ mod tests {
             root: directory.path().into(),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -1088,8 +1992,10 @@ mod tests {
             root: directory.path().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();
@@ -1118,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_attention_baselines_history_but_distinguishes_new_waiting_edges() {
+    fn automation_attention_keeps_new_edges_durable_without_backfilling_acknowledged_history() {
         use crate::{
             agent_execution::{State, Update},
             automations::DirectoryIdentity,
@@ -1165,7 +2071,12 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
-        assert!(run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).is_none());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
         let run = registry
             .update_agent_run(
                 accepted.run.id,
@@ -1179,11 +2090,16 @@ mod tests {
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Waiting, 400)
             .unwrap();
-        let first =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
-        assert_eq!(
-            initial_attention(&registry).unwrap()[&run.id],
-            first.evidence
+        let first = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        assert!(registry.ack_automation_attention(first.receipt).unwrap());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
         );
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Resumed, 500)
@@ -1191,10 +2107,17 @@ mod tests {
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Waiting, 600)
             .unwrap();
-        let second =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
-        assert_ne!(first.evidence.key, second.evidence.key);
-        assert_eq!(first.target(), second.target());
+        let second = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        assert_ne!(first.event.evidence.key, second.event.evidence.key);
+        assert_eq!(first.event.target(), second.event.target());
+        assert!(!registry.ack_automation_attention(first.receipt).unwrap());
+        assert_eq!(
+            registry.pending_automation_attention(100).unwrap()[0].receipt,
+            second.receipt
+        );
         registry
             .update_agent_run(
                 run.id,
@@ -1206,20 +2129,135 @@ mod tests {
                 700,
             )
             .unwrap();
-        let finished =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
+        let finished = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
         assert_eq!(
-            finished.evidence.kind,
+            finished.event.evidence.kind,
             crate::notifications::Kind::Interrupted
         );
         assert_eq!(
-            finished.source_session(),
+            finished.event.source_session(),
             None,
             "pre-attachment evidence needs no fabricated session"
         );
-        assert_eq!(
-            initial_attention(&registry).unwrap()[&run.id],
-            finished.evidence
+        assert!(!registry.ack_automation_attention(second.receipt).unwrap());
+        assert!(registry.ack_automation_attention(finished.receipt).unwrap());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
         );
     }
+
+    #[test]
+    fn stopped_notification_journal_keeps_no_run_receipt_and_scheduler_control_progress() {
+        use crate::{
+            automations::DirectoryIdentity, host::model::Registry, model::ProjectKind,
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_owned();
+        let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        model
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Private fixture", "prompt":"Private fixture prompt",
+            "agent":{"provider":"Codex","account":null,"target":{"repository":repository,"directory":repository,"placement":null},"surface":"Chat","model":null,"permission_mode":null,"reasoning_effort":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        })).unwrap();
+        let automation = model
+            .create_automation(
+                definition,
+                100,
+                DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        model
+            .set_automation_enabled(
+                automation.id,
+                automation.revision,
+                Some(crate::automations::Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        model
+            .apply(&ModelEdit::CloseProject { repository })
+            .unwrap();
+        let before = model.pending_automation_notifications(100).unwrap();
+        assert_eq!(before.len(), 1);
+        let host = crate::host::service::test_host();
+        // This is the actual stopped-enqueue behavior, not a fake successful
+        // journal receipt. No notification thread/portal/provider is started.
+        let (notifications, _) = crate::host::notifications::Handle::inert_for_test();
+        host.lock().unwrap().notifications = Some(notifications);
+        let registry = Arc::new(Mutex::new(model));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        let control = host.lock().unwrap().control_gate.clone();
+        let exclusive = control.write().unwrap();
+        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        drop(exclusive);
+        let delay = handle.tick(&host).unwrap();
+        assert!(delay > Duration::ZERO && delay <= notifications::RETRY);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(100)
+                .unwrap(),
+            before
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .due_automations(service::now().unwrap(), 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.0.workers.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.0.wake.state.lock().unwrap().generation,
+            0,
+            "journal progress uses the existing finite wait, not read-triggered wakes"
+        );
+        assert!(
+            handle.0.attention.lock().unwrap().in_flight.is_empty(),
+            "a no-run event cannot invent AgentRun attention"
+        );
+    }
+    include!("broker/history_tests.rs");
 }
