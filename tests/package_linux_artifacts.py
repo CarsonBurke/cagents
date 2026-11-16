@@ -28,7 +28,7 @@ class PackageLinuxArtifacts(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         for leaf in ("scripts", "packaging"):
             (self.checkout / leaf).mkdir(parents=True)
-        for name in ("package-linux.sh", "build-ceditor-product"):
+        for name in ("package-linux.sh", "build-ceditor-product", "cargo_artifacts.py"):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         for name in ("dev.cagents.Cagents.desktop", "dev.cagents.Cagents.Daemon.desktop",
                      "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",
@@ -285,12 +285,12 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                               "--locked", "--profile", "release", "--target-dir", str(self.target),
                               "--target", NATIVE]
                     defaults = ["--no-default-features"] if variant == "browserless" else []
-                    ui = "ui" if variant == "browserless" else "integrated-browser"
+                    ui = [] if variant == "browserless" else ["--features", "integrated-browser"]
                     message = ["--message-format=json-render-diagnostics"]
                     self.assertEqual(self.builds(), [
                         common + defaults + ["--bin", "cagents"] + message,
                         common + defaults + ["--features", "host", "--bin", "cagentsd"] + message,
-                        common + defaults + ["--features", ui, "--bin", "cagents-ui"] + message,
+                        common + ["-p", "cagents-ui"] + ui + ["--bin", "cagents-ui"] + message,
                     ])
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)

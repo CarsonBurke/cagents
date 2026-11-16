@@ -1,10 +1,12 @@
 //! Asking a provider's own CLI how an account stands.
 //!
-//! Every question goes through the provider's official client, as that
-//! client's own documented protocol: Claude Code's stream-json control
-//! requests and `claude auth status`, Codex's app server. cagents never reads
-//! a credential file and never calls a provider's service itself, so a login
-//! stays the property of the client it belongs to.
+//! Ordinary usage goes through the provider's official client and its
+//! protocol: Claude Code's stream-json control
+//! requests and `claude auth status`, Codex's app server. Reset inventory,
+//! consumption and dynamic plan metadata are the narrow exception: Claude
+//! exposes no control route for resets or the profile's display name,
+//! so `reset_transport` reads its subscription bearer in memory for its fixed
+//! private endpoint. The provider CLI still owns login and credential refresh.
 //!
 //! A probe runs on the async runtime, never the interface thread. It is
 //! bounded in time ([`TIMEOUT`]) and in how much output it will read
@@ -35,6 +37,12 @@ use super::{
 };
 use crate::{agent::Provider, chat::Model};
 
+mod reset_consume;
+#[cfg(test)]
+mod reset_contract_tests;
+mod reset_transport;
+pub use reset_consume::consume;
+
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a CLI's stdout a probe reads before giving up on it.
@@ -42,7 +50,7 @@ pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// A cached identity cannot override the provider explicitly rejecting its
 /// credentials. Unsupported quota reporting can still confirm an identity.
-pub(crate) fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
+pub fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
     status != UsageStatus::NeedsLogin
         && (identity.is_some()
             || matches!(
@@ -61,15 +69,25 @@ const MODELS_GRACE: Duration = Duration::from_secs(3);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Variables that would make a probe behave unlike the user's own shell:
-/// Claude Code's markers for "running inside Claude Code", and cagents' own
-/// launch handshake.
+/// cagents' own launch handshake. A provider session's markers, such as
+/// Claude Code's "running inside Claude Code", go too (see [`scrub`]).
 const SCRUBBED_ENVIRONMENT: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
     crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV,
 ];
+
+/// Removes [`SCRUBBED_ENVIRONMENT`], `extra` and every provider session
+/// variable this process holds from `command`'s environment.
+fn scrub(command: &mut Command, extra: &[&str]) {
+    for variable in SCRUBBED_ENVIRONMENT.iter().chain(extra) {
+        command.env_remove(variable);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(crate::agent::is_session_variable) {
+            command.env_remove(name);
+        }
+    }
+}
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
 /// else of its environment, after [`SHELL_PATH_MARKER`] and its length in
@@ -122,8 +140,54 @@ pub enum Outcome {
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
 /// Unless `force`d, a cached answer another window observed within
-/// [`STALE_AFTER`] is returned instead of probing again.
+/// [`STALE_AFTER`] is returned instead of probing again. Explicit refreshes
+/// wait for an in-flight reader within [`TIMEOUT`], then take a fresh reading:
+/// a read that started before a reset cannot establish its resulting state.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
+    let second_home = second_home(&account, &|name| std::env::var(name).ok());
+    if force {
+        run_forced(account, cache, second_home, TIMEOUT).await
+    } else {
+        run_reading(account, cache, false, second_home).await
+    }
+}
+
+async fn run_forced(
+    account: Account,
+    cache: Option<Cache>,
+    second_home: Option<PathBuf>,
+    timeout: Duration,
+) -> Outcome {
+    let reading = async {
+        loop {
+            let outcome =
+                run_reading(account.clone(), cache.clone(), true, second_home.clone()).await;
+            if !matches!(outcome, Outcome::Busy) {
+                return outcome;
+            }
+            // Only retry read admission. A consume is never part of this loop.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(timeout, reading)
+        .await
+        .unwrap_or_else(|_| {
+            Outcome::Failed(format!(
+                "{} could not provide fresh usage within {} seconds",
+                cli_name(account.provider),
+                timeout.as_secs()
+            ))
+        })
+}
+
+/// [`run`], with `second_home` the home whose record of `account`'s login
+/// to compare the one the CLI reports with (see [`second_home`]).
+async fn run_reading(
+    account: Account,
+    cache: Option<Cache>,
+    force: bool,
+    second_home: Option<PathBuf>,
+) -> Outcome {
     let now = now_ms();
     let search_path = search_path().await;
     let setup = {
@@ -142,18 +206,54 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     };
     let probed = tokio::time::timeout(
         TIMEOUT,
-        probe_cli(&account, &program, search_path.as_deref()),
+        probe_cli(&account, &program, search_path.as_deref(), cache.as_ref()),
     )
     .await;
-    let outcome = match probed {
-        Ok(Ok(probed)) => probed.into_outcome(),
-        Ok(Err(message)) => Outcome::Failed(message),
+    let mut outcome = match probed {
+        Ok(result) => completed_probe(result),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
             cli_name(account.provider),
             TIMEOUT.as_secs()
         )),
     };
+    if let (
+        Outcome::Answered {
+            identity: Some(identity),
+            ..
+        },
+        Some(cache),
+        Some(key),
+        Some(home),
+    ) = (&mut outcome, cache.clone(), key.clone(), second_home)
+    {
+        let other = second_login(&account, &program, search_path.as_deref(), &home).await;
+        let reported = identity.clone();
+        identity.disputed_by =
+            tokio::task::spawn_blocking(move || dispute(other, &cache, &key, &reported, now_ms()))
+                .await
+                .ok()
+                .flatten();
+    }
+    // Failed inventory is unknown, not zero. Retain disabled prior rows.
+    if let Outcome::Answered {
+        identity, snapshot, ..
+    } = &mut outcome
+        && snapshot.detail.as_deref() == Some("Reset availability could not be refreshed")
+        && let Some(previous) = cache.as_ref().and_then(|cache| {
+            key.as_ref()
+                .and_then(|key| cache.load(now_ms()).remove(key))
+        })
+        && identity
+            .as_ref()
+            .zip(previous.identity.as_ref())
+            .is_some_and(|(current, previous)| reset_consume::same_identity(current, previous))
+    {
+        snapshot.resets = previous.snapshot.resets;
+        for reset in &mut snapshot.resets {
+            reset.usable = false;
+        }
+    }
     if let (
         Outcome::Answered {
             identity,
@@ -170,18 +270,18 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         };
         let catalog = catalog.clone();
         let provider = account.provider;
-        // Written in the background so the answer reaches the reader at
-        // once, with the probe lock held until the answer is in the cache:
-        // a window that takes the lock next finds it there instead of
-        // probing again. A cache that cannot be written only costs other
-        // windows a probe.
-        tokio::task::spawn_blocking(move || {
+        // Publish off the runtime thread, then release admission before the
+        // caller receives Answered. Returning earlier lets an immediate
+        // post-consume refresh collide with this probe's unfinished write.
+        // A cache write failure still leaves the observed answer usable.
+        let _ = tokio::task::spawn_blocking(move || {
             let _ = cache.store(&key, entry);
             if let Some(catalog) = catalog {
                 let _ = cache.store_catalog(provider, catalog);
             }
             drop(lock);
-        });
+        })
+        .await;
     }
     outcome
 }
@@ -258,6 +358,8 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
 struct Probed {
     identity: Option<Identity>,
     snapshot: UsageSnapshot,
+    /// Raw plan observations used only to merge verified profile metadata.
+    plan_metadata: super::claude::PlanMetadata,
     /// A model response has its own observation, independent of quota.
     catalog: Option<Catalog>,
 }
@@ -272,6 +374,7 @@ impl Probed {
         Self {
             identity: None,
             snapshot: UsageSnapshot::state(status, detail, observed_at),
+            plan_metadata: Default::default(),
             catalog,
         }
     }
@@ -282,6 +385,15 @@ impl Probed {
             snapshot: self.snapshot,
             catalog: self.catalog,
         }
+    }
+}
+
+/// Share the production success/failure mapping with collector regressions.
+/// Only Answered reaches the cache-publication branch in `run`.
+fn completed_probe(result: Result<Probed, String>) -> Outcome {
+    match result {
+        Ok(probed) => probed.into_outcome(),
+        Err(message) => Outcome::Failed(message),
     }
 }
 
@@ -296,6 +408,8 @@ fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
     (!models.is_empty()).then_some(Catalog {
         models,
         observed_at,
+        default_model: None,
+        reasoning_defaults: Default::default(),
     })
 }
 
@@ -321,9 +435,10 @@ async fn probe_cli(
     account: &Account,
     program: &Path,
     search_path: Option<&OsStr>,
+    cache: Option<&Cache>,
 ) -> Result<Probed, String> {
     match account.provider {
-        Provider::Claude => probe_claude_with_path(account, program, search_path).await,
+        Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
@@ -461,12 +576,7 @@ pub async fn refresh_search_path() -> Option<OsString> {
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args(["-i", "-c", SHELL_PATH_COMMAND]);
-    for variable in SCRUBBED_ENVIRONMENT
-        .iter()
-        .chain(SHELL_SCRUBBED_ENVIRONMENT)
-    {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }
@@ -563,9 +673,7 @@ fn command(account: &Account, program: &Path) -> Command {
 
 fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in SCRUBBED_ENVIRONMENT {
-        command.env_remove(variable);
-    }
+    scrub(&mut command, &[]);
     match account.probe_environment() {
         Some((variable, home)) => {
             command.env(variable, home);
@@ -859,13 +967,14 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// user's hooks and leaves nothing behind in their history.
 #[cfg(test)]
 async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
-    probe_claude_with_path(account, program, current_search_path().as_deref()).await
+    probe_claude_with_path(account, program, current_search_path().as_deref(), None).await
 }
 
 async fn probe_claude_with_path(
     account: &Account,
     program: &Path,
     search_path: Option<&OsStr>,
+    cache: Option<&Cache>,
 ) -> Result<Probed, String> {
     let mut status = command_with_path(account, program, search_path);
     status.args(["auth", "status", "--json"]);
@@ -883,7 +992,159 @@ async fn probe_claude_with_path(
         "",
         "--disable-slash-commands",
     ]);
-    join_claude(run_json(status), claude_usage(usage)).await
+    let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
+    // Identity transitions must invalidate even when this login's adapter
+    // cannot load. Otherwise A -> unavailable B -> A could reuse old A data.
+    if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
+        let identity = probed.identity.clone();
+        let signed_out = probed.snapshot.status == UsageStatus::NeedsLogin;
+        tokio::task::spawn_blocking(move || {
+            invalidate_changed_profile(&cache, &key, identity.as_ref(), signed_out)
+        })
+        .await
+        .map_err(|_| "Claude's profile cache could not be updated")?
+        .map_err(|_| "Claude's profile cache could not be updated")?;
+    }
+    if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
+        match reset_transport::Client::load(account, program, search_path).await {
+            Ok(client) => {
+                // Both reads use the frozen login. Reading plan metadata must
+                // not consume inventory's existing probe timeout budget.
+                let plan = async {
+                    match probed.identity.as_ref() {
+                        Some(identity) => client
+                            .plan(
+                                identity,
+                                &probed.plan_metadata,
+                                cache,
+                                account.cache_key().as_deref(),
+                            )
+                            .await
+                            .ok(),
+                        None => None,
+                    }
+                };
+                let (plan, inventory) = tokio::join!(plan, client.inventory());
+                if let Some(metadata) = plan {
+                    let plan = metadata.name();
+                    if let Some(identity) = &mut probed.identity {
+                        identity.plan = plan.clone();
+                    }
+                    probed.snapshot.plan = plan;
+                    probed.snapshot.plan_display_name = metadata.display_name;
+                    probed.snapshot.rate_limit_tier = metadata.rate_limit_tier;
+                }
+                match inventory {
+                    Ok(resets) => probed.snapshot.resets = resets,
+                    Err(_) => {
+                        probed.snapshot.detail =
+                            Some("Reset availability could not be refreshed".into())
+                    }
+                }
+            }
+            Err(_) => {
+                if reset_transport::login_was_removed(account).await
+                    && let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key())
+                {
+                    tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
+                        .await
+                        .map_err(|_| "Claude's profile cache could not be updated")?
+                        .map_err(|_| "Claude's profile cache could not be updated")?;
+                }
+                probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
+            }
+        }
+    }
+    Ok(probed)
+}
+
+fn invalidate_changed_profile(
+    cache: &Cache,
+    key: &str,
+    current: Option<&Identity>,
+    signed_out: bool,
+) -> io::Result<()> {
+    let normalized = |text: Option<&str>| {
+        text.map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_lowercase)
+    };
+    let changed = cache.load(now_ms()).remove(key).is_some_and(|previous| {
+        match (previous.identity.as_ref(), current) {
+            (Some(previous), Some(current)) => {
+                normalized(previous.email.as_deref()) != normalized(current.email.as_deref())
+                    || normalized(previous.organization.as_deref())
+                        != normalized(current.organization.as_deref())
+            }
+            (None, None) => false,
+            _ => true,
+        }
+    });
+    if signed_out || changed {
+        cache.invalidate_plan(key)?;
+    }
+    Ok(())
+}
+
+/// The home whose record of `account`'s login may disagree with the one its
+/// CLI reports, in `environment`: when `account` is the system Claude login,
+/// whose CLI keeps its record in `~/.claude.json`, its home `~/.claude`,
+/// where launches that exported `CLAUDE_CONFIG_DIR=~/.claude` kept another
+/// (see [`Account::launch_home`]).
+fn second_home(account: &Account, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if account.provider != Provider::Claude
+        || !matches!(account.home, super::AccountHome::System)
+        || account.launch_home_in(environment).is_some()
+    {
+        return None;
+    }
+    account.home_directory(environment)
+}
+
+/// What the record that `account`'s CLI keeps when `home` is exported as its
+/// configuration directory names, as that CLI reports it.
+async fn second_login(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+    home: &Path,
+) -> super::claude::RecordedLogin {
+    use super::claude::RecordedLogin;
+    // Claude Code writes that record only while the directory is exported.
+    if !tokio::fs::try_exists(home.join(".claude.json"))
+        .await
+        .unwrap_or(false)
+    {
+        return RecordedLogin::Nobody;
+    }
+    let mut status = command_with_path(account, program, search_path);
+    status.env("CLAUDE_CONFIG_DIR", home);
+    status.args(["auth", "status", "--json"]);
+    match tokio::time::timeout(TIMEOUT, run_json(status)).await {
+        Ok(Ok(observed)) => RecordedLogin::reported(&observed.value),
+        _ => RecordedLogin::Unknown,
+    }
+}
+
+/// The login the second record, naming `other`, names where it disagrees
+/// with `reported` and no settlement filed under `key` in `cache` covers the
+/// disagreement, as of `now` in Unix milliseconds; recording what settles it.
+fn dispute(
+    other: super::claude::RecordedLogin,
+    cache: &super::cache::Cache,
+    key: &str,
+    reported: &Identity,
+    now: u64,
+) -> Option<String> {
+    cache
+        .settle_with(key, |settled, previous| {
+            super::claude::settle_dispute(reported, other.clone(), previous, settled, now)
+        })
+        .unwrap_or_else(|error| {
+            // Without the settlement, the disagreement is reported as found.
+            tracing::debug!(%error, "cannot record how the login's records were settled");
+            super::claude::settle_dispute(reported, other, None, None, now).0
+        })
 }
 
 async fn join_claude(
@@ -902,7 +1163,12 @@ fn finish_claude_probe(
         Ok(ClaudeSession { catalog, usage }) => (catalog, Ok(usage)),
         Err(message) => (None, Err(message)),
     };
-    let identity = match status {
+    let auth_metadata = status
+        .as_ref()
+        .ok()
+        .map(|status| super::claude::plan_metadata(&status.value))
+        .unwrap_or_default();
+    let mut identity = match status {
         Ok(status) => match super::claude::parse_auth_status(&status.value) {
             Err(state) => {
                 return Ok(Probed::state(
@@ -919,9 +1185,16 @@ fn finish_claude_probe(
     // An auth failure still takes precedence above. Otherwise a missing usage
     // answer remains the original failure, even when identity was available.
     let usage = usage?;
+    let plan_metadata = usage
+        .value
+        .as_ref()
+        .ok()
+        .map(super::claude::plan_metadata)
+        .unwrap_or_default()
+        .or(auth_metadata);
     let observed_at = usage.observed_at;
-    let snapshot = match usage.value {
-        Ok(response) => super::claude::parse_usage(&response, observed_at),
+    let mut snapshot = match usage.value {
+        Ok(response) => super::claude::probe_usage(&response, observed_at)?,
         Err(message) => match super::claude::error_status(&message) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
@@ -938,9 +1211,23 @@ fn finish_claude_probe(
             None => return Err("Claude Code could not read usage just now".into()),
         },
     };
+    // The merged CLI observation is already useful when the optional profile
+    // lookup cannot run. Keep identity and usage on the same reported plan;
+    // a rejected login retains its existing signed-out behavior.
+    if confirms_login(identity.as_ref(), snapshot.status)
+        && let Some(plan) = plan_metadata.name()
+    {
+        if let Some(identity) = &mut identity {
+            identity.plan = Some(plan.clone());
+        }
+        snapshot.plan = Some(plan);
+        snapshot.plan_display_name = plan_metadata.display_name.clone();
+        snapshot.rate_limit_tier = plan_metadata.rate_limit_tier.clone();
+    }
     Ok(Probed {
         identity,
         snapshot,
+        plan_metadata,
         catalog,
     })
 }
@@ -987,10 +1274,10 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
 
 fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
     initialized.value.as_ref().ok().and_then(|value| {
-        observed_catalog(
-            models(value["models"].as_array(), Model::from_claude),
-            initialized.observed_at,
-        )
+        let entries = value["models"].as_array();
+        let mut listed = models(entries, Model::from_claude);
+        Model::resolve_claude_labels(&mut listed, entries.map(Vec::as_slice).unwrap_or_default());
+        observed_catalog(listed, initialized.observed_at)
     })
 }
 
@@ -1072,20 +1359,34 @@ async fn probe_codex_with_path(
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
+fn codex_catalog(answer: &Observed<RpcResult>) -> Option<Catalog> {
+    let result = answer.value.as_ref().ok()?;
+    let entries = result["data"].as_array();
+    let mut catalog =
+        observed_catalog(self::models(entries, Model::from_codex), answer.observed_at)?;
+    for entry in entries.into_iter().flatten() {
+        let Some(id) = entry["model"].as_str() else {
+            continue;
+        };
+        if entry["isDefault"].as_bool() == Some(true) {
+            catalog.default_model = Some(id.to_owned());
+        }
+        if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
+            catalog
+                .reasoning_defaults
+                .insert(id.to_owned(), effort.to_owned());
+        }
+    }
+    Some(catalog)
+}
+
 fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, String> {
     let CodexSession {
         account: account_read,
         limits: limits_read,
         models,
     } = result?;
-    let catalog = models.and_then(|answer| {
-        answer.value.ok().and_then(|result| {
-            observed_catalog(
-                self::models(result["data"].as_array(), Model::from_codex),
-                answer.observed_at,
-            )
-        })
-    });
+    let catalog = models.as_ref().and_then(codex_catalog);
     let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
@@ -1106,7 +1407,7 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
     };
     let observed_at = limits_read.observed_at;
     let snapshot = match limits_read.value {
-        Ok(result) => super::codex::parse_rate_limits(&result, observed_at),
+        Ok(result) => super::codex::probe_rate_limits(&result, observed_at)?,
         Err(error) => match super::codex::error_status(&error) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
@@ -1124,6 +1425,7 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
     Ok(Probed {
         identity,
         snapshot,
+        plan_metadata: Default::default(),
         catalog,
     })
 }
@@ -1228,6 +1530,133 @@ fn rpc_result(mut frame: Value) -> RpcResult {
     }
 }
 
+#[cfg(all(any(test, feature = "test-support"), feature = "ui"))]
+#[doc(hidden)]
+pub mod collector_fixture {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    pub enum Frames {
+        Claude {
+            initialize: Value,
+            quota: Value,
+            auth: Value,
+        },
+        Codex {
+            quota: Value,
+            account: Value,
+            models: Option<Value>,
+        },
+    }
+
+    // Exercise the production observers/finishers without preparing an account,
+    // opening a session, invoking a CLI, or starting a detached cache writer.
+    pub async fn held_outcome(
+        account: Account,
+        frames: Frames,
+        now: impl Fn() -> u64,
+        quota_observed: oneshot::Sender<()>,
+        nonquota_ready: oneshot::Receiver<()>,
+        close_ready: oneshot::Receiver<()>,
+    ) -> Result<Outcome, String> {
+        let probed = match frames {
+            Frames::Claude {
+                initialize,
+                quota,
+                auth,
+            } if account.provider == Provider::Claude => {
+                let initialized =
+                    observed_control_response(&initialize, "cagents-usage-initialize", &now)
+                        .ok_or("fixture initialize did not match the original request")?;
+                if initialized.value.is_err() {
+                    return Err("fixture initialization did not admit a quota request".into());
+                }
+                let catalog = claude_catalog(&initialized);
+                let usage = observed_control_response(&quota, "cagents-usage", &now)
+                    .ok_or("fixture quota did not match the original request")?;
+                quota_observed
+                    .send(())
+                    .map_err(|_| "fixture quota observer was dropped")?;
+                let status = async {
+                    nonquota_ready
+                        .await
+                        .map_err(|_| "fixture auth gate was dropped".to_owned())?;
+                    let bytes = serde_json::to_vec(&auth).map_err(|error| error.to_string())?;
+                    observed_json(&bytes, &now)
+                };
+                let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                    close_ready
+                        .await
+                        .expect("fixture close gate must be released");
+                });
+                join_claude(status, usage).await?
+            }
+            Frames::Codex {
+                quota,
+                account: account_frame,
+                models,
+            } if account.provider == Provider::Codex => {
+                let mut answers = CodexAnswers::default();
+                answers.take(quota, &now);
+                if answers.limits.is_none() {
+                    return Err("fixture quota did not match the original request".into());
+                }
+                quota_observed
+                    .send(())
+                    .map_err(|_| "fixture quota observer was dropped")?;
+                let collected = async {
+                    nonquota_ready
+                        .await
+                        .map_err(|_| "fixture account/models gate was dropped".to_owned())?;
+                    answers.take(account_frame, &now);
+                    if answers.account.is_none() {
+                        return Err("fixture account did not match the original request".into());
+                    }
+                    if let Some(models) = models {
+                        answers.take(models, &now);
+                    }
+                    Ok::<CodexSession, String>(answers.finish())
+                };
+                finish_codex_probe(
+                    after_close(collected.await, async {
+                        close_ready
+                            .await
+                            .expect("fixture close gate must be released");
+                    })
+                    .await,
+                )?
+            }
+            _ => return Err("fixture provider does not match the original account".into()),
+        };
+        Ok(probed.into_outcome())
+    }
+
+    /// The UI fixture receives the same completion policy as `run`, including
+    /// an actual Failed outcome when a collected probe has no usable quota.
+    pub async fn held_completion(
+        account: Account,
+        frames: Frames,
+        now: impl Fn() -> u64,
+        quota_observed: oneshot::Sender<()>,
+        nonquota_ready: oneshot::Receiver<()>,
+        close_ready: oneshot::Receiver<()>,
+    ) -> Outcome {
+        match held_outcome(
+            account,
+            frames,
+            now,
+            quota_observed,
+            nonquota_ready,
+            close_ready,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(message) => completed_probe(Err(message)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1284,6 +1713,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A window started inside an agent's session must not probe as that
+    /// session's child, nor hand the CLI its messaging socket.
+    #[tokio::test]
+    async fn a_probe_never_runs_inside_the_session_cagents_was_started_from() {
+        const CHILD: &str = "CAGENTS_PROBE_SESSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::a_probe_never_runs_inside_the_session_cagents_was_started_from",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", directory.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("CLAUDECODE", "1")
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", "/run/parent.sock")
+                .env("CODEX_ESCALATE_SOCKET", "/run/parent-escalate.sock")
+                .env("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION", "10")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let script = "[ -z \"${CLAUDECODE+x}${CLAUDE_CODE_MESSAGING_SOCKET+x}${CODEX_ESCALATE_SOCKET+x}\" ] || exit 17\n\
+                      [ \"$CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION\" = 10 ] || exit 18";
+        let output = command(&Account::system(Provider::Claude), Path::new("/bin/sh"))
+            .args(["-c", script])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
     }
 
     #[test]
@@ -1350,6 +1814,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
+        let answer = Observed {
+            observed_at: 7,
+            value: Ok(json!({"data": [
+                {"model":"mini", "displayName":"Mini", "isDefault":true,
+                 "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
+                     {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}]},
+                {"model":"other", "defaultReasoningEffort":"high"}
+            ]})),
+        };
+        let catalog = codex_catalog(&answer).unwrap();
+        assert_eq!(catalog.default_effort(None), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
+        assert_eq!(catalog.default_effort(Some("other")), Some("high"));
+        assert_eq!(catalog.observed_at, 7);
+    }
+
+    #[test]
     fn rpc_frames_split_into_results_and_errors() {
         assert_eq!(
             rpc_result(json!({"id": 2, "result": {"a": 1}})),
@@ -1363,6 +1845,164 @@ mod tests {
             rpc_result(json!({"id": 3, "error": null, "result": 5})),
             Ok(json!(5))
         );
+    }
+
+    #[test]
+    fn observed_identity_transitions_invalidate_profile_before_adapter_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/fixture";
+        let binding = "c".repeat(64);
+        let identity = |email: &str, plan: &str| Identity {
+            email: Some(email.into()),
+            plan: Some(plan.into()),
+            ..Identity::default()
+        };
+        let first = identity("fixture@example.test", "max");
+        cache
+            .store(
+                key,
+                Entry {
+                    identity: Some(first.clone()),
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "fixture", now_ms()),
+                },
+            )
+            .unwrap();
+        assert!(
+            cache
+                .store_plan_profile(
+                    key,
+                    0,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("Ultra".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        // Plan changes and capitalization are not a different login.
+        let same = identity("FIXTURE@example.test", "future-subscription");
+        invalidate_changed_profile(&cache, key, Some(&same), false).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_some());
+        // B is observed before adapter loading. It may never reach plan().
+        let other = identity("other@example.test", "pro");
+        invalidate_changed_profile(&cache, key, Some(&other), false).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_none());
+        assert!(
+            !cache
+                .store_plan_profile(
+                    key,
+                    0,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("Superseded".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        let epoch = cache.plan_profile(key, &binding).0;
+        assert!(
+            cache
+                .store_plan_profile(
+                    key,
+                    epoch,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("New login".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        invalidate_changed_profile(&cache, key, None, true).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_none());
+    }
+
+    #[test]
+    fn claude_probe_keeps_usage_plan_metadata_over_auth_without_persisting_it() {
+        let auth = json!({"loggedIn":true,"email":"fixture@example.test",
+            "subscriptionType":"max","planDisplayName":"Ultra","rateLimitTier":"default_claude_max_20x"});
+        for display in [Some("Future Plan"), None] {
+            let mut response = json!({"subscription_type":"future-subscription",
+                "rate_limit_tier":"default_claude_future_subscription_17x",
+                "rate_limits":{"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null}]}});
+            if let Some(display) = display {
+                response["plan_display_name"] = json!(display);
+            }
+            let probed = finish_claude_probe(
+                Ok(Observed {
+                    value: auth.clone(),
+                    observed_at: 1,
+                }),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage: Observed {
+                        value: Ok(response),
+                        observed_at: 2,
+                    },
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                probed.plan_metadata.subscription_type.as_deref(),
+                Some("future-subscription")
+            );
+            assert_eq!(
+                probed.plan_metadata.display_name.as_deref(),
+                Some(display.unwrap_or("Ultra"))
+            );
+            assert_eq!(
+                probed.plan_metadata.rate_limit_tier.as_deref(),
+                Some("default_claude_future_subscription_17x")
+            );
+            let encoded = serde_json::to_value(probed.into_outcome()).unwrap();
+            assert!(!encoded.to_string().contains("plan_metadata"));
+        }
+    }
+
+    #[test]
+    fn merged_cli_plan_survives_without_an_optional_profile_lookup() {
+        for (auth, mut response, expected) in [
+            (
+                json!({"loggedIn":true,"email":"fixture@example.test","subscriptionType":"max","planDisplayName":"Ultra"}),
+                json!({"subscription_type":"max"}),
+                "Ultra",
+            ),
+            (
+                json!({"loggedIn":true,"email":"fixture@example.test","subscriptionType":"max"}),
+                json!({"subscription_type":"max","plan_display_name":"Future Plan"}),
+                "Future Plan",
+            ),
+        ] {
+            response["rate_limits"] = json!({"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null}]});
+            let probed = finish_claude_probe(
+                Ok(Observed {
+                    value: auth,
+                    observed_at: 1,
+                }),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage: Observed {
+                        value: Ok(response),
+                        observed_at: 2,
+                    },
+                }),
+            )
+            .unwrap();
+            assert_eq!(probed.snapshot.plan.as_deref(), Some(expected));
+            assert_eq!(
+                probed.identity.as_ref().unwrap().plan.as_deref(),
+                Some(expected)
+            );
+            assert_eq!(probed.snapshot.status, UsageStatus::Ok);
+            let encoded = serde_json::to_value(probed.into_outcome()).unwrap();
+            assert!(!encoded.to_string().contains("plan_metadata"));
+        }
     }
 
     fn claude_reply(request: &str, response: Value) -> Value {
@@ -1642,6 +2282,234 @@ mod tests {
         assert_eq!(calls.get(), 4);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_sparse_quota_fails_without_publishing_a_replacement_after_late_auth() {
+        for (quota, expected) in [
+            (Ok(json!({})), None),
+            (Ok(json!({"rate_limits": null})), None),
+            (
+                Ok(json!({"rate_limits":{"limits":[{"kind":"weekly_scoped","percent":20}]}})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits": {"limits": []}, "subscription_type": "max"})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits": {"limits": [{"kind":"session","percent":"unknown"}]}})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits_available": false, "rate_limits": null})),
+                Some(UsageStatus::Unavailable),
+            ),
+            (
+                Ok(json!({"rate_limits": {"five_hour": {"utilization": 25}}})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Err("Unsupported control request subtype: get_usage"),
+                Some(UsageStatus::Unavailable),
+            ),
+            (Err("Not logged in"), Some(UsageStatus::NeedsLogin)),
+        ] {
+            // None is an auth-transport failure, not a signed-out answer.
+            for signed_in in [Some(true), Some(false), None] {
+                let clock = std::cell::Cell::new(5);
+                let initialized = observed_control_response(
+                    &claude_reply("initialize", json!({"models":[{"value":"opus"}]})),
+                    "initialize",
+                    || clock.get(),
+                )
+                .unwrap();
+                let catalog = claude_catalog(&initialized);
+                clock.set(10);
+                let frame = match &quota {
+                    Ok(value) => claude_reply("usage", value.clone()),
+                    Err(message) => json!({"type":"control_response", "response": {
+                        "subtype":"error", "request_id":"usage", "error": message,
+                    }}),
+                };
+                let usage = observed_control_response(&frame, "usage", || clock.get()).unwrap();
+                assert_eq!(usage.observed_at, 10);
+                let (auth_ready, auth_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let auth_clock = &clock;
+                let auth = async move {
+                    auth_wait.await.unwrap();
+                    match signed_in {
+                        Some(logged_in) => observed_json(&serde_json::to_vec(&json!({
+                            "loggedIn": logged_in, "email":"user@example.com", "subscriptionType":"max",
+                        })).unwrap(), || auth_clock.get()),
+                        None => Err("synthetic auth transport failure".into()),
+                    }
+                };
+                let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                    close_wait.await.unwrap();
+                });
+                let mut completion = Box::pin(join_claude(auth, usage));
+                assert_pending(completion.as_mut());
+                clock.set(30);
+                auth_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let outcome = completed_probe(completion.await);
+                let expected = if signed_in == Some(false) {
+                    Some(UsageStatus::NeedsLogin)
+                } else {
+                    expected
+                };
+                match (expected, outcome) {
+                    (None, Outcome::Failed(message)) => assert!(!message.is_empty()),
+                    (
+                        Some(status),
+                        Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        },
+                    ) => {
+                        assert_eq!(snapshot.status, status);
+                        assert_eq!(
+                            snapshot.observed_at,
+                            if signed_in == Some(false) { 30 } else { 10 }
+                        );
+                        assert_eq!(catalog.unwrap().observed_at, 5);
+                        assert_eq!(identity.is_some(), signed_in == Some(true));
+                    }
+                    (_, other) => panic!("unexpected sparse-quota/auth result: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_sparse_quota_fails_without_publishing_a_replacement_after_late_models() {
+        for (quota, expected) in [
+            (Ok(json!({})), None),
+            (Ok(json!({"rateLimits": null})), None),
+            (
+                Ok(
+                    json!({"rateLimitsByLimitId":{"spark":{"limitName":"Spark","secondary":{"usedPercent":20,"windowDurationMins":10080}}}}),
+                ),
+                None,
+            ),
+            (
+                Ok(
+                    json!({"rateLimitsByLimitId": {"codex": {"primary":{"usedPercent":"unknown"}}}}),
+                ),
+                None,
+            ),
+            (
+                Ok(json!({"ordinaryUsageAllowed": true, "rateLimits": null})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Ok(json!({"ordinaryUsageAllowed": false, "rateLimits": null})),
+                Some(UsageStatus::Limited),
+            ),
+            (
+                Ok(json!({"rateLimits":{"rateLimitReachedType":"rate_limit_reached"}})),
+                Some(UsageStatus::Limited),
+            ),
+            (
+                Ok(json!({"rateLimits":{"primary":{"usedPercent":25}}})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Err(json!({"code":-32601,"message":"method not found"})),
+                Some(UsageStatus::Unavailable),
+            ),
+            (
+                Err(json!({"code":-1,"message":"401 unauthorized"})),
+                Some(UsageStatus::NeedsLogin),
+            ),
+        ] {
+            // Signed-in, signed-out, API-key and failed account/read controls.
+            for account_kind in 0..4 {
+                let clock = std::cell::Cell::new(10);
+                let mut answers = CodexAnswers::default();
+                answers.take(
+                    match &quota {
+                        Ok(value) => json!({"id":3,"result":value}),
+                        Err(error) => json!({"id":3,"error":error}),
+                    },
+                    || clock.get(),
+                );
+                assert_eq!(answers.limits.as_ref().unwrap().observed_at, 10);
+                let (nonquota_ready, nonquota_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let nonquota_clock = &clock;
+                let collected = async move {
+                    nonquota_wait.await.unwrap();
+                    let account = match account_kind {
+                        0 => {
+                            json!({"id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"}}})
+                        }
+                        1 => json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}),
+                        2 => {
+                            json!({"id":2,"result":{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}})
+                        }
+                        _ => {
+                            json!({"id":2,"error":{"code":-1,"message":"synthetic account transport failure"}})
+                        }
+                    };
+                    answers.take(account, || nonquota_clock.get());
+                    answers.take(
+                        json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}}),
+                        || nonquota_clock.get(),
+                    );
+                    Ok(answers.finish())
+                };
+                let mut completion = Box::pin(async {
+                    finish_codex_probe(
+                        after_close(collected.await, async {
+                            close_wait.await.unwrap();
+                        })
+                        .await,
+                    )
+                });
+                assert_pending(completion.as_mut());
+                clock.set(30);
+                nonquota_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let outcome = completed_probe(completion.await);
+                let expected = match account_kind {
+                    1 => Some(UsageStatus::NeedsLogin),
+                    2 => Some(UsageStatus::Unavailable),
+                    _ => expected,
+                };
+                match (expected, outcome) {
+                    (None, Outcome::Failed(message)) => assert!(!message.is_empty()),
+                    (
+                        Some(status),
+                        Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        },
+                    ) => {
+                        assert_eq!(snapshot.status, status);
+                        assert_eq!(
+                            snapshot.observed_at,
+                            if matches!(account_kind, 1 | 2) {
+                                30
+                            } else {
+                                10
+                            }
+                        );
+                        assert_eq!(catalog.unwrap().observed_at, 30);
+                        assert_eq!(identity.is_some(), account_kind == 0);
+                    }
+                    (_, other) => panic!("unexpected sparse-quota/account result: {other:?}"),
+                }
+            }
+        }
+    }
+
     /// A fake CLI stands in for the provider's: the probe has to speak the
     /// protocol, read only the answer it asked for, and leave nothing running.
     #[tokio::test]
@@ -1671,6 +2539,7 @@ sleep 30
             identity,
             snapshot,
             catalog,
+            ..
         } = probe_claude(&account, &script).await.unwrap();
         let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
@@ -1733,6 +2602,7 @@ cat >/dev/null
             identity,
             snapshot,
             catalog,
+            ..
         } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();
@@ -1870,6 +2740,202 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The system Claude login's two records, as the probe reads them: the
+    /// one in `~/.claude`, which earlier cagents launches kept, disputes the
+    /// login the CLI reported until a sign-in settles which is right.
+    #[test]
+    fn a_second_record_disputes_the_reported_login_until_a_sign_in_settles_it() {
+        use super::super::claude::RecordedLogin;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path().join("cache"));
+        const NOW: u64 = 1_000_000_000;
+        let key = "claude:/home/a/.claude";
+        let reported = |email: &str| Identity {
+            email: Some(email.into()),
+            ..Identity::default()
+        };
+        let names = |email: &str| RecordedLogin::Login(email.into());
+        let observe = |identity: Identity, observed_at: u64| {
+            cache
+                .store(
+                    key,
+                    Entry {
+                        identity: Some(identity),
+                        snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                    },
+                )
+                .unwrap();
+        };
+        let me = || reported("me@example.com");
+        // Without a second record there is nothing to dispute.
+        assert_eq!(
+            dispute(RecordedLogin::Nobody, &cache, key, &me(), NOW),
+            None
+        );
+
+        let disputed = dispute(names("other@example.com"), &cache, key, &me(), NOW);
+        assert_eq!(disputed.as_deref(), Some("other@example.com"));
+        observe(
+            Identity {
+                disputed_by: disputed,
+                ..me()
+            },
+            1,
+        );
+        assert_eq!(
+            dispute(names("other@example.com"), &cache, key, &me(), NOW).as_deref(),
+            Some("other@example.com")
+        );
+
+        // A sign-in that cagents ran finishes; the next probe settles it.
+        cache
+            .settle(
+                key,
+                Some(super::super::cache::Settled::SignedIn { at: NOW - 1_000 }),
+            )
+            .unwrap();
+        assert_eq!(
+            dispute(names("other@example.com"), &cache, key, &me(), NOW),
+            None
+        );
+        observe(me(), 2);
+        assert_eq!(
+            dispute(names("other@example.com"), &cache, key, &me(), NOW),
+            None
+        );
+
+        // The second record is written by a sign-in of its own: shown again.
+        let disputed = dispute(names("third@example.com"), &cache, key, &me(), NOW);
+        assert_eq!(disputed.as_deref(), Some("third@example.com"));
+        observe(
+            Identity {
+                disputed_by: disputed,
+                ..me()
+            },
+            3,
+        );
+        // A record the CLI could not report, or a probe that names no login,
+        // says nothing new: what was shown stays.
+        assert_eq!(
+            dispute(RecordedLogin::Unknown, &cache, key, &me(), NOW).as_deref(),
+            Some("third@example.com")
+        );
+        assert_eq!(
+            dispute(
+                names("third@example.com"),
+                &cache,
+                key,
+                &Identity::default(),
+                NOW
+            ),
+            None
+        );
+        assert_eq!(
+            dispute(names("third@example.com"), &cache, key, &me(), NOW).as_deref(),
+            Some("third@example.com")
+        );
+        // A sign-in in the reader's own terminal changes the login the CLI's
+        // record names, which settles it too.
+        assert_eq!(
+            dispute(
+                names("third@example.com"),
+                &cache,
+                key,
+                &reported("new@example.com"),
+                NOW
+            ),
+            None
+        );
+        // Records that come to agree leave nothing settled behind.
+        assert_eq!(
+            dispute(
+                names("new@example.com"),
+                &cache,
+                key,
+                &reported("new@example.com"),
+                NOW
+            ),
+            None
+        );
+        assert_eq!(cache.settled(key), None);
+    }
+
+    /// The second record is the one the CLI itself reports with the default
+    /// home exported, and only the system Claude login without a home of the
+    /// reader's choosing has one.
+    #[tokio::test]
+    async fn the_second_record_is_read_through_the_cli_with_the_default_home_exported() {
+        use super::super::claude::RecordedLogin;
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let home_text = home.to_str().unwrap().to_owned();
+        let environment = |name: &str| (name == "HOME").then(|| home_text.clone());
+        let system = Account::system(Provider::Claude);
+        let second = second_home(&system, &environment).unwrap();
+        assert_eq!(second, home.join(".claude"));
+        let chosen = |name: &str| match name {
+            "HOME" => Some(home_text.clone()),
+            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/claude-config")),
+            _ => None,
+        };
+        assert_eq!(second_home(&system, &chosen), None);
+        // The default an earlier cagents terminal exported is no home of the
+        // reader's choosing; the same value set by the reader is.
+        let spelled = |terminal: bool| {
+            let home_text = home_text.clone();
+            move |name: &str| match name {
+                "HOME" => Some(home_text.clone()),
+                "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
+                "CAGENTS_TERMINAL_ID" if terminal => Some("terminal".to_owned()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            second_home(&system, &spelled(true)),
+            Some(home.join(".claude"))
+        );
+        assert_eq!(second_home(&system, &spelled(false)), None);
+        assert_eq!(
+            second_home(&Account::system(Provider::Codex), &environment),
+            None
+        );
+        let linked = Account::linked(Provider::Claude, uuid::Uuid::from_u128(2), home.clone());
+        assert_eq!(second_home(&linked, &environment), None);
+
+        let program = directory.path().join("claude");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+[ "$1 $2 $3" = "auth status --json" ] || exit 2
+case "$CLAUDE_CONFIG_DIR" in
+  */home/.claude) printf '{"loggedIn":true,"email":"other@example.com"}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        make_executable(&program);
+        // Claude Code has not kept a record there.
+        assert_eq!(
+            second_login(&system, &program, None, &second).await,
+            RecordedLogin::Nobody
+        );
+        std::fs::write(second.join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            second_login(&system, &program, None, &second).await,
+            RecordedLogin::Login("other@example.com".into())
+        );
+        // A CLI that fails says nothing either way.
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            second_login(&system, &program, None, &elsewhere).await,
+            RecordedLogin::Unknown
+        );
     }
 
     #[tokio::test]

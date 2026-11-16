@@ -76,9 +76,7 @@ impl FencedTarget {
         // Files-backend locks do not fence a reftable repository. Preserve
         // unsupported ref storage rather than claiming the same guarantee.
         use crate::process::ProcessExecutor;
-        let command = crate::process::CommandSpec::new("git")
-            .cwd(repository)
-            .args(["config", "--get", "extensions.refStorage"]);
+        let command = cleanup_ref_storage_command(repository);
         let output = crate::process::SystemProcessExecutor
             .execute(&command, &cancellation)
             .map_err(|error| error.to_string())?;
@@ -201,6 +199,33 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
         ));
     }
     Ok(record.clone())
+}
+
+#[cfg(feature = "host")]
+fn cleanup_ref_storage_command(repository: &Path) -> crate::process::CommandSpec {
+    crate::repository::RepositoryService::system("git")
+        .git_base(repository, false)
+        .args(["config", "--get", "extensions.refStorage"])
+}
+
+#[cfg(feature = "host")]
+fn cleanup_removal_command(
+    repository: &Path,
+    path: &Path,
+    force: bool,
+    timeout: std::time::Duration,
+) -> crate::process::CommandSpec {
+    let mut command = crate::repository::RepositoryService::system("git")
+        .git_base(repository, false)
+        .args(["worktree", "remove"]);
+    if force {
+        command = command.arg("--force");
+    }
+    command
+        .arg("--")
+        .arg(path.as_os_str())
+        .timeout(timeout)
+        .output_limits(64 * 1024, 64 * 1024)
 }
 
 #[cfg(feature = "host")]
@@ -360,17 +385,7 @@ pub(crate) fn remove_fenced(
                 )
             })?;
     }
-    let mut command = crate::process::CommandSpec::new("git")
-        .cwd(&target.repository)
-        .args(["worktree", "remove"]);
-    if force {
-        command = command.arg("--force");
-    }
-    let command = command
-        .arg("--")
-        .arg(target.path.as_os_str())
-        .timeout(timeout)
-        .output_limits(64 * 1024, 64 * 1024);
+    let command = cleanup_removal_command(&target.repository, &target.path, force, timeout);
     let result = crate::process::SystemProcessExecutor
         .execute(&command, &cancellation)
         .and_then(|output| output.require_success(&command.program));
@@ -456,7 +471,7 @@ impl Protection {
         Ok(files)
     }
 
-    pub(crate) fn directory(&self) -> &Path {
+    pub fn directory(&self) -> &Path {
         &self.directory
     }
 }
@@ -567,7 +582,7 @@ pub fn complete_standalone_editor_protection(paths: &[PathBuf]) -> io::Result<()
     if !STANDALONE_EDITOR.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    let _launch = crate::instance::recovery_launch_fence()?;
+    let _launch = crate::instance::editor_launch_fence()?;
     let runtime = crate::instance::runtime_directory()?;
     let guards = initial_editor_protections(&runtime, paths)?;
     EDITOR_STARTUP_PROTECTIONS
@@ -651,8 +666,9 @@ pub(crate) fn protect_operation(directory: &Path) -> io::Result<Protection> {
     acquire(&crate::instance::runtime_directory()?, directory, false)
 }
 
-#[cfg(test)]
-pub(crate) fn fixture_protection(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture_protection(
     runtime: &Path,
     directory: &Path,
     exclusive: bool,
@@ -663,7 +679,7 @@ pub(crate) fn fixture_protection(
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
-pub(crate) struct WindowProtections {
+pub struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     resolved: BTreeMap<PathBuf, PathBuf>,
     requested: std::collections::BTreeSet<PathBuf>,
@@ -671,7 +687,7 @@ pub(crate) struct WindowProtections {
     retry_after: Option<std::time::Instant>,
     last_failure: Option<String>,
     missing: std::collections::BTreeSet<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fixture_runtime: Option<PathBuf>,
 }
 
@@ -683,19 +699,20 @@ impl WindowProtections {
         self.last_failure = None;
     }
 
-    #[cfg(test)]
-    pub(crate) fn use_fixture_runtime(&mut self, runtime: PathBuf) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn use_fixture_runtime(&mut self, runtime: PathBuf) {
         assert!(self.directories.is_empty());
         self.fixture_runtime = Some(runtime);
     }
 
-    pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
-        #[cfg(test)]
+    pub fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
         let protection = match &self.fixture_runtime {
             Some(runtime) => Some(acquire(runtime, directory, false)?),
             None => protect(directory)?,
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let protection = protect(directory)?;
         if let Some(protection) = protection {
             self.resolved
@@ -705,10 +722,7 @@ impl WindowProtections {
         }
         Ok(())
     }
-    pub(crate) fn sync(
-        &mut self,
-        directories: impl IntoIterator<Item = PathBuf>,
-    ) -> io::Result<()> {
+    pub fn sync(&mut self, directories: impl IntoIterator<Item = PathBuf>) -> io::Result<()> {
         if !crate::instance::window_is_initialized() {
             return Ok(());
         }
@@ -835,6 +849,25 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    /// A plain `File` holding a lock releases it only when every copy closes, and
+    /// a sibling test's fork holds a copy until its exec. That is inferred: the test
+    /// passed alone before this wait.
+    fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match acquire(runtime, directory, exclusive) {
+                Ok(protection) => return protection,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("could not protect {}: {error}", directory.display()),
+            }
+        }
+    }
+
     fn fixture_directory() -> tempfile::TempDir {
         // Positive fixtures need physical paths even when TMPDIR names a symlink.
         // Keep the TempDir guard; the lease API still rejects symlink components.
@@ -904,6 +937,117 @@ mod tests {
             }
             assert!(!exact_merged_head(&request, &pr));
         }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn cleanup_commands_ignore_inherited_git_redirection() {
+        use crate::process::ProcessExecutor;
+        const FIXTURE: &str = "CAGENTS_CLEANUP_REDIRECT_FIXTURE";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let cancellation = crate::process::CancellationToken::new();
+            let output = crate::process::SystemProcessExecutor
+                .execute(
+                    &cleanup_ref_storage_command(&root.join("primary")),
+                    &cancellation,
+                )
+                .unwrap();
+            assert_eq!(output.exit_code, Some(1));
+            assert!(
+                output.stdout.is_empty(),
+                "foreign ref storage must not be read"
+            );
+            let mut removal = request();
+            removal.repository = root.join("primary");
+            removal.path = root.join("worktree");
+            let command = cleanup_removal_command(
+                &removal.repository,
+                &removal.path,
+                false,
+                std::time::Duration::from_secs(30),
+            );
+            let removed = crate::process::SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap();
+            assert!(
+                removed.success,
+                "{}",
+                String::from_utf8_lossy(&removed.stderr)
+            );
+            std::fs::write(root.join("child-completed"), "ok").unwrap();
+            return;
+        }
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = fixture.path();
+        for name in ["primary", "foreign"] {
+            let repository = root.join(name);
+            std::fs::create_dir(&repository).unwrap();
+            for arguments in [
+                vec!["init", "-b", "main"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            ] {
+                let output = fixture_git(&repository).args(arguments).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = fixture_git(&root.join("primary"))
+            .args(["worktree", "add", "-b", "feature"])
+            .arg(root.join("worktree"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let foreign = root.join("foreign");
+        let output = fixture_git(&foreign)
+            .args(["config", "extensions.refStorage", "reftable"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let foreign_config = std::fs::read(foreign.join(".git/config")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_cleanup::tests::cleanup_commands_ignore_inherited_git_redirection",
+                "--nocapture",
+            ])
+            .env(FIXTURE, root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_DIR", foreign.join(".git"))
+            .env("GIT_WORK_TREE", &foreign)
+            .env("GIT_INDEX_FILE", foreign.join(".git/index"))
+            .env("GIT_COMMON_DIR", foreign.join(".git"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.join("child-completed").exists());
+        assert!(!root.join("worktree").exists());
+        assert_eq!(
+            std::fs::read(foreign.join(".git/config")).unwrap(),
+            foreign_config
+        );
     }
 
     #[cfg(feature = "host")]
@@ -1311,8 +1455,8 @@ mod tests {
         assert!(acquire(runtime.path(), &moved, true).is_err());
         child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
-        assert!(acquire(runtime.path(), &moved, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
+        acquire_once_released(runtime.path(), &moved, true);
     }
 
     #[test]

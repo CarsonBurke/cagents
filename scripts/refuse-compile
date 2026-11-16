@@ -1,0 +1,15 @@
+#!/bin/sh
+# RUSTC_WRAPPER for a launch holding the native lock. Cargo may ask rustc about
+# itself and confirm that nothing needs building, but compiling there would keep
+# every other native session waiting.
+case " $* " in
+    *" -vV "* | *" -V "* | *" --version "* | *" --print"*) exec "$@" ;;
+esac
+crate=
+previous=
+for argument do
+    [ "$previous" != --crate-name ] || crate=$argument
+    previous=$argument
+done
+printf '%s\n' "refusing to compile ${crate:-this checkout} while holding the native lock ${CAGENTS_NATIVE_LOCK_HELD:-}: other native sessions queue behind it. Release it, build this lane into the same target, then take it again." >&2
+exit 78

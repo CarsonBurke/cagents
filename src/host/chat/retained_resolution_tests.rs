@@ -69,6 +69,7 @@ fn isolated() -> Option<PathBuf> {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture"])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(MODE, &test)
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -142,6 +143,11 @@ impl Fixture {
             if time.monotonic()>=deadline: raise RuntimeError('reset gate timed out')
             time.sleep(0.01)
         send({'type':'conversation_reset'})
+        (root/'reset-sent').write_text('sent')
+        deadline=time.monotonic()+30
+        while not (root/'identity-now').exists():
+            if time.monotonic()>=deadline: raise RuntimeError('identity gate timed out')
+            time.sleep(0.01)
         import uuid
         session=str(uuid.uuid4())
         send({'type':'system','subtype':'init','session_id':session})
@@ -375,6 +381,9 @@ impl Drop for Fixture {
 
 #[test]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host_without_discovery();
@@ -425,6 +434,9 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 
 #[test]
 fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host_without_discovery();
@@ -536,6 +548,9 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
 
 #[test]
 fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     let inspect = |host: &SharedHost| {
@@ -627,6 +642,9 @@ fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
 
 #[test]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -739,6 +757,9 @@ fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
 
 #[test]
 fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -785,6 +806,9 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 
 #[test]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -862,6 +886,9 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
 
 #[test]
 fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -918,6 +945,9 @@ fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
 
 #[test]
 fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::with_reset(root, true);
     fixture
@@ -948,6 +978,18 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
         Some(a.as_str())
     );
     fs::write(fixture.root.join("reset-now"), b"provider reset").unwrap();
+    wait(
+        || fixture.root.join("reset-sent").exists(),
+        "provider did not emit reset",
+    );
+    wait(
+        || fixture.handle().confirmed_session_id().is_none(),
+        "HOST did not observe reset before the next identity",
+    );
+    // The new identity arrives in a later frame, after the one-shot hidden
+    // output observation has been consumed. No visibility/rearm/refresh may
+    // be needed to learn semantic metadata from this frame.
+    fs::write(fixture.root.join("identity-now"), b"next identity").unwrap();
     wait(
         || fixture.root.join("reset-id").exists(),
         "provider did not emit its explicit reset/new identity",
@@ -990,6 +1032,9 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
 
 #[test]
 fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     for replace_proxy in [false, true] {
         let mut fixture = Fixture::new(root.clone());
@@ -1035,6 +1080,9 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
 // and isolated() retain their original bounded real-helper ownership mechanics.
 #[test]
 fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     let original_scope = fixture.handle().launch_account_scope().unwrap().clone();
@@ -1058,7 +1106,7 @@ fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
             .is_err_and(|error| error.contains("fixture reinstall retirement commit failure"))
     );
     assert!(!fixture.identity.record.root.is_current());
-    assert!(!fixture.identity.record.holder.is_current());
+    assert!(fixture.identity.record.holder.reaped());
     let cleanup_handle = fixture.handle();
     assert!(cleanup_handle.is_close_only());
     let cleanup_source = fixture.host.lock().unwrap().chats[&fixture.original.id]
@@ -1107,7 +1155,7 @@ fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
         Some(ownership)
     );
     assert!(!fixture.identity.record.root.is_current());
-    assert!(!fixture.identity.record.holder.is_current());
+    assert!(fixture.identity.record.holder.reaped());
     fixture.no_prompt();
 
     // Remove only this fixture's fault and finish the original cleanup retry;

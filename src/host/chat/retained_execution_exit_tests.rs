@@ -9,6 +9,9 @@ use std::{fs, path::Path};
 
 #[test]
 fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_adoption() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const MODE: &str = "CAGENTS_RETAINED_EXECUTION_EXIT_TEST";
     if std::env::var_os(MODE).is_none() {
         for mode in ["cold-close", "reconcile"] {
@@ -29,6 +32,7 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &exact, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(MODE, mode)
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -302,17 +306,29 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
             .is_none(),
         "unproved actor must remain retained without blocking daemon reconciliation"
     );
-    assert!(super::native_cleanup::close_retained(&successor, &canonical).is_err());
-    assert!(
-        process_inner(
-            &successor,
-            0,
-            ClientRequest::ChatPrepareResume {
-                source: canonical.clone()
-            }
-        )
-        .is_err()
-    );
+    // Without its receipt the exit stays unproved for retirement, but the
+    // helper, provider and their process group are all gone: that proves the
+    // actor abandoned, so the conversation reopens as a distinct successor
+    // instead of stranding the card. A Close here would settle it as lost
+    // (#2484, see
+    // `a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_survives`);
+    // this test goes on to the receipt reappearing instead.
+    let ServerResponse::ChatResumePrepared { session: abandoned } = process_inner(
+        &successor,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: canonical.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_ne!(abandoned.id, canonical.id);
+    assert_eq!(abandoned.launch, canonical.launch);
+    assert!(matches!(
+        abandoned.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    ));
     {
         let state = successor.lock().unwrap();
         assert!(

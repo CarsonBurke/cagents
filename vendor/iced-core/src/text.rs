@@ -1,8 +1,10 @@
 //! Draw and interact with text.
+pub mod blink;
 pub mod editor;
 pub mod highlighter;
 pub mod paragraph;
 
+pub use blink::Blink;
 pub use editor::Editor;
 pub use highlighter::Highlighter;
 pub use paragraph::Paragraph;

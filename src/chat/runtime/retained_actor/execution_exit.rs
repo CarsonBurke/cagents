@@ -29,6 +29,95 @@ pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
     }
 }
 
+/// Whether an exact retained helper and its provider ended without leaving
+/// any process in either's process group or session.
+///
+/// The provider is spawned as its own process-group leader and the helper as
+/// its own session leader. Linux never hands out a PID while a process still
+/// uses it as a process-group or session ID, so a process naming either PID
+/// that way is a survivor of the old actor (or, conservatively, a later one
+/// that happens to reuse it); both refuse. Descendants that left the group on
+/// purpose are tool work, not writers of the provider's conversation, which
+/// only the provider process itself records.
+pub(crate) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+    abandoned_in(std::path::Path::new("/proc"), holder, root)
+}
+
+fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Result<bool, String> {
+    abandoned_with_policy(proc, holder, root, false)
+}
+
+/// Codex execution needs a positive survivor tied to the pane. A reused PID
+/// proves its original group/session also ended: Linux cannot reuse the PID
+/// while that numeric group/session still has members.
+pub(crate) fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+    abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true)
+}
+
+fn abandoned_with_policy(
+    proc: &std::path::Path,
+    holder: &Process,
+    root: &Process,
+    exclude_reused: bool,
+) -> Result<bool, String> {
+    let mut groups = Vec::with_capacity(2);
+    for expected in [holder, root] {
+        if expected.pid <= 0 || expected.start == 0 {
+            return Err("Invalid retained process absence identity".into());
+        }
+        match Process::read(expected.pid) {
+            Ok(actual) if actual == *expected => return Ok(false),
+            Ok(_) if exclude_reused => {}
+            Ok(_) => groups.push(expected.pid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => groups.push(expected.pid),
+            Err(error) => return Err(format!("Cannot establish exact process absence: {error}")),
+        }
+    }
+    let entries = std::fs::read_dir(proc)
+        .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // A process that exited during the scan holds no group: its
+            // entry is gone, or was reaped between opening and reading it.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot read process {pid} for exact absence: {error}"
+                ));
+            }
+        };
+        let Some(close) = stat.iter().rposition(|&byte| byte == b')') else {
+            return Err(format!("Process {pid} has an unreadable identity"));
+        };
+        let fields = String::from_utf8_lossy(&stat[close + 1..]);
+        let mut fields = fields.split_ascii_whitespace().skip(2);
+        let (Some(group), Some(session)) = (
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+        ) else {
+            return Err(format!("Process {pid} has an unreadable group identity"));
+        };
+        if [group, session].iter().any(|id| groups.contains(id)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn observe(expected: &Process) -> Result<Observation, String> {
     if expected.pid <= 0 || expected.start == 0 {
         return Err("Invalid retained helper execution identity".into());
@@ -152,5 +241,65 @@ mod tests {
             })
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod abandonment_tests {
+    use super::*;
+
+    fn stat(root: &std::path::Path, pid: i32, group: i32, session: i32) {
+        let directory = root.join(pid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("stat"),
+            format!("{pid} (odd ) name) S 1 {group} {session} 0 0"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_absence_excludes_reused_ids_but_keeps_leaderless_groups() {
+        let me = Process::read(std::process::id() as i32).unwrap();
+        let reused = Process {
+            start: me.start + 1,
+            ..me.clone()
+        };
+        let gone = Process {
+            pid: i32::MAX - 1,
+            start: 1,
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        stat(root.path(), 10, reused.pid, reused.pid);
+        assert!(abandoned_with_policy(root.path(), &reused, &gone, true).unwrap());
+        // Retained Claude keeps its existing conservative policy.
+        assert!(!abandoned_in(root.path(), &reused, &gone).unwrap());
+        assert!(!abandoned_with_policy(root.path(), &me, &gone, true).unwrap());
+        // The old leader is absent, yet a child still holds its numeric group.
+        stat(root.path(), 10, gone.pid, 10);
+        assert!(!abandoned_with_policy(root.path(), &reused, &gone, true).unwrap());
+    }
+
+    #[test]
+    fn abandonment_requires_both_exits_and_no_surviving_group_or_session() {
+        let me = Process::read(std::process::id() as i32).unwrap();
+        let gone = |pid| Process { pid, start: 1 };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        stat(root.path(), 10, 10, 10);
+        assert!(abandoned_in(root.path(), &gone(i32::MAX - 1), &gone(i32::MAX - 2)).unwrap());
+        // A live helper or provider is never abandoned.
+        assert!(!abandoned_in(root.path(), &me, &gone(i32::MAX - 2)).unwrap());
+        assert!(!abandoned_in(root.path(), &gone(i32::MAX - 1), &me).unwrap());
+        // A process left in the provider's group or the helper's session survives it.
+        stat(root.path(), 11, i32::MAX - 2, 10);
+        assert!(!abandoned_in(root.path(), &gone(i32::MAX - 1), &gone(i32::MAX - 2)).unwrap());
+        std::fs::remove_dir_all(root.path().join("11")).unwrap();
+        stat(root.path(), 12, 12, i32::MAX - 1);
+        assert!(!abandoned_in(root.path(), &gone(i32::MAX - 1), &gone(i32::MAX - 2)).unwrap());
+        std::fs::remove_dir_all(root.path().join("12")).unwrap();
+        // An unreadable identity is never read as absence.
+        std::fs::create_dir_all(root.path().join("13")).unwrap();
+        std::fs::write(root.path().join("13/stat"), "13 no-close").unwrap();
+        assert!(abandoned_in(root.path(), &gone(i32::MAX - 1), &gone(i32::MAX - 2)).is_err());
     }
 }

@@ -57,6 +57,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
             "--nocapture",
         ])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(MODE, name)
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
@@ -185,6 +186,9 @@ pub(super) fn pause_failed_confirmation(id: TerminalId) {
 
 #[test]
 fn named_claude_resume_failure_preserves_replacement_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_failure_preserves_replacement_attachment",
         false,
@@ -194,6 +198,9 @@ fn named_claude_resume_failure_preserves_replacement_attachment() {
 
 #[test]
 fn named_claude_resume_failure_retires_before_exact_retry() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_failure_retires_before_exact_retry",
         false,
@@ -203,6 +210,9 @@ fn named_claude_resume_failure_retires_before_exact_retry() {
 
 #[test]
 fn named_claude_resume_retry_finishes_failed_retirement_write() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_retry_finishes_failed_retirement_write",
         true,
@@ -212,6 +222,9 @@ fn named_claude_resume_retry_finishes_failed_retirement_write() {
 
 #[test]
 fn named_claude_resume_normal_close_finishes_failed_retirement_write() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     named_resume_case(
         "named_claude_resume_normal_close_finishes_failed_retirement_write",
         true,
@@ -602,7 +615,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             .unwrap()
             .is_some()
         {
-            assert!(!owner.owner().root.is_current() && !owner.owner().holder.is_current());
+            assert!(!owner.owner().root.is_current() && owner.owner().holder.reaped());
         }
     }
     client.close().unwrap();
@@ -762,6 +775,9 @@ impl Drop for HostClientWire {
 
 #[test]
 fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) =
         isolated("unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc")
     else {
@@ -829,6 +845,9 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
 
 #[test]
 fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) =
         isolated("installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry")
     else {
@@ -994,5 +1013,5 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
             .is_some()
     );
     super::native_cleanup::close_retained(&host, &session).unwrap();
-    assert!(!owner.root.is_current() && !owner.holder.is_current());
+    assert!(!owner.root.is_current() && owner.holder.reaped());
 }

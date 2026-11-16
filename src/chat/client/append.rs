@@ -84,6 +84,57 @@ impl Lineage {
         }
     }
 
+    /// Carry the unchanged items of a resident `previous` publication into a
+    /// full `next` snapshot of the same conversation, and prove the text that
+    /// only grew. A full snapshot arrives after a resync or when a reader
+    /// returns to a chat it kept while hidden; without this, every message in
+    /// it would be a new version, and the interface would prepare each one
+    /// again behind a loading placeholder. Runs on the client's reader thread:
+    /// comparing bodies is O(bytes), which the interface thread never pays.
+    pub fn adopt(&mut self, previous: &Snapshot, next: &mut Snapshot) {
+        fn adopt_items(edges: &mut Lineage, previous: &[Arc<Item>], next: &mut [Arc<Item>]) {
+            if previous.is_empty() {
+                return;
+            }
+            let previous: std::collections::HashMap<&str, &Arc<Item>> = previous
+                .iter()
+                .map(|item| (item.id.as_str(), item))
+                .collect();
+            for item in next {
+                let Some(old) = previous.get(item.id.as_str()) else {
+                    continue;
+                };
+                if Arc::ptr_eq(old, item) {
+                    continue;
+                }
+                if old.as_ref() == item.as_ref() {
+                    *item = Arc::clone(old);
+                    continue;
+                }
+                let grew = old.role == item.role
+                    && matches!((&old.content, &item.content),
+                        (ItemContent::Text { text: before, thinking: a, phase: x },
+                         ItemContent::Text { text: after, thinking: b, phase: y })
+                        if a == b && x == y && after.len() > before.len()
+                            && after.starts_with(before.as_str()));
+                if grew {
+                    if edges.edges.len() == LIMIT {
+                        edges.edges.pop_front();
+                    }
+                    edges
+                        .edges
+                        .push_back((Arc::downgrade(old), Arc::downgrade(item)));
+                }
+            }
+        }
+        adopt_items(self, &previous.items, &mut next.items);
+        for agent in &mut next.subagents {
+            if let Some(old) = previous.subagents.iter().find(|old| old.id == agent.id) {
+                adopt_items(self, &old.items, &mut agent.items);
+            }
+        }
+    }
+
     pub fn proves(&self, previous: &Arc<Item>, current: &Arc<Item>) -> bool {
         let mut cursor = Arc::downgrade(previous);
         let target = Arc::downgrade(current);

@@ -18,6 +18,8 @@ use cosmic::{
     },
 };
 
+use crate::input_trace::HIGHLIGHT_DWELL;
+
 /// Only the shared rule participates in layout; the pointer target overlaps it.
 pub const WIDTH: f32 = crate::design::BORDER_WIDTH;
 const HIT_WIDTH: f32 = 8.0;
@@ -222,9 +224,14 @@ struct ResizeOrigin {
 #[derive(Debug, Default)]
 struct SplitterState {
     drag: Option<ResizeOrigin>,
-    /// Whether the pointer was over the hit target as of the last event. The
-    /// rule is repainted when this changes, not on every pointer move.
-    hovered: bool,
+    /// Since when the pointer has been over the hit target, or `None` while
+    /// it is elsewhere. The rule is repainted when this starts, ends, or has
+    /// lasted [`HIGHLIGHT_DWELL`], not on every pointer move.
+    hovered_since: Option<std::time::Instant>,
+    /// Whether the pointer has rested on the hit target for
+    /// [`HIGHLIGHT_DWELL`]: only then does the rule light up and the resize
+    /// cursor appear. A press resizes at once either way.
+    hover_shown: bool,
     is_focused: bool,
     keyboard_gesture: bool,
     last_click: Option<std::time::Instant>,
@@ -332,18 +339,36 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
     ) {
         let bounds = Self::hit_bounds(layout.bounds());
         let state = tree.state.downcast_mut::<SplitterState>();
+        let hovered = !self.modal_open && cursor.is_over(bounds);
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) => {
-                let hovered = cursor.is_over(bounds);
-                if std::mem::replace(&mut state.hovered, hovered) != hovered {
+                if hovered {
+                    crate::input_trace::mark_on_resize_handle();
+                    if state.hovered_since.is_none() {
+                        let now = std::time::Instant::now();
+                        state.hovered_since = Some(now);
+                        shell.request_redraw_at(now + HIGHLIGHT_DWELL);
+                    }
+                } else if state.hovered_since.take().is_some()
+                    && std::mem::take(&mut state.hover_shown)
+                {
                     shell.request_redraw();
                 }
             }
             // The frame about to be drawn paints from the cursor, so record
             // what it will show: a splitter that moved under a still pointer
             // is then repainted when the pointer leaves it.
-            Event::Window(window::Event::RedrawRequested(_)) => {
-                state.hovered = cursor.is_over(bounds);
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                if !hovered {
+                    state.hovered_since = None;
+                    state.hover_shown = false;
+                } else if let Some(since) = state.hovered_since {
+                    let due = since + HIGHLIGHT_DWELL;
+                    state.hover_shown = *now >= due;
+                    if !state.hover_shown {
+                        shell.request_redraw_at(due);
+                    }
+                }
             }
             _ => {}
         }
@@ -362,8 +387,11 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if tree.state.downcast_ref::<SplitterState>().drag.is_some()
-            || (!self.modal_open && cursor.is_over(Self::hit_bounds(layout.bounds())))
+        let state = tree.state.downcast_ref::<SplitterState>();
+        if state.drag.is_some()
+            || (!self.modal_open
+                && state.hover_shown
+                && cursor.is_over(Self::hit_bounds(layout.bounds())))
         {
             mouse::Interaction::ResizingHorizontally
         } else {
@@ -398,7 +426,8 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         // sibling border.
         let state = tree.state.downcast_ref::<SplitterState>();
         let active = !self.modal_open
-            && (state.drag.is_some() || cursor.is_over(Self::hit_bounds(layout.bounds())));
+            && (state.drag.is_some()
+                || (state.hover_shown && cursor.is_over(Self::hit_bounds(layout.bounds()))));
         let color: Color = if active || state.is_focused {
             crate::design::accent_color(theme)
         } else {
@@ -802,6 +831,98 @@ mod tests {
                 &renderer,
             )
             .is_empty()
+        );
+    }
+
+    fn interaction(tree: &Tree, cursor: mouse::Cursor, renderer: &Renderer) -> mouse::Interaction {
+        let size = Size::new(WIDTH, 480.0);
+        let mut element = element(Edge::Trailing);
+        let mut layout_tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut layout_tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        element.as_widget().mouse_interaction(
+            tree,
+            Layout::new(&node),
+            cursor,
+            &Rectangle::with_size(size),
+            renderer,
+        )
+    }
+
+    #[test]
+    fn passing_over_the_handle_shows_nothing_until_the_pointer_rests() {
+        let renderer = headless_renderer();
+        let initial = element(Edge::Trailing);
+        let mut tree = Tree::new(&initial);
+        let over = mouse::Cursor::Available(Point::new(2.0, 120.0));
+        let entered = std::time::Instant::now();
+        dispatch_event(
+            360.0,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(2.0, 120.0),
+            }),
+            over,
+            &mut tree,
+            &renderer,
+        );
+        assert!(crate::input_trace::on_resize_handle());
+        dispatch_event(
+            360.0,
+            &Event::Window(window::Event::RedrawRequested(entered)),
+            over,
+            &mut tree,
+            &renderer,
+        );
+        assert_eq!(
+            interaction(&tree, over, &renderer),
+            mouse::Interaction::default(),
+            "no resize cursor while passing over"
+        );
+        dispatch_event(
+            360.0,
+            &Event::Window(window::Event::RedrawRequested(
+                entered + HIGHLIGHT_DWELL + std::time::Duration::from_millis(10),
+            )),
+            over,
+            &mut tree,
+            &renderer,
+        );
+        assert_eq!(
+            interaction(&tree, over, &renderer),
+            mouse::Interaction::ResizingHorizontally
+        );
+
+        // Pressing straight away still begins resizing.
+        let mut tree = Tree::new(&initial);
+        dispatch_event(
+            360.0,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            over,
+            &mut tree,
+            &renderer,
+        );
+        assert_eq!(
+            dispatch_event(
+                360.0,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(12.0, 120.0),
+                }),
+                mouse::Cursor::Available(Point::new(12.0, 120.0)),
+                &mut tree,
+                &renderer,
+            ),
+            vec![Message::Resize(370.0)]
+        );
+        assert_eq!(
+            interaction(
+                &tree,
+                mouse::Cursor::Available(Point::new(12.0, 120.0)),
+                &renderer
+            ),
+            mouse::Interaction::ResizingHorizontally
         );
     }
 
