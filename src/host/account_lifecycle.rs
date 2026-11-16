@@ -911,12 +911,20 @@ pub(super) fn reserve_restore(
 /// left alone - its provider reports no login, say - is not asked about again
 /// by this daemon; an explicit restore still can. One whose check did not
 /// finish is asked about again after a number of sweeps that doubles each
-/// time.
-pub(super) fn restore_unregistered_homes(host: std::sync::Weak<super::state::HostLock>) {
+/// time; so is one whose check panicked.
+pub(super) fn restore_unregistered_homes(
+    host: std::sync::Weak<super::state::HostLock>,
+) -> std::io::Result<()> {
+    use super::service::Next;
     let mut sweep = RestoreSweep::default();
-    while restore_pass(&host, &mut sweep) {
-        std::thread::sleep(RESTORE_SCAN);
-    }
+    super::service::periodic("cagents-account-restore", RESTORE_SCAN, move || {
+        if restore_pass(&host, &mut sweep) {
+            Next::Continue
+        } else {
+            Next::Stop
+        }
+    })
+    .map(drop)
 }
 
 /// What the sweep remembers between passes.
@@ -984,13 +992,34 @@ pub(super) fn restore_pass(
             let Some(strong) = host.upgrade() else {
                 return false;
             };
-            let reservation = Reservation::for_operation(&strong, &operation);
-            drop(strong);
-            let result = reservation
-                .map_err(|error| crate::account::remote::RestoreFailure::from(error.message))
-                .and_then(|reservation| {
-                    crate::account::remote::restore_installation_home(&reservation, provider, key)
-                });
+            // A home whose restore panics is passed over like one whose check
+            // did not finish, so it cannot keep the homes after it waiting.
+            let result = super::service::contain("account restore", || {
+                let reservation = Reservation::for_operation(&strong, &operation);
+                drop(strong);
+                reservation
+                    .map_err(|error| crate::account::remote::RestoreFailure::from(error.message))
+                    .and_then(|reservation| {
+                        crate::account::remote::restore_installation_home(
+                            &reservation,
+                            provider,
+                            key,
+                        )
+                    })
+            });
+            let result = match result {
+                Ok(result) => result,
+                Err(panicked) => {
+                    sweep.unfinished((provider, key));
+                    tracing::error!(
+                        provider = provider.executable(),
+                        %key,
+                        %panicked,
+                        "an unlisted account home could not be checked"
+                    );
+                    break;
+                }
+            };
             match result {
                 Ok(restored) => {
                     sweep.deferred.remove(&(provider, key));
