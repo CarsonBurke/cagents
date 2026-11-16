@@ -3532,6 +3532,9 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            // Above the draft, so the row with Stop keeps
+                            // its place for the second press.
+                            .chain(self.stop_confirmation())
                             .chain((!attachment_chips.is_empty()).then(|| {
                                 widget::column::with_children(attachment_chips)
                                     .spacing(step::GAP_XS)
@@ -3907,7 +3910,10 @@ impl Runtime {
     /// A provider whose interrupt does not spare background subagents takes
     /// them down with the turn. Saying so on the control is not enough for
     /// Esc, which is pressed without reading it, so such a cancel waits for a
-    /// second press that names what it stops.
+    /// second press, and [`Self::stop_confirmation`] names what it stops.
+    /// The control keeps its size and place while it waits, so the draft
+    /// beside it doesn't rewrap and the second press lands where the first
+    /// did.
     fn stop_control(&self, available: bool) -> Element<'_, Message> {
         let target = self.target;
         let at_stake = self.interrupt_casualties();
@@ -3916,32 +3922,49 @@ impl Runtime {
         } else {
             "subagents"
         };
-        if self.interrupt_armed.is_some() && at_stake > 0 {
-            crate::ui_controls::button::destructive(format!(
-                "Stop turn and {at_stake} {subagents}"
-            ))
-            .icon(Icon::Stop)
-            .name(format!(
+        let armed = self.interrupt_armed.is_some() && at_stake > 0;
+        let tooltip = if armed {
+            Cow::Owned(format!(
                 "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc)"
             ))
-            .id(card_control_id(target.card, "chat-stop"))
-            .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
-            .into()
+        } else if at_stake > 0 {
+            Cow::Owned(format!(
+                "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
+            ))
         } else {
-            crate::ui_controls::icon_button(
-                Icon::Stop,
-                if at_stake > 0 {
-                    Cow::Owned(format!(
-                        "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
-                    ))
-                } else {
-                    Cow::Borrowed("Cancel active turn (Esc)")
-                },
-            )
+            Cow::Borrowed("Cancel active turn (Esc)")
+        };
+        let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))
-            .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
-            .into()
+            .on_press_maybe(available.then(|| action(Action::Interrupt(target))));
+        if armed {
+            control = control
+                .selected(true)
+                .tone(crate::design::Tone::Themed(design::destructive_color));
         }
+        control.into()
+    }
+
+    /// While a cancel that also stops background subagents waits for its
+    /// second press, what that press stops.
+    fn stop_confirmation(&self) -> Option<Element<'_, Message>> {
+        let at_stake = self.interrupt_casualties();
+        (self.interrupt_armed.is_some() && at_stake > 0).then(|| {
+            let subagents = if at_stake == 1 {
+                "subagent"
+            } else {
+                "subagents"
+            };
+            widget::container(
+                widget::text(format!(
+                    "Press Stop or Esc again to cancel the turn and stop {at_stake} background {subagents}"
+                ))
+                .size(design::TEXT_CAPTION)
+                .class(cosmic::theme::Text::Custom(design::destructive_text)),
+            )
+            .padding(iced::Padding::from([space::XS, COMPOSER_PADDING]))
+            .into()
+        })
     }
 
     /// The `+` at the composer's leading edge, and the menu it opens while it
@@ -12813,6 +12836,8 @@ mod tests {
         footer: iced::Rectangle,
         controls: HashMap<String, iced::Rectangle>,
         footer_text: Vec<String>,
+        /// Every text the view draws.
+        text: Vec<String>,
         /// What assistive technology is told inside the footer.
         footer_names: Vec<String>,
         /// The far edge of whatever the footer draws, text or named glyph.
@@ -12922,6 +12947,7 @@ mod tests {
             })
             .filter(|(bounds, _)| footer.contains(bounds.center()))
             .collect();
+        let all_text = probe.text.iter().map(|(_, text)| text.clone()).collect();
         let text: Vec<(iced::Rectangle, String)> = probe
             .text
             .into_iter()
@@ -12929,6 +12955,7 @@ mod tests {
             .collect();
         Laid {
             footer,
+            text: all_text,
             controls: probe.controls,
             footer_drawn_right: text
                 .iter()
@@ -13002,6 +13029,56 @@ mod tests {
                 Trailing::Stop,
             ]
         );
+    }
+
+    /// A cancel that also stops background subagents waits for a second
+    /// press. Stop and the draft keep their place while it waits, so the
+    /// second press lands where the first did, and the line above the draft
+    /// says what that press stops.
+    #[test]
+    fn a_stop_waiting_for_confirmation_keeps_its_place_and_says_what_it_stops() {
+        let roles = ["chat-stop", "chat-composer"];
+        let (mut runtime, _handle) = furnished_runtime();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.interrupt_stops_background = true;
+        for id in ["scout", "planner"] {
+            snapshot.subagents.push(chat::Subagent {
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                id: id.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: chat::ToolStatus::Running,
+                background: true,
+                items: Vec::new(),
+            });
+        }
+        runtime.composer = text_editor::Content::with_text("Run the tests again");
+        for width in [470.0_f32, 900.0] {
+            let waiting = |runtime: &mut Runtime, armed: bool| {
+                runtime.interrupt_armed = armed.then(Instant::now);
+                lay_out(runtime, width, None, &roles)
+            };
+            let first = waiting(&mut runtime, false);
+            let second = waiting(&mut runtime, true);
+            assert_eq!(
+                second.controls["chat-stop"], first.controls["chat-stop"],
+                "Stop keeps its place at {width}"
+            );
+            assert_eq!(
+                second.controls["chat-composer"].width, first.controls["chat-composer"].width,
+                "the draft keeps its width at {width}"
+            );
+            let says = |laid: &Laid| {
+                laid.text.iter().any(|text| {
+                    text == "Press Stop or Esc again to cancel the turn and stop 2 background subagents"
+                })
+            };
+            assert!(!says(&first));
+            assert!(says(&second), "{:?}", second.text);
+        }
     }
 
     #[test]
