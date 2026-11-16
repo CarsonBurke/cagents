@@ -273,7 +273,7 @@ mod tests {
             mouse,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
+        app.pane_inspectors = pane_inspector::PaneInspectors::default();
         let card = CardId::new();
         app.terminal_find.insert(
             card,

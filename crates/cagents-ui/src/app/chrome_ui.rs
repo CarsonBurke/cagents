@@ -1453,7 +1453,7 @@ mod tests {
             (false, true, false, Foreground::None),
         ] {
             let mut app = super::super::tests::context_inspector_test_app(true);
-            app.context_inspector_open = false;
+            app.pane_inspectors = pane_inspector::PaneInspectors::default();
             let card = app.workspace.focused().unwrap();
             let directory = tempfile::tempdir().unwrap();
             app.cards.insert(
