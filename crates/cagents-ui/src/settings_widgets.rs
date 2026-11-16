@@ -48,7 +48,8 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     }
 
     /// Label, control, error and description, at the fixed distances
-    /// [`design::rhythm`] sets between those roles.
+    /// [`design::rhythm`] sets between those roles, shown together when the
+    /// keyboard focuses the control.
     fn view(self, query: &str) -> Element<'a, Message> {
         use design::rhythm;
         let gap = |height: f32| -> Element<'a, Message> {
@@ -90,9 +91,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
             children.push(gap(after_control));
             children.push(design::description(self.detail).into());
         }
-        widget::column::with_children(children)
-            .width(Length::Fill)
-            .into()
+        crate::interaction::focus_group(widget::column::with_children(children).width(Length::Fill))
     }
 }
 

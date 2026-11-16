@@ -24,7 +24,7 @@ mod keyed_list;
 mod list_navigation;
 pub use list_navigation::{reveal_list_selection, selection_offset};
 mod reveal_focus;
-pub use reveal_focus::reveal_focus;
+pub use reveal_focus::{focus_group, reveal_focus};
 
 use crate::design::space;
 

@@ -481,6 +481,7 @@ pub(super) mod tests {
         #[derive(Default)]
         struct Seen {
             viewport: Option<iced::Rectangle>,
+            content: f32,
             scrolled: f32,
             focused: Option<(widget::Id, iced::Rectangle)>,
         }
@@ -492,12 +493,13 @@ pub(super) mod tests {
                 &mut self,
                 _: Option<&widget::Id>,
                 bounds: iced::Rectangle,
-                _: iced::Rectangle,
+                content: iced::Rectangle,
                 translation: iced::Vector,
                 _: &mut dyn operation::scrollable::Scrollable,
             ) {
                 if self.viewport.is_none() {
                     self.viewport = Some(bounds);
+                    self.content = content.height;
                     self.scrolled = translation.y;
                 }
             }
@@ -524,12 +526,19 @@ pub(super) mod tests {
                 id,
                 bounds - iced::Vector::new(0.0, seen.scrolled),
                 seen.scrolled,
+                seen.content,
             )
         };
-        let in_view = |viewport: iced::Rectangle, drawn: iced::Rectangle| {
-            drawn.y >= viewport.y - 0.5
-                && drawn.y + drawn.height <= viewport.y + viewport.height + 0.5
-        };
+        // Clear of the fade at each edge, which is as deep as the content
+        // hidden beyond it, up to the full fade.
+        let in_view =
+            |viewport: iced::Rectangle, drawn: iced::Rectangle, scrolled: f32, content: f32| {
+                let fade = |hidden: f32| hidden.clamp(0.0, crate::interaction::OVERFLOW_FADE);
+                drawn.y >= viewport.y + fade(scrolled) - 0.5
+                    && drawn.y + drawn.height
+                        <= viewport.y + viewport.height - fade(content - viewport.height - scrolled)
+                            + 0.5
+            };
         let tab = iced::Event::Keyboard(key_press(keyboard::key::Named::Tab));
         // A frame follows the key, as it does in the app.
         let frame = iced::Event::Window(iced::window::Event::RedrawRequested(
@@ -538,10 +547,10 @@ pub(super) mod tests {
         for row in &ids[1..] {
             press(&mut element, &mut tree, tab.clone());
             press(&mut element, &mut tree, frame.clone());
-            let (viewport, id, drawn, _) = seen(&mut element, &mut tree);
+            let (viewport, id, drawn, scrolled, content) = seen(&mut element, &mut tree);
             assert_eq!(&id, row);
             assert!(
-                in_view(viewport, drawn),
+                in_view(viewport, drawn, scrolled, content),
                 "{id:?} is drawn at {drawn:?}, outside {viewport:?}"
             );
         }
@@ -553,9 +562,12 @@ pub(super) mod tests {
             press(&mut element, &mut tree, iced::Event::Keyboard(shift_tab()));
             press(&mut element, &mut tree, frame.clone());
         }
-        let (viewport, id, drawn, scrolled) = seen(&mut element, &mut tree);
+        let (viewport, id, drawn, scrolled, content) = seen(&mut element, &mut tree);
         assert_eq!(id, ids[0]);
-        assert!(in_view(viewport, drawn), "{drawn:?} outside {viewport:?}");
+        assert!(
+            in_view(viewport, drawn, scrolled, content),
+            "{drawn:?} outside {viewport:?}"
+        );
         assert_eq!(scrolled, 0.0, "the first row sits flush at the top again");
     }
 

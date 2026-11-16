@@ -6,30 +6,58 @@ use cosmic::iced::advanced::{
 use cosmic::iced::{Event, Length, Rectangle, Size, Vector, keyboard, mouse, window};
 use cosmic::{Element, Renderer, Theme};
 
+/// How many frames after a key the reveal waits for focus to move: the app
+/// may answer the key by focusing a control a frame or two later.
+const SETTLE_FRAMES: u8 = 3;
+
 /// `content`, a scrollable, scrolled just far enough to show a control that
 /// the keyboard moves focus to inside it, by Tab, an arrow key or a shortcut
 /// the app answers by focusing a control, clear of the fades at its edges.
-/// A control already wholly in view stays where it is, and focus taken by
-/// the pointer never scrolls: the person is looking at what they clicked,
-/// and a person who scrolls the focused control away keeps the view they
-/// chose.
+/// Inside a [`focus_group`] the whole group shows, so a field comes with its
+/// label and the line under it. Focus taken by the pointer never scrolls:
+/// the person is looking at what they clicked, and a person who scrolls the
+/// focused control away keeps the view they chose.
 ///
 /// `content` must be the scrollable itself, or wrap it without other
 /// scrollables in between, as for [`super::overflow_fade_y`]. Focus inside a
-/// scrollable nested in it is that scrollable's to reveal, with a
-/// `reveal_focus` of its own. A control that takes focus without an id, as
-/// an iced text editor made without one does, can't be followed and is left
-/// where it is.
+/// scrollable nested in it, such as a list in a dialog, brings that list
+/// into view; a `reveal_focus` around the list as well then shows the
+/// control within it. A control that takes focus without an id, as an iced text editor
+/// made without one does, can't be followed and is left where it is.
 pub fn reveal_focus<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    Element::new(RevealFocus {
+    Element::new(Marked {
         content: content.into(),
+        role: Role::Reveal,
     })
 }
 
-struct RevealFocus<'a, Message> {
+/// `content`, a control with the label and notes that belong to it, which a
+/// [`reveal_focus`] around it shows together when the control takes focus,
+/// unless the group is taller than the view.
+pub fn focus_group<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(Marked {
+        content: content.into(),
+        role: Role::Group,
+    })
+}
+
+/// A wrapper that marks its content for [`FindFocus`].
+struct Marked<'a, Message> {
     content: Element<'a, Message>,
+    role: Role,
+}
+
+/// What a [`Marked`] wrapper says about its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// A scrollable that reveals focus within itself.
+    Reveal,
+    /// A control and the text about it, revealed together.
+    Group,
 }
 
 /// Where focus stood when the last key arrived.
@@ -37,24 +65,80 @@ struct RevealFocus<'a, Message> {
 struct State {
     /// The control focused before the last key was handled.
     before: Option<Id>,
-    /// A key was handled since the last frame, which shows where it moved
-    /// focus, if anywhere.
-    pending: bool,
+    /// Frames left to wait for the last key to move focus.
+    settling: u8,
 }
 
-/// The outermost scrollable inside, and the focused control directly under
-/// it.
+/// A region the walk is inside.
+#[derive(Clone, Copy, Debug)]
+enum Frame {
+    /// A scrollable's viewport.
+    Scrollable(Rectangle),
+    /// A [`focus_group`].
+    Group(Rectangle),
+}
+
+/// The outermost scrollable inside, and what to show of the focused control.
 #[derive(Default)]
 struct FindFocus {
     /// The scrollable's viewport, its content height and its offset.
     scrollable: Option<(Rectangle, f32, f32)>,
-    /// The focused control, laid out in the scrollable's content, or `None`
-    /// for its bounds when it lies in a nested scrollable.
+    /// The focused control, and the region of the outer scrollable's content
+    /// to show for it, if any.
     focused: Option<(Id, Option<Rectangle>)>,
-    /// How many scrollables enclose the widgets being visited.
-    depth: usize,
-    /// A scrollable was just visited; the next traversal enters it.
-    entering: bool,
+    /// The regions enclosing the widgets being visited, outermost first.
+    frames: Vec<Frame>,
+    /// A region was just visited; the next traversal enters it.
+    entering: Option<Frame>,
+}
+
+impl FindFocus {
+    /// What to show for a control at `control`, in the outer content: the
+    /// nested scrollable it is in, else its innermost group, else itself. A
+    /// group taller than the view gives way to what it holds, so the control
+    /// still shows; a taller nested list shows its start.
+    fn target(&self, control: Rectangle) -> Option<Rectangle> {
+        let mut frames = self.frames.iter();
+        // The first scrollable is the outer one; regions are measured in its
+        // content from there.
+        let Some(Frame::Scrollable(view)) =
+            frames.find(|frame| matches!(frame, Frame::Scrollable(_)))
+        else {
+            return None;
+        };
+        let fits = |region: &Rectangle| region.height <= view.height;
+        let mut shown = None;
+        for frame in frames {
+            match *frame {
+                Frame::Group(bounds) => shown = Some(bounds).filter(fits).or(shown),
+                // A nested scrollable's content is laid out unscrolled
+                // within it, so only its own viewport places anything here:
+                // this view brings the list into view, and a `reveal_focus`
+                // of the list's own shows the control within it.
+                Frame::Scrollable(bounds) => {
+                    return Some(
+                        shown
+                            .filter(|group| group.contains_rect(bounds))
+                            .unwrap_or(bounds),
+                    );
+                }
+            }
+        }
+        Some(shown.unwrap_or(control))
+    }
+}
+
+trait ContainsRect {
+    fn contains_rect(&self, other: Rectangle) -> bool;
+}
+
+impl ContainsRect for Rectangle {
+    fn contains_rect(&self, other: Rectangle) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.width <= self.x + self.width
+            && other.y + other.height <= self.y + self.height
+    }
 }
 
 impl Operation for FindFocus {
@@ -62,10 +146,14 @@ impl Operation for FindFocus {
         if self.focused.is_some() {
             return;
         }
-        let entering = std::mem::take(&mut self.entering);
-        self.depth += usize::from(entering);
+        let entering = self.entering.take();
+        if let Some(frame) = entering {
+            self.frames.push(frame);
+        }
         operate(self);
-        self.depth -= usize::from(entering);
+        if entering.is_some() {
+            self.frames.pop();
+        }
     }
 
     fn scrollable(
@@ -79,7 +167,13 @@ impl Operation for FindFocus {
         if self.scrollable.is_none() {
             self.scrollable = Some((bounds, content.height, translation.y));
         }
-        self.entering = true;
+        self.entering = Some(Frame::Scrollable(bounds));
+    }
+
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(Role::Group) = state.downcast_ref::<Role>() {
+            self.entering = Some(Frame::Group(bounds));
+        }
     }
 
     fn focusable(
@@ -88,10 +182,8 @@ impl Operation for FindFocus {
         bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if let Some(id) = id.filter(|_| state.is_focused() && self.depth > 0) {
-            // A nested scrollable's content is laid out unscrolled within
-            // it, so these bounds say nothing about where it is drawn here.
-            self.focused = Some((id.clone(), (self.depth == 1).then_some(bounds)));
+        if let Some(id) = id.filter(|_| state.is_focused() && self.scrollable.is_some()) {
+            self.focused = Some((id.clone(), self.target(bounds)));
         }
     }
 }
@@ -124,7 +216,7 @@ impl Operation for ScrollTo {
     }
 }
 
-impl<Message> RevealFocus<'_, Message> {
+impl<Message> Marked<'_, Message> {
     fn find(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) -> FindFocus {
         let mut find = FindFocus::default();
         self.content
@@ -133,32 +225,29 @@ impl<Message> RevealFocus<'_, Message> {
         find
     }
 
-    /// Scrolls to the focused control if focus moved to it since the last
-    /// key arrived, and it isn't wholly in view.
+    /// Whether focus moved since the last key arrived; if so, scrolls to
+    /// what it moved to.
     fn reveal(
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
-    ) {
+    ) -> bool {
         let find = self.find(tree, layout, renderer);
         let state = tree.state.downcast_mut::<State>();
         let focused = find.focused.as_ref().map(|(id, _)| id.clone());
         if state.before == focused {
-            return;
+            return false;
         }
         state.before = focused;
-        let (Some((viewport, content, current)), Some((_, Some(control)))) =
+        let (Some((viewport, content, current)), Some((_, Some(region)))) =
             (find.scrollable, find.focused)
         else {
-            return;
+            return true;
         };
-        let top = control.y - viewport.y;
-        let height = control.height.min(viewport.height);
-        if top >= current && top + height <= current + viewport.height {
-            return;
-        }
+        let top = region.y - viewport.y;
+        let height = region.height.min(viewport.height);
         let offset = super::selection_offset(top, height, viewport.height, content, current);
         if (offset - current).abs() > 0.5 {
             self.content.as_widget_mut().operate(
@@ -170,10 +259,11 @@ impl<Message> RevealFocus<'_, Message> {
             shell.invalidate_layout();
             shell.request_redraw();
         }
+        true
     }
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
+impl<Message> Widget<Message, Theme, Renderer> for Marked<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
     }
@@ -215,9 +305,22 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
+        let content = &mut self.content;
+        let child = &mut tree.children[0];
+        match self.role {
+            // The scrollable inside is entered by its own traversal.
+            Role::Reveal => content
+                .as_widget_mut()
+                .operate(child, layout, renderer, operation),
+            Role::Group => {
+                operation.custom(None, layout.bounds(), &mut Role::Group);
+                operation.traverse(&mut |operation| {
+                    content
+                        .as_widget_mut()
+                        .operate(child, layout, renderer, operation);
+                });
+            }
+        }
     }
     fn update(
         &mut self,
@@ -230,12 +333,25 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.role == Role::Group {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
         // Only the keyboard's moves count: what has focus before a key is
-        // the baseline, however it got there, and what has it at the next
-        // frame, moved by the key itself or by the app's answer to it, is
-        // the move. That frame's layout is the one the reveal measures.
+        // the baseline, however it got there, and the first change in the
+        // frames that follow, moved by the key itself or by the app's answer
+        // to it, is the move. Those frames' layout is the one measured.
         let key = matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. }));
-        if key {
+        if key && tree.state.downcast_ref::<State>().settling == 0 {
             let before = self.find(tree, layout, renderer).focused.map(|(id, _)| id);
             tree.state.downcast_mut::<State>().before = before;
         }
@@ -250,11 +366,13 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
             viewport,
         );
         if key {
-            tree.state.downcast_mut::<State>().pending = true;
+            tree.state.downcast_mut::<State>().settling = SETTLE_FRAMES;
         } else if matches!(event, Event::Window(window::Event::RedrawRequested(_)))
-            && std::mem::take(&mut tree.state.downcast_mut::<State>().pending)
+            && tree.state.downcast_ref::<State>().settling > 0
         {
-            self.reveal(tree, layout, renderer, shell);
+            let moved = self.reveal(tree, layout, renderer, shell);
+            let state = tree.state.downcast_mut::<State>();
+            state.settling = if moved { 0 } else { state.settling - 1 };
         }
     }
     fn mouse_interaction(
@@ -342,8 +460,23 @@ mod tests {
     use cosmic::iced::{Point, time::Instant};
     use cosmic::widget;
 
-    /// Twenty 30 px rows in a 100 px tall scrollable; the row `nested` holds
-    /// a scrollable of its own, 30 px tall, around ten rows.
+    /// The view's height; its fades take 24 px at each edge.
+    const VIEW: f32 = 150.0;
+
+    /// What stands in a row of the page.
+    #[derive(Clone, Copy)]
+    enum Row {
+        /// A 30 px button.
+        Button,
+        /// A 30 px scrollable around buttons 100 to 109.
+        Nested,
+        /// A button under a 20 px caption and over a 20 px note, in a
+        /// [`focus_group`].
+        Field,
+    }
+
+    /// Twenty rows in a [`VIEW`] tall scrollable, button rows unless `rows`
+    /// says otherwise.
     struct Harness {
         element: Element<'static, ()>,
         tree: Tree,
@@ -355,7 +488,7 @@ mod tests {
         Id::new(format!("row-{row}"))
     }
 
-    fn row(row: usize) -> Element<'static, ()> {
+    fn button(row: usize) -> Element<'static, ()> {
         widget::button::text(format!("Row {row}"))
             .id(id(row))
             .height(30)
@@ -364,25 +497,36 @@ mod tests {
     }
 
     impl Harness {
-        fn new(nested: Option<usize>) -> Self {
+        fn new(rows: &[(usize, Row)]) -> Self {
             let rows = (0..20)
-                .map(|index| match nested {
-                    Some(at) if at == index => widget::scrollable(widget::column::with_children(
-                        (100..110).map(row).collect::<Vec<_>>(),
-                    ))
-                    .height(30)
-                    .into(),
-                    _ => row(index),
+                .map(|index| {
+                    match rows
+                        .iter()
+                        .find(|(at, _)| *at == index)
+                        .map(|(_, row)| *row)
+                    {
+                        None | Some(Row::Button) => button(index),
+                        Some(Row::Nested) => widget::scrollable(widget::column::with_children(
+                            (100..110).map(button).collect::<Vec<_>>(),
+                        ))
+                        .height(30)
+                        .into(),
+                        Some(Row::Field) => focus_group(widget::column::with_children(vec![
+                            widget::text("Caption").height(20).into(),
+                            button(index),
+                            widget::text("Note").height(20).into(),
+                        ])),
+                    }
                 })
                 .collect::<Vec<_>>();
             let mut element =
-                reveal_focus(widget::scrollable(widget::column::with_children(rows)).height(100));
+                reveal_focus(widget::scrollable(widget::column::with_children(rows)).height(VIEW));
             let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, VIEW)),
             );
             Self {
                 element,
@@ -411,7 +555,7 @@ mod tests {
                 &self.renderer,
                 &mut clipboard::Null,
                 &mut Shell::new(&mut messages),
-                &Rectangle::with_size(Size::new(300.0, 100.0)),
+                &Rectangle::with_size(Size::new(300.0, VIEW)),
             );
         }
 
@@ -439,6 +583,14 @@ mod tests {
             ));
         }
 
+        /// A key that focuses `row`, answered in the next frame.
+        fn tab_to(&mut self, row: usize) -> f32 {
+            self.key();
+            self.focus(row);
+            self.frame();
+            self.scrolled()
+        }
+
         /// The outer scrollable's offset.
         fn scrolled(&mut self) -> f32 {
             let mut find = FindFocus::default();
@@ -448,29 +600,40 @@ mod tests {
     }
 
     #[test]
-    fn a_control_the_keyboard_focuses_below_the_fold_scrolls_into_view() {
-        let mut harness = Harness::new(None);
-        harness.key();
-        // The app answers the key by focusing a row; the next frame shows it.
-        harness.focus(10);
-        harness.frame();
-        let scrolled = harness.scrolled();
-        assert!(
-            (300.0 - 100.0 + 30.0..=300.0).contains(&scrolled),
-            "row 10, at 300..330, is in the 100 px viewport at {scrolled}"
-        );
-        // A row already in view stays where it is.
-        harness.key();
-        harness.focus(9);
-        harness.frame();
-        assert_eq!(harness.scrolled(), scrolled);
+    fn a_control_the_keyboard_focuses_below_the_fold_scrolls_clear_of_the_fade() {
+        let mut harness = Harness::new(&[]);
+        // Row 10, at 300..330, ends a fade's depth above the bottom edge.
+        assert_eq!(harness.tab_to(10), 330.0 + 24.0 - VIEW);
+        // Rows 9 and 8, down to 240, are clear of both fades there.
+        assert_eq!(harness.tab_to(9), 330.0 + 24.0 - VIEW);
+        assert_eq!(harness.tab_to(8), 330.0 + 24.0 - VIEW);
+        // Row 7, at 210..240, is under the top fade and comes out of it.
+        assert_eq!(harness.tab_to(7), 210.0 - 24.0);
+    }
+
+    #[test]
+    fn a_control_in_view_but_under_a_fade_comes_out_of_it() {
+        let mut harness = Harness::new(&[]);
+        // Row 4, at 120..150, is wholly inside the view, under its bottom fade.
+        assert_eq!(harness.tab_to(4), 150.0 + 24.0 - VIEW);
+    }
+
+    #[test]
+    fn a_field_shows_with_its_caption_and_note() {
+        let mut harness = Harness::new(&[(10, Row::Field)]);
+        // The group spans 300..370: caption, button, note.
+        assert_eq!(harness.tab_to(10), 370.0 + 24.0 - VIEW);
+        // Coming back up from row 13, the caption above the button shows
+        // clear of the top fade too.
+        harness.tab_to(13);
+        assert_eq!(harness.tab_to(10), 300.0 - 24.0);
     }
 
     #[test]
     fn focus_the_pointer_gives_never_scrolls() {
-        let mut harness = Harness::new(None);
-        // A click focuses a row partly under the fold; no key came first.
-        harness.focus(3);
+        let mut harness = Harness::new(&[]);
+        // A click focuses a row under the bottom fade; no key came first.
+        harness.focus(4);
         harness.frame();
         assert_eq!(harness.scrolled(), 0.0);
         // A later key that leaves focus where the click put it moves nothing.
@@ -480,15 +643,33 @@ mod tests {
     }
 
     #[test]
-    fn focus_inside_a_nested_scrollable_is_left_to_it() {
-        let mut harness = Harness::new(Some(12));
+    fn focus_inside_a_nested_list_below_the_fold_brings_the_list_into_view() {
+        let mut harness = Harness::new(&[(12, Row::Nested)]);
+        // The list's viewport is at 360..390; its own content, laid out
+        // unscrolled, doesn't place the control in the page.
+        assert_eq!(harness.tab_to(105), 390.0 + 24.0 - VIEW);
+    }
+
+    #[test]
+    fn focus_the_app_moves_a_few_frames_after_the_key_is_revealed() {
+        let mut harness = Harness::new(&[]);
         harness.key();
-        harness.focus(105);
         harness.frame();
-        assert_eq!(
-            harness.scrolled(),
-            0.0,
-            "a nested control's unscrolled bounds don't place it in the outer view"
-        );
+        harness.frame();
+        harness.focus(10);
+        harness.frame();
+        assert_eq!(harness.scrolled(), 330.0 + 24.0 - VIEW);
+    }
+
+    #[test]
+    fn focus_moved_long_after_the_key_is_not_the_keys() {
+        let mut harness = Harness::new(&[]);
+        harness.key();
+        for _ in 0..SETTLE_FRAMES {
+            harness.frame();
+        }
+        harness.focus(10);
+        harness.frame();
+        assert_eq!(harness.scrolled(), 0.0);
     }
 }
