@@ -23,11 +23,13 @@ pub enum AccountCommand {
         #[arg(long)]
         yes: bool,
         /// Reuse this key only to resolve the same previously submitted reset.
-        #[arg(long, requires = "reset_id")]
+        #[arg(long, requires = "reset_id", value_name = "KEY")]
         idempotency_key: Option<String>,
     },
-    /// Register an existing provider home on this device, or on --device.
-    /// Does not transfer credentials or verify coding access.
+    /// Register an existing provider home.
+    #[command(
+        after_help = "Registers it on this device, or on --device. Does not transfer credentials or verify coding access."
+    )]
     Link {
         /// Provider whose existing home is registered: claude or codex.
         #[arg(value_parser = link::parse_provider)]
@@ -44,7 +46,8 @@ pub enum AccountCommand {
         /// A full ID from account list (for example claude/system), or automatic.
         selection: crate::account::preferences::DefaultSelection,
     },
-    /// Forget a linked account registration; managed file deletion remains unavailable.
+    /// Forget a linked account registration.
+    #[command(after_help = "Deleting managed account files is not available.")]
     Remove {
         /// Stable account ID from account list on the selected device.
         account: crate::account::AccountId,
@@ -52,13 +55,15 @@ pub enum AccountCommand {
         #[arg(long, required = true)]
         yes: bool,
     },
-    /// List active accounts and any retained caller account from the selected daemon.
+    /// List active accounts.
+    #[command(after_help = "Includes any retained caller account. Reads from the selected daemon.")]
     List {
         /// Limit rows to claude, codex, or omp; never probe its CLI.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
     },
-    /// Read caller context and configured account plan allowances without probing.
+    /// Read caller context and configured account plan allowances.
+    #[command(after_help = "Probes no provider unless --refresh asks.")]
     Info {
         /// Limit account rows to claude, codex, or omp.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
@@ -266,7 +271,7 @@ mod tests {
     #[test]
     fn account_info_defaults_to_cached_and_refresh_names_one_account() {
         let parsed = Cli::try_parse_from(["cagents", "account", "info", "--json"]).unwrap();
-        assert!(parsed.json);
+        assert!(parsed.global.json);
         assert!(matches!(
             parsed.command,
             TopCommand::Account {

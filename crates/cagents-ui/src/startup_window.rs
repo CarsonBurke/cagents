@@ -256,11 +256,8 @@ impl cosmic::Application for Window {
             }
             body.push(diagnostics.into());
         }
-        let mut open = crate::ui_controls::button::primary(if self.working {
-            "Please wait…"
-        } else {
-            "Open cagents"
-        });
+        let mut open = crate::ui_controls::button::primary("Open cagents")
+            .instead("Please wait…", self.working);
         if !self.working && self.context_ready && self.snapshot.can_open() {
             open = open.on_press(Message::Open);
         }
@@ -280,13 +277,10 @@ impl cosmic::Application for Window {
             widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     design::caption("CAGENTS · UPDATE").into(),
-                    crate::ui_controls::button::secondary(if self.details {
-                        "Hide technical details"
-                    } else {
-                        "Technical details"
-                    })
-                    .on_press(Message::Details)
-                    .into(),
+                    crate::ui_controls::button::secondary("Technical details")
+                        .instead("Hide technical details", self.details)
+                        .on_press(Message::Details)
+                        .into(),
                 ])
                 .spacing(space::S)
                 .align_y(iced::Alignment::Center)

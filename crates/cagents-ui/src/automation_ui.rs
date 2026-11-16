@@ -795,19 +795,18 @@ impl State {
             widget::column::with_children(vec![
                 crate::design::title("Discard automation changes?").into(),
                 crate::design::body("Your unsaved changes will be lost.").into(),
-                widget::row::with_children(vec![
-                    crate::ui_controls::button::secondary("Keep editing")
-                        .id(draft_dialog_focus_id())
-                        .on_press(Action::KeepDraft(*generation))
-                        .into(),
-                    crate::ui_controls::button::destructive("Discard changes")
-                        .on_press(Action::DiscardDraft(*generation))
-                        .into(),
-                ])
-                .spacing(space::S)
-                .into(),
             ])
             .spacing(space::M),
+            widget::row::with_children(vec![
+                crate::ui_controls::button::secondary("Keep editing")
+                    .id(draft_dialog_focus_id())
+                    .on_press(Action::KeepDraft(*generation))
+                    .into(),
+                crate::ui_controls::button::destructive("Discard changes")
+                    .on_press(Action::DiscardDraft(*generation))
+                    .into(),
+            ])
+            .spacing(space::S),
             560.0,
         ))
     }
@@ -2504,28 +2503,33 @@ impl State {
                         content = content.push(
                             widget::row::with_children(vec![
                                 button("Edit", Action::Edit, !busy),
-                                if selected.enabled {
-                                    button("Pause", Action::Pause, !busy)
-                                } else {
-                                    button(
-                                        "Enable…",
-                                        Action::Enable,
-                                        !busy && selected.blocked.is_none(),
-                                    )
-                                },
-                                button(
-                                    if self.manual_requests.get(&selected.id).is_some_and(
-                                        |(revision, _)| *revision == selected.execution_revision,
-                                    ) {
-                                        "Retry run…"
+                                // Pausing, enabling or running relabels its
+                                // button; the buttons after it stay put.
+                                crate::ui_controls::button::secondary("Pause")
+                                    .instead("Enable…", !selected.enabled)
+                                    .on_press_maybe(if selected.enabled {
+                                        (!busy).then_some(Action::Pause)
                                     } else {
-                                        "Run now…"
-                                    },
-                                    Action::RunNow,
-                                    !busy
-                                        && selected.active_firing.is_none()
-                                        && selected.blocked.is_none(),
-                                ),
+                                        (!busy && selected.blocked.is_none())
+                                            .then_some(Action::Enable)
+                                    })
+                                    .into(),
+                                crate::ui_controls::button::secondary("Run now…")
+                                    .instead(
+                                        "Retry run…",
+                                        self.manual_requests.get(&selected.id).is_some_and(
+                                            |(revision, _)| {
+                                                *revision == selected.execution_revision
+                                            },
+                                        ),
+                                    )
+                                    .on_press_maybe(
+                                        (!busy
+                                            && selected.active_firing.is_none()
+                                            && selected.blocked.is_none())
+                                        .then_some(Action::RunNow),
+                                    )
+                                    .into(),
                                 button(
                                     "Remove…",
                                     Action::Remove,

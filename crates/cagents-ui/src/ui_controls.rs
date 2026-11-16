@@ -24,6 +24,7 @@ mod owned;
 mod placeholder;
 mod popover;
 mod pull_request_state;
+mod reserved;
 mod responsive;
 mod shrinkable;
 mod tabs;
@@ -36,7 +37,9 @@ pub(crate) use gauge::activity_animates;
 pub use gauge::{
     activity_spinner, animate_activity, budget_bar, budget_radial, budget_radial_toned,
 };
-pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
+pub use icon::{
+    Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_artwork, provider_icon,
+};
 pub use icon_button::{
     IconButton, control_style, icon_button, outlined_control_style, segmented_controls,
     toolbar_actions,
@@ -54,6 +57,7 @@ pub use pull_request_state::{
     check_state_look, checks_glyph, pull_request_review_glyph, pull_request_state_glyph,
     review_label, review_look,
 };
+pub use reserved::reserved;
 pub use responsive::responsive;
 pub use shrinkable::shrinkable;
 pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};

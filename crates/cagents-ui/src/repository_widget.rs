@@ -3221,13 +3221,23 @@ impl RepositoryRuntime {
         runtime
     }
 
-    /// Whether the comparison on screen has been requested and is loading.
+    /// Whether the comparison on screen has been requested again: from Git,
+    /// or, for one retained only for a restyle, rebuilt from the live buffer,
+    /// which then asks Git nothing. A cancelled or differently styled rebuild
+    /// does not count.
     #[cfg(test)]
     pub(crate) fn requests_shown_diff(&self) -> bool {
         matches!(
             self.diff_state(&self.diff_basis),
             Some(DiffState::Loading { .. })
-        )
+        ) || (self
+            .retained_diff()
+            .is_some_and(|retained| retained.restyle)
+            && (self.working_diff.timer.is_some()
+                || self.working_diff.active.as_ref().is_some_and(|active| {
+                    active.presentation == self.diff_presentation
+                        && !active.cancellation.is_cancelled()
+                })))
     }
 
     /// The same, under a chosen file name.

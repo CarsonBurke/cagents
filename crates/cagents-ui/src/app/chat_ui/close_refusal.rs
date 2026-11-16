@@ -283,14 +283,12 @@ impl Runtime {
         let mut buttons: Vec<Element<'_, Message>> = Vec::new();
         if proved > 0 {
             buttons.push(
-                crate::ui_controls::button::destructive(if refusal.ending {
-                    "Ending\u{2026}".to_owned()
-                } else {
-                    end_label(proved)
-                })
-                .reserve_labels([end_label(proved), "Ending…".to_owned()])
-                .on_press_maybe((!refusal.ending).then(|| action(Action::EndCloseHolders(target))))
-                .into(),
+                crate::ui_controls::button::destructive(end_label(proved))
+                    .instead("Ending…", refusal.ending)
+                    .on_press_maybe(
+                        (!refusal.ending).then(|| action(Action::EndCloseHolders(target))),
+                    )
+                    .into(),
             );
         }
         buttons.push(

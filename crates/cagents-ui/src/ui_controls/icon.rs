@@ -242,24 +242,29 @@ pub fn ceditor_window_icon() -> cosmic::iced::window::Icon {
         .expect("embedded editor icon must contain valid RGBA pixels")
 }
 
+/// A provider's mark as SVG source, and whether it is a symbolic drawing
+/// that takes the surrounding icon colour rather than its own.
+pub fn provider_artwork(provider: crate::agent::Provider) -> (&'static [u8], bool) {
+    use crate::agent::Provider;
+
+    match provider {
+        Provider::Omp => (include_bytes!("../icons/omp.svg"), false),
+        Provider::Claude => (include_bytes!("../icons/claude.svg"), false),
+        Provider::Codex => (include_bytes!("../icons/codex.svg"), true),
+    }
+}
+
 /// Provider identity is shared by terminal and native-chat tab presentations.
 pub fn provider_icon(provider: crate::agent::Provider) -> Handle {
     use crate::agent::Provider;
 
-    static OMP: LazyLock<Handle> = LazyLock::new(|| {
-        icon::from_svg_bytes(include_bytes!("../icons/omp.svg").as_slice()).symbolic(false)
+    static HANDLES: LazyLock<[Handle; Provider::ALL.len()]> = LazyLock::new(|| {
+        Provider::ALL.map(|provider| {
+            let (svg, symbolic) = provider_artwork(provider);
+            icon::from_svg_bytes(svg).symbolic(symbolic)
+        })
     });
-    static CLAUDE: LazyLock<Handle> = LazyLock::new(|| {
-        icon::from_svg_bytes(include_bytes!("../icons/claude.svg").as_slice()).symbolic(false)
-    });
-    static CODEX: LazyLock<Handle> = LazyLock::new(|| {
-        icon::from_svg_bytes(include_bytes!("../icons/codex.svg").as_slice()).symbolic(true)
-    });
-    match provider {
-        Provider::Omp => OMP.clone(),
-        Provider::Claude => CLAUDE.clone(),
-        Provider::Codex => CODEX.clone(),
-    }
+    HANDLES[provider as usize].clone()
 }
 
 #[cfg(test)]

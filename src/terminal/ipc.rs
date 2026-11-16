@@ -263,7 +263,9 @@ use crate::{
 /// Version 186 appends `ChatStartInPane`, which admits a pane's first send by
 /// its stable pane identity before the provider starts, so a second window's
 /// fresh conversation cannot take a pane another window already started.
-pub const PROTOCOL_VERSION: u16 = 186;
+/// Version 187 lets a transcript query's `before` name its entry by the short
+/// cursor `cagents transcript` prints, which a daemon before it cannot match.
+pub const PROTOCOL_VERSION: u16 = 187;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

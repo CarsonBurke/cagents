@@ -139,7 +139,10 @@ impl Application for DaemonStop {
         })
     }
     fn view(&self) -> Element<'_, StopMessage> {
-        widget::container(
+        // The window is small and a failed refresh or stop reports the
+        // daemon's own error, so the explanation scrolls and the actions
+        // stay in reach.
+        widget::container(super::dialog_ui::scrolling_with_actions(
             widget::column::with_children(vec![
                 crate::design::display("Stop daemon?").into(),
                 crate::design::title(format!(
@@ -148,35 +151,32 @@ impl Application for DaemonStop {
                 ))
                 .into(),
                 crate::design::body(&self.detail).into(),
-                super::dialog_ui::confirmation_actions(
-                    crate::ui_controls::button::secondary(if self.settled {
-                        "Close"
-                    } else {
-                        "Cancel"
-                    })
-                    .id(widget::Id::new("daemon-stop.cancel"))
-                    .on_press_maybe((!self.pending).then_some(StopMessage::Cancel)),
-                    widget::row::with_children(vec![
-                        crate::ui_controls::button::secondary("Refresh count")
-                            .on_press_maybe(
-                                (!self.pending
-                                    && self.settled
-                                    && self.failed.load(Ordering::Acquire))
-                                .then_some(StopMessage::Refresh),
-                            )
-                            .into(),
-                        crate::ui_controls::button::destructive("Stop daemon")
-                            .id(widget::Id::new("daemon-stop.confirm"))
-                            .on_press_maybe(
-                                (!self.pending && !self.settled).then_some(StopMessage::Confirm),
-                            )
-                            .into(),
-                    ])
-                    .spacing(space::S),
-                ),
             ])
             .spacing(space::L),
-        )
+            super::dialog_ui::confirmation_actions(
+                crate::ui_controls::button::secondary("Cancel")
+                    .instead("Close", self.settled)
+                    .id(widget::Id::new("daemon-stop.cancel"))
+                    .on_press_maybe((!self.pending).then_some(StopMessage::Cancel)),
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Refresh count")
+                        .on_press_maybe(
+                            (!self.pending && self.settled && self.failed.load(Ordering::Acquire))
+                                .then_some(StopMessage::Refresh),
+                        )
+                        .into(),
+                    crate::ui_controls::button::destructive("Stop daemon")
+                        .id(widget::Id::new("daemon-stop.confirm"))
+                        .on_press_maybe(
+                            (!self.pending && !self.settled).then_some(StopMessage::Confirm),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S),
+            ),
+            Padding::ZERO.bottom(space::L),
+            crate::design::base,
+        ))
         .padding(space::XL)
         .width(Length::Fill)
         .height(Length::Fill)

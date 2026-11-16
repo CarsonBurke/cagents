@@ -129,6 +129,7 @@ JOBS = (
               sources=("scripts/gh-pr-status", "scripts/cargo_artifacts.py")),
         Suite("GitHub request telemetry", "tests/gh-observe.py", sources=("scripts/gh-observe",)),
         Suite("GitHub request coordination", "tests/gh-coordinate.py", sources=("scripts/gh-coordinate.py",)),
+        Suite("pull request landing", "tests/land_pr.py", sources=("scripts/land-pr",)),
     )),
 )
 

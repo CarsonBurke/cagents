@@ -6,8 +6,6 @@
 //! second application, and every dialog that mixed the two had no single
 //! control height to align to.
 
-mod reserved_label;
-
 use std::borrow::Cow;
 
 use cosmic::{
@@ -32,8 +30,11 @@ enum Weight {
 }
 
 pub struct Button<'a, Message> {
-    label: Cow<'a, str>,
-    reserved_labels: Vec<Cow<'a, str>>,
+    /// Every label the button can show, the one it was made with first. It
+    /// keeps the room of the widest, whichever it shows.
+    labels: Vec<Cow<'a, str>>,
+    /// The index in `labels` of the one it shows.
+    shown: usize,
     weight: Weight,
     name: Option<Cow<'a, str>>,
     icon: Option<widget::icon::Handle>,
@@ -65,8 +66,8 @@ pub fn quiet<'a, Message>(label: impl Into<Cow<'a, str>>) -> Button<'a, Message>
 impl<'a, Message> Button<'a, Message> {
     fn new(label: impl Into<Cow<'a, str>>, weight: Weight) -> Self {
         Self {
-            label: label.into(),
-            reserved_labels: Vec::new(),
+            labels: vec![label.into()],
+            shown: 0,
             weight,
             name: None,
             icon: None,
@@ -88,7 +89,7 @@ impl<'a, Message> Button<'a, Message> {
     }
 
     /// The accessible name, where the visible label alone would not say what
-    /// the button acts on. Defaults to the label.
+    /// the button acts on. Defaults to the label it shows.
     pub fn name(mut self, name: impl Into<Cow<'a, str>>) -> Self {
         self.name = Some(name.into());
         self
@@ -100,14 +101,32 @@ impl<'a, Message> Button<'a, Message> {
         self
     }
 
-    /// Keep the footprint of every possible label, measured with the same font
-    /// as the visible label. Include both the idle and busy labels on every
-    /// render so enabled neighboring controls stay in place during an action.
-    pub fn reserve_labels(
+    /// Shows `label` in place of the one the button was made with while
+    /// `shown`: a busy state such as "Saving…", an outcome such as "Retry",
+    /// or the other side of a toggle. Give it on every render, shown or not:
+    /// the button always keeps the room of the widest label it was given, so
+    /// neither it nor the controls beside it move when its label changes.
+    /// Where several are shown, the first wins, as in an `if`/`else if`.
+    ///
+    /// Labels it keeps room for are measured with the visible label's font,
+    /// but never drawn or announced.
+    pub fn instead(mut self, label: impl Into<Cow<'a, str>>, shown: bool) -> Self {
+        if shown && self.shown == 0 {
+            self.shown = self.labels.len();
+        }
+        self.labels.push(label.into());
+        self
+    }
+
+    /// Keeps room for labels shown in this button's place when the choice is
+    /// made elsewhere: a different button swapped into its slot, or a label
+    /// chosen by a model the view only reads. Where the view picks the
+    /// label, [`Self::instead`] says so in one place.
+    pub fn keep_room_for(
         mut self,
         labels: impl IntoIterator<Item = impl Into<Cow<'a, str>>>,
     ) -> Self {
-        self.reserved_labels = labels.into_iter().map(Into::into).collect();
+        self.labels.extend(labels.into_iter().map(Into::into));
         self
     }
 
@@ -126,8 +145,8 @@ impl<'a, Message> Button<'a, Message> {
 impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message> {
     fn from(button: Button<'a, Message>) -> Self {
         let Button {
-            label,
-            reserved_labels,
+            mut labels,
+            shown,
             weight,
             name,
             icon,
@@ -135,13 +154,36 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
             width,
             id,
         } = button;
-        let mut content = widget::row::with_capacity(2)
-            .spacing(space::XS + space::XXS)
-            .align_y(Alignment::Center);
-        if let Some(icon) = icon {
-            content = content.push(widget::icon(icon).size(design::ROW_ICON_SIZE));
-        }
-        content = content.push(reserved_label::view(label.clone(), reserved_labels));
+        // The glyph and label move as one, so they never part. A quiet
+        // button led by a glyph reads as a line of text, such as a
+        // disclosure, so the room kept for a longer label trails it; any
+        // other keeps its content centered.
+        let align = if matches!(weight, Weight::Quiet) && icon.is_some() {
+            iced::alignment::Horizontal::Left
+        } else {
+            iced::alignment::Horizontal::Center
+        };
+        let content = |label: Cow<'a, str>| -> Element<'a, Message> {
+            let mut content = widget::row::with_capacity(2)
+                .spacing(space::XS + space::XXS)
+                .align_y(Alignment::Center);
+            if let Some(icon) = &icon {
+                content = content.push(widget::icon(icon.clone()).size(design::ROW_ICON_SIZE));
+            }
+            content
+                .push(design::heading(label).wrapping(iced::widget::text::Wrapping::None))
+                .into()
+        };
+        let label = labels.swap_remove(shown);
+        let content = if labels.is_empty() {
+            content(label.clone())
+        } else {
+            super::reserved(
+                content(label.clone()),
+                labels.into_iter().map(content),
+                align,
+            )
+        };
         let mut button = widget::button::custom(
             widget::container(content)
                 // COSMIC's transparent container resets the inherited ink.
@@ -280,25 +322,72 @@ fn style(weight: Weight) -> cosmic::theme::Button {
 mod tests {
     use super::*;
 
-    #[test]
-    fn changing_labels_keep_button_and_enabled_neighbor_bounds() {
-        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
-        use cosmic::iced::{Rectangle, Size};
+    /// The button made with `labels[0]`, offering the rest `instead`, while
+    /// it shows `current`.
+    fn showing<'a>(labels: &[&'a str], current: &str) -> Button<'a, ()> {
+        labels[1..]
+            .iter()
+            .fold(primary(labels[0]), |button, label| {
+                button.instead(*label, *label == current)
+            })
+    }
+
+    /// The bounds of a row's children, and the names it announces.
+    fn laid_out_row(
+        row: &mut Element<'_, ()>,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        width: f32,
+    ) -> (Vec<cosmic::iced::Rectangle>, Vec<String>) {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse};
 
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        for labels in [
-            ["Create worktree", "Creating…"],
-            ["Reconnect", "Checking…"],
-            ["Sign in", "Signing in…"],
-            ["Close", "Checking…"],
-            ["End 12 processes and close", "Ending…"],
+        tree.diff(row.as_widget_mut());
+        let node = row.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 80.0)),
+        );
+        let bounds = node.children().iter().map(layout::Node::bounds).collect();
+        let accessible =
+            row.as_widget()
+                .a11y_nodes(Layout::new(&node), tree, mouse::Cursor::Unavailable);
+        let names = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        (bounds, names)
+    }
+
+    /// Whatever label a button shows, it and the enabled control beside it
+    /// keep their bounds, and only the label it shows is announced.
+    #[test]
+    fn changing_labels_keep_button_and_enabled_neighbor_bounds() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let cases: [&[&str]; 7] = [
+            &["Create worktree", "Creating…"],
+            &["Reconnect", "Checking…"],
+            &["Sign in", "Signing in…"],
+            &["Close", "Checking…"],
+            &["End 12 processes and close", "Ending…"],
+            &[
+                "Load more viewed states",
+                "Loading viewed states…",
+                "Retry viewed states",
+            ],
             // Width comes from shaping, not character count.
-            ["WWW", "iiii"],
-        ] {
+            &["WWW", "iiii"],
+        ];
+        for labels in cases {
             let widest = labels
-                .into_iter()
+                .iter()
                 .map(|label| {
-                    let mut plain: Element<'_, ()> = primary(label).into();
+                    let mut plain: Element<'_, ()> = primary(*label).into();
                     let mut tree = Tree::new(plain.as_widget());
                     plain
                         .as_widget_mut()
@@ -313,49 +402,132 @@ mod tests {
                 .fold(0.0, f32::max);
             for width in [320.0, 900.0] {
                 let mut tree = Tree::empty();
-                let mut bounds: Option<Vec<Rectangle>> = None;
+                let mut first = None;
                 for current in labels {
                     let mut row: Element<'_, ()> = widget::row::with_children(vec![
-                        primary(current).reserve_labels(labels).on_press(()).into(),
+                        showing(labels, current).on_press(()).into(),
                         secondary("Cancel").on_press(()).into(),
                     ])
                     .spacing(space::S)
                     .into();
-                    tree.diff(row.as_widget_mut());
-                    let node = row.as_widget_mut().layout(
-                        &mut tree,
-                        &renderer,
-                        &layout::Limits::new(Size::ZERO, Size::new(width, 80.0)),
-                    );
-                    let actual: Vec<_> = node.children().iter().map(layout::Node::bounds).collect();
+                    let (bounds, names) = laid_out_row(&mut row, &mut tree, width);
                     assert_eq!(
-                        actual[0].width, widest,
-                        "{labels:?} must reserve the widest label"
+                        bounds[0].width, widest,
+                        "{labels:?} must keep the widest label's room"
                     );
-                    if let Some(bounds) = &bounds {
-                        assert_eq!(&actual, bounds, "{labels:?} at {width}px");
-                    } else {
-                        bounds = Some(actual);
+                    match &first {
+                        Some(first) => assert_eq!(&bounds, first, "{labels:?} at {width}px"),
+                        None => first = Some(bounds),
                     }
-                    let accessible = row.as_widget().a11y_nodes(
-                        Layout::new(&node),
-                        &tree,
-                        mouse::Cursor::Unavailable,
-                    );
-                    let names: Vec<_> = accessible
-                        .root()
-                        .iter()
-                        .chain(accessible.children())
-                        .filter_map(|node| node.node().label())
-                        .collect();
-                    assert!(names.contains(&current), "{names:?}");
-                    let hidden = labels.into_iter().find(|label| *label != current).unwrap();
-                    assert!(
-                        !names.contains(&hidden),
-                        "alternate label must not be announced: {names:?}"
-                    );
+                    assert!(names.iter().any(|name| name == current), "{names:?}");
+                    for hidden in labels.iter().filter(|label| **label != *current) {
+                        assert!(
+                            !names.iter().any(|name| name == hidden),
+                            "{hidden} must not be announced while {current} shows: {names:?}"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// The first label shown wins, as in an `if`/`else if`; one kept for
+    /// another button takes room but is never shown.
+    #[test]
+    fn the_first_shown_label_wins_and_kept_room_is_never_shown() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let names = |button: Button<'static, ()>| {
+            let mut row: Element<'_, ()> = widget::row::with_children(vec![button.into()]).into();
+            laid_out_row(&mut row, &mut Tree::empty(), 900.0).1
+        };
+        let both = primary("Load more")
+            .instead("Loading…", true)
+            .instead("Retry", true);
+        assert!(names(both).iter().any(|name| name == "Loading…"));
+        let neither = primary("Load more")
+            .instead("Loading…", false)
+            .instead("Retry", false);
+        assert!(names(neither).iter().any(|name| name == "Load more"));
+        let kept = secondary("Check again").keep_room_for(["Restart daemon"]);
+        let shown = names(kept);
+        assert!(shown.iter().any(|name| name == "Check again"), "{shown:?}");
+        assert!(
+            !shown.iter().any(|name| name == "Restart daemon"),
+            "{shown:?}"
+        );
+
+        let mut tree = Tree::empty();
+        let mut kept: Element<'_, ()> = widget::row::with_children(vec![
+            secondary("Check again")
+                .keep_room_for(["Restart daemon"])
+                .into(),
+        ])
+        .into();
+        let mut wide: Element<'_, ()> =
+            widget::row::with_children(vec![destructive("Restart daemon").into()]).into();
+        assert_eq!(
+            laid_out_row(&mut kept, &mut tree, 900.0).0[0].width,
+            laid_out_row(&mut wide, &mut Tree::empty(), 900.0).0[0].width,
+            "the swapped-in button keeps the room of the one it replaces"
+        );
+    }
+
+    /// A glyph and its label stay together whichever label shows. A quiet
+    /// button, such as the "Hide options" disclosure, keeps them at its
+    /// start with the spare room trailing; one with a surface, such as
+    /// Commit sized for "Amend commit", keeps them centered on it.
+    #[test]
+    fn a_shorter_label_stays_beside_its_glyph() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        use cosmic::iced::{Point, Rectangle, Size, Vector};
+
+        fn leaves(node: &layout::Node, origin: Point, found: &mut Vec<Rectangle>) {
+            let bounds = node.bounds() + Vector::new(origin.x, origin.y);
+            if node.children().is_empty() {
+                found.push(bounds);
+            }
+            for child in node.children() {
+                leaves(child, bounds.position(), found);
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        // The button, its glyph and its label.
+        let laid_out = |button: Button<'static, ()>| {
+            let mut element: Element<'_, ()> = button
+                .icon(widget::icon::from_name("pan-down-symbolic"))
+                .on_press(())
+                .into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 80.0)),
+            );
+            let mut found = Vec::new();
+            leaves(&node, Point::ORIGIN, &mut found);
+            let [glyph, label] = found[..] else {
+                panic!("expected a glyph and a label, found {found:?}");
+            };
+            (node.bounds(), glyph, label)
+        };
+        let gap = |glyph: Rectangle, label: Rectangle| label.x - (glyph.x + glyph.width);
+
+        for advanced in [false, true] {
+            let (button, glyph, label) =
+                laid_out(quiet("Base branch & destination").instead("Hide options", advanced));
+            assert_eq!(gap(glyph, label), space::XS + space::XXS);
+            assert_eq!(glyph.x - button.x, space::M, "the quiet glyph leads");
+        }
+        for amend in [false, true] {
+            let (button, glyph, label) = laid_out(primary("Commit").instead("Amend commit", amend));
+            assert_eq!(gap(glyph, label), space::XS + space::XXS);
+            let leading = glyph.x - button.x;
+            let trailing = button.x + button.width - (label.x + label.width);
+            assert!(
+                (leading - trailing).abs() < 1.0,
+                "centered while amend is {amend}: {leading} before, {trailing} after"
+            );
         }
     }
 

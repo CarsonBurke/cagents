@@ -18,8 +18,7 @@ const DEFAULT_WAIT: &str = "90";
 /// A message given as an argument, in a file, or on standard input.
 #[derive(Debug, clap::Args)]
 pub struct MessageArgs {
-    /// The message, which may begin with `-`; a lone `-` reads it from
-    /// standard input.
+    /// The message, which may begin with `-`; a lone `-` reads standard input.
     #[arg(value_name = "MESSAGE", allow_hyphen_values = true)]
     pub(super) text: Option<String>,
     /// Read the message from this file.
@@ -41,8 +40,8 @@ impl MessageArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct SendArgs {
-    /// The session: its ID, lineage or agent ID, or at least four characters
-    /// of one; or `parent`, the session that started this one.
+    /// A session, lineage or agent ID, or at least four characters of one; or
+    /// `parent`, the session that started this one.
     #[arg(value_name = "SESSION")]
     pub(super) to: String,
     #[command(flatten)]
@@ -53,7 +52,8 @@ pub struct SendArgs {
 pub struct AskArgs {
     #[command(flatten)]
     pub(super) send: SendArgs,
-    /// How long to wait for the reply. A later reply arrives as a message.
+    /// How long to wait for the reply, in seconds; a later one arrives as a
+    /// message.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait)]
     timeout: f64,
 }
@@ -163,7 +163,7 @@ pub(super) fn inbox(arguments: InboxArgs) -> Result<CommandOutput, AppError> {
         }
     } else {
         let mut lines: Vec<_> = messages.iter().map(message_lines).collect();
-        lines.push("Answer one with: cagents reply <id> \"…\"".into());
+        lines.push(reply_hint(&super::format::program(), &messages));
         lines.join("\n\n")
     };
     Ok(CommandOutput {
@@ -216,8 +216,11 @@ fn converse(
         None => Err(AppError::new(
             "timeout",
             format!(
-                "{}\nNo reply within {timeout} s. A later reply arrives as a message; read it with `cagents inbox`.",
-                delivery_lines(&handed)
+                "{}\nNo reply within {timeout} s; a later reply arrives as a message.\n{}",
+                delivery_lines(&handed),
+                super::format::hint(&[
+                    (format!("{} inbox", super::format::program()), "reads it",)
+                ])
             ),
         )),
     }
@@ -483,6 +486,21 @@ pub(super) fn read_messages(output: &str) -> Vec<Received> {
         open = true;
     }
     messages
+}
+
+/// How to answer `messages`: the one by its ID, or any of several.
+pub(super) fn reply_step(program: &str, messages: &[Message]) -> (String, &'static str) {
+    match messages {
+        [message] => (
+            format!("{program} reply {} MESSAGE", short(message.id)),
+            "answers it",
+        ),
+        _ => (format!("{program} reply ID MESSAGE"), "answers one"),
+    }
+}
+
+fn reply_hint(program: &str, messages: &[Message]) -> String {
+    super::format::hint(&[reply_step(program, messages)])
 }
 
 /// A message as `inbox`, `ask` and `agent wait` print it.
@@ -1123,9 +1141,16 @@ mod tests {
         let mut answer = message.clone();
         answer.reply_to = Some(crate::model::MessageId::new());
         let printed = [message_lines(&message), message_lines(&answer)].join("\n\n");
-        let read = read_messages(&format!(
-            "{printed}\n\nAnswer one with: cagents reply <id> \"…\""
-        ));
+        let hint = reply_hint("cagents", &[message.clone(), answer.clone()]);
+        assert_eq!(hint, "hint: `cagents reply ID MESSAGE` answers one");
+        assert_eq!(
+            reply_hint("cagents", std::slice::from_ref(&message)),
+            format!(
+                "hint: `cagents reply {} MESSAGE` answers it",
+                short(message.id)
+            )
+        );
+        let read = read_messages(&format!("{printed}\n\n{hint}"));
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].id, short(message.id));
         assert_eq!(read[1].from, message.from.label());

@@ -110,7 +110,7 @@ mod tests {
                 "cagents", "--device", device, "account", "link", provider, home,
             ])
             .unwrap();
-            assert_eq!(cli.device.as_deref(), Some(device));
+            assert_eq!(cli.global.device.as_deref(), Some(device));
             let TopCommand::Account {
                 command: AccountCommand::Link { home: parsed, .. },
             } = cli.command

@@ -230,24 +230,24 @@ impl Cagents {
                     } else {
                         self.dont_ask_again_control(QUESTION, true)
                     },
-                    dialog_ui::confirmation_actions(
-                        crate::ui_controls::button::secondary(if discard_draft {
-                            "Cancel"
-                        } else {
-                            "Keep working"
-                        })
-                        .id(widget::Id::new(CANCEL))
-                        .on_press(Message::CancelChatClose),
-                        crate::ui_controls::button::destructive(if discard_draft {
-                            "Discard"
-                        } else {
-                            "Stop and close"
-                        })
-                        .id(widget::Id::new(CONFIRM))
-                        .on_press(Message::ConfirmChatClose),
-                    ),
                 ])
                 .spacing(space::M),
+                dialog_ui::confirmation_actions(
+                    crate::ui_controls::button::secondary(if discard_draft {
+                        "Cancel"
+                    } else {
+                        "Keep working"
+                    })
+                    .id(widget::Id::new(CANCEL))
+                    .on_press(Message::CancelChatClose),
+                    crate::ui_controls::button::destructive(if discard_draft {
+                        "Discard"
+                    } else {
+                        "Stop and close"
+                    })
+                    .id(widget::Id::new(CONFIRM))
+                    .on_press(Message::ConfirmChatClose),
+                ),
                 560.0,
             ),
             Some(Message::CancelChatClose),

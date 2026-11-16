@@ -2038,16 +2038,16 @@ impl Cagents {
                         ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
                         ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
                     }),
-                    super::dialog_ui::confirmation_actions(
-                        crate::ui_controls::button::secondary("Cancel")
-                            .id(widget::Id::new("dialog.project.remove.cancel"))
-                            .on_press(Message::ProjectUi(Action::Dismiss)),
-                        crate::ui_controls::button::destructive("Remove project")
-                            .id(widget::Id::new("dialog.project.remove.confirm"))
-                            .on_press(Message::ProjectUi(Action::ConfirmRemove)),
-                    ),
                 ])
                 .spacing(space::M),
+                super::dialog_ui::confirmation_actions(
+                    crate::ui_controls::button::secondary("Cancel")
+                        .id(widget::Id::new("dialog.project.remove.cancel"))
+                        .on_press(Message::ProjectUi(Action::Dismiss)),
+                    crate::ui_controls::button::destructive("Remove project")
+                        .id(widget::Id::new("dialog.project.remove.confirm"))
+                        .on_press(Message::ProjectUi(Action::ConfirmRemove)),
+                ),
                 500.0,
             ));
         }
@@ -2079,20 +2079,20 @@ impl Cagents {
             .blocker
             .is_none()
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
-        rows.push(super::dialog_ui::confirmation_actions(
+        let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
                 .on_press(Message::ProjectUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete worktree"
-            })
-            .id(widget::Id::new("dialog.project.confirm"))
-            .on_press_maybe(confirm),
-        ));
+            crate::ui_controls::button::destructive("Delete worktree")
+                .instead("Retry delete", dialog.failure.is_some())
+                .id(widget::Id::new("dialog.project.confirm"))
+                .on_press_maybe(confirm),
+        );
+        // The warning, what else closes and why a delete failed can run
+        // long; they scroll, and the answers stay in reach.
         Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
+            actions,
             480.0,
         ))
     }
@@ -3689,6 +3689,36 @@ mod tests {
         assert!(app.project_ui.is_deleting(linked.id));
         assert_eq!(app.status.as_ref().unwrap().message, notice);
         assert!(row(&app, linked.id).is_some());
+    }
+
+    /// The warning, what else closes and why the last delete failed can run
+    /// long; they scroll, and Cancel and Retry stay in reach at the scaled
+    /// minimum window.
+    #[test]
+    fn worktree_deletion_answers_stay_in_reach_beside_a_long_failure() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/topic"),
+            Some("topic".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        app.project_ui.dialog.as_mut().unwrap().failure = Some(long_message());
+        assert_actions_stay_in_reach(
+            || super::super::dialog_ui::overlay(app.project_dialog_view().unwrap(), None, 1.0),
+            &["dialog.project.close", "dialog.project.confirm"].map(widget::Id::new),
+        );
     }
 
     #[test]

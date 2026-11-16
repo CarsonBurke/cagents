@@ -2463,18 +2463,14 @@ impl State {
         }
         if self.pages.cursor.is_some() {
             status.push(
-                crate::ui_controls::button::quiet(if self.pages.loading {
-                    "Loading viewed states…"
-                } else if self.pages.error.is_some() {
-                    "Retry viewed states"
-                } else {
-                    "Load more viewed states"
-                })
-                .on_press_maybe(
-                    (!self.pages.loading && !modal_open)
-                        .then_some(Action::FilePage(file_pages::PageAction::More)),
-                )
-                .into(),
+                crate::ui_controls::button::quiet("Load more viewed states")
+                    .instead("Loading viewed states…", self.pages.loading)
+                    .instead("Retry viewed states", self.pages.error.is_some())
+                    .on_press_maybe(
+                        (!self.pages.loading && !modal_open)
+                            .then_some(Action::FilePage(file_pages::PageAction::More)),
+                    )
+                    .into(),
             );
         }
         widget::column::with_children(vec![

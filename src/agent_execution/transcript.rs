@@ -33,7 +33,8 @@ pub struct Query {
     /// The session, named as `cagents send` names a recipient: at least four
     /// characters of its session ID, lineage or agent ID, or `parent`.
     pub session: String,
-    /// An entry ID from an earlier page's `earlier`; the page ends just before it.
+    /// Where an earlier page's `earlier` says the conversation goes on, as
+    /// that entry ID or its [`cursor`]; the page ends just before it.
     pub before: Option<String>,
     /// Messages to return; tool calls between them come along.
     pub limit: u16,
@@ -86,6 +87,25 @@ pub enum Content {
     Tool(Tool),
     /// A run of consecutive tool calls, summarized.
     Tools(ToolRun),
+}
+
+/// Hexadecimal digits of a [`cursor`]: unlike a prefix of the provider's
+/// IDs, which share long stems such as `msg_011Ch5`, they tell apart the
+/// entries of any conversation a person could page through.
+const CURSOR_DIGITS: usize = 10;
+
+/// A short, stable name for the entry `id`, accepted as `before` like the ID
+/// itself: the first [`CURSOR_DIGITS`] hexadecimal digits of its SHA-256.
+pub fn cursor(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digits = format!("{:x}", Sha256::digest(id.as_bytes()));
+    digits.truncate(CURSOR_DIGITS);
+    digits
+}
+
+/// Whether `before`, an entry ID or its [`cursor`], names the entry `id`.
+fn names(before: &str, id: &str) -> bool {
+    id == before || (before.len() == CURSOR_DIGITS && cursor(id) == before)
 }
 
 /// Text, possibly clipped.
@@ -363,10 +383,12 @@ impl Builder {
             return false;
         }
         if let Some(cursor) = &self.before {
-            if item.id == *cursor {
-                // Until an older item joins the page, the cursor itself
-                // still marks where the next page begins.
-                self.oldest = self.before.take();
+            if names(cursor, &item.id) {
+                // Until an older item joins the page, the cursor's entry
+                // still marks where the next page begins: by its ID, as
+                // `earlier` always is, whichever name the caller gave.
+                self.oldest = Some(item.id.clone());
+                self.before = None;
             }
             return true;
         }
@@ -720,6 +742,11 @@ mod tests {
         );
         assert_eq!(earlier, None, "the first message starts the conversation");
 
+        // A cursor names the same entry as its ID.
+        let mut short = query(2);
+        short.before = Some(cursor("u2"));
+        assert_eq!(build(&short, &items).0, build(&previous, &items).0);
+
         let mut missing = query(2);
         missing.before = Some("rewritten".into());
         let mut builder = Builder::new(&missing);
@@ -727,6 +754,33 @@ mod tests {
             builder.push(item);
         }
         assert!(builder.finish(true).unwrap_err().contains("rewritten"));
+    }
+
+    #[test]
+    fn a_cursor_is_short_and_tells_apart_ids_that_share_a_stem() {
+        let one = cursor("msg_011Ch5wPqUWsnCetdsGqDMp3:0");
+        let other = cursor("msg_011Ch5yqUxx6BuqNBiK7Bk2L:0");
+        assert_eq!(one.len(), CURSOR_DIGITS);
+        assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(one, other);
+        assert_eq!(one, cursor("msg_011Ch5wPqUWsnCetdsGqDMp3:0"), "stable");
+        assert!(names(&one, "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+        assert!(!names(&one[..8], "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+    }
+
+    #[test]
+    fn a_page_cut_short_at_its_cursor_names_the_entry_by_id() {
+        let items = conversation();
+        let mut query = query(10);
+        query.before = Some(cursor("a1"));
+        let mut builder = Builder::new(&query);
+        // History runs out of reading time right after the cursor's entry.
+        for item in items[7..].iter().rev() {
+            assert!(builder.push(item));
+        }
+        let (entries, earlier) = builder.finish(false).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(earlier.as_deref(), Some("a1"), "never the cursor itself");
     }
 
     #[test]

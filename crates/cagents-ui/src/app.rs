@@ -334,6 +334,8 @@ enum NoticeKey {
     BrowserUnavailable,
     /// Saving the reservation for this already running terminal.
     TerminalSave(CardId, TerminalId),
+    /// Starting or restoring the terminal in this card.
+    TerminalStart(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5615,7 +5617,7 @@ pub struct Cagents {
     worktree_offsets: HashMap<PathBuf, f32>,
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
-    known_worktree_roots: HashSet<PathBuf>,
+    known_worktree_roots: worktree_ui::KnownWorktreeRoots,
     worktree_paths: worktree_ui::WorktreePathIndex,
     /// What the projects list of pull requests, by repository and number,
     /// which every chat labels its pull request links from.
@@ -6273,11 +6275,12 @@ impl Cagents {
                         created = save_failure.is_none();
                         Some(hosted)
                     } else {
-                        client
-                            .list()
-                            .map_err(|error| error.to_string())?
-                            .into_iter()
-                            .find(|hosted| hosted.session.id == session.id)
+                        // Name what the daemon shows about a terminal it no
+                        // longer lists, rather than a reconnect it can't make.
+                        Some(daemon_recovery::hosted_proving_absence(
+                            &session,
+                            &mut client,
+                        )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
                     shared_terminal_attachment(hosted.session, client.proof().clone())
@@ -6488,6 +6491,7 @@ impl Cagents {
         let mut tasks = Vec::new();
         match result {
             Ok(started) => {
+                self.resolve_notice(NoticeKey::TerminalStart(card));
                 let unsaved = started.save_failure.is_some();
                 if let Some(failure) = started.save_failure {
                     self.record_terminal_save_failure(card, failure);
@@ -6594,7 +6598,11 @@ impl Cagents {
             }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
-                self.status = Some(TransientNotice::error(error));
+                let notice = self.missing_terminal_notice(card);
+                self.status = Some(
+                    TransientNotice::error(notice.unwrap_or(error))
+                        .with_key(NoticeKey::TerminalStart(card)),
+                );
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
         }
@@ -9370,7 +9378,7 @@ impl Cagents {
         };
         let succeeded = result.is_ok();
         let result = result.map_err(|message| RuntimeError {
-            code: "runtime_hydration_failed".into(),
+            code: terminal_failure::runtime_error_code(&message, "runtime_hydration_failed").into(),
             message,
         });
         if !self.lifecycle.hydration_finished(card, epoch, result) {
@@ -9399,7 +9407,7 @@ impl Cagents {
         };
         let residency = Residency::Failed {
             typed_error: RuntimeError {
-                code: "runtime_failed".into(),
+                code: terminal_failure::runtime_error_code(&message, "runtime_failed").into(),
                 message,
             },
             retryable: true,
@@ -11415,6 +11423,11 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
+                        pane_inspector::TOGGLE_CLEARANCE
+                    } else {
+                        0.0
+                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -11546,7 +11559,11 @@ impl Cagents {
                                 }
                                 controls
                             } else { vec![
-                                crate::ui_controls::button::primary(retry_label)
+                                (if self.terminal_retry_is_blocked(id) {
+                                    crate::ui_controls::button::secondary(retry_label)
+                                } else {
+                                    crate::ui_controls::button::primary(retry_label)
+                                })
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
                                     // Retry does nothing once Close owns the pane.
@@ -11595,15 +11612,12 @@ impl Cagents {
                             }
                             controls.push(
                                 {
-                                    button(&controls, if closing {
-                                        "Checking…"
-                                    } else {
-                                        "Close"
-                                    })
-                                    .id(card_control_id(id, "failed.close"))
-                                    .name(format!("Close {}", labels.type_label))
-                                    .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
-                                    .into()
+                                    button(&controls, "Close")
+                                        .instead("Checking…", closing)
+                                        .id(card_control_id(id, "failed.close"))
+                                        .name(format!("Close {}", labels.type_label))
+                                        .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
+                                        .into()
                                 },
                             );
                             controls
@@ -13244,6 +13258,7 @@ impl Cagents {
                     key @ (NoticeKey::ChatAttach(card)
                     | NoticeKey::ChatReturn(card)
                     | NoticeKey::ChatClose(card)
+                    | NoticeKey::TerminalStart(card)
                     | NoticeKey::TerminalSave(card, _)),
                 ) if self
                     .card_state(*card)
@@ -19373,12 +19388,11 @@ impl Application for Cagents {
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
                     ])
                     .spacing(space::M),
+                    widget::row::with_children(controls)
+                        .spacing(space::S)
+                        .wrap(),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
@@ -19450,16 +19464,16 @@ impl Application for Cagents {
                              pane widths, and the configured language servers.",
                         ),
                         notice_detail("This cannot be undone."),
-                        dialog_ui::confirmation_actions(
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings),
-                        ),
                     ])
                     .spacing(space::M),
+                    dialog_ui::confirmation_actions(
+                        crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.reset-settings.cancel"))
+                            .on_press(Message::CancelResetSettings),
+                        crate::ui_controls::button::destructive("Reset settings")
+                            .id(widget::Id::new("dialog.reset-settings.confirm"))
+                            .on_press(Message::ConfirmResetSettings),
+                    ),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -19535,28 +19549,26 @@ impl Application for Cagents {
                 );
             }
             controls.push(
-                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
-                    "Overwrite and close"
-                } else if runtime.has_durability_warning() {
-                    "Retry save and close"
-                } else {
-                    "Save and close"
-                })
-                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .on_press_maybe(save_message)
-                .into(),
+                crate::ui_controls::button::primary("Save and close")
+                    .instead("Overwrite and close", runtime.has_save_conflict())
+                    .instead("Retry save and close", runtime.has_durability_warning())
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                    .on_press_maybe(save_message)
+                    .into(),
             );
             let dismiss = controls.remove(0);
-            rows.push(dialog_ui::confirmation_actions(
+            let actions = dialog_ui::confirmation_actions(
                 dismiss,
                 widget::row::with_children(controls).spacing(space::S),
-            ));
-
+            );
+            // A long path or save error scrolls; the answers stay in reach.
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::scrolling_surface_with_actions(
                     widget::container(widget::column::with_children(rows).spacing(space::M))
                         .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    actions,
                     560.0,
+                    dialog_ui::MAX_HEIGHT,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
                 1.0,
@@ -20270,9 +20282,7 @@ fn attach_initial_terminal(
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
-    let terminals = client.list().map_err(|error| error.to_string())?;
-    let session = initial_terminal_attachment(&source, &terminals, &proof)?
-        .ok_or("The recovered daemon no longer holds this terminal. Its saved pane is kept; use Retry explicitly to reconnect or relaunch it")?;
+    let session = initial_terminal_from_daemon(&source, &mut client)?;
     saved_terminal::attach_existing(
         card,
         daemon_recovery::RecoveredTerminal {
@@ -20285,6 +20295,51 @@ fn attach_initial_terminal(
         proof,
         sender,
     )
+}
+
+/// [`initial_terminal_proving_absence`], asked of a connected daemon.
+fn initial_terminal_from_daemon(
+    source: &TerminalSession,
+    client: &mut crate::control::ControlClient,
+) -> Result<TerminalSession, String> {
+    let proof = client.proof().clone();
+    initial_terminal_proving_absence(
+        source,
+        &proof,
+        client,
+        daemon_recovery::list_terminals,
+        daemon_recovery::ensure_admitted,
+    )
+}
+
+/// The terminal an initial pane attaches to. A listing taken while the daemon
+/// is still restoring can be partial, so it can attach to what it lists but
+/// can't show that a terminal is gone: absence is read again after admission
+/// readiness, as a shared pane's open does.
+fn initial_terminal_proving_absence<C>(
+    source: &TerminalSession,
+    proof: &HostSessionProof,
+    client: &mut C,
+    list: impl Fn(&mut C) -> Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>,
+    ready: impl Fn(&mut C) -> Result<(), String>,
+) -> Result<TerminalSession, String> {
+    if let Some(session) = initial_terminal_attachment(source, &list(client)?, proof)? {
+        return Ok(session);
+    }
+    ready(client)?;
+    initial_terminal_or_missing(source, &list(client)?, proof)
+}
+
+/// When its daemon no longer lists an initial pane's terminal, the pane is
+/// kept and the error says what Retry will find.
+fn initial_terminal_or_missing(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<TerminalSession, String> {
+    initial_terminal_attachment(source, terminals, proof)?.ok_or_else(|| {
+        terminal_failure::missing_terminal_message(source, proof, terminals).to_owned()
+    })
 }
 
 fn initial_terminal_attachment(
@@ -22956,6 +23011,13 @@ mod tests {
             app.cards.insert(
                 card,
                 CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
+            );
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(
+                !runtime.requests_shown_diff(),
+                "already requested: {field:?}"
             );
             drop(app.apply_setting_input(field, value.into()));
             let CardRuntime::Repository(runtime) = &app.cards[&card] else {
@@ -31565,7 +31627,7 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
-            known_worktree_roots: HashSet::new(),
+            known_worktree_roots: worktree_ui::KnownWorktreeRoots::default(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
             pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
@@ -34879,7 +34941,15 @@ mod tests {
     #[test]
     fn pull_request_panes_stay_in_the_worktree_where_the_user_opened_them() {
         let (mut app, project) = pull_request_test_app(&[7]);
-        let terminal = |path: &str| {
+        // Restoring a session admits only a worktree whose directory still
+        // exists; a missing one falls back as a removed worktree.
+        let checkouts = tempfile::tempdir().unwrap();
+        let feature_path = checkouts.path().join("feature");
+        let other_path = checkouts.path().join("other");
+        for path in [&feature_path, &other_path] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let terminal = |path: &Path| {
             let mut card = terminal_card_state();
             let CardKind::Terminal(session) = &mut card.kind else {
                 unreachable!();
@@ -34887,27 +34957,24 @@ mod tests {
             session.launch.working_directory = path.into();
             card
         };
-        let feature = terminal("/repo/feature");
-        let other = terminal("/repo/other");
+        let feature = terminal(&feature_path);
+        let other = terminal(&other_path);
         Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()].into();
         let rows = &mut app.sidebar_model.projects[0].worktrees;
-        rows.extend(["/repo/feature", "/repo/other"].map(|path| {
-            SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))
+        rows.extend([&feature_path, &other_path].map(|path| {
+            SidebarWorktree::from_durable(WorktreeId::new(), path.clone(), Some("feature".into()))
         }));
 
-        drop(app.select_worktree("/repo/feature".into(), false));
+        drop(app.select_worktree(feature_path.clone(), false));
         drop(app.update(open_pull_request(project, 7)));
         let review = pull_request_cards(&app)[0].0;
-        assert_eq!(
-            app.durable.card_scopes[&review],
-            PathBuf::from("/repo/feature")
-        );
+        assert_eq!(app.durable.card_scopes[&review], feature_path);
 
-        drop(app.select_worktree("/repo/other".into(), false));
+        drop(app.select_worktree(other_path.clone(), false));
         assert!(app.workspace.card(review).is_none());
         assert_eq!(app.workspace.focused(), Some(other.id));
         // Repository refreshes reselect the active worktree after discovery.
-        drop(app.select_worktree("/repo/other".into(), false));
+        drop(app.select_worktree(other_path.clone(), false));
         app.repository_generations.insert(project, 1);
         let availability = app.github_availability[&project].clone();
         drop(app.update(Message::GitUi(git_ui::Action::Remote {
@@ -34925,10 +34992,7 @@ mod tests {
             other_review, review,
             "explicit opening belongs to this worktree"
         );
-        assert_eq!(
-            app.durable.card_scopes[&other_review],
-            PathBuf::from("/repo/other")
-        );
+        assert_eq!(app.durable.card_scopes[&other_review], other_path);
         drop(app.browse_pull_requests(project));
         assert_eq!(
             pull_request_cards(&app).len(),
@@ -34937,7 +35001,7 @@ mod tests {
         );
 
         // Persisted filing also controls a rebuilt session's strip.
-        Arc::make_mut(&mut app.durable).active_worktree = Some("/repo/feature".into());
+        Arc::make_mut(&mut app.durable).active_worktree = Some(feature_path.clone());
         app.worktree_owners.clear();
         drop(app.restore_worktree_scope());
         assert!(app.workspace.card(review).is_some());

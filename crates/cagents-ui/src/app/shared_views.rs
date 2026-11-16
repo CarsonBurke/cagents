@@ -8820,6 +8820,8 @@ mod tests {
         assert_eq!(app.durable.active_channel, Some(destination));
         assert!(app.workspace.order().next().is_none());
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        // The placeholder is saved with the navigation that opened it.
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         let draft = app.workspace.focused().unwrap();
         app.retain_local_pane(draft);
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
@@ -8973,6 +8975,8 @@ mod tests {
         assert_eq!(app.durable.active_channel, Some(destination));
         assert!(app.workspace.order().next().is_none());
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        // The placeholder is saved with the navigation that opened it.
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         let draft = app.workspace.focused().unwrap();
         app.retain_local_pane(draft);
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {

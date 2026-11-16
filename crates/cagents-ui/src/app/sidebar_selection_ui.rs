@@ -918,13 +918,10 @@ impl Cagents {
         );
         // A short window scrolls the members and notes; Cancel and the
         // deletion stay in reach.
-        Some(crate::interaction::focus_scope(
-            dialog_ui::scrolling_surface_with_actions(
-                widget::column::with_children(rows).spacing(space::M),
-                actions,
-                500.0,
-                640.0,
-            ),
+        Some(dialog_ui::confirmation_surface(
+            widget::column::with_children(rows).spacing(space::M),
+            actions,
+            500.0,
         ))
     }
 }

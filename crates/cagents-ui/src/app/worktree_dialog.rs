@@ -549,19 +549,16 @@ impl Cagents {
                 ),
                 branch_note,
             ),
-            crate::ui_controls::button::quiet(if dialog.advanced {
-                "Hide options"
-            } else {
-                "Base branch & destination"
-            })
-            .icon(if dialog.advanced {
-                Icon::PanDown
-            } else {
-                Icon::PanEnd
-            })
-            .id(widget::Id::new("dialog.worktree.options"))
-            .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
-            .into(),
+            crate::ui_controls::button::quiet("Base branch & destination")
+                .instead("Hide options", dialog.advanced)
+                .icon(if dialog.advanced {
+                    Icon::PanDown
+                } else {
+                    Icon::PanEnd
+                })
+                .id(widget::Id::new("dialog.worktree.options"))
+                .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
+                .into(),
         ];
         if let Some(notice) = &dialog.checkout_notice {
             rows.insert(1, design::caption(notice).into());
@@ -597,14 +594,21 @@ impl Cagents {
                 )),
             ));
         }
+        // An error about the request as a whole leads the body, beside the
+        // Branch field that takes the cursor, so it is in view even when
+        // the open options fill the dialog.
         if let Some(error) = dialog.error.as_ref().filter(|error| error.field.is_none()) {
-            rows.push(
-                widget::selectable_text(error.message.as_str())
-                    .size(design::TEXT_BODY)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
+            rows.insert(
+                1,
+                widget::container(
+                    widget::selectable_text(error.message.as_str())
+                        .size(design::TEXT_BODY)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Text::Custom(design::warning_text)),
+                )
+                .id(widget::Id::new("dialog.worktree.error"))
+                .into(),
             );
         }
         let status: Element<'_, Message> = if dialog.resolving.is_some() {
@@ -619,29 +623,29 @@ impl Cagents {
         } else {
             iced::widget::Space::new().width(Length::Fill).into()
         };
-        rows.push(
-            widget::row::with_children(vec![
-                status,
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("dialog.worktree.cancel"))
-                    .on_press(Message::CancelDialog)
-                    .into(),
-                crate::ui_controls::button::primary(if dialog.resolving.is_some() {
-                    "Creating…"
-                } else {
-                    "Create worktree"
-                })
-                .reserve_labels(["Create worktree", "Creating…"])
+        let actions = widget::row::with_children(vec![
+            status,
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("dialog.worktree.cancel"))
+                .on_press(Message::CancelDialog)
+                .into(),
+            crate::ui_controls::button::primary("Create worktree")
+                .instead("Creating…", dialog.resolving.is_some())
                 .id(widget::Id::new("dialog.worktree.create"))
                 .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
                 .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-        );
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center);
         Some((
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 520.0),
+            // A long Git error scrolls with the fields; Cancel and Create
+            // stay in reach.
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                520.0,
+                dialog_ui::MAX_HEIGHT,
+            ),
             editable.then_some(Message::CancelDialog),
         ))
     }
@@ -1057,6 +1061,59 @@ mod tests {
             },
             captured,
         }
+    }
+
+    /// A long Git error scrolls with the fields; Cancel and Create stay in
+    /// reach at the scaled minimum window, with the options open too.
+    #[test]
+    fn worktree_actions_stay_in_reach_beside_a_long_error() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let Fixture {
+            mut app, _state, ..
+        } = fixture();
+        let dialog = app.worktree_dialog.as_mut().unwrap();
+        dialog.draft.branch = "feature/topic".into();
+        dialog.advanced = true;
+        dialog.error = Some(WorktreeInputError {
+            field: None,
+            message: long_message(),
+        });
+        assert_actions_stay_in_reach(
+            || super::super::dialog_ui::overlay(app.worktree_dialog_view().unwrap().0, None, 1.0),
+            &["dialog.worktree.cancel", "dialog.worktree.create"].map(widget::Id::new),
+        );
+    }
+
+    /// An error about the request as a whole starts in view when the open
+    /// options already fill the dialog, beside the Branch field that takes
+    /// the cursor, rather than below the fold.
+    #[test]
+    fn a_request_error_starts_in_view_with_the_options_open() {
+        use super::super::dialog_ui::tests::{
+            SCALED_MINIMUM_WINDOW, action_geometry, long_message,
+        };
+        let Fixture {
+            mut app, _state, ..
+        } = fixture();
+        let dialog = app.worktree_dialog.as_mut().unwrap();
+        dialog.draft.branch = "feature/topic".into();
+        dialog.advanced = true;
+        dialog.error = Some(WorktreeInputError {
+            field: None,
+            message: long_message(),
+        });
+        let (_, viewport, content, error) = action_geometry(
+            super::super::dialog_ui::overlay(app.worktree_dialog_view().unwrap().0, None, 1.0),
+            SCALED_MINIMUM_WINDOW,
+            &widget::Id::new("dialog.worktree.error"),
+        );
+        assert!(content > viewport.height, "the body scrolls");
+        assert!(error.height > 0.0, "the error is shown");
+        assert!(
+            error.y >= viewport.y
+                && error.y + 2.0 * design::TEXT_BODY <= viewport.y + viewport.height,
+            "the error starts in view: {error:?} in {viewport:?}"
+        );
     }
 
     /// Escape closes the dialog on the first press although its focused

@@ -307,15 +307,12 @@ impl Cagents {
                 .align_y(Alignment::Center);
         if !crate::device::is_remote() {
             row = row.push(
-                crate::ui_controls::button::secondary(if self.daemon_health_ui.restarting {
-                    "Restarting…"
-                } else {
-                    "Restart daemon"
-                })
-                .on_press_maybe(
-                    (!self.daemon_health_ui.restarting && !self.modal_is_open())
-                        .then_some(Message::DaemonHealthUi(Action::Open)),
-                ),
+                crate::ui_controls::button::secondary("Restart daemon")
+                    .instead("Restarting…", self.daemon_health_ui.restarting)
+                    .on_press_maybe(
+                        (!self.daemon_health_ui.restarting && !self.modal_is_open())
+                            .then_some(Message::DaemonHealthUi(Action::Open)),
+                    ),
             );
         }
         widget::container(row)
@@ -360,11 +357,11 @@ impl Cagents {
             rows.push(notice_detail(
                 "Check again to verify the current daemon. Restarting still requires a separate confirmation.",
             ));
-            crate::ui_controls::button::secondary("Check again")
+            crate::ui_controls::button::secondary("Check again").keep_room_for(["Restart daemon"])
         } else {
-            crate::ui_controls::button::destructive("Restart daemon")
+            crate::ui_controls::button::destructive("Restart daemon").keep_room_for(["Check again"])
         };
-        rows.push(dialog_ui::confirmation_actions(
+        let actions = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("daemon-health.cancel"))
                 .on_press_maybe(
@@ -373,9 +370,16 @@ impl Cagents {
             confirm
                 .id(health_action_id(state))
                 .on_press_maybe(available_action.clone().map(Message::DaemonHealthUi)),
-        ));
+        );
+        // The explanation and a long error scroll; Cancel and the restart
+        // stay in reach.
         let overlay = dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 560.0),
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                560.0,
+                dialog_ui::MAX_HEIGHT,
+            ),
             (!state.restarting).then_some(Message::DaemonHealthUi(Action::Cancel)),
             1.0,
         );
@@ -529,6 +533,26 @@ mod tests {
         assert!(app.daemon_health_ui.error.is_some());
         drop(app.update(Message::DaemonHealth(daemon_health::State::Responsive)));
         assert!(!app.daemon_health_ui.confirmation);
+    }
+
+    /// The explanation and a long error scroll; Cancel and the restart stay
+    /// in reach at the scaled minimum window.
+    #[test]
+    fn daemon_restart_actions_stay_in_reach_beside_a_long_error() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(
+            app.update(Message::DaemonHealth(daemon_health::State::Unreachable {
+                since: std::time::SystemTime::UNIX_EPOCH,
+            })),
+        );
+        drop(app.update_daemon_health_ui(Action::Open));
+        app.daemon_health_ui.error = Some(long_message());
+        let confirm = health_action_id(&app.daemon_health_ui);
+        assert_actions_stay_in_reach(
+            || app.daemon_health_dialog().unwrap(),
+            &[widget::Id::new("daemon-health.cancel"), confirm],
+        );
     }
 
     #[test]

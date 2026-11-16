@@ -237,6 +237,150 @@ mod tests {
         );
         assert!(initial_terminal_attachment(&source, &[current.clone(), current], &proof).is_err());
     }
+
+    #[test]
+    fn an_initial_pane_its_daemon_no_longer_lists_says_what_retry_will_find() {
+        let card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(mut source) = card.kind else {
+            unreachable!()
+        };
+        let proof = HostSessionProof {
+            host_session_id: "host".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "replacement".into(),
+        };
+        let code = |source: &TerminalSession| {
+            let message = initial_terminal_or_missing(source, &[], &proof).unwrap_err();
+            terminal_failure::runtime_error_code(&message, "runtime_failed")
+        };
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: "earlier-boot".into(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(code(&source), "terminal_not_hosted");
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(code(&source), "terminal_daemon_restarted");
+    }
+
+    #[test]
+    fn a_startup_listing_alone_does_not_show_that_an_initial_terminal_is_gone() {
+        let card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(source) = card.kind else {
+            unreachable!()
+        };
+        let proof = HostSessionProof {
+            host_session_id: "host".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "replacement".into(),
+        };
+        let mut hosted = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            source.id,
+            source.launch.clone(),
+            source.transcript_path.clone(),
+        );
+        hosted.session = source.clone();
+        hosted.session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        // Each listing hands out the next inventory, or the error it fails
+        // with; the startup state answers in turn.
+        type Listing = Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>;
+        struct Daemon {
+            listings: Vec<Listing>,
+            ready: Result<(), String>,
+            asked_ready: bool,
+        }
+        let attach_source = |source: &TerminalSession, daemon: &mut Daemon| {
+            initial_terminal_proving_absence(
+                source,
+                &proof,
+                daemon,
+                |daemon| daemon.listings.remove(0),
+                |daemon| {
+                    daemon.asked_ready = true;
+                    daemon.ready.clone()
+                },
+            )
+        };
+        let attach = |daemon: &mut Daemon| attach_source(&source, daemon);
+        let restoring = daemon_recovery::admitted(crate::terminal::ipc::StartupState::Restoring {
+            awaiting: 1,
+        });
+
+        // Still restoring: the partial listing yields a pane that says so, not
+        // a claim that the terminal is gone.
+        let mut daemon = Daemon {
+            listings: vec![Ok(Vec::new())],
+            ready: restoring.clone(),
+            asked_ready: false,
+        };
+        let message = attach(&mut daemon).unwrap_err();
+        assert_eq!(
+            terminal_failure::runtime_error_code(&message, "runtime_failed"),
+            "terminals_restoring"
+        );
+
+        // A listing that fails is that failure, and nothing is concluded.
+        let mut daemon = Daemon {
+            listings: vec![Err("connection reset".into())],
+            ready: Ok(()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Err("connection reset".into()));
+        assert!(!daemon.asked_ready);
+        let mut daemon = Daemon {
+            listings: vec![Ok(Vec::new()), Err("connection reset".into())],
+            ready: Ok(()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Err("connection reset".into()));
+        assert!(daemon.asked_ready);
+
+        // Ready, and the terminal was restored meanwhile: it attaches.
+        let mut daemon = Daemon {
+            listings: vec![Ok(Vec::new()), Ok(vec![hosted.clone()])],
+            ready: Ok(()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Ok(hosted.session.clone()));
+
+        // Ready and still absent: the pane says what Retry will find. A pane
+        // with nothing to prove its terminal by finds it no longer running,
+        // and one this boot's daemon started finds its daemon restarted.
+        let absent = |source: &TerminalSession| {
+            let mut daemon = Daemon {
+                listings: vec![Ok(Vec::new()), Ok(Vec::new())],
+                ready: Ok(()),
+                asked_ready: false,
+            };
+            let message = attach_source(source, &mut daemon).unwrap_err();
+            terminal_failure::runtime_error_code(&message, "runtime_failed")
+        };
+        assert_eq!(absent(&source), "terminal_not_hosted");
+        let mut same_boot = source.clone();
+        same_boot.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(absent(&same_boot), "terminal_daemon_restarted");
+
+        // A listed terminal attaches without asking for readiness.
+        let mut daemon = Daemon {
+            listings: vec![Ok(vec![hosted.clone()])],
+            ready: Err("unused".into()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Ok(hosted.session.clone()));
+        assert!(!daemon.asked_ready);
+    }
 }
 
 impl InitialPanes {

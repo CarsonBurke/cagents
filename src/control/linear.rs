@@ -19,12 +19,12 @@ pub struct LinearCommand {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
-    /// Read an issue; --full includes comments, attachments, children, and relations.
+    /// Read an issue.
     Issue {
         #[command(flatten)]
         target: IssueTarget,
         #[arg(long)]
-        #[arg(help = "Include the complete issue, comments, attachments and relations.")]
+        #[arg(help = "Include the complete issue, comments, attachments, children and relations.")]
         full: bool,
     },
     /// Read a page of comments, including Markdown image URLs.
@@ -48,7 +48,7 @@ enum Operation {
         #[command(flatten)]
         page: Page,
     },
-    /// List outgoing relations; --inverse lists incoming relations.
+    /// List an issue's relations, outgoing by default.
     Relations {
         #[command(flatten)]
         target: Target,
@@ -93,10 +93,13 @@ enum Operation {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// Create an issue, or update --id/--current. Names must resolve uniquely.
-    #[command(visible_alias = "save-issue")]
+    /// Create an issue, or update one.
+    #[command(
+        visible_alias = "save-issue",
+        after_help = "--id or --current names the issue to update. Names must resolve uniquely."
+    )]
     Create(Save),
-    /// Update common issue fields; use "none" to clear an optional field.
+    /// Set one common issue field.
     Set {
         #[command(flatten)]
         target: Target,

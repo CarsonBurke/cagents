@@ -44,6 +44,9 @@ use row_interaction::RowInteraction;
 mod attention;
 pub use attention::{State as AttentionState, Summary as AttentionSummary};
 
+mod members;
+pub use members::{MemberState as ChannelMemberState, Members as ChannelMembers};
+
 mod rail;
 
 mod revisioned;
@@ -541,6 +544,10 @@ pub struct SidebarChannel {
     pub attention: AttentionSummary,
     /// Bounded derived context from the shared notification journal.
     pub notification_preview: Option<String>,
+    /// The live agents and plain terminals in the channel, which its glyph
+    /// column draws as the lead's mark and a count. A fixed-size tally, so comparing rows stays
+    /// as cheap as comparing their other fields.
+    pub members: ChannelMembers,
     pub chats: usize,
     pub has_panes: bool,
     /// The creation rank the shared registry assigned. Carried on the row
@@ -562,24 +569,68 @@ impl SidebarChannel {
         &self.tooltip
     }
 
+    #[cfg(test)]
+    pub(crate) fn accessible_name_for_test(&self) -> &str {
+        &self.accessible_name
+    }
+
     pub fn with_attention(mut self, attention: AttentionSummary) -> Self {
         self.attention = attention;
-        let description = attention.description();
-        if !description.is_empty() {
-            self.tooltip = format!("{}\n{description}", self.tooltip).into_boxed_str();
-            self.accessible_name =
-                format!("{}, {description}", self.accessible_name).into_boxed_str();
-        }
+        self.describe();
         self
     }
 
     pub fn with_notification_preview(mut self, preview: Option<String>) -> Self {
-        if let Some(preview) = &preview {
-            self.tooltip = format!("{}\n{preview}", self.tooltip).into_boxed_str();
-            self.accessible_name = format!("{}, {preview}", self.accessible_name).into_boxed_str();
-        }
         self.notification_preview = preview;
+        self.describe();
         self
+    }
+
+    /// The live agents and plain terminals the row's glyph column shows.
+    pub fn with_members(mut self, members: ChannelMembers) -> Self {
+        self.members = members;
+        self.describe();
+        self
+    }
+
+    /// What the row's tooltip and accessible name say, rebuilt from the row's
+    /// own fields whenever one of them is set, so no builder's text depends
+    /// on which ran first.
+    fn describe(&mut self) {
+        let contents = match self.chats {
+            1 => "1 chat".to_owned(),
+            other => format!("{other} chats"),
+        };
+        let mut tooltip = format!("{} · {contents}", self.title);
+        let mut name = format!(
+            "Open channel {}, {contents}{}{}",
+            self.title,
+            if self.has_panes {
+                ""
+            } else {
+                ", no open panes"
+            },
+            if self.unread {
+                ", unread agent update"
+            } else {
+                ""
+            }
+        );
+        let members = self.members.description();
+        let attention = self.attention.description();
+        for part in [Some(members.as_str()), Some(attention.as_str())]
+            .into_iter()
+            .chain(std::iter::once(self.notification_preview.as_deref()))
+            .flatten()
+            .filter(|part| !part.is_empty())
+        {
+            tooltip.push('\n');
+            tooltip.push_str(part);
+            name.push_str(", ");
+            name.push_str(part);
+        }
+        self.tooltip = tooltip.into_boxed_str();
+        self.accessible_name = name.into_boxed_str();
     }
 
     /// What the Attention filter lists a channel for: an unread update, an
@@ -599,17 +650,14 @@ impl SidebarChannel {
         has_panes: bool,
         ordinal: u32,
     ) -> Self {
-        let contents = match chats {
-            1 => "1 chat".to_owned(),
-            other => format!("{other} chats"),
-        };
-        Self {
+        let mut row = Self {
             id,
             selected,
             activity,
             unread,
             attention: AttentionSummary::card(activity, unread, false),
             notification_preview: None,
+            members: ChannelMembers::default(),
             chats,
             has_panes,
             ordinal,
@@ -618,15 +666,12 @@ impl SidebarChannel {
             open_id: entity_id("channel.open", id),
             delete_id: entity_id("channel.delete", id),
             delete_name: format!("Delete channel {title}").into_boxed_str(),
-            accessible_name: format!(
-                "Open channel {title}, {contents}{}{}",
-                if has_panes { "" } else { ", no open panes" },
-                if unread { ", unread agent update" } else { "" }
-            )
-            .into_boxed_str(),
-            tooltip: format!("{title} · {contents}").into_boxed_str(),
+            accessible_name: Box::default(),
+            tooltip: Box::default(),
             title,
-        }
+        };
+        row.describe();
+        row
     }
 }
 
@@ -8316,16 +8361,35 @@ fn channel_view(
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
-    let glyph: Element<'static, SidebarAction> = row_glyph(
-        WorkspaceGlyph::Channel,
-        channel_ink(channel, listing),
-        if compact {
-            rail::CHILD_GLYPH
-        } else {
-            CHILD_ROW_ICON_SIZE
-        },
-    )
-    .into();
+    let ink = channel_ink(channel, listing);
+    // Who is at work stands in for the glyph. A channel on its way out shows
+    // only the muted glyph its label recedes with.
+    let mark = (!deleting)
+        .then(|| {
+            members::view(
+                &channel.members,
+                if compact {
+                    members::Ground::Rail
+                } else {
+                    members::Ground::Row
+                },
+                ink,
+            )
+        })
+        .flatten();
+    let has_members = mark.is_some();
+    let glyph: Element<'static, SidebarAction> = mark.unwrap_or_else(|| {
+        row_glyph(
+            WorkspaceGlyph::Channel,
+            ink,
+            if compact {
+                rail::CHILD_GLYPH
+            } else {
+                CHILD_ROW_ICON_SIZE
+            },
+        )
+        .into()
+    });
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -8338,6 +8402,8 @@ fn channel_view(
         );
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+            // The mark's badge already counts who is there.
+            _ if has_members => attention_indicator(attention),
             _ => channel_indicator(attention, channel.chats),
         };
         grid.content(glyph, Some(label), indicator)
@@ -11794,7 +11860,9 @@ fn changes_footer<'a>(
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        crate::ui_controls::button::primary(commit_label)
+        // Ticking Amend relabels Commit; Push beside it stays put.
+        crate::ui_controls::button::primary("Commit")
+            .instead("Amend commit", state.commit_draft.amend)
             .icon(Icon::Commit)
             .name(format!("{commit_label} (Ctrl+Enter)"))
             .id(chrome.commit_id.clone())
@@ -12285,16 +12353,16 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             design::caption("Discarded work is not recoverable from Git.").into(),
-            crate::app::dialog_ui::confirmation_actions(
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(discard_cancel_id())
-                    .on_press(SidebarAction::CancelDiscard),
-                crate::ui_controls::button::destructive("Discard")
-                    .id(discard_confirm_id())
-                    .on_press(pending.confirm_action()),
-            ),
         ])
         .spacing(space::M),
+        crate::app::dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel")
+                .id(discard_cancel_id())
+                .on_press(SidebarAction::CancelDiscard),
+            crate::ui_controls::button::destructive("Discard")
+                .id(discard_confirm_id())
+                .on_press(pending.confirm_action()),
+        ),
         520.0,
     )
 }
@@ -16122,6 +16190,49 @@ pub(crate) mod tests {
         assert_ne!(initial, reloading, "a change is drawn");
         assert_eq!(reloading, cache.generation(&model, &state));
         assert_eq!(comparisons(), before + 3);
+    }
+
+    /// A channel's mark and count come from its members, so a change in who
+    /// is at work redraws the list, and a refresh that finds the same members
+    /// does not.
+    #[test]
+    fn navigation_cache_redraws_when_a_channels_members_change() {
+        use crate::agent::Provider;
+        let mut project = project();
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "Release prep".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        ));
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let alone = cache.generation(&model, &state);
+
+        let mut members = ChannelMembers::default();
+        members.add_agent(Provider::Claude, ChannelMemberState::Working);
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        let working = cache.generation(&model, &state);
+        assert_ne!(alone, working, "an agent joining is drawn");
+
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        assert_eq!(working, cache.generation(&model, &state));
+
+        members.add_agent(Provider::Codex, ChannelMemberState::Idle);
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        assert_ne!(
+            working,
+            cache.generation(&model, &state),
+            "a second agent is drawn"
+        );
     }
 
     #[test]

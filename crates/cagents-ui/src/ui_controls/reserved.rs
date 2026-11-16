@@ -1,44 +1,40 @@
-//! Measure alternate labels without drawing or announcing them.
-
-use std::borrow::Cow;
+//! Keep the footprint of content that may be swapped for something larger,
+//! without drawing or announcing the alternatives.
 
 use cosmic::iced::advanced::{
     Layout, Widget, layout, renderer,
     widget::{Operation, Tree},
 };
-use cosmic::iced::{Length, Point, Rectangle, Size, mouse};
+use cosmic::iced::{Length, Point, Rectangle, Size, alignment::Horizontal, mouse};
 use cosmic::{Element, Renderer, Theme};
 
-use crate::design;
-
-pub(super) fn view<'a, Message: 'a>(
-    current: Cow<'a, str>,
-    alternatives: Vec<Cow<'a, str>>,
+/// `current`, in a box as large as the largest of it and `alternatives`,
+/// placed horizontally by `align` and centered vertically. Neighbors keep
+/// their place when `current` later becomes one of the alternatives.
+///
+/// For passive content such as labels: `current` is drawn and announced,
+/// but receives no input events, cursor or overlays.
+pub fn reserved<'a, Message: 'a>(
+    current: impl Into<Element<'a, Message>>,
+    alternatives: impl IntoIterator<Item = Element<'a, Message>>,
+    align: Horizontal,
 ) -> Element<'a, Message> {
-    let heading = |label| {
-        design::heading(label)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .into()
-    };
-    if alternatives.is_empty() {
-        heading(current)
-    } else {
-        Element::new(ReservedLabel {
-            labels: std::iter::once(current)
-                .chain(alternatives)
-                .map(heading)
-                .collect(),
-        })
-    }
+    Element::new(Reserved {
+        labels: std::iter::once(current.into())
+            .chain(alternatives)
+            .collect(),
+        align,
+    })
 }
 
-struct ReservedLabel<'a, Message> {
+struct Reserved<'a, Message> {
     // Only the first label is visible and accessible. The others participate
     // in layout with their own cached text state, never as transparent text.
     labels: Vec<Element<'a, Message>>,
+    align: Horizontal,
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for ReservedLabel<'_, Message> {
+impl<Message> Widget<Message, Theme, Renderer> for Reserved<'_, Message> {
     fn children(&self) -> Vec<Tree> {
         self.labels.iter().map(Tree::new).collect()
     }
@@ -67,20 +63,24 @@ impl<Message> Widget<Message, Theme, Renderer> for ReservedLabel<'_, Message> {
                     .layout(state, renderer, &limits.loose())
             })
             .collect();
-        let width = nodes
-            .iter()
-            .map(|node| node.size().width)
-            .fold(0.0, f32::max);
+        let largest = nodes.iter().fold(Size::ZERO, |largest, node| {
+            Size::new(
+                largest.width.max(node.size().width),
+                largest.height.max(node.size().height),
+            )
+        });
         let mut current = nodes
             .into_iter()
             .next()
             .expect("the current label is present");
-        let size = limits.resolve(
-            Length::Shrink,
-            Length::Shrink,
-            Size::new(width, current.size().height),
-        );
-        current.move_to_mut(Point::new((size.width - current.size().width) / 2.0, 0.0));
+        let size = limits.resolve(Length::Shrink, Length::Shrink, largest);
+        let room = size.width - current.size().width;
+        let x = match self.align {
+            Horizontal::Left => 0.0,
+            Horizontal::Center => room / 2.0,
+            Horizontal::Right => room,
+        };
+        current.move_to_mut(Point::new(x, (size.height - current.size().height) / 2.0));
         layout::Node::with_children(size, vec![current])
     }
 

@@ -437,10 +437,22 @@ mod tests {
                 agents: vec!["a".into(), "b".into()]
             }))
         );
-        assert_eq!(
-            parse("cagents --json terminal list", None),
-            Some(Kind::Act(Act::Cli("terminal list".into())))
-        );
+        // Global options read the same before or after the subcommand.
+        for line in [
+            "cagents --json terminal list",
+            "cagents terminal --json list",
+            "cagents terminal list --json --no-start",
+        ] {
+            assert_eq!(
+                parse(line, None),
+                Some(Kind::Act(Act::Cli("terminal list".into()))),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            parse("cagents agent spawn Review --json", None),
+            Some(Kind::Spawn(_))
+        ));
         assert_eq!(
             parse("cagents linear issue CAG-12 --full", None),
             Some(Kind::Act(Act::Linear {
@@ -657,7 +669,7 @@ mod tests {
         assert_eq!(accepted.run.unwrap().agent, "1a2b3c4d");
         let waited = super::outcome(
             &spawn,
-            "agent 1a2b3c4d (codex) run 5e6f7a8b Succeeded\n\nAll green.\n\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi",
+            "agent 1a2b3c4d (codex) run 5e6f7a8b Succeeded\n\nAll green.\n\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nhint: `cagents reply ab12 MESSAGE` answers it; `cagents agent wait 1a2b3c4d` waits again",
         );
         let run = waited.run.unwrap();
         assert_eq!(run.provider, "codex");
@@ -669,7 +681,7 @@ mod tests {
         // A wait that messages ended before the run answered has no result.
         let interrupted = super::outcome(
             &spawn,
-            "agent 1a2b3c4d (codex) run 5e6f7a8b Running\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nAnswer one with: cagents reply <id> \"…\"",
+            "agent 1a2b3c4d (codex) run 5e6f7a8b Waiting\nhint: `cagents agent requests 1a2b3c4d` lists what it asks\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nhint: `cagents reply ab12 MESSAGE` answers it; `cagents agent wait 1a2b3c4d` waits again",
         );
         assert_eq!(interrupted.run.unwrap().result, "");
         assert_eq!(interrupted.messages[0].body, "hi");

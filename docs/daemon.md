@@ -107,7 +107,7 @@ cagents daemon stop --confirm
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
 | `sessions [--project PATH \| --all \| --channel [CHANNEL]]` (alias `ls`), `whoami` | List live agent sessions in this project or everyone in a channel, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
-| `transcript SESSION [-n N] [--before ID] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
+| `transcript SESSION [-n N] [--before CURSOR] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
 | `work [--project PATH \| --all] [--column COLUMN] [--limit N] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show the worktrees and branches in progress in this project, or every open project with `--all`, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 
@@ -169,7 +169,10 @@ validated running owner. While that owner's protocol is incompatible, ordinary
 CLI commands and desktop launches use its matching executables. Compatible
 candidates can attach to the preserved daemon, so reviewed reopening adopts the
 new UI without replacing a compatible daemon. The application handoff remains a
-separate reviewed operation, including its save checks.
+separate reviewed operation, including its save checks. `--select VERSION
+--stage-only` withdraws or restores a staged build under the same checks; it
+keeps the recorded owner, so re-selecting restores the same routing (see
+[Installation](installation.md#withdraw-or-re-select-a-staged-build)).
 
 If that incompatible daemon crashes while its old UI survives, the public
 launcher verifies each window's exact kernel flock, process lifetime and matched

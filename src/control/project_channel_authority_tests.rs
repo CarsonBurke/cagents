@@ -410,7 +410,7 @@ fn public_user_open_and_spawn_preserve_folder_identity_order_and_readiness_polic
                 let context = ProjectChannelContext {
                     authority: Authority::default(),
                     remote,
-                    no_start: cli.no_start,
+                    no_start: cli.global.no_start,
                 };
                 let existing = Cell::new(0);
                 let ready = Cell::new(0);
