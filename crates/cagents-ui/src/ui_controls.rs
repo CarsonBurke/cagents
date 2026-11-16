@@ -24,6 +24,7 @@ mod owned;
 mod placeholder;
 mod popover;
 mod pull_request_state;
+mod reserved;
 mod responsive;
 mod shrinkable;
 mod tabs;
@@ -56,6 +57,7 @@ pub use pull_request_state::{
     check_state_look, checks_glyph, pull_request_review_glyph, pull_request_state_glyph,
     review_label, review_look,
 };
+pub use reserved::reserved;
 pub use responsive::responsive;
 pub use shrinkable::shrinkable;
 pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};

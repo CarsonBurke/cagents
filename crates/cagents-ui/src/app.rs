@@ -22988,6 +22988,13 @@ mod tests {
                 card,
                 CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
             );
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(
+                !runtime.requests_shown_diff(),
+                "already requested: {field:?}"
+            );
             drop(app.apply_setting_input(field, value.into()));
             let CardRuntime::Repository(runtime) = &app.cards[&card] else {
                 unreachable!()
@@ -34910,7 +34917,15 @@ mod tests {
     #[test]
     fn pull_request_panes_stay_in_the_worktree_where_the_user_opened_them() {
         let (mut app, project) = pull_request_test_app(&[7]);
-        let terminal = |path: &str| {
+        // Restoring a session admits only a worktree whose directory still
+        // exists; a missing one falls back as a removed worktree.
+        let checkouts = tempfile::tempdir().unwrap();
+        let feature_path = checkouts.path().join("feature");
+        let other_path = checkouts.path().join("other");
+        for path in [&feature_path, &other_path] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let terminal = |path: &Path| {
             let mut card = terminal_card_state();
             let CardKind::Terminal(session) = &mut card.kind else {
                 unreachable!();
@@ -34918,27 +34933,24 @@ mod tests {
             session.launch.working_directory = path.into();
             card
         };
-        let feature = terminal("/repo/feature");
-        let other = terminal("/repo/other");
+        let feature = terminal(&feature_path);
+        let other = terminal(&other_path);
         Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()].into();
         let rows = &mut app.sidebar_model.projects[0].worktrees;
-        rows.extend(["/repo/feature", "/repo/other"].map(|path| {
-            SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))
+        rows.extend([&feature_path, &other_path].map(|path| {
+            SidebarWorktree::from_durable(WorktreeId::new(), path.clone(), Some("feature".into()))
         }));
 
-        drop(app.select_worktree("/repo/feature".into(), false));
+        drop(app.select_worktree(feature_path.clone(), false));
         drop(app.update(open_pull_request(project, 7)));
         let review = pull_request_cards(&app)[0].0;
-        assert_eq!(
-            app.durable.card_scopes[&review],
-            PathBuf::from("/repo/feature")
-        );
+        assert_eq!(app.durable.card_scopes[&review], feature_path);
 
-        drop(app.select_worktree("/repo/other".into(), false));
+        drop(app.select_worktree(other_path.clone(), false));
         assert!(app.workspace.card(review).is_none());
         assert_eq!(app.workspace.focused(), Some(other.id));
         // Repository refreshes reselect the active worktree after discovery.
-        drop(app.select_worktree("/repo/other".into(), false));
+        drop(app.select_worktree(other_path.clone(), false));
         app.repository_generations.insert(project, 1);
         let availability = app.github_availability[&project].clone();
         drop(app.update(Message::GitUi(git_ui::Action::Remote {
@@ -34956,10 +34968,7 @@ mod tests {
             other_review, review,
             "explicit opening belongs to this worktree"
         );
-        assert_eq!(
-            app.durable.card_scopes[&other_review],
-            PathBuf::from("/repo/other")
-        );
+        assert_eq!(app.durable.card_scopes[&other_review], other_path);
         drop(app.browse_pull_requests(project));
         assert_eq!(
             pull_request_cards(&app).len(),
@@ -34968,7 +34977,7 @@ mod tests {
         );
 
         // Persisted filing also controls a rebuilt session's strip.
-        Arc::make_mut(&mut app.durable).active_worktree = Some("/repo/feature".into());
+        Arc::make_mut(&mut app.durable).active_worktree = Some(feature_path.clone());
         app.worktree_owners.clear();
         drop(app.restore_worktree_scope());
         assert!(app.workspace.card(review).is_some());

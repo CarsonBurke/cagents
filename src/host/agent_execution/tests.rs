@@ -3180,6 +3180,57 @@ fn unavailable_console_keeps_failed_idle_provider_bound_and_explicitly_closeable
 }
 
 #[test]
+fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
+    if isolated_with_console_cli(
+        "failed_console_publication_retires_terminal_and_retains_idle_provider",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let cli = path.parent().unwrap().join("console/cagents");
+    std::fs::write(&cli, "#!/bin/sh\nexec cat >/dev/null\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.surface = Surface::Terminal;
+    request.prompt = "must not send".into();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .refuse_agent_console_for_test()
+        .unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Failed, "{run:?}");
+    assert!(
+        run.result
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("injected console publication failure"),
+        "{run:?}"
+    );
+    let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+    assert!(agent.session.is_some());
+    assert!(agent.console.is_none());
+    assert!(!agent.closed);
+    assert!(
+        host.lock().unwrap().terminals.is_empty(),
+        "the unpublished console terminal is retired"
+    );
+    assert!(!path.parent().unwrap().join("prompts").exists());
+    assert!(
+        close(&host, &Authority::default(), agent.id)
+            .unwrap()
+            .closed
+    );
+}
+
+#[test]
 fn rejected_pre_spawn_launch_clears_private_intent_and_can_be_closed() {
     if isolated("rejected_pre_spawn_launch_clears_private_intent_and_can_be_closed").is_some() {
         return;

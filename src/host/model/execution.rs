@@ -2807,6 +2807,22 @@ pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, S
 }
 
 #[cfg(test)]
+impl Registry {
+    /// Refuse binding a console to any agent on this connection only. A
+    /// trigger in the main schema would change the published layout, so the
+    /// registry would refuse every earlier write before the console binding.
+    pub(in crate::host) fn refuse_agent_console_for_test(&self) -> Result<(), String> {
+        self.db
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_console BEFORE UPDATE OF record ON main.agents
+                 WHEN json_extract(NEW.record, '$.console') IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'injected console publication failure'); END;",
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::MessageHandoff;
     use super::*;
