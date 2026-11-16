@@ -704,7 +704,11 @@ impl ViewportUpdate {
 /// different content after a peer inserts, resizes, or reorders panes.
 #[derive(Debug, Clone)]
 pub struct ViewportAnchor {
+    /// The leftmost visible pane at its reading position.
     position: Option<ViewportPoint>,
+    /// The selected pane, when it begins inside the viewport. It is where the
+    /// reader types, so it keeps its place before the reading edge does.
+    selection: Option<ViewportPoint>,
     destination: Option<ViewportPoint>,
     destination_reveals_focus: bool,
     camera: Camera,
@@ -747,7 +751,9 @@ impl ViewportPoint {
         Some(
             if card.start == self.card.start && card.end == self.card.end {
                 self.offset
-            } else if card.width() == self.card.width() {
+            } else if card.width() == self.card.width() || self.fraction < 0.0 {
+                // A pane that begins inside the viewport keeps its on-screen
+                // start; scaling a negative fraction would move it away.
                 self.offset + (card.start - self.card.start)
             } else {
                 card.start + self.fraction * card.width()
@@ -1401,14 +1407,19 @@ impl Workspace {
             })
             .flatten();
         ViewportAnchor {
-            // With several panes in view, the selected one is where the
-            // reader types, so it keeps its place before any other pane.
             position: ViewportPoint::capture(
                 self.presentation_geometry(),
                 self.camera.offset(),
                 self.viewport_width,
-                self.focused,
+                None,
             ),
+            selection: ViewportPoint::capture(
+                self.presentation_geometry(),
+                self.camera.offset(),
+                self.viewport_width,
+                self.focused,
+            )
+            .filter(|point| Some(point.card.id) == self.focused && point.fraction < 0.0),
             destination,
             destination_reveals_focus: destination
                 .is_some_and(|point| Some(point.card.id) == self.focused),
@@ -1442,9 +1453,21 @@ impl Workspace {
                     fallback.jump_to(target);
                 }
             }
-            let position = anchor
-                .position
-                .and_then(|point| point.resolve(&self.geometry));
+            let selection = anchor
+                .selection
+                .filter(|point| Some(point.card.id) == self.focused)
+                .and_then(|point| {
+                    // The selection stays wholly in view if it grew past the
+                    // viewport's edge.
+                    let offset = point.resolve(&self.geometry)?;
+                    self.geometry
+                        .focus_offset(point.card.id, self.viewport_width, offset)
+                });
+            let position = selection.or_else(|| {
+                anchor
+                    .position
+                    .and_then(|point| point.resolve(&self.geometry))
+            });
             let destination = anchor.destination.and_then(|point| {
                 let target = point.resolve(&self.geometry)?;
                 if anchor.destination_reveals_focus {
@@ -2180,6 +2203,51 @@ mod tests {
             workspace.visibility(selected),
             Some(VisibilityClass::Visible)
         );
+    }
+
+    #[test]
+    fn a_resized_selection_beside_the_reading_edge_stays_fully_in_view() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 1100.0);
+        let selected = workspace.order().nth(1).unwrap();
+        workspace.focus(selected).unwrap();
+        while workspace.camera().is_animating() {
+            workspace.tick(Duration::from_millis(16));
+        }
+        workspace.take_widget_focus_request();
+        let before = workspace.geometry().card(selected).unwrap();
+        let on_screen = before.start - workspace.camera().offset();
+        assert!(on_screen > 0.0, "the selection is not the leftmost pane");
+        let anchor = workspace.capture_viewport_anchor();
+        // A peer widens the selection; scaling its negative fraction would
+        // move the camera far left and leave the selection offscreen.
+        workspace
+            .set_card_width(selected, CardWidth::Fixed(900.0))
+            .unwrap();
+
+        workspace.restore_viewport_anchor(anchor);
+        let after = workspace.geometry().card(selected).unwrap();
+        assert_eq!(after.width(), 900.0);
+        let offset = workspace.camera().offset();
+        assert!(after.start >= offset && after.end <= offset + 1100.0);
+        assert_eq!(workspace.focused(), Some(selected));
+        assert_eq!(workspace.pending_widget_focus, None);
+
+        // Narrowing it keeps its on-screen start.
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 1100.0);
+        let selected = workspace.order().nth(1).unwrap();
+        workspace.focus(selected).unwrap();
+        while workspace.camera().is_animating() {
+            workspace.tick(Duration::from_millis(16));
+        }
+        let before = workspace.geometry().card(selected).unwrap();
+        let on_screen = before.start - workspace.camera().offset();
+        let anchor = workspace.capture_viewport_anchor();
+        workspace
+            .set_card_width(selected, CardWidth::Fixed(480.0))
+            .unwrap();
+        workspace.restore_viewport_anchor(anchor);
+        let after = workspace.geometry().card(selected).unwrap();
+        assert_eq!(after.start - workspace.camera().offset(), on_screen);
     }
 
     #[test]
