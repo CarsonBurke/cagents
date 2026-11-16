@@ -163,7 +163,7 @@ pub(super) fn inbox(arguments: InboxArgs) -> Result<CommandOutput, AppError> {
         }
     } else {
         let mut lines: Vec<_> = messages.iter().map(message_lines).collect();
-        lines.push("Answer one with: cagents reply <id> \"…\"".into());
+        lines.push(reply_hint(&super::format::program(), &messages));
         lines.join("\n\n")
     };
     Ok(CommandOutput {
@@ -483,6 +483,21 @@ pub(super) fn read_messages(output: &str) -> Vec<Received> {
         open = true;
     }
     messages
+}
+
+/// How to answer `messages`: the one by its ID, or any of several.
+pub(super) fn reply_step(program: &str, messages: &[Message]) -> (String, &'static str) {
+    match messages {
+        [message] => (
+            format!("{program} reply {} MESSAGE", short(message.id)),
+            "answers it",
+        ),
+        _ => (format!("{program} reply ID MESSAGE"), "answers one"),
+    }
+}
+
+fn reply_hint(program: &str, messages: &[Message]) -> String {
+    super::format::hint(&[reply_step(program, messages)])
 }
 
 /// A message as `inbox`, `ask` and `agent wait` print it.
@@ -1123,9 +1138,16 @@ mod tests {
         let mut answer = message.clone();
         answer.reply_to = Some(crate::model::MessageId::new());
         let printed = [message_lines(&message), message_lines(&answer)].join("\n\n");
-        let read = read_messages(&format!(
-            "{printed}\n\nAnswer one with: cagents reply <id> \"…\""
-        ));
+        let hint = reply_hint("cagents", &[message.clone(), answer.clone()]);
+        assert_eq!(hint, "hint: `cagents reply ID MESSAGE` answers one");
+        assert_eq!(
+            reply_hint("cagents", std::slice::from_ref(&message)),
+            format!(
+                "hint: `cagents reply {} MESSAGE` answers it",
+                short(message.id)
+            )
+        );
+        let read = read_messages(&format!("{printed}\n\n{hint}"));
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].id, short(message.id));
         assert_eq!(read[1].from, message.from.label());
