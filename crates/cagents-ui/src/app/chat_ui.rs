@@ -9416,11 +9416,11 @@ impl Cagents {
         }
         let offered = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
+                // A paste or attachment still arriving only disables Fresh in
+                // place (see `stopped`); withdrawing the offer would swap the
+                // primary button for Close under the pointer.
                 runtime.offers_fresh_conversation()
                     && self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Chat(current) if current == &runtime.session || current == &runtime.return_session()))
-                    && runtime.pending.is_none()
-                    && runtime.attachment_chooser_pending.is_none()
-                    && runtime.pastes_pending == 0
             }
             _ => self.chat_retry_blocked(card) || self.chat_ui.fresh_offers.contains(&card),
         };

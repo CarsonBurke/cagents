@@ -1050,3 +1050,59 @@ fn a_failed_empty_pane_does_not_invite_a_first_message() {
         "an empty healthy pane still invites one"
     );
 }
+
+/// A saved conversation that couldn't reopen says its draft is kept, so its
+/// Close asks before discarding typed text, as a blocked first message does.
+#[test]
+fn closing_a_blocked_saved_conversation_asks_before_discarding_its_draft() {
+    let (mut app, card) = blocked_app(true, true, true);
+    assert!(!chat_runtime(&app, card).is_draft());
+    drop(app.update(Message::CloseCard(card)));
+    assert!(app.chat_close_dialog_visible());
+    let (tree, mut cancel) = frame(app.chat_close_dialog(), 900.0, Some("Cancel"));
+    assert!(labels(&tree).contains(&"Discard this message?"));
+    drop(app.update(cancel.pop().unwrap()));
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(
+        chat_runtime(&app, card).composer.text(),
+        "Keep this unsent note."
+    );
+
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::new());
+    assert_eq!(
+        app.blocked_draft_discard(card),
+        None,
+        "nothing typed, nothing to ask"
+    );
+}
+
+/// A paste still arriving disables Fresh where it is, rather than withdrawing
+/// it and moving Close under the pointer.
+#[test]
+fn a_pending_paste_disables_fresh_in_place() {
+    let (mut app, card) = blocked_app(true, true, true);
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().pastes_pending = 1;
+    assert!(app.chat_offers_fresh_conversation(card));
+    let stopped = chat_runtime(&app, card).stopped(false, false);
+    assert!(matches!(
+        stopped.primary,
+        Some((
+            "Start a new conversation",
+            stopped::Press::StartFresh,
+            false
+        ))
+    ));
+    assert!(matches!(
+        stopped.secondary,
+        Some(("Close", stopped::Press::Close, true))
+    ));
+    drop(app.handle_chat_ui(Action::StartFresh(card)));
+    assert!(
+        app.chat_ui.phases.get(&card).is_none(),
+        "nothing closes mid-paste"
+    );
+}

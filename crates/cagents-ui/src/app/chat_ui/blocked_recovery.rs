@@ -20,8 +20,9 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
         };
-        (runtime.is_draft()
-            && runtime.start_retry_blocked
+        // Every blocked surface says the draft is kept, and nothing restores
+        // it once its card closes: a reopened conversation gets a new card.
+        (runtime.start_retry_blocked
             && (!runtime.composer.text().trim().is_empty() || !runtime.attachments.is_empty()))
         .then_some(runtime.session.id)
     }
@@ -73,6 +74,15 @@ impl Cagents {
 
     pub(super) fn begin_fresh_conversation(&mut self, card: CardId) -> Task<Message> {
         if !self.chat_offers_fresh_conversation(card) {
+            return Task::none();
+        }
+        // The draft Fresh keeps must be complete: its button is disabled
+        // until a pending send, paste or attachment settles.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+            && (runtime.pending.is_some()
+                || runtime.attachment_chooser_pending.is_some()
+                || runtime.pastes_pending > 0)
+        {
             return Task::none();
         }
         let Some(CardKind::Chat(requested)) = self.card_state(card).map(|state| &state.kind) else {
