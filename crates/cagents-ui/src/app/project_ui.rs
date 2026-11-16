@@ -709,7 +709,7 @@ impl Cagents {
             .project(project)
             .map_or("This project", |row| row.name.as_str());
         TransientNotice::warning(format!(
-            "{name} was closed in another window. Save or discard the changes in its open files to finish closing it here."
+            "{name} was closed in another window. Save or discard the changes in its open files, or resolve their file warnings, to finish closing it here."
         ))
     }
 
