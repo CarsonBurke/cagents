@@ -1136,11 +1136,14 @@ impl Cagents {
                 // the process in the way. Any other error stays out of the pane.
                 let readable =
                     super::daemon_recovery::is_retry_refusal(&refusal).then(|| refusal.clone());
-                // A daemon still restoring is what the pane now says, whatever
-                // it said before: the failure this press recorded already does.
-                let restoring = refusal == TERMINALS_RESTORING;
-                if restoring || is_missing_terminal(prior.code) {
-                    if !restoring {
+                // When the pane explains what this press found, such as a
+                // daemon still restoring, that is what it now says, whatever it
+                // said before. Otherwise a missing terminal it explained before
+                // still applies. An earlier explanation of restoring never
+                // outlives the press: by then the daemon answered something else.
+                let explained = pane_explains(details.code);
+                if explained || is_missing_terminal(prior.code) {
+                    if !explained {
                         // The refusal doesn't change what the pane knew about
                         // this terminal, so it keeps saying so.
                         details.code = prior.code;
@@ -1665,6 +1668,45 @@ mod tests {
                 app.status.as_ref().unwrap().message,
                 format!("{pane}: Retry didn't start anything. {}", details.message)
             );
+        }
+    }
+    /// Once restoring has finished, a press can be refused for another reason.
+    /// The pane then says that, not that terminals are still being restored.
+    #[test]
+    fn a_refusal_after_restoring_finished_replaces_the_restoring_explanation() {
+        let sentence = "sleep (PID 42) is still running, so nothing was started.";
+        for (refusal, readable) in [
+            (sentence, Some(sentence)),
+            ("daemon ownership changed during recovery", None),
+        ] {
+            let (mut app, card, _) = app_and_session();
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("old-host"),
+                boot_id: crate::model::BootId::new("old-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("old"),
+            };
+            let terminal = session.id;
+            app.fail_runtime(card, TERMINALS_RESTORING.into());
+            drop(app.retry_card(card));
+            let operation = app.terminal_failure.attempts[&card].operation;
+            drop(app.update_terminal_failure(Action::RetryFinished {
+                card,
+                operation,
+                terminal,
+                result: Err(refusal.into()),
+            }));
+            let details = app.terminal_details(card).unwrap();
+            assert_ne!(details.code, "terminals_restoring", "after {refusal}");
+            assert!(
+                !details.copy_text().contains("still being restored")
+                    && !details.copy_text().contains("restoring"),
+                "after {refusal}: {}",
+                details.copy_text()
+            );
+            assert_eq!(details.retry_refusal.as_deref(), readable);
         }
     }
     #[test]
