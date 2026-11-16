@@ -46,13 +46,8 @@ USAGE, FAILED = 2, 125
 # What uv says when the network is disabled and its cache lacks the package.
 COLD_CACHE = ("the network was disabled", "not found in the cache")
 
-# Reads {"encoding": NAME, "texts": [...]} and prints the token count of each text.
-COUNTER = r"""
-import json, sys, tiktoken
-request = json.load(sys.stdin)
-encoding = tiktoken.get_encoding(request["encoding"])
-print(json.dumps([len(encoding.encode_ordinary(text)) for text in request["texts"]]))
-"""
+# uv runs this script again in this mode, inside the environment that has tiktoken.
+COUNTER = "--count-request"
 
 
 class CountFailed(Exception):
@@ -85,8 +80,10 @@ def count_with_uv(encoding, texts):
     if uv is None:
         raise CountFailed("tiktoken is not importable and uv is not on PATH; install uv or tiktoken")
     request = json.dumps({"encoding": encoding, "texts": texts})
-    base = [uv, "run", "--quiet", "--no-project", "--with", f"tiktoken=={TIKTOKEN_VERSION}",
-            "python3", "-I", "-c", COUNTER]
+    # The environment is built on the same interpreter as every script here,
+    # and uv runs this file in it as a script.
+    base = [uv, "run", "--quiet", "--no-project", "--python", sys.executable,
+            "--with", f"tiktoken=={TIKTOKEN_VERSION}", "--script", str(Path(__file__).resolve()), COUNTER]
     # Offline, so a warm cache never touches the network; online only to fill a cold one.
     for command in ([*base[:2], "--offline", *base[2:]], base):
         result = subprocess.run(command, input=request, capture_output=True, text=True,
@@ -192,6 +189,15 @@ def parse(arguments):
     return options, command
 
 
+def count_request():
+    """Read {"encoding": NAME, "texts": [...]} and print the token count of each text."""
+    import tiktoken
+    request = json.load(sys.stdin)
+    encoding = tiktoken.get_encoding(request["encoding"])
+    print(json.dumps([len(encoding.encode_ordinary(text)) for text in request["texts"]]))
+    return 0
+
+
 def main(arguments=None):
     options, command = parse(sys.argv[1:] if arguments is None else arguments)
     status = None
@@ -218,4 +224,4 @@ def main(arguments=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(count_request() if sys.argv[1:] == [COUNTER] else main())

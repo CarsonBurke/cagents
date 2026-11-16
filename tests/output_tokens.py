@@ -40,7 +40,9 @@ if os.environ.get("FAIL_ALWAYS"):
     print("    encoding = tiktoken.get_encoding(request['encoding'])", file=sys.stderr)
     print("ValueError: Unknown encoding bogus.", file=sys.stderr)
     sys.exit(1)
-assert sys.argv[sys.argv.index("-c") + 1].strip().startswith("import json, sys, tiktoken")
+script = sys.argv[sys.argv.index("--script") + 1]
+assert sys.argv[sys.argv.index("--python") + 1] == {sys.executable!r}
+assert script.endswith("scripts/output-tokens") and sys.argv[-1] == "--count-request", sys.argv
 print(json.dumps([len(text.split()) for text in request["texts"]]))
 '''
 

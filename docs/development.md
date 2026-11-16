@@ -1624,8 +1624,8 @@ agent's, so compare outputs under one encoding rather than reading the numbers
 as a bill; `--encoding cl100k_base` selects another. It imports tiktoken when
 the current Python has it, and otherwise runs `uv run --offline` with the
 pinned tiktoken, going online only when uv's cache lacks it. The first use
-downloads what is missing: the package (and a Python, if uv has none) into uv's
-cache, and the vocabulary into `TIKTOKEN_CACHE_DIR` (default
+downloads what is missing: the package into uv's cache, for an environment
+built on `/usr/bin/python3`, and the vocabulary into `TIKTOKEN_CACHE_DIR` (default
 `~/.cache/tiktoken`), where tiktoken checks its hash. Later counts need no
 network or API key.
 
