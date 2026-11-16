@@ -91,7 +91,7 @@ print(json.dumps({"ok": True, "data": {
     "snapshot": {"pull_request": pr, "checks_state": answer.get("ci", "SUCCESS"), "checks": checks,
                  "checks_complete": answer.get("complete", True),
                  "transport": answer.get("transport", "graphql")},
-    "fetched_at": int(time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
+    "fetched_at": int(os.environ.get("FAKE_STATUS_NOW") or time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
     "error": None, "limitations": answer.get("data_limitations", [])},
     "limitations": answer.get("limitations", [])}))
 '''
@@ -198,13 +198,18 @@ class LandTests(unittest.TestCase):
         self.assertIn("landed #7", self.output)
 
     def test_waits_through_pending_and_unknown_checks(self):
+        # One clock for the fake's reads and land-pr's waits, so each wait is
+        # measured from the read it follows, however slowly the fake answers.
+        now = 1_800_000_000
+        self.enterContext(patch.dict(os.environ, {"FAKE_STATUS_NOW": str(now)}))
+        self.enterContext(patch.object(land.time, "time", lambda: now))
         self.status({"ci": "PENDING"}, {"ci": None, "limitations": ["CI unknown"]},
                     {"ci": "SUCCESS", "checks": [{"__typename": "CheckRun", "name": "a",
                                                   "status": "IN_PROGRESS", "conclusion": None}]},
                     {"ci": "SUCCESS"})
         self.assertEqual(self.run_land(), 0, self.output)
         self.assertEqual(len(self.sleeps), 3)
-        self.assertTrue(all(seconds >= land.REFRESH for seconds in self.sleeps), self.sleeps)
+        self.assertEqual(self.sleeps, [land.REFRESH + 1] * 3)
 
     def test_ci_failure_names_the_check_and_does_not_merge(self):
         self.status({"ci": "FAILURE", "checks": [{"__typename": "CheckRun", "name": "contracts",
