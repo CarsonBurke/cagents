@@ -1,5 +1,7 @@
 //! Plain tables for interactive CLI output; JSON uses explicit command DTOs.
-use unicode_width::UnicodeWidthStr;
+use std::path::Path;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(super) fn plain(text: &str) -> String {
     text.chars()
@@ -12,25 +14,75 @@ pub(super) fn table<const N: usize>(
     rows: Vec<[String; N]>,
     empty: &str,
 ) -> String {
+    render(&headers, rows.into_iter().map(Vec::from).collect(), empty)
+}
+
+/// A [`table`] without the columns no row has a value for, so a fact every
+/// row lacks costs no space.
+pub(super) fn sparse_table<const N: usize>(
+    headers: [&str; N],
+    rows: Vec<[String; N]>,
+    empty: &str,
+) -> String {
+    let kept = columns_in_use(&rows);
+    table_of(headers, rows, kept, empty)
+}
+
+/// Which of `rows`' columns any row has a value for. A value of `-` counts
+/// as none. Tables of one listing that share these keep the same columns.
+pub(super) fn columns_in_use<const N: usize>(rows: &[[String; N]]) -> [bool; N] {
+    std::array::from_fn(|index| {
+        rows.iter()
+            .any(|row| !row[index].is_empty() && row[index] != "-")
+    })
+}
+
+/// A [`table`] of only the columns `kept` marks.
+pub(super) fn table_of<const N: usize>(
+    headers: [&str; N],
+    rows: Vec<[String; N]>,
+    kept: [bool; N],
+    empty: &str,
+) -> String {
+    let pick = |row: [String; N]| -> Vec<String> {
+        row.into_iter()
+            .zip(kept)
+            .filter_map(|(value, kept)| kept.then_some(value))
+            .collect()
+    };
+    render(
+        &pick(headers.map(str::to_owned))
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        rows.into_iter().map(pick).collect(),
+        empty,
+    )
+}
+
+fn render(headers: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
     if rows.is_empty() {
         return empty.into();
     }
+    let columns = headers.len();
     let rows = rows
         .into_iter()
-        .map(|row| row.map(|value| plain(&value)))
+        .map(|row| row.iter().map(|value| plain(value)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    let widths: [usize; N] = std::array::from_fn(|index| {
-        rows.iter()
-            .map(|row| row[index].as_str().width())
-            .max()
-            .unwrap_or(0)
-            .max(headers[index].width())
-    });
-    let line = |row: &[String; N]| {
+    let widths: Vec<usize> = (0..columns)
+        .map(|index| {
+            rows.iter()
+                .map(|row| row[index].as_str().width())
+                .max()
+                .unwrap_or(0)
+                .max(headers[index].width())
+        })
+        .collect();
+    let line = |row: &[String]| {
         row.iter()
             .enumerate()
             .map(|(index, value)| {
-                if index + 1 == N {
+                if index + 1 == columns {
                     value.clone()
                 } else {
                     format!(
@@ -40,12 +92,111 @@ pub(super) fn table<const N: usize>(
                 }
             })
             .collect::<String>()
+            .trim_end()
+            .to_owned()
     };
-    let titles = std::array::from_fn(|index| headers[index].to_owned());
+    let titles: Vec<String> = headers.iter().map(|&header| header.to_owned()).collect();
     std::iter::once(line(&titles))
-        .chain(rows.iter().map(line))
+        .chain(rows.iter().map(|row| line(row)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The fewest characters a listed ID is shown by. Eight hexadecimal digits
+/// keep a prefix unique among the few hundred sessions and agents one
+/// daemon hosts, and every command that takes an ID accepts a prefix.
+pub(super) const MIN_ABBREVIATION: usize = 8;
+
+/// The shortest prefix length, at least [`MIN_ABBREVIATION`], that tells
+/// every one of `ids` apart, as Git abbreviates object names. One length
+/// serves a whole listing, so its ID column stays aligned. A prefix never
+/// ends at a UUID's hyphen.
+pub(super) fn abbreviation<'a>(ids: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut ids: Vec<&str> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let longest = ids.iter().map(|id| id.len()).max().unwrap_or(0);
+    let mut length = MIN_ABBREVIATION;
+    while length < longest
+        && (ids
+            .windows(2)
+            .any(|pair| prefix(pair[0], length) == prefix(pair[1], length))
+            || ids.iter().any(|id| prefix(id, length).ends_with('-')))
+    {
+        length += 1;
+    }
+    length
+}
+
+/// `id` cut to `length` characters, whole when it is no longer.
+pub(super) fn prefix(id: &str, length: usize) -> &str {
+    id.char_indices()
+        .nth(length)
+        .map_or(id, |(end, _)| &id[..end])
+}
+
+/// `text` in at most `width` columns, ending in an ellipsis when cut.
+pub(super) fn clip(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut clipped = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let size = character.width().unwrap_or(0);
+        if used + size + 1 > width {
+            break;
+        }
+        used += size;
+        clipped.push(character);
+    }
+    clipped.truncate(clipped.trim_end().len());
+    clipped.push('…');
+    clipped
+}
+
+/// `path` as a listing scoped to the checkout at `root` shows it: relative
+/// to that root, `.` for the root itself, and otherwise with the home
+/// directory shortened to `~`.
+pub(super) fn location(path: &Path, root: Option<&Path>) -> String {
+    location_in(
+        path,
+        root,
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn location_in(path: &Path, root: Option<&Path>, home: Option<&Path>) -> String {
+    if let Some(relative) = root.and_then(|root| path.strip_prefix(root).ok()) {
+        return if relative.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            relative.display().to_string()
+        };
+    }
+    match home
+        .filter(|home| home.is_absolute())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(relative) if !relative.as_os_str().is_empty() => {
+            format!("~/{}", relative.display())
+        }
+        _ => path.display().to_string(),
+    }
+}
+
+/// A listing's next steps, each a runnable command and what it does, in the
+/// one line every command ends its output with: "hint: `cagents …` does this;
+/// `cagents …` that". Empty when there are none.
+pub(super) fn hint<S: AsRef<str>>(steps: &[(S, &str)]) -> String {
+    if steps.is_empty() {
+        return String::new();
+    }
+    let steps = steps
+        .iter()
+        .map(|(command, does)| format!("`{}` {does}", command.as_ref()))
+        .collect::<Vec<_>>();
+    format!("hint: {}", steps.join("; "))
 }
 
 /// A byte count in the largest binary unit that keeps it at least one.
@@ -132,5 +283,80 @@ mod tests {
         let output = table(["NAME"], vec![["name\n\t\u{1b}end".into()]], "No accounts");
         assert_eq!(output, "NAME\nname   end");
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn listed_ids_are_the_shortest_prefixes_that_tell_them_apart() {
+        let a = "9f005968-f150-4c49-b1aa-c5431bab72f8";
+        let b = "a669dbd8-ae3c-496e-96c8-0a9e2dca8d16";
+        assert_eq!(abbreviation([a, b]), MIN_ABBREVIATION);
+        assert_eq!(prefix(a, abbreviation([a, b])), "9f005968");
+        // A repeated ID is one ID.
+        assert_eq!(abbreviation([a, a]), MIN_ABBREVIATION);
+        // Sharing the first eight digits, a prefix runs past the hyphen.
+        let c = "9f005968-f1aa-4000-8000-000000000000";
+        assert_eq!(prefix(a, abbreviation([a, c])), "9f005968-f15");
+        let d = "9f005968-0000-4000-8000-000000000000";
+        assert_eq!(prefix(a, abbreviation([a, d])), "9f005968-f");
+        assert_eq!(abbreviation(std::iter::empty()), MIN_ABBREVIATION);
+        assert_eq!(prefix("system", MIN_ABBREVIATION), "system");
+        assert_eq!(prefix("界界界", 2), "界界");
+    }
+
+    #[test]
+    fn clipped_text_fits_its_width_and_says_it_was_cut() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("exactly10!", 10), "exactly10!");
+        assert_eq!(clip("one two three", 9), "one two…");
+        assert_eq!(clip("界界界界", 5), "界界…");
+    }
+
+    #[test]
+    fn locations_are_relative_to_the_listed_checkout_or_home() {
+        let home = Some(Path::new("/home/me"));
+        let root = Some(Path::new("/home/me/repo"));
+        let at = |path: &str, root| location_in(Path::new(path), root, home);
+        assert_eq!(at("/home/me/repo", root), ".");
+        assert_eq!(at("/home/me/repo/.worktrees/fix", root), ".worktrees/fix");
+        assert_eq!(at("/home/me/repository", root), "~/repository");
+        assert_eq!(at("/home/me/other", None), "~/other");
+        assert_eq!(at("/home/me", None), "/home/me");
+        assert_eq!(at("/var/tmp/linked", root), "/var/tmp/linked");
+        assert_eq!(
+            location_in(Path::new("/srv/x"), None, Some(Path::new("relative"))),
+            "/srv/x"
+        );
+    }
+
+    #[test]
+    fn hints_are_runnable_commands_in_one_line() {
+        assert_eq!(hint::<&str>(&[]), "");
+        assert_eq!(
+            hint(&[
+                ("cagents transcript SESSION", "reads one"),
+                ("cagents ls --all", "lists every project"),
+            ]),
+            "hint: `cagents transcript SESSION` reads one; `cagents ls --all` lists every project"
+        );
+    }
+
+    #[test]
+    fn sparse_tables_drop_columns_no_row_has() {
+        assert_eq!(
+            sparse_table(
+                ["A", "B", "C"],
+                vec![
+                    ["1".into(), "-".into(), "x".into()],
+                    ["2".into(), String::new(), "y".into()],
+                ],
+                "None"
+            ),
+            "A  C\n1  x\n2  y"
+        );
+        assert_eq!(sparse_table(["A"], vec![], "None"), "None");
+        assert_eq!(
+            columns_in_use(&[["a".into(), "-".into()], [String::new(), "b".into()]]),
+            [true, true]
+        );
     }
 }
