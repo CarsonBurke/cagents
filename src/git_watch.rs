@@ -390,6 +390,11 @@ pub struct Change {
     pub membership: bool,
     pub error: Option<String>,
     pub coverage: Option<bool>,
+    /// With `coverage: Some(false)`, whether registering the same plan again
+    /// may restore coverage: a native registration failed or the backend
+    /// reported a fault. A plan that asks to be polled or exceeds the watch
+    /// budget stays uncovered however often it is registered.
+    pub recoverable: bool,
 }
 
 impl Change {
@@ -401,6 +406,7 @@ impl Change {
         self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
             self.coverage = Some(coverage);
+            self.recoverable = other.recoverable;
             if coverage {
                 self.error = None;
             }
@@ -418,7 +424,8 @@ struct Pending {
     changes: BTreeMap<ProjectId, Change>,
     faulted: bool,
     // Only desired recursive roots are retained, never an unbounded list of
-    // failed descendants. Unknown quota errors stay degraded until removal.
+    // failed descendants. A quota error no recursive root accounts for leaves
+    // coverage unknown until the next registration rearms every watch.
     recursive: BTreeMap<PathBuf, BTreeSet<ProjectId>>,
     quota_rearm: BTreeSet<PathBuf>,
     quota_unknown: BTreeSet<ProjectId>,
@@ -490,6 +497,7 @@ impl Pending {
                     membership: true,
                     error: Some(error.to_string()),
                     coverage: Some(false),
+                    recoverable: true,
                     ..Change::default()
                 }),
             };
@@ -511,12 +519,14 @@ impl Pending {
             .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
             .map(|(path, _)| (path.clone(), owners.get(path).cloned().unwrap_or_default()))
             .collect();
-        self.quota_unknown
-            .retain(|id| self.projects.contains_key(id));
         self.quota_rearm
             .retain(|path| self.recursive.contains_key(path));
+        // Which watches an unattributed quota error cost is unknown, so the
+        // next registration rebuilds them all, metadata first, rather than
+        // leaving every project polled until it is closed.
+        let unknown = !std::mem::take(&mut self.quota_unknown).is_empty();
         Rearm {
-            all: std::mem::take(&mut self.faulted),
+            all: std::mem::take(&mut self.faulted) || unknown,
             recursive: std::mem::take(&mut self.quota_rearm),
         }
     }
@@ -785,6 +795,7 @@ impl Monitor {
                 };
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
+                let mut unadmitted = BTreeSet::new();
                 while requests.recv().is_ok() {
                     let projects = {
                         let configuration = desired_configuration
@@ -828,6 +839,9 @@ impl Monitor {
                         owners,
                         mut failures,
                     } = Registrations::within(&projects, MAX_DIRECTORIES);
+                    // The plan's own refusals: registering it again cannot
+                    // cover these projects.
+                    let planned = failures.keys().copied().collect::<BTreeSet<_>>();
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
@@ -850,6 +864,7 @@ impl Monitor {
                         Ok(watcher) => reconcile(
                             watcher,
                             &mut registered,
+                            &mut unadmitted,
                             &desired,
                             &metadata,
                             &owners,
@@ -889,6 +904,7 @@ impl Monitor {
                         pending.changes.entry(id).or_default().merge(Change {
                             worktrees,
                             coverage: Some(coverage),
+                            recoverable: !coverage && !planned.contains(&id),
                             error: failures.remove(&id),
                             ..Change::default()
                         });
@@ -925,9 +941,14 @@ impl Monitor {
     }
 }
 
+/// `unadmitted` holds the metadata paths that did not fit even after every
+/// content watch was evicted for them, across registrations. Evicting again
+/// for one would only churn every content watch and rescan its projects, so
+/// later passes just retry the watch until a full rearm.
 fn reconcile(
     watcher: &mut impl Watcher,
     registered: &mut BTreeMap<PathBuf, (RecursiveMode, u64, u64)>,
+    unadmitted: &mut BTreeSet<PathBuf>,
     desired: &BTreeMap<PathBuf, RecursiveMode>,
     metadata: &BTreeSet<PathBuf>,
     owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
@@ -935,6 +956,11 @@ fn reconcile(
     failures: &mut BTreeMap<ProjectId, String>,
 ) -> BTreeSet<ProjectId> {
     let mut rearmed = BTreeSet::new();
+    if rearm.all {
+        unadmitted.clear();
+    } else {
+        unadmitted.retain(|path| metadata.contains(path));
+    }
     registered.retain(|path, (mode, device, inode)| {
         if !rearm.all
             && !rearm.recursive.contains(path)
@@ -958,12 +984,13 @@ fn reconcile(
         if registered.contains_key(path) {
             continue;
         }
-        let mut result = watcher.watch(path, mode);
-        if metadata.contains(path)
-            && result
+        let quota = |result: &notify::Result<()>| {
+            result
                 .as_ref()
                 .is_err_and(|error| matches!(error.kind, notify::ErrorKind::MaxFilesWatch))
-        {
+        };
+        let mut result = watcher.watch(path, mode);
+        if metadata.contains(path) && !unadmitted.contains(path) && quota(&result) {
             // Existing content may occupy all native capacity when a new
             // project's metadata arrives. Only quota refusal can preempt it;
             // every evicted path is admitted again in the content pass below.
@@ -978,6 +1005,9 @@ fn reconcile(
                     registered.remove(&path);
                 }
                 result = watcher.watch(path, mode);
+                if quota(&result) {
+                    unadmitted.insert(path.clone());
+                }
             }
         }
         let result = result.and_then(|()| {
@@ -992,6 +1022,7 @@ fn reconcile(
         });
         match result {
             Ok(()) => {
+                unadmitted.remove(path);
                 if let Some(ids) = owners.get(path) {
                     rearmed.extend(ids);
                 }
@@ -1675,6 +1706,8 @@ mod tests {
         removals: Vec<PathBuf>,
         fail: BTreeSet<PathBuf>,
         remove_after_watch: Option<PathBuf>,
+        /// The coordinator's memory of metadata eviction could not admit.
+        unadmitted: BTreeSet<PathBuf>,
     }
 
     impl Watcher for LimitedWatcher {
@@ -1756,15 +1789,18 @@ mod tests {
     ) -> BTreeMap<ProjectId, String> {
         let rearm = pending.rearm(desired, owners);
         let mut failures = BTreeMap::new();
+        let mut unadmitted = std::mem::take(&mut watcher.unadmitted);
         reconcile(
             watcher,
             registered,
+            &mut unadmitted,
             desired,
             metadata,
             owners,
             &rearm,
             &mut failures,
         );
+        watcher.unadmitted = unadmitted;
         pending.retain_failures(&mut failures);
         failures
     }
@@ -1801,6 +1837,7 @@ mod tests {
         reconcile(
             &mut watcher,
             &mut registered,
+            &mut BTreeSet::new(),
             &plan.desired,
             &plan.metadata,
             &plan.owners,
@@ -1910,6 +1947,99 @@ mod tests {
     }
 
     #[test]
+    fn metadata_that_eviction_cannot_admit_stops_evicting_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = directory.path().join("a-content");
+        let metadata_path = directory.path().join("z-metadata");
+        for p in [&content, &metadata_path] {
+            std::fs::create_dir(p).unwrap();
+        }
+        let id = ProjectId::new();
+        let desired = BTreeMap::from([
+            (content.clone(), RecursiveMode::NonRecursive),
+            (metadata_path.clone(), RecursiveMode::Recursive),
+        ]);
+        let metadata = BTreeSet::from([metadata_path.clone()]);
+        let owners = desired
+            .keys()
+            .map(|p| (p.clone(), BTreeSet::from([id])))
+            .collect::<BTreeMap<_, _>>();
+        // The metadata root's subtree exceeds the quota however much content
+        // yields, as when other processes hold most of the inotify limit.
+        let mut watcher = LimitedWatcher {
+            capacity: 2,
+            fail: BTreeSet::from([metadata_path.clone()]),
+            ..Default::default()
+        };
+        let mut registered = BTreeMap::new();
+        let mut pending = Pending::default();
+        // Nothing is registered to evict yet; content then fills capacity.
+        let first = registered_transition(
+            &mut pending,
+            &mut watcher,
+            &mut registered,
+            &desired,
+            &metadata,
+            &owners,
+        );
+        assert!(first.contains_key(&id));
+        assert!(registered.contains_key(&content));
+        assert!(watcher.unadmitted.is_empty());
+        // The retry evicts content once; the metadata still does not fit.
+        watcher.removals.clear();
+        let second = registered_transition(
+            &mut pending,
+            &mut watcher,
+            &mut registered,
+            &desired,
+            &metadata,
+            &owners,
+        );
+        assert!(second.contains_key(&id));
+        assert!(watcher.removals.contains(&content));
+        assert!(
+            registered.contains_key(&content),
+            "content is admitted again"
+        );
+        assert_eq!(watcher.unadmitted, BTreeSet::from([metadata_path.clone()]));
+        for _ in 0..3 {
+            watcher.removals.clear();
+            watcher.attempts.clear();
+            let failures = registered_transition(
+                &mut pending,
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &metadata,
+                &owners,
+            );
+            assert!(failures.contains_key(&id), "the metadata stays uncovered");
+            assert_eq!(
+                watcher.attempts,
+                vec![metadata_path.clone()],
+                "a retry tries the metadata once and leaves content registered"
+            );
+            assert!(!watcher.removals.contains(&content));
+            assert!(registered.contains_key(&content));
+        }
+        // Once the watch fits, the memory is settled.
+        watcher.fail.clear();
+        watcher.capacity = 3;
+        assert!(
+            registered_transition(
+                &mut pending,
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &metadata,
+                &owners
+            )
+            .is_empty()
+        );
+        assert!(watcher.unadmitted.is_empty());
+    }
+
+    #[test]
     fn recursive_quota_rearm_preserves_unrelated_watches_and_newer_faults() {
         let directory = tempfile::tempdir().unwrap();
         let project = Arc::new(project(directory.path()));
@@ -1989,6 +2119,7 @@ mod tests {
         reconcile(
             &mut watcher,
             &mut registered,
+            &mut BTreeSet::new(),
             &desired,
             &metadata,
             &owners,
@@ -2134,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_quota_error_keeps_coverage_degraded_without_discarding_healthy_watches() {
+    fn unknown_quota_error_rebuilds_every_watch_on_the_next_registration() {
         let directory = tempfile::tempdir().unwrap();
         let project = Arc::new(project(directory.path()));
         let id = project.id;
@@ -2166,50 +2297,48 @@ mod tests {
             notify::Error::new(notify::ErrorKind::MaxFilesWatch)
                 .add_path(directory.path().join("unknown")),
         ] {
-            pending.event(Err(error));
-            assert!(
-                registered_transition(
-                    &mut pending,
-                    &mut watcher,
-                    &mut registered,
-                    &desired,
-                    &metadata,
-                    &owners
-                )
-                .contains_key(&id)
-            );
-            assert!(watcher.removals.is_empty() && registered.contains_key(&path));
-        }
-        assert_eq!(pending.quota_unknown, BTreeSet::from([id]));
-        for _ in 0..3 {
-            assert!(
-                registered_transition(
-                    &mut pending,
-                    &mut watcher,
-                    &mut registered,
-                    &desired,
-                    &metadata,
-                    &owners
-                )
-                .contains_key(&id),
-                "cached success alone cannot clear unknown quota coverage"
-            );
-        }
-        assert!(watcher.removals.is_empty());
-        pending.projects.clear();
-        assert!(
-            registered_transition(
-                &mut pending,
+            // An unattributed fault arriving while registration runs without
+            // the Pending lock keeps that pass from claiming coverage.
+            let rearm = pending.rearm(&desired, &owners);
+            let mut failures = BTreeMap::new();
+            reconcile(
                 &mut watcher,
                 &mut registered,
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-                &BTreeMap::new()
-            )
-            .is_empty()
-        );
-        assert!(pending.quota_unknown.is_empty() && registered.is_empty());
-        pending.projects.insert(id, project);
+                &mut BTreeSet::new(),
+                &desired,
+                &metadata,
+                &owners,
+                &rearm,
+                &mut failures,
+            );
+            pending.event(Err(error));
+            pending.retain_failures(&mut failures);
+            assert!(failures.contains_key(&id));
+            assert_eq!(pending.quota_unknown, BTreeSet::from([id]));
+
+            // The next registration cannot tell which watch the fault cost,
+            // so it rebuilds every one rather than polling until close.
+            watcher.removals.clear();
+            watcher.attempts.clear();
+            assert!(
+                registered_transition(
+                    &mut pending,
+                    &mut watcher,
+                    &mut registered,
+                    &desired,
+                    &metadata,
+                    &owners
+                )
+                .is_empty(),
+                "a complete rebuild restores coverage"
+            );
+            assert_eq!(watcher.removals, vec![path.clone()]);
+            assert_eq!(watcher.attempts, vec![path.clone()]);
+            assert!(registered.contains_key(&path));
+            assert!(pending.quota_unknown.is_empty());
+        }
+        // Healthy registrations are kept once the fault is settled.
+        watcher.removals.clear();
         assert!(
             registered_transition(
                 &mut pending,
@@ -2219,9 +2348,9 @@ mod tests {
                 &metadata,
                 &owners
             )
-            .is_empty(),
-            "closing the owner retires its unknown fault"
+            .is_empty()
         );
+        assert!(watcher.removals.is_empty());
     }
 
     #[test]
@@ -2311,6 +2440,40 @@ mod tests {
             .is_empty()
         );
         assert!(registered.contains_key(&content));
+    }
+
+    #[test]
+    fn only_native_registration_failures_are_reported_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        std::fs::create_dir_all(project.worktrees[0].root.join("src")).unwrap();
+        std::fs::create_dir_all(&project.common_dir).unwrap();
+        // The plan itself asks to be polled, as on a network filesystem.
+        project.polling = Some("network or FUSE filesystem".into());
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, "a polled plan", |change| {
+            change.coverage == Some(false) && !change.recoverable
+        });
+        // A backend fault, by contrast, may clear on a later registration.
+        let mut pending = Pending::default();
+        pending
+            .projects
+            .insert(project.id, Arc::new(project.clone()));
+        pending.event(Err(notify::Error::io(std::io::Error::other(
+            "backend failure",
+        ))));
+        let change = &pending.changes[&project.id];
+        assert_eq!(change.coverage, Some(false));
+        assert!(change.recoverable);
     }
 
     #[test]

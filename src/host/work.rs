@@ -192,6 +192,9 @@ struct Tracked {
     last_scan: Option<Instant>,
     /// Whether the watcher covers every worktree, so polling can rest.
     covered: bool,
+    /// Uncovered only because native registration failed, so registering
+    /// the same plan again may restore coverage.
+    watch_recoverable: bool,
     hints: Arc<scan::ForgeHints>,
     forge: Forge,
     snapshot: Option<Arc<forge::Snapshot>>,
@@ -227,6 +230,7 @@ impl Tracked {
             urgent: false,
             last_scan: None,
             covered: false,
+            watch_recoverable: false,
             hints: Arc::default(),
             forge: Forge::Pending,
             snapshot: None,
@@ -1603,6 +1607,7 @@ impl Scanner {
             };
             if let Some(covered) = change.coverage {
                 tracked.covered = covered;
+                tracked.watch_recoverable = change.recoverable;
             }
             if let Some(error) = &change.error {
                 tracing::debug!(%error, project = %tracked.name, "the Work board polls this project");
@@ -1721,7 +1726,9 @@ impl Scanner {
                     (
                         plan,
                         tracked.scans,
-                        !tracked.covered && tracked.scan_error.is_none(),
+                        !tracked.covered
+                            && tracked.watch_recoverable
+                            && tracked.scan_error.is_none(),
                     ),
                 ))
             })
@@ -1736,10 +1743,11 @@ impl Scanner {
                 })
             });
         if !unchanged {
-            // A failed registration can recover without another filesystem
-            // event. Reuse the completed fallback scan's plan, but retry no
-            // faster than active polling. Coverage acknowledgements and idle
-            // coordinator wakes alone must not create a registration loop.
+            // A failed native registration can recover without another
+            // filesystem event. Reuse the completed fallback scan's plan, but
+            // retry no faster than active polling. Coverage acknowledgements
+            // and idle coordinator wakes alone must not create a registration
+            // loop, and a plan that is polled by design is never retried.
             monitor.configure(plans.values().map(|(plan, _, _)| plan.clone()).collect());
             let attempted = Instant::now();
             self.configured = plans

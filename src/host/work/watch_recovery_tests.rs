@@ -151,7 +151,12 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
             },
             move |handler: Box<dyn FnMut(notify::Result<Event>) + Send>| {
                 Ok(QuotaWatcher {
-                    native: notify::recommended_watcher(handler)?,
+                    // The production backend's configuration, kernel mask
+                    // included.
+                    native: notify::RecommendedWatcher::new(
+                        handler,
+                        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+                    )?,
                     refs: refs.clone(),
                     refuse: refuse.clone(),
                     attempts: attempts.clone(),
@@ -178,6 +183,17 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     scanner.configure(&handle);
     coverage(&mut scanner, &handle, id, false);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        handle.shared().projects[&repository].watch_recoverable,
+        "a native quota refusal may recover on a later registration"
+    );
+    // configure only signals the monitor thread, so judge a wrongly issued
+    // reconfiguration by the scanner's own record, not by watch attempts that
+    // may not have happened yet.
+    let configured = |scanner: &Scanner| {
+        let configured = &scanner.configured[&id];
+        (configured.scan, configured.attempted)
+    };
 
     // Initial registration can request one reconciliation scan. Its unchanged
     // plan and all ordinary coordinator wakes stay inside the retry backoff.
@@ -188,9 +204,11 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         .unwrap()
         .last_scan = Some(Instant::now() - SCAN_SPACING);
     complete_scan(&mut scanner, &handle);
+    let before = configured(&scanner);
     for _ in 0..100 {
         scanner.configure(&handle);
     }
+    assert_eq!(configured(&scanner), before);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     // Advance only the existing scheduler's timestamps, avoiding a real
@@ -224,9 +242,11 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     // Capacity can return in an unrelated process with no Git event here.
     // A completed fallback poll alone must retry and acknowledge real coverage.
     refuse.store(false, Ordering::SeqCst);
+    let before = configured(&scanner);
     for _ in 0..100 {
         scanner.configure(&handle);
     }
+    assert_eq!(configured(&scanner), before);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     poll(&mut scanner);
     coverage(&mut scanner, &handle, id, true);
@@ -257,7 +277,13 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
             .branch_names
             .contains("recovered")
     );
+    let before = configured(&scanner);
     scanner.configure(&handle);
+    assert_eq!(
+        configured(&scanner).0,
+        before.0,
+        "a covered project's new scan does not reconfigure the monitor"
+    );
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         3,
