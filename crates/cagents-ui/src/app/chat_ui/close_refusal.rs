@@ -185,6 +185,9 @@ impl CloseRefusal {
     }
 }
 
+/// The tallest the panel grows before its detail scrolls.
+const CEILING: f32 = 320.0;
+
 /// How many of what still runs the pane lists in full; the rest are named
 /// together, so that everything the action ends has been shown.
 const LISTED_PROCESSES: usize = 5;
@@ -219,103 +222,109 @@ fn end_label(count: usize) -> String {
 
 impl Runtime {
     pub(super) fn close_refusal_view(&self) -> Option<Element<'_, Message>> {
-        let refusal = self.close_refusal.as_ref()?;
-        let target = self.target;
-        let action = |action| Message::ChatUi(action);
-        let proved = refusal
-            .processes
-            .iter()
-            .filter(|process| process.proved)
-            .count();
-        let mut rows: Vec<Element<'_, Message>> =
-            vec![design::body(refusal.reason.as_str()).into()];
-        if !refusal.processes.is_empty() {
-            rows.push(design::caption("Still running for it:").into());
-            // What the action ends comes first, then what it leaves running.
-            let (ended, left): (Vec<&LostProcess>, Vec<&LostProcess>) =
-                refusal.processes.iter().partition(|process| process.proved);
-            let listed = ended.len().min(LISTED_PROCESSES);
-            let (ended_listed, ended_rest) = ended.split_at(listed);
-            let (left_listed, left_rest) = left.split_at(left.len().min(LISTED_PROCESSES - listed));
-            for process in ended_listed.iter().chain(left_listed) {
-                let mut line = vec![
-                    design::body(process.name.as_str()).into(),
-                    design::caption(process.command.as_str()).into(),
-                ];
-                if !process.proved {
-                    line.push(
-                        design::caption(format!(
-                            "Process {}. Cagents can't prove it is this conversation's, so it leaves it running. End it yourself if it is.",
-                            process.process.pid
-                        ))
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .into(),
-                    );
-                }
-                rows.push(
-                    widget::column::with_children(line)
-                        .spacing(space::XXS)
-                        .into(),
-                );
-            }
-            if !ended_rest.is_empty() {
-                rows.push(
+        Some(refusal_panel(self.close_refusal.as_ref()?, self.target))
+    }
+}
+
+/// The refusal, what still runs for it, and the answers to it.
+fn refusal_panel(refusal: &CloseRefusal, target: Target) -> Element<'_, Message> {
+    let action = |action| Message::ChatUi(action);
+    let proved = refusal
+        .processes
+        .iter()
+        .filter(|process| process.proved)
+        .count();
+    let mut rows: Vec<Element<'_, Message>> = vec![design::body(refusal.reason.as_str()).into()];
+    if !refusal.processes.is_empty() {
+        rows.push(design::caption("Still running for it:").into());
+        // What the action ends comes first, then what it leaves running.
+        let (ended, left): (Vec<&LostProcess>, Vec<&LostProcess>) =
+            refusal.processes.iter().partition(|process| process.proved);
+        let listed = ended.len().min(LISTED_PROCESSES);
+        let (ended_listed, ended_rest) = ended.split_at(listed);
+        let (left_listed, left_rest) = left.split_at(left.len().min(LISTED_PROCESSES - listed));
+        for process in ended_listed.iter().chain(left_listed) {
+            let mut line = vec![
+                design::body(process.name.as_str()).into(),
+                design::caption(process.command.as_str()).into(),
+            ];
+            if !process.proved {
+                line.push(
                     design::caption(format!(
-                        "{} more: {}",
-                        ended_rest.len(),
-                        named_together(ended_rest.iter().copied())
-                    ))
-                    .into(),
-                );
-            }
-            if !left_rest.is_empty() {
-                rows.push(
-                    design::caption(format!(
-                        "{} more Cagents can't prove are this conversation's, so it leaves them running: {}",
-                        left_rest.len(),
-                        named_together(left_rest.iter().copied())
+                        "Process {}. Cagents can't prove it is this conversation's, so it leaves it running. End it yourself if it is.",
+                        process.process.pid
                     ))
                     .class(cosmic::theme::Text::Custom(design::warning_text))
                     .into(),
                 );
             }
-        }
-        let mut buttons: Vec<Element<'_, Message>> = Vec::new();
-        if proved > 0 {
-            buttons.push(
-                crate::ui_controls::button::destructive(end_label(proved))
-                    .instead("Ending…", refusal.ending)
-                    .on_press_maybe(
-                        (!refusal.ending).then(|| action(Action::EndCloseHolders(target))),
-                    )
+            rows.push(
+                widget::column::with_children(line)
+                    .spacing(space::XXS)
                     .into(),
             );
         }
+        if !ended_rest.is_empty() {
+            rows.push(
+                design::caption(format!(
+                    "{} more: {}",
+                    ended_rest.len(),
+                    named_together(ended_rest.iter().copied())
+                ))
+                .into(),
+            );
+        }
+        if !left_rest.is_empty() {
+            rows.push(
+                design::caption(format!(
+                    "{} more Cagents can't prove are this conversation's, so it leaves them running: {}",
+                    left_rest.len(),
+                    named_together(left_rest.iter().copied())
+                ))
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .into(),
+            );
+        }
+    }
+    let mut buttons: Vec<Element<'_, Message>> = Vec::new();
+    if proved > 0 {
         buttons.push(
-            crate::ui_controls::button::secondary("Dismiss")
-                .on_press_maybe(
-                    (!refusal.ending).then(|| action(Action::DismissCloseRefusal(target))),
-                )
+            crate::ui_controls::button::destructive(end_label(proved))
+                .instead("Ending…", refusal.ending)
+                .on_press_maybe((!refusal.ending).then(|| action(Action::EndCloseHolders(target))))
                 .into(),
         );
-        rows.push(widget::row::with_children(buttons).spacing(space::S).into());
-        let panel = widget::container(widget::column::with_children(rows).spacing(space::S))
-            .padding(space::M)
-            .width(Length::Fill)
-            .max_width(super::layout::READING_COLUMN)
-            .class(cosmic::theme::Container::custom(|theme| {
-                widget::container::Style {
-                    background: Some(iced::Background::Color(design::raised(theme))),
-                    border: iced::Border {
-                        color: design::destructive_color(theme),
-                        width: design::BORDER_WIDTH,
-                        radius: design::RADIUS_S.into(),
-                    },
-                    ..Default::default()
-                }
-            }));
-        Some(widget::container(panel).center_x(Length::Fill).into())
     }
+    buttons.push(
+        crate::ui_controls::button::secondary("Dismiss")
+            .on_press_maybe((!refusal.ending).then(|| action(Action::DismissCloseRefusal(target))))
+            .into(),
+    );
+    // However long the reason and the commands, the answers stay in
+    // reach and the conversation above keeps its room: only the detail
+    // scrolls.
+    let panel = widget::container(crate::app::dialog_ui::scrolling_with_actions(
+        widget::column::with_children(rows).spacing(space::S),
+        widget::row::with_children(buttons).spacing(space::S),
+        iced::Padding::ZERO.bottom(space::S),
+        design::raised,
+    ))
+    .padding(space::M)
+    .width(Length::Fill)
+    .max_width(super::layout::READING_COLUMN)
+    .max_height(CEILING)
+    .class(cosmic::theme::Container::custom(|theme| {
+        widget::container::Style {
+            background: Some(iced::Background::Color(design::raised(theme))),
+            border: iced::Border {
+                color: design::destructive_color(theme),
+                width: design::BORDER_WIDTH,
+                radius: design::RADIUS_S.into(),
+            },
+            ..Default::default()
+        }
+    }));
+    widget::container(panel).center_x(Length::Fill).into()
 }
 
 #[cfg(test)]
@@ -328,6 +337,67 @@ mod tests {
             name: name.to_owned(),
             command: name.to_owned(),
             proved: true,
+        }
+    }
+
+    /// However long the reason and the commands, the panel stops growing
+    /// and its answers stay whole inside it; only the detail scrolls.
+    #[test]
+    fn a_long_refusal_keeps_its_answers_in_reach() {
+        use cosmic::iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        let long = "a reason the daemon gave that runs on ".repeat(30);
+        let refusal = CloseRefusal {
+            reason: long.clone(),
+            processes: (1..=7)
+                .map(|pid| LostProcess {
+                    command: format!("python3 -m {long}"),
+                    proved: pid % 2 == 0,
+                    ..process(pid, "python3")
+                })
+                .collect(),
+            ending: false,
+        };
+        let mut panel = refusal_panel(
+            &refusal,
+            Target {
+                card: CardId::new(),
+                generation: 1,
+            },
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(panel.as_widget());
+        let node = panel.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 900.0)),
+        );
+        #[derive(Default)]
+        struct Answers(Vec<(String, iced::Rectangle)>);
+        impl Operation for Answers {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == "Dismiss" || text.starts_with("End ") {
+                    self.0.push((text.to_owned(), bounds));
+                }
+            }
+        }
+        let mut answers = Answers::default();
+        panel
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut answers);
+        let height = node.size().height;
+        assert!(height <= CEILING, "the panel grows to {height}");
+        assert_eq!(answers.0.len(), 2, "{:?}", answers.0);
+        for (answer, bounds) in answers.0 {
+            assert!(
+                bounds.y >= 0.0 && bounds.y + bounds.height <= height,
+                "{answer} lies outside the panel: {bounds:?} in {height}"
+            );
         }
     }
 

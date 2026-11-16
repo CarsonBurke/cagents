@@ -651,18 +651,20 @@ impl Cagents {
     }
 }
 
-/// A labelled input with the one line under it that is about it.
+/// A labelled input with the one line under it that is about it, shown
+/// together when the keyboard focuses the input.
 fn field<'a>(
     label: &'a str,
     input: impl Into<Element<'a, Message>>,
     note: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    widget::column::with_capacity(3)
-        .push(design::caption(label))
-        .push(input)
-        .push_maybe(note)
-        .spacing(space::XS)
-        .into()
+    crate::interaction::focus_group(
+        widget::column::with_capacity(3)
+            .push(design::caption(label))
+            .push(input)
+            .push_maybe(note)
+            .spacing(space::XS),
+    )
 }
 
 fn error_note(message: &str) -> Element<'_, Message> {

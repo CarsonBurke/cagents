@@ -271,6 +271,59 @@ fn paint(weight: Weight, status: Status, theme: &cosmic::Theme) -> Paint {
     }
 }
 
+/// COSMIC's stock text button, showing `label`, that keeps the room of each
+/// of `alternatives` too: for a surface that uses COSMIC's buttons rather
+/// than the shell's, such as a notice's own actions or the standalone editor,
+/// whose label changes in place, as "Save" to "Saving…". Like
+/// [`Button::instead`], neither the button nor its neighbors move when the
+/// label changes, and the alternatives are measured but never drawn or
+/// announced.
+///
+/// It is named for `label` and draws in COSMIC's standard class; set a
+/// class, an id or a press message on the result.
+pub fn stock<'a, Message: Clone + 'a>(
+    label: &'a str,
+    alternatives: impl IntoIterator<Item = &'a str>,
+) -> widget::Button<'a, Message> {
+    // The metrics of `widget::button::standard`, which takes only one label.
+    let theme = cosmic::theme::active();
+    let spacing = theme.cosmic();
+    let height = Length::Fixed(spacing.space_l().into());
+    let text = |label: &'a str| -> Element<'a, Message> {
+        widget::text(label)
+            .size(14)
+            .line_height(iced::widget::text::LineHeight::Absolute(20.0.into()))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    };
+    widget::button::custom(
+        widget::container(super::reserved(
+            text(label),
+            alternatives.into_iter().map(text),
+            iced::alignment::Horizontal::Center,
+        ))
+        .padding([0, spacing.space_s()])
+        .center_y(height),
+    )
+    .padding(0)
+    .name(label)
+}
+
+/// [`stock`] showing `instead` in place of `label` while `shown`, as
+/// [`Button::instead`] does: a busy state such as "Saving…", or the second
+/// press a confirmation asks for. It keeps the room of both either way.
+pub fn stock_instead<'a, Message: Clone + 'a>(
+    label: &'a str,
+    instead: &'a str,
+    shown: bool,
+) -> widget::Button<'a, Message> {
+    if shown {
+        stock(instead, [label])
+    } else {
+        stock(label, [instead])
+    }
+}
+
 /// The quiet weight's look for a control with content of its own, such as
 /// a checkbox row: no surface until hovered, ordinary ink and the shared
 /// focus ring.
@@ -470,6 +523,61 @@ mod tests {
             laid_out_row(&mut kept, &mut tree, 900.0).0[0].width,
             laid_out_row(&mut wide, &mut Tree::empty(), 900.0).0[0].width,
             "the swapped-in button keeps the room of the one it replaces"
+        );
+    }
+
+    /// A stock COSMIC button that changes its label keeps the room of the
+    /// wider, so its neighbor stays put, and announces only the one it
+    /// shows. With the wider label showing, it is COSMIC's own button.
+    #[test]
+    fn a_stock_button_keeps_its_room_and_cosmic_s_look() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let row = |button: Element<'static, ()>| -> Element<'static, ()> {
+            widget::row::with_children(vec![
+                button,
+                widget::button::standard("Cancel").on_press(()).into(),
+            ])
+            .spacing(space::S)
+            .into()
+        };
+        let mut tree = Tree::empty();
+        let mut laid = |shown: bool| {
+            let mut row =
+                row(
+                    stock_instead("Reset all settings", "Confirm reset all settings", shown)
+                        .on_press(())
+                        .into(),
+                );
+            laid_out_row(&mut row, &mut tree, 900.0)
+        };
+        let (idle, idle_names) = laid(false);
+        let (confirming, confirming_names) = laid(true);
+        assert_eq!(idle, confirming);
+        assert!(idle_names.iter().any(|name| name == "Reset all settings"));
+        assert!(
+            !idle_names
+                .iter()
+                .any(|name| name == "Confirm reset all settings")
+        );
+        assert!(
+            confirming_names
+                .iter()
+                .any(|name| name == "Confirm reset all settings")
+        );
+        assert!(
+            !confirming_names
+                .iter()
+                .any(|name| name == "Reset all settings")
+        );
+
+        let mut cosmic = row(widget::button::standard("Confirm reset all settings")
+            .on_press(())
+            .into());
+        assert_eq!(
+            laid_out_row(&mut cosmic, &mut Tree::empty(), 900.0).0,
+            confirming,
+            "the same size and place as COSMIC's stock button"
         );
     }
 

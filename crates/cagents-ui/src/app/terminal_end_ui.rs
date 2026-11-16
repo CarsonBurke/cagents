@@ -224,6 +224,18 @@ impl Cagents {
         }
     }
 
+    /// Whether a finished agent's action may read Open conversation while
+    /// its footer shows. That depends on whether this window still holds the
+    /// agent's conversation, which can change under a footer already in view,
+    /// so the action keeps that label's room either way.
+    fn terminal_relaunch_may_open_conversation(
+        &self,
+        card: CardId,
+        session: &TerminalSession,
+    ) -> bool {
+        self.completed_terminal(card).is_some() && chat_ui::conversion(session).is_ok()
+    }
+
     /// Relaunches an ended terminal from Enter on its final screen, unless the
     /// key followed the end too closely to have been meant for it.
     pub(super) fn relaunch_from_ended_screen(&mut self, card: CardId) -> Task<Message> {
@@ -389,6 +401,10 @@ impl Cagents {
         // this; the tooltip is where that is said without crowding the row.
         actions.push(crate::interaction::tooltip(
             crate::ui_controls::button::primary(relaunch.label())
+                .keep_room_for(
+                    self.terminal_relaunch_may_open_conversation(card, session)
+                        .then_some(TerminalRelaunch::OpenConversation.label()),
+                )
                 .id(card_control_id(card, "ended.relaunch"))
                 .on_press(Message::RetryCard(card)),
             format!("{} (Enter)", relaunch.explanation(session)),
@@ -722,6 +738,51 @@ mod tests {
             10_000 + ENTER_RELAUNCH_GRACE_MS - 1
         ));
         assert!(enter_relaunches(10_000, 10_000 + ENTER_RELAUNCH_GRACE_MS));
+    }
+
+    #[test]
+    fn a_finished_agents_action_keeps_its_place_whether_or_not_it_opens_the_conversation() {
+        let relaunch = |owned: bool| {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let card = app.workspace.focused().unwrap();
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                panic!("terminal fixture");
+            };
+            let identity = session.id;
+            session.launch.program = "codex".into();
+            let endpoint = PathBuf::from("/daemon-temporary-root")
+                .join(format!("cagents-codex-{identity}"))
+                .join("control.sock");
+            session.launch.arguments =
+                vec!["--remote".into(), format!("unix://{}", endpoint.display())];
+            session.owned_codex_listener = owned.then(|| crate::chat::OwnedCodexListener {
+                socket: endpoint,
+                allocator: HostSessionProof {
+                    host_session_id: "allocator".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "previous-host".into(),
+                },
+            });
+            transition_terminal_to_relaunchable(session, terminal_exit(0, None));
+            app.set_residency(card, Residency::Hibernated);
+            app.cards.insert(card, CardRuntime::Completed);
+            let session = app.completed_terminal(card).unwrap().clone();
+            assert_eq!(
+                app.terminal_relaunch(card, &session) == TerminalRelaunch::OpenConversation,
+                owned
+            );
+            let footer = app.ended_terminal_footer(card, &session);
+            super::super::dialog_ui::tests::action_geometry(
+                footer,
+                iced::Size::new(900.0, 200.0),
+                &card_control_id(card, "ended.relaunch"),
+            )
+            .3
+        };
+        let opens = relaunch(true);
+        let resumes = relaunch(false);
+        assert!(opens.width > 0.0, "{opens:?}");
+        assert_eq!(opens, resumes);
     }
 
     #[test]

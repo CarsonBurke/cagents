@@ -1283,8 +1283,10 @@ fn settings_layout<'a>(
     .width(Length::Fill)
     .height(Length::Fill);
     // The title and save state stay put while the page scrolls under them,
-    // fading out beneath the title rather than being cut at its foot.
-    let scroll = crate::interaction::overflow_fade_y(scroll, design::base);
+    // fading out beneath the title rather than being cut at its foot. A
+    // control Tab reaches below the fold scrolls into view.
+    let scroll =
+        crate::interaction::overflow_fade_y(crate::interaction::reveal_focus(scroll), design::base);
     let content: Element<'a, Message> =
         widget::column::with_children(header.map(Element::from).into_iter().chain([scroll]))
             .width(Length::Fill)

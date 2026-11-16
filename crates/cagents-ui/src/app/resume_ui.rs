@@ -1832,7 +1832,12 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
         scope
             .reaches()
             .map(|reach| {
-                let label = format!("{} {}", scope.label(reach), counts[reach.index()]);
+                let count = counts[reach.index()].to_string();
+                let label = format!("{} {count}", scope.label(reach));
+                // As a scan finds conversations, the counts climb; each
+                // segment keeps room for three digits, so the others don't
+                // shuffle along the bar while it does.
+                let room = format!("{} {}", scope.label(reach), "0".repeat(count.len().max(3)));
                 // The sidebar's icons: its worktree glyph for a worktree, a
                 // folder for a project.
                 let icon = match reach {
@@ -1847,7 +1852,11 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
                         design::COMPACT_ICON_SIZE + 2,
                     ));
                 }
-                contents.push(design::body(label).into());
+                contents.push(crate::ui_controls::reserved(
+                    design::body(label),
+                    [design::body(room).into()],
+                    iced::alignment::Horizontal::Left,
+                ));
                 widget::button::custom(
                     widget::row::with_children(contents)
                         .spacing(space::XXS)
@@ -1953,6 +1962,48 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> (Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As a scan finds conversations, the counts climb, and the segments
+    /// keep their place rather than shuffling along the bar.
+    #[test]
+    fn climbing_counts_keep_the_reach_segments_in_place() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let scope = Scope {
+            reach: Reach::Project,
+            project: "project".into(),
+            roots: Vec::new(),
+            worktree: Some(WorktreeScope {
+                label: "fix-auth".into(),
+                roots: Vec::new(),
+                nested: Vec::new(),
+            }),
+        };
+        let segments = |counts: [usize; 3]| {
+            let mut bar = resume_reaches(&scope, &counts);
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(bar.as_widget());
+            let node = bar.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 80.0)),
+            );
+            // Every box but the labels themselves, which center in the
+            // room their segment keeps.
+            fn boxes(node: &layout::Node, found: &mut Vec<iced::Rectangle>) {
+                if !node.children().is_empty() {
+                    found.push(node.bounds());
+                }
+                node.children().iter().for_each(|child| boxes(child, found));
+            }
+            let mut found = Vec::new();
+            boxes(&node, &mut found);
+            (node.size(), found)
+        };
+        let first = segments([1, 4, 9]);
+        for counts in [[12, 40, 98], [120, 400, 999]] {
+            assert_eq!(segments(counts), first, "{counts:?}");
+        }
+    }
 
     /// A conversation saved while cagents exported Claude's default home and
     /// the same conversation found under a launch that leaves the CLI to

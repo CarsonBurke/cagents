@@ -38,11 +38,13 @@ pub(crate) fn scrolled_region<'a, M: 'a>(
     max_height: f32,
 ) -> Element<'a, M> {
     widget::container(crate::interaction::overflow_fade_y(
-        widget::scrollable(scrolled_body(content, Padding::ZERO))
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .width(Length::Fill),
+        crate::interaction::reveal_focus(
+            widget::scrollable(scrolled_body(content, Padding::ZERO))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .width(Length::Fill),
+        ),
         design::dialog_base,
     ))
     .width(Length::Fill)
@@ -152,12 +154,15 @@ pub(crate) fn scrolling_with_actions<'a, M: 'a>(
 ) -> Element<'a, M> {
     crate::interaction::footed(
         crate::interaction::overflow_fade_y(
-            widget::scrollable(scrolled_body(content, padding))
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .width(Length::Fill)
-                .height(Length::Shrink),
+            // Tab to a field below the fold brings it into view.
+            crate::interaction::reveal_focus(
+                widget::scrollable(scrolled_body(content, padding))
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Shrink),
+            ),
             fill,
         ),
         actions,
@@ -409,6 +414,161 @@ pub(super) mod tests {
             (Some(ids[2].clone()), true),
             "Tab moves on from a button disabled while focused"
         );
+    }
+
+    /// Tab through a dialog whose body scrolls: each control it reaches in
+    /// the body is brought into view, clear of the fades at its edges, and
+    /// Shift+Tab brings the first back.
+    #[test]
+    fn tab_brings_a_control_below_the_fold_into_view() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
+        let ids: Vec<widget::Id> = (0..12)
+            .map(|row| widget::Id::new(format!("row-{row}")))
+            .collect();
+        let mut element = overlay(
+            crate::interaction::focus_scope(scrolling_surface_with_actions(
+                widget::column::with_children(
+                    ids.iter()
+                        .map(|id| {
+                            widget::button::text("Choose this row")
+                                .id(id.clone())
+                                .on_press(Message::CancelDialog)
+                                .into()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(space::M),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(widget::Id::new("cancel"))
+                    .on_press(Message::CancelDialog),
+                480.0,
+                MAX_HEIGHT,
+            )),
+            None,
+            1.0,
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let window = iced::Rectangle::with_size(SCALED_MINIMUM_WINDOW);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, window.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(ids[0].clone()),
+        );
+        let mut press = |element: &mut Element<'_, Message>, tree: &mut Tree, event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &window,
+            );
+        };
+        // The body's viewport, the focused control and where it is drawn.
+        #[derive(Default)]
+        struct Seen {
+            viewport: Option<iced::Rectangle>,
+            content: f32,
+            scrolled: f32,
+            focused: Option<(widget::Id, iced::Rectangle)>,
+        }
+        impl Operation for Seen {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                content: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::scrollable::Scrollable,
+            ) {
+                if self.viewport.is_none() {
+                    self.viewport = Some(bounds);
+                    self.content = content.height;
+                    self.scrolled = translation.y;
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = id.cloned().map(|id| (id, bounds));
+                }
+            }
+        }
+        let mut seen = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+            let mut seen = Seen::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut seen);
+            let viewport = seen.viewport.expect("the body scrolls");
+            let (id, bounds) = seen.focused.expect("a control has focus");
+            (
+                viewport,
+                id,
+                bounds - iced::Vector::new(0.0, seen.scrolled),
+                seen.scrolled,
+                seen.content,
+            )
+        };
+        // Clear of the fade at each edge, which is as deep as the content
+        // hidden beyond it, up to the full fade.
+        let in_view =
+            |viewport: iced::Rectangle, drawn: iced::Rectangle, scrolled: f32, content: f32| {
+                let fade = |hidden: f32| hidden.clamp(0.0, crate::interaction::OVERFLOW_FADE);
+                drawn.y >= viewport.y + fade(scrolled) - 0.5
+                    && drawn.y + drawn.height
+                        <= viewport.y + viewport.height - fade(content - viewport.height - scrolled)
+                            + 0.5
+            };
+        let tab = iced::Event::Keyboard(key_press(keyboard::key::Named::Tab));
+        // A frame follows the key, as it does in the app.
+        let frame = iced::Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
+        for row in &ids[1..] {
+            press(&mut element, &mut tree, tab.clone());
+            press(&mut element, &mut tree, frame.clone());
+            let (viewport, id, drawn, scrolled, content) = seen(&mut element, &mut tree);
+            assert_eq!(&id, row);
+            assert!(
+                in_view(viewport, drawn, scrolled, content),
+                "{id:?} is drawn at {drawn:?}, outside {viewport:?}"
+            );
+        }
+        assert!(
+            seen(&mut element, &mut tree).3 > 0.0,
+            "the last row is reached by scrolling"
+        );
+        for _ in 1..ids.len() {
+            press(&mut element, &mut tree, iced::Event::Keyboard(shift_tab()));
+            press(&mut element, &mut tree, frame.clone());
+        }
+        let (viewport, id, drawn, scrolled, content) = seen(&mut element, &mut tree);
+        assert_eq!(id, ids[0]);
+        assert!(
+            in_view(viewport, drawn, scrolled, content),
+            "{drawn:?} outside {viewport:?}"
+        );
+        assert_eq!(scrolled, 0.0, "the first row sits flush at the top again");
     }
 
     pub(in crate::app) fn space() -> keyboard::Event {
