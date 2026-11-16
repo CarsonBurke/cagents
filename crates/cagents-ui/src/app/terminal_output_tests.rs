@@ -744,7 +744,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     fn row(id: WorktreeId, path: PathBuf) -> SidebarWorktree {
         SidebarWorktree::new(id, path, None, false, false, None, None, None)
     }
-    app.sidebar_model.projects = vec![
+    *app.sidebar_model.projects = vec![
         SidebarProject::new(
             first,
             RepositoryId::new(),
@@ -1205,7 +1205,7 @@ fn unchanged_agent_output_reuses_ownership_and_topology_rebinds_attention() {
             vec![],
         )
     };
-    app.sidebar_model.projects = vec![project(first, first_row)];
+    *app.sidebar_model.projects = vec![project(first, first_row)];
     app.worktree_owners.remove(&card);
     Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
     app.known_worktree_roots.clear();
@@ -1276,7 +1276,7 @@ fn unchanged_agent_output_reuses_ownership_and_topology_rebinds_attention() {
 
     // A real structural update rebinds both cached activity and unread
     // attention even though no new activity event arrives from the terminal.
-    app.sidebar_model.projects = vec![project(second, second_row)];
+    *app.sidebar_model.projects = vec![project(second, second_row)];
     drop(app.update(Message::WindowResized(1200.0, 800.0)));
     assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
     assert!(!app.sidebar_state.has_agent_update(first, first_row));

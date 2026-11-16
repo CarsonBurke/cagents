@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2289,7 +2289,7 @@ mod tests {
             card_scopes: HashMap::from([(source.id, root.clone())]),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2632,7 +2632,7 @@ mod tests {
             focused: Some(a_focused.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2739,7 +2739,7 @@ mod tests {
             focused: Some(a.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2864,7 +2864,7 @@ mod tests {
             focused: Some(parent_terminal.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project,
             RepositoryId::new(),
             "repo".into(),
@@ -3017,7 +3017,7 @@ mod tests {
         let older = repository.join("worktrees/alpha-old");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project,
             RepositoryId::new(),
             "repo".into(),
