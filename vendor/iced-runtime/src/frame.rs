@@ -13,7 +13,9 @@ pub struct Frame {
     /// frame, up to presenting this one: updates, views, layout, drawing and
     /// presentation. Time spent waiting for events is excluded.
     pub work: Duration,
-    /// Time since the shell presented the previous frame.
+    /// Time since the shell presented the previous frame, on any surface.
+    /// After an idle stretch this is the idle time, since shells draw on
+    /// demand.
     pub interval: Option<Duration>,
 }
 
