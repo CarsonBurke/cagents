@@ -66,8 +66,7 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
 }
 
 /// The page oldest first, as a conversation reads, under a line naming the
-/// session, then what to run next: the earlier page, read the same way as
-/// this one, and, from the newest page of a live session, messaging it.
+/// session, then how to read the page before it the same way.
 fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
     let mut out = heading(&page.session, now);
     if page.entries.is_empty() {
@@ -81,11 +80,10 @@ fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
         out.push_str("\n\n");
         out.push_str(&render(entry));
     }
-    let session = format::shell_word(&query.session);
-    let mut steps = Vec::new();
     if let Some(earlier) = &page.earlier {
         let mut command = format!(
-            "{program} transcript {session} --before {}",
+            "{program} transcript {} --before {}",
+            format::shell_word(&query.session),
             cursor(earlier)
         );
         if query.limit != DEFAULT_LIMIT {
@@ -97,14 +95,8 @@ fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
         if query.full {
             command.push_str(" --full");
         }
-        steps.push((command, "reads the page before"));
-    }
-    if query.before.is_none() && !page.session.exited {
-        steps.push((format!("{program} send {session} MESSAGE"), "messages it"));
-    }
-    if !steps.is_empty() {
         out.push_str("\n\n");
-        out.push_str(&format::hint(&steps));
+        out.push_str(&format::hint(&[(command, "reads the page before")]));
     }
     out
 }
@@ -437,8 +429,7 @@ mod tests {
         };
         assert_eq!(
             human(&page, &query("0000"), "cagents", 0),
-            "Session 00000000 (codex, idle)\n\nNo conversation yet.\n\n\
-             hint: `cagents send 0000 MESSAGE` messages it"
+            "Session 00000000 (codex, idle)\n\nNo conversation yet."
         );
         let mut earlier = query("0000");
         earlier.before = Some("u1".into());
@@ -452,7 +443,7 @@ mod tests {
                  reads the page before",
                 cursor("u0")
             )),
-            "the hint keeps the view and the device, and an older page offers no message"
+            "the hint keeps the view and the device"
         );
     }
 }
