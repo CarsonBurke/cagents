@@ -11,8 +11,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 import tempfile
@@ -265,8 +267,8 @@ class Running(Tree):
         status, output = self.job_output(jobs, "job")
         self.assertEqual(status, 1)
         lines = output.splitlines()
-        self.assertRegex(lines[0], r"^ok   good: 2 tests \(1 skipped\), \d+\.\ds$")
-        self.assertEqual(lines[1], "FAIL bad")
+        self.assertRegex(lines[0], r"^good \.\.\. ok \(2 tests, 1 skipped, \d+\.\ds\)$")
+        self.assertEqual(lines[1], "bad ... FAIL (exit 1)")
         self.assertIn("AssertionError: the reason", output)
         self.assertIn("FAILED (failures=1)", output)
         self.assertEqual(lines[-1], "Failed: bad (exit 1)")
@@ -304,7 +306,29 @@ class Running(Tree):
                     os.kill(int(pid.read_text()), 9)
         self.assertLess(time.monotonic() - started, 30)
         self.assertEqual(status, 0)
-        self.assertRegex(output, r"^ok   leaky: passed, \d+\.\ds\n$")
+        self.assertRegex(output, r"^leaky \.\.\. ok \(passed, \d+\.\ds\)\n$")
+
+    def test_an_interrupted_suite_is_named_with_what_it_printed(self):
+        self.write("tests/hung.py", "import time\nprint('progress before hang')\ntime.sleep(60)\n")
+        jobs = (Job("job", (Suite("hung", "tests/hung.py"),)),)
+        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        started = time.monotonic()
+        with quiet() as read:
+            timer.start()
+            with self.assertRaises(KeyboardInterrupt):
+                contracts.run(self.root, "job", jobs=jobs, verbose=False)
+            output = read()
+        timer.cancel()
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(output, "hung ... INTERRUPTED\nprogress before hang\n")
+
+    def test_a_failing_log_keeps_prints_and_tracebacks_in_order(self):
+        self.write("tests/order.py", "import unittest\n\nclass Order(unittest.TestCase):\n"
+                                     "    def test_a(self):\n        print('printed first')\n"
+                                     "        self.fail('then failed')\n\nunittest.main()\n")
+        status, output = self.job_output((Job("job", (Suite("order", "tests/order.py"),)),), "job")
+        self.assertEqual(status, 1)
+        self.assertLess(output.index("printed first"), output.index("AssertionError: then failed"))
 
     def test_every_suite_runs_and_the_first_failure_status_is_preserved(self):
         self.recording("tests/one.py", "one", exit_code=19)

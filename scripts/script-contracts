@@ -15,7 +15,8 @@ older-head applicability case to tolerate.
                     sharded job's single suite, so the shards cover it exactly.
                     Without JOB, run every job unsharded, one after another,
                     then the source job's suites. Each suite that passes gets
-                    one line, and one that fails its whole output; --verbose,
+                    one line, and one that fails or is interrupted its whole
+                    output; --verbose,
                     the default on GitHub Actions, prints every test and the
                     digest of every file a suite tests, as CI's log records
 """
@@ -25,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -331,6 +333,10 @@ def parse_shard(text, shards):
 
 def command(suite, shard=None, verbose=True):
     flags = ["-I", "-B"] if suite.isolated else ["-B"]
+    if not verbose:
+        # Unbuffered, so a captured log keeps prints and tracebacks in order
+        # and holds everything written before an interruption.
+        flags.append("-u")
     if shard is None:
         return [sys.executable, *flags, suite.fixture, *(["-v"] if verbose else [])]
     index, count = shard
@@ -342,10 +348,10 @@ def default_verbose():
 
 
 def outcome(log, seconds):
-    """What unittest's closing lines say about a run that passed, such as '12 tests (1 skipped), 0.4s'."""
+    """What unittest's closing lines say about a run that passed, such as '12 tests, 1 skipped, 0.4s'."""
     ran = re.findall(r"^Ran (\d+) tests? in ", log, re.MULTILINE)
     skipped = re.findall(r"^OK \(.*?skipped=(\d+)", log, re.MULTILINE)
-    counted = f"{ran[-1]} tests" + (f" ({skipped[-1]} skipped)" if skipped else "") if ran else "passed"
+    counted = f"{ran[-1]} tests" + (f", {skipped[-1]} skipped" if skipped else "") if ran else "passed"
     return f"{counted}, {seconds:.1f}s"
 
 
@@ -359,20 +365,39 @@ def run_suite(root, suite, shard, verbose):
         if os.environ.get("GITHUB_ACTIONS") == "true":
             print("::endgroup::", flush=True)
         return returncode
+    # The name comes first, so a slow or hung suite is named while it runs.
+    print(f"{suite.name} ... ", end="", flush=True)
+    started = time.monotonic()
     # A file rather than a pipe, so a process the suite leaves behind cannot
     # hold the run open after the suite itself has exited.
-    started = time.monotonic()
     with tempfile.TemporaryFile() as captured:
-        returncode = subprocess.run(command(suite, shard, verbose=False), cwd=root, env=environment,
-                                    stdout=captured, stderr=subprocess.STDOUT).returncode
+        def show(verdict):
+            captured.seek(0)
+            log = captured.read().decode(errors="replace")
+            print(verdict, flush=True)
+            sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
+            sys.stdout.flush()
+
+        process = subprocess.Popen(command(suite, shard, verbose=False), cwd=root, env=environment,
+                                   stdout=captured, stderr=subprocess.STDOUT)
+        try:
+            returncode = process.wait()
+        except BaseException:
+            # Interrupted or terminated: say so with what the suite printed, then stop.
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            show("INTERRUPTED")
+            raise
+        if returncode:
+            show(f"FAIL (exit {returncode})")
+            return returncode
         captured.seek(0)
         log = captured.read().decode(errors="replace")
-    if returncode:
-        print(f"FAIL {suite.name}", flush=True)
-        sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
-        sys.stdout.flush()
-    else:
-        print(f"ok   {suite.name}: {outcome(log, time.monotonic() - started)}", flush=True)
+    print(f"ok ({outcome(log, time.monotonic() - started)})", flush=True)
     return returncode
 
 
@@ -455,6 +480,8 @@ def main():
     run_parser.add_argument("shard", nargs="?")
     args = parser.parse_args()
     root = args.root.resolve()
+    # A terminated run reports the suite it stopped in, as an interrupted one does.
+    signal.signal(signal.SIGTERM, lambda number, _frame: sys.exit(128 + number))
     try:
         if args.command == "verify":
             problems = verify(root)

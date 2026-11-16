@@ -1485,11 +1485,13 @@ mise run ci                                 # with formatting and the protocol c
 python3 -I -B scripts/script-contracts plan # the CI matrix
 ```
 
-Locally, each suite that passes prints one line, such as `ok   doctor: 10
-tests, 1.1s`, and one that fails prints `FAIL NAME` followed by its whole
-output. `scripts/script-contracts run --verbose JOB` prints what CI's log
-records instead: every test by name, and the SHA-256 of each file the suite
-tests. GitHub Actions runs verbose by default.
+Locally, each suite prints one line, starting with its name as it begins, such
+as `doctor ... ok (10 tests, 1.1s)`. A suite that fails, or is interrupted,
+ends its line with `FAIL (exit N)` or `INTERRUPTED` and is followed by its
+whole output. `mise run test:scripts --verbose tooling` (or
+`scripts/script-contracts run --verbose JOB`) prints what CI's log records
+instead: every test by name, and the SHA-256 of each file the suite tests.
+GitHub Actions runs verbose by default.
 
 A new `tests/` file that imports `unittest` must be added to a job, or to
 `UNSCHEDULED` when CI deliberately does not run it; `verify` refuses it
