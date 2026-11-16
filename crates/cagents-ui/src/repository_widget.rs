@@ -5745,9 +5745,9 @@ impl RepositoryRuntime {
         self.update_diff_typography();
     }
 
-    /// Requests the comparisons a presentation change dropped, the Git one
-    /// on screen and the live buffer's, and moves the mounted surface to its
-    /// retained position.
+    /// Requests the comparisons a presentation change dropped, the live
+    /// buffer's or else the Git one on screen, and moves the mounted surface
+    /// to its retained position.
     pub fn refresh_diff_presentation(&mut self, card: CardId) -> Task<RepositoryAction> {
         Task::batch([
             self.ensure_current_diff(card),
@@ -7703,6 +7703,13 @@ impl RepositoryRuntime {
                 || (showing_diff && *basis == self.diff_basis)
         });
         if !showing_diff || self.diff_state(&self.diff_basis).is_some() {
+            return Task::none();
+        }
+        // The retained comparison is rebuilt from the live buffer, as after a
+        // presentation change. Git compares the file on disk instead, so its
+        // rows could replace the retained ones before the buffer's arrive.
+        // A buffer the live comparison could not cover still asks Git.
+        if self.wanted_working_diff().is_some() && self.working_diff.error.is_none() {
             return Task::none();
         }
         let Some(selected) = self.selected.as_ref() else {
@@ -18074,6 +18081,31 @@ mod tests {
         assert!(runtime.working_annotations_current());
         assert!(runtime.working_diff.timer.is_none());
         assert!(runtime.working_diff.active.is_none());
+    }
+
+    /// The buffer is what the reader compares: a Git comparison of the
+    /// file on disk must not replace the retained rows while they rebuild.
+    #[test]
+    fn a_restyle_rebuilds_from_the_buffer_without_asking_git() {
+        let card = CardId::new();
+        let (mut runtime, _) = working_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+        drop(runtime.refresh_diff_presentation(card));
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+        assert!(runtime.diff_model().is_some(), "the retained rows stay");
+        assert!(runtime.working_diff.timer.is_some());
+        // Returning to Diff while the rows rebuild asks Git nothing either.
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+
+        // A buffer the live comparison could not cover falls back to Git.
+        runtime.working_diff.error = Some("too large".into());
+        drop(runtime.ensure_current_diff(card));
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Loading { .. })
+        ));
     }
 
     #[test]
