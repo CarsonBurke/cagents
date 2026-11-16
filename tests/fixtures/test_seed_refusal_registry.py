@@ -12,8 +12,7 @@ import uuid
 
 SCRIPT = Path(__file__).with_name("seed-refusal-registry.py")
 TABLES = (
-    "channels", "view_scopes", "panes", "channel_work_placement_epochs",
-    "channel_work_placement_clock", "view_revision_clock", "retired_panes",
+    "channels", "view_scopes", "panes", "view_revision_clock", "retired_panes",
     "view_operations", "shared_view_terminal_sources", "shared_terminal_retention_pins",
     "terminal_retention_pins", "fixture_actor_history",
 )
@@ -31,21 +30,14 @@ class SeedRefusalRegistry(unittest.TestCase):
         self.selected = [str(uuid.uuid4()) for _ in range(2)]
         self.unrelated = str(uuid.uuid4())
         with sqlite3.connect(self.db) as db:
-            # These active epoch/clock and FK projection declarations match
-            # host/model/channel_work/placement.rs and views/store.rs. The
-            # parent view columns are limited to those the fixture consumes.
+            # These clock and FK projection declarations match
+            # host/model/views/store.rs. The parent view columns are limited
+            # to those the fixture consumes.
             db.executescript("""
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE channels(id TEXT PRIMARY KEY,title TEXT);
                 CREATE TABLE view_scopes(id INTEGER PRIMARY KEY,channel TEXT);
                 CREATE TABLE panes(id TEXT PRIMARY KEY,scope INTEGER REFERENCES view_scopes(id) ON DELETE CASCADE,kind TEXT);
-                CREATE TABLE channel_work_placement_epochs(
-                    pane TEXT PRIMARY KEY,epoch INTEGER NOT NULL CHECK(epoch>0)
-                ) STRICT;
-                CREATE TABLE channel_work_placement_clock(
-                    id INTEGER PRIMARY KEY CHECK(id=1),last_epoch INTEGER NOT NULL CHECK(last_epoch>=0)
-                ) STRICT;
-                INSERT INTO channel_work_placement_clock VALUES(1,3);
                 CREATE TABLE view_revision_clock(
                     id INTEGER PRIMARY KEY CHECK(id=1),last INTEGER NOT NULL CHECK(last>=0)
                 ) STRICT;
@@ -74,12 +66,11 @@ class SeedRefusalRegistry(unittest.TestCase):
                 db.execute("INSERT INTO view_scopes VALUES(?,?)", (scope, channel))
                 db.execute("INSERT INTO retired_panes VALUES(?,?,0,100)", (scope, str(uuid.uuid4())))
                 db.execute("INSERT INTO view_operations VALUES(?,?,100)", (str(uuid.uuid4()), scope))
-            for epoch, (pane, scope, kind) in enumerate([
+            for pane, scope, kind in [
                 (self.selected[0], 1, "chat"), (self.selected[1], 1, "terminal"),
                 (self.unrelated, 2, "terminal"),
-            ], 1):
+            ]:
                 db.execute("INSERT INTO panes VALUES(?,?,?)", (pane, scope, kind))
-                db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
                 if kind == "terminal":
                     db.execute("INSERT INTO shared_view_terminal_sources VALUES(?,?,?)", (pane, "source", "ended"))
                     db.execute("INSERT INTO shared_terminal_retention_pins VALUES(?,?)", (pane, "terminal-" + pane))
@@ -109,27 +100,20 @@ class SeedRefusalRegistry(unittest.TestCase):
         after = self.snapshot()
         self.assertEqual(after["view_scopes"], [(2, self.other)])
         self.assertEqual(after["panes"], [(self.unrelated, 2, "terminal")])
-        self.assertEqual(after["channel_work_placement_epochs"], [(self.unrelated, 3)])
         for table in ["retired_panes", "view_operations"]:
             scope_column = 0 if table == "retired_panes" else 1
             self.assertEqual(after[table], [row for row in before[table] if row[scope_column] == 2])
         for table in ["shared_view_terminal_sources", "shared_terminal_retention_pins"]:
             self.assertEqual(after[table], [row for row in before[table] if row[0] == self.unrelated])
-        for table in ["channel_work_placement_clock", "view_revision_clock", "terminal_retention_pins", "fixture_actor_history"]:
+        for table in ["view_revision_clock", "terminal_retention_pins", "fixture_actor_history"]:
             self.assertEqual(after[table], before[table], table)
         allowed = self.run_script("allow")
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
-        # Same-pane registration allocates fresh generations, without the stale
-        # non-FK row that caused the actual native retry's UNIQUE refusal.
+        # The same panes register again once the refusal is lifted.
         with sqlite3.connect(self.db) as db:
-            self.assertEqual(db.execute("PRAGMA foreign_key_list(channel_work_placement_epochs)").fetchall(), [])
             db.execute("INSERT INTO view_scopes VALUES(1,?)", (self.channel,))
-            for epoch, pane in enumerate(self.selected, 4):
+            for pane in self.selected:
                 db.execute("INSERT INTO panes VALUES(?,1,'chat')", (pane,))
-                db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
-                db.execute("UPDATE channel_work_placement_clock SET last_epoch=?", (epoch,))
-            self.assertEqual(db.execute("SELECT epoch FROM channel_work_placement_epochs WHERE pane=?", (self.unrelated,)).fetchone(), (3,))
-            self.assertEqual(db.execute("SELECT last_epoch FROM channel_work_placement_clock").fetchone(), (5,))
 
     def test_conditional_trigger_body_only_in_plain_sqlite(self):
         # This checks the trigger body only. The real daemon rejects its
