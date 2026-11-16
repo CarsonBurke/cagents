@@ -101,7 +101,8 @@ enum ViewScopeAuthorities<'a> {
         repositories: HashMap<PathBuf, PathBuf>,
         projects: HashSet<PathBuf>,
     },
-    /// Owned by [`discovery::ViewDiscovery`] between saves.
+    /// Borrowed from the topology [`discovery::ViewDiscovery`] keeps
+    /// between saves.
     Indexed {
         repositories: &'a HashMap<PathBuf, PathBuf>,
         projects: &'a HashSet<PathBuf>,
@@ -1085,27 +1086,6 @@ impl Cagents {
                     .map(|path| (card, path))
             })
             .collect::<Vec<_>>();
-        let scopes = self.discovered_scopes(
-            &topology.authorities,
-            self.active_workspace.as_deref(),
-            worktree_cards.iter().map(|(_, path)| *path),
-        );
-        ScopeDiscovery {
-            scopes,
-            worktree_cards,
-        }
-    }
-
-    /// The scopes `discover_view_scopes_with` finds, given the active
-    /// workspace and the worktree of each card outside a channel, in the
-    /// order it finds them: channels, then listed worktree views, known
-    /// roots, the active workspace and the cards' worktrees.
-    fn discovered_scopes<'a: 'p, 'p>(
-        &'a self,
-        authorities: &ViewScopeAuthorities<'_>,
-        active: Option<&'p Path>,
-        card_paths: impl Iterator<Item = &'p Path>,
-    ) -> Vec<Cow<'a, Scope>> {
         let mut channels = HashSet::new();
         let mut scopes = self
             .durable
@@ -1119,7 +1099,7 @@ impl Cagents {
         let mut worktrees = HashSet::<(&Path, &Path)>::new();
         for view in &self.workspace_model.views {
             if let Scope::Worktree { repository, path } = &view.scope
-                && authorities.contains_repository(repository)
+                && topology.authorities.contains_repository(repository)
                 && worktrees.insert((repository.as_path(), path.as_path()))
             {
                 scopes.push(Cow::Borrowed(&view.scope));
@@ -1128,11 +1108,11 @@ impl Cagents {
         for path in self
             .known_worktree_roots
             .iter()
-            .map(|root| -> &'p Path { root })
-            .chain(active)
-            .chain(card_paths)
+            .map(PathBuf::as_path)
+            .chain(self.active_workspace.as_deref())
+            .chain(worktree_cards.iter().map(|(_, path)| *path))
         {
-            if let Some(repository) = authorities.repository_for(path)
+            if let Some(repository) = topology.authorities.repository_for(path)
                 && worktrees.insert((repository, path))
             {
                 scopes.push(Cow::Owned(Scope::Worktree {
@@ -1141,7 +1121,10 @@ impl Cagents {
                 }));
             }
         }
-        scopes
+        ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        }
     }
 
     #[cfg(test)]

@@ -588,8 +588,8 @@ impl Cagents {
         Ok(())
     }
 
-    /// Every worktree scope, discovered as `discovered_scopes` does, but for
-    /// the active workspace.
+    /// Every worktree scope, discovered as `discover_view_scopes_with` does,
+    /// but for the active workspace.
     fn discover_worktrees(
         &self,
         topology: &Topology,
