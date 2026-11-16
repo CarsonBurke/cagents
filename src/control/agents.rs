@@ -1707,13 +1707,16 @@ fn submitted(
     if let Some(start) = &start {
         human.push_str(&start_phrase(start, interrupt == Some(true), handles));
     }
-    human.push('\n');
-    human.push_str(&super::format::hint(&run_steps(
+    let steps = run_steps(
         &program,
         &handles.name(accepted.agent.id),
         accepted.agent.spec.provider,
         accepted.run.state,
-    )));
+    );
+    if !steps.is_empty() {
+        human.push('\n');
+        human.push_str(&super::format::hint(&steps));
+    }
     let mut data = json!({
         "agent": accepted.agent,
         "run": accepted.run,
@@ -1974,14 +1977,19 @@ fn status_lines(
         lines.push_str(diagnostic);
     }
     // Before the result, which readers of the output take to its end.
-    if hint {
-        lines.push('\n');
-        lines.push_str(&super::format::hint(&run_steps(
+    let steps = if hint {
+        run_steps(
             &super::format::program(),
             &handles.name(agent.id),
             agent.spec.provider,
             run.state,
-        )));
+        )
+    } else {
+        Vec::new()
+    };
+    if !steps.is_empty() {
+        lines.push('\n');
+        lines.push_str(&super::format::hint(&steps));
     }
     if !run.result.text.trim().is_empty() {
         lines.push_str("\n\n");
@@ -1993,7 +2001,11 @@ fn status_lines(
     lines
 }
 
-/// What to run next for an agent whose latest run is in `state`.
+/// What to run next for an agent whose latest run is in `state`, when that
+/// is not obvious: what it asks while it waits for input, and its
+/// conversation once it failed or stopped. A working run is waited on and a
+/// finished one followed up, as every caller knows, and these commands run in
+/// loops, so they print nothing for those.
 fn run_steps(
     program: &str,
     agent: &str,
@@ -2001,32 +2013,21 @@ fn run_steps(
     state: crate::agent_execution::State,
 ) -> Vec<(String, &'static str)> {
     use crate::agent_execution::State;
-    let follow_up = (format!("{program} agent send {agent} PROMPT"), "follows up");
     match state {
-        State::Accepted | State::Running => {
-            vec![(format!("{program} agent wait {agent}"), "waits for it")]
-        }
         State::Waiting => vec![(
             format!("{program} agent requests {agent}"),
             "lists what it asks",
         )],
-        State::Succeeded => vec![
-            follow_up,
-            (format!("{program} agent close {agent}"), "closes it"),
-        ],
         // Omp conversations cannot be read back yet.
         State::Failed | State::Cancelled | State::Interrupted
-            if provider == crate::agent::Provider::Omp =>
+            if provider != crate::agent::Provider::Omp =>
         {
-            vec![follow_up]
-        }
-        State::Failed | State::Cancelled | State::Interrupted => vec![
-            (
+            vec![(
                 format!("{program} transcript {agent}"),
                 "reads its conversation",
-            ),
-            follow_up,
-        ],
+            )]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -4188,40 +4189,34 @@ mod tests {
         let hint = |program: &str, provider, state| {
             super::super::format::hint(&run_steps(program, "1a2b3c4d", provider, state))
         };
+        // What follows a working or finished run goes without saying.
+        for state in [State::Accepted, State::Running, State::Succeeded] {
+            assert!(run_steps("cagents", "1a2b3c4d", Provider::Claude, state).is_empty());
+        }
         assert_eq!(
-            hint("cagents", Provider::Claude, State::Running),
-            "hint: `cagents agent wait 1a2b3c4d` waits for it"
+            hint("cagents --device fw16", Provider::Codex, State::Waiting),
+            "hint: `cagents --device fw16 agent requests 1a2b3c4d` lists what it asks"
         );
-        assert_eq!(
-            hint("cagents", Provider::Codex, State::Waiting),
-            "hint: `cagents agent requests 1a2b3c4d` lists what it asks"
-        );
-        assert_eq!(
-            hint("cagents --device fw16", Provider::Claude, State::Succeeded),
-            "hint: `cagents --device fw16 agent send 1a2b3c4d PROMPT` follows up; \
-             `cagents --device fw16 agent close 1a2b3c4d` closes it"
-        );
-        assert!(
-            hint("cagents", Provider::Claude, State::Interrupted)
-                .starts_with("hint: `cagents transcript 1a2b3c4d` reads its conversation")
-        );
+        for state in [State::Failed, State::Cancelled, State::Interrupted] {
+            assert_eq!(
+                hint("cagents", Provider::Claude, state),
+                "hint: `cagents transcript 1a2b3c4d` reads its conversation"
+            );
+        }
         // An Omp conversation cannot be read back, so none is suggested.
-        assert_eq!(
-            hint("cagents", Provider::Omp, State::Failed),
-            "hint: `cagents agent send 1a2b3c4d PROMPT` follows up"
-        );
+        assert!(run_steps("cagents", "1a2b3c4d", Provider::Omp, State::Failed).is_empty());
         #[cfg(feature = "ui")]
         {
             let status = format!(
-                "agent 1a2b3c4d (claude) run 5e6f7a8b Succeeded\n{}\n\nDone.",
-                hint("cagents", Provider::Claude, State::Succeeded)
+                "agent 1a2b3c4d (claude) run 5e6f7a8b Failed\n{}\n\nDone.",
+                hint("cagents", Provider::Claude, State::Failed)
             );
             let run = read_run(&status).unwrap();
-            assert_eq!(run.state, Some(State::Succeeded));
+            assert_eq!(run.state, Some(State::Failed));
             assert_eq!(run.result, "Done.");
             let accepted = format!(
                 "Accepted agent 1a2b3c4d run 5e6f7a8b\n{}",
-                hint("cagents", Provider::Claude, State::Accepted)
+                hint("cagents", Provider::Claude, State::Waiting)
             );
             assert_eq!(read_run(&accepted).unwrap().agent, "1a2b3c4d");
         }
@@ -4233,9 +4228,10 @@ mod tests {
     fn several_runs_share_one_hint() {
         use crate::agent_execution::State;
         let summaries: Vec<Summary> = [
-            ("1a2b3c4d", State::Succeeded),
-            ("5e6f7a8b", State::Succeeded),
-            ("9c0d1e2f", State::Running),
+            ("1a2b3c4d", State::Failed),
+            ("5e6f7a8b", State::Cancelled),
+            ("9c0d1e2f", State::Waiting),
+            ("0f1e2d3c", State::Succeeded),
         ]
         .into_iter()
         .map(|(agent, state)| {
@@ -4271,9 +4267,8 @@ mod tests {
         let handles = Handles::among(&summaries, &[]);
         assert_eq!(
             super::super::format::hint(&runs_steps("cagents", &statuses, handles)),
-            "hint: `cagents agent send AGENT PROMPT` follows up; \
-             `cagents agent close AGENT` closes it; \
-             `cagents agent wait 9c0d1e2f` waits for it"
+            "hint: `cagents transcript AGENT` reads its conversation; \
+             `cagents agent requests 9c0d1e2f` lists what it asks"
         );
         let status = status_lines(
             &statuses[0].0,

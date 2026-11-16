@@ -43,13 +43,14 @@ project, `agent list` names it once in a closing `(project NAME at PATH)` line
 (just the path when the project is named for its folder), and the DIRECTORY
 column shows each directory relative to it, leaving it out when every agent
 works in the checkout itself. Agents from several projects get a PROJECT
-column and full directories instead. The output of `spawn`, `send`, `status`
-and `wait` puts a `hint:` line after the run's notes and before its result,
-naming what usually comes next: `agent wait` while the run works, `agent
-requests` while it waits for input, `agent send` or `agent close` once it
-succeeds, and `transcript` after it fails or stops (except for Omp, whose
-conversations can't be read yet). A wait on several runs prints one hint
-after them all, with `AGENT` where more than one agent fits.
+column and full directories instead.
+
+A run that needs something from you adds a `hint:` line to the output of
+`spawn`, `send`, `status` and `wait`, after the run's notes and before its
+result: `agent requests` while it waits for input, and `transcript` after it
+fails or stops (except for Omp, whose conversations can't be read yet). A run
+that is working or has succeeded gets none. A wait on several runs prints one
+hint after them all, with `AGENT` where more than one agent fits.
 
 ```text
 AGENT     NAME      PROVIDER  STATE      RUN
