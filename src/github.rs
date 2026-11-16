@@ -359,6 +359,26 @@ pub struct PullRequest {
     pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
 }
 
+/// An open pull request numbered `number`, for tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture_pull_request(number: u64) -> PullRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "PR_1",
+        "number": number,
+        "title": format!("Change {number}"),
+        "body": "",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefName": "feature",
+        "headRefOid": "a".repeat(40),
+        "baseRefName": "main",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "url": format!("https://github.com/o/r/pull/{number}"),
+    }))
+    .unwrap()
+}
+
 /// The two real GraphQL check variants returned in `gh pr list`'s rollup.
 /// Keep conclusions distinct from execution status so a completed failure
 /// cannot accidentally become a passing check.
@@ -484,6 +504,22 @@ pub struct PullRequestCheck {
     pub state: RemoteValue,
     #[serde(default)]
     pub workflow: String,
+}
+
+impl PullRequestCheck {
+    /// The check's actual state. gh's coarse buckets treat cancellation as
+    /// failure and skips as passes, so inspect those conclusions first.
+    pub fn work_state(&self) -> Option<crate::work::CheckState> {
+        use crate::work::CheckState;
+        match (self.state.0.as_str(), self.bucket.0.as_str()) {
+            ("CANCELLED", _) => Some(CheckState::Cancelled),
+            ("SKIPPED", _) => Some(CheckState::Skipped),
+            (_, "pass") => Some(CheckState::Passed),
+            (_, "fail") => Some(CheckState::Failed),
+            (_, "pending") => Some(CheckState::Pending),
+            _ => None,
+        }
+    }
 }
 
 /// Read-only inspector data. A failed section remains an error, never an empty
@@ -1398,7 +1434,7 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
-    pub(crate) fn refresh_succeeded(&self) -> bool {
+    pub fn refresh_succeeded(&self) -> bool {
         !matches!(self, Self::Failed { .. } | Self::RateLimited { .. })
     }
 

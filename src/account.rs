@@ -1,15 +1,15 @@
 //! Provider accounts and the usage limits each one is working against.
 //!
 //! An account is a provider plus the home directory its CLI keeps its login
-//! in. Everything cagents knows about one comes from that CLI: its identity
+//! in. Ordinary account metadata comes from that CLI: its identity
 //! from `claude auth status` or Codex's `account/read`, and its limits from
 //! Claude's `get_usage` control request or Codex's `account/rateLimits/read`.
 //! Omp keeps several logins of its own and picks between them itself; its
 //! accounts, and their limits, come from the usage record it keeps.
-//! cagents never opens a credential file and never talks to a provider's
-//! service itself - a subscription login belongs to the provider's own client,
-//! and the account model below holds only the non-secret metadata those
-//! clients chose to report.
+//! The reset transport is a narrow exception for Claude's private reset API:
+//! it reads the stored subscription bearer in memory and never copies or
+//! refreshes it. Login remains owned by the provider CLI. The account model
+//! contains only non-secret metadata.
 //!
 //! The model is shared by every lane. The parsers are pure functions over the
 //! JSON a CLI printed, so they are fixture-tested here. A running native chat
@@ -37,6 +37,8 @@ pub mod info;
 pub mod login;
 pub mod omp;
 pub mod preferences;
+pub mod resets;
+pub use resets::{ResetKind, ResetScope, UsageReset};
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -203,10 +205,7 @@ pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
 /// Expand only on the device that owns the account registry. An absolute
 /// remainder after ~/ would replace HOME during Path::join, so reject it first.
 #[cfg(any(feature = "ui", feature = "host", test))]
-pub(crate) fn expand_linked_home(
-    value: &str,
-    home: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, String> {
+pub fn expand_linked_home(value: &str, home: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
     validate_linked_home_operand(value)?;
     let path = if let Some(relative) = value.strip_prefix("~/") {
         PathBuf::from(home.ok_or("HOME is unavailable")?).join(relative)
@@ -232,7 +231,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
 /// stored login. Keep this list explicit: cloud credentials may still be needed
 /// by the agent's tools, and account-local configuration remains user-owned.
 /// See docs/user-guide.md, "Account credential isolation", for provider sources.
-pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str] {
+pub fn credential_overrides(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &[
             "ANTHROPIC_API_KEY",
@@ -737,8 +736,8 @@ impl Account {
 pub struct Identity {
     pub email: Option<String>,
     pub organization: Option<String>,
-    /// The provider's plan identifier (`max`, `prolite`), not a display name;
-    /// see [`plan_label`].
+    /// The reported plan name, or a legacy subscription identifier.
+    /// Older providers may supply only an identifier; see [`plan_label`].
     pub plan: Option<String>,
     /// The login another record of the same credentials names, when the
     /// records disagree.
@@ -979,7 +978,9 @@ pub struct Credits {
     pub unlimited: bool,
     pub used: Option<Money>,
     pub limit: Option<Money>,
-    /// A balance the provider reports as preformatted text.
+    /// Codex's credit balance, as the text it reports: a decimal count of
+    /// credits, such as `23292.7457325000`. [`Credits::summary`] writes it
+    /// as Codex does.
     pub balance: Option<String>,
     /// The fraction of a spending limit used, where there is one.
     pub used_fraction: Option<f32>,
@@ -997,13 +998,49 @@ impl Credits {
         match (&self.used, &self.limit, &self.balance) {
             (Some(used), Some(limit), _) => format!("{used} of {limit} used"),
             (Some(used), None, _) => format!("{used} used"),
-            (None, _, Some(balance)) => format!("{balance} left"),
+            (None, _, Some(balance)) => format!("{} left", credit_balance(balance)),
             (None, _, None) => match self.used_fraction {
                 Some(used) => format!("{:.0}% used", used * 100.0),
                 None => "On".into(),
             },
         }
     }
+}
+
+/// A reported credit balance as Codex's own status shows it: whole credits,
+/// here with thousands separated, so `23292.7457325000` is `23,293 credits`.
+/// A fraction of one is not rounded away to nothing, and a balance that is
+/// not a number is shown as it came.
+fn credit_balance(reported: &str) -> String {
+    let Some(credits) = reported
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|credits| credits.is_finite())
+    else {
+        return reported.to_owned();
+    };
+    if credits > 0.0 && credits < 0.5 {
+        return "Under 1 credit".into();
+    }
+    let whole = credits.round();
+    let digits = format!("{:.0}", whole.abs());
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if whole < 0.0 {
+        grouped.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    let unit = if whole.abs() == 1.0 {
+        "credit"
+    } else {
+        "credits"
+    };
+    format!("{grouped} {unit}")
 }
 
 /// How an account stands against its limits.
@@ -1038,6 +1075,8 @@ pub enum UsageSource {
 /// Everything known about an account's limits at one moment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
+    #[serde(default)]
+    pub resets: Vec<UsageReset>,
     pub windows: Vec<UsageWindow>,
     pub credits: Option<Credits>,
     pub status: UsageStatus,
@@ -1050,6 +1089,12 @@ pub struct UsageSnapshot {
     pub source: UsageSource,
     /// The plan the usage response named, where it named one.
     pub plan: Option<String>,
+    /// The provider's literal display name, kept separate from legacy labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_display_name: Option<String>,
+    /// Reported allowance tier for details; never used to invent a plan name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
     /// Why a snapshot has no figures, in the provider's or cagents' words.
     pub detail: Option<String>,
 }
@@ -1063,12 +1108,15 @@ impl UsageSnapshot {
     pub fn state(status: UsageStatus, detail: impl Into<String>, observed_at: u64) -> Self {
         Self {
             windows: Vec::new(),
+            resets: Vec::new(),
             credits: None,
             status,
             ordinary_usage_allowed: None,
             observed_at,
             source: UsageSource::Probe,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: Some(detail.into()),
         }
     }
@@ -1224,16 +1272,20 @@ pub fn plan_label(plan: &str) -> String {
         "prolite" => "Pro Lite".into(),
         "edu_plus" => "Edu Plus".into(),
         "edu_pro" => "Edu Pro".into(),
-        other => humanize(other),
+        // Underscores identify older machine names. Otherwise preserve the
+        // provider's punctuation and capitalization within its display name.
+        other => humanize_words(other, &['_', ' ']),
     }
 }
 
 /// `weekly_scoped` as `Weekly scoped`: a provider's identifier made legible
 /// for the one place it has to be shown verbatim.
 pub fn humanize(identifier: &str) -> String {
-    let mut words = identifier
-        .split(['_', '-', ' '])
-        .filter(|word| !word.is_empty());
+    humanize_words(identifier, &['_', '-', ' '])
+}
+
+fn humanize_words(identifier: &str, separators: &[char]) -> String {
+    let mut words = identifier.split(separators).filter(|word| !word.is_empty());
     let mut label = String::with_capacity(identifier.len());
     if let Some(first) = words.next() {
         let mut characters = first.chars();
@@ -1509,6 +1561,7 @@ mod tests {
 
     fn snapshot(windows: Vec<UsageWindow>) -> UsageSnapshot {
         UsageSnapshot {
+            resets: Vec::new(),
             windows,
             credits: None,
             status: UsageStatus::Ok,
@@ -1516,6 +1569,8 @@ mod tests {
             observed_at: 0,
             source: UsageSource::Probe,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         }
     }
@@ -2105,6 +2160,9 @@ mod tests {
         assert_eq!(humanize(""), "");
         assert_eq!(plan_label("prolite"), "Pro Lite");
         assert_eq!(plan_label("team"), "Team");
+        assert_eq!(plan_label("Max 20x"), "Max 20x");
+        assert_eq!(plan_label("Ultra"), "Ultra");
+        assert_eq!(plan_label("Fixture-Horizon 37x"), "Fixture-Horizon 37x");
         assert_eq!(span_label(300 * 60), "5h");
         assert_eq!(span_label(10_080 * 60), "Weekly");
         assert_eq!(span_label(30 * 86_400), "30d");
@@ -2138,6 +2196,31 @@ mod tests {
         assert_eq!(off.summary(), "Off");
     }
 
+    /// Codex reports its credit balance as a bare decimal count of credits.
+    #[test]
+    fn a_credit_balance_is_whole_credits() {
+        let left = |balance: &str| {
+            Credits {
+                enabled: true,
+                unlimited: false,
+                used: None,
+                limit: None,
+                balance: Some(balance.into()),
+                used_fraction: None,
+            }
+            .summary()
+        };
+        assert_eq!(left("23292.7457325000"), "23,293 credits left");
+        assert_eq!(left("1234567"), "1,234,567 credits left");
+        assert_eq!(left("999.4"), "999 credits left");
+        assert_eq!(left("12.50"), "13 credits left");
+        assert_eq!(left("1"), "1 credit left");
+        assert_eq!(left("0.2"), "Under 1 credit left");
+        assert_eq!(left("0"), "0 credits left");
+        assert_eq!(left("-3.6"), "-4 credits left");
+        assert_eq!(left("$12.34"), "$12.34 left");
+    }
+
     #[test]
     fn a_moment_is_named_relative_to_today() {
         let now = 1_790_119_800;
@@ -2164,6 +2247,7 @@ mod tests {
             })
         };
         let reading = |observed_at| UsageSnapshot {
+            resets: Vec::new(),
             windows: vec![window("five_hour", WindowKind::Session, 0.1, None)],
             credits: None,
             status: UsageStatus::Ok,
@@ -2171,6 +2255,8 @@ mod tests {
             observed_at,
             source: UsageSource::Probe,
             plan: Some("max".into()),
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         };
 
@@ -2204,11 +2290,9 @@ mod tests {
     }
 }
 
-/// The policy boundary this module is built on, held as a test: no source
-/// file may name a provider's credential store or token fields, or a
-/// provider's service endpoints. A subscription login belongs to the
-/// provider's own client; cagents learns about an account only by asking
-/// that client.
+/// Provider credentials and service endpoints stay inside the explicit
+/// Claude reset transport exception. Ordinary account metadata and all
+/// other provider operations continue to use the provider's own client.
 #[cfg(test)]
 mod credential_guard {
     //! A tripwire, not a proof: a determined change can spell a needle so it
@@ -2319,6 +2403,11 @@ mod credential_guard {
         let forbidden = forbidden();
         let mut violations = Vec::new();
         for file in files {
+            // Explicitly authorized private Claude reset adapter. Keep all
+            // credential discovery and provider HTTP in this one boundary.
+            if file.ends_with("src/account/probe/reset_transport.rs") {
+                continue;
+            }
             // This documented Codex setting selects storage; naming it does
             // not access Omp's similarly named credential table.
             let mut text = std::fs::read_to_string(&file)
@@ -2334,7 +2423,7 @@ mod credential_guard {
             }
             // The Accounts install action opens this fixed documentation page
             // in a browser. It does not read credentials or call a service API.
-            if file.ends_with("src/app/account_ui.rs") {
+            if file.ends_with("crates/cagents-ui/src/app/account_ui.rs") {
                 let documentation = ["https://developers.open", "ai.com/codex/cli/"].concat();
                 text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
             }

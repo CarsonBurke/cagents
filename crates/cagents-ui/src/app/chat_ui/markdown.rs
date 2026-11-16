@@ -1,0 +1,3171 @@
+//! Native Markdown model and parser, without discarded widget highlighting.
+//!
+//! Adapted from iced_widget/src/markdown.rs at libcosmic revision
+//! caec74c2559924443f12fc6faf97a5bcefe6271d. Rendering remains in prose.rs.
+//! Keeping the parser model here exposes cheap logical text/byte ranges to
+//! selection and virtualization without forcing styled spans for hidden rows.
+/*
+Copyright 2019 Héctor Ramón, Iced contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+use super::pull_request_links;
+use crate::ui_controls::WorktreePullRequestState;
+use cosmic::iced::widget::{span, text};
+use cosmic::iced::{Font, font};
+pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
+#[cfg(test)]
+use std::cell::Cell;
+use std::{
+    borrow::BorrowMut,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    mem,
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
+use unicase::UniCase;
+pub type Uri = Arc<str>;
+
+/// A bunch of Markdown that has been parsed.
+#[derive(Debug, Default, Clone)]
+pub struct Content {
+    items: Vec<Item>,
+    incomplete: HashMap<usize, Section>,
+    state: State,
+    open_fence: Option<OpenFence>,
+    open_plain: bool,
+    /// Raw EOF spaces become rendered only when later nonspace arrives.
+    pending_spaces: usize,
+    // A partially typed table row can temporarily parse as a following
+    // paragraph. Keep both items in the unfinished source until separated.
+    reparse_items: usize,
+    #[cfg(test)]
+    parsed_bytes: usize,
+    #[cfg(test)]
+    disposal: Option<Arc<Disposal>>,
+}
+#[cfg(test)]
+#[derive(Debug)]
+struct Disposal(std::sync::mpsc::Sender<std::thread::ThreadId>);
+#[cfg(test)]
+impl Drop for Disposal {
+    fn drop(&mut self) {
+        let _ = self.0.send(std::thread::current().id());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Section {
+    // One raw CommonMark unit may produce several display items (images
+    // surrounded by text). Rebuild the whole unit exactly once.
+    items: usize,
+    content: String,
+    references: HashSet<ReferenceLabel>,
+}
+
+impl Content {
+    #[cfg(test)]
+    pub(super) fn has_open_fence_for_test(&self) -> bool {
+        self.open_fence.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn parsed_work_bytes(&self) -> usize {
+        self.parsed_bytes
+    }
+
+    /// Creates a new empty [`Content`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates some new [`Content`] by parsing the given Markdown.
+    pub fn parse(markdown: &str) -> Self {
+        Self::parse_labelled(markdown, Arc::default())
+    }
+
+    /// Parses `markdown` with its pull request links read as `labels` say.
+    pub(super) fn parse_labelled(markdown: &str, labels: Arc<pull_request_links::Labels>) -> Self {
+        let mut content = Self::new();
+        content.state.labels = labels;
+        content.push_str(markdown);
+        content
+    }
+
+    /// How text parsed from now on reads its pull request links. What was
+    /// parsed already keeps its labels; a caller whose labels changed for
+    /// what it holds parses it again.
+    pub(super) fn set_labels(&mut self, labels: Arc<pull_request_links::Labels>) {
+        self.state.labels = labels;
+    }
+
+    pub(super) fn labels(&self) -> &Arc<pull_request_links::Labels> {
+        &self.state.labels
+    }
+
+    /// Append source while retaining completed parsed blocks. The unfinished
+    /// block may be reparsed; syntax-free paragraphs and open top-level fences
+    /// have specialized append paths. This does not promise linear work for
+    /// every growing CommonMark document.
+    pub fn push_str(&mut self, markdown: &str) {
+        if markdown.is_empty() {
+            return;
+        }
+
+        // A syntax-free single-line paragraph cannot change interpretation
+        // while more ordinary text arrives. Delimiters/newlines return to the
+        // CommonMark path, including markers split across provider deltas.
+        // A colon can make the word being written a bare reference that
+        // `linked` turns into a link, so that word is parsed again.
+        if self.open_plain
+            && markdown.chars().all(plain_character)
+            && !markdown.contains(':')
+            && let Some(Item::Paragraph(text)) = self.items.last_mut()
+        {
+            let suffix = visible_suffix(markdown, &mut self.pending_spaces);
+            self.state.leftover.push_str(markdown);
+            if !suffix.is_empty() {
+                text.append_plain(&suffix);
+            }
+            return;
+        }
+        self.open_plain = false;
+
+        // Once a top-level fence is open, its body has no Markdown syntax.
+        // Append directly until a possible closing line requires the parser.
+        if !markdown.contains(['\r', '\0'])
+            && let Some(mut fence) = self.open_fence.take()
+            && !fence.advance(markdown)
+            && let Some(Item::CodeBlock {
+                code,
+                reader_source,
+                source,
+                ..
+            }) = self.items.last_mut()
+        {
+            self.state.leftover.push_str(markdown);
+            reader_source.append(code, markdown);
+            let mut appended = String::with_capacity(code.len() + markdown.len());
+            appended.push_str(code);
+            appended.push_str(markdown);
+            *code = Arc::from(appended);
+            *source = code.clone();
+            self.open_fence = Some(fence);
+            return;
+        }
+        self.open_fence = None;
+        // Append to last leftover text
+        let mut leftover = std::mem::take(&mut self.state.leftover);
+        leftover.push_str(markdown);
+
+        let input = if leftover.trim_end().ends_with('|') {
+            leftover.trim_end().trim_end_matches('|')
+        } else {
+            leftover.as_str()
+        };
+
+        #[cfg(test)]
+        {
+            self.parsed_bytes += input.len();
+            PARSER_WORK_BYTES.with(|bytes| bytes.set(bytes.get() + input.len()));
+        }
+        // Retain only enough prior parser state to prove a rendered styled
+        // prefix after reparsing. Raw-source append alone is insufficient.
+        let reparse = self.reparse_items.min(self.items.len());
+        let previous_index = self.items.len().saturating_sub(reparse);
+        let previous = (reparse == 1).then(|| self.items.pop()).flatten();
+        self.items.truncate(previous_index);
+        self.incomplete.retain(|index, _| *index < previous_index);
+        let mut table_tail = None;
+        let input_origin = self.state.leftover_origin;
+        let previous_references = self.state.references.clone();
+
+        // Re-parse the unfinished source, including a table whose next row
+        // was not yet recognizable at the preceding publication boundary.
+        let mut last_unit_items = 0;
+        for (unit, source, references) in parse_with(&mut self.state, input, Some(input_origin)) {
+            let start = source.as_ptr().addr() - input.as_ptr().addr();
+            if matches!(unit.as_slice(), [Item::Table { .. }]) {
+                table_tail = Some((self.items.len(), start));
+            } else if table_tail.is_some() {
+                let prefix = input[..start].strip_suffix('\n').unwrap_or(&input[..start]);
+                let separated = prefix
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.trim().is_empty());
+                if separated || !matches!(unit.as_slice(), [Item::Paragraph(_)]) {
+                    table_tail = None;
+                }
+            }
+            if !references.is_empty() {
+                self.incomplete.insert(
+                    self.items.len(),
+                    Section {
+                        items: unit.len(),
+                        content: source.to_owned(),
+                        references,
+                    },
+                );
+            }
+            last_unit_items = unit.len();
+            self.items.extend(unit);
+        }
+
+        self.reparse_items = last_unit_items;
+        if self.reparse_items == 0 {
+            // Definitions and metadata can consume raw source without
+            // producing a widget. Keep that tail, but do not remove a prior
+            // completed block when the next provider delta arrives.
+            self.state.leftover = input.to_owned();
+            self.state.leftover_origin = input_origin;
+        }
+        if let Some((index, start)) = table_tail {
+            let count = self.items.len() - index;
+            if count > 1 {
+                self.state.leftover = input[start..].to_owned();
+                self.state.leftover_origin = input_origin + start;
+                self.reparse_items = count;
+            }
+        }
+        self.state.leftover.push_str(&leftover[input.len()..]);
+
+        self.open_fence = self.items.last().and_then(|item| {
+            let Item::CodeBlock { code, .. } = item else {
+                return None;
+            };
+            OpenFence::detect(&self.state.leftover, code)
+        });
+
+        let rendered_source = self.state.leftover.trim_end_matches(' ');
+        self.pending_spaces = self.state.leftover.len() - rendered_source.len();
+        self.open_plain = self
+            .state
+            .leftover
+            .chars()
+            .next()
+            .is_some_and(char::is_alphabetic)
+            && self.state.leftover.chars().all(plain_character)
+            && !self
+                .state
+                .leftover
+                .rsplit(' ')
+                .next()
+                .is_some_and(|word| word.contains(':'))
+            && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
+
+        // A reference destination/title may grow, disappear, or be shadowed
+        // while its definition is unfinished. Keep dependent sections even
+        // after their first resolution and update them from exact current
+        // definitions, including changes in their number of rendered items.
+        let changed = previous_references
+            .keys()
+            .chain(self.state.references.keys())
+            .filter(|label| previous_references.get(*label) != self.state.references.get(*label))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut previous_index = previous_index;
+        if !changed.is_empty() {
+            let old_tail = previous_index;
+            let mut sections = std::mem::take(&mut self.incomplete);
+            let mut rebuilt = Vec::with_capacity(self.items.len());
+            let mut old_items = std::mem::take(&mut self.items).into_iter().enumerate();
+            while let Some((index, item)) = old_items.next() {
+                let section = sections.remove(&index);
+                if index < old_tail
+                    && section.as_ref().is_some_and(|section| {
+                        section
+                            .references
+                            .iter()
+                            .any(|label| changed.contains(label))
+                    })
+                {
+                    let section = section.unwrap();
+                    for _ in 1..section.items {
+                        old_items.next().expect("complete raw unit items");
+                    }
+                    #[cfg(test)]
+                    {
+                        self.parsed_bytes += section.content.len();
+                        PARSER_WORK_BYTES
+                            .with(|bytes| bytes.set(bytes.get() + section.content.len()));
+                    }
+                    let mut state = State {
+                        references: self.state.references.clone(),
+                        labels: self.state.labels.clone(),
+                        ..State::default()
+                    };
+                    let before = rebuilt.len();
+                    for (unit, source, references) in parse_with(&mut state, &section.content, None)
+                    {
+                        if !references.is_empty() {
+                            self.incomplete.insert(
+                                rebuilt.len(),
+                                Section {
+                                    items: unit.len(),
+                                    content: source.to_owned(),
+                                    references,
+                                },
+                            );
+                        }
+                        rebuilt.extend(unit);
+                    }
+                    previous_index = previous_index + rebuilt.len() - before - section.items;
+                } else {
+                    if let Some(section) = section {
+                        self.incomplete.insert(rebuilt.len(), section);
+                    }
+                    rebuilt.push(item);
+                }
+            }
+            self.items = rebuilt;
+            self.state.images.clear();
+            collect_images(&self.items, &mut self.state.images);
+        }
+        if let (Some(previous), Some(current)) =
+            (previous.as_ref(), self.items.get_mut(previous_index))
+        {
+            match (previous, current) {
+                (Item::Paragraph(previous), Item::Paragraph(current)) => {
+                    current.record_prefix(previous)
+                }
+                (Item::Heading(old_level, previous), Item::Heading(level, current))
+                    if old_level == level =>
+                {
+                    current.record_prefix(previous)
+                }
+                (
+                    Item::CodeBlock {
+                        language: old_language,
+                        code: old,
+                        reader_source: previous,
+                        ..
+                    },
+                    Item::CodeBlock {
+                        language,
+                        code,
+                        reader_source,
+                        ..
+                    },
+                ) if old_language == language => {
+                    **reader_source = super::reader_source::Source::updated(previous, old, code);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Release parser-only source after its publication has finished. The
+    /// owning normalizer forces a complete restart before another append.
+    pub(super) fn discard_continuation(&mut self) {
+        self.state.leftover = String::new();
+        self.state.references = Arc::default();
+        self.incomplete = HashMap::new();
+        self.open_fence = None;
+        self.open_plain = false;
+        self.pending_spaces = 0;
+        self.reparse_items = 0;
+    }
+
+    /// A document can own substantial references or unfinished input without
+    /// producing a single rendered item. Cache disposal must account for all
+    /// these owners, using constant-time container checks.
+    pub(super) fn has_retained_allocations(&self) -> bool {
+        self.items.capacity() != 0
+            || self.incomplete.capacity() != 0
+            || self.state.leftover.capacity() != 0
+            || self.state.references.capacity() != 0
+            || self.state.images.capacity() != 0
+            || self.open_fence.is_some()
+    }
+    #[cfg(test)]
+    pub(super) fn watch_disposal(
+        &mut self,
+        sender: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    ) {
+        self.disposal = Some(Arc::new(Disposal(sender)));
+    }
+
+    #[cfg(test)]
+    pub(super) fn watch_first_raw_spans(
+        &mut self,
+        disposed: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+    ) -> usize {
+        let Some(Item::Paragraph(text)) = self.items.first_mut() else {
+            panic!("a real paragraph owns the observed raw spans")
+        };
+        text.watch_raw_spans(disposed);
+        text.len()
+    }
+    #[cfg(test)]
+    pub(super) fn reference_count(&self) -> usize {
+        self.state.references.len()
+    }
+
+    /// Returns the Markdown items, ready to be rendered.
+    ///
+    /// You can use [`view`] to turn them into an [`Element`].
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// Returns the URLs of the Markdown images present in the [`Content`].
+    pub fn images(&self) -> &HashSet<Uri> {
+        &self.state.images
+    }
+}
+
+/// CommonMark discards ASCII spaces at paragraph EOF. Keep them in raw source
+/// and publish them only when a subsequent nonspace makes them interior text.
+fn visible_suffix(suffix: &str, pending: &mut usize) -> String {
+    let visible = suffix.trim_end_matches(' ');
+    if visible.is_empty() {
+        *pending += suffix.len();
+        return String::new();
+    }
+    let mut result = String::with_capacity(*pending + visible.len());
+    result.extend(std::iter::repeat_n(' ', *pending));
+    result.push_str(visible);
+    *pending = suffix.len() - visible.len();
+    result
+}
+
+fn plain_character(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            ' ' | '.' | ',' | ':' | ';' | '?' | '!' | '/' | '(' | ')' | '=' | '+' | '-'
+        )
+}
+
+/// Only a zero-indented top-level fence is fast-pathed. Nested/indented
+/// fences, CRLF and parser-normalized content retain the general parser path.
+#[derive(Debug, Clone)]
+struct OpenFence {
+    marker: u8,
+    length: usize,
+    leading: usize,
+    markers: usize,
+    trailing: bool,
+    other: bool,
+}
+impl OpenFence {
+    fn detect(source: &str, code: &str) -> Option<Self> {
+        let (header, body) = source.split_once('\n')?;
+        let marker = *header.as_bytes().first()?;
+        if !matches!(marker, b'`' | b'~') || body.contains(['\r', '\0']) || body != code {
+            return None;
+        }
+        let length = header.bytes().take_while(|byte| *byte == marker).count();
+        if length < 3 {
+            return None;
+        }
+        let mut fence = Self {
+            marker,
+            length,
+            leading: 0,
+            markers: 0,
+            trailing: false,
+            other: false,
+        };
+        if fence.advance(body) {
+            None
+        } else {
+            Some(fence)
+        }
+    }
+    /// A possible closing fence delegates the complete block to CommonMark;
+    /// otherwise only finite line-prefix state is needed across appends.
+    fn advance(&mut self, text: &str) -> bool {
+        for byte in text.bytes() {
+            if byte == b'\n' {
+                if !self.other && self.markers >= self.length {
+                    return true;
+                }
+                self.leading = 0;
+                self.markers = 0;
+                self.trailing = false;
+                self.other = false;
+            } else if !self.other {
+                if self.markers == 0 && byte == b' ' && self.leading < 3 {
+                    self.leading += 1;
+                } else if byte == self.marker && !self.trailing {
+                    self.markers += 1;
+                } else if matches!(byte, b' ' | b'\t') && self.markers > 0 {
+                    self.trailing = true;
+                } else {
+                    self.other = true;
+                }
+            }
+        }
+        !self.other && self.markers >= self.length
+    }
+}
+
+#[cfg(test)]
+thread_local! { static ITEM_CLONES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn cloned_items() -> usize {
+    ITEM_CLONES.with(Cell::get)
+}
+
+/// A Markdown item.
+#[derive(Debug)]
+#[cfg_attr(not(test), derive(Clone))]
+pub enum Item {
+    /// A heading.
+    Heading(pulldown_cmark::HeadingLevel, Text),
+    /// A paragraph.
+    Paragraph(Text),
+    /// A code block. Highlighting is prepared only by the native renderer.
+    CodeBlock {
+        /// The language of the code block, if any.
+        language: Option<String>,
+        /// The raw code of the code block.
+        code: Arc<str>,
+        /// Immutable display input prepared once with this parser revision.
+        source: Arc<str>,
+        /// The styled lines of text in the code block.
+        lines: Vec<Text>,
+        /// Stable source digest and bounded append proof for nested reader geometry.
+        reader_source: Box<super::reader_source::Source>,
+    },
+    /// A list.
+    List {
+        /// The first number of the list, if it is ordered.
+        start: Option<u64>,
+        /// The items of the list.
+        bullets: Vec<Bullet>,
+    },
+    /// An image.
+    Image {
+        /// The destination URL of the image.
+        url: Uri,
+        /// The title of the image.
+        title: String,
+        /// Literal title text prepared alongside the image, never parsed as Markdown.
+        title_text: Box<Text>,
+        /// The alternative text of the image.
+        alt: Box<Text>,
+    },
+    /// A quote.
+    Quote(Vec<Item>),
+    /// A horizontal separator.
+    Rule,
+    /// A table.
+    Table {
+        /// The columns of the table.
+        columns: Vec<Column>,
+        /// The rows of the table.
+        rows: Vec<Row>,
+    },
+}
+
+#[cfg(test)]
+impl Clone for Item {
+    fn clone(&self) -> Self {
+        ITEM_CLONES.with(|count| count.set(count.get() + 1));
+        match self {
+            Self::Heading(level, text) => Self::Heading(*level, text.clone()),
+            Self::Paragraph(text) => Self::Paragraph(text.clone()),
+            Self::CodeBlock {
+                language,
+                code,
+                source,
+                lines,
+                reader_source,
+            } => Self::CodeBlock {
+                language: language.clone(),
+                code: code.clone(),
+                source: source.clone(),
+                lines: lines.clone(),
+                reader_source: reader_source.clone(),
+            },
+            Self::List { start, bullets } => Self::List {
+                start: *start,
+                bullets: bullets.clone(),
+            },
+            Self::Image {
+                url,
+                title,
+                title_text,
+                alt,
+            } => Self::Image {
+                url: url.clone(),
+                title: title.clone(),
+                title_text: title_text.clone(),
+                alt: alt.clone(),
+            },
+            Self::Quote(items) => Self::Quote(items.clone()),
+            Self::Rule => Self::Rule,
+            Self::Table { columns, rows } => Self::Table {
+                columns: columns.clone(),
+                rows: rows.clone(),
+            },
+        }
+    }
+}
+
+/// The column of a table.
+#[derive(Debug, Clone)]
+pub struct Column {
+    /// The header of the column.
+    pub header: Vec<Item>,
+    /// The alignment of the column.
+    pub alignment: pulldown_cmark::Alignment,
+}
+
+/// The row of a table.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// The cells of the row.
+    pub cells: Vec<Vec<Item>>,
+}
+
+#[cfg(test)]
+thread_local! { static PARSER_WORK_BYTES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn parser_work_bytes_on_thread() -> usize {
+    PARSER_WORK_BYTES.with(Cell::get)
+}
+
+#[cfg(test)]
+thread_local! { static MATERIALIZED_BYTES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn materialized_bytes() -> usize {
+    MATERIALIZED_BYTES.with(Cell::get)
+}
+
+/// A bunch of parsed Markdown text.
+#[derive(Debug, Clone)]
+pub struct Text {
+    spans: Arc<Spans>,
+    plain: std::cell::OnceCell<Arc<str>>,
+    plain_source: std::cell::OnceCell<Box<super::reader_source::Source>>,
+    // Most parsed nodes are never styled. Keep the large Style and empty
+    // Arc allocation out of every cold Text (and therefore every Item).
+    styled_cache: RefCell<Option<Box<StyledCache>>>,
+    lineage: Arc<std::sync::Mutex<StyledLineage>>,
+}
+#[derive(Debug, Clone)]
+struct StyledCache {
+    style: Style,
+    spans: Arc<[text::Span<'static, Uri>]>,
+}
+
+#[derive(Debug, Default)]
+struct StyledLineage {
+    edges: std::collections::VecDeque<(std::sync::Weak<Spans>, std::sync::Weak<Spans>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attributes {
+    strikethrough: bool,
+    strong: bool,
+    emphasis: bool,
+    code: bool,
+}
+#[derive(Debug, Clone)]
+struct Run {
+    end: usize,
+    link: Option<Uri>,
+    attributes: Attributes,
+    /// What this run is of a pull request link shown by its label.
+    inline: Option<Inline>,
+}
+
+/// The parts of a pull request link that its label replaces the address
+/// with. See [`super::pull_request_links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inline {
+    /// The room the link's state glyph is drawn in, when its state is known.
+    Glyph(WorktreePullRequestState),
+    /// The reference and title that stand for the address.
+    Label,
+}
+
+/// Where a paragraph's pull request links put their glyphs, and what Copy
+/// gives for the text that stands in for their addresses.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Inlines {
+    /// The span each glyph is drawn over, in span order.
+    pub(super) glyphs: Box<[(usize, WorktreePullRequestState)]>,
+    /// Shown text that copies as something else, in text order: a label
+    /// copies as its address, and a glyph's room as nothing.
+    pub(super) copies: Box<[(Range<usize>, Uri)]>,
+    /// The spans of each link and what hovering it says, in span order.
+    pub(super) tips: Box<[(Range<usize>, Arc<str>)]>,
+}
+
+impl Inlines {
+    /// What hovering the link drawn by span `index` says.
+    pub(super) fn tip(&self, index: usize) -> Option<&Arc<str>> {
+        let at = self.tips.partition_point(|(spans, _)| spans.end <= index);
+        self.tips
+            .get(at)
+            .filter(|(spans, _)| spans.contains(&index))
+            .map(|(_, tip)| tip)
+    }
+    /// `plain[range]` as Copy gives it. A label any part of which is
+    /// selected copies whole, as its address, since a part of it names no
+    /// pull request.
+    pub(super) fn copy(&self, plain: &str, range: Range<usize>) -> String {
+        let first = self.copies.partition_point(|(at, _)| at.end <= range.start);
+        let mut copied = String::with_capacity(range.len());
+        let mut from = range.start;
+        for (at, copy) in self.copies[first..]
+            .iter()
+            .take_while(|(at, _)| at.start < range.end)
+        {
+            if from < at.start {
+                copied.push_str(&plain[from..at.start]);
+            }
+            copied.push_str(copy);
+            from = at.end;
+        }
+        if from < range.end {
+            copied.push_str(&plain[from..range.end]);
+        }
+        copied
+    }
+}
+
+#[derive(Debug)]
+struct Spans {
+    // Keep this growable: syntax-free streaming appends to this buffer.
+    text: String,
+    runs: Box<[Run]>,
+    /// Present when a pull request link is shown by its label.
+    inlines: Option<Arc<Inlines>>,
+    #[cfg(test)]
+    disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
+}
+impl Clone for Spans {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            runs: self.runs.clone(),
+            inlines: self.inlines.clone(),
+            #[cfg(test)]
+            disposed: None,
+        }
+    }
+}
+impl Spans {
+    fn new(spans: Vec<Span>) -> Self {
+        let bytes = spans.iter().map(|span| span.text().len()).sum::<usize>();
+        let mut runs = Vec::with_capacity(spans.len());
+        let mut spans = spans.into_iter();
+        let mut text = String::new();
+        if let Some(Span::Standard {
+            text: first,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        }) = spans.next()
+        {
+            text = first;
+            text.reserve_exact(bytes - text.len());
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+                inline: None,
+            });
+        }
+        for Span::Standard {
+            text: next,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        } in spans
+        {
+            text.push_str(&next);
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+                inline: None,
+            });
+        }
+        Self {
+            text,
+            runs: runs.into_boxed_slice(),
+            inlines: None,
+            #[cfg(test)]
+            disposed: None,
+        }
+    }
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
+    fn span(&self, index: usize) -> SpanRef<'_> {
+        let start = if index == 0 {
+            0
+        } else {
+            self.runs[index - 1].end
+        };
+        let run = &self.runs[index];
+        SpanRef {
+            text: &self.text[start..run.end],
+            run,
+        }
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = SpanRef<'_>> {
+        (0..self.runs.len()).map(|index| self.span(index))
+    }
+}
+#[cfg(test)]
+impl Drop for Spans {
+    fn drop(&mut self) {
+        let bytes = self.text.len();
+        // Observe disposal of the actual text and run owners.
+        drop(std::mem::take(&mut self.text));
+        drop(std::mem::take(&mut self.runs));
+        if let Some(disposed) = self.disposed.take() {
+            let _ = disposed.send((std::thread::current().id(), bytes));
+        }
+    }
+}
+struct SpanRef<'a> {
+    text: &'a str,
+    run: &'a Run,
+}
+impl std::fmt::Debug for SpanRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Standard")
+            .field("text", &self.text)
+            .field("strikethrough", &self.run.attributes.strikethrough)
+            .field("link", &self.run.link)
+            .field("strong", &self.run.attributes.strong)
+            .field("emphasis", &self.run.attributes.emphasis)
+            .field("code", &self.run.attributes.code)
+            .finish()
+    }
+}
+
+/// Immutable input for a shared Flow owner. UI-local Text cells never cross
+/// this boundary. Capture only existing backing, without plain/style work.
+pub(super) struct FlowText {
+    spans: Arc<Spans>,
+    plain: std::sync::OnceLock<Arc<str>>,
+    // Retain every source/cache owner until raw Flow retirement, including
+    // already-primed proof state and a cached style captured from the Text.
+    captured: Option<Box<FlowCaches>>,
+    lineage: Arc<std::sync::Mutex<StyledLineage>>,
+}
+struct FlowCaches {
+    _plain_source: Option<super::reader_source::Source>,
+    styled: Option<StyledCache>,
+}
+
+impl FlowText {
+    pub(super) fn len(&self) -> usize {
+        self.spans.text.len()
+    }
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
+    }
+    pub(super) fn append_proven(&self, previous: &Self) -> bool {
+        append_proven(
+            &self.spans,
+            &previous.spans,
+            &self.lineage,
+            &previous.lineage,
+        )
+    }
+    pub(super) fn plain(&self) -> Arc<str> {
+        self.plain
+            .get_or_init(|| {
+                #[cfg(test)]
+                MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+                Arc::from(self.spans.text.as_str())
+            })
+            .clone()
+    }
+    pub(super) fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
+        if let Some(cached) = self
+            .captured
+            .as_ref()
+            .and_then(|capture| capture.styled.as_ref())
+            && cached.style == style
+        {
+            cached.spans.clone()
+        } else {
+            #[cfg(test)]
+            MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+            self.spans.iter().map(|span| span.view(&style)).collect()
+        }
+    }
+}
+
+fn append_proven(
+    spans: &Arc<Spans>,
+    previous: &Arc<Spans>,
+    lineage: &Arc<std::sync::Mutex<StyledLineage>>,
+    old_lineage: &Arc<std::sync::Mutex<StyledLineage>>,
+) -> bool {
+    if Arc::ptr_eq(spans, previous) {
+        return true;
+    }
+    if !Arc::ptr_eq(lineage, old_lineage) {
+        return false;
+    }
+    let mut cursor = Arc::downgrade(previous);
+    let target = Arc::downgrade(spans);
+    let lineage = lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+    for (old, next) in &lineage.edges {
+        if !old.ptr_eq(&cursor) {
+            continue;
+        }
+        if next.ptr_eq(&target) {
+            return true;
+        }
+        cursor = next.clone();
+    }
+    false
+}
+
+impl Text {
+    /// Plain literal source; this never interprets Markdown or creates links.
+    pub(super) fn literal(text: String) -> Self {
+        Self::literal_linked(text, None)
+    }
+    pub(super) fn literal_linked(text: String, link: Option<Uri>) -> Self {
+        Self::new(vec![Span::Standard {
+            text,
+            strikethrough: false,
+            link,
+            strong: false,
+            emphasis: false,
+            code: false,
+        }])
+    }
+    pub(super) fn prepared_plain_proof(&self) -> Option<std::sync::Weak<str>> {
+        self.plain.get().map(Arc::downgrade)
+    }
+    /// Semantic parser output, excluding materialization caches and weak
+    /// append-proof lineage. Tests retain every raw span attribute and link.
+    #[cfg(test)]
+    pub(super) fn semantic_spans(&self) -> impl std::fmt::Debug + '_ {
+        self.spans.iter().collect::<Vec<_>>()
+    }
+    fn new(spans: Vec<Span>) -> Self {
+        Self::from_spans(Spans::new(spans))
+    }
+
+    fn from_spans(spans: Spans) -> Self {
+        Self {
+            spans: Arc::new(spans),
+            plain: std::cell::OnceCell::new(),
+            plain_source: std::cell::OnceCell::new(),
+            styled_cache: RefCell::default(),
+            lineage: Default::default(),
+        }
+    }
+
+    fn is_plain_source(&self, source: &str) -> bool {
+        matches!(self.spans.runs.as_ref(), [Run { link: None,
+            attributes: Attributes { strikethrough: false, strong: false, emphasis: false, code: false }, .. }]
+            if self.spans.text == source)
+    }
+    fn append_plain(&mut self, suffix: &str) {
+        let previous = Arc::downgrade(&self.spans);
+        if let Some(source) = self.plain_source.get_mut() {
+            source.append(&self.spans.text, suffix);
+        }
+        let spans = Arc::make_mut(&mut self.spans);
+        let [run] = spans.runs.as_mut() else {
+            unreachable!("plain append requires one plain span")
+        };
+        spans.text.push_str(suffix);
+        run.end = spans.text.len();
+        self.plain.take();
+        *self.styled_cache.get_mut() = None;
+        self.record_edge(previous);
+    }
+
+    fn record_edge(&mut self, previous: std::sync::Weak<Spans>) {
+        let mut lineage = self
+            .lineage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if lineage.edges.len() == 256 {
+            lineage.edges.pop_front();
+        }
+        lineage
+            .edges
+            .push_back((previous, Arc::downgrade(&self.spans)));
+    }
+    fn record_prefix(&mut self, previous: &Text) {
+        if self.spans.len() < previous.spans.len() {
+            return;
+        }
+        if !previous
+            .spans
+            .iter()
+            .zip(self.spans.iter())
+            .enumerate()
+            .all(|(index, (old, new))| old.prefix_of(&new, index + 1 == previous.spans.len()))
+        {
+            return;
+        }
+        self.lineage = previous.lineage.clone();
+        self.record_edge(Arc::downgrade(&previous.spans));
+    }
+    /// Bounded, lineage-only proof for a previously rendered styled prefix.
+    /// This never scans text or materializes plain/styled spans. Reparsing
+    /// records exact conservative proofs before publication; rewrites and
+    /// Markdown reinterpretation establish a new lineage instead.
+    pub fn append_proven(&self, previous: &Text) -> bool {
+        append_proven(
+            &self.spans,
+            &previous.spans,
+            &self.lineage,
+            &previous.lineage,
+        )
+    }
+
+    pub(super) fn flow_source(&self) -> FlowText {
+        let plain = std::sync::OnceLock::new();
+        if let Some(ready) = self.plain.get() {
+            let _ = plain.set(ready.clone());
+        }
+        let source = self
+            .plain_source
+            .get()
+            .map(|source| source.as_ref().clone());
+        let styled = self.styled_cache.borrow().as_deref().cloned();
+        let captured = (source.is_some() || styled.is_some()).then(|| {
+            Box::new(FlowCaches {
+                _plain_source: source,
+                styled,
+            })
+        });
+        FlowText {
+            spans: self.spans.clone(),
+            plain,
+            captured,
+            lineage: self.lineage.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn watch_raw_spans(
+        &mut self,
+        disposed: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+    ) {
+        Arc::make_mut(&mut self.spans).disposed = Some(disposed);
+    }
+
+    /// Logical text without constructing styled presentation spans. Shared by
+    /// the active transcript's selection/find index and bounded visible rows.
+    #[cfg(test)]
+    pub(super) fn plain_ready(&self) -> bool {
+        self.plain.get().is_some()
+    }
+    pub fn plain(&self) -> Arc<str> {
+        self.plain
+            .get_or_init(|| {
+                #[cfg(test)]
+                MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+                Arc::from(self.spans.text.as_str())
+            })
+            .clone()
+    }
+    pub fn plain_prefixes(&self) -> Arc<Vec<[u8; 32]>> {
+        self.plain_source
+            .get_or_init(|| Box::new(super::reader_source::Source::new(&self.plain())))
+            .prefixes()
+    }
+    pub fn len(&self) -> usize {
+        self.spans.text.len()
+    }
+
+    /// Where this text's pull request links draw their glyphs, and what
+    /// their labels copy as; `None` when it shows none.
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
+    }
+
+    /// Style just a bounded rendered byte range; hidden chunks never populate
+    /// the AST's whole-paragraph styled-spans cache.
+    pub fn spans_range(
+        &self,
+        style: Style,
+        range: Range<usize>,
+    ) -> Arc<[text::Span<'static, Uri>]> {
+        let first = self
+            .spans
+            .runs
+            .partition_point(|run| run.end <= range.start);
+        (first..self.spans.len())
+            .map(|index| (index, self.spans.span(index)))
+            .take_while(|(index, _)| *index == 0 || self.spans.runs[*index - 1].end < range.end)
+            .filter_map(|(index, span)| {
+                let offset = if index == 0 {
+                    0
+                } else {
+                    self.spans.runs[index - 1].end
+                };
+                let start = range.start.saturating_sub(offset);
+                let end = range.end.saturating_sub(offset).min(span.text.len());
+                (start < end).then(|| span.view_part(&style, start..end))
+            })
+            .collect()
+    }
+
+    /// Returns the [`rich_text()`] spans ready to be used for the given style.
+    ///
+    /// This method performs caching for you. It will only reallocate if the [`Style`]
+    /// provided changes.
+    pub fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
+        let mut cached = self.styled_cache.borrow_mut();
+        if cached.as_ref().is_none_or(|cached| cached.style != style) {
+            #[cfg(test)]
+            MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+            *cached = Some(Box::new(StyledCache {
+                style,
+                spans: self.spans.iter().map(|span| span.view(&style)).collect(),
+            }));
+        }
+
+        cached
+            .as_ref()
+            .expect("styled spans installed")
+            .spans
+            .clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Span {
+    Standard {
+        text: String,
+        strikethrough: bool,
+        link: Option<Uri>,
+        strong: bool,
+        emphasis: bool,
+        code: bool,
+    },
+}
+
+impl Span {
+    fn text(&self) -> &str {
+        let Self::Standard { text, .. } = self;
+        text
+    }
+}
+impl SpanRef<'_> {
+    fn prefix_of(&self, new: &Self, last: bool) -> bool {
+        self.run.attributes == new.run.attributes
+            && self.run.link == new.run.link
+            && self.run.inline == new.run.inline
+            && if last {
+                new.text.starts_with(self.text)
+            } else {
+                new.text == self.text
+            }
+    }
+    fn view(&self, style: &Style) -> text::Span<'static, Uri> {
+        self.view_part(style, 0..self.text.len())
+    }
+    fn view_part(&self, style: &Style, range: Range<usize>) -> text::Span<'static, Uri> {
+        let text = self.text;
+        let Attributes {
+            strikethrough,
+            strong,
+            emphasis,
+            code,
+        } = &self.run.attributes;
+        let link = &self.run.link;
+        let span = span(text[range].to_owned()).strikethrough(*strikethrough);
+
+        let span = if *code {
+            span.font(style.inline_code_font)
+                .color(style.inline_code_color)
+                .background(style.inline_code_highlight.background)
+                .border(style.inline_code_highlight.border)
+                .padding(style.inline_code_padding)
+        } else if *strong || *emphasis {
+            span.font(Font {
+                weight: if *strong {
+                    font::Weight::Bold
+                } else {
+                    font::Weight::Normal
+                },
+                style: if *emphasis {
+                    font::Style::Italic
+                } else {
+                    font::Style::Normal
+                },
+                ..style.font
+            })
+        } else {
+            span.font(style.font)
+        };
+
+        if let Some(link) = link.as_ref() {
+            span.color(style.link_color).link(link.clone())
+        } else {
+            span
+        }
+    }
+}
+
+/// The item of a list.
+#[derive(Debug, Clone)]
+pub enum Bullet {
+    /// A simple bullet point.
+    Point {
+        /// The contents of the bullet point.
+        items: Vec<Item>,
+    },
+    /// A task.
+    Task {
+        /// The contents of the task.
+        items: Vec<Item>,
+        /// Whether the task is done or not.
+        done: bool,
+    },
+}
+
+impl Bullet {
+    fn items(&self) -> &[Item] {
+        match self {
+            Bullet::Point { items } | Bullet::Task { items, .. } => items,
+        }
+    }
+
+    fn push(&mut self, item: Item) {
+        let (Bullet::Point { items } | Bullet::Task { items, .. }) = self;
+
+        items.push(item);
+    }
+}
+
+type ReferenceLabel = UniCase<String>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reference {
+    origin: usize,
+    destination: Uri,
+    title: String,
+}
+#[derive(Debug, Default, Clone)]
+struct State {
+    leftover: String,
+    leftover_origin: usize,
+    references: Arc<HashMap<ReferenceLabel, Reference>>,
+    images: HashSet<Uri>,
+    /// How pull request links read; see [`super::pull_request_links`].
+    labels: Arc<pull_request_links::Labels>,
+}
+
+/// Whether `item` shows an image, itself or within its quotes, lists or
+/// table cells.
+pub(super) fn shows_image(item: &Item) -> bool {
+    match item {
+        Item::Image { .. } => true,
+        Item::Quote(items) => items.iter().any(shows_image),
+        Item::List { bullets, .. } => bullets
+            .iter()
+            .any(|bullet| bullet.items().iter().any(shows_image)),
+        Item::Table { columns, rows } => {
+            columns
+                .iter()
+                .any(|column| column.header.iter().any(shows_image))
+                || rows
+                    .iter()
+                    .any(|row| row.cells.iter().flatten().any(shows_image))
+        }
+        _ => false,
+    }
+}
+
+fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
+    for item in items {
+        match item {
+            Item::Image { url, .. } => {
+                images.insert(url.clone());
+            }
+            Item::Quote(items) => collect_images(items, images),
+            Item::List { bullets, .. } => {
+                for bullet in bullets {
+                    collect_images(bullet.items(), images);
+                }
+            }
+            Item::Table { columns, rows } => {
+                for column in columns {
+                    collect_images(&column.header, images);
+                }
+                for row in rows {
+                    for cell in &row.cells {
+                        collect_images(cell, images);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parser-local text and ranges. Text fragments enter their final backing
+/// directly; publication never builds and then rejoins owned span Strings.
+#[derive(Default)]
+struct SpanBuffer {
+    text: String,
+    runs: Vec<Run>,
+    labels: Arc<pull_request_links::Labels>,
+}
+
+impl SpanBuffer {
+    fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        text: pulldown_cmark::CowStr<'_>,
+        attributes: Attributes,
+        link: Option<Uri>,
+    ) {
+        if self.text.is_empty() {
+            self.text = text.into_string();
+        } else {
+            self.text.push_str(&text);
+        }
+        self.runs.push(Run {
+            end: self.text.len(),
+            link,
+            attributes,
+            inline: None,
+        });
+    }
+
+    fn finish(&mut self, linkify: bool) -> Text {
+        let text = mem::take(&mut self.text);
+        let mut runs = mem::take(&mut self.runs);
+        if linkify {
+            // Match the existing bare-reference rule: only adjacent unlinked,
+            // non-code fragments in the same style can form one reference.
+            runs.dedup_by(|next, previous| {
+                if next.link.is_none()
+                    && previous.link.is_none()
+                    && !next.attributes.code
+                    && next.attributes == previous.attributes
+                {
+                    previous.end = next.end;
+                    true
+                } else {
+                    false
+                }
+            });
+            let mut start = 0;
+            let first_split = runs.iter_mut().enumerate().find_map(|(index, run)| {
+                let fragment = &text[start..run.end];
+                start = run.end;
+                if run.link.is_none() && run.attributes.code {
+                    run.link = destination(fragment);
+                    None
+                } else if run.link.is_none() && references(fragment).next().is_some() {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            if let Some(first_split) = first_split {
+                let mut linked = Vec::with_capacity(runs.len());
+                linked.extend(runs.drain(..first_split));
+                let mut start = linked.last().map_or(0, |run| run.end);
+                for mut run in runs {
+                    let end = run.end;
+                    let fragment = &text[start..end];
+                    if run.link.is_none() && run.attributes.code {
+                        run.link = destination(fragment);
+                        linked.push(run);
+                    } else if run.link.is_none() {
+                        let mut copied = 0;
+                        for (from, to, destination) in references(fragment) {
+                            if copied < from {
+                                linked.push(Run {
+                                    end: start + from,
+                                    link: None,
+                                    attributes: run.attributes,
+                                    inline: None,
+                                });
+                            }
+                            linked.push(Run {
+                                end: start + to,
+                                link: Some(destination),
+                                attributes: run.attributes,
+                                inline: None,
+                            });
+                            copied = to;
+                        }
+                        if copied == 0 || copied < fragment.len() {
+                            linked.push(Run {
+                                end,
+                                link: None,
+                                attributes: run.attributes,
+                                inline: None,
+                            });
+                        }
+                    } else {
+                        linked.push(run);
+                    }
+                    start = end;
+                }
+                runs = linked;
+            }
+        }
+        let (text, runs, inlines) = if linkify {
+            labelled(text, runs, &self.labels)
+        } else {
+            (text, runs, None)
+        };
+        Text::from_spans(Spans {
+            text,
+            runs: runs.into_boxed_slice(),
+            inlines,
+            #[cfg(test)]
+            disposed: None,
+        })
+    }
+}
+
+/// A paragraph's pull request links as their labels show them.
+///
+/// A link whose text is its own address, which is how a bare address, an
+/// autolink and `[address](address)` all arrive, is shown by its pull
+/// request's glyph and label instead. A link with words of its own keeps
+/// them and gains the glyph before them, which says what it opens and in
+/// what state without rewording the author's sentence. A pull request
+/// address set in code is the author's literal text and stays as written.
+fn labelled(
+    text: String,
+    runs: Vec<Run>,
+    labels: &pull_request_links::Labels,
+) -> (String, Vec<Run>, Option<Arc<Inlines>>) {
+    // A link's own words need not name the pull request it opens, so its
+    // destination is what is looked at.
+    if !runs.iter().any(|run| {
+        !run.attributes.code
+            && run
+                .link
+                .as_deref()
+                .and_then(pull_request_links::pull_request)
+                .is_some()
+    }) {
+        return (text, runs, None);
+    }
+    let mut shown = String::with_capacity(text.len());
+    let mut out: Vec<Run> = Vec::with_capacity(runs.len() + 2);
+    let mut glyphs = Vec::new();
+    let mut copies = Vec::new();
+    let mut tips = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < runs.len() {
+        let run = &runs[index];
+        // The link's runs: one per style its words change through.
+        let last = index
+            + runs[index + 1..]
+                .iter()
+                .take_while(|next| next.link.is_some() && next.link == run.link)
+                .count();
+        // A link set wholly in code is the author's literal text.
+        let key = run
+            .link
+            .as_deref()
+            .filter(|_| runs[index..=last].iter().any(|run| !run.attributes.code))
+            .and_then(pull_request_links::pull_request);
+        let Some(key) = key else {
+            shown.push_str(&text[start..run.end]);
+            out.push(Run {
+                end: shown.len(),
+                ..run.clone()
+            });
+            start = run.end;
+            index += 1;
+            continue;
+        };
+        let end = runs[last].end;
+        let destination = run.link.clone().expect("a pull request link");
+        let label = labels.label(&key);
+        let first = out.len();
+        let glyph_start = shown.len();
+        // A pull request whose state is unknown has no glyph: a neutral one
+        // would look like a state of its own.
+        if let Some(state) = label.glyph {
+            shown.push_str(pull_request_links::GLYPH_SPACE);
+            glyphs.push((out.len(), state));
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                // The glyph takes the link's color, not its words' decoration.
+                attributes: Attributes {
+                    strikethrough: false,
+                    code: false,
+                    ..run.attributes
+                },
+                inline: Some(Inline::Glyph(state)),
+            });
+        }
+        if text[start..end].trim_end_matches('/') == destination.trim_end_matches('/') {
+            shown.push_str(&label.text);
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                attributes: run.attributes,
+                inline: Some(Inline::Label),
+            });
+            copies.push((glyph_start..shown.len(), destination.clone()));
+        } else {
+            copies.push((glyph_start..shown.len(), Uri::from("")));
+            for run in &runs[index..=last] {
+                shown.push_str(&text[start..run.end]);
+                out.push(Run {
+                    end: shown.len(),
+                    ..run.clone()
+                });
+                start = run.end;
+            }
+        }
+        tips.push((first..out.len(), Arc::from(label.tip(&destination))));
+        start = end;
+        index = last + 1;
+    }
+    let inlines = Inlines {
+        glyphs: glyphs.into_boxed_slice(),
+        copies: copies.into_boxed_slice(),
+        tips: tips.into_boxed_slice(),
+    };
+    (shown, out, Some(Arc::new(inlines)))
+}
+
+fn parse_with<'a>(
+    mut state: impl BorrowMut<State> + 'a,
+    markdown: &'a str,
+    origin: Option<usize>,
+) -> impl Iterator<Item = (Vec<Item>, &'a str, HashSet<ReferenceLabel>)> + 'a {
+    enum Scope {
+        List(List),
+        Quote(Vec<Item>),
+        Table {
+            alignment: Vec<pulldown_cmark::Alignment>,
+            columns: Vec<Column>,
+            rows: Vec<Row>,
+            current: Vec<Item>,
+        },
+    }
+
+    struct List {
+        start: Option<u64>,
+        bullets: Vec<Bullet>,
+    }
+
+    let reference_labels = Rc::new(RefCell::new(HashSet::new()));
+
+    let mut spans = SpanBuffer {
+        labels: state.borrow().labels.clone(),
+        ..SpanBuffer::default()
+    };
+    let mut code = String::new();
+    let mut code_language = None;
+    let mut code_lines = Vec::new();
+    let mut strong = false;
+    let mut emphasis = false;
+    let mut strikethrough = false;
+    let mut metadata = false;
+    let mut code_block = false;
+    let mut link = None;
+    let mut image = None;
+    let mut stack = Vec::new();
+
+    let inherited: Arc<HashMap<ReferenceLabel, Reference>> = match origin {
+        Some(origin) => Arc::new(
+            state
+                .borrow()
+                .references
+                .iter()
+                .filter(|(_, reference)| reference.origin < origin)
+                .map(|(label, reference)| (label.clone(), reference.clone()))
+                .collect(),
+        ),
+        None => state.borrow().references.clone(),
+    };
+    let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
+        markdown,
+        pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+            | pulldown_cmark::Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+            | pulldown_cmark::Options::ENABLE_TABLES
+            | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
+            | pulldown_cmark::Options::ENABLE_TASKLISTS,
+        {
+            let references = inherited.clone();
+            let reference_labels = reference_labels.clone();
+
+            Some(move |broken_link: pulldown_cmark::BrokenLink<'_>| {
+                let label = UniCase::new(broken_link.reference.into_string());
+                RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                references.get(&label).map(|reference| {
+                    (
+                        pulldown_cmark::CowStr::from(reference.destination.to_string()),
+                        pulldown_cmark::CowStr::from(reference.title.clone()),
+                    )
+                })
+            })
+        },
+    );
+
+    if let Some(origin) = origin {
+        let mut references = inherited.as_ref().clone();
+        for (label, definition) in parser.reference_definitions().iter() {
+            references
+                .entry(UniCase::new(label.to_owned()))
+                .or_insert_with(|| Reference {
+                    origin: origin + definition.span.start,
+                    destination: Arc::from(definition.dest.as_ref()),
+                    title: definition.title.as_deref().unwrap_or("").to_owned(),
+                });
+        }
+        state.borrow_mut().references = Arc::new(references);
+    }
+    let references = state.borrow().references.clone();
+
+    let produced_references = reference_labels.clone();
+    let inline_items = Rc::new(RefCell::new(Vec::new()));
+    let produce_batch = Rc::new(
+        move |state: &mut State, stack: &mut Vec<Scope>, items: Vec<Item>, source: Range<usize>| {
+            if items.is_empty() {
+                return None;
+            }
+            if let Some(scope) = stack.last_mut() {
+                for item in items {
+                    match &mut *scope {
+                        Scope::List(list) => {
+                            list.bullets.last_mut().expect("item context").push(item)
+                        }
+                        Scope::Quote(items) => items.push(item),
+                        Scope::Table { current, .. } => current.push(item),
+                    }
+                }
+                None
+            } else {
+                state.leftover = markdown[source.start..].to_owned();
+                if let Some(origin) = origin {
+                    state.leftover_origin = origin + source.start;
+                }
+                Some((
+                    items,
+                    &markdown[source.start..source.end],
+                    produced_references.take(),
+                ))
+            }
+        },
+    );
+    let produce = {
+        let inline_items = inline_items.clone();
+        let produce_batch = produce_batch.clone();
+        move |state: &mut State, stack: &mut Vec<Scope>, item: Item, source: Range<usize>| {
+            let mut items = inline_items.take();
+            items.push(item);
+            produce_batch(state, stack, items, source)
+        }
+    };
+    let flush_inline = {
+        let inline_items = inline_items.clone();
+        let produce_batch = produce_batch.clone();
+        move |state: &mut State, stack: &mut Vec<Scope>, source: Range<usize>| {
+            produce_batch(state, stack, inline_items.take(), source)
+        }
+    };
+    let mut inline_heading = None;
+
+    let parser = parser.into_offset_iter();
+
+    parser.filter_map(move |(event, source)| match event {
+        pulldown_cmark::Event::Start(tag) => match tag {
+            pulldown_cmark::Tag::Heading { level, .. } if !metadata => {
+                inline_heading = Some(level);
+                None
+            }
+            pulldown_cmark::Tag::Paragraph if !metadata => {
+                inline_heading = None;
+                None
+            }
+            pulldown_cmark::Tag::Strong if !metadata => {
+                strong = true;
+                None
+            }
+            pulldown_cmark::Tag::Emphasis if !metadata => {
+                emphasis = true;
+                None
+            }
+            pulldown_cmark::Tag::Strikethrough if !metadata => {
+                strikethrough = true;
+                None
+            }
+            pulldown_cmark::Tag::Link { dest_url, id, .. } if !metadata => {
+                let definition = if id.is_empty() {
+                    None
+                } else {
+                    let label = UniCase::new(id.into_string());
+                    RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                    references.get(&label)
+                };
+                link = Some(definition.map_or_else(
+                    || Arc::from(dest_url.as_ref()),
+                    |reference| reference.destination.clone(),
+                ));
+                None
+            }
+            pulldown_cmark::Tag::Image {
+                dest_url,
+                title,
+                id,
+                ..
+            } if !metadata => {
+                if !spans.is_empty() {
+                    let text = spans.finish(true);
+                    RefCell::borrow_mut(&inline_items).push(match inline_heading {
+                        Some(level) => Item::Heading(level, text),
+                        None => Item::Paragraph(text),
+                    });
+                }
+                let definition = if id.is_empty() {
+                    None
+                } else {
+                    let label = UniCase::new(id.into_string());
+                    RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                    references.get(&label)
+                };
+                image = Some(definition.map_or_else(
+                    || (Arc::from(dest_url.as_ref()), title.into_string()),
+                    |reference| (reference.destination.clone(), reference.title.clone()),
+                ));
+                None
+            }
+            pulldown_cmark::Tag::List(first_item) if !metadata => {
+                let prev = if spans.is_empty() {
+                    None
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source,
+                    )
+                };
+
+                stack.push(Scope::List(List {
+                    start: first_item,
+                    bullets: Vec::new(),
+                }));
+
+                prev
+            }
+            pulldown_cmark::Tag::Item => {
+                if let Some(Scope::List(list)) = stack.last_mut() {
+                    list.bullets.push(Bullet::Point { items: Vec::new() });
+                }
+
+                None
+            }
+            pulldown_cmark::Tag::BlockQuote(_kind) if !metadata => {
+                let prev = if spans.is_empty() {
+                    None
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source,
+                    )
+                };
+
+                stack.push(Scope::Quote(Vec::new()));
+
+                prev
+            }
+            pulldown_cmark::Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(language))
+                if !metadata =>
+            {
+                code_block = true;
+                code_language = (!language.is_empty()).then(|| language.into_string());
+
+                if spans.is_empty() {
+                    None
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source,
+                    )
+                }
+            }
+            pulldown_cmark::Tag::MetadataBlock(_) => {
+                metadata = true;
+                None
+            }
+            pulldown_cmark::Tag::Table(alignment) => {
+                stack.push(Scope::Table {
+                    columns: Vec::with_capacity(alignment.len()),
+                    alignment,
+                    current: Vec::new(),
+                    rows: Vec::new(),
+                });
+
+                None
+            }
+            pulldown_cmark::Tag::TableHead => {
+                strong = true;
+                None
+            }
+            pulldown_cmark::Tag::TableRow => {
+                let Scope::Table { rows, .. } = stack.last_mut()? else {
+                    return None;
+                };
+
+                rows.push(Row { cells: Vec::new() });
+                None
+            }
+            _ => None,
+        },
+        pulldown_cmark::Event::End(tag) => match tag {
+            pulldown_cmark::TagEnd::Heading(level) if !metadata => {
+                inline_heading = None;
+                if spans.is_empty() {
+                    flush_inline(state.borrow_mut(), &mut stack, source)
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Heading(level, spans.finish(true)),
+                        source,
+                    )
+                }
+            }
+            pulldown_cmark::TagEnd::Strong if !metadata => {
+                strong = false;
+                None
+            }
+            pulldown_cmark::TagEnd::Emphasis if !metadata => {
+                emphasis = false;
+                None
+            }
+            pulldown_cmark::TagEnd::Strikethrough if !metadata => {
+                strikethrough = false;
+                None
+            }
+            pulldown_cmark::TagEnd::Link if !metadata => {
+                link = None;
+                None
+            }
+            pulldown_cmark::TagEnd::Paragraph if !metadata => {
+                if spans.is_empty() {
+                    flush_inline(state.borrow_mut(), &mut stack, source)
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source,
+                    )
+                }
+            }
+            pulldown_cmark::TagEnd::Item if !metadata => {
+                if spans.is_empty() {
+                    flush_inline(state.borrow_mut(), &mut stack, source)
+                } else {
+                    produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source,
+                    )
+                }
+            }
+            pulldown_cmark::TagEnd::List(_) if !metadata => {
+                let scope = stack.pop()?;
+
+                let Scope::List(list) = scope else {
+                    return None;
+                };
+
+                produce(
+                    state.borrow_mut(),
+                    &mut stack,
+                    Item::List {
+                        start: list.start,
+                        bullets: list.bullets,
+                    },
+                    source,
+                )
+            }
+            pulldown_cmark::TagEnd::BlockQuote(_kind) if !metadata => {
+                let scope = stack.pop()?;
+
+                let Scope::Quote(quote) = scope else {
+                    return None;
+                };
+
+                produce(state.borrow_mut(), &mut stack, Item::Quote(quote), source)
+            }
+            pulldown_cmark::TagEnd::Image if !metadata => {
+                let (url, title) = image.take()?;
+                let alt = spans.finish(false);
+
+                let state = state.borrow_mut();
+                let _ = state.images.insert(url.clone());
+
+                let title_text = Text::new(vec![Span::Standard {
+                    text: title.clone(),
+                    strikethrough: false,
+                    link: None,
+                    strong: false,
+                    emphasis: false,
+                    code: false,
+                }]);
+                RefCell::borrow_mut(&inline_items).push(Item::Image {
+                    url,
+                    title,
+                    title_text: Box::new(title_text),
+                    alt: Box::new(alt),
+                });
+                None
+            }
+            pulldown_cmark::TagEnd::CodeBlock if !metadata => {
+                code_block = false;
+
+                let display: Arc<str> = Arc::from(mem::take(&mut code));
+                produce(
+                    state.borrow_mut(),
+                    &mut stack,
+                    Item::CodeBlock {
+                        language: code_language.take(),
+                        source: display.clone(),
+                        reader_source: Box::new(super::reader_source::Source::new(&display)),
+                        code: display,
+                        lines: code_lines.drain(..).collect(),
+                    },
+                    source,
+                )
+            }
+            pulldown_cmark::TagEnd::MetadataBlock(_) => {
+                metadata = false;
+                None
+            }
+            pulldown_cmark::TagEnd::Table => {
+                let scope = stack.pop()?;
+
+                let Scope::Table { columns, rows, .. } = scope else {
+                    return None;
+                };
+
+                produce(
+                    state.borrow_mut(),
+                    &mut stack,
+                    Item::Table { columns, rows },
+                    source,
+                )
+            }
+            pulldown_cmark::TagEnd::TableHead => {
+                strong = false;
+                None
+            }
+            pulldown_cmark::TagEnd::TableCell => {
+                if !spans.is_empty() {
+                    let _ = produce(
+                        state.borrow_mut(),
+                        &mut stack,
+                        Item::Paragraph(spans.finish(true)),
+                        source.clone(),
+                    );
+                }
+
+                let _ = flush_inline(state.borrow_mut(), &mut stack, source.clone());
+
+                let Scope::Table {
+                    alignment,
+                    columns,
+                    rows,
+                    current,
+                } = stack.last_mut()?
+                else {
+                    return None;
+                };
+
+                if columns.len() < alignment.len() {
+                    columns.push(Column {
+                        header: std::mem::take(current),
+                        alignment: alignment[columns.len()],
+                    });
+                } else {
+                    rows.last_mut()
+                        .expect("table row")
+                        .cells
+                        .push(std::mem::take(current));
+                }
+
+                None
+            }
+            _ => None,
+        },
+        pulldown_cmark::Event::Text(text) if !metadata => {
+            if code_block {
+                code.push_str(&text);
+                return None;
+            }
+            spans.push(
+                text,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
+            None
+        }
+        pulldown_cmark::Event::Code(code) if !metadata => {
+            spans.push(
+                code,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: true,
+                },
+                link.clone(),
+            );
+            None
+        }
+        pulldown_cmark::Event::SoftBreak if !metadata => {
+            spans.push(
+                " ".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
+            None
+        }
+        pulldown_cmark::Event::HardBreak if !metadata => {
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
+            None
+        }
+        pulldown_cmark::Event::InlineHtml(h) if !metadata && h.eq_ignore_ascii_case("<br>") => {
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
+            None
+        }
+        pulldown_cmark::Event::Rule => produce(state.borrow_mut(), &mut stack, Item::Rule, source),
+        pulldown_cmark::Event::TaskListMarker(done) => {
+            if let Some(Scope::List(list)) = stack.last_mut()
+                && let Some(item) = list.bullets.last_mut()
+                && let Bullet::Point { items } = item
+            {
+                *item = Bullet::Task {
+                    items: std::mem::take(items),
+                    done,
+                };
+            }
+
+            None
+        }
+        _ => None,
+    })
+}
+
+/// A paragraph's spans with its bare web addresses and file positions made
+/// into links.
+///
+/// Agents write `https://example.com/docs` and `src/app.rs:42` in prose far
+/// more often than they write Markdown links, and a reader expects both to
+/// open, as a terminal would. Only plain text is read: code spans and text
+/// already inside a link keep what the author wrote. The text itself is never
+/// changed, so selection, Find and Copy see exactly the answer.
+///
+/// The parser can hand over one run of text as several pieces, so neighbours
+/// set in the same style are joined first: an address cut in two would
+/// otherwise link neither half.
+#[cfg(test)]
+fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
+    let mut joined: Vec<Span> = Vec::new();
+    for span in spans {
+        if let (
+            Some(Span::Standard {
+                text: previous,
+                strikethrough: a,
+                link: None,
+                strong: b,
+                emphasis: c,
+                code: false,
+            }),
+            Span::Standard {
+                text,
+                strikethrough: d,
+                link: None,
+                strong: e,
+                emphasis: f,
+                code: false,
+            },
+        ) = (joined.last_mut(), &span)
+            && (*a, *b, *c) == (*d, *e, *f)
+        {
+            previous.push_str(text);
+            continue;
+        }
+        joined.push(span);
+    }
+    let mut out = Vec::with_capacity(joined.len());
+    for mut span in joined {
+        // Agents set positions in code (`src/lib.rs:12`) as often as in
+        // prose; a code span that is exactly one keeps its face and opens.
+        if let Span::Standard {
+            text,
+            link: link @ None,
+            code: true,
+            ..
+        } = &mut span
+        {
+            *link = destination(text);
+            out.push(span);
+            continue;
+        }
+        let Span::Standard {
+            text,
+            strikethrough,
+            link: None,
+            strong,
+            emphasis,
+            code: false,
+        } = span
+        else {
+            out.push(span);
+            continue;
+        };
+        let piece = |text: &str, link: Option<Uri>| Span::Standard {
+            text: text.to_owned(),
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code: false,
+        };
+        let mut copied = 0;
+        for (start, end, destination) in references(&text) {
+            if copied < start {
+                out.push(piece(&text[copied..start], None));
+            }
+            out.push(piece(&text[start..end], Some(destination)));
+            copied = end;
+        }
+        match copied {
+            0 => out.push(piece(&text, None)),
+            copied if copied < text.len() => out.push(piece(&text[copied..], None)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where in `text` a bare reference sits, and what it opens.
+fn references(text: &str) -> impl Iterator<Item = (usize, usize, Uri)> + '_ {
+    text.split_inclusive(char::is_whitespace)
+        .scan(0, |offset, word| {
+            let start = *offset;
+            *offset += word.len();
+            Some((start, word.trim_end()))
+        })
+        .filter_map(|(start, word)| {
+            // Brackets and quotes around a reference are the sentence's, as
+            // is the punctuation after it, except a closing bracket that
+            // the reference itself opened, as in a wiki address.
+            let inner = word.trim_start_matches(['(', '[', '{', '<', '"', '\'', '`', '*', '_']);
+            let start = start + word.len() - inner.len();
+            let mut end = inner.len();
+            while let Some(last) = inner[..end].chars().next_back() {
+                let unbalanced = |open: char, close: char| {
+                    last == close
+                        && inner[..end].matches(close).count() > inner[..end].matches(open).count()
+                };
+                if matches!(
+                    last,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '>' | '`' | '*' | '_'
+                ) || unbalanced('(', ')')
+                    || unbalanced('[', ']')
+                    || unbalanced('{', '}')
+                {
+                    end -= last.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let reference = &inner[..end];
+            destination(reference).map(|destination| (start, start + end, destination))
+        })
+}
+
+/// Domain suffixes that end a host name far more often than a file name.
+const HOST_SUFFIXES: [&str; 17] = [
+    "com",
+    "net",
+    "org",
+    "io",
+    "co",
+    "dev",
+    "app",
+    "ai",
+    "edu",
+    "gov",
+    "test",
+    "localhost",
+    "internal",
+    "local",
+    "lan",
+    "cloud",
+    "svc",
+];
+
+/// File names that are conventionally written without an extension.
+const EXTENSIONLESS_FILES: [&str; 12] = [
+    "Makefile",
+    "GNUmakefile",
+    "makefile",
+    "Dockerfile",
+    "Containerfile",
+    "Justfile",
+    "justfile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "Vagrantfile",
+    "Jenkinsfile",
+];
+
+/// What a bare reference opens: a web address, or a file at a line.
+///
+/// A file position needs a line and a file name that reads as one: an
+/// extension that starts with a letter, a dotfile, or a conventional
+/// extensionless name in a directory, such as `docker/Dockerfile`. So a time
+/// such as `12:30`, `issue:42`, and an image tag such as `bitnami/redis:7`
+/// stay text.
+fn destination(reference: &str) -> Option<Uri> {
+    // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = reference.get(..8).unwrap_or(reference).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let url = url::Url::parse(reference).ok()?;
+        return url
+            .host_str()
+            .is_some_and(|host| !host.is_empty())
+            .then(|| Arc::from(reference));
+    }
+    if reference.contains("://") {
+        return None;
+    }
+    let (path, position) = crate::document_link::file_position(reference);
+    position?;
+    // `api.example.com:5432` and `ghcr.io/org/app:2` name a host's port or an
+    // image's tag, not a line of a file.
+    // No host starts with a dot, and dotfiles such as `.env.local` end in one.
+    let first = path.split('/').next().unwrap_or(path);
+    if !first.starts_with('.')
+        && first.rsplit_once('.').is_some_and(|(_, suffix)| {
+            HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        })
+    {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let file = EXTENSIONLESS_FILES.contains(&name)
+        || name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        });
+    (file && !path.contains(':')).then(|| Arc::from(reference))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::chat_ui::markdown as native;
+    use cosmic::widget::markdown as original;
+
+    macro_rules! outline {
+        ($name:ident, $module:ident, $plain:expr) => {
+            fn $name(items: &[$module::Item]) -> Vec<String> {
+                let mut out = Vec::new();
+                for item in items {
+                    match item {
+                        $module::Item::Heading(level, text) => {
+                            out.push(format!("heading {level:?} {}", ($plain)(text)))
+                        }
+                        $module::Item::Paragraph(text) => {
+                            out.push(format!("paragraph {}", ($plain)(text)))
+                        }
+                        $module::Item::CodeBlock { language, code, .. } => {
+                            out.push(format!("code {language:?} {code}"))
+                        }
+                        $module::Item::Quote(items) => {
+                            out.push("quote".into());
+                            out.extend($name(items));
+                            out.push("/quote".into());
+                        }
+                        $module::Item::List { start, bullets } => {
+                            out.push(format!("list {start:?}"));
+                            for bullet in bullets {
+                                let items = match bullet {
+                                    $module::Bullet::Point { items } => {
+                                        out.push("bullet".into());
+                                        items
+                                    }
+                                    $module::Bullet::Task { items, done } => {
+                                        out.push(format!("task {done}"));
+                                        items
+                                    }
+                                };
+                                out.extend($name(items));
+                                out.push("/bullet".into());
+                            }
+                            out.push("/list".into());
+                        }
+                        $module::Item::Table { columns, rows } => {
+                            out.push("table".into());
+                            for column in columns {
+                                out.push(format!("column {:?}", column.alignment));
+                                out.extend($name(&column.header));
+                            }
+                            for row in rows {
+                                out.push("row".into());
+                                for cell in &row.cells {
+                                    out.push("cell".into());
+                                    out.extend($name(cell));
+                                }
+                            }
+                            out.push("/table".into());
+                        }
+                        $module::Item::Image {
+                            url, title, alt, ..
+                        } => out.push(format!("image {url} {title} {}", ($plain)(alt))),
+                        $module::Item::Rule => out.push("rule".into()),
+                    }
+                }
+                out
+            }
+        };
+    }
+    outline!(native_outline, native, |text: &native::Text| text
+        .plain()
+        .to_string());
+    outline!(original_outline, original, |text: &original::Text| {
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        text.spans(style)
+            .iter()
+            .map(|span| span.text.as_ref())
+            .collect::<String>()
+    });
+
+    fn paragraph_text(content: &Content) -> Text {
+        match content.items() {
+            [Item::Paragraph(text)] => text.clone(),
+            other => panic!("expected paragraph: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_parser_runs_match_owned_span_linking_and_image_text() {
+        let span = |text: &str, strong, code, link: Option<Uri>| Span::Standard {
+            text: text.into(),
+            strikethrough: false,
+            link,
+            strong,
+            emphasis: false,
+            code,
+        };
+        let cases = [
+            vec![
+                span("ordinary prefix ", false, false, None),
+                span("src/first.rs:12", false, true, None),
+                span(" then https://example.test/λ ", false, false, None),
+                span("src/last.rs:8", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span("https://exa", false, false, None),
+                span("mple.test/λ", false, false, None),
+            ],
+            vec![
+                span("", false, false, None),
+                span("λ café ", true, false, None),
+                span("src/lib.rs:12", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span(
+                    "https://example.test",
+                    false,
+                    false,
+                    Some("app://explicit".into()),
+                ),
+                span(" /tmp/λ.rs:8", false, false, None),
+            ],
+        ];
+        for spans in cases {
+            for linkify in [false, true] {
+                let expected = Text::new(if linkify {
+                    linked(spans.clone().into_iter())
+                } else {
+                    spans.clone()
+                });
+                let mut builder = SpanBuffer::default();
+                for Span::Standard {
+                    text,
+                    strikethrough,
+                    link,
+                    strong,
+                    emphasis,
+                    code,
+                } in spans.clone()
+                {
+                    builder.push(
+                        text.into(),
+                        Attributes {
+                            strikethrough,
+                            strong,
+                            emphasis,
+                            code,
+                        },
+                        link,
+                    );
+                }
+                let actual = builder.finish(linkify);
+                assert_eq!(
+                    format!("{:?}", actual.semantic_spans()),
+                    format!("{:?}", expected.semantic_spans())
+                );
+                assert_eq!(actual.plain(), expected.plain());
+                assert!(builder.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn cold_parsed_graph_and_document_clone_keep_compact_unstyled_text() {
+        let source = "paragraph **λ linked [text](https://example.test)**\n\n![alt](image.png \"title\")\n\n".repeat(1024);
+        let content = Content::parse(&source);
+        assert!(content.items().len() >= 2048);
+        let Item::Paragraph(first) = &content.items()[0] else {
+            panic!("real parsed paragraph")
+        };
+        let materialized = materialized_bytes();
+        let cloned = content.clone();
+        let document = super::super::prose_document::Document::snapshot(&content);
+        assert_eq!(
+            materialized_bytes(),
+            materialized,
+            "cloning cold publications must not style text"
+        );
+        assert_eq!(
+            native_outline(content.items()),
+            native_outline(cloned.items())
+        );
+        assert_eq!(
+            native_outline(content.items()),
+            native_outline(document.items())
+        );
+        for items in [content.items(), cloned.items(), document.items()] {
+            let Item::Paragraph(copy) = &items[0] else {
+                panic!("same parsed shape")
+            };
+            assert!(
+                Arc::ptr_eq(&first.spans, &copy.spans),
+                "actual raw span ownership stays shared"
+            );
+            assert!(
+                copy.styled_cache.borrow().is_none(),
+                "cold clone has no styled allocation"
+            );
+        }
+        // Bound the per-node cold storage, including the raw Flow capture,
+        // independently of theme or whether caches were materialized.
+        assert!(
+            std::mem::size_of::<Text>() <= 96,
+            "cold Text bytes: {}",
+            std::mem::size_of::<Text>()
+        );
+        assert!(
+            std::mem::size_of::<Item>() <= 128,
+            "cold Item bytes: {}",
+            std::mem::size_of::<Item>()
+        );
+        assert!(
+            std::mem::size_of::<FlowText>() <= 96,
+            "cold Flow text bytes: {}",
+            std::mem::size_of::<FlowText>()
+        );
+    }
+
+    /// The links a paragraph's text carries, with the text each covers.
+    fn links(content: &Content) -> Vec<(String, String)> {
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        content
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Paragraph(text) | Item::Heading(_, text) => Some(text.spans(style)),
+                _ => None,
+            })
+            .flat_map(|spans| {
+                spans
+                    .iter()
+                    .filter_map(|span| {
+                        span.link
+                            .as_ref()
+                            .map(|link| (span.text.to_string(), link.to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Bare addresses and file positions in prose open like Markdown links,
+    /// and the text a reader selects or copies is unchanged.
+    #[test]
+    fn bare_addresses_and_file_positions_are_links() {
+        let answer = "See (https://example.com/a_(b)), src/main.rs:42:7. Then \
+            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2, .env.local:3 and <https://kept.example>.";
+        let content = Content::parse(answer);
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(text, link)| (text.to_string(), link.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            links(&content),
+            pairs(&[
+                ("https://example.com/a_(b)", "https://example.com/a_(b)"),
+                ("src/main.rs:42:7", "src/main.rs:42:7"),
+                ("docs/guide.md:9", "docs/guide.md:9"),
+                ("lib.rs:3", "lib.rs:3"),
+                ("docker/Dockerfile:4", "docker/Dockerfile:4"),
+                (".env:2", ".env:2"),
+                (".env.local:3", ".env.local:3"),
+                ("https://kept.example", "https://kept.example"),
+            ])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        assert_eq!(
+            text.plain().as_ref(),
+            "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
+             lib.rs:3, docker/Dockerfile:4, .env:2, .env.local:3 and https://kept.example."
+        );
+        // A code span that is exactly a position opens too, still as code.
+        let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
+        assert_eq!(
+            links(&content),
+            pairs(&[("src/code.rs:22", "src/code.rs:22")])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        assert!(
+            text.spans(style)
+                .iter()
+                .any(|span| { span.link.is_some() && span.font == Some(style.inline_code_font) })
+        );
+        // An author's own link, hosts, image tags, and colons that are not
+        // positions stay as written.
+        let content = Content::parse(
+            "[the docs](https://display.example) at 12:30, issue:42, v1.2:3, \
+             ftp://host/x, https:// alone, api.example.com:5432, db.internal:6379, \
+             ghcr.io/org/app:2, docker.io/library/node:20, bitnami/redis:7, \
+             app.localhost:3000, api.example.dev:8443, src/bin:3 and std::fmt.",
+        );
+        assert_eq!(
+            links(&content),
+            pairs(&[("the docs", "https://display.example")])
+        );
+    }
+
+    /// An answer that arrives a few bytes at a time links what the whole
+    /// answer links, including a position whose line arrives last.
+    #[test]
+    fn a_streamed_reference_is_linked_when_it_completes() {
+        let answer = "Open src/lib.rs:12 and see https://example.com/docs now";
+        for cut in [
+            "Open src/lib.rs:".len(),
+            "Open src/lib.rs:1".len(),
+            "Open src/lib.rs:12 and see https".len(),
+            "Open src/lib.rs:12 and see https://example.com/do".len(),
+        ] {
+            let mut streamed = Content::new();
+            for piece in [&answer[..cut], &answer[cut..]] {
+                streamed.push_str(piece);
+            }
+            assert_eq!(
+                links(&streamed),
+                links(&Content::parse(answer)),
+                "cut at {cut}"
+            );
+            assert_eq!(links(&streamed).len(), 2, "cut at {cut}");
+        }
+        let mut streamed = Content::new();
+        for ch in answer.chars() {
+            streamed.push_str(&ch.to_string());
+        }
+        assert_eq!(links(&streamed), links(&Content::parse(answer)));
+    }
+
+    #[test]
+    fn parsed_style_cache_clone_flow_append_and_restyle_keep_exact_spans() {
+        let mut content = Content::parse("hello α");
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let original = text.spans(style);
+        assert!(Arc::ptr_eq(&original, &text.spans(style)));
+        let cloned = text.clone();
+        let flow = cloned.flow_source();
+        assert!(Arc::ptr_eq(&original, &cloned.spans(style)));
+        assert!(Arc::ptr_eq(&original, &flow.spans(style)));
+
+        content.push_str(" β");
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("appended paragraph")
+        };
+        assert!(
+            text.styled_cache.borrow().is_none(),
+            "append invalidates old presentation"
+        );
+        let appended = text.spans(style);
+        assert!(!Arc::ptr_eq(&original, &appended));
+        assert_eq!(
+            appended
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α β"
+        );
+        assert_eq!(
+            flow.spans(style)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α"
+        );
+
+        let mut changed = style;
+        changed.link_color = cosmic::iced::Color::from_rgb(0.8, 0.2, 0.1);
+        let restyled = text.spans(changed);
+        assert!(!Arc::ptr_eq(&appended, &restyled));
+        assert_eq!(
+            restyled
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α β"
+        );
+        assert!(Arc::ptr_eq(&restyled, &text.spans(changed)));
+        assert_eq!(
+            text.spans_range(changed, 0..5)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello"
+        );
+        assert!(
+            Arc::ptr_eq(&restyled, &text.spans(changed)),
+            "range extraction preserves the full style cache"
+        );
+
+        let linked = Content::parse("[link](https://example.test)");
+        let Item::Paragraph(link) = &linked.items()[0] else {
+            panic!("parsed link")
+        };
+        assert_eq!(link.spans(style)[0].color, Some(style.link_color));
+        assert_eq!(link.spans(changed)[0].color, Some(changed.link_color));
+    }
+
+    #[test]
+    fn cloned_code_descriptors_share_the_entire_body_and_release_it_together() {
+        let content = Content::parse(&format!("```text\n{}\n```", "x".repeat(1024 * 1024)));
+        let Item::CodeBlock { code, .. } = &content.items()[0] else {
+            panic!("code fixture")
+        };
+        let weak = Arc::downgrade(code);
+        let copies: Vec<_> = (0..1000).map(|_| content.items()[0].clone()).collect();
+        assert_eq!(Arc::strong_count(code), 2002);
+        assert!(
+            copies
+                .iter()
+                .all(|item| matches!(item,Item::CodeBlock{code:copy,..} if Arc::ptr_eq(code,copy)))
+        );
+        drop(copies);
+        drop(content);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn styled_append_lineage_accepts_coalesced_prefixes_and_releases_old_bodies() {
+        let mut content = Content::parse(&"words ".repeat(1000));
+        let first = paragraph_text(&content);
+        content.push_str("more words");
+        let middle = paragraph_text(&content);
+        let released = Arc::downgrade(&middle.spans);
+        content.push_str(" still more");
+        let latest = paragraph_text(&content);
+        assert!(latest.append_proven(&first));
+        assert!(latest.append_proven(&middle));
+        drop(middle);
+        assert!(
+            released.upgrade().is_none(),
+            "proof edges must not own source bodies"
+        );
+        let mut styled = Content::parse("word **bold** tail");
+        let previous = paragraph_text(&styled);
+        styled.push_str(" continuing");
+        assert!(
+            paragraph_text(&styled).append_proven(&previous),
+            "unchanged emphasis/link/style prefix may complete progressively"
+        );
+    }
+
+    #[test]
+    fn styled_append_lineage_rejects_reinterpretation_rewrites_and_expired_proofs() {
+        let mut content = Content::parse("word **bold");
+        let previous = paragraph_text(&content);
+        content.push_str("**");
+        assert!(
+            !paragraph_text(&content).append_proven(&previous),
+            "raw append that changes emphasis is not a rendered prefix"
+        );
+        let previous = paragraph_text(&Content::parse("[label](https://old.example) tail"));
+        let changed = paragraph_text(&Content::parse("[label](https://new.example) tail"));
+        assert!(!changed.append_proven(&previous));
+        let mut content = Content::parse("plain words");
+        let first = paragraph_text(&content);
+        for _ in 0..300 {
+            content.push_str(" more");
+        }
+        let latest = paragraph_text(&content);
+        assert!(
+            !latest.append_proven(&first),
+            "expired proof requires worker-side exact fallback"
+        );
+        assert!(latest.lineage.lock().unwrap().edges.len() <= 256);
+    }
+
+    const CASES: &[&str] = &[
+        "# Heading\n\nA **bold** and *italic* [link](https://example.com), `inline code`, ~~strike~~.\n",
+        "```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nAfter.\n",
+        "> A quote.\n>\n> - nested\n> - list\n\nOutside.\n",
+        "1. one\n2. two\n   - nested\n   - [x] done\n\n- [ ] pending\n",
+        "| alpha | beta |\n| :--- | ---: |\n| a | **b** |\n| | empty |\n",
+        "![alternative](https://example.com/a.png \"title\")\n\n[label][ref]\n\n[ref]: https://example.com\n",
+        "A Unicode αβ emoji 👩🏽‍💻 e\u{301} link [Straße](https://example.com).\n\n----\n",
+        "one long paragraph with **bold crossing\nlines** and `code\nspanning lines`, [link\nlabel](https://example.com).\n",
+    ];
+
+    #[test]
+    fn native_model_matches_pinned_markdown_semantics_without_discarded_highlight_lines() {
+        for source in CASES {
+            let native = Content::parse(source);
+            let original = original::Content::parse(source);
+            assert_eq!(
+                native_outline(native.items()),
+                original_outline(original.items()),
+                "{source:?}"
+            );
+            for item in native.items() {
+                if let Item::CodeBlock { lines, .. } = item {
+                    assert!(lines.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_table_rows_keep_their_header_context_at_every_utf8_boundary() {
+        for source in [
+            "| alpha | beta |\n| :--- | ---: |\n| a | **b** |\n| | empty |\n",
+            "| H | B |\n|---|---|\n| V | W |\n\nOutside table.\n",
+            "| H | B |\n|---|---|\n| V | W |\n  \nOutside table.\n",
+        ] {
+            let mut streamed = Content::new();
+            let mut previous = 0;
+            for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                streamed.push_str(&source[previous..end]);
+                assert_eq!(
+                    native_outline(streamed.items()),
+                    native_outline(Content::parse(&source[..end]).items()),
+                    "table prefix {:?}",
+                    &source[..end]
+                );
+                previous = end;
+            }
+        }
+    }
+
+    fn reference_text(items: &[Item]) -> Vec<(char, Option<Uri>)> {
+        let mut output = Vec::new();
+        for item in items {
+            match item {
+                Item::Paragraph(text) | Item::Heading(_, text) => {
+                    for span in text.spans.iter() {
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
+                    }
+                }
+                Item::Image { alt: text, .. } => {
+                    for span in text.spans.iter() {
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
+                    }
+                }
+                Item::Quote(items) => output.extend(reference_text(items)),
+                Item::List { bullets, .. } => {
+                    for bullet in bullets {
+                        output.extend(reference_text(bullet.items()));
+                    }
+                }
+                Item::Table { columns, rows } => {
+                    for column in columns {
+                        output.extend(reference_text(&column.header));
+                    }
+                    for row in rows {
+                        for cell in &row.cells {
+                            output.extend(reference_text(cell));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn reference_definitions_match_full_prefixes_without_losing_prior_items_or_targets() {
+        assert_eq!(
+            native_outline(Content::parse("before ![alt](/i) after").items()),
+            vec!["paragraph before ", "image /i  alt", "paragraph  after"]
+        );
+        assert_eq!(
+            native_outline(Content::parse("# before ![alt](/i) after").items()),
+            vec!["heading H1 before ", "image /i  alt", "heading H1  after"]
+        );
+        for source in [
+            "![alternative](https://example.com/a.png \"title\")\n\n[label][ref]\n\n[ref]: https://example.com\n",
+            "[label][ref]\n\n[ref]: https://example.com \"growing title\"\n",
+            "[ref]: https://first.example\n\n[label][REF]\n\n[ref]: https://second.example\n",
+            "[Straße][strasse]\n\n[STRASSE]: /destination\n",
+            "[label][ref]\n\n[ref]: <https://example.com>\n",
+            "![alt][img]\n\n[img]: /one \"caption\"\n\n[img]: /two\n",
+            "before ![alt][img] after\n\n[img]: /image.png\n",
+            "# before ![alt][img] after\n\n[img]: /image.png\n",
+            "before ![one][img] between ![two][img] after\n\n[img]: /image.png\n",
+            "- before ![alt][img] after\n\n[img]: /image.png\n",
+            "| H |\n|---|\n| before ![alt][img] after |\n\n[img]: /image.png\n",
+            "- [label][ref]\n\n| H |\n|---|\n| [label][ref] |\n\n[ref]: /destination\n",
+        ] {
+            let mut streamed = Content::new();
+            let mut previous = 0;
+            for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                streamed.push_str(&source[previous..end]);
+                let full = Content::parse(&source[..end]);
+                assert_eq!(
+                    native_outline(streamed.items()),
+                    native_outline(full.items()),
+                    "source prefix {:?}",
+                    &source[..end]
+                );
+                assert_eq!(
+                    reference_text(streamed.items()),
+                    reference_text(full.items()),
+                    "link prefix {:?}",
+                    &source[..end]
+                );
+                assert_eq!(
+                    streamed.images(),
+                    full.images(),
+                    "image prefix {:?}",
+                    &source[..end]
+                );
+                previous = end;
+            }
+        }
+        let content = Content::parse(
+            "[ref]: https://first.example\n\n[label][REF]\n\n[ref]: https://second.example\n",
+        );
+        assert!(
+            reference_text(content.items())
+                .iter()
+                .filter_map(|(_, link)| link.as_deref())
+                .all(|link| link == "https://first.example")
+        );
+        assert!(
+            reference_text(content.items())
+                .iter()
+                .any(|(_, link)| link.as_deref() == Some("https://first.example"))
+        );
+        let folded = Content::parse("[Straße][strasse]\n\n[STRASSE]: /destination\n");
+        assert!(
+            reference_text(folded.items())
+                .iter()
+                .any(|(_, link)| link.as_deref() == Some("/destination"))
+        );
+    }
+
+    #[test]
+    fn all_utf8_append_boundaries_match_a_whole_parse() {
+        for source in CASES {
+            let expected = native_outline(Content::parse(source).items());
+            for stride in [1, 2, 7, 31] {
+                let mut content = Content::new();
+                let mut previous = 0;
+                for end in (1..=source.len())
+                    .filter(|end| source.is_char_boundary(*end))
+                    .step_by(stride)
+                    .chain(std::iter::once(source.len()))
+                {
+                    if end > previous {
+                        content.push_str(&source[previous..end]);
+                        previous = end;
+                    }
+                }
+                assert_eq!(
+                    native_outline(content.items()),
+                    expected,
+                    "stride {stride}, {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_plain_stream_is_linear_and_delimiters_restore_commonmark_semantics() {
+        let mut content = Content::parse("Answer");
+        let before = content.parsed_bytes;
+        let mut source = "Answer".to_owned();
+        for _ in 0..10000 {
+            content.push_str(" more ordinary α text");
+            source.push_str(" more ordinary α text");
+        }
+        assert_eq!(content.parsed_bytes, before);
+        for suffix in [
+            " **",
+            "bold",
+            "**",
+            "\n",
+            "- item",
+            "\n\n",
+            "[link",
+            "](https://example.com)",
+        ] {
+            content.push_str(suffix);
+            source.push_str(suffix);
+            assert_eq!(
+                native_outline(content.items()),
+                original_outline(original::Content::parse(&source).items()),
+                "suffix {suffix:?}"
+            );
+        }
+        for source in [
+            "Alpha ordinary text.",
+            "Alpha **strong** text",
+            "Alpha &amp; entity",
+            "Alpha <tag>text</tag>",
+            "Alpha `code` end",
+            "Alpha\n---",
+            "Alpha [link](https://example.com)",
+        ] {
+            let mut content = Content::new();
+            for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                let previous = source[..end].char_indices().last().unwrap().0;
+                content.push_str(&source[previous..end]);
+                assert_eq!(
+                    native_outline(content.items()),
+                    original_outline(original::Content::parse(&source[..end]).items()),
+                    "prefix {:?}",
+                    &source[..end]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_eof_spaces_remain_pending_until_the_next_visible_character() {
+        for initial in ["Answer", "Answer **bold** tail"] {
+            let mut source = initial.to_owned();
+            let mut content = Content::parse(initial);
+            for suffix in [
+                " ",
+                " ",
+                "α",
+                " ",
+                "new ",
+                " ",
+                "words",
+                "  ",
+                "**markup** ",
+                " ",
+                "after",
+            ] {
+                source.push_str(suffix);
+                content.push_str(suffix);
+                assert_eq!(
+                    native_outline(content.items()),
+                    original_outline(original::Content::parse(&source).items()),
+                    "{source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_top_level_fence_parses_new_bytes_without_reparsing_its_body() {
+        let mut content = Content::parse("```rust\nfn main() {}\n");
+        let before = content.parsed_bytes;
+        let mut source = "```rust\nfn main() {}\n".to_owned();
+        for _ in 0..10000 {
+            content.push_str("let value = 42;\n");
+            source.push_str("let value = 42;\n");
+        }
+        assert_eq!(
+            content.parsed_bytes, before,
+            "the open body never re-enters CommonMark"
+        );
+        content.push_str("```\n\nAfter the fence.\n");
+        source.push_str("```\n\nAfter the fence.\n");
+        assert_eq!(
+            native_outline(content.items()),
+            original_outline(original::Content::parse(&source).items())
+        );
+        assert!(
+            content.parsed_bytes < source.len() * 2,
+            "closing costs one linear parse, not quadratic appends"
+        );
+    }
+
+    #[test]
+    fn extracting_a_visible_span_range_does_not_style_the_hidden_paragraph() {
+        let source = format!(
+            "{} **linked [αβ](https://example.com)** {}",
+            "plain ".repeat(10000),
+            "tail ".repeat(10000)
+        );
+        let content = Content::parse(&source);
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let plain = text.plain();
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        let at = plain.find("linked").unwrap();
+        let spans = text.spans_range(style, at..at + "linked αβ".len());
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "linked αβ"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.link.as_deref() == Some("https://example.com"))
+        );
+        assert!(
+            text.styled_cache
+                .borrow()
+                .as_ref()
+                .map(|cache| cache.style)
+                .is_none(),
+            "hidden text has no styled-span cache"
+        );
+        assert!(
+            text.styled_cache
+                .borrow()
+                .as_ref()
+                .is_none_or(|cache| cache.spans.is_empty())
+        );
+    }
+}
+
+#[test]
+fn completed_source_discards_parser_scratch_without_discarding_rendered_content() {
+    let mut content = Content::parse(&format!(
+        "![alt](https://example.test/image.png)\n\n{}",
+        "word ".repeat(16000)
+    ));
+    let before = format!("{:?}", content.items());
+    let images = content.images().clone();
+    assert!(content.state.leftover.capacity() > 64000);
+    content.discard_continuation();
+    assert_eq!(content.state.leftover.capacity(), 0);
+    assert!(content.incomplete.is_empty());
+    assert_eq!(format!("{:?}", content.items()), before);
+    assert_eq!(content.images(), &images);
+}
+
+#[cfg(all(test, not(feature = "integrated-browser")))]
+mod heap_cost;
+
+#[cfg(test)]
+mod storage_cost;

@@ -18,6 +18,16 @@ come from its bounded, read-only `usage_history` query. The human output is
 concise; `--json` uses the normal stable CLI envelope and includes each account's
 ID, provider, registered and observed identities, plan, allowance windows,
 credits, source, observation time, age, and stale/reset indicators.
+Reset inventory includes each grant's scope, count, expiry where reported,
+and whether it can be used now.
+
+Claude plan badges prefer the profile's reported display name. A matching-family
+reported tier adds its multiplier, such as Max 5x or Max 20x. A legacy Max tier
+never renames Ultra or another reported plan. Without a display name, badges
+use the CLI subscription label and any matching reported tier. Unknown plans
+retain their names; there is no plan table. The raw rate-limit tier is also
+available in details and tooltips. Allowances use reported usage windows,
+without converting a plan name or multiplier into hours of model work.
 
 `--refresh` requires one explicit `--account` ID and reuses that provider CLI's
 isolated usage probe. It requests usage, without submitting a paid model turn.
@@ -47,6 +57,51 @@ for the reported limit and usage. Unlimited, missing, or incompatible values
 remain unknown. Conversation token counts and API-equivalent cost estimates
 are never converted into subscription plan allowance.
 
+## Using a usage reset
+
+The account usage menu and Accounts pane show available resets. When a covered
+window is near or at its limit, **Use a reset** asks you to confirm the account,
+the windows it refills, and how many resets are left. A matching chat limit card
+offers the same action. A model reset only refills the windows its grant names;
+a Fable reset does not necessarily refill the account's weekly allowance.
+
+From a system terminal, use the stable account ID printed by `account list`:
+
+```sh
+cagents account reset claude/system --scope Fable
+cagents account reset codex/system --yes
+```
+
+The first command asks for confirmation. `--yes` explicitly confirms spending
+one reset. Without a terminal, confirmation requires `--yes`. If several resets
+cover different windows, select the scope rather than accepting an ambiguous
+choice. Spending a reset cannot be undone. Agent-authenticated sessions cannot
+spend resets.
+
+Each attempt has an idempotency key. If the result is uncertain, cagents reads
+the account again and shows the reported state. It never automatically retries
+a consume request. Keep the reported key for any deliberate retry of that same
+attempt; reuse both `--reset-id ID` and `--idempotency-key KEY` from the printed
+recovery command rather than creating a new operation.
+
+Claude's recurring session reset has no server idempotency contract; cagents
+cannot make that API idempotent. Its local request key only prevents submitting
+the same operation twice. After an uncertain result, recovery checks usage
+without sending another consume. While the UI retains that uncertain attempt,
+it permits a new confirmation only after observing a later available period.
+The durable protection applies to the original request key.
+
+Codex uses its supported app-server reset-credit methods. Claude Code does not
+expose a reset operation through its control protocol, so Claude reset inventory
+and consumption use the private endpoint its own client uses. The same probe
+reads its identity-verified profile for dynamic plan names and tiers. The result,
+including a missing-name or failed lookup, is cached for that login and identity.
+Ordinary usage refreshes do not refetch it; a sign-in or changed identity does.
+An external same-identity sign-in is detectable only if cagents observes the
+intervening logout; access-token refresh does not invalidate display metadata.
+This adapter reads the selected Claude home's OAuth login without copying or
+refreshing credentials. Normal sign-in remains the provider CLI's responsibility.
+
 ## Choosing defaults from the CLI
 
 `cagents account list` prints the stable IDs accepted by
@@ -63,8 +118,9 @@ and accepts only `automatic`. Existing conversations keep their recorded account
 
 New installations use **Automatic** for each provider. Add each subscription
 once with its provider's browser or device-code sign-in. Thereafter the CLI
-uses its saved login and refreshes its own tokens; cagents never reads or
-copies credentials. Multiple personal and organization plans can remain
+uses its saved login and refreshes its own tokens. The Claude reset adapter
+described above is the only direct credential reader; cagents does not copy
+credentials. Multiple personal and organization plans can remain
 signed in at the same time in separate homes.
 
 To refresh an existing login, choose **Sign in again** in its account menu.

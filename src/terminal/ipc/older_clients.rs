@@ -51,18 +51,22 @@ pub struct OlderClient {
     /// Variants of `agent_execution::Reply`. A later one answers only an
     /// operation the older client cannot encode.
     agent_replies: u32,
+    /// Variants of `device_service::Reply`. A later one answers only an
+    /// operation the older client cannot encode.
+    device_replies: u32,
 }
 
 /// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 175,
+    proven_at: 184,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
     work_responses: 6,
     agent_replies: 11,
+    device_replies: 15,
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
@@ -84,16 +88,48 @@ const MODEL_EDGES_WITH_EFFECTS: u16 = 175;
 // Wire shape tracing uses Serde variant names, including rename_all.
 const MODEL_EDGES: &[&str] = &["workspace_model_edited"];
 
+/// Work boards include the expanded check counts from this protocol onward.
+const WORK_CHECK_COUNTS: u16 = 176;
+const WORK_CHECK_REPLIES: &[&str] = &["Board", "Pinned", "Watching"];
+const WORK_BOARD_MESSAGES: &[&str] = &["work_board"];
+
 /// The first protocol with `ToolStatus::Waiting`. An older client is told such
 /// an agent is running, which is what it was before: it hasn't finished.
 pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
+
+/// Earlier runs are shown as stopped to clients that cannot name Ended.
+pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
+
+/// Earlier clients receive retryable Internal errors for store contention.
+pub(super) const STORE_BUSY_ERROR: u16 = 179;
+
+/// The first protocol whose account usage readings carry reset inventories and
+/// reported plan details. An earlier client is sent the reading without them.
+pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
+
+/// Fields a later protocol added to a struct, which a client from before it is
+/// sent without: the struct's type name, the fields, and the protocol that
+/// added them. The wire format proof accepts exactly these.
+#[cfg(test)]
+const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[(
+    "cagents::account::info::UsageReading",
+    &["resets", "plan_display_name", "rate_limit_tier"],
+    PLAN_AND_RESET_READINGS,
+)];
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
 /// added it. The wire format proof accepts exactly these.
 #[cfg(test)]
-const RESTATED_VARIANTS: &[(&str, &str, u16)] =
-    &[("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS)];
+const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
+    ("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS),
+    ("cagents::chat::ToolStatus", "Ended", ENDED_TOOL_STATUS),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "store_busy",
+        STORE_BUSY_ERROR,
+    ),
+];
 
 thread_local! {
     /// The older protocol this thread is encoding a message for.
@@ -151,6 +187,7 @@ impl OlderClient {
             server_responses,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            device_replies: u32::MAX,
         }
     }
 
@@ -161,6 +198,20 @@ impl OlderClient {
             && !changes_the_daemon(request)
             && !self.cannot_read_the_firing_for(request)
             && !self.cannot_read_model_edges_for(request)
+            && !self.cannot_read_work_checks_for(request)
+    }
+
+    /// Refuse before execution: an older CLI must not pin a card and then
+    /// discover it cannot decode the result.
+    fn cannot_read_work_checks_for(&self, request: &ClientRequest) -> bool {
+        self.protocol < WORK_CHECK_COUNTS
+            && matches!(
+                request,
+                ClientRequest::WatchWork
+                    | ClientRequest::Work(
+                        crate::work::Request::Board { .. } | crate::work::Request::Pin { .. }
+                    )
+            )
     }
 
     /// A watch would only deliver edges the client cannot read.
@@ -199,6 +250,9 @@ impl OlderClient {
                 let nested = match response {
                     ServerResponse::Work(work) => {
                         variant_index(work).is_some_and(|index| index < self.work_responses)
+                            && (self.protocol >= WORK_CHECK_COUNTS
+                                || !variant_name(work)
+                                    .is_some_and(|name| WORK_CHECK_REPLIES.contains(&name)))
                     }
                     ServerResponse::Automation(automation) => {
                         self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
@@ -207,10 +261,14 @@ impl OlderClient {
                     ServerResponse::Agent(reply) => {
                         variant_index(reply).is_some_and(|index| index < self.agent_replies)
                     }
+                    ServerResponse::DeviceOperation { reply } => {
+                        variant_index(reply).is_some_and(|index| index < self.device_replies)
+                    }
                     _ => true,
                 };
                 nested && variant_index(response).is_some_and(|index| index < self.server_responses)
             }
+            ServerMessage::WorkBoard { .. } => self.protocol >= WORK_CHECK_COUNTS,
             ServerMessage::WorkspaceModelEdited { .. } => self.protocol >= MODEL_EDGES_WITH_EFFECTS,
             _ => true,
         }
@@ -431,6 +489,46 @@ mod tests {
     use crate::terminal_ipc::{ServerResponse, TerminalCloseResult};
 
     #[test]
+    fn store_busy_errors_preserve_retryability_for_current_and_carried_clis() {
+        use crate::terminal_ipc::{ServerEnvelope, ServerEnvelopeRef, read_frame, write_frame};
+        let error = ProtocolError::new(ProtocolErrorCode::StoreBusy, "database is locked", true);
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "store-busy-wire".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
+        };
+        for (version, expected) in [
+            (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::Internal),
+            (177, ProtocolErrorCode::Internal),
+            (178, ProtocolErrorCode::Internal),
+            (STORE_BUSY_ERROR, ProtocolErrorCode::StoreBusy),
+        ] {
+            let message = ServerMessage::Error(error.clone());
+            let mut frame = Vec::new();
+            write_frame(
+                &mut frame,
+                &ServerEnvelopeRef {
+                    version,
+                    request_id: Some(17),
+                    proof: &proof,
+                    message: &message,
+                },
+            )
+            .unwrap();
+            let decoded: ServerEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+            assert_eq!(decoded.version, version);
+            assert_eq!(decoded.request_id, Some(17));
+            assert_eq!(decoded.proof, proof);
+            assert_eq!(
+                decoded.message,
+                ServerMessage::Error(ProtocolError::new(expected, error.message.clone(), true,))
+            );
+            // Encoding an older frame must not change unscoped JSON output.
+            assert_eq!(serde_json::to_value(&error).unwrap()["code"], "store_busy");
+        }
+    }
+
+    #[test]
     fn variant_index_is_the_declaration_position_at_every_payload_shape() {
         assert_eq!(variant_index(&ClientRequest::List), Some(1));
         assert_eq!(
@@ -451,6 +549,91 @@ mod tests {
         assert_eq!(variant_index(&TerminalCloseResult::Closed), Some(0));
         assert_eq!(variant_index("not an enum"), None);
         assert_eq!(variant_index(&Some(ClientRequest::List)), None);
+    }
+
+    #[test]
+    fn an_older_client_reads_usage_without_resets_or_plan_details() {
+        use crate::account::{
+            UsageSource, UsageStatus,
+            info::UsageReading,
+            resets::{ResetKind, ResetScope, UsageReset},
+        };
+        /// The reading as protocol 183 and earlier decode it.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Before {
+            windows: Vec<crate::account::UsageWindow>,
+            credits: Option<crate::account::Credits>,
+            status: UsageStatus,
+            ordinary_usage_allowed: Option<bool>,
+            observed_at: u64,
+            source: UsageSource,
+            plan: Option<String>,
+            detail: Option<String>,
+        }
+        let reading = |observed_at| UsageReading {
+            resets: vec![UsageReset {
+                id: "fable-fixture".into(),
+                kind: ResetKind::Granted,
+                scopes: vec![ResetScope::Model("Fable".into())],
+                available_count: 2,
+                expires_at: Some(1_900_000_000),
+                usable: true,
+            }],
+            windows: Vec::new(),
+            credits: None,
+            status: UsageStatus::Limited,
+            ordinary_usage_allowed: Some(false),
+            observed_at,
+            source: UsageSource::Probe,
+            plan: Some("Max".into()),
+            plan_display_name: Some("Ultra".into()),
+            rate_limit_tier: Some("default_claude_max_20x".into()),
+            detail: Some("Fable limit".into()),
+        };
+        // Two in a row: a misaligned first reading would corrupt the second.
+        let readings = vec![reading(1), reading(2)];
+        let current = postcard::to_stdvec(&readings).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Vec<UsageReading>>(&current).unwrap(),
+            readings
+        );
+        let json = serde_json::to_value(&readings[0]).unwrap();
+        assert_eq!(json["plan_display_name"], "Ultra");
+        assert_eq!(json["resets"][0]["id"], "fable-fixture");
+        let older = encoding_for(CANDIDATE_LINE_PROTOCOL, || {
+            postcard::to_stdvec(&readings).unwrap()
+        });
+        let (decoded, rest) = postcard::take_from_bytes::<Vec<Before>>(&older).unwrap();
+        assert!(rest.is_empty(), "the older reading has trailing bytes");
+        assert_eq!(
+            decoded,
+            [1, 2].map(|observed_at| Before {
+                windows: Vec::new(),
+                credits: None,
+                status: UsageStatus::Limited,
+                ordinary_usage_allowed: Some(false),
+                observed_at,
+                source: UsageSource::Probe,
+                plan: Some("Max".into()),
+                detail: Some("Fable limit".into()),
+            })
+        );
+        assert_eq!(
+            encoding_for(PLAN_AND_RESET_READINGS, || postcard::to_stdvec(&readings)
+                .unwrap()),
+            current
+        );
+    }
+
+    #[test]
+    fn a_device_reply_after_the_older_protocol_is_refused() {
+        use crate::device_service::Reply;
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |reply| ServerMessage::Response {
+            response: ServerResponse::DeviceOperation { reply },
+        };
+        assert!(client.admits_message(&reply(Reply::Saved)));
+        assert!(!client.admits_message(&reply(Reply::AccountReset(serde_json::Value::Null))));
     }
 
     #[test]
@@ -565,6 +748,26 @@ mod tests {
         assert!(variant_index(&addresses).unwrap() >= CANDIDATE_LINE.server_messages);
     }
 
+    /// A change to a project's pending automation requests is told only to a
+    /// window of this protocol. No listed older client could decode it, so it
+    /// is withheld, and such a window keeps finding requests by reading them.
+    #[test]
+    fn automation_request_changes_are_withheld_from_every_older_client() {
+        let changed = ServerMessage::AutomationProposalsChanged {
+            repository: "/fixture".into(),
+        };
+        assert!(!OLDER_CLIENTS.is_empty());
+        for client in OLDER_CLIENTS {
+            assert!(client.protocol < 178);
+            assert!(
+                !client.admits_message(&changed),
+                "protocol {} clients cannot decode it",
+                client.protocol
+            );
+        }
+        assert!(variant_index(&changed).unwrap() >= CANDIDATE_LINE.server_messages);
+    }
+
     #[test]
     fn a_work_reply_after_the_older_protocol_is_refused() {
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
@@ -585,6 +788,86 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    #[test]
+    fn expanded_work_counts_require_a_matching_client_before_reading_or_pinning() {
+        use crate::work::{Board, Request, Response, Scope};
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let current = OlderClient {
+            protocol: WORK_CHECK_COUNTS,
+            ..client
+        };
+        for request in [
+            ClientRequest::WatchWork,
+            ClientRequest::Work(Request::Board {
+                scope: Scope::All,
+                fresh: false,
+            }),
+            ClientRequest::Work(Request::Pin {
+                scope: Scope::All,
+                item: "branch".into(),
+                column: None,
+            }),
+        ] {
+            assert!(!client.admits_request(&request));
+            assert!(current.admits_request(&request));
+        }
+        for request in [
+            ClientRequest::Work(Request::RemovalPlan {
+                scope: Scope::All,
+                item: "branch".into(),
+                fetch: false,
+            }),
+            ClientRequest::Work(Request::Snapshots { scope: Scope::All }),
+        ] {
+            assert!(client.admits_request(&request));
+        }
+        let board = Board {
+            generated_at_unix_ms: 0,
+            stale_after_days: 7,
+            projects: Vec::new(),
+            items: Vec::new(),
+            linear_unavailable: None,
+        };
+        for message in [
+            ServerMessage::WorkBoard {
+                revision: 1,
+                board: Box::new(board.clone()),
+            },
+            ServerMessage::Response {
+                response: ServerResponse::Work(Response::Board(board.clone())),
+            },
+            ServerMessage::Response {
+                response: ServerResponse::Work(Response::Watching {
+                    revision: 1,
+                    board: Box::new(board),
+                }),
+            },
+        ] {
+            assert!(!client.admits_message(&message));
+            assert!(current.admits_message(&message));
+        }
+        assert!(!client.admits_message(&ServerMessage::Response {
+            response: ServerResponse::Work(Response::Pinned(Box::new(crate::work::Item {
+                project: "/repo".into(),
+                project_name: "repo".into(),
+                key: crate::work::ItemKey::Branch("branch".into()),
+                branch: None,
+                worktree: None,
+                head: None,
+                comparison: None,
+                dirty: None,
+                pull_request: None,
+                linear: None,
+                sessions: Vec::new(),
+                last_activity: None,
+                error: None,
+                column: crate::work::Column::InProgress,
+                derived: crate::work::Column::InProgress,
+                pinned: false,
+            }))),
+        }));
     }
 
     #[test]
@@ -749,6 +1032,7 @@ mod tests {
             server_responses: detached,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            device_replies: u32::MAX,
         };
         assert!(!client.admits_request(&ClientRequest::List));
         assert!(client.admits_request(&ClientRequest::Connect {

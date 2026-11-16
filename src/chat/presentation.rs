@@ -50,7 +50,7 @@ fn body_mut(content: &mut ItemContent) -> Option<&mut String> {
     }
 }
 impl ItemChange {
-    pub(crate) fn between(previous: Option<&Item>, current: &Item) -> Self {
+    pub fn between(previous: Option<&Item>, current: &Item) -> Self {
         if let Some(previous) = previous
             && let (Some(old), Some(new)) = (body(&previous.content), body(&current.content))
             && new.starts_with(old)

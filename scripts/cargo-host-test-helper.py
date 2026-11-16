@@ -11,6 +11,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cargo_artifacts import CargoArtifactError, CargoArtifacts
+
 
 HELPER = "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
 VALUED = {"-p", "--package", "--bin", "--example", "--test", "--bench", "-F", "--features",
@@ -103,7 +106,7 @@ def prepare(cargo, arguments):
     metadata_args = [word for name, _, words in parsed if name in METADATA for word in words]
     described = subprocess.run([cargo, *toolchain, "metadata", "--format-version", "1",
                                 "--no-deps", *metadata_args], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, close_fds=False)
     if described.returncode:
         return None  # Cargo itself diagnoses an invalid original command.
     try:
@@ -119,52 +122,29 @@ def prepare(cargo, arguments):
     command = [cargo, *toolchain, "build", *build, "--package", package["id"],
                "--bin", "cagentsd", "--message-format=json-render-diagnostics"]
     print("cargo-gate: building the matched cagentsd helper for HOST tests", file=sys.stderr)
-    products = set()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as child:
+    artifacts = CargoArtifacts()
+    # Cargo keeps the jobserver descriptors MAKEFLAGS names.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, close_fds=False) as child:
         for line in child.stdout:
-            try:
-                message = json.loads(line)
-            except ValueError:
-                sys.stderr.write(line)
-                continue
-            if message.get("reason") == "compiler-message":
-                sys.stderr.write(message.get("message", {}).get("rendered") or "")
-            target = message.get("target", {})
-            if (message.get("reason") == "compiler-artifact"
-                    and target.get("name") == "cagentsd" and "bin" in target.get("kind", [])
-                    and message.get("executable") is not None):
-                products.add(message["executable"])
+            artifacts.read(line, diagnostics=sys.stderr)
         status = child.wait()
     if status:
         raise SystemExit(status if status > 0 else 128 - status)
-    if len(products) != 1:
-        raise SystemExit("cargo-gate: helper build did not report exactly one cagentsd executable")
-    product = products.pop()
-    if (not isinstance(product, str) or not os.path.isabs(product)
-            or not Path(product).is_file() or not os.access(product, os.X_OK)):
-        raise SystemExit("cargo-gate: helper build did not produce an absolute executable file")
-    return product
+    return str(artifacts.executable("cagentsd"))
 
 
 def main():
     arguments = sys.argv[1:]
-    run = bool(arguments and arguments[0] == "--run")
-    if run:
-        arguments.pop(0)
     if not arguments:
-        raise SystemExit("usage: cargo-host-test-helper.py [--run] CARGO COMMAND...")
+        raise SystemExit("usage: cargo-host-test-helper.py CARGO COMMAND...")
     cargo, arguments = arguments[0], arguments[1:]
     helper = prepare(cargo, arguments)
-    if run:
-        if helper:
-            os.environ[HELPER] = helper
-        os.execvp(cargo, [cargo, *arguments])
-    elif helper:
+    if helper:
         print(helper)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except OSError as error:
+    except (OSError, CargoArtifactError) as error:
         raise SystemExit(f"cargo-gate: could not prepare the HOST test helper: {error}")

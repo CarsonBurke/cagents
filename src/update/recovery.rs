@@ -239,8 +239,8 @@ impl Census {
             || uuid::Uuid::parse_str(&self.transaction).is_err()
             || terminals.len() != self.terminals.len()
             || chats.len() != self.chats.len()
-            || self.terminals.len() > 1024
-            || self.chats.len() > 128
+            || self.terminals.len() > crate::upgrade::handoff::MAX_TERMINALS
+            || self.chats.len() > crate::upgrade::handoff::MAX_CHATS
             || self.source.as_ref().is_some_and(|p| !p.is_complete())
             || (self.source.is_none() && (!self.terminals.is_empty() || !self.chats.is_empty()))
         {
@@ -1765,6 +1765,31 @@ mod tests {
             checkpoint_before: None,
         }
     }
+    #[test]
+    fn a_census_takes_as_many_chats_as_a_daemon_may_host() {
+        let chat = |_| crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal().session.launch,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(proof()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        // 128 was once the default capacity, never the largest allowed.
+        for chats in [150, 300, crate::upgrade::handoff::MAX_CHATS] {
+            let mut census = census(&terminal());
+            census.chats = (0..chats).map(chat).collect();
+            census.validate().unwrap();
+        }
+        let mut census = census(&terminal());
+        census.chats = (0..=crate::upgrade::handoff::MAX_CHATS).map(chat).collect();
+        assert!(census.validate().is_err());
+    }
+
     #[test]
     fn update_recovery_requires_exact_inventory_not_matching_counts() {
         let original = terminal();

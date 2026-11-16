@@ -11,6 +11,57 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// Authorization refusals remain distinct from registry/record failures until
+/// the request dispatcher assigns a protocol error code.
+#[derive(Debug, thiserror::Error)]
+pub(in crate::host) enum AuthorityError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for AuthorityError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl From<&str> for AuthorityError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+/// An identity-only projection issued by an authenticated retained Claude
+/// helper. This shape grants no authority: callers must authenticate its exact
+/// source lineage before updating a saved agent or pane.
+pub(super) fn retained_identity_update(
+    source: &crate::chat::Session,
+    replacement: &crate::chat::Session,
+) -> bool {
+    if source.launch.provider != crate::agent::Provider::Claude
+        || !matches!(
+            source.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        )
+        || !source.has_valid_native_continuity()
+        || !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete())
+        || !replacement
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    {
+        return false;
+    }
+    let mut projected = source.clone();
+    projected.launch.session_id = replacement.launch.session_id.clone();
+    projected == *replacement
+}
+
 /// The host proves this actor state before inspecting or retiring authority.
 #[derive(Clone, Copy)]
 pub(in crate::host) enum ResidentRelease {
@@ -860,12 +911,17 @@ impl Registry {
         Ok(claimed)
     }
 
-    pub(crate) fn execution_origin(&self, authority: &Authority) -> Result<Origin, String> {
+    pub(in crate::host) fn execution_origin(
+        &self,
+        authority: &Authority,
+    ) -> Result<Origin, AuthorityError> {
         let Some(token) = authority.token() else {
             return Ok(Origin::User);
         };
         if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
-            return Err("Invalid agent session authority".into());
+            return Err(AuthorityError::Denied(
+                "Invalid agent session authority".into(),
+            ));
         }
         // A session owns what its whole lineage started.
         let lineage: String = self
@@ -877,7 +933,13 @@ impl Registry {
                 [token],
                 |row| row.get(0),
             )
-            .map_err(|_| "This agent session authority is no longer registered".to_owned())?;
+            .optional()
+            .map_err(|error| AuthorityError::Failed(error.to_string()))?
+            .ok_or_else(|| {
+                AuthorityError::Denied(
+                    "This agent session authority is no longer registered".into(),
+                )
+            })?;
         Ok(Origin::Child {
             parent: Lineage(
                 lineage
@@ -893,6 +955,14 @@ impl Registry {
         &self,
         authority: &Authority,
     ) -> Result<Option<HostedSession>, String> {
+        self.checked_agent_authority_source(authority)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn checked_agent_authority_source(
+        &self,
+        authority: &Authority,
+    ) -> Result<Option<HostedSession>, AuthorityError> {
         self.execution_origin(authority)?;
         authority
             .token()
@@ -904,10 +974,14 @@ impl Registry {
                         [token],
                         |row| row.get(0),
                     )
-                    .map_err(|_| {
-                        "This agent session authority is no longer registered".to_owned()
+                    .optional()
+                    .map_err(|error| AuthorityError::Failed(error.to_string()))?
+                    .ok_or_else(|| {
+                        AuthorityError::Denied(
+                            "This agent session authority is no longer registered".into(),
+                        )
                     })?;
-                decode(&source)
+                decode(&source).map_err(AuthorityError::Failed)
             })
             .transpose()
     }
@@ -1523,13 +1597,41 @@ impl Registry {
         records.iter().map(|record| decode(record)).collect()
     }
 
+    /// Presentation identities come from each agent's first accepted task,
+    /// even when its provider has never been attached by a window. Later runs
+    /// and provider titles do not rename the original delegated task.
+    pub(crate) fn agent_labels(&self) -> Result<Vec<(AgentId, String)>, String> {
+        let mut query = self.db.prepare(
+            "SELECT a.record, (SELECT r.request FROM agent_runs r WHERE r.agent=a.id ORDER BY r.rowid LIMIT 1)
+             FROM agents a WHERE a.closed=0 ORDER BY a.rowid DESC LIMIT 1024",
+        ).map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (agent, request) = row.map_err(|error| error.to_string())?;
+            let agent: Agent = decode(&agent)?;
+            let request: Option<Submit> = request.as_deref().map(decode).transpose()?;
+            Ok((
+                agent.id,
+                crate::agent_execution::agent_label(
+                    agent.name.as_deref().unwrap_or("an agent"),
+                    request.as_ref().map(|request| request.prompt.as_str()),
+                ),
+            ))
+        })
+        .collect()
+    }
+
     /// Bind the daemon-issued descriptor once. Adoption may later replace it
     /// only after independently validating the exact prior descriptor lineage.
     pub(crate) fn bind_agent(
         &mut self,
         id: AgentId,
         expected: Option<&HostedSession>,
-        session: HostedSession,
+        mut session: HostedSession,
     ) -> Result<Agent, String> {
         let tx = self
             .db
@@ -1547,10 +1649,21 @@ impl Registry {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(pending) = pending
-            && !decode::<HostedSession>(&pending)?.same_process(&session)
-        {
-            return Err("The provider does not match the committed launch intent".into());
+        if let Some(pending) = pending {
+            let pending = decode::<HostedSession>(&pending)?;
+            if !pending.same_process(&session) {
+                return Err("The provider does not match the committed launch intent".into());
+            }
+            // Confirmation can commit after startup captured its reply but
+            // before this binding. Keep the authenticated pending identity;
+            // an older reply must not erase it from the agent and its pane.
+            if let (HostedSession::Chat(current), HostedSession::Chat(learned)) =
+                (&mut session, &pending)
+                && current.launch.session_id.is_none()
+                && retained_identity_update(current, learned)
+            {
+                current.launch.session_id = learned.launch.session_id.clone();
+            }
         }
         require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         agent.session = Some(session);
@@ -1868,13 +1981,24 @@ impl Registry {
     /// pending launch refuse; runs that ended (including `Interrupted` ones a
     /// crash recovery recorded) do not. Returns whether anything changed; no
     /// authority is issued for the successor.
+    ///
+    /// A conversation can also reopen in place after an unclean restart,
+    /// keeping its chat ID under a new process proof, as a Codex conversation
+    /// does through its retained listener allocation. The same proof of an
+    /// ended predecessor applies; authority issued to the successor's own
+    /// process is kept, and any other under that ID is dropped. A reopen that
+    /// is the very process the agent already holds proves nothing ended.
     pub(crate) fn adopt_successor(
         &mut self,
         predecessor: &crate::chat::Session,
         successor: &crate::chat::Session,
     ) -> Result<bool, String> {
-        if successor.id == predecessor.id {
-            return Err("A resumed successor needs its own chat ID".into());
+        let in_place = successor.id == predecessor.id;
+        if in_place
+            && HostedSession::Chat(successor.clone())
+                .same_process(&HostedSession::Chat(predecessor.clone()))
+        {
+            return Err("The successor is the process the agent already holds".into());
         }
         if successor.launch.provider != predecessor.launch.provider
             || successor.launch.recipe.working_directory
@@ -1912,7 +2036,7 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if bound {
+        if bound && !in_place {
             return Err("The successor already belongs to another agent".into());
         }
         // Only a recorded stop, or a boot the successor does not share, proves
@@ -1923,30 +2047,40 @@ impl Registry {
             .proof
             .as_ref()
             .is_some_and(|proof| proof.boot_id != boot);
-        if !stopped && !earlier_boot {
+        if !earlier_boot && !stopped {
             return Err("The predecessor may still be running; stop it first".into());
         }
         // Any authority left from an earlier boot is stale. Rewriting the
         // record below also drops the predecessor's stop marker.
-        tx.execute(
-            "DELETE FROM agent_authorities WHERE session_id = ?1",
-            [predecessor.id.to_string()],
-        )
-        .map_err(|error| error.to_string())?;
-        // A prompt still queued unsent belongs to the agent, not to the ended
-        // process, and goes to the successor.
-        let unsettled: bool = tx
-            .query_row(
-                &format!(
-                    "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = ?1
-                     AND r.state IN ('accepted', 'running', 'waiting') AND NOT ({UNSENT}))
-                 OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)"
-                ),
-                [agent.id.to_string()],
-                |row| row.get(0),
+        if in_place {
+            // The reopened process shares the ID; keep only what was issued
+            // to it.
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                    [predecessor.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let next = HostedSession::Chat(successor.clone());
+            if let Some(stored) = stored
+                && !next.same_process(&decode::<HostedSession>(&stored)?)
+            {
+                tx.execute(
+                    "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
+                    params![predecessor.id.to_string(), stored],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        } else {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1",
+                [predecessor.id.to_string()],
             )
             .map_err(|error| error.to_string())?;
-        if unsettled {
+        }
+        if unsettled(&tx, agent.id)? {
             return Err("The stopped agent still has unsettled work; it cannot be rebound".into());
         }
         let next = HostedSession::Chat(successor.clone());
@@ -1969,6 +2103,85 @@ impl Registry {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Rebind each open agent whose pane shows its chat reopened in place by
+    /// a process the agent never adopted, as one reopened before in-place
+    /// adoption existed. A pane that disagrees with its agent blocks its whole
+    /// view from opening, and so the reopen that would adopt it never comes.
+    /// Both processes must come from boots before `boot`, so neither can still
+    /// act; the agent then follows the pane, which records the later reopen,
+    /// and authority left to either is dropped. An agent with unsettled work
+    /// is left for that work's own recovery. Returns how many were rebound.
+    pub(in crate::host) fn adopt_reopened_panes(
+        &mut self,
+        boot: &crate::model::BootId,
+    ) -> Result<usize, String> {
+        let earlier = |session: &crate::chat::Session| {
+            session
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete() && &proof.boot_id != boot)
+        };
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let records = tx
+            .prepare("SELECT record FROM agents WHERE closed = 0")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut adopted = 0;
+        for record in records {
+            // One unreadable record must not hold back the others.
+            let Ok(mut agent) = decode::<Agent>(&record) else {
+                continue;
+            };
+            let Some(HostedSession::Chat(bound)) = &agent.session else {
+                continue;
+            };
+            if !earlier(bound) {
+                continue;
+            }
+            let Some(shown) = super::views::agent_pane_chat(&tx, agent.id)? else {
+                continue;
+            };
+            let previous = HostedSession::Chat(bound.clone());
+            let next = HostedSession::Chat(shown.clone());
+            if shown.id != bound.id
+                || next.same_process(&previous)
+                || !earlier(&shown)
+                || shown.launch.provider != bound.launch.provider
+                || shown.launch.recipe.working_directory != bound.launch.recipe.working_directory
+                || unsettled(&tx, agent.id)?
+            {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1",
+                [bound.id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            agent.console = shown.terminal.clone();
+            agent.session = Some(next);
+            tx.execute(
+                "UPDATE agents SET record = ?2 WHERE id = ?1",
+                params![agent.id.to_string(), encode(&agent)?],
+            )
+            .map_err(|error| error.to_string())?;
+            adopted += 1;
+        }
+        if adopted > 0 {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(adopted)
     }
 
     /// Whether this open agent's bound process was proven to have ended (a
@@ -2396,6 +2609,23 @@ fn process_agent(tx: &Transaction<'_>, source: &HostedSession) -> Result<Option<
     .map_err(|e| e.to_string())?
     .map(|record| decode(&record))
     .transpose()
+}
+
+/// Whether the agent has work its bound process has not settled: a prompt
+/// accepted and sent but not finished, or a launch still pending. A prompt
+/// still queued unsent belongs to the agent, not to the process, and follows
+/// it to a successor.
+fn unsettled(tx: &Connection, agent: AgentId) -> Result<bool, String> {
+    tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = ?1
+             AND r.state IN ('accepted', 'running', 'waiting') AND NOT ({UNSENT}))
+         OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)"
+        ),
+        [agent.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Whether a daemon stop recorded that this open agent's bound process ended.
@@ -5405,6 +5635,35 @@ mod tests {
     }
 
     #[test]
+    fn binding_preserves_identity_confirmed_during_pending_launch() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut initial) = source() else {
+            unreachable!()
+        };
+        initial.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let confirmed = initial.launch.session_id.take().unwrap();
+        let initial = HostedSession::Chat(initial);
+        registry
+            .reserve_agent_launch(accepted.agent.id, &initial)
+            .unwrap();
+        let mut learned = initial.clone();
+        let HostedSession::Chat(chat) = &mut learned else {
+            unreachable!()
+        };
+        chat.launch.session_id = Some(confirmed);
+        registry
+            .adopt_authenticated_agent_session(std::slice::from_ref(&initial), &learned)
+            .unwrap();
+        // The startup reply was captured before the daemon persisted confirmation.
+        let bound = registry
+            .bind_agent(accepted.agent.id, None, initial)
+            .unwrap();
+        assert_eq!(bound.session, Some(learned));
+    }
+
+    #[test]
     fn approved_directory_identity_survives_reopen_and_refuses_replacement() {
         let (mut registry, directory, request) = fixture();
         let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
@@ -5712,6 +5971,48 @@ mod tests {
         assert!(registry.agents(None).unwrap().is_empty());
         request.name = Some("reviewer-2_api".into());
         assert!(registry.submit_agent(&Origin::User, &request, 2).is_ok());
+    }
+
+    #[test]
+    fn unloaded_agent_labels_use_the_first_accepted_task_and_survive_reconnect() {
+        use crate::workspace_model::metadata::{Query, Reply};
+
+        let (mut registry, directory, mut request) = fixture();
+        request.name = Some("reviewer".into());
+        request.prompt = "Review the one-row cards\nCheck the narrow layout too".into();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert!(accepted.agent.session.is_none());
+        assert!(registry.model().unwrap().views.is_empty());
+        let expected = vec![(
+            accepted.agent.id,
+            "reviewer · Review the one-row cards".into(),
+        )];
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+
+        request.name = None;
+        request.destination = Destination::Existing(accepted.agent.id);
+        request.idempotency_key = "follow-up".into();
+        request.prompt = "A later task does not rename the agent".into();
+        registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        drop(registry);
+
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agent_labels().unwrap(), expected);
+        let identity = registry.model().unwrap().identity;
+        assert_eq!(
+            registry.metadata(Query::AgentLabels).unwrap(),
+            Reply::AgentLabels {
+                identity,
+                labels: expected,
+            }
+        );
+        for run in registry.unfinished_agent_runs(accepted.agent.id).unwrap() {
+            registry.cancel_agent_run_at_close(&run, 3).unwrap();
+        }
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(registry.agent_labels().unwrap().is_empty());
     }
 
     #[test]

@@ -104,7 +104,7 @@ impl RecoveryContext {
 
 /// Reserve one bounded recovery payload before touching the filesystem.
 /// Producers must retain no more than MAX_RECOVERY_DESCRIPTORS descriptors.
-pub(crate) struct RecoverySlot {
+pub struct RecoverySlot {
     budget: Arc<Budget>,
     context: Option<RecoveryContext>,
     // Exact creation admission, with no filesystem mutation or IPC in Drop.
@@ -113,7 +113,7 @@ pub(crate) struct RecoverySlot {
     creation_guard: Option<Arc<dyn Send + Sync>>,
 }
 impl RecoverySlot {
-    pub(crate) fn reserve() -> Result<Self, String> {
+    pub fn reserve() -> Result<Self, String> {
         Self::from_budget(budget())
     }
     fn from_budget(budget: Arc<Budget>) -> Result<Self, String> {
@@ -139,7 +139,7 @@ impl RecoverySlot {
         self.creation_guard = Some(guard);
         self
     }
-    pub(crate) fn retain(
+    pub fn retain(
         self,
         description: String,
         retry: impl FnMut() -> Result<(), String> + Send + 'static,
@@ -186,7 +186,7 @@ pub struct RecoveryAuthority(Arc<RecoveryInner>);
 impl RecoveryAuthority {
     /// Join existing bounded payloads without reserving a new slot after an
     /// effect. Nested cleanup errors must not discard an earlier authority.
-    pub(crate) fn combine(self, other: Self) -> Self {
+    pub fn combine(self, other: Self) -> Self {
         if self == other {
             return self;
         }
@@ -252,7 +252,7 @@ impl RecoveryAuthority {
     }
     /// Blocking worker only. The producer revalidates retained authority and
     /// must refuse foreign names/no-clobber collisions on every retry.
-    pub(crate) fn retry(&self) -> Result<(), String> {
+    pub fn retry(&self) -> Result<(), String> {
         let mut work = self.0.work.lock().map_err(|_| {
             "Editor recovery previously failed unexpectedly; its retained authority was kept."
                 .to_owned()
