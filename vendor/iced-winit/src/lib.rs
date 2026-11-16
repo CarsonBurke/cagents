@@ -1505,6 +1505,11 @@ async fn run_instance<P>(
                     continue;
                 }
 
+                platform_specific_handler.route_keyboard_grabs(
+                    &mut events,
+                    |id| window_manager.get(id).is_some(),
+                );
+
                 let mut uis_stale = false;
                 let mut resized = false;
                 for (id, window) in window_manager.iter_mut() {

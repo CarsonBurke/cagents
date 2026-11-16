@@ -84,6 +84,19 @@ impl PlatformSpecific {
         }
     }
 
+    /// Gives keyboard input addressed to a toplevel to the grabbing popup
+    /// that owns it; see `wayland::keyboard_grab`.
+    pub(crate) fn route_keyboard_grabs(
+        &mut self,
+        events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
+        is_open: impl Fn(window::Id) -> bool,
+    ) {
+        #[cfg(wayland_platform)]
+        {
+            self.wayland.keyboard_grabs.route(events, is_open);
+        }
+    }
+
     pub(crate) fn clear_subsurface_list(&mut self) {
         #[cfg(wayland_platform)]
         {
