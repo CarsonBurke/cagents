@@ -104,7 +104,7 @@ def selected_account(raw, home):
     registry = tomllib.loads(raw.decode("utf-8"))
     if registry.get("version", 0) > 5:
         raise ValueError("Unknown accounts registry version")
-    matches = [row for row in registry.get("accounts", [])
+    matches = [row for row in registry.get("account", [])
                if row.get("provider") == "claude" and row.get("linked_home") == str(home)]
     if len(matches) != 1:
         raise ValueError("Need one public linked registration for the prepared namespace")

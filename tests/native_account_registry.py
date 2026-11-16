@@ -39,7 +39,7 @@ class AccountRegistryFixtureTests(unittest.TestCase):
         home, path = fixture.paths(self.root)
         path.parent.mkdir(mode=0o700)
         text = (f'version = 5\nrevision = 2\n[defaults]\nclaude = "{KEY}"\n'
-                f'[[accounts]]\nprovider = "claude"\nkey = "{KEY}"\n'
+                f'[[account]]\nprovider = "claude"\nkey = "{KEY}"\n'
                 f'linked_home = "{home}"\nadded_at = 1\n')
         path.write_text(text)
         path.chmod(0o600)
@@ -89,7 +89,7 @@ class AccountRegistryFixtureTests(unittest.TestCase):
 
     def test_duplicate_matching_registrations_refuse(self):
         home, path, original = self.registered()
-        path.write_bytes(original + original[original.index(b"[[accounts]]"):])
+        path.write_bytes(original + original[original.index(b"[[account]]"):])
         with self.assertRaises(ValueError):
             fixture.fault(self.root)
 
